@@ -226,6 +226,11 @@ pub const ProbeSink = struct {
     /// scan applies it to each batch's values BEFORE calling `process`, so
     /// the sink's compiled indices stay valid. Null = identity.
     probe_map: ?[]const usize = null,
+    /// Accept only as a link of a probe chain already running in the
+    /// workers, never by starting one at a bare scan: a scan that takes a
+    /// sink gives up the samples and strategies a plain stream keeps, which
+    /// a terminal filter push (`Filter.tryFuseSelf`) has no join to repay.
+    extends_chain: bool = false,
     bind: *const fn (ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void,
     /// Returns null when this probe batch produced no output rows (the
     /// worker pulls the next scan batch); never called on an exhausted chunk.

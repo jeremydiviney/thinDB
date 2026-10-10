@@ -53,7 +53,10 @@ const SchemaStub = struct {
 /// sink processes the surviving rows.
 const FilterForward = struct {
     src: *Filter,
-    inner: exec.ProbeSink,
+    /// The sink above (a join's), or null for a terminal push
+    /// (`Filter.tryFuseSelf`): the survivors are the pipeline's output. A
+    /// join created above later upgrades it by adopting its sink.
+    inner: ?exec.ProbeSink,
     /// Upstream schema snapshotted at offer time — the scan re-types its
     /// out_schema on accept, so it can't be re-read at bind time.
     in_schema: []const Column,
@@ -66,6 +69,14 @@ const FilterForward = struct {
 
     fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
         const cf: *FilterForward = @ptrCast(@alignCast(ctx));
+        // Grow-only, as `ChainForward.bindHook`: a SetUnion forwards one
+        // sink to both arms, so this can bind twice. The inner sink is
+        // itself grow-only.
+        if (cf.per_chunk.len >= n_chunks) {
+            if (cf.inner) |inner| try inner.bind(inner.ctx, n_chunks, alloc);
+            return;
+        }
+        cf.freeClones();
         cf.bind_alloc = alloc;
         const qs = try alloc.alloc(Query, n_chunks);
         errdefer alloc.free(qs);
@@ -86,36 +97,40 @@ const FilterForward = struct {
         }
         cf.per_chunk = qs;
         cf.stubs = stubs;
-        if (cf.inner.probe_map) |m| {
-            const mv = try alloc.alloc([]ColumnView, n_chunks);
-            var mbuilt: usize = 0;
-            errdefer {
-                for (mv[0..mbuilt]) |v| alloc.free(v);
-                alloc.free(mv);
-            }
-            for (mv) |*v| {
-                v.* = try alloc.alloc(ColumnView, m.len);
-                mbuilt += 1;
-            }
-            cf.map_views = mv;
+        if (cf.inner) |inner| {
+            if (inner.probe_map) |m| cf.map_views = try allocMapViews(alloc, n_chunks, m.len);
+            try inner.bind(inner.ctx, n_chunks, alloc);
         }
-        try cf.inner.bind(cf.inner.ctx, n_chunks, alloc);
     }
 
     fn processHook(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
         const cf: *FilterForward = @ptrCast(@alignCast(ctx));
         const f = exec.queryAs(Filter, cf.per_chunk[chunk]).?;
         var out = (try f.evalBatch(batch)) orelse return null;
-        if (cf.inner.probe_map) |m| {
+        const inner = cf.inner orelse return out;
+        if (inner.probe_map) |m| {
             const vs = cf.map_views[chunk];
             for (m, vs) |src, *v| v.* = out.values[src];
             out = .{ .schema = out.schema, .values = vs, .row_count = out.row_count };
         }
-        return try cf.inner.process(cf.inner.ctx, chunk, out);
+        return try inner.process(inner.ctx, chunk, out);
     }
 
-    fn deinitAll(cf: *FilterForward, owner_alloc: Allocator) void {
-        if (cf.probe_source) |*source| source.deinit(owner_alloc);
+    fn allocMapViews(alloc: Allocator, n_chunks: usize, width: usize) ![][]ColumnView {
+        const mv = try alloc.alloc([]ColumnView, n_chunks);
+        var built: usize = 0;
+        errdefer {
+            for (mv[0..built]) |v| alloc.free(v);
+            alloc.free(mv);
+        }
+        for (mv) |*v| {
+            v.* = try alloc.alloc(ColumnView, width);
+            built += 1;
+        }
+        return mv;
+    }
+
+    fn freeClones(cf: *FilterForward) void {
         for (cf.per_chunk, cf.stubs) |*q, st| {
             q.deinit();
             cf.bind_alloc.destroy(st);
@@ -126,6 +141,14 @@ const FilterForward = struct {
         }
         for (cf.map_views) |v| cf.bind_alloc.free(v);
         if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+        cf.per_chunk = &.{};
+        cf.stubs = &.{};
+        cf.map_views = &.{};
+    }
+
+    fn deinitAll(cf: *FilterForward, owner_alloc: Allocator) void {
+        if (cf.probe_source) |*source| source.deinit(owner_alloc);
+        cf.freeClones();
         owner_alloc.destroy(cf);
     }
 };
@@ -168,6 +191,10 @@ pub const Filter = struct {
     /// runs in per-chunk clones inside the scan workers, and this operator
     /// passes the final joined batches through untouched.
     chain: ?*FilterForward = null,
+
+    /// `stats()` as of a terminal push (`tryFuseSelf`). The links below
+    /// then report the chain's stats rather than this filter's input.
+    terminal_stats: exec.PipelineStats = .{ .upper_rows = std.math.maxInt(u64) },
 
     /// New conjunct slices synthesized by the plan-time simplification pass
     /// (one per AND level that lost a conjunct). Allocated from `allocator`,
@@ -268,6 +295,7 @@ pub const Filter = struct {
         // Filter degrades to a pass-through. The expr it borrows is `self.expr`,
         // which outlives the query (owned by this Filter).
         self.fused = self.upstream.tryFuseFilter(self.expr) catch false;
+        if (!self.fused and upstream.probeFusionReachable()) _ = self.tryFuseSelf();
 
         return makeQuery(allocator, self);
     }
@@ -418,13 +446,50 @@ pub const Filter = struct {
     /// must decline: its mask evaluates against the probe-side schema and
     /// would be applied to already-joined rows.
     pub fn tryFuseProbe(self: *Filter, sink: exec.ProbeSink) !bool {
-        if (self.expr == .always and !self.expr.always) return false;
+        if (self.provenEmpty()) return false;
         if (self.fused) return self.upstream.tryFuseProbe(sink);
+        if (self.chain) |cf| {
+            // Upgrade a terminal push: the clones are already bound below;
+            // rechain the sink to the bottom scan, then adopt it so each
+            // chunk's survivors feed it.
+            if (cf.inner != null) return false;
+            if (!(try self.upstream.rechainProbeSink(sink))) return false;
+            if (sink.probe_map) |m| cf.map_views = try FilterForward.allocMapViews(cf.bind_alloc, cf.per_chunk.len, m.len);
+            cf.inner = sink;
+            return true;
+        }
         // Unfused: the predicate must run BETWEEN the source's batches and
         // the join — forward a wrapper whose per-chunk clones filter each
         // batch before the join's sink sees it. A proven-false predicate
         // emits nothing either way; keep it on the cheap serial path.
-        if (self.chain != null) return false;
+        return self.pushChain(sink, sink.out_schema, sink.extends_chain);
+    }
+
+    /// Terminal self-push: nothing above offers a probe sink, but the
+    /// pipeline below already runs a probe chain in the scan workers. Join
+    /// that chain as its last link, so the workers emit only the survivors
+    /// (a materializing scan copies only those) and this operator passes
+    /// them through, which also lets a partial aggregate above fuse into
+    /// the workers. A join created above later upgrades the link
+    /// (`tryFuseProbe`). No-op when the upstream declines.
+    pub fn tryFuseSelf(self: *Filter) bool {
+        if (self.fused or self.chain != null or self.provenEmpty()) return false;
+        const before = self.stats();
+        const column_stats = if (self.cached_stats.len == 0 and before.column_stats.len > 0)
+            self.allocator.dupe(exec.ColStat, before.column_stats) catch return false
+        else
+            null;
+        if (!(self.pushChain(null, self.schema, true) catch false)) {
+            if (column_stats) |owned| self.allocator.free(owned);
+            return false;
+        }
+        if (column_stats) |owned| self.cached_stats = owned;
+        self.terminal_stats = before;
+        self.terminal_stats.column_stats = self.cached_stats;
+        return true;
+    }
+
+    fn pushChain(self: *Filter, inner: ?exec.ProbeSink, out_schema: []const Column, extends_chain: bool) !bool {
         var probe_source = if (predicate.kernelsOnly(self.expr)) try mat_stage.stageBehind(self.allocator, self.upstream, null) else null;
         defer if (probe_source) |*source| source.deinit(self.allocator);
         if (probe_source) |*source| {
@@ -438,12 +503,13 @@ pub const Filter = struct {
         errdefer self.allocator.destroy(chain);
         chain.* = .{
             .src = self,
-            .inner = sink,
+            .inner = inner,
             .in_schema = self.upstream.outputSchema(),
         };
         const ok = self.upstream.tryFuseProbe(.{
             .ctx = chain,
-            .out_schema = sink.out_schema,
+            .out_schema = out_schema,
+            .extends_chain = extends_chain,
             .bind = FilterForward.bindHook,
             .process = FilterForward.processHook,
         }) catch false;
@@ -493,8 +559,13 @@ pub const Filter = struct {
         return self.upstream.probeFusionReachable();
     }
 
+    /// A terminal link passes nothing on: a sink bound below it would never
+    /// be fed, so the caller must upgrade it through `tryFuseProbe`.
     pub fn rechainProbeSink(self: *Filter, sink: exec.ProbeSink) !bool {
-        if (!self.fused and self.chain == null) return false;
+        if (!self.fused) {
+            const cf = self.chain orelse return false;
+            if (cf.inner == null) return false;
+        }
         return self.upstream.rechainProbeSink(sink);
     }
 
@@ -526,7 +597,8 @@ pub const Filter = struct {
         // Chained: this operator no longer shapes the batches; the cached
         // per-column tightening would mis-index against the re-typed
         // upstream schema.
-        if (self.chain != null) {
+        if (self.chain) |cf| {
+            if (cf.inner == null) return self.terminal_stats;
             var joined = self.upstream.stats();
             joined.row_origin = null;
             return joined;

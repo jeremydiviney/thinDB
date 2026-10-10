@@ -1462,6 +1462,7 @@ pub const ParallelScan = struct {
     /// schema (`out_schema` swap below).
     pub fn tryFuseProbe(self: *ParallelScan, sink: exec.ProbeSink) !bool {
         const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
+        if (sink.extends_chain) return false;
         if (self.mode != .unset) {
             if (trace_jf) std.debug.print("[jf]   ps decline: mode={s} table={}\n", .{ @tagName(self.mode), self.table != null });
             return false;

@@ -849,6 +849,7 @@ pub const Compute = struct {
         const ok = self.upstream.tryFuseProbe(.{
             .ctx = chain,
             .out_schema = sink.out_schema,
+            .extends_chain = sink.extends_chain,
             .bind = ChainForward.bindHook,
             .process = ChainForward.processHook,
         }) catch false;

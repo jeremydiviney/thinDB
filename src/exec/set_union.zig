@@ -173,7 +173,9 @@ pub const SetUnion = struct {
     /// compose (larger space wins; arms drain sequentially, never racing).
     pub fn tryFuseProbe(self: *SetUnion, sink: exec.ProbeSink) !bool {
         const trace = getenv_su("THINDB_TRACE_JOINFUSE") != null;
-        if (self.probe_sink != null) return false;
+        // A chain-only sink stays off a union: an arm without a chain would
+        // run it on the serial lane, a split the push gains nothing from.
+        if (self.probe_sink != null or sink.extends_chain) return false;
         // An arm that needs a unifying cast can't probe from its workers (the
         // sink's indices address the POST-cast union schema) — but it can
         // still take the serial lane below, where rebatched() casts first.
