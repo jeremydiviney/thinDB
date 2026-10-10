@@ -67,6 +67,10 @@ pub fn pushJoinFilters(arena: Allocator, catalog: ?*api.Catalog, session: api.Se
     var transferred: std.AutoHashMapUnmanaged(*const ir.Op, [2]*const ir.Op) = .empty;
     const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session, .transferred = &transferred };
     try walk(ctx, op);
+    // Every pin has reached the inputs it can by now: a key pinned on both
+    // inputs is only provable once the walk has finished moving filters.
+    var seen: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+    try dropPinnedKeys(ctx, op, false, &seen);
 }
 
 fn walk(ctx: Ctx, op: *ir.Op) anyerror!void {
@@ -468,6 +472,59 @@ fn transferKeyConstants(ctx: Ctx, op: *ir.Op, above: []const PredicateExpr) anye
         try walk(ctx, nf);
     }
     if (ctx.transferred) |seen| try seen.put(ctx.arena, op, .{ j.left, j.right });
+}
+
+/// Walk the tree, each shared body once, dropping pinned key pairs from its
+/// joins. A KEYED BY body keeps its pairs: the region recognizer routes and
+/// filters its joins by them.
+fn dropPinnedKeys(ctx: Ctx, op: *ir.Op, in_region: bool, seen: *std.AutoHashMapUnmanaged(*const ir.Op, void)) anyerror!void {
+    var region = in_region;
+    if (op.* == .materialize) {
+        if ((try seen.getOrPut(ctx.arena, op)).found_existing) return;
+        if (op.materialize.region_keys != null) region = true;
+    }
+    switch (op.*) {
+        inline else => |payload| {
+            const Payload = @TypeOf(payload);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = @field(payload, field.name);
+                if (field.type == *ir.Op) {
+                    try dropPinnedKeys(ctx, child, region, seen);
+                } else if (field.type == ?*ir.Op) {
+                    if (child) |c| try dropPinnedKeys(ctx, c, region, seen);
+                } else if (field.type == []const *ir.Op) {
+                    for (child) |c| try dropPinnedKeys(ctx, c, region, seen);
+                }
+            }
+        },
+    }
+    if (op.* == .join and !region) try dropJoinPinnedKeys(ctx, &op.join);
+}
+
+/// Drop the ON pairs whose two keys every input row pins to one same
+/// literal. Such a pair holds for every pair of rows, so testing it only
+/// hashes and compares a constant. One pair always stays, so the join keeps
+/// its keyed form.
+fn dropJoinPinnedKeys(ctx: Ctx, j: *ir.Op.Join) anyerror!void {
+    if (j.on.len < 2) return;
+    var kept: std.ArrayListUnmanaged(ir.JoinKeyPair) = .empty;
+    for (j.on, 0..) |pair, i| {
+        const last_left = kept.items.len == 0 and i == j.on.len - 1;
+        if (!last_left and !pair.null_safe and try pinnedAlike(ctx, j, pair)) continue;
+        try kept.append(ctx.arena, pair);
+    }
+    if (kept.items.len == j.on.len) return;
+    if (trace_push) std.debug.print("[ppd]   pinned keys dropped: {d} of {d}\n", .{ j.on.len - kept.items.len, j.on.len });
+    j.on = kept.items;
+}
+
+fn pinnedAlike(ctx: Ctx, j: *const ir.Op.Join, pair: ir.JoinKeyPair) anyerror!bool {
+    const l = try keyFacts(ctx, j.left, pair.left) orelse return false;
+    const r = try keyFacts(ctx, j.right, pair.right) orelse return false;
+    const l_pin = l.pin orelse return false;
+    const r_pin = r.pin orelse return false;
+    return sameKeyType(l.col_type, r.col_type) and l_pin.val.eql(r_pin.val);
 }
 
 /// A conjunct of `above` that pins column `name` of `j`'s `side` input.

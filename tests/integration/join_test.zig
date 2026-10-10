@@ -3476,3 +3476,114 @@ fn filtersOverInnermostJoin(allocator: std.mem.Allocator, db: anytype, sql: []co
     while (i > 0 and std.mem.eql(u8, std.mem.trim(u8, lines[i - 1] orelse "", " "), "Filter")) : (i -= 1) filters += 1;
     return filters;
 }
+
+test "join: a key both inputs pin to one literal leaves the join keys" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE fact (tenant INT NOT NULL, model VARCHAR(8) NOT NULL, k BIGINT NOT NULL, amount BIGINT NOT NULL)");
+    try helpers.exec(allocator, db, "CREATE TABLE dim (tenant INT NOT NULL, model VARCHAR(8) NOT NULL, k BIGINT NOT NULL, since BIGINT NOT NULL)");
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.appendSlice(allocator, "INSERT INTO fact VALUES ");
+    for (1..4) |tenant| for ([_][]const u8{ "x", "y" }) |model| for (1..6) |k| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, '{s}', {d}, {d})", .{ tenant, model, k, tenant * 100 + k * 10 + model.len });
+    };
+    try helpers.exec(allocator, db, sql.items);
+    sql.clearRetainingCapacity();
+    try sql.appendSlice(allocator, "INSERT INTO dim VALUES ");
+    for (1..4) |tenant| for ([_][]const u8{ "x", "y" }) |model| for (2..5) |k| {
+        if (sql.items[sql.items.len - 1] == ')') try sql.append(allocator, ',');
+        try sql.print(allocator, "({d}, '{s}', {d}, {d})", .{ tenant, model, k, tenant * 1000 + k });
+    };
+    try helpers.exec(allocator, db, sql.items);
+
+    // Each case runs beside a twin whose pins hide behind an expression, so
+    // no key there is provably constant: both must return the same rows. The
+    // count is the keys left on each join of the case, outermost first.
+    const cases = .{
+        .{
+            "SELECT f.k, f.amount, d.since FROM (SELECT * FROM fact WHERE tenant = 2 AND model = 'x') f JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            "SELECT f.k, f.amount, d.since FROM (SELECT * FROM fact WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'x') f JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            &[_]usize{1},
+        },
+        .{
+            "SELECT f.k, f.amount, d.since FROM (SELECT * FROM fact WHERE tenant = 3 AND model = 'y') f LEFT JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            "SELECT f.k, f.amount, d.since FROM (SELECT * FROM fact WHERE tenant + 0 = 3 AND CONCAT(model, '') = 'y') f LEFT JOIN dim d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            &[_]usize{1},
+        },
+        .{
+            "SELECT COUNT(*), SUM(f.amount), SUM(d.since) FROM (SELECT * FROM fact WHERE tenant = 3 AND k = 2) f JOIN dim d ON d.tenant = f.tenant AND d.k = f.k",
+            "SELECT COUNT(*), SUM(f.amount), SUM(d.since) FROM (SELECT * FROM fact WHERE tenant + 0 = 3 AND k + 0 = 2) f JOIN dim d ON d.tenant = f.tenant AND d.k = f.k",
+            &[_]usize{1},
+        },
+        .{
+            "SELECT COUNT(*) FROM (SELECT * FROM fact WHERE tenant = 2) f JOIN (SELECT * FROM dim WHERE tenant = 3) d ON d.tenant = f.tenant AND d.k = f.k",
+            "SELECT COUNT(*) FROM (SELECT * FROM fact WHERE tenant + 0 = 2) f JOIN (SELECT * FROM dim WHERE tenant + 0 = 3) d ON d.tenant = f.tenant AND d.k = f.k",
+            &[_]usize{2},
+        },
+        .{
+            "SELECT f.k, f.amount, d.k, d.since FROM (SELECT * FROM fact WHERE tenant = 1 AND model = 'x') f FULL JOIN (SELECT * FROM dim WHERE tenant = 1 AND model = 'x') d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k, d.k",
+            "SELECT f.k, f.amount, d.k, d.since FROM (SELECT * FROM fact WHERE tenant + 0 = 1 AND CONCAT(model, '') = 'x') f FULL JOIN (SELECT * FROM dim WHERE tenant + 0 = 1 AND CONCAT(model, '') = 'x') d ON d.tenant = f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k, d.k",
+            &[_]usize{1},
+        },
+        .{
+            "SELECT f.k, d.since FROM (SELECT * FROM fact WHERE tenant = 2 AND model = 'y') f JOIN (SELECT * FROM dim WHERE tenant = 2 AND model = 'y') d ON d.tenant <=> f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            "SELECT f.k, d.since FROM (SELECT * FROM fact WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'y') f JOIN (SELECT * FROM dim WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'y') d ON d.tenant <=> f.tenant AND d.model = f.model AND d.k = f.k ORDER BY f.k",
+            &[_]usize{2},
+        },
+        .{
+            \\WITH facts AS (SELECT tenant, model, k, amount FROM fact WHERE tenant = 2 AND model = 'x'),
+            \\starts AS (SELECT tenant, model, k, since FROM dim WHERE tenant = 2 AND model = 'x'),
+            \\firsts AS (SELECT s.tenant, s.model, s.k FROM facts f JOIN starts s ON s.tenant = f.tenant AND s.model = f.model AND s.k = f.k
+            \\  WHERE f.amount > 220 GROUP BY s.tenant, s.model, s.k)
+            \\SELECT f.k, f.amount, s.since FROM facts f LEFT JOIN starts s ON s.tenant = f.tenant AND s.model = f.model AND s.k = f.k
+            \\JOIN firsts p ON p.tenant = f.tenant AND p.model = f.model AND p.k = f.k ORDER BY f.k
+            ,
+            \\WITH facts AS (SELECT tenant, model, k, amount FROM fact WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'x'),
+            \\starts AS (SELECT tenant, model, k, since FROM dim WHERE tenant + 0 = 2 AND CONCAT(model, '') = 'x'),
+            \\firsts AS (SELECT s.tenant, s.model, s.k FROM facts f JOIN starts s ON s.tenant = f.tenant AND s.model = f.model AND s.k = f.k
+            \\  WHERE f.amount > 220 GROUP BY s.tenant, s.model, s.k)
+            \\SELECT f.k, f.amount, s.since FROM facts f LEFT JOIN starts s ON s.tenant = f.tenant AND s.model = f.model AND s.k = f.k
+            \\JOIN firsts p ON p.tenant = f.tenant AND p.model = f.model AND p.k = f.k ORDER BY f.k
+            ,
+            &[_]usize{ 1, 1, 1 },
+        },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        const got = try crossRowsText(allocator, db, c[0]);
+        defer allocator.free(got);
+        const want = try crossRowsText(allocator, db, c[1]);
+        defer allocator.free(want);
+        try std.testing.expectEqualStrings(want[std.mem.indexOfScalar(u8, want, '\n') orelse want.len ..], got[std.mem.indexOfScalar(u8, got, '\n') orelse got.len ..]);
+        const keys = try joinKeyCounts(allocator, db, c[0]);
+        defer allocator.free(keys);
+        try std.testing.expectEqualSlices(usize, c[2], keys);
+    }
+}
+
+/// The number of key pairs on each keyed join in the plan of `sql`, in plan
+/// order.
+fn joinKeyCounts(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]usize {
+    const helpers = @import("sql_helpers.zig");
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    const lines = try helpers.collectStrings(allocator, db, explain_sql);
+    defer helpers.freeStrings(allocator, lines);
+    var counts: std.ArrayList(usize) = .empty;
+    errdefer counts.deinit(allocator);
+    for (lines) |line| {
+        const text = line orelse continue;
+        const start = std.mem.indexOf(u8, text, "Join on=[") orelse continue;
+        const keys = text[start + "Join on=[".len ..];
+        const end = std.mem.indexOfScalar(u8, keys, ']') orelse return error.TestExpectedJoinKeys;
+        try counts.append(allocator, std.mem.count(u8, keys[0..end], ", ") + 1);
+    }
+    return counts.toOwnedSlice(allocator);
+}
