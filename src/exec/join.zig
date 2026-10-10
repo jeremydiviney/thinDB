@@ -856,6 +856,52 @@ inline fn prefetchSlot(slot_keys: []u64, heads: []u32, slot: usize) void {
     @prefetch(&slot_keys[slot], .{ .rw = .write, .locality = 3, .cache = .data });
 }
 
+/// Probe rows digested per window. The digests come first so the probe can
+/// prefetch the slot of a row `PROBE_PREFETCH_DIST` ahead while the current
+/// row walks the table: a table larger than the cache then misses on many
+/// rows at once instead of one row at a time.
+const PROBE_WINDOW: u32 = 512;
+const PROBE_PREFETCH_DIST: u32 = 16;
+
+inline fn prefetchProbeSlot(comptime kind: FastKeyKind, ft: *const FastTable, digest: u64) void {
+    const slot = homeSlot(kind, digest, ft.mask);
+    @prefetch(&ft.heads[slot], .{ .locality = 3, .cache = .data });
+    @prefetch(&ft.slot_keys[slot], .{ .locality = 3, .cache = .data });
+}
+
+/// Probe row `row`'s digest in the form `slot_keys` holds it: an int key's
+/// widened value, a string's wyhash, a compound key's combined digest.
+inline fn probeDigest(comptime kind: FastKeyKind, key_view: ColumnView, probe_views: []const ColumnView, row: u32) u64 {
+    return switch (kind) {
+        .int => fastIntKey(key_view, row),
+        .string => std.hash.Wyhash.hash(0, stringRowBytes(key_view, row)),
+        .compound, .null_safe => compoundDigestOf(kind, probe_views, row),
+    };
+}
+
+/// `probeDigest` of rows [start, start + out.len), a column at a time for a
+/// compound key so each column's type dispatches once. A row with a NULL key
+/// gets a value nobody reads: the probe rejects the row first.
+fn probeDigests(comptime kind: FastKeyKind, key_view: ColumnView, probe_views: []const ColumnView, start: u32, out: []u64) void {
+    if (kind != .compound) {
+        for (out, start..) |*d, row| d.* = probeDigest(kind, key_view, probe_views, @intCast(row));
+        return;
+    }
+    @memset(out, 0x9e3779b97f4a7c15);
+    for (probe_views) |v| switch (v.data) {
+        inline .int, .bigint, .date, .datetime, .tinyint, .smallint => |col| for (out, col[start..][0..out.len]) |*d, x| {
+            d.* = fastMix(d.* ^ @as(u64, @bitCast(@as(i64, x))));
+        },
+        .boolean => |col| for (out, col[start..][0..out.len]) |*d, x| {
+            d.* = fastMix(d.* ^ x);
+        },
+        .varchar, .string, .char, .json => |sv| for (out, start..) |*d, row| {
+            d.* = fastMix(d.* ^ std.hash.Wyhash.hash(0, sv.rowBytes(@intCast(row))));
+        },
+        else => unreachable,
+    };
+}
+
 const Place = enum { placed, chained, needs_chain, full };
 
 /// Probe from `home` (wrapping under `wrap_mask`) and insert `row`: into
@@ -2655,8 +2701,20 @@ pub const Join = struct {
         try probe_rows.ensureUnusedCapacity(alloc, n);
         try build_rows.ensureUnusedCapacity(alloc, n);
 
+        var digests: [PROBE_WINDOW]u64 = undefined;
+        var window_start: u32 = 0;
         var i: u32 = 0;
         while (i < n) : (i += 1) {
+            if (i == window_start) {
+                const window = digests[0..@min(PROBE_WINDOW, n - window_start)];
+                probeDigests(kind, key_view, probe_views, window_start, window);
+                for (window[0..@min(PROBE_PREFETCH_DIST, window.len)]) |d| prefetchProbeSlot(kind, ft, d);
+                window_start += @intCast(window.len);
+            }
+            const at = i % PROBE_WINDOW;
+            if (at + PROBE_PREFETCH_DIST < PROBE_WINDOW and i + PROBE_PREFETCH_DIST < window_start) {
+                prefetchProbeSlot(kind, ft, digests[at + PROBE_PREFETCH_DIST]);
+            }
             if (probeKeyRejected(kind, ft, key_view, probe_views, i)) {
                 if (preserved) try pushPair(alloc, probe_rows, build_rows, i, FAST_EMPTY);
                 continue;
@@ -2664,7 +2722,7 @@ pub const Join = struct {
             var found = false;
             switch (kind) {
                 .int => {
-                    const key = fastIntKey(key_view, i);
+                    const key = digests[at];
                     var slot = fastMix(key) & ft.mask;
                     while (true) {
                         const head = ft.heads[slot];
@@ -2689,7 +2747,7 @@ pub const Join = struct {
                 },
                 .string => {
                     const bytes = stringRowBytes(key_view, i);
-                    const key = std.hash.Wyhash.hash(0, bytes);
+                    const key = digests[at];
                     var slot = key & ft.mask;
                     while (true) {
                         const head = ft.heads[slot];
@@ -2716,7 +2774,7 @@ pub const Join = struct {
                     }
                 },
                 .compound, .null_safe => {
-                    const key = compoundDigestOf(kind, probe_views, i);
+                    const key = digests[at];
                     var slot = key & ft.mask;
                     while (true) {
                         const head = ft.heads[slot];
@@ -2889,14 +2947,13 @@ pub const Join = struct {
     /// the compound kind.
     fn fastLookupFirst(ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32) u32 {
         return switch (ft.kind) {
-            inline else => |kind| fastLookupFirstOf(kind, ft, key_view, probe_views, i),
+            inline else => |kind| fastLookupFirstOf(kind, ft, key_view, probe_views, i, probeDigest(kind, key_view, probe_views, i)),
         };
     }
 
-    fn fastLookupFirstOf(comptime kind: FastKeyKind, ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32) u32 {
+    fn fastLookupFirstOf(comptime kind: FastKeyKind, ft: *const FastTable, key_view: ColumnView, probe_views: []const ColumnView, i: u32, key: u64) u32 {
         switch (kind) {
             .int => {
-                const key = fastIntKey(key_view, i);
                 var slot = fastMix(key) & ft.mask;
                 while (true) {
                     if (ft.heads[slot] == FAST_EMPTY) return FAST_EMPTY;
@@ -2906,7 +2963,6 @@ pub const Join = struct {
             },
             .string => {
                 const bytes = stringRowBytes(key_view, i);
-                const key = std.hash.Wyhash.hash(0, bytes);
                 var slot = key & ft.mask;
                 while (true) {
                     const head = ft.heads[slot];
@@ -2925,7 +2981,6 @@ pub const Join = struct {
                 }
             },
             .compound, .null_safe => {
-                const key = compoundDigestOf(kind, probe_views, i);
                 var slot = key & ft.mask;
                 while (true) {
                     const head = ft.heads[slot];
@@ -2993,9 +3048,21 @@ pub const Join = struct {
         const key_view = batch.values[probe_key_indices[0]];
         var pkv_buf: [MAX_FAST_KEYS]ColumnView = undefined;
         const probe_views = if (comptime keyViewsPerKey(kind)) self.probeKeyViews(batch, &pkv_buf) else &.{};
+        var digests: [PROBE_WINDOW]u64 = undefined;
+        var window_start: u32 = 0;
         var i: u32 = 0;
         while (i < batch.row_count) : (i += 1) {
-            var m: u32 = if (probeKeyRejected(kind, ft, key_view, probe_views, i)) FAST_EMPTY else fastLookupFirstOf(kind, ft, key_view, probe_views, i);
+            if (i == window_start) {
+                const window = digests[0..@min(PROBE_WINDOW, batch.row_count - window_start)];
+                probeDigests(kind, key_view, probe_views, window_start, window);
+                for (window[0..@min(PROBE_PREFETCH_DIST, window.len)]) |d| prefetchProbeSlot(kind, ft, d);
+                window_start += @intCast(window.len);
+            }
+            const at = i % PROBE_WINDOW;
+            if (at + PROBE_PREFETCH_DIST < PROBE_WINDOW and i + PROBE_PREFETCH_DIST < window_start) {
+                prefetchProbeSlot(kind, ft, digests[at + PROBE_PREFETCH_DIST]);
+            }
+            var m: u32 = if (probeKeyRejected(kind, ft, key_view, probe_views, i)) FAST_EMPTY else fastLookupFirstOf(kind, ft, key_view, probe_views, i, digests[at]);
             if (m != FAST_EMPTY and self.ranges.len > 0 and !self.passesAllRanges(batch, i, m)) m = FAST_EMPTY;
             out_rows.appendAssumeCapacity(m);
         }
