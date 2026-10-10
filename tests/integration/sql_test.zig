@@ -4219,6 +4219,64 @@ test "sql: FULL join whose build side is a shared CTE stage drains unmatched bui
 // At DOP > 1 the CTE is read by a parallel buffer scan and the key cast
 // above it is self-pushed into that scan's workers (a terminal chain); the
 // shared build still sees through it to the stage columns.
+// A WHERE comparing both sides of a join runs in the probe workers once the
+// join fuses there, and the GROUP BY above then aggregates in the workers.
+test "sql: cross-side WHERE over a fused join feeds a grouped aggregate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4, .row_group_size = 64 });
+    defer db.close();
+    const fl = try db.table("fl", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "g", .type = .int }, .{ .name = "lv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const fr = try db.table("fr", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "rv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    var lrows: [4000]struct { id: i64, g: i32, lv: i32 } = undefined;
+    for (&lrows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .g = @intCast(i % 7), .lv = @intCast(i % 41) };
+    try fl.insert(&lrows);
+    try fl.flush();
+    var rrows: [1200]struct { id: i64, rv: i32 } = undefined;
+    for (&rrows, 0..) |*r, i| r.* = .{ .id = @intCast(i * 3), .rv = @intCast((i * 13) % 53) };
+    try fr.insert(&rrows);
+    try fr.flush();
+
+    var want_n = [_]i64{0} ** 7;
+    var want_s = [_]i64{0} ** 7;
+    for (rrows) |r| {
+        if (r.id >= lrows.len) continue;
+        const l = lrows[@intCast(r.id)];
+        if (l.lv >= r.rv) continue;
+        want_n[@intCast(l.g)] += 1;
+        want_s[@intCast(l.g)] += l.lv;
+    }
+
+    var q = try runSql(allocator, db,
+        \\SELECT fl.g, COUNT(*) AS n, SUM(fl.lv) AS s
+        \\FROM fl JOIN fr ON fr.id = fl.id
+        \\WHERE fl.lv < fr.rv
+        \\GROUP BY fl.g ORDER BY fl.g
+    );
+    defer q.deinit();
+    var got_n = [_]i64{0} ** 7;
+    var got_s = [_]i64{0} ** 7;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |i| {
+            const g: usize = @intCast(b.values[0].data.int[i]);
+            got_n[g] = b.values[1].data.bigint[i];
+            got_s[g] = b.values[2].data.bigint[i];
+        }
+    }
+    try std.testing.expectEqualSlices(i64, &want_n, &got_n);
+    try std.testing.expectEqualSlices(i64, &want_s, &got_s);
+}
+
 test "sql: shared CTE stage build sees through a self-pushed key cast at DOP > 1" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

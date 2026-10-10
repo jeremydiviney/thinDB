@@ -4303,6 +4303,121 @@ test "SetUnion rechain: a second join above the union extends the fused pipeline
     }
 }
 
+test "filter over a fused join runs as the probe chain's last link" {
+    // A cross-side filter above a probe-fused join joins the chain in the
+    // workers as a terminal link; a join stacked above then adopts that
+    // link. Both must match the all-serial reference multiset.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Filter = @import("filter.zig").Filter;
+    const Join = @import("join.zig").Join;
+
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 64,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const l = try db.table("fl", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "lv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const r = try db.table("fr", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "rv", .type = .int } },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+    const r2 = try db.table("fr2", .{
+        .columns = &.{ .{ .name = "rv", .type = .int }, .{ .name = "sv", .type = .int } },
+        .order_key = &.{"rv"},
+        .unique = true,
+    }, .{ .order_key = &.{"rv"}, .unique = true, .row_group_size = 64 });
+
+    var lrows: [900]struct { id: i64, lv: i32 } = undefined;
+    for (&lrows, 0..) |*row, i| row.* = .{ .id = @intCast(i), .lv = @intCast(i % 50) };
+    try l.insert(&lrows);
+    try l.flush();
+    var rrows: [400]struct { id: i64, rv: i32 } = undefined;
+    for (&rrows, 0..) |*row, i| row.* = .{ .id = @intCast(i * 2), .rv = @intCast((i * 7) % 97) };
+    try r.insert(&rrows);
+    try r.flush();
+    var r2rows: [33]struct { rv: i32, sv: i32 } = undefined;
+    for (&r2rows, 0..) |*row, i| row.* = .{ .rv = @intCast(i * 3), .sv = @intCast(i * 100) };
+    try r2.insert(&r2rows);
+    try r2.flush();
+
+    const on_id = @import("join.zig").Spec{ .on = &.{.{ .left = "id", .right = "id" }}, .join_type = .inner, .algorithm = .auto };
+    const on_rv = @import("join.zig").Spec{ .on = &.{.{ .left = "rv", .right = "rv" }}, .join_type = .left, .algorithm = .auto };
+    const cross_side: PredicateExpr = .{ .leaf_col_col = .{ .left = "lv", .op = .lt, .right = "rv" } };
+
+    const collect = struct {
+        fn run(a: std.mem.Allocator, q: *Query, out: *std.ArrayList(i64)) !void {
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |i| {
+                    var acc: i64 = 0;
+                    for (batch.values) |col| {
+                        const v: i64 = if (!col.isValid(@intCast(i))) -1 else switch (col.data) {
+                            .bigint => |s| s[i],
+                            .int => |s| s[i],
+                            else => 0,
+                        };
+                        acc = acc *% 1099511628211 +% v;
+                    }
+                    try out.append(a, acc);
+                }
+            }
+            std.sort.pdq(i64, out.items, {}, std.sort.asc(i64));
+        }
+    }.run;
+
+    var ref: std.ArrayList(i64) = .empty;
+    defer ref.deinit(allocator);
+    {
+        const j = try (try scan(allocator, l)).join(try scan(allocator, r), on_id);
+        var q = try j.filter(cross_side);
+        defer q.deinit();
+        try collect(allocator, &q, &ref);
+    }
+    {
+        const j = try (try exec.ParallelScan.create(allocator, l, null, null, 4)).join(try scan(allocator, r), on_id);
+        try std.testing.expect(exec.queryAs(Join, j).?.probe_fused);
+        var q = try j.filter(cross_side);
+        defer q.deinit();
+        const chain = exec.queryAs(Filter, q).?.chain orelse return error.TestExpectedChain;
+        try std.testing.expect(chain.inner == null);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect(allocator, &q, &got);
+        try std.testing.expect(got.items.len > 0 and got.items.len < 400);
+        try std.testing.expectEqualSlices(i64, ref.items, got.items);
+    }
+
+    var ref_upper: std.ArrayList(i64) = .empty;
+    defer ref_upper.deinit(allocator);
+    {
+        const j = try (try scan(allocator, l)).join(try scan(allocator, r), on_id);
+        var q = try (try j.filter(cross_side)).join(try scan(allocator, r2), on_rv);
+        defer q.deinit();
+        try collect(allocator, &q, &ref_upper);
+    }
+    {
+        const j = try (try exec.ParallelScan.create(allocator, l, null, null, 4)).join(try scan(allocator, r), on_id);
+        const filtered = try j.filter(cross_side);
+        var q = try filtered.join(try scan(allocator, r2), on_rv);
+        defer q.deinit();
+        try std.testing.expect(exec.queryAs(Join, q).?.probe_fused);
+        const chain = exec.queryAs(Filter, filtered).?.chain orelse return error.TestExpectedChain;
+        try std.testing.expect(chain.inner != null);
+        var got: std.ArrayList(i64) = .empty;
+        defer got.deinit(allocator);
+        try collect(allocator, &q, &got);
+        try std.testing.expectEqualSlices(i64, ref_upper.items, got.items);
+    }
+}
+
 test "join: empty fused stage filter skips every lookup in a join chain" {
     const allocator = std.testing.allocator;
     const ex = exec;
