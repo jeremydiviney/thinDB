@@ -622,7 +622,7 @@ fn prepareExecution(allocator: Allocator, table: *api.Table, snapshot: Scan.Snap
 
 fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const t0 = exec.prof.nowTicks();
-    const core_allocator = try exec.memory.trackedBackend(std.heap.page_allocator, exec.memory.accountantOf(ctx.allocator));
+    const core_allocator = try exec.memory.workerAllocator(exec.memory.accountantOf(ctx.allocator), std.heap.page_allocator);
     const params = GroupTopNEngine.paramsFromEnv(ctx.dop);
     ctx.bucket_count = params.bucket_count;
     ctx.chunk_rows = params.raw_chunk_rows;
