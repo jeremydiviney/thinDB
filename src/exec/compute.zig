@@ -320,15 +320,22 @@ const ChainForward = struct {
     /// the derived batch directly. A later upper join UPGRADES a terminal
     /// push by rechaining its sink through this Compute (tryFuseProbe).
     inner: ?exec.ProbeSink,
-    /// Upstream schema snapshotted at offer time — the scan re-types its
-    /// out_schema on accept, so it can't be re-read at bind time.
-    in_schema: []const Column,
-    per_chunk: []Query = &.{},
-    stubs: []*SchemaStub = &.{},
+    /// The upstream every clone is built on: the schema snapshotted at offer
+    /// time (the scan re-types its out_schema on accept, so it can't be
+    /// re-read at bind time). Schema-only, so the chunks share it.
+    upstream: SchemaStub,
+    /// One clone per chunk, built by the worker that processes the chunk's
+    /// first batch. A bind sizes for every chunk the scan plans (DOP × 4),
+    /// and building them all at compile cost a serial ~45 µs each — most of
+    /// a small query's wall at a high DOP — including chunks that pruning
+    /// leaves empty. A chunk is processed by one worker at a time and a
+    /// scan's rounds and drains are barriers, so the slot needs no lock.
+    per_chunk: []?Query = &.{},
     /// Per-chunk remap scratch when the inner sink carries a probe_map (a
     /// Project narrowed this Compute's output before the join compiled
     /// against it): the derived batch remaps into these views post-eval.
     map_views: [][]ColumnView = &.{},
+    /// The scan's worker allocator, which is thread-safe.
     bind_alloc: Allocator = undefined,
 
     fn bindHook(ctx: *anyopaque, n_chunks: usize, alloc: Allocator) anyerror!void {
@@ -340,41 +347,11 @@ const ChainForward = struct {
             if (cf.inner) |inner| try inner.bind(inner.ctx, n_chunks, alloc);
             return;
         }
-        if (cf.per_chunk.len > 0) {
-            for (cf.per_chunk, cf.stubs) |*q, st| {
-                q.deinit();
-                cf.bind_alloc.destroy(st);
-            }
-            cf.bind_alloc.free(cf.per_chunk);
-            cf.bind_alloc.free(cf.stubs);
-            cf.per_chunk = &.{};
-            cf.stubs = &.{};
-            for (cf.map_views) |v| cf.bind_alloc.free(v);
-            if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
-            cf.map_views = &.{};
-        }
+        cf.freeClones();
         cf.bind_alloc = alloc;
-        const t_bind = exec.prof.nowTicks();
-        defer exec.prof.addPhase("compute.chain.bind_clones", @intCast(exec.prof.nowTicks() - t_bind));
-        const qs = try alloc.alloc(Query, n_chunks);
-        errdefer alloc.free(qs);
-        const stubs = try alloc.alloc(*SchemaStub, n_chunks);
-        errdefer alloc.free(stubs);
-        var built: usize = 0;
-        errdefer for (qs[0..built], stubs[0..built]) |*q, st| {
-            q.deinit();
-            alloc.destroy(st);
-        };
-        for (qs, stubs) |*q, *st| {
-            const stub = try alloc.create(SchemaStub);
-            errdefer alloc.destroy(stub);
-            stub.* = .{ .schema = cf.in_schema };
-            q.* = try Compute.createWithRegistry(alloc, makeQuery(alloc, stub), cf.src.derived_ir, cf.src.udf_registry);
-            st.* = stub;
-            built += 1;
-        }
+        const qs = try alloc.alloc(?Query, n_chunks);
+        @memset(qs, null);
         cf.per_chunk = qs;
-        cf.stubs = stubs;
         if (if (cf.inner) |inner| inner.probe_map else null) |m| {
             const mv = try alloc.alloc([]ColumnView, n_chunks);
             var mbuilt: usize = 0;
@@ -393,7 +370,9 @@ const ChainForward = struct {
 
     fn processHook(ctx: *anyopaque, chunk: usize, batch: Batch) anyerror!?Batch {
         const cf: *ChainForward = @ptrCast(@alignCast(ctx));
-        const c = exec.queryAs(Compute, cf.per_chunk[chunk]).?;
+        const slot = &cf.per_chunk[chunk];
+        if (slot.* == null) slot.* = try Compute.createWithRegistry(cf.bind_alloc, makeQuery(cf.bind_alloc, &cf.upstream), cf.src.derived_ir, cf.src.udf_registry);
+        const c = exec.queryAs(Compute, slot.*.?).?;
         var out = try c.evalBatch(batch);
         const inner = cf.inner orelse return out;
         if (inner.probe_map) |m| {
@@ -404,19 +383,19 @@ const ChainForward = struct {
         return try inner.process(inner.ctx, chunk, out);
     }
 
+    fn freeClones(cf: *ChainForward) void {
+        for (cf.per_chunk) |*slot| if (slot.*) |*q| q.deinit();
+        if (cf.per_chunk.len > 0) cf.bind_alloc.free(cf.per_chunk);
+        for (cf.map_views) |v| cf.bind_alloc.free(v);
+        if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+        cf.per_chunk = &.{};
+        cf.map_views = &.{};
+    }
+
     fn deinitAll(cf: *ChainForward, owner_alloc: Allocator) void {
         const t_free = exec.prof.nowTicks();
         defer exec.prof.addPhase("compute.chain.deinit_clones", @intCast(exec.prof.nowTicks() - t_free));
-        for (cf.per_chunk, cf.stubs) |*q, st| {
-            q.deinit();
-            cf.bind_alloc.destroy(st);
-        }
-        if (cf.per_chunk.len > 0) {
-            cf.bind_alloc.free(cf.per_chunk);
-            cf.bind_alloc.free(cf.stubs);
-        }
-        for (cf.map_views) |v| cf.bind_alloc.free(v);
-        if (cf.map_views.len > 0) cf.bind_alloc.free(cf.map_views);
+        cf.freeClones();
         owner_alloc.destroy(cf);
     }
 };
@@ -870,7 +849,7 @@ pub const Compute = struct {
         chain.* = .{
             .src = self,
             .inner = sink,
-            .in_schema = self.upstream.outputSchema(),
+            .upstream = .{ .schema = self.upstream.outputSchema() },
         };
         // An error can follow a partial accept (a union arm bound the chain
         // before its sibling failed), which no decline undoes: it fails the
@@ -948,7 +927,7 @@ pub const Compute = struct {
         chain.* = .{
             .src = self,
             .inner = null,
-            .in_schema = self.upstream.outputSchema(),
+            .upstream = .{ .schema = self.upstream.outputSchema() },
         };
         errdefer chain.deinitAll(self.allocator);
         const ok = try self.upstream.tryFuseProbe(.{
