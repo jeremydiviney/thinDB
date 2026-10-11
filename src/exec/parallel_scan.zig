@@ -1366,7 +1366,7 @@ pub const ParallelScan = struct {
     /// deletes only take rows away. Slot `k` is null when `cols[k]` is,
     /// when its column holds more than `cap` distinct values, or when a value
     /// has no ordered form; the result is null when no slot survives. Values
-    /// live in `out`, sorted.
+    /// live in `out`; numeric ones sorted.
     pub fn collectKeySets(self: *ParallelScan, out: Allocator, cols: []const ?[]const u8, cap: usize) !?[]?[]const types.Value {
         const table = self.table orelse return null;
         if (self.mode != .unset or self.workers.len == 0 or cols.len > MAX_KEY_SETS) return null;
@@ -1409,9 +1409,7 @@ pub const ParallelScan = struct {
             built += 1;
             pass.setRange(worker.range_start_seg, worker.range_start_rg, worker.range_end_seg, worker.range_end_rg, worker.scan_memtable);
             try pass.copyPrunesFrom(worker);
-            if (worker.fused_filter) |expr| {
-                if (!try pass.tryFuseFilter(expr)) return null;
-            }
+            if (!try pass.adoptFusedFilter(worker)) return null;
         }
         const pass_schema = passes[0].outputSchema();
         for (slot_col[0..cols.len]) |*c| {
@@ -1444,7 +1442,7 @@ pub const ParallelScan = struct {
         for (result, 0..) |*slot, k| {
             slot.* = null;
             if (collect.dead[k].load(.monotonic)) continue;
-            slot.* = try mergeKeySets(out, self.allocator, states, k, cap) orelse continue;
+            slot.* = try mergeKeySets(out, states, k, cap) orelse continue;
             any = true;
         }
         return if (any) result else null;
@@ -2690,26 +2688,42 @@ fn keyCellValue(view: ColumnView, row: usize) ?types.Value {
 }
 
 /// Slot `k`'s distinct values across every thread's `State`, copied into
-/// `out` and sorted, or null past `cap`.
-fn mergeKeySets(out: Allocator, scratch: Allocator, states: []KeyCollect.State, k: usize, cap: usize) !?[]const types.Value {
-    var merged: std.StringHashMapUnmanaged(void) = .empty;
-    defer merged.deinit(scratch);
-    var values: std.ArrayListUnmanaged(types.Value) = .empty;
-    defer values.deinit(scratch);
+/// `out`, or null past `cap`. Numeric values come sorted (an IN list's
+/// numeric evaluator sorts its copy, fast when already in order); text needs
+/// no order.
+fn mergeKeySets(out: Allocator, states: []KeyCollect.State, k: usize, cap: usize) !?[]const types.Value {
+    // The largest thread's set takes in the others': threads mostly see the
+    // same keys. Every thread's keys and values stay in its arena until the
+    // pass ends.
+    var base = &states[0];
+    for (states[1..]) |*st| {
+        if (st.seen[k].count() > base.seen[k].count()) base = st;
+    }
+    const merged = &base.seen[k];
     for (states) |*st| {
+        if (st == base) continue;
         var it = st.seen[k].iterator();
         while (it.next()) |e| {
-            if ((try merged.getOrPut(scratch, e.key_ptr.*)).found_existing) continue;
+            const gop = try merged.getOrPut(base.arena.allocator(), e.key_ptr.*);
+            if (gop.found_existing) continue;
+            gop.value_ptr.* = e.value_ptr.*;
             if (merged.count() > cap) return null;
-            try values.append(scratch, e.value_ptr.*);
         }
     }
-    const owned = try out.alloc(types.Value, values.items.len);
-    for (values.items, owned) |v, *o| o.* = switch (v) {
-        .text => |t| .{ .text = try out.dupe(u8, t) },
-        else => v,
-    };
-    std.sort.pdq(types.Value, owned, {}, valueLess);
+    const owned = try out.alloc(types.Value, merged.count());
+    var it = merged.valueIterator();
+    var text = false;
+    for (owned) |*o| {
+        const v = it.next().?.*;
+        o.* = switch (v) {
+            .text => |t| blk: {
+                text = true;
+                break :blk .{ .text = try out.dupe(u8, t) };
+            },
+            else => v,
+        };
+    }
+    if (!text) std.sort.pdq(types.Value, owned, {}, valueLess);
     return owned;
 }
 
