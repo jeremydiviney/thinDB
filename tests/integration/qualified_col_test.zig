@@ -635,3 +635,23 @@ test "SELECT * skips the hidden ORDER BY keys and WHERE operands beside a comput
     };
     inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
 }
+
+test "a CTE grouped over an aliased CTE names its columns bare (issue #582)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try setupShadowed(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const with = "WITH src AS (SELECT n, m FROM dn), b AS (SELECT n, SUM(m) AS s FROM src x GROUP BY n) ";
+    const cases = .{
+        .{ with ++ "SELECT b.n, b.s FROM b ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+        .{ with ++ "SELECT * FROM b ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+        .{ with ++ "SELECT dk.n, b.s FROM dk JOIN b ON dk.k = b.n ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 50, 7, 60, 8, 70, 9 } },
+        .{ "WITH src AS (SELECT n, m FROM dn), b AS (SELECT x.n, SUM(x.m) AS s FROM src x GROUP BY x.n) SELECT b.n, b.s FROM b ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+        .{ "WITH src AS (SELECT n, m FROM dn) SELECT b.n, b.s FROM (SELECT n, SUM(m) AS s FROM src x GROUP BY n) b ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+        .{ "SELECT n, SUM(m) AS s FROM (SELECT n, m FROM dn) x GROUP BY n ORDER BY 1", &[_][]const u8{ "n", "s" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+        .{ "WITH src AS (SELECT n, m FROM dn), b AS (SELECT n, m FROM src x GROUP BY n, m) SELECT b.n, b.m FROM b ORDER BY 1", &[_][]const u8{ "n", "m" }, &[_]?i64{ 5, 7, 6, 8, 7, 9 } },
+    };
+    inline for (cases) |case| try expectNamedCells(allocator, db, case[0], case[1], case[2]);
+}
