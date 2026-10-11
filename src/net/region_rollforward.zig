@@ -5210,7 +5210,13 @@ fn buildScanSources(
     }
     seg_start[snap.segment_count] = total_rgs;
 
-    const first = try openChunkScan(input, table, snap, scan_cols, prune_leaves, filter);
+    // Every chunk scan reads the same snapshot: merge its column stats once
+    // for all of them. The scans borrow them only while they are built.
+    var chunk_snap = snap;
+    if (total_rgs > 1) chunk_snap.column_stats = try Scan.snapshotColumnStats(qa, table, snap);
+    defer if (chunk_snap.column_stats.len > 0) qa.free(chunk_snap.column_stats);
+
+    const first = try openChunkScan(input, table, chunk_snap, scan_cols, prune_leaves, filter);
     var first_owned = true;
     errdefer if (first_owned) {
         var q = first.query;
@@ -5241,7 +5247,7 @@ fn buildScanSources(
     for (0..n_chunks) |i| {
         const lo = i * total_rgs / n_chunks;
         const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
-        const chunk = if (i == 0) first else try openChunkScan(input, table, snap, scan_cols, prune_leaves, filter);
+        const chunk = if (i == 0) first else try openChunkScan(input, table, chunk_snap, scan_cols, prune_leaves, filter);
         sources[i] = chunk.query;
         scans[i] = chunk.scan;
         built += 1;
@@ -5251,6 +5257,7 @@ fn buildScanSources(
         chunk.scan.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
     }
     if (known_mask) |m| recutSourcesForPruning(scans, seg_start, snap.segment_count, m, surviving_rgs);
+    for (scans) |sc| sc.releaseSnapshotStats();
     snap.release(table);
     pin_held = false;
     return .{ .sources = sources, .total_rows = total_rows, .work_units = work_units };
@@ -5443,6 +5450,9 @@ fn buildOrderedSources(
             iv_rows[iv] += r.rows;
         }
     }
+    var interval_snap = snap;
+    if (n_src > 1) interval_snap.column_stats = try Scan.snapshotColumnStats(qa, table, snap);
+    defer if (interval_snap.column_stats.len > 0) qa.free(interval_snap.column_stats);
     const sources = try qa.alloc(exec.Query, n_src);
     var built: usize = 0;
     errdefer {
@@ -5450,7 +5460,7 @@ fn buildOrderedSources(
         qa.free(sources);
     }
     for (0..n_src) |i| {
-        const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
+        const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, interval_snap) catch return NoMatch;
         sources[i] = exec.makeQuery(qa, s);
         built += 1;
         if (i == 0) {
@@ -5483,6 +5493,7 @@ fn buildOrderedSources(
         } else .{ .@"and" = try conj.toOwnedSlice(qa) };
         const fused = s.tryFuseFilter(fexpr) catch return NoMatch;
         if (!fused) return NoMatch;
+        s.releaseSnapshotStats();
     }
     snap.release(table);
     pin_held = false;

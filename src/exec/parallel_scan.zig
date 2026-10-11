@@ -687,6 +687,10 @@ pub const ParallelScan = struct {
     /// materialize mode `n_threads` worker threads steal these via `next_chunk`;
     /// in round mode it's one batch per chunk per fork-join round.
     workers: []Leaf,
+    /// The snapshot's column stats the chunk scans borrow
+    /// (`Scan.Snapshot.column_stats`); freed after them. Empty when the
+    /// scan has one chunk.
+    column_stats: []const exec.ColStat = &.{},
     /// Worker thread count (the effective DOP). ≤ `workers.len`; in materialize
     /// mode `n_threads` threads steal `workers.len` chunks.
     n_threads: usize,
@@ -869,6 +873,13 @@ pub const ParallelScan = struct {
         const n_threads = @max(@as(usize, 1), @min(dop, @max(total_rgs, 1)));
         const n_chunks = @max(n_threads, @min(dop * CHUNK_FACTOR, @max(total_rgs, 1)));
 
+        // Every chunk scan reads the same snapshot: merge its column stats
+        // once for all of them rather than once per chunk.
+        const column_stats: []exec.ColStat = if (n_chunks > 1) try Scan.snapshotColumnStats(allocator, table, snap) else &.{};
+        errdefer if (column_stats.len > 0) allocator.free(column_stats);
+        var chunk_snap = snap;
+        chunk_snap.column_stats = column_stats;
+
         // Mint or adopt the single accountant exposed to the downstream serial
         // tail. Workers get it as `injected` (they never touch it, so sharing is
         // race-free) so they don't each mint their own.
@@ -918,7 +929,7 @@ pub const ParallelScan = struct {
             const hi = if (bounds) |b| b[i + 1] else (if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks);
             const start = flatToCoord(lo, seg_start, snap.segment_count, total_rgs);
             const end = flatToCoord(hi, seg_start, snap.segment_count, total_rgs);
-            const w = try Scan.allocWithProjectionLoc(wa, table, acct, needed, false, snap);
+            const w = try Scan.allocWithProjectionLoc(wa, table, acct, needed, false, chunk_snap);
             workers[i] = .{ .segment = w };
             built += 1;
             // The last chunk also drains the memtable (ordered last).
@@ -952,6 +963,7 @@ pub const ParallelScan = struct {
             .worker_alloc = wa,
             .stage = null,
             .workers = workers,
+            .column_stats = column_stats,
             .n_threads = n_threads,
             .next_chunk = std.atomic.Value(usize).init(0),
             .acct = acct,
@@ -1261,6 +1273,7 @@ pub const ParallelScan = struct {
         const owned = @min(self.agg_built + self.compute_built, self.workers.len);
         for (self.workers[owned..]) |w| w.deinit();
         self.allocator.free(self.workers);
+        if (self.column_stats.len > 0) self.allocator.free(self.column_stats);
         self.allocator.free(self.round);
         self.allocator.free(self.werr);
         self.allocator.free(self.threads);
@@ -1405,6 +1418,7 @@ pub const ParallelScan = struct {
                 .memtable_row_count = worker.memtable_row_count,
                 .segments = worker.segs,
                 .tomb_epoch = worker.tomb_epoch,
+                .column_stats = worker.schema_stats,
             });
             passes[built] = pass;
             built += 1;

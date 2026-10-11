@@ -471,6 +471,9 @@ pub const Scan = struct {
     /// memtable rows). Computed once at create; borrowed by `stats()`. One
     /// slot per projected column.
     cached_stats: []exec.ColStat = &.{},
+    /// Every table column's stats over the snapshot, borrowed from
+    /// `Snapshot.column_stats`; empty when the snapshot carries none.
+    schema_stats: []const exec.ColStat = &.{},
     /// `exec.snapshotId` of the segment set and memtable this scan reads.
     snapshot_id: u64 = 0,
     /// What this scan reads once prune hints skip segments or row groups
@@ -684,6 +687,11 @@ pub const Scan = struct {
         /// from a worker Scan leaves them 0.
         tomb_generation: u64 = 0,
         memtable_gen: u64 = 0,
+        /// Every table column's stats over this snapshot
+        /// (`snapshotColumnStats`), when the capturer merged them once for
+        /// the scans it builds from it; empty otherwise. Borrowed: the
+        /// capturer keeps them alive as long as those scans.
+        column_stats: []const exec.ColStat = &.{},
 
         /// Drop the memtable and tombstone pins (not `segments`).
         pub fn release(self: Snapshot, table: *Table) void {
@@ -767,6 +775,22 @@ pub const Scan = struct {
         table.mutex.lockUncancelable(table.io);
         defer table.mutex.unlock(table.io);
         return captureLocked(table, allocator);
+    }
+
+    /// Every column of `table` summarized over `snap`: what each scan
+    /// built from `snap` would otherwise merge for itself, for
+    /// `Snapshot.column_stats`.
+    pub fn snapshotColumnStats(allocator: Allocator, table: *const Table, snap: Snapshot) ![]exec.ColStat {
+        const all_phys = try allocator.alloc(usize, table.schema.columns.len);
+        defer allocator.free(all_phys);
+        for (all_phys, 0..) |*p, i| p.* = i;
+        return computeColumnStats(allocator, table.schema.columns, snap.segments, all_phys, snap.memtable_row_count);
+    }
+
+    /// Stop borrowing `Snapshot.column_stats`, for a builder that frees
+    /// them once its scans are built. Later fusions merge their own.
+    pub fn releaseSnapshotStats(self: *Scan) void {
+        self.schema_stats = &.{};
     }
 
     fn captureLocked(table: *Table, allocator: ?Allocator) !Snapshot {
@@ -905,7 +929,12 @@ pub const Scan = struct {
             if (owned_accountant) |a| a.releaseOwner(allocator);
         };
 
-        const cached_stats = try computeColumnStats(
+        const schema_stats: []const exec.ColStat = if (snap.column_stats.len == table.schema.columns.len) snap.column_stats else &.{};
+        const cached_stats = if (schema_stats.len > 0) blk: {
+            const picked = try allocator.alloc(exec.ColStat, out_phys.len);
+            for (picked, out_phys) |*p, ci| p.* = schema_stats[ci];
+            break :blk picked;
+        } else try computeColumnStats(
             allocator,
             table.schema.columns,
             segs,
@@ -939,6 +968,7 @@ pub const Scan = struct {
             .owned_accountant = owned_accountant,
             .owns_accountant = owns_accountant,
             .cached_stats = cached_stats,
+            .schema_stats = schema_stats,
             .snapshot_id = snapshot_id,
         };
 
@@ -1392,6 +1422,10 @@ pub const Scan = struct {
     fn orderFusedConjuncts(self: *Scan) !void {
         const expr = self.fused_filter orelse return;
         const schema = self.table.schema.columns;
+        if (self.schema_stats.len == schema.len) {
+            self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, self.schema_stats);
+            return;
+        }
         const all_phys = try self.allocator.alloc(usize, schema.len);
         defer self.allocator.free(all_phys);
         for (all_phys, 0..) |*p, i| p.* = i;

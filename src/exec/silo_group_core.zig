@@ -6702,7 +6702,12 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             });
         }
     }
-    const snap = cfg.snapshot;
+    // The stats scan and every worker scan read this snapshot: merge its
+    // column stats once for all of them.
+    var snap = cfg.snapshot;
+    const column_stats: []thindb.exec.ColStat = if (snap.column_stats.len == 0) try Scan.snapshotColumnStats(allocator, table, snap) else &.{};
+    defer if (column_stats.len > 0) allocator.free(column_stats);
+    if (column_stats.len > 0) snap.column_stats = column_stats;
     const total = totalRows(snap);
     const dop = @max(@as(usize, 1), cfg.dop);
 
