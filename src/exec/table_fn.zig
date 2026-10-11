@@ -67,6 +67,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
+const bcache = @import("broadcast_cache.zig");
 
 /// Test hook: std.testing.allocator is single-threaded, so tests run the
 /// serial path unless they opt in with a thread-safe allocator of their own.
@@ -149,6 +150,16 @@ pub const TableFnExec = struct {
     /// asserted (`ordered_output`). Downstream same-key windows / TVFs
     /// ride it instead of re-sorting. Slices are node-arena owned.
     advertised_keys: ?ir.WindowSpec = null,
+    /// Cross-statement broadcast cache (installed by the staged compiler
+    /// when every broadcast input has a stable identity and none is
+    /// borrowed): `broadcast_key` names this call's broadcast inputs, and
+    /// `broadcast_hit` is the entry already holding them, held from compile
+    /// until execution ends. A hit skips the broadcast drains; either way
+    /// the workers' states are leased from the cache.
+    broadcast_cache: ?*bcache.Cache = null,
+    broadcast_key: u64 = 0,
+    broadcast_hit: ?*bcache.Entry = null,
+    leased_states: std.ArrayList(*bcache.WorkerState) = .empty,
 
     pub fn create(
         allocator: Allocator,
@@ -355,6 +366,8 @@ pub const TableFnExec = struct {
         for (self.multi_borrow_srcs) |maybe| {
             if (maybe) |src| src.releaseUse();
         }
+        self.dropBroadcastLease();
+        self.leased_states.deinit(self.allocator);
         for (self.call_args) |a| {
             if (a) |v| switch (v) {
                 .text => |t| self.allocator.free(t),
@@ -924,7 +937,9 @@ pub const TableFnExec = struct {
         if (trace) std.debug.print("[tvf] multi {s}: {d} inputs\n", .{ self.entry.name, n_in });
 
         const Drained = struct {
+            /// Owned by `store_alloc`; empty for an input the cache holds.
             cols: []ColumnStore,
+            store_alloc: Allocator,
             views: []ColumnView,
             perm: []u32,
             digests: []u128,
@@ -933,8 +948,8 @@ pub const TableFnExec = struct {
         var drained: usize = 0;
         defer {
             for (ins[0..drained]) |*d| {
-                for (d.cols) |*c| c.deinit(a);
-                a.free(d.cols);
+                for (d.cols) |*c| c.deinit(d.store_alloc);
+                d.store_alloc.free(d.cols);
                 a.free(d.views);
                 a.free(d.perm);
                 a.free(d.digests);
@@ -943,14 +958,32 @@ pub const TableFnExec = struct {
         }
         for (0..n_in) |i| {
             const decl = self.entry.input_schemas[i];
-            const cols = try a.alloc(ColumnStore, decl.len);
+            const cached = self.broadcastSlot(i);
+            if (cached) |k| if (self.broadcast_hit) |hit| {
+                const held = hit.inputs[k];
+                const views = try a.alloc(ColumnView, decl.len);
+                errdefer a.free(views);
+                for (held.cols, views) |c, *v| v.* = c.view();
+                const perm = try a.alloc(u32, held.rows);
+                errdefer a.free(perm);
+                for (perm, 0..) |*p, r| p.* = @intCast(r);
+                const digests = try a.alloc(u128, held.rows);
+                @memset(digests, 0);
+                ins[i] = .{ .cols = &.{}, .store_alloc = a, .views = views, .perm = perm, .digests = digests };
+                drained += 1;
+                if (trace) std.debug.print("[tvf]   input{d} cached {d} rows\n", .{ i, held.rows });
+                continue;
+            };
+            // A cached input drains into memory the cache can keep.
+            const store_alloc = if (cached != null) self.broadcast_cache.?.alloc else a;
+            const cols = try store_alloc.alloc(ColumnStore, decl.len);
             var inited: usize = 0;
             errdefer {
-                for (cols[0..inited]) |*c| c.deinit(a);
-                a.free(cols);
+                for (cols[0..inited]) |*c| c.deinit(store_alloc);
+                store_alloc.free(cols);
             }
             for (decl, cols) |col, *store| {
-                store.* = try ColumnStore.init(a, col.type, col.nullable);
+                store.* = try ColumnStore.init(store_alloc, col.type, col.nullable);
                 inited += 1;
             }
 
@@ -996,7 +1029,7 @@ pub const TableFnExec = struct {
                 defer if (converts) self.releaseConverted(i, conv_views);
                 for (self.input_maps[i], cols, 0..) |ui, *store, ci| {
                     if (borrowed[ci] != null) continue;
-                    try transform.appendAllColumn(a, batch.values[ui], store);
+                    try transform.appendAllColumn(store_alloc, batch.values[ui], store);
                 }
                 accumulated += batch.row_count;
             }
@@ -1044,7 +1077,7 @@ pub const TableFnExec = struct {
             if (trace) std.debug.print("[tvf]   input{d} sort ({s}): {d:.0}ms\n", .{
                 i, sort_path, prof.ticksToMs(prof.nowTicks() - t_sort),
             });
-            ins[i] = .{ .cols = cols, .views = views, .perm = perm, .digests = digests };
+            ins[i] = .{ .cols = cols, .store_alloc = store_alloc, .views = views, .perm = perm, .digests = digests };
             drained += 1;
         }
 
@@ -1179,7 +1212,7 @@ pub const TableFnExec = struct {
         }
         const t_kernel = if (trace) prof.nowTicks() else 0;
         if (n_workers <= 1) {
-            var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, self.output_cols);
+            var runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, self.output_cols, try self.leaseState());
             defer runner.deinit();
             for (groups.items) |g| _ = try runner.runOne(g);
             if (trace) std.debug.print("[tvf]   kernel (serial, {d} groups): {d:.0}ms\n", .{
@@ -1199,6 +1232,49 @@ pub const TableFnExec = struct {
         // per group (validated in runOne), so output rows align 1:1.
         const contiguous0 = self.key_idxs[0].len + self.order_idxs[0].len == 0;
         try self.gatherPassthrough(ins[0].views, ins[0].perm, contiguous0, if (allow_parallel) self.dop else 1);
+
+        const cache = self.broadcast_cache orelse return;
+        if (self.broadcast_hit) |hit| {
+            cache.release(hit, self.leased_states.items, true);
+            self.broadcast_hit = null;
+            self.leased_states.clearRetainingCapacity();
+            return;
+        }
+        const inputs = cache.alloc.alloc(bcache.Input, self.entry.broadcast_inputs.len) catch return;
+        for (self.entry.broadcast_inputs, inputs) |b, *input| {
+            input.* = .{ .cols = ins[b].cols, .rows = ins[b].perm.len };
+            ins[b].cols = &.{};
+        }
+        cache.publish(self.broadcast_key, inputs, self.leased_states.items);
+        self.leased_states.clearRetainingCapacity();
+    }
+
+    /// Position of input `i` among the broadcast inputs the cache serves.
+    fn broadcastSlot(self: *const TableFnExec, i: usize) ?usize {
+        if (self.broadcast_cache == null) return null;
+        for (self.entry.broadcast_inputs, 0..) |b, k| {
+            if (b == i) return k;
+        }
+        return null;
+    }
+
+    fn leaseState(self: *TableFnExec) !?*bcache.WorkerState {
+        const cache = self.broadcast_cache orelse return null;
+        try self.leased_states.ensureUnusedCapacity(self.allocator, 1);
+        const state = try cache.leaseState(self.broadcast_hit);
+        self.leased_states.appendAssumeCapacity(state);
+        return state;
+    }
+
+    /// An execution that never finished hands nothing to the cache: its
+    /// states may be half built.
+    fn dropBroadcastLease(self: *TableFnExec) void {
+        const cache = self.broadcast_cache orelse return;
+        if (self.broadcast_hit) |hit| {
+            cache.release(hit, self.leased_states.items, false);
+            self.broadcast_hit = null;
+        } else for (self.leased_states.items) |state| cache.destroyState(state);
+        self.leased_states.clearRetainingCapacity();
     }
 
     fn executeMultiParallel(
@@ -1271,7 +1347,7 @@ pub const TableFnExec = struct {
                 inited += 1;
             }
             w.* = .{
-                .runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, out_stores),
+                .runner = try MultiRunner.init(a, self, views_by_input, perms_by_input, kernel0_views, max_run0, out_stores, try self.leaseState()),
                 .out_stores = out_stores,
             };
             built += 1;
@@ -1335,6 +1411,9 @@ pub const TableFnExec = struct {
         /// once per worker and reuse them across every group it claims.
         worker_arena: std.heap.ArenaAllocator,
         worker_state: ?*anyopaque = null,
+        /// Takes the place of the two above when the broadcast cache keeps
+        /// worker states across statements; owned by the operator.
+        leased: ?*bcache.WorkerState,
 
         fn init(
             allocator: Allocator,
@@ -1344,6 +1423,7 @@ pub const TableFnExec = struct {
             kernel0_views: []const ColumnView,
             max_run0: usize,
             out_stores: []ColumnStore,
+            leased: ?*bcache.WorkerState,
         ) !MultiRunner {
             const n_in = op.upstreams.len;
             const scratch = try allocator.alloc([]ColumnStore, n_in);
@@ -1425,6 +1505,7 @@ pub const TableFnExec = struct {
                 .out_ptrs = out_ptrs,
                 .arena = std.heap.ArenaAllocator.init(allocator),
                 .worker_arena = std.heap.ArenaAllocator.init(allocator),
+                .leased = leased,
             };
         }
 
@@ -1500,8 +1581,8 @@ pub const TableFnExec = struct {
                 .arena = self.arena.allocator(),
                 .user_data = op.entry.user_data,
                 .args = op.call_args,
-                .worker_arena = self.worker_arena.allocator(),
-                .worker_state = &self.worker_state,
+                .worker_arena = if (self.leased) |l| l.arena.allocator() else self.worker_arena.allocator(),
+                .worker_state = if (self.leased) |l| &l.state else &self.worker_state,
             };
             var out = udf_mod.TvfOutput{
                 .columns = self.out_ptrs,

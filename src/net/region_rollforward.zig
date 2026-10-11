@@ -1260,6 +1260,77 @@ fn hash_declaration_sources(input: engine_v2.CompileInput, h: *std.hash.Wyhash, 
     }
 }
 
+/// Identity of a table-function call's broadcast inputs for the
+/// cross-statement broadcast cache (exec/broadcast_cache.zig): the kernel's
+/// registration, the call arguments, the session state names resolve
+/// against, and per broadcast input its subtree with every literal plus the
+/// data version of each table it reads. Null when any part has no stable
+/// identity: a session variable, a subquery, a nondeterministic or
+/// user-data call, a nested table or aggregate function, or a table outside
+/// the session database.
+pub fn broadcastInputsKey(input: engine_v2.CompileInput, call: ir.Op.TableFn, entry: *const udf_mod.TableEntry) ?u64 {
+    var h = std.hash.Wyhash.init(0x62636173745f696e);
+    h.update(std.mem.asBytes(&entry.process));
+    hu(&h, entry.registration);
+    hu(&h, call.args.len);
+    for (call.args) |arg| {
+        if (arg) |v| {
+            hu(&h, 1);
+            hashValue(&h, v);
+        } else hu(&h, 0);
+    }
+    hostr(&h, input.session.current_db);
+    hstr(&h, input.session.current_schema);
+    hu(&h, @intFromEnum(input.session.dialect));
+    hu(&h, @intFromBool(input.force_ordered));
+    for (entry.broadcast_inputs) |b| {
+        const source = call.inputs[b];
+        hashOp(&h, source, &.{}) catch return null;
+        hash_broadcast_calls(input.udf_registry, &h, source, 0) catch return null;
+        hash_declaration_sources(input, &h, source) catch return null;
+    }
+    return h.final();
+}
+
+fn hash_broadcast_calls(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, node: *const ir.Op, depth: usize) error{RegionUnhashable}!void {
+    if (depth > 256) return Unhashable;
+    switch (node.*) {
+        .scan, .single_row => {},
+        .compute => |c| {
+            for (c.derived) |d| try hash_fusion_expr(registry, h, d.expr);
+            try hash_broadcast_calls(registry, h, c.upstream, depth + 1);
+        },
+        .window => |w| {
+            for (w.calls) |call| {
+                for (call.args) |arg| try hash_fusion_expr(registry, h, arg);
+            }
+            try hash_broadcast_calls(registry, h, w.upstream, depth + 1);
+        },
+        .group_by => |g| {
+            for (g.aggs) |agg| {
+                if (agg.udf_name != null) return Unhashable;
+            }
+            try hash_broadcast_calls(registry, h, g.upstream, depth + 1);
+        },
+        .join => |j| {
+            if (j.residual) |res| for (res.derived) |d| try hash_fusion_expr(registry, h, d.expr);
+            try hash_broadcast_calls(registry, h, j.left, depth + 1);
+            try hash_broadcast_calls(registry, h, j.right, depth + 1);
+        },
+        .set_union => |u| {
+            try hash_broadcast_calls(registry, h, u.left, depth + 1);
+            try hash_broadcast_calls(registry, h, u.right, depth + 1);
+        },
+        .filter => |f| try hash_broadcast_calls(registry, h, f.upstream, depth + 1),
+        .select, .exclude => |p| try hash_broadcast_calls(registry, h, p.upstream, depth + 1),
+        .limit => |l| try hash_broadcast_calls(registry, h, l.upstream, depth + 1),
+        .order_by => |o| try hash_broadcast_calls(registry, h, o.upstream, depth + 1),
+        .materialize => |m| try hash_broadcast_calls(registry, h, m.upstream, depth + 1),
+        .alias => |a| try hash_broadcast_calls(registry, h, a.upstream, depth + 1),
+        else => return Unhashable,
+    }
+}
+
 fn hu(h: *std.hash.Wyhash, v: u64) void {
     h.update(std.mem.asBytes(&v));
 }

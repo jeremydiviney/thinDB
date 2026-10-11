@@ -799,6 +799,110 @@ test "table UDF broadcast input: parallel matches serial (worker_state per worke
     try expectBcastValues(allocator, db);
 }
 
+var bcast_builds = std.atomic.Value(usize).init(0);
+
+/// fxConvertBcast, counting the worker states it builds.
+fn fxConvertBcastCounted(
+    ctx: *const thindb.udf.TvfContext,
+    parts: []const thindb.udf.TvfPartition,
+    out: *thindb.udf.TvfOutput,
+) !void {
+    if (ctx.worker_state) |slot| {
+        if (slot.* == null) _ = bcast_builds.fetchAdd(1, .monotonic);
+    }
+    return fxConvertBcast(ctx, parts, out);
+}
+
+fn bcastSum(allocator: std.mem.Allocator, db: *thindb.Database, rates_sql: []const u8) !i64 {
+    const sql = try std.fmt.allocPrint(allocator,
+        \\SELECT id, val FROM TABLE(fx_counted(
+        \\  (SELECT amt, id, g FROM t),
+        \\  ({s})
+        \\) PARTITION BY g)
+    , .{rates_sql});
+    defer allocator.free(sql);
+    var res = try run(allocator, db, sql);
+    defer res.deinit();
+    var sum: i64 = 0;
+    while (try res.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            if (batch.values[1].isValid(i)) sum += batch.values[1].data.bigint[i];
+        }
+    }
+    return sum;
+}
+
+/// Worker states only get built while null, and an entry keeps every state
+/// its statements leased: a key never sees more builds than workers, however
+/// the groups fell to them.
+fn expectBroadcastReuse(allocator: std.mem.Allocator, db: *thindb.Database, workers: usize) !void {
+    try db.registerTableUdf(.{
+        .name = "fx_counted",
+        .input_schemas = &.{ &fx_in0, &bcast_in1 },
+        .output_schema = &fx_out,
+        .execution = .partitioned,
+        .row_aligned = true,
+        .broadcast_inputs = &.{1},
+        .passthrough = &.{.{ .out_idx = 0, .in_idx = 1 }},
+        .kernel_input_cols = 1,
+        .process = fxConvertBcastCounted,
+    });
+    const rates = "SELECT g AS gg, rate FROM rates";
+    bcast_builds.store(0, .monotonic);
+    for (0..3) |_| try std.testing.expectEqual(@as(i64, 120), try bcastSum(allocator, db, rates));
+    try std.testing.expect(bcast_builds.load(.monotonic) <= workers);
+
+    // Another literal is another broadcast input.
+    bcast_builds.store(0, .monotonic);
+    try std.testing.expectEqual(@as(i64, 0), try bcastSum(allocator, db, "SELECT g AS gg, rate FROM rates WHERE rate > 5"));
+    try std.testing.expect(bcast_builds.load(.monotonic) >= 1);
+
+    // A nondeterministic call has no identity to cache under.
+    const volatile_rates = "SELECT g AS gg, rate + CAST(rand() * 0 AS BIGINT) AS rate FROM rates";
+    bcast_builds.store(0, .monotonic);
+    for (0..3) |_| try std.testing.expectEqual(@as(i64, 120), try bcastSum(allocator, db, volatile_rates));
+    try std.testing.expect(bcast_builds.load(.monotonic) >= 3);
+
+    // A write to a table the broadcast input reads is a new version of it.
+    const t = try db.openTable("rates", .{});
+    try t.insert(&.{.{ .g = @as(i32, 2), .rate = @as(i64, 3) }});
+    bcast_builds.store(0, .monotonic);
+    for (0..3) |_| try std.testing.expectEqual(@as(i64, 390), try bcastSum(allocator, db, rates));
+    const rebuilt = bcast_builds.load(.monotonic);
+    try std.testing.expect(rebuilt >= 1 and rebuilt <= workers);
+}
+
+test "table UDF broadcast input: a repeated statement reuses the drained input and worker states (serial)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+    try expectBroadcastReuse(allocator, db, 1);
+}
+
+test "table UDF broadcast input: a repeated statement reuses the drained input and worker states (parallel)" {
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    try seed(db);
+    try seedRates(db);
+
+    thindb.exec.table_fn.force_parallel_in_tests = true;
+    defer thindb.exec.table_fn.force_parallel_in_tests = false;
+    try expectBroadcastReuse(allocator, db, 4);
+}
+
 test "table UDF broadcast input: validation rejects input 0 and out-of-range indices" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

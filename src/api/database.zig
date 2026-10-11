@@ -24,6 +24,8 @@ const CatalogMod = @import("catalog.zig");
 const Catalog = CatalogMod.Catalog;
 
 const snapshot = @import("../util/snapshot.zig");
+const broadcast_cache = @import("../exec/broadcast_cache.zig");
+const BroadcastCache = broadcast_cache.Cache;
 
 pub const default_schema_name: []const u8 = "public";
 pub const back_compat_database_name: []const u8 = "main";
@@ -54,6 +56,10 @@ pub const Database = struct {
     /// die with the database. Opaque to keep api/ free of net/ imports.
     region_cache: ?*anyopaque = null,
     region_cache_deinit: ?*const fn (*anyopaque) void = null,
+    /// Table functions' broadcast inputs and worker states, kept across
+    /// statements (exec/broadcast_cache.zig). Created on first use under
+    /// `region_cache_lock`.
+    broadcast_cache: ?*BroadcastCache = null,
     /// Guards slot creation only (CAS spinlock — touched once per query at
     /// most; std.Thread.Mutex is gone in Zig 0.16 and Io.Mutex would force
     /// an Io through the recognizer for a two-instruction critical section).
@@ -159,6 +165,19 @@ pub const Database = struct {
         }
     }
 
+    /// The broadcast cache, created on first use; null when disabled or out
+    /// of memory.
+    pub fn broadcastCache(self: *Database) ?*BroadcastCache {
+        self.region_cache_lock.lock();
+        defer self.region_cache_lock.unlock();
+        if (self.broadcast_cache) |c| return c;
+        const cap = broadcast_cache.capBytes();
+        if (cap == 0) return null;
+        const c = BroadcastCache.create(self.allocator, cap, self.config.memory_pool) catch return null;
+        self.broadcast_cache = c;
+        return c;
+    }
+
     pub fn close(self: *Database) void {
         if (self.owned_catalog) |c| {
             c.close();
@@ -174,6 +193,10 @@ pub const Database = struct {
         if (self.region_cache) |p| {
             self.region_cache_deinit.?(p);
             self.region_cache = null;
+        }
+        if (self.broadcast_cache) |c| {
+            c.destroy();
+            self.broadcast_cache = null;
         }
         var it = self.schemas.iterator();
         while (it.next()) |entry| entry.value_ptr.*.close();

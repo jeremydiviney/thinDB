@@ -1642,6 +1642,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 if (tf.advertised_keys != null and getenv("THINDB_TVF_TRACE") != null) {
                     std.debug.print("[tvf] compile {s}: advertises output order\n", .{t.name});
                 }
+                installBroadcastCache(eff_input, t, entry, tvf_borrow_srcs, tf);
             }
             if (t.alias) |a| return exec.AliasRename.create(input.allocator, q, a);
             return q;
@@ -2339,6 +2340,32 @@ fn riderCoveredBy(src: ir.WindowSpec, rider: ir.WindowSpec) bool {
         if (!columnRefMatchesName(x.col, y.col) or x.desc != y.desc) return false;
     }
     return true;
+}
+
+/// A call whose broadcast inputs a statement reads again over unchanged
+/// tables takes them, and its workers' states, from the database's broadcast
+/// cache. A borrowed input stays out: its columns belong to a stage of this
+/// statement.
+fn installBroadcastCache(
+    input: engine_v2.CompileInput,
+    call: ir.Op.TableFn,
+    entry: *const udf.TableEntry,
+    borrow_srcs: []const ?*mat_stage.Stage,
+    tf: *exec.table_fn.TableFnExec,
+) void {
+    if (entry.broadcast_inputs.len == 0) return;
+    for (entry.broadcast_inputs) |b| {
+        if (borrow_srcs[b] != null) return;
+    }
+    const db = input.catalog.database(input.session.current_db orelse return) orelse return;
+    const key = @import("region_rollforward.zig").broadcastInputsKey(input, call, entry) orelse return;
+    const cache = db.broadcastCache() orelse return;
+    tf.broadcast_cache = cache;
+    tf.broadcast_key = key;
+    tf.broadcast_hit = cache.acquire(key);
+    if (getenv("THINDB_TVF_TRACE") != null) {
+        std.debug.print("[tvf] compile {s}: broadcast cache {s}\n", .{ call.name, if (tf.broadcast_hit != null) "hit" else "miss" });
+    }
 }
 
 /// The output-order advertisement a TVF call can make, in OUTPUT-schema
