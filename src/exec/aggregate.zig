@@ -2238,16 +2238,23 @@ pub const Aggregate = struct {
 
     /// Ensure the per-aggregate columns hold at least `capacity` cells (one per
     /// group assigned so far), allocating fresh if unallocated or growing
-    /// geometrically otherwise. New cells get the aggregate's initial value.
+    /// otherwise. New cells get the aggregate's initial value.
     /// The columns follow the group count, not the group table's slot count:
     /// a table is sized for a whole batch of potential new groups, or for its
     /// ceiling, and filling a cell per slot for every aggregate costs far more
-    /// than the few groups a partial aggregate over one chunk finds.
+    /// than the few groups a partial aggregate over one chunk finds. They
+    /// double while groups are few; past `ADAPTIVE_INITIAL` groups the input is
+    /// high-cardinality, and one jump to the `group_cap` ceiling (as the table
+    /// makes) beats copying ever-larger columns on every doubling.
     fn ensureAggColsCapacity(self: *Aggregate, capacity: usize) !void {
+        const have = self.aggColsLen();
+        if (self.agg_cols.len != 0 and have >= capacity) return;
+        const doubled = @max(capacity, have * 2);
+        const target = if (capacity > ADAPTIVE_INITIAL and self.group_cap > doubled) self.group_cap else doubled;
         if (self.agg_cols.len == 0) {
-            try self.allocAggCols(capacity);
-        } else if (self.aggColsLen() < capacity) {
-            try self.growAggCols(@max(capacity, self.aggColsLen() * 2));
+            try self.allocAggCols(target);
+        } else {
+            try self.growAggCols(target);
         }
     }
 
