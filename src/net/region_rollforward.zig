@@ -1055,6 +1055,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     var opts = ctx.opts;
     opts.n_threads = n_threads;
     opts.iv_rows_est = bs.iv_rows;
+    var work_units = bs.work_units;
 
     // Side tables: fresh snapshot scans from the cached recipes, with the
     // same schema-drift guard the entry gets.
@@ -1071,6 +1072,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
     for (ctx.side_specs.items, op_sides) |*spec, *s| {
         const st = (sessionDb(input) orelse return NoMatch).openTable(spec.table, .{}) catch return NoMatch;
         const sbs = try buildScanSources(input, st, spec.prune, spec.filter, spec.scan_cols, n_threads);
+        work_units = addWorkUnits(work_units, sbs.work_units);
         s.* = .{
             .scan_schema = spec.scan_schema,
             .pre_schema = spec.pre_schema,
@@ -1089,6 +1091,7 @@ fn runCached(input: engine_v2.CompileInput, anchor: *const ir.Op, ctx: *Ctx) !ex
         }
     }
 
+    opts.work_units = if (opts.ordered) null else work_units;
     const q = try region.RegionExecOp.create(
         qa,
         ctx.entry_schema,
@@ -1782,6 +1785,8 @@ const Builder = struct {
     member_filters: std.ArrayListUnmanaged(region.MemberFilter) = .empty,
     /// Per-side scan sources (query-lifetime; the RegionExecOp takes them).
     side_sources: std.ArrayListUnmanaged([]exec.Query) = .empty,
+    /// The side sources' summed `BuiltSources.work_units`.
+    side_work_units: ?usize = 0,
     /// Consolidation range-key NAMES, resolved against the CURRENT frame at
     /// every partition check — frame-replacing ops (group_agg, replace-TVF)
     /// keep the names by contract, so name resolution survives epochs that
@@ -3417,12 +3422,15 @@ fn build_region_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, dec
         .iv_rows_est = iv_rows_est,
         .iv_cost_slot = if (order_aligned) ctx.iv_cost else null,
         .member_filters = b.member_filters.items,
+        .work_units = if (order_aligned) null else addWorkUnits(bs.work_units, b.side_work_units),
     };
     ctx.opts = opts;
     // The estimate slice is query-lifetime (scan-source scratch) — never
     // let the cached ctx carry it across runs; each run supplies its own.
-    // (iv_cost_slot IS ctx-owned and deliberately persists.)
+    // (iv_cost_slot IS ctx-owned and deliberately persists.) The work
+    // units are per-run too.
     ctx.opts.iv_rows_est = &.{};
+    ctx.opts.work_units = null;
 
     const op_sides = try qa.alloc(region.SideInput, ctx.side_specs.items.len);
     for (ctx.side_specs.items, b.side_sources.items, op_sides) |spec, srcs, *s| {
@@ -4965,6 +4973,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
             .agg = side_agg,
         });
         try b.side_sources.append(a, bs.sources);
+        b.side_work_units = addWorkUnits(b.side_work_units, bs.work_units);
         sources_owned = false;
         side_idx = b.side_nodes.items.len - 1;
     }
@@ -5107,7 +5116,16 @@ const BuiltSources = struct {
     /// weights (boundary RGs count toward the interval owning their min) —
     /// drives the fused scan+exec LPT assignment.
     iv_rows: []u64 = &.{},
+    /// Chunked scan sources only: row groups surviving the prune hints plus
+    /// the memtable as 64K-row units (`DriverOpts.work_units`). Null when
+    /// unknown (staged ingress, ordered sources).
+    work_units: ?usize = null,
 };
+
+/// Work units of two source sets; unknown when either is.
+fn addWorkUnits(a: ?usize, b: ?usize) ?usize {
+    return (a orelse return null) + (b orelse return null);
+}
 
 /// Staged ingress compiled during one boundary search, by subtree root.
 /// Boundaries above an ordinary ingress cut share it, so a declined
@@ -5156,8 +5174,11 @@ fn build_staged_source(input: engine_v2.CompileInput, root: *const ir.Op, keys: 
 }
 
 /// Chunked fused-filter scans over the base table (the rf_custom recipe):
-/// snapshot once, split row groups into ~4×DOP ranges, prune + fuse the
-/// filter into every chunk. Scratch is query-lifetime — nothing here may
+/// snapshot once, split row groups into ~4 ranges per worker, prune + fuse
+/// the filter into every chunk. The first chunk's prune hints say how much
+/// of the table survives, which sizes the workers (`region.workersFor`)
+/// and so the chunk count: a selective query does not build 4×DOP scans
+/// over row groups it pruned. Scratch is query-lifetime — nothing here may
 /// grow a cached ctx arena. Caller owns `sources` until the op takes them.
 fn buildScanSources(
     input: engine_v2.CompileInput,
@@ -5188,7 +5209,26 @@ fn buildScanSources(
         total_rows += e.row_count;
     }
     seg_start[snap.segment_count] = total_rgs;
-    const n_chunks = @max(n_threads, @min(n_threads * 4, @max(total_rgs, 1)));
+
+    const first = try openChunkScan(input, table, snap, scan_cols, prune_leaves, filter);
+    var first_owned = true;
+    errdefer if (first_owned) {
+        var q = first.query;
+        q.deinit();
+    };
+    first.scan.adoptDdlLock();
+    lock_held = false;
+    const mask = if (n_threads > 1) first.scan.survivingMask(qa) else null;
+    defer if (mask) |m| qa.free(m);
+    const known_mask = if (mask) |m| (if (m.len == total_rgs) m else null) else null;
+    var surviving_rgs = total_rgs;
+    if (known_mask) |m| {
+        surviving_rgs = 0;
+        for (m) |keep| surviving_rgs += @intFromBool(keep);
+    }
+    const work_units = surviving_rgs + @as(usize, @intCast((snap.memtable_row_count + 65535) / 65536));
+    const workers = region.workersFor(n_threads, work_units);
+    const n_chunks = @max(workers, @min(workers * 4, @max(total_rgs, 1)));
 
     const sources = try qa.alloc(exec.Query, n_chunks);
     var built: usize = 0;
@@ -5201,31 +5241,46 @@ fn buildScanSources(
     for (0..n_chunks) |i| {
         const lo = i * total_rgs / n_chunks;
         const hi = if (i == n_chunks - 1) total_rgs else (i + 1) * total_rgs / n_chunks;
-        // emit_loc: the physical row locator rides through the exchange as
-        // the FINAL consolidation sort key, so (invoiceId, date) ties inside
-        // a group keep the table's physical order — the same order the
-        // engine's staged path presents to the estimates kernel, whose
-        // representative-row picks are input-order-sensitive ("first row
-        // wins"). Without it those picks are scatter-arrival nondeterministic.
-        const s = Scan.allocWithProjectionLoc(qa, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
-        sources[i] = exec.makeQuery(qa, s);
-        scans[i] = s;
+        const chunk = if (i == 0) first else try openChunkScan(input, table, snap, scan_cols, prune_leaves, filter);
+        sources[i] = chunk.query;
+        scans[i] = chunk.scan;
         built += 1;
-        if (i == 0) {
-            s.adoptDdlLock();
-            lock_held = false;
-        }
+        first_owned = false;
         const start = flatToCoord(lo, seg_start, snap.segment_count);
         const end = flatToCoord(hi, seg_start, snap.segment_count);
-        s.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
-        for (prune_leaves) |l| s.addPrune(l) catch {};
-        const fused = s.tryFuseFilter(filter) catch return NoMatch;
-        if (!fused) return NoMatch;
+        chunk.scan.setRange(start.seg, start.rg, end.seg, end.rg, i == n_chunks - 1);
     }
-    recutSourcesForPruning(qa, scans, seg_start, snap.segment_count, total_rgs);
+    if (known_mask) |m| recutSourcesForPruning(scans, seg_start, snap.segment_count, m, surviving_rgs);
     snap.release(table);
     pin_held = false;
-    return .{ .sources = sources, .total_rows = total_rows };
+    return .{ .sources = sources, .total_rows = total_rows, .work_units = work_units };
+}
+
+const ChunkScan = struct { query: exec.Query, scan: *Scan };
+
+/// One chunk of `buildScanSources`: pruned, with the filter fused. The
+/// caller sets its range.
+fn openChunkScan(
+    input: engine_v2.CompileInput,
+    table: anytype,
+    snap: Scan.Snapshot,
+    scan_cols: ?[]const []const u8,
+    prune_leaves: []const predicate_mod.Predicate,
+    filter: PredicateExpr,
+) !ChunkScan {
+    // emit_loc: the physical row locator rides through the exchange as
+    // the FINAL consolidation sort key, so (invoiceId, date) ties inside
+    // a group keep the table's physical order — the same order the
+    // engine's staged path presents to the estimates kernel, whose
+    // representative-row picks are input-order-sensitive ("first row
+    // wins"). Without it those picks are scatter-arrival nondeterministic.
+    const s = Scan.allocWithProjectionLoc(input.allocator, table, input.accountant, scan_cols, true, snap) catch return NoMatch;
+    var q = exec.makeQuery(input.allocator, s);
+    errdefer q.deinit();
+    for (prune_leaves) |l| s.addPrune(l) catch {};
+    const fused = s.tryFuseFilter(filter) catch return NoMatch;
+    if (!fused) return NoMatch;
+    return .{ .query = q, .scan = s };
 }
 
 /// ParallelScan.rebalanceChunksForPruning for the region's chunk scans. The
@@ -5236,15 +5291,11 @@ fn buildScanSources(
 /// ~equal SURVIVING row groups; bounds stay ascending, so chunk emission
 /// order (and the emit_loc tie order riding it) is unchanged. Only when at
 /// most half the groups survive — above that the even split is the better
-/// work model.
-fn recutSourcesForPruning(qa: Allocator, scans: []const *Scan, seg_start: []const usize, n_segs: usize, total: usize) void {
-    if (scans.len <= 1) return;
-    const mask = scans[0].survivingMask(qa) orelse return;
-    defer qa.free(mask);
-    if (mask.len != total) return;
-    var surviving: usize = 0;
-    for (mask) |m| surviving += @intFromBool(m);
-    if (surviving == 0 or surviving > total / 2) return;
+/// work model. `mask` is the row-group survival in the chunks' flat index
+/// space, with `surviving` entries set.
+fn recutSourcesForPruning(scans: []const *Scan, seg_start: []const usize, n_segs: usize, mask: []const bool, surviving: usize) void {
+    const total = mask.len;
+    if (scans.len <= 1 or surviving == 0 or surviving > total / 2) return;
 
     const n = scans.len;
     var lo: usize = 0;
