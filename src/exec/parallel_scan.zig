@@ -1386,6 +1386,7 @@ pub const ParallelScan = struct {
         for (self.workers) |w| if (w != .segment) return null;
         // The pass reads the workers' ranges, cut before any hint existed;
         // the first pull re-cuts them again over whatever hints it finds.
+        try self.shrinkToSurvivors();
         self.rebalanceChunksForPruning();
 
         var needed: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -1465,13 +1466,13 @@ pub const ParallelScan = struct {
 
     pub fn tryFuseFilter(self: *ParallelScan, expr: predicate.PredicateExpr) !bool {
         if (self.compute_fused) return self.fuseFilterIntoComputes(expr);
+        if (self.workers.len == 0) return false;
         // Every worker is an identical Scan over the same table/projection, so
-        // fusion succeeds (or not) uniformly. Apply to all to stay consistent.
-        var fused = false;
-        for (self.workers, 0..) |w, i| {
-            const r = try w.tryFuseFilter(expr);
-            if (i == 0) fused = r;
-        }
+        // fusion succeeds (or not) uniformly. Apply to all to stay consistent,
+        // once the first one's hints have dropped the chunks left empty.
+        const fused = try self.workers[0].tryFuseFilter(expr);
+        if (fused) try self.shrinkToSurvivors();
+        for (self.workers[1..]) |w| _ = try w.tryFuseFilter(expr);
         return fused;
     }
 
@@ -1552,6 +1553,7 @@ pub const ParallelScan = struct {
         }
         if (self.stage_deferred) return false;
         if (self.mode != .unset) return false;
+        try self.shrinkToSurvivors();
         // CASE over a TABLE scan stays serial by MEASUREMENT, not capability:
         // a production-workload A/B (2026-07-11, table-source) showed fusing CASE-heavy
         // chains there is a net loss — the scan is memory-bandwidth-bound, so
@@ -1655,6 +1657,7 @@ pub const ParallelScan = struct {
             if (trace_jf) std.debug.print("[jf]   ps decline: probe_map exceeds chunk schema ({d} cols)\n", .{self.out_schema.len});
             return false;
         }
+        try self.shrinkToSurvivors();
         const map_views: [][]ColumnView = if (sink.probe_map) |m| try self.allocProbeMapViews(m.len) else &.{};
         // The offerer declines and carries on when this fails, so a failed
         // bind must leave the scan as it found it.
@@ -1737,6 +1740,7 @@ pub const ParallelScan = struct {
             return true;
         }
         if (self.mode != .unset or self.compute_fused or self.pending_computes.items.len > 0 or self.agg_fused) return false;
+        try self.shrinkToSurvivors();
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
         for (self.workers, 0..) |w, i| {
@@ -2041,19 +2045,83 @@ pub const ParallelScan = struct {
         }
         if (surviving == 0 or surviving > mask.len / 2) return;
 
-        const n = self.workers.len;
-        const seg_start = self.allocator.alloc(usize, first.segs.len + 1) catch return;
+        const seg_start = segmentStarts(self.allocator, first.segs) catch return;
         defer self.allocator.free(seg_start);
-        var total: usize = 0;
-        for (first.segs, 0..) |entry, i| {
-            seg_start[i] = total;
-            total += entry.row_group_count;
-        }
-        seg_start[first.segs.len] = total;
-        if (total != mask.len) return;
+        if (seg_start[first.segs.len] != mask.len) return;
+        self.cutOverSurvivors(seg_start, mask, surviving);
+        if (exec.prof.enabled) std.debug.print(
+            "[pscan] prune-rebalance: surviving={d}/{d} rgs recut across {d} chunks\n",
+            .{ surviving, mask.len, self.workers.len },
+        );
+    }
 
-        // Quantile cut: chunk c ends once ceil((c+1)·surviving/n) survivors
-        // are behind it. Trailing chunks may end empty when surviving < n.
+    /// Drop the chunk scans the prune hints leave nothing to read, while
+    /// nothing is built per chunk yet. `create` cuts DOP × CHUNK_FACTOR
+    /// chunks before any hint exists, so after a selective filter most of
+    /// them are empty, yet every later fusion (per-chunk computes, a probe
+    /// sink's per-chunk state) and the teardown still pay for each one.
+    /// Keeps one chunk per surviving row group, at least one since the last
+    /// chunk drains the memtable, and re-cuts the survivors over them.
+    fn shrinkToSurvivors(self: *ParallelScan) !void {
+        if (self.table == null or self.mode != .unset or self.workers.len <= 1) return;
+        if (self.compute_fused or self.agg_fused or self.probe_sink != null) return;
+        for (self.workers) |w| if (w != .segment) return;
+        const first = self.workers[0].segment;
+        const mask = first.survivingMask(self.allocator) orelse return;
+        defer self.allocator.free(mask);
+        var surviving: usize = 0;
+        for (mask) |m| surviving += @intFromBool(m);
+        const keep = @max(@as(usize, 1), surviving);
+        if (keep >= self.workers.len) return;
+        const seg_start = try segmentStarts(self.allocator, first.segs);
+        defer self.allocator.free(seg_start);
+        if (seg_start[first.segs.len] != mask.len) return;
+
+        const workers = try self.allocator.alloc(Leaf, keep);
+        errdefer self.allocator.free(workers);
+        const round = try self.allocator.alloc(?Batch, keep);
+        errdefer self.allocator.free(round);
+        const werr = try self.allocator.alloc(?anyerror, keep);
+        errdefer self.allocator.free(werr);
+        const threads = try self.allocator.alloc(std.Thread, keep);
+        errdefer self.allocator.free(threads);
+        const thread_active = try self.allocator.alloc(bool, keep);
+        errdefer self.allocator.free(thread_active);
+        const exhausted = try self.allocator.alloc(bool, keep);
+        @memset(exhausted, false);
+
+        const had = self.workers.len;
+        @memcpy(workers, self.workers[0..keep]);
+        for (self.workers[keep..]) |w| w.deinit();
+        self.allocator.free(self.workers);
+        self.allocator.free(self.round);
+        self.allocator.free(self.werr);
+        self.allocator.free(self.threads);
+        self.allocator.free(self.thread_active);
+        self.allocator.free(self.exhausted);
+        self.workers = workers;
+        self.round = round;
+        self.werr = werr;
+        self.threads = threads;
+        self.thread_active = thread_active;
+        self.exhausted = exhausted;
+        self.round_cursor = keep;
+        self.n_threads = @min(self.n_threads, keep);
+        self.cutOverSurvivors(seg_start, mask, surviving);
+        if (exec.prof.enabled) std.debug.print(
+            "[pscan] prune-shrink: surviving={d}/{d} rgs, kept {d} of {d} chunks\n",
+            .{ surviving, mask.len, keep, had },
+        );
+    }
+
+    /// Re-cut the workers' ranges over the flat row-group index space so
+    /// chunk c ends once ceil((c+1)·surviving/n) survivors are behind it.
+    /// Trailing chunks may end empty when surviving < n; the last one also
+    /// drains the memtable.
+    fn cutOverSurvivors(self: *ParallelScan, seg_start: []const usize, mask: []const bool, surviving: usize) void {
+        const n = self.workers.len;
+        const n_segs = seg_start.len - 1;
+        const total = mask.len;
         var lo: usize = 0;
         var seen: usize = 0;
         var cut: usize = 0;
@@ -2063,18 +2131,14 @@ pub const ParallelScan = struct {
                 if (mask[cut]) seen += 1;
             }
             const hi = if (c == n - 1) total else cut;
-            const start = flatToCoord(lo, seg_start, first.segs.len, total);
-            const end = flatToCoord(hi, seg_start, first.segs.len, total);
+            const start = flatToCoord(lo, seg_start, n_segs, total);
+            const end = flatToCoord(hi, seg_start, n_segs, total);
             switch (w) {
                 .segment => |s| s.resetRange(start.seg, start.rg, end.seg, end.rg, c == n - 1),
                 .chunk => {},
             }
             lo = hi;
         }
-        if (exec.prof.enabled) std.debug.print(
-            "[pscan] prune-rebalance: surviving={d}/{d} rgs recut across {d} chunks\n",
-            .{ surviving, total, n },
-        );
     }
 
     /// Stage-adoption handshake (`VTable.takeOwnedChunks`): run the mode
@@ -2088,6 +2152,7 @@ pub const ParallelScan = struct {
     pub fn takeOwnedChunks(self: *ParallelScan) !?exec.OwnedChunks {
         if (self.mode == .unset) {
             if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
+            try self.shrinkToSurvivors();
             self.rebalanceChunksForPruning();
             const compute_streams = self.compute_fused and self.table == null;
             const force_mat = self.agg_fused or self.workers[0].fusedActive() or
@@ -2121,6 +2186,7 @@ pub const ParallelScan = struct {
     pub fn next(self: *ParallelScan) !?Batch {
         if (self.stage_deferred and self.workers.len == 0) try self.buildDeferredWorkers();
         if (self.mode == .unset) {
+            try self.shrinkToSurvivors();
             self.rebalanceChunksForPruning();
             // Fusion happens after create() (the wrapping Filter/Compute fuse on
             // their way up), so the strategy is settled by the first pull.
@@ -3096,6 +3162,19 @@ fn readable(scan_cols: []const Column, locals: []const Expr.Operand, name: []con
 }
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Each segment's first flat row-group index, plus the total at the end.
+/// Caller frees.
+fn segmentStarts(allocator: Allocator, segs: []const storage.ManifestEntry) ![]usize {
+    const seg_start = try allocator.alloc(usize, segs.len + 1);
+    var total: usize = 0;
+    for (segs, 0..) |entry, i| {
+        seg_start[i] = total;
+        total += entry.row_group_count;
+    }
+    seg_start[segs.len] = total;
+    return seg_start;
+}
 
 /// Map a flat row-group index to its `(segment, row_group)` coordinate. `f ==
 /// total` (a worker's exclusive end) maps to the past-the-end sentinel.
