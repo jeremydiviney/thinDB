@@ -2943,7 +2943,8 @@ test "join: GROUP BY over a cross join groups each side first and keeps every gr
     // Each statement's `{s}` takes either nothing or a conjunct reading both
     // sides that holds for every row: it keeps the product whole beneath the
     // GROUP BY, the plan the rewrite replaces. The last statement's SELECT
-    // list is the GROUP BY's own output, which keeps its plan and names.
+    // list is the GROUP BY's own output, which a join's GROUP BY still
+    // projects to name its keys bare.
     const cases = .{
         .{ "SELECT LOWER(e.grp) AS k, s.n, MAX(e.v) AS mx, MIN(e.d) AS lo, ANY_VALUE(e.name) AS nm, COUNT(DISTINCT e.v) AS nv, MAX(e.v) + s.n AS bumped " ++
             "FROM ent e CROSS JOIN spine s WHERE s.n > 0 {s} GROUP BY LOWER(e.grp), s.n ORDER BY k, s.n", 9, true },
@@ -2951,7 +2952,7 @@ test "join: GROUP BY over a cross join groups each side first and keeps every gr
         .{ "SELECT s.n, e.id, MAX(s.n * 10) AS t FROM ent e CROSS JOIN spine s WHERE e.v > 4 {s} GROUP BY e.id, s.n ORDER BY e.id, s.n", 10, true },
         .{ "SELECT s.n, e.grp, MIN(e.v) AS lo FROM ent e CROSS JOIN spine s WHERE s.n > 100 {s} GROUP BY e.grp, s.n", 0, true },
         .{ "SELECT s.n, e.grp, MIN(e.v) AS lo FROM ent e CROSS JOIN spine s WHERE e.v > 100 {s} GROUP BY e.grp, s.n", 0, true },
-        .{ "SELECT e.grp, s.n, MAX(e.v) AS mx FROM ent e CROSS JOIN spine s WHERE s.n > 0 {s} GROUP BY e.grp, s.n ORDER BY e.grp, s.n", 12, false },
+        .{ "SELECT e.grp, s.n, MAX(e.v) AS mx FROM ent e CROSS JOIN spine s WHERE s.n > 0 {s} GROUP BY e.grp, s.n ORDER BY e.grp, s.n", 12, true },
     };
     inline for (cases) |c| {
         const sql = comptime std.fmt.comptimePrint(c[0], .{""});
@@ -3592,4 +3593,39 @@ fn joinKeyCounts(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]
         try counts.append(allocator, std.mem.count(u8, keys[0..end], ", ") + 1);
     }
     return counts.toOwnedSlice(allocator);
+}
+
+// A grouped join's key, read qualified or not, names the derived table's or
+// CTE's column by its bare name.
+test "join: a grouped join's keys keep their bare names outside" {
+    const allocator = std.testing.allocator;
+    const helpers = @import("sql_helpers.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE fact (k BIGINT, c BIGINT)");
+    try helpers.exec(allocator, db, "CREATE TABLE dim (k BIGINT, c BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO fact VALUES (1, 1), (3, 1), (3, 1), (17, 1), (40, 0), (50, 0)");
+    try helpers.exec(allocator, db, "INSERT INTO dim VALUES (3, 1), (17, 1), (40, 0)");
+    try helpers.exec(allocator, db, "CREATE TABLE tag (c BIGINT, w BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO tag VALUES (1, 7), (0, 9)");
+
+    const grouped = "(SELECT g.k, COUNT(*) AS n FROM fact g JOIN dim d ON d.c = g.c GROUP BY g.k)";
+    const cases = .{
+        .{ "SELECT t.k, t.n FROM " ++ grouped ++ " t ORDER BY t.k", "k:bigint n:bigint \n1|2\n3|4\n17|2\n40|1\n50|1" },
+        .{ "SELECT * FROM " ++ grouped ++ " t ORDER BY 1", "k:bigint n:bigint \n1|2\n3|4\n17|2\n40|1\n50|1" },
+        .{ "WITH t AS " ++ grouped ++ " SELECT t.k, t.n FROM t WHERE t.k > 3 ORDER BY t.k", "k:bigint n:bigint \n17|2\n40|1\n50|1" },
+        .{ "SELECT f.k, t.n FROM dim f JOIN " ++ grouped ++ " t ON t.k = f.k ORDER BY f.k", "k:bigint n:bigint \n3|4\n17|2\n40|1" },
+        .{ "SELECT t.k, t.n FROM (SELECT g.k, COUNT(*) AS n FROM fact g JOIN dim d ON d.c = g.c GROUP BY g.k ORDER BY g.k DESC LIMIT 2) t ORDER BY t.k", "k:bigint n:bigint \n40|1\n50|1" },
+        .{ "SELECT t.w, t.n FROM (SELECT w, COUNT(*) AS n FROM fact g JOIN tag x ON x.c = g.c GROUP BY w) t ORDER BY t.w", "w:bigint n:bigint \n7|4\n9|2" },
+        .{ "WITH t AS (SELECT w, COUNT(*) AS n FROM fact g JOIN tag x ON x.c = g.c GROUP BY w ORDER BY w LIMIT 5) SELECT t.w, t.n FROM t ORDER BY t.w", "w:bigint n:bigint \n7|4\n9|2" },
+        .{ "SELECT t.w, t.n FROM (SELECT w, COUNT(*) AS n FROM fact g CROSS JOIN tag x GROUP BY w) t ORDER BY t.w", "w:bigint n:bigint \n7|6\n9|6" },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        const text = try crossRowsText(allocator, db, c[0]);
+        defer allocator.free(text);
+        try std.testing.expectEqualStrings(c[1], text);
+    }
 }
