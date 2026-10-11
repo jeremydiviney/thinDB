@@ -942,7 +942,10 @@ pub fn computeSelfPushed(up: exec.Query, derived: []const ir.Derived, udf_regist
     const q = try up.computeWithRegistry(derived, udf_registry);
     if (probe_fusion_reachable) {
         if (exec.queryAs(@import("compute.zig").Compute, q)) |c| {
-            const pushed = c.tryFuseSelf();
+            const pushed = c.tryFuseSelf() catch |err| {
+                @import("compute.zig").Compute.deinitLayersOver(q, up);
+                return err;
+            };
             if (getenv_c("THINDB_TRACE_SELFPUSH") != null and !pushed) {
                 var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(std.heap.page_allocator);

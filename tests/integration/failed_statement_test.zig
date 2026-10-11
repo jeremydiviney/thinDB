@@ -353,6 +353,12 @@ const query_statements = [_][]const u8{
     "SELECT x.g, x.n FROM (SELECT g, COUNT(*) AS n FROM oa GROUP BY g) x WHERE x.n > 1",
     "SELECT g, SUM(d) AS t FROM oa GROUP BY g WITH ROLLUP",
     "SELECT g, COUNT(*) AS n FROM oa GROUP BY g HAVING COUNT(*) > 1",
+    // Chains offered through a union: an arm that fails to take one fails
+    // the statement, even after the other arm took it (#603).
+    "SELECT u.id + 1 AS x FROM (SELECT id FROM oe UNION ALL SELECT id FROM oa) u",
+    "SELECT u.g, ob.s FROM (SELECT g, id FROM oe UNION ALL SELECT g, id FROM oa) u JOIN ob ON u.id = ob.id",
+    "SELECT v.x, ob.s FROM (SELECT u.id * 2 AS x, u.id FROM (SELECT id FROM oe UNION ALL SELECT id FROM oa) u) v JOIN ob ON v.id = ob.id",
+    "SELECT v.id, ob.s FROM (SELECT u.id FROM (SELECT id, g FROM oe UNION ALL SELECT id, g FROM oa) u WHERE u.g + u.id > 2) v JOIN ob ON v.id = ob.id",
 };
 
 const table_function_statements = [_][]const u8{

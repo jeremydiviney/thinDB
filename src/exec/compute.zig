@@ -867,19 +867,22 @@ pub const Compute = struct {
             return true;
         }
         const chain = try self.allocator.create(ChainForward);
-        errdefer self.allocator.destroy(chain);
         chain.* = .{
             .src = self,
             .inner = sink,
             .in_schema = self.upstream.outputSchema(),
         };
-        const ok = self.upstream.tryFuseProbe(.{
+        // An error can follow a partial accept (a union arm bound the chain
+        // before its sibling failed), which no decline undoes: it fails the
+        // statement, and the clones go with the chain (#603).
+        errdefer chain.deinitAll(self.allocator);
+        const ok = try self.upstream.tryFuseProbe(.{
             .ctx = chain,
             .out_schema = sink.out_schema,
             .extends_chain = sink.extends_chain,
             .bind = ChainForward.bindHook,
             .process = ChainForward.processHook,
-        }) catch false;
+        });
         if (!ok) {
             if (trace_jf) {
                 var buf: std.ArrayList(u8) = .empty;
@@ -937,21 +940,23 @@ pub const Compute = struct {
     /// the derived evaluation into it as a terminal chained sink, so the
     /// stripe workers emit already-computed batches and this operator
     /// becomes a pass-through. A join created later upgrades the terminal
-    /// wrapper via tryFuseProbe. Safe no-op when the upstream declines.
-    pub fn tryFuseSelf(self: *Compute) bool {
+    /// wrapper via tryFuseProbe. Safe no-op when the upstream declines; an
+    /// error fails the statement (see `tryFuseProbe`).
+    pub fn tryFuseSelf(self: *Compute) !bool {
         if (self.chain != null) return false;
-        const chain = self.allocator.create(ChainForward) catch return false;
+        const chain = try self.allocator.create(ChainForward);
         chain.* = .{
             .src = self,
             .inner = null,
             .in_schema = self.upstream.outputSchema(),
         };
-        const ok = self.upstream.tryFuseProbe(.{
+        errdefer chain.deinitAll(self.allocator);
+        const ok = try self.upstream.tryFuseProbe(.{
             .ctx = chain,
             .out_schema = self.output_schema,
             .bind = ChainForward.bindHook,
             .process = ChainForward.processHook,
-        }) catch false;
+        });
         if (!ok) {
             self.allocator.destroy(chain);
             return false;
