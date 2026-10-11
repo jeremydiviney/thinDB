@@ -56,6 +56,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 const transform = @import("../engine/transform.zig");
 const Derived = @import("compute.zig").Derived;
+const Compute = @import("compute.zig").Compute;
 const core_scheduler = @import("../util/core_scheduler.zig");
 const expr_mod = @import("expr.zig");
 const Expr = expr_mod.Expr;
@@ -1288,8 +1289,163 @@ pub const ParallelScan = struct {
         for (self.workers) |w| try w.addPrune(pred);
     }
 
+    /// Dropped once the workers run: a hint only ever saves work.
     pub fn addPruneSet(self: *ParallelScan, set: predicate.InSet) !void {
-        for (self.workers) |w| try w.addPruneSet(set);
+        if (self.mode != .unset) return;
+        var hint = set;
+        hint.col = self.leafColumnName(set.col) orelse return;
+        if (set.rows and !self.rowSetFusable()) {
+            if (set.values.len > Scan.ROW_SET_ZONEMAP_MAX) return;
+            hint.rows = false;
+        }
+        for (self.workers) |w| try w.addPruneSet(hint);
+    }
+
+    /// Whether a row filter can still fuse into the workers without
+    /// changing how this scan runs: before the first pull, over a table,
+    /// and only when the workers already filter. A streaming scan would
+    /// switch to materialize and buffer every survivor; a probe-fused one
+    /// streams in round mode only.
+    fn rowSetFusable(self: *const ParallelScan) bool {
+        if (self.mode != .unset or self.table == null or self.workers.len == 0 or self.emit_keep != null) return false;
+        return self.materializesOnPull();
+    }
+
+    /// The worker scans' name for output column `col`, through the
+    /// operators fused over them: a rename names its source, and a computed
+    /// column has none.
+    pub fn leafColumnName(self: *ParallelScan, col: []const u8) ?[]const u8 {
+        if (!self.compute_fused) return col;
+        var name = col;
+        var q = self.compute_q[0];
+        while (true) {
+            if (exec.queryAs(Compute, q)) |c| {
+                name = (c.inputColumnName(name) catch return null) orelse return null;
+                q = c.upstream;
+            } else if (exec.queryAs(exec.Project, q)) |p| {
+                name = (p.inputColumnName(name) catch return null) orelse return null;
+                q = p.upstream;
+            } else if (exec.queryAs(exec.Filter, q)) |f| {
+                q = f.upstream;
+            } else return if (exec.queryAs(Scan, q) != null) name else null;
+        }
+    }
+
+    /// Table rows a row-level offer on `col` filters here: the rows the
+    /// workers read, when the offer fuses. Zero otherwise.
+    pub fn rowSetTargetRows(self: *ParallelScan, col: []const u8) u64 {
+        if (!self.rowSetFusable()) return 0;
+        const leaf_col = self.leafColumnName(col) orelse return 0;
+        if (types.findColumn(self.workers[0].outputSchema(), leaf_col) == null) return 0;
+        return self.prunedTableRows() orelse 0;
+    }
+
+    /// Whether output columns `a` and `b` read one worker scan column.
+    pub fn sameLeafColumn(self: *ParallelScan, a: []const u8, b: []const u8) bool {
+        if (self.workers.len == 0) return false;
+        const schema = self.workers[0].outputSchema();
+        const ia = types.findColumn(schema, self.leafColumnName(a) orelse return false) orelse return false;
+        return ia == types.findColumn(schema, self.leafColumnName(b) orelse return false);
+    }
+
+    /// Rows the workers would decode: the table's rows the prune hints
+    /// keep, counted from segment footers (exact, not an estimate). Null
+    /// for a buffer source.
+    pub fn prunedTableRows(self: *ParallelScan) ?u64 {
+        if (self.table == null or self.workers.len == 0) return null;
+        return switch (self.workers[0]) {
+            .segment => |s| s.stats().upper_rows,
+            .chunk => null,
+        };
+    }
+
+    /// Distinct non-NULL values per requested column of the rows this scan
+    /// emits through its fused filter, read before it runs (a join learning
+    /// its probe keys ahead of its build). A separate key-only pass over the
+    /// SAME snapshot and row-group ranges sees every row the scan will: later
+    /// deletes only take rows away. Slot `k` is null when `cols[k]` is,
+    /// when its column holds more than `cap` distinct values, or when a value
+    /// has no ordered form; the result is null when no slot survives. Values
+    /// live in `out`; numeric ones sorted.
+    pub fn collectKeySets(self: *ParallelScan, out: Allocator, cols: []const ?[]const u8, cap: usize) !?[]?[]const types.Value {
+        const table = self.table orelse return null;
+        if (self.mode != .unset or self.workers.len == 0 or cols.len > MAX_KEY_SETS) return null;
+        for (self.workers) |w| if (w != .segment) return null;
+        // The pass reads the workers' ranges, cut before any hint existed;
+        // the first pull re-cuts them again over whatever hints it finds.
+        self.rebalanceChunksForPruning();
+
+        var needed: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer needed.deinit(self.allocator);
+        var slot_col: [MAX_KEY_SETS]?usize = @splat(null);
+        const worker_schema = self.workers[0].outputSchema();
+        for (cols, 0..) |maybe, k| {
+            const name = maybe orelse continue;
+            const ci = types.findColumn(worker_schema, name) orelse continue;
+            const base = worker_schema[ci].name;
+            const pos = for (needed.items, 0..) |n, i| {
+                if (std.mem.eql(u8, n, base)) break i;
+            } else blk: {
+                try needed.append(self.allocator, base);
+                break :blk needed.items.len - 1;
+            };
+            slot_col[k] = pos;
+        }
+        if (needed.items.len == 0) return null;
+
+        const passes = try self.allocator.alloc(*Scan, self.workers.len);
+        defer self.allocator.free(passes);
+        var built: usize = 0;
+        defer for (passes[0..built]) |s| s.deinit();
+        for (self.workers) |w| {
+            const worker = w.segment;
+            const pass = try Scan.allocWithProjectionLoc(self.worker_alloc, table, self.acct, needed.items, false, .{
+                .segment_count = worker.segment_count,
+                .memtable_snap = worker.memtable_snap,
+                .memtable_row_count = worker.memtable_row_count,
+                .segments = worker.segs,
+            });
+            passes[built] = pass;
+            built += 1;
+            pass.setRange(worker.range_start_seg, worker.range_start_rg, worker.range_end_seg, worker.range_end_rg, worker.scan_memtable);
+            try pass.copyPrunesFrom(worker);
+            if (!try pass.adoptFusedFilter(worker)) return null;
+        }
+        const pass_schema = passes[0].outputSchema();
+        for (slot_col[0..cols.len]) |*c| {
+            const pos = c.* orelse continue;
+            c.* = types.findColumn(pass_schema, needed.items[pos]) orelse return null;
+        }
+
+        var collect: KeyCollect = .{
+            .passes = passes,
+            .slot_col = slot_col[0..cols.len],
+            .cap = cap,
+        };
+        for (collect.dead[0..cols.len], slot_col[0..cols.len]) |*d, c| d.store(c == null, .monotonic);
+        const threads = @max(@as(usize, 1), @min(self.n_threads, passes.len));
+        const states = try self.allocator.alloc(KeyCollect.State, threads);
+        defer self.allocator.free(states);
+        for (states) |*st| st.* = .{ .arena = std.heap.ArenaAllocator.init(self.worker_alloc) };
+        defer for (states) |*st| st.deinit();
+        const spawned = try self.allocator.alloc(?std.Thread, threads);
+        defer self.allocator.free(spawned);
+        @memset(spawned, null);
+        for (1..threads) |t| spawned[t] = std.Thread.spawn(.{}, KeyCollect.run, .{ &collect, &states[t] }) catch null;
+        KeyCollect.run(&collect, &states[0]);
+        // A thread that failed to spawn leaves its passes to the others.
+        for (spawned[1..]) |th| if (th) |t| t.join();
+        for (states) |st| if (st.err) |e| return e;
+
+        const result = try out.alloc(?[]const types.Value, cols.len);
+        var any = false;
+        for (result, 0..) |*slot, k| {
+            slot.* = null;
+            if (collect.dead[k].load(.monotonic)) continue;
+            slot.* = try mergeKeySets(out, states, k, cap) orelse continue;
+            any = true;
+        }
+        return if (any) result else null;
     }
 
     pub fn tryFuseFilter(self: *ParallelScan, expr: predicate.PredicateExpr) !bool {
@@ -2417,6 +2573,164 @@ pub const ParallelScan = struct {
     }
 };
 
+/// Most columns one `collectKeySets` pass gathers (one per join key).
+pub const MAX_KEY_SETS = 16;
+
+/// A `collectKeySets` pass in flight: threads claim the key-only scans off
+/// one cursor, each gathering distinct values per slot into its own `State`.
+const KeyCollect = struct {
+    passes: []const *Scan,
+    /// Per slot: the pass output column it reads, null when not requested.
+    slot_col: []const ?usize,
+    cap: usize,
+    next: std.atomic.Value(usize) = .{ .raw = 0 },
+    /// Per slot: past `cap` distinct values, or a value with no ordered form.
+    dead: [MAX_KEY_SETS]std.atomic.Value(bool) = @splat(.{ .raw = false }),
+    stop: std.atomic.Value(bool) = .{ .raw = false },
+
+    const State = struct {
+        arena: std.heap.ArenaAllocator,
+        /// Per slot: the value under its key bytes (text bytes, or the
+        /// ordered i128's).
+        seen: [MAX_KEY_SETS]std.StringHashMapUnmanaged(types.Value) = @splat(.empty),
+        err: ?anyerror = null,
+
+        fn deinit(self: *State) void {
+            self.arena.deinit();
+        }
+    };
+
+    fn run(self: *KeyCollect, state: *State) void {
+        self.drain(state) catch |e| {
+            state.err = e;
+            self.stop.store(true, .monotonic);
+        };
+    }
+
+    fn drain(self: *KeyCollect, state: *State) !void {
+        // Same core lease discipline as `stealLoop`: pin to a free core when
+        // there is one, never wait for one.
+        const sched = core_scheduler.global();
+        var lease: core_scheduler.Lease = undefined;
+        var leased = false;
+        defer if (leased) lease.release();
+        const a = state.arena.allocator();
+        while (!self.stop.load(.monotonic)) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.passes.len) return;
+            if (!leased) {
+                lease = sched.tryAcquire();
+                leased = true;
+            }
+            while (try self.passes[i].next()) |batch| {
+                if (self.stop.load(.monotonic)) return;
+                var live = false;
+                for (self.slot_col, 0..) |maybe_col, k| {
+                    const col = maybe_col orelse continue;
+                    if (self.dead[k].load(.monotonic)) continue;
+                    if (try addDistinct(a, &state.seen[k], batch.values[col], batch.row_count, self.cap)) {
+                        live = true;
+                    } else {
+                        self.dead[k].store(true, .monotonic);
+                    }
+                }
+                if (!live) {
+                    self.stop.store(true, .monotonic);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Add `view`'s non-NULL values to `seen`; false once it holds more than
+    /// `cap` or a value has no ordered form.
+    fn addDistinct(a: Allocator, seen: *std.StringHashMapUnmanaged(types.Value), view: ColumnView, rows: usize, cap: usize) !bool {
+        var ordered_bytes: [16]u8 = undefined;
+        for (0..rows) |row| {
+            if (!view.isValid(row)) continue;
+            const value = keyCellValue(view, row) orelse return false;
+            const key: []const u8 = switch (value) {
+                .text => |t| t,
+                else => blk: {
+                    ordered_bytes = @bitCast(predicate.valueToRangeI128(value) orelse return false);
+                    break :blk &ordered_bytes;
+                },
+            };
+            const gop = try seen.getOrPut(a, key);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = try a.dupe(u8, key);
+            gop.value_ptr.* = switch (value) {
+                .text => .{ .text = gop.key_ptr.* },
+                else => value,
+            };
+            if (seen.count() > cap) return false;
+        }
+        return true;
+    }
+};
+
+/// A key column's cell as a `Value` whose equality is byte equality, or
+/// null for the types where it isn't (floats, JSON) or that have no `Value`
+/// form here.
+fn keyCellValue(view: ColumnView, row: usize) ?types.Value {
+    return switch (view.data) {
+        .int => |s| .{ .int = s[row] },
+        .bigint => |s| .{ .bigint = s[row] },
+        .tinyint => |s| .{ .tinyint = s[row] },
+        .smallint => |s| .{ .smallint = s[row] },
+        .date => |s| .{ .date = s[row] },
+        .datetime => |s| .{ .datetime = s[row] },
+        .decimal64 => |s| .{ .decimal64 = s[row] },
+        .largeint => |s| .{ .largeint = s[row] },
+        .varchar, .string, .char => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        else => null,
+    };
+}
+
+/// Slot `k`'s distinct values across every thread's `State`, copied into
+/// `out`, or null past `cap`. Numeric values come sorted (an IN list's
+/// numeric evaluator sorts its copy, fast when already in order); text needs
+/// no order.
+fn mergeKeySets(out: Allocator, states: []KeyCollect.State, k: usize, cap: usize) !?[]const types.Value {
+    // The largest thread's set takes in the others': threads mostly see the
+    // same keys. Every thread's keys and values stay in its arena until the
+    // pass ends.
+    var base = &states[0];
+    for (states[1..]) |*st| {
+        if (st.seen[k].count() > base.seen[k].count()) base = st;
+    }
+    const merged = &base.seen[k];
+    for (states) |*st| {
+        if (st == base) continue;
+        var it = st.seen[k].iterator();
+        while (it.next()) |e| {
+            const gop = try merged.getOrPut(base.arena.allocator(), e.key_ptr.*);
+            if (gop.found_existing) continue;
+            gop.value_ptr.* = e.value_ptr.*;
+            if (merged.count() > cap) return null;
+        }
+    }
+    const owned = try out.alloc(types.Value, merged.count());
+    var it = merged.valueIterator();
+    var text = false;
+    for (owned) |*o| {
+        const v = it.next().?.*;
+        o.* = switch (v) {
+            .text => |t| blk: {
+                text = true;
+                break :blk .{ .text = try out.dupe(u8, t) };
+            },
+            else => v,
+        };
+    }
+    if (!text) std.sort.pdq(types.Value, owned, {}, valueLess);
+    return owned;
+}
+
+fn valueLess(_: void, a: types.Value, b: types.Value) bool {
+    return a.compare(b) == .lt;
+}
+
 /// Per-chunk leaf for composed probe+aggregate fusion: pulls the chunk's
 /// scan, runs each batch through the join's ProbeSink, and emits the joined
 /// batches — the per-chunk partial Aggregate built on top drains this inside
@@ -2463,7 +2777,10 @@ const ProbeChunkScan = struct {
         return self.ps.workers[self.chunk].addPrune(pred);
     }
 
+    /// A row-level offer would fuse a filter into a worker mid-probe; the
+    /// offering consumer drops those rows anyway.
     pub fn addPruneSet(self: *ProbeChunkScan, set: predicate.InSet) !void {
+        if (set.rows) return;
         return self.ps.workers[self.chunk].addPruneSet(set);
     }
 

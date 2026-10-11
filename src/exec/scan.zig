@@ -423,6 +423,10 @@ pub const Scan = struct {
     /// A long text IN list's literals (or their FSST encodings), probed by
     /// hash rather than compared one by one.
     text_in_set: std.StringHashMapUnmanaged(void) = .empty,
+    /// The literals `text_in_set` holds, while it holds a list's own text
+    /// (a fused filter's list stays put for the scan's life, so each row
+    /// group reuses it); null while it holds anything else.
+    text_in_set_of: ?[]const Value = null,
     /// The current row group's survivor row indices (`survivorRows`), shared
     /// by every projected column's gather.
     survivor_rows: []u32 = &.{},
@@ -667,7 +671,7 @@ pub const Scan = struct {
         /// `Scan.segs`). The orchestrator owns this and frees it once every
         /// worker has duped its own copy; null when the capturer didn't ask
         /// for it (callers that only need counts).
-        segments: []storage.ManifestEntry = &.{},
+        segments: []const storage.ManifestEntry = &.{},
     };
 
     /// Capture a consistent snapshot, pinning the memtable and (when
@@ -1247,32 +1251,8 @@ pub const Scan = struct {
         // no-op.
         var coerced = expr;
         try predicate.validateExpr(&coerced, self.table.schema.columns);
-        if (self.fused_filter) |existing| {
-            // SECOND fusion (any filter layered
-            // over a block whose WHERE already fused): conjoin. Only when the
-            // new predicate references projected columns exclusively — the
-            // eval state built for the first filter (its unprojected-column
-            // decode set) then stays valid as-is. The arms slice is owned via
-            // filter_rewritten, freed at deinit like orderPredicate's copies.
-            var refs: std.ArrayListUnmanaged(usize) = .empty;
-            defer refs.deinit(self.allocator);
-            try collectPredicateColumns(self.allocator, coerced, self.table.schema.columns, &refs);
-            for (refs.items) |phys| {
-                var projected = false;
-                for (self.out_phys) |o| {
-                    if (o == phys) {
-                        projected = true;
-                        break;
-                    }
-                }
-                if (!projected) return false;
-            }
-            const arms = try self.allocator.alloc(PredicateExpr, 2);
-            errdefer self.allocator.free(arms);
-            arms[0] = existing;
-            arms[1] = coerced;
-            try self.filter_rewritten.append(self.allocator, arms);
-            self.fused_filter = .{ .@"and" = arms };
+        if (self.fused_filter != null) {
+            if (!try self.conjoinFusedFilter(coerced)) return false;
             try self.extractPruneHints(coerced);
             self.keyBloomPrunePass() catch {};
             try self.orderFusedConjuncts();
@@ -1283,6 +1263,45 @@ pub const Scan = struct {
         try self.extractPruneHints(coerced);
         self.keyBloomPrunePass() catch {};
         try self.orderFusedConjuncts();
+        return true;
+    }
+
+    /// Evaluate `src`'s fused filter as `src` does: over the same table, with
+    /// its hints taken over by `copyPrunesFrom`, it is already validated and
+    /// its conjuncts ordered. `src` must outlive this scan.
+    pub fn adoptFusedFilter(self: *Scan, src: *const Scan) !bool {
+        const expr = src.fused_filter orelse return true;
+        if (self.out_phys.len == 0) return false;
+        self.fused_filter = expr;
+        try self.setupFilterEval(expr);
+        return true;
+    }
+
+    /// SECOND fusion (any filter layered over a block whose WHERE already
+    /// fused): AND validated `coerced` after the fused filter's conjuncts,
+    /// keeping the conjunction flat (the guided block path declines a nested
+    /// AND). Only when it references projected columns exclusively — the
+    /// eval state built for the first filter (its unprojected-column decode
+    /// set) then stays valid as-is. The arms slice is owned via
+    /// filter_rewritten, freed at deinit like orderPredicate's copies.
+    fn conjoinFusedFilter(self: *Scan, coerced: PredicateExpr) !bool {
+        const existing = self.fused_filter.?;
+        var refs: std.ArrayListUnmanaged(usize) = .empty;
+        defer refs.deinit(self.allocator);
+        try collectPredicateColumns(self.allocator, coerced, self.table.schema.columns, &refs);
+        for (refs.items) |phys| {
+            if (std.mem.indexOfScalar(usize, self.out_phys, phys) == null) return false;
+        }
+        const lead: []const PredicateExpr = switch (existing) {
+            .@"and" => |children| children,
+            else => (&existing)[0..1],
+        };
+        const arms = try self.allocator.alloc(PredicateExpr, lead.len + 1);
+        errdefer self.allocator.free(arms);
+        @memcpy(arms[0..lead.len], lead);
+        arms[lead.len] = coerced;
+        try self.filter_rewritten.append(self.allocator, arms);
+        self.fused_filter = .{ .@"and" = arms };
         return true;
     }
 
@@ -1572,6 +1591,11 @@ pub const Scan = struct {
     /// own hints on the column rule out can't match, so it doesn't count: a
     /// set disjoint from `col = v` skips everything.
     pub fn addPruneSet(self: *Scan, set: predicate.InSet) !void {
+        if (set.rows) return self.addRowSet(set);
+        return self.addZonemapSet(set);
+    }
+
+    fn addZonemapSet(self: *Scan, set: predicate.InSet) !void {
         if (set.negate) return;
         const col_idx = types.findColumn(self.table.schema.columns, set.col) orelse return Error.ColumnNotFound;
         const col_type = self.table.schema.columns[col_idx].type;
@@ -1597,6 +1621,51 @@ pub const Scan = struct {
         self.in_prunes.appendAssumeCapacity(.{ .col_idx = col_idx, .values = values });
         try self.markPruned();
     }
+
+    /// Take on every row-group and segment skip `src` has: a second scan
+    /// over the same table, snapshot and segment list then skips exactly
+    /// what `src` does. The range and key-set hints borrow `src`'s values,
+    /// so `src` must outlive this scan.
+    pub fn copyPrunesFrom(self: *Scan, src: *const Scan) !void {
+        std.debug.assert(self.table == src.table and self.segs.len == src.segs.len);
+        try self.prunes.appendSlice(self.allocator, src.prunes.items);
+        try self.key_in_sets.appendSlice(self.allocator, src.key_in_sets.items);
+        try self.in_prunes.ensureUnusedCapacity(self.allocator, src.in_prunes.items.len);
+        for (src.in_prunes.items) |hint| {
+            self.in_prunes.appendAssumeCapacity(.{ .col_idx = hint.col_idx, .values = try self.allocator.dupe(i128, hint.values) });
+        }
+        if (src.seg_skip) |skip| {
+            if (self.seg_skip) |own| {
+                for (own, skip) |*o, s| o.* = o.* or s;
+            } else self.seg_skip = try self.allocator.dupe(bool, skip);
+        }
+        if (src.prunes.items.len + src.in_prunes.items.len > 0 or src.seg_skip != null) try self.markPruned();
+    }
+
+    /// `addPruneSet` for a row-level offer (`InSet.rows`): the rows outside
+    /// the set are also filtered out here, as a fused `IN` conjunct, so the
+    /// consumers above never see them. A set the scan can't fuse keeps only
+    /// the row-group skip; the offering consumer drops those rows anyway.
+    fn addRowSet(self: *Scan, set: predicate.InSet) !void {
+        if (set.negate) return;
+        var hint = set;
+        hint.rows = false;
+        if (set.values.len <= ROW_SET_ZONEMAP_MAX) try self.addZonemapSet(hint);
+        if (self.fused_filter == null or self.out_phys.len == 0) {
+            _ = try self.tryFuseFilter(.{ .in_set = hint });
+            return;
+        }
+        // Last, after the conjuncts the WHERE already ordered: it then only
+        // tests their survivors, and the scan skips re-ordering (which
+        // merges every column's stats over every segment, per offer).
+        var coerced: PredicateExpr = .{ .in_set = hint };
+        try predicate.validateExpr(&coerced, self.table.schema.columns);
+        _ = try self.conjoinFusedFilter(coerced);
+    }
+
+    /// Longest row-level offer the row-group skip still tests: it checks
+    /// every value against every group's range.
+    pub const ROW_SET_ZONEMAP_MAX = 1024;
 
     /// Whether some value of `values` lies in `range`'s [min, max].
     fn setOverlaps(values: []const i128, range: storage.format.Stats) bool {
@@ -3038,6 +3107,8 @@ pub const Scan = struct {
         active: ?[]const bool,
         out: []bool,
     ) !bool {
+        // The buffer holds another group's literals at the same address.
+        self.text_in_set_of = null;
         self.or_set_values.clearRetainingCapacity();
         try self.or_set_values.ensureTotalCapacity(self.allocator, g.count);
         var last: ?SetArmLookup = null;
@@ -3227,11 +3298,16 @@ pub const Scan = struct {
     /// set is valid until the next call.
     fn textInSet(self: *Scan, values: []const Value) !TextInSet {
         if (values.len <= predicate.IN_SET_LINEAR_MAX) return .{ .values = values, .hashed = null };
+        if (self.text_in_set_of) |held| {
+            if (held.ptr == values.ptr and held.len == values.len) return .{ .values = values, .hashed = &self.text_in_set };
+        }
+        self.text_in_set_of = null;
         self.text_in_set.clearRetainingCapacity();
         try self.text_in_set.ensureTotalCapacity(self.allocator, @intCast(values.len));
         for (values) |v| {
             if (v == .text) self.text_in_set.putAssumeCapacity(v.text, {});
         }
+        self.text_in_set_of = values;
         return .{ .values = values, .hashed = &self.text_in_set };
     }
 
@@ -3303,6 +3379,7 @@ pub const Scan = struct {
             try ends.append(allocator, comp.items.len);
         }
         if (ends.items.len > predicate.IN_SET_LINEAR_MAX) {
+            self.text_in_set_of = null;
             self.text_in_set.clearRetainingCapacity();
             try self.text_in_set.ensureTotalCapacity(allocator, @intCast(ends.items.len));
             var start: usize = 0;
@@ -4444,6 +4521,7 @@ pub const Scan = struct {
         }
         self.or_set_values.clearAndFree(self.allocator);
         self.text_in_set.clearAndFree(self.allocator);
+        self.text_in_set_of = null;
         if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
         self.survivor_rows = &.{};
         for (self.code_bufs) |*b| b.clearAndFree(self.allocator);

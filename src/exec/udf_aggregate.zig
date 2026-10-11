@@ -235,6 +235,10 @@ pub const UdfAggregate = struct {
         return exec.aggregate_op.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
 
+    pub fn rowSetTargetRows(self: *UdfAggregate, col: []const u8) u64 {
+        return exec.aggregate_op.group_row_set_target_rows(self.upstream, self.output_schema, self.group_col_indices, col);
+    }
+
     pub fn stats(self: *UdfAggregate) exec.PipelineStats {
         const upstream_stats = self.upstream.stats();
         return .{

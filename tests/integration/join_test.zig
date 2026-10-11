@@ -3271,6 +3271,46 @@ test "join: a small build key set prunes the probe side without changing results
     }
 }
 
+// A join learns its probe side's keys before building and filters the build
+// side's scan rows to them. Only build rows the join can't match may go: a
+// preserved build side, a LIMIT or a window in the build input, and NULL keys
+// under `<=>` keep every row. (Tests run the pass whatever the input sizes.)
+test "join: probe keys filter the build side without changing results" {
+    const allocator = std.testing.allocator;
+    const helpers = @import("sql_helpers.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openKeySetDb(allocator, tmp.dir);
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE nk (k BIGINT, s VARCHAR(8), v BIGINT NOT NULL, PRIMARY KEY (v))");
+    try helpers.exec(allocator, db, "INSERT INTO nk VALUES (1, 'a', 1), (1, 'a', 2), (2, 'b', 3), (NULL, NULL, 4), (NULL, NULL, 5), (3, 'c', 6), (4, 'd', 7)");
+
+    const odd_groups = "(SELECT k, COUNT(*) AS n FROM fact WHERE c = 1 GROUP BY k) t";
+    const cases = .{
+        .{ "SELECT COUNT(*) * 100000 + SUM(t.n) FROM fact f JOIN " ++ odd_groups ++ " ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{16012800} },
+        .{ "SELECT COUNT(*) * 100000 + COUNT(t.n) FROM fact f LEFT JOIN " ++ odd_groups ++ " ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{28000160} },
+        .{ "SELECT COUNT(*) * 100000 + COUNT(f.k) FROM fact f RIGHT JOIN " ++ odd_groups ++ " ON t.k = f.k AND f.k IN (3, 17, 40)", &[_]i64{20800160} },
+        .{ "SELECT COUNT(*) FROM (SELECT k FROM fact WHERE k IN (3, 40)) f FULL JOIN " ++ odd_groups ++ " ON t.k = f.k", &[_]i64{249} },
+        .{ "SELECT COUNT(*) * 100000 + SUM(t.n) FROM fact f JOIN (SELECT k, c, COUNT(*) AS n FROM fact WHERE c >= 0 GROUP BY k, c) t ON t.k = f.k AND t.c = f.c WHERE f.k IN (3, 40)", &[_]i64{20020800} },
+        .{ "SELECT COUNT(*) FROM fact f JOIN (SELECT k, COUNT(*) AS n FROM fact WHERE c = 1 GROUP BY k ORDER BY k LIMIT 3) t ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{80} },
+        .{ "SELECT SUM(t.rn) FROM fact f JOIN (SELECT k, ROW_NUMBER() OVER (ORDER BY k) AS rn FROM (SELECT DISTINCT k FROM fact WHERE c = 1) d) t ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{880} },
+        .{ "SELECT COUNT(*) FROM fact f JOIN (SELECT k, COUNT(*) AS n FROM fact GROUP BY k HAVING COUNT(*) > 100) t ON t.k = f.k WHERE f.k IN (3, 40, 41)", &[_]i64{260} },
+        .{ "SELECT COUNT(*) FROM nk a JOIN (SELECT k, COUNT(*) AS n FROM nk WHERE v > 0 GROUP BY k) b ON a.k = b.k WHERE a.v < 6", &[_]i64{3} },
+        .{ "SELECT COUNT(*) FROM nk a JOIN (SELECT k, COUNT(*) AS n FROM nk WHERE v > 0 GROUP BY k) b ON a.k <=> b.k WHERE a.v < 6", &[_]i64{5} },
+        .{ "SELECT COUNT(*) * 100 + COUNT(b.n) FROM nk a LEFT JOIN (SELECT s, COUNT(*) AS n FROM nk WHERE v > 0 GROUP BY s) b ON a.s = b.s WHERE a.v IN (1, 4, 6)", &[_]i64{302} },
+        .{ "SELECT COUNT(*) * 100000 + SUM(t.n) FROM fact f JOIN (SELECT g.k AS k, COUNT(*) AS n FROM fact g JOIN dim d ON d.c = g.c GROUP BY g.k) t ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{28065600} },
+        .{ "SELECT COUNT(*) * 100000 + COUNT(t.n) FROM fact f LEFT JOIN (SELECT g.k AS k, COUNT(*) AS n FROM fact g JOIN dim d ON d.c = g.c WHERE g.k <> 17 GROUP BY g.k) t ON t.k = f.k WHERE f.k IN (3, 17, 40)", &[_]i64{28000200} },
+        .{ "SELECT COUNT(*) * 100000 + SUM(t.n) FROM fact f JOIN (SELECT g.k AS k, COUNT(*) AS n FROM fact g JOIN dim d ON d.k = g.k GROUP BY g.k) t ON t.k = f.k WHERE f.k IN (3, 40, 50)", &[_]i64{20020800} },
+        .{ "SELECT COUNT(*) FROM fact f JOIN (SELECT g.k AS k, COUNT(*) AS n FROM fact g JOIN dim d ON d.c = g.c GROUP BY g.k ORDER BY n DESC, g.k LIMIT 5) t ON t.k = f.k WHERE f.k IN (3, 17, 40, 97)", &[_]i64{0} },
+    };
+    inline for (cases) |case| {
+        errdefer std.debug.print("case: {s}\n", .{case[0]});
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
+
 test "join: a key pinned on one input filters the other input's key" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

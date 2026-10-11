@@ -17,6 +17,7 @@
 //!   - HLL / peek-scan for refined cardinality before materialization
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -39,6 +40,10 @@ const Error = exec.Error;
 const makeQuery = exec.makeQuery;
 const cast = @import("cast.zig");
 const Compute = @import("compute.zig").Compute;
+const ParallelScan = exec.ParallelScan;
+const MAX_KEY_SETS = @import("parallel_scan.zig").MAX_KEY_SETS;
+const RadixAggregate = @import("radix_aggregate.zig").RadixAggregate;
+const RadixLeaseAggregate = @import("radix_aggregate.zig").RadixLeaseAggregate;
 const udf_mod = @import("../udf.zig");
 const scalar_fn = @import("scalar_fn.zig");
 const decimal = @import("scalar_fn_decimal.zig");
@@ -1409,6 +1414,9 @@ pub const Join = struct {
     /// Per `on` pair: whether it matches NULL to NULL (`KeyPair.null_safe`).
     /// Empty when no pair does. Arena-owned.
     null_safe_keys: []const bool = &.{},
+    /// Per `on` pair: both key columns hold one type, so a set of one
+    /// side's key values reads the same on the other side. Arena-owned.
+    same_key_types: []const bool,
 
     /// Optional skew detector. Set when Spec.skew_ratio_threshold > 0;
     /// observed during buildPhase, checked at end. Allocated in
@@ -1684,6 +1692,8 @@ pub const Join = struct {
             }
         }
         const null_safe_keys = try nullSafeKeyFlags(aa, spec.on);
+        const same_key_types = try aa.alloc(bool, spec.on.len);
+        for (left_keys, right_keys, same_key_types) |l, r, *same| same.* = sameValueType(left_schema[l].type, right_schema[r].type);
 
         // Resolve range predicates into column indices.
         const resolved_ranges = try aa.alloc(Join.ResolvedRange, spec.ranges.len);
@@ -1802,6 +1812,7 @@ pub const Join = struct {
             .left_key_names = left_key_names,
             .right_key_names = right_key_names,
             .null_safe_keys = null_safe_keys,
+            .same_key_types = same_key_types,
             .left_key_indices = left_keys,
             .right_key_indices = right_keys,
             .ranges = resolved_ranges,
@@ -2038,18 +2049,106 @@ pub const Join = struct {
     }
 
     fn offerPrune(self: *Join, offer: exec.PruneOffer) !void {
-        // Push pruning to both sides; each will only accept predicates
-        // referencing its own columns (via the column-not-found check
-        // in its addPrune). The other side silently ignores via the
-        // existing error path.
-        offer.offerTo(&self.left, offer.column()) catch |e| switch (e) {
-            error.ColumnNotFound => {},
-            else => return e,
+        // An output column belongs to one side: the other side could match
+        // the name's tail to a different column of its own. A name outside
+        // the output goes to whichever side holds it.
+        const idx = types.findColumn(self.output_schema, offer.column()) orelse {
+            try offerIgnoringMissing(&self.left, offer, offer.column());
+            return offerIgnoringMissing(&self.right, offer, offer.column());
         };
-        offer.offerTo(&self.right, offer.column()) catch |e| switch (e) {
-            error.ColumnNotFound => {},
-            else => return e,
+        const from_left = idx < self.left_col_count;
+        const name = self.output_schema[idx].name;
+        try offerIgnoringMissing(if (from_left) &self.left else &self.right, offer, name);
+        const set = switch (offer) {
+            .set => |set| set,
+            .range => return,
         };
+        if (!set.rows) return;
+        for (0..self.left_key_names.len) |k| {
+            const across = self.keyAcross(k, from_left, name) orelse continue;
+            try offerIgnoringMissing(if (from_left) &self.right else &self.left, .{ .set = set }, across);
+        }
+    }
+
+    /// `offerPrune`'s routing for a row-level set: the side that holds
+    /// `col`, plus the other side through every key `col` is.
+    pub fn rowSetTargetRows(self: *Join, col: []const u8) u64 {
+        const idx = types.findColumn(self.output_schema, col) orelse return 0;
+        const from_left = idx < self.left_col_count;
+        const name = self.output_schema[idx].name;
+        var rows = (if (from_left) self.left else self.right).rowSetTargetRows(name);
+        for (0..self.left_key_names.len) |k| {
+            const across = self.keyAcross(k, from_left, name) orelse continue;
+            rows +|= (if (from_left) self.right else self.left).rowSetTargetRows(across);
+        }
+        return rows;
+    }
+
+    /// The other side's key of pair `k` when `name` is this side's. A
+    /// row-level offer on one key holds for the other: an output row's two
+    /// keys are equal (or both NULL under `<=>`) and the offering consumer
+    /// drops NULL, so a row the other side drops for its key loses only
+    /// output rows the consumer drops, whatever the join type.
+    fn keyAcross(self: *Join, k: usize, from_left: bool, name: []const u8) ?[]const u8 {
+        if (!self.same_key_types[k]) return null;
+        const own = if (from_left) self.left_key_names[k] else self.right_key_names[k];
+        if (!sameColumnOf(if (from_left) self.left else self.right, name, own)) return null;
+        return if (from_left) self.right_key_names[k] else self.left_key_names[k];
+    }
+
+    /// Sideways information passing toward the build: before building, read
+    /// the probe side's distinct join keys straight off its table scan and
+    /// offer each key's set to the build side as a row filter. A build row
+    /// whose key no probe row carries never matches, and an unpreserved
+    /// build side emits nothing for it, so the build subtree's scans may
+    /// drop it before it is aggregated or joined. The probe's rows are a
+    /// subset of what its scan reads, so the sets hold every key that can
+    /// match. Runs only where the extra pass pays: the scans the sets can
+    /// filter read at least twice the probe scan's rows (exact counts from
+    /// segment footers), and every set stays under a cap.
+    fn offerProbeKeys(self: *Join) void {
+        const build_preserved = switch (self.join_type) {
+            .inner => false,
+            .left => self.build_is_left,
+            .right => !self.build_is_left,
+            .full => true,
+        };
+        if (build_preserved or self.left_key_names.len > MAX_KEY_SETS) return;
+        const probe = if (self.build_is_left) self.right else self.left;
+        const build = if (self.build_is_left) &self.left else &self.right;
+        const probe_names = if (self.build_is_left) self.right_key_names else self.left_key_names;
+        const build_names = if (self.build_is_left) self.left_key_names else self.right_key_names;
+
+        var leaf: ?*ParallelScan = null;
+        var cols: [MAX_KEY_SETS]?[]const u8 = @splat(null);
+        var build_rows: u64 = 0;
+        for (probe_names, build_names, 0..) |pname, bname, k| {
+            if (keyIsNullSafe(self.null_safe_keys, k) or !self.same_key_types[k]) continue;
+            const rows = build.rowSetTargetRows(bname);
+            if (rows == 0) continue;
+            const source = keySource(probe, pname) orelse continue;
+            if (leaf != null and leaf.? != source.scan) continue;
+            leaf = source.scan;
+            cols[k] = source.col;
+            build_rows = @max(build_rows, rows);
+        }
+        const scan = leaf orelse return;
+        const probe_rows = scan.prunedTableRows() orelse return;
+        if (PROBE_KEY_SIZE_GATE and (build_rows < PROBE_KEY_MIN_BUILD_ROWS or build_rows / 2 < probe_rows)) return;
+
+        const t0 = exec.prof.nowTicks();
+        // The pass only ever saves work, so a failure skips it.
+        const sets = (scan.collectKeySets(self.arena.allocator(), cols[0..probe_names.len], PROBE_KEY_SET_MAX) catch null) orelse return;
+        var offered: usize = 0;
+        for (sets, build_names) |maybe, bname| {
+            const values = maybe orelse continue;
+            if (values.len == 0) continue;
+            build.addPruneSet(.{ .col = bname, .values = values, .negate = false, .rows = true }) catch continue;
+            offered += 1;
+        }
+        if (getenv("THINDB_TRACE_JOINFUSE") != null) {
+            std.debug.print("[jf] probe-key filter: {d} probe rows, {d} build rows, {d} sets offered ({d:.1} ms)\n", .{ probe_rows, build_rows, offered, exec.prof.ticksToMs(exec.prof.nowTicks() - t0) });
+        }
     }
 
     /// Pre-execution stats on join output.
@@ -2154,6 +2253,7 @@ pub const Join = struct {
         while (true) {
             switch (self.phase) {
                 .building => {
+                    self.offerProbeKeys();
                     if (self.probe_fused and try self.empty_fused_probe()) {
                         self.finishPhase();
                         return null;
@@ -3626,6 +3726,79 @@ pub fn joinKeysCovered(state: exec.SortState, on: []const KeyPair, side: KeySide
 
 fn columnIndex(schema: []const Column, name: []const u8) ?usize {
     return types.findColumn(schema, name);
+}
+
+/// Distinct values a probe key may hold for the build side to filter on.
+/// Past it the IN conjunct costs the build scans more than it saves.
+const PROBE_KEY_SET_MAX = 1 << 16;
+/// Build-side scan rows below which a probe-key pass's fixed cost (threads,
+/// a second read of the probe table) outweighs the build work it can save.
+const PROBE_KEY_MIN_BUILD_ROWS = 1 << 20;
+/// Tests run the pass on every eligible join whatever the sizes, so the
+/// suites' joins check its results.
+const PROBE_KEY_SIZE_GATE = !builtin.is_test;
+
+/// Whether a set of one column's values reads the same against the other:
+/// one type, or two string types (keys compare as bytes).
+fn sameValueType(a: Type, b: Type) bool {
+    const at = typeTag(a);
+    const bt = typeTag(b);
+    if (at == .json or bt == .json) return false;
+    return std.meta.eql(a, b) or (isStringTag(at) and isStringTag(bt));
+}
+
+fn offerIgnoringMissing(input: *Query, offer: exec.PruneOffer, col: []const u8) !void {
+    offer.offerTo(input, col) catch |e| switch (e) {
+        error.ColumnNotFound => {},
+        else => return e,
+    };
+}
+
+/// Whether `a` and `b` name one input column of `side`: equal names, or
+/// a rename beside its source, as the parser stages ON keys
+/// (`__join_on_right_N`), in a Compute or fused into the scan.
+fn sameColumnOf(side: Query, a: []const u8, b: []const u8) bool {
+    if (types.columnNameEql(a, b)) return true;
+    if (exec.queryAs(Compute, side)) |c| {
+        const input = c.output_schema[0..c.in_width];
+        const sa = (c.inputColumnName(a) catch return false) orelse return false;
+        const sb = (c.inputColumnName(b) catch return false) orelse return false;
+        const ia = types.findColumn(input, sa) orelse return false;
+        return ia == types.findColumn(input, sb);
+    }
+    if (exec.queryAs(ParallelScan, side)) |ps| return ps.sameLeafColumn(a, b);
+    return false;
+}
+
+const ColumnInput = struct { q: Query, col: []const u8 };
+
+/// The input of single-input operator `q` and its name for output column
+/// `col`, when every value of `col` comes from that input column: `q`
+/// passes it through unchanged, or groups on it.
+fn columnInput(q: Query, col: []const u8) ?ColumnInput {
+    if (exec.queryAs(exec.Filter, q)) |f| return .{ .q = f.upstream, .col = col };
+    if (exec.queryAs(Compute, q)) |c| return .{ .q = c.upstream, .col = (c.inputColumnName(col) catch return null) orelse return null };
+    if (exec.queryAs(exec.AliasRename, q)) |a| return .{ .q = a.upstream, .col = a.inputColumnName(col) catch return null };
+    if (exec.queryAs(exec.Project, q)) |p| return .{ .q = p.upstream, .col = (p.inputColumnName(col) catch return null) orelse return null };
+    inline for (.{ exec.Aggregate, exec.aggregate_op.SortedAggregate, RadixAggregate, RadixLeaseAggregate, exec.UdfAggregate }) |Agg| {
+        if (exec.queryAs(Agg, q)) |a| return .{ .q = a.upstream, .col = exec.aggregate_op.group_input_name(a.upstream, a.output_schema, a.group_col_indices, col) orelse return null };
+    }
+    return null;
+}
+
+const KeySource = struct { scan: *ParallelScan, col: []const u8 };
+
+/// The table scan column every value of `col` in `q`'s output comes from,
+/// through operators that pass values through unchanged and only drop rows,
+/// or join inputs (a join adds nothing but NULLs).
+fn keySource(q: Query, col: []const u8) ?KeySource {
+    if (exec.queryAs(ParallelScan, q)) |ps| return .{ .scan = ps, .col = ps.leafColumnName(col) orelse return null };
+    if (exec.queryAs(Join, q)) |j| {
+        const idx = types.findColumn(j.output_schema, col) orelse return null;
+        return keySource(if (idx < j.left_col_count) j.left else j.right, j.output_schema[idx].name);
+    }
+    const input = columnInput(q, col) orelse return null;
+    return keySource(input.q, input.col);
 }
 
 fn isStringTag(t: TypeTag) bool {

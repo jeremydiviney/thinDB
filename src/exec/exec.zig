@@ -276,6 +276,13 @@ pub const VTable = struct {
     /// `set.values` are used. The values stay valid while the offering
     /// operator lives. Operators without `addPruneSet` drop the hint.
     addPruneSet: *const fn (ptr: *anyopaque, set: predicate.InSet) anyerror!void,
+    /// Table rows a row-level `addPruneSet` (`InSet.rows`) on output column
+    /// `col` would filter in this subtree, summed over the scans it reaches:
+    /// an operator that passes `col` through and only drops rows forwards
+    /// it, and a scan that would fuse the set counts the rows it reads
+    /// (exact counts from segment footers). Zero where the offer stops,
+    /// the default for an operator without `rowSetTargetRows`.
+    rowSetTargetRows: *const fn (ptr: *anyopaque, col: []const u8) u64,
     /// Offer a full predicate to this operator for in-place evaluation. The
     /// Scan accepts (returns true) and applies the filter directly over its
     /// borrowed cache bytes, emitting compacted owned survivors. Every other
@@ -892,6 +899,10 @@ pub const Query = struct {
         return self.vtable.addPruneSet(self.ptr, set);
     }
 
+    pub fn rowSetTargetRows(self: Query, col: []const u8) u64 {
+        return self.vtable.rowSetTargetRows(self.ptr, col);
+    }
+
     /// Offer a join-probe sink for in-worker probing (see `ProbeSink`).
     pub fn tryFuseProbe(self: Query, sink: ProbeSink) !bool {
         return self.vtable.tryFuseProbe(self.ptr, sink);
@@ -1254,6 +1265,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.addPruneSet(set);
         }
+        fn rowSetTargetRowsWrap(ptr: *anyopaque, col: []const u8) u64 {
+            if (!@hasDecl(Op, "rowSetTargetRows")) return 0;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.rowSetTargetRows(col);
+        }
         fn tryFuseFilterWrap(ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool {
             if (!@hasDecl(Op, "tryFuseFilter")) return false;
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -1343,6 +1359,7 @@ fn OpWrapper(comptime Op: type) type {
             .outputSchema = outputSchemaWrap,
             .addPrune = addPruneWrap,
             .addPruneSet = addPruneSetWrap,
+            .rowSetTargetRows = rowSetTargetRowsWrap,
             .tryFuseFilter = tryFuseFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,

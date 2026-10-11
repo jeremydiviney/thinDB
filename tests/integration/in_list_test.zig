@@ -157,3 +157,43 @@ test "in-list: literals of another type prune row groups without losing rows" {
         try std.testing.expectEqualSlices(i64, case[1], got);
     }
 }
+
+test "in-list: equal-length lists on different columns each test their own literals" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, a VARCHAR(8) NOT NULL, b VARCHAR(8) NOT NULL)");
+    var insert: std.ArrayList(u8) = .empty;
+    defer insert.deinit(allocator);
+    try insert.appendSlice(allocator, "INSERT INTO s VALUES ");
+    for (0..60) |i| {
+        if (i > 0) try insert.appendSlice(allocator, ", ");
+        try insert.print(allocator, "({d}, 'v{d}', 'v{d}')", .{ i, i % 20, (i * 7) % 20 });
+    }
+    try exec(allocator, db, insert.items);
+    try (try db.openTable("s", .{})).flush();
+
+    // Nine literals per column: past the length compared one by one, so
+    // each column's list is hashed in turn from the same scratch buffer.
+    var not_in: i64 = 0;
+    var in: i64 = 0;
+    for (0..60) |i| {
+        const a_listed = i % 20 <= 8;
+        const b_listed = (i * 7) % 20 >= 10 and (i * 7) % 20 <= 18;
+        if (!a_listed and !b_listed) not_in += 1;
+        if (a_listed and b_listed) in += 1;
+    }
+    const cases = .{
+        .{ "SELECT id FROM s WHERE a NOT IN ('v0', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7', 'v8') " ++
+            "AND b NOT IN ('v10', 'v11', 'v12', 'v13', 'v14', 'v15', 'v16', 'v17', 'v18')", not_in },
+        .{ "SELECT id FROM s WHERE (a = 'v0' OR a = 'v1' OR a = 'v2' OR a = 'v3' OR a = 'v4' OR a = 'v5' OR a = 'v6' OR a = 'v7' OR a = 'v8') " ++
+            "AND (b = 'v10' OR b = 'v11' OR b = 'v12' OR b = 'v13' OR b = 'v14' OR b = 'v15' OR b = 'v16' OR b = 'v17' OR b = 'v18')", in },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, c[0]);
+        defer allocator.free(ids);
+        try std.testing.expectEqual(@as(usize, @intCast(c[1])), ids.len);
+    }
+}
