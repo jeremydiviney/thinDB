@@ -1413,9 +1413,9 @@ fn stripIdentifierQuotes(s_in: []const u8) []const u8 {
 }
 
 /// ERR packet for a failed compile. A reference no operator could ever bind,
-/// as the compile reported it, is named the way MySQL names it
-/// (ER_BAD_FIELD_ERROR, ER_SP_DOES_NOT_EXIST); otherwise the mapped internal
-/// error stands.
+/// or one two columns answer to, as the compile reported it, is named the way
+/// MySQL names it (ER_BAD_FIELD_ERROR, ER_SP_DOES_NOT_EXIST,
+/// ER_NON_UNIQ_ERROR); otherwise the mapped internal error stands.
 fn sendCompileError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: anyerror, unbound: ?local.Unbound) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1424,11 +1424,13 @@ fn sendCompileError(allocator: Allocator, w: *std.Io.Writer, seq_id: u8, err: an
         const named = switch (u) {
             .column => |c| std.fmt.allocPrint(aa, "Unknown column '{s}' in 'field list'", .{c}),
             .function => |f| std.fmt.allocPrint(aa, "FUNCTION {s} does not exist", .{f}),
+            .ambiguous_column => |c| std.fmt.allocPrint(aa, "Column '{s}' in field list is ambiguous", .{c}),
         };
         if (named) |msg| {
             const code: u16, const sqlstate: [5]u8 = switch (u) {
                 .column => .{ 1054, "42S22".* },
                 .function => .{ 1305, "42000".* },
+                .ambiguous_column => .{ 1052, "23000".* },
             };
             return handshake.sendErrPacket(allocator, w, seq_id, code, sqlstate, msg);
         } else |_| {}
