@@ -131,6 +131,23 @@ pub const CoreScheduler = struct {
         return total;
     }
 
+    /// Hardware threads no lease holds right now: the spare capacity a fan-out
+    /// can use without time-slicing against other statements' workers. A
+    /// snapshot for sizing only, never an admission gate. The oversubscription
+    /// slot (`capacity` is hardware threads + 1) doesn't count as idle. No
+    /// accounting (disabled, or no topology) reports unlimited.
+    pub fn idleHardwareThreads(self: *CoreScheduler) usize {
+        if (self.disabled or self.cores.len == 0) return std.math.maxInt(usize);
+        self.lock.lock();
+        defer self.lock.unlock();
+        var idle: usize = 0;
+        for (self.cores) |s| {
+            const hw: u16 = s.capacity - 1;
+            if (s.leased < hw) idle += hw - s.leased;
+        }
+        return idle;
+    }
+
     /// Lease one core for the calling thread and pin to it. Blocks (sleep-poll)
     /// until a slot frees when the bucket is full — UNLESS this thread already
     /// holds a core, in which case it returns a non-owning lease immediately
@@ -273,6 +290,25 @@ test "capacity full then a freed slot reopens" {
     s.cores[0].leased -= 1; // free one slot on core 0
     try std.testing.expectEqual(@as(?usize, 0), s.leastLoaded());
     for (s.cores) |*c| c.leased = 0;
+}
+
+test "idle hardware threads exclude leased and oversubscription slots" {
+    var s = try CoreScheduler.init(std.testing.allocator);
+    defer s.deinit();
+    if (s.cores.len == 0) return error.SkipZigTest;
+    s.disabled = false;
+
+    const hardware_threads = s.capacity() - s.cores.len;
+    try std.testing.expectEqual(hardware_threads, s.idleHardwareThreads());
+    s.cores[0].leased = 1;
+    try std.testing.expectEqual(hardware_threads - 1, s.idleHardwareThreads());
+    for (s.cores) |*c| c.leased = c.capacity - 1;
+    try std.testing.expectEqual(@as(usize, 0), s.idleHardwareThreads());
+    for (s.cores) |*c| c.leased = c.capacity; // the oversubscription slot is taken too
+    try std.testing.expectEqual(@as(usize, 0), s.idleHardwareThreads());
+    for (s.cores) |*c| c.leased = 0;
+    s.disabled = true;
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), s.idleHardwareThreads());
 }
 
 test "holder never takes a second slot (no hold-and-wait)" {
