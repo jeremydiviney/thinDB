@@ -2307,17 +2307,25 @@ pub const ParallelScan = struct {
     }
 
     /// Threads actually worth spawning: the configured DOP clamped by the work
-    /// that survives zone-map pruning (`Scan.survivingWorkUnits`). Runs at
-    /// spawn time — the first `next()` — which is after the Query is composed,
-    /// so the workers' prune hints are installed. No hints → full DOP.
+    /// that survives zone-map pruning (`Scan.survivingWorkUnits`) and by the
+    /// machine's idle hardware threads. Runs at spawn time — the first `next()`
+    /// — which is after the Query is composed, so the workers' prune hints are
+    /// installed. No hints → full DOP.
     fn effectiveThreads(self: *ParallelScan) usize {
         if (self.n_threads <= 1) return self.n_threads;
         // A buffer stripe with nothing fused into it is a view slice — no
         // work to spread, only a pool to spawn and join.
         if (self.table == null and !self.compute_fused and !self.agg_fused and self.probe_sink == null) return 1;
-        const surviving = self.workers[0].survivingWorkUnits() orelse return self.n_threads;
-        const want = (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD;
-        return @max(@as(usize, 1), @min(self.n_threads, want));
+        const by_work = if (self.workers[0].survivingWorkUnits()) |surviving|
+            @min(self.n_threads, (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD)
+        else
+            self.n_threads;
+        // Helpers beyond the idle hardware threads only time-slice against
+        // other statements' workers: they add spawn, join and per-worker state
+        // but no throughput. The calling thread runs regardless, and chunks are
+        // claimed from a shared cursor, so the result is the same at any count.
+        const idle = core_scheduler.global().idleHardwareThreads();
+        return @max(@as(usize, 1), @min(by_work, idle +| 1));
     }
 
     /// Spawn `effectiveThreads()-1` workers (the calling thread is the last);
