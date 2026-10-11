@@ -332,14 +332,18 @@ const SourceClaims = struct {
     owner: []std.atomic.Value(u32) = &.{},
     taken: []std.atomic.Value(bool) = &.{},
     stolen: std.atomic.Value(usize) = .init(0),
+    /// Workers the owners were last dealt to. A run with a different count
+    /// deals them again: owners past its last worker would all be stolen.
+    n_workers: usize = 0,
 
     fn begin(self: *SourceClaims, alloc: Allocator, n_sources: usize, n_workers: usize) !void {
-        if (self.owner.len != n_sources) {
+        if (self.owner.len != n_sources or self.n_workers != n_workers) {
             self.deinit(alloc);
             const owner = try alloc.alloc(std.atomic.Value(u32), n_sources);
             errdefer alloc.free(owner);
             self.taken = try alloc.alloc(std.atomic.Value(bool), n_sources);
             self.owner = owner;
+            self.n_workers = n_workers;
             for (self.owner, 0..) |*o, i| o.* = .init(@intCast(i % n_workers));
         }
         @memset(self.taken, .init(false));
@@ -392,6 +396,10 @@ pub const Exchange = struct {
     arenas: []SlabArena,
     schema: []const Column,
     n_workers: usize,
+    /// Workers whose bucket rows the latest run filled. A run sized below
+    /// `n_workers` (`runWorkers`) leaves the other rows empty, so `clear`
+    /// stops here.
+    active: usize,
     n_shards: usize,
     /// Region key column (index into `schema`) — hash source. P0: one
     /// string-typed key column; composite keys hash-combine later.
@@ -431,6 +439,7 @@ pub const Exchange = struct {
             .arenas = arenas,
             .schema = schema,
             .n_workers = n_workers,
+            .active = n_workers,
             .n_shards = n_shards,
             .key_col = key_col,
             .buckets = buckets,
@@ -446,7 +455,7 @@ pub const Exchange = struct {
 
     /// Pool reuse: retain every bucket's capacity for the next run.
     pub fn clear(self: *Exchange) void {
-        for (self.buckets) |*b| {
+        for (self.buckets[0 .. self.active * self.n_shards]) |*b| {
             for (b.cols) |*c| c.clear();
             b.rows = 0;
             b.keys.clearRetainingCapacity();
@@ -3128,7 +3137,33 @@ pub const DriverOpts = struct {
     /// on real costs (row counts miss group/append skew) while the
     /// assignment stays deterministic, keeping pooled slot high-waters put.
     iv_cost_slot: ?[]i64 = null,
+    /// Hash-exchange mode: the decode work behind this run's sources, entry
+    /// and sides together, in `Scan.survivingWorkUnits` units (row groups
+    /// surviving pruning plus the memtable as 64K-row units). Sizes the run
+    /// below `n_threads` when the work is small (`runWorkers`). Null =
+    /// unknown: all `n_threads`.
+    work_units: ?usize = null,
 };
+
+/// Work units a region worker should have before another joins it:
+/// ParallelScan's per-thread basis. Below it a worker's fixed costs (a
+/// thread per phase, a row of `n_shards` buckets to clear, compact and
+/// merge) outweigh the decode it would take over.
+const UNITS_PER_WORKER: usize = 2;
+
+/// Workers worth running over `work_units` (null = unknown) with up to
+/// `n_threads` available.
+pub fn workersFor(n_threads: usize, work_units: ?usize) usize {
+    const units = work_units orelse return n_threads;
+    return @max(1, @min(n_threads, (units + UNITS_PER_WORKER - 1) / UNITS_PER_WORKER));
+}
+
+/// Workers for one hash-exchange run. The pool's exchange stays sized to
+/// `n_threads`, so selective and broad runs of one program reuse it warm
+/// instead of rebuilding it.
+fn runWorkers(opts: DriverOpts) usize {
+    return workersFor(opts.n_threads, opts.work_units);
+}
 
 /// Per-shard program outputs. Shards with zero input rows have empty stores.
 pub const RegionResult = struct {
@@ -4394,28 +4429,31 @@ pub fn runRegionPooled(
         std.debug.print("[region] pool acquire={d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - t_acq)});
     }
     const ex = &pool.ex.?;
+    const n_workers = runWorkers(opts);
+    ex.active = n_workers;
+    for (pool.side_ex) |*sex| sex.active = n_workers;
 
-    const errs = try alloc.alloc(?anyerror, opts.n_threads);
+    const errs = try alloc.alloc(?anyerror, n_workers);
     defer alloc.free(errs);
     @memset(errs, null);
-    const threads = try alloc.alloc(std.Thread, opts.n_threads);
+    const threads = try alloc.alloc(std.Thread, n_workers);
     defer alloc.free(threads);
 
     const t0 = if (trace) exec.prof.nowTicks() else 0;
 
     const side_scans = try alloc.alloc(ScanPhase.SideScan, sides.len);
     defer alloc.free(side_scans);
-    try ex.claims.begin(ex.alloc, sources.len, ex.n_workers);
+    try ex.claims.begin(ex.alloc, sources.len, n_workers);
     for (sides, pool.side_ex, side_scans) |*side, *sex, *ss| {
-        try sex.claims.begin(sex.alloc, side.sources.len, sex.n_workers);
+        try sex.claims.begin(sex.alloc, side.sources.len, n_workers);
         ss.* = .{ .ex = sex, .input = side };
     }
-    const scan_ticks: ?[][5]i64 = if (trace) try alloc.alloc([5]i64, opts.n_threads) else null;
+    const scan_ticks: ?[][5]i64 = if (trace) try alloc.alloc([5]i64, n_workers) else null;
     defer if (scan_ticks) |t| alloc.free(t);
     if (scan_ticks) |t| @memset(t, @splat(0));
     // Few input streams cannot occupy all scan workers. Shard bins can
     // share their sort work once ingress has finished and buffers exist.
-    const defer_sort = sources.len < opts.n_threads;
+    const defer_sort = sources.len < n_workers;
     var scan_phase = ScanPhase{
         .ex = ex,
         .sources = sources,
@@ -4430,16 +4468,16 @@ pub fn runRegionPooled(
         .ticks = scan_ticks,
     };
     var spawned: usize = 0;
-    for (0..opts.n_threads - 1) |w| {
+    for (0..n_workers - 1) |w| {
         threads[w] = try std.Thread.spawn(.{}, ScanPhase.worker, .{ &scan_phase, w });
         spawned += 1;
     }
-    scan_phase.worker(opts.n_threads - 1);
+    scan_phase.worker(n_workers - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
 
     if (defer_sort) {
-        for (0..ex.n_workers) |w| {
+        for (0..n_workers) |w| {
             for (0..ex.n_shards) |s| {
                 try prepare_bucket_sort(ex, w, s, opts.sort_cols.len);
             }
@@ -4447,19 +4485,20 @@ pub fn runRegionPooled(
     }
 
     const t1 = if (trace) exec.prof.nowTicks() else 0;
-    const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, opts.n_threads) else null;
+    const bins = try packBins(alloc, ex, n_workers);
+    defer freeBins(alloc, bins);
+    const shard_workers = @max(1, @min(n_workers, bins.len));
+    const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, shard_workers) else null;
     defer if (shard_busy) |b| alloc.free(b);
     if (shard_busy) |b| @memset(b, 0);
 
-    const bins = try packBins(alloc, ex, opts.n_threads);
-    defer freeBins(alloc, bins);
     @memset(errs, null);
     var shard_phase = ShardPhase{
         .ex = ex,
         .opts = opts,
         .bins = bins,
         .result = result,
-        .slots = pool.slots.items[0..opts.n_threads],
+        .slots = pool.slots.items[0..shard_workers],
         .side_ex = pool.side_ex,
         .sides = sides,
         .errs = errs,
@@ -4467,11 +4506,11 @@ pub fn runRegionPooled(
         .deferred_sort = defer_sort,
     };
     spawned = 0;
-    for (0..opts.n_threads - 1) |w| {
+    for (0..shard_workers - 1) |w| {
         threads[w] = try std.Thread.spawn(.{}, ShardPhase.worker, .{ &shard_phase, w });
         spawned += 1;
     }
-    shard_phase.worker(opts.n_threads - 1);
+    shard_phase.worker(shard_workers - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
 
@@ -4480,8 +4519,8 @@ pub fn runRegionPooled(
         var rows: usize = 0;
         for (result.shards) |s| rows += s.rows;
         const max_bin: usize = if (bins.len > 0) bins[0].rows else 0;
-        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d} parts={d} bins={d} max_bin={d}\n", .{
-            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, opts.n_threads, opts.n_shards, bins.len, max_bin,
+        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d}/{d} parts={d} bins={d} max_bin={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, n_workers, opts.n_threads, opts.n_shards, bins.len, max_bin,
         });
         scan_phase.printTrace();
         shard_phase.printTrace();
@@ -4494,17 +4533,17 @@ pub fn runRegionPooled(
         // Per-op CPU (summed across workers; wall ≈ sum / threads when
         // load-balanced). Consolidation reported the same way.
         var con: i64 = 0;
-        for (pool.slots.items[0..opts.n_threads]) |slot| con += slot.rw.consolidate_ticks;
+        for (pool.slots.items[0..n_workers]) |slot| con += slot.rw.consolidate_ticks;
         std.debug.print("[region]   consolidate={d:.0}ms(cpu)", .{exec.prof.ticksToMs(con)});
         for (prog.ops, 0..) |op, oi| {
             var t: i64 = 0;
-            for (pool.slots.items[0..opts.n_threads]) |slot| {
+            for (pool.slots.items[0..n_workers]) |slot| {
                 if (slot.rw.op_ticks) |ticks| t += ticks[oi];
             }
             std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
         }
         std.debug.print("\n", .{});
-        printProbePhases(pool, prog, opts.n_threads);
+        printProbePhases(pool, prog, n_workers);
     }
 
     pool.releaseRun();
@@ -6379,6 +6418,92 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
     try testing.expectEqual(@as(usize, 3), result.totalRows());
     try testing.expect(pool.ex == null);
     try testing.expectEqual(@as(usize, 0), pool.retainedBytes());
+}
+
+test "region pool: a run with little work uses fewer workers on the warm exchange" {
+    const alloc = testing.allocator;
+    const entry = [_]Column{
+        .{ .name = "k", .type = .string, .nullable = true },
+        .{ .name = "g", .type = .int, .nullable = true },
+        .{ .name = "v", .type = .bigint, .nullable = true },
+    };
+    var stores: [3]ColumnStore = undefined;
+    stores[0] = try ColumnStore.init(alloc, .string, true);
+    stores[1] = try ColumnStore.init(alloc, .int, true);
+    stores[2] = try ColumnStore.init(alloc, .bigint, true);
+    defer for (&stores) |*c| c.deinit(alloc);
+    const K = [_]?[]const u8{ "a", "b", "a", "c" };
+    const V = [_]?i64{ 10, 20, 30, 40 };
+    for (K, V) |k, v| {
+        try tAppendStr(alloc, &stores[0], k);
+        try tAppendInt(alloc, &stores[1], 1);
+        try tAppendI64(alloc, &stores[2], v);
+    }
+    var views: [3]ColumnView = undefined;
+    for (&views, &stores) |*v, *c| v.* = c.view();
+
+    const agg_out = [_]AggOut{
+        .{ .name = "k", .kind = .{ .first = 0 } },
+        .{ .name = "sum_v", .kind = .{ .sum_int = 2 } },
+    };
+    const emit_cols = [_]usize{ 0, 1 };
+    const ops = [_]RegionOp{
+        .{ .group_agg = .{ .subkeys = &.{}, .out = &agg_out } },
+        .{ .emit = .{ .cols = &emit_cols } },
+    };
+    var prog = try Program.build(alloc, &entry, &ops, null);
+    defer prog.deinit();
+
+    const sort_cols = [_]OrderCol{.{ .col = 0, .kind = .string }};
+    var pool = RegionPool.init(alloc, 1 << 30);
+    defer pool.deinit();
+    var result = try RegionResult.init(alloc, prog.output_schema, 4);
+    defer result.deinit();
+
+    // Broad, selective, broad: each run must see only its own rows, so
+    // `clear` has to reach every bucket row the previous run filled.
+    const runs = [_]struct { units: ?usize, workers: usize }{
+        .{ .units = null, .workers = 4 },
+        .{ .units = 1, .workers = 1 },
+        .{ .units = 5, .workers = 3 },
+        .{ .units = 64, .workers = 4 },
+    };
+    var buckets: ?[*]Bucket = null;
+    for (runs) |run| {
+        result.clear();
+        var srcs: [4]exec.Query = undefined;
+        var made: usize = 0;
+        defer for (srcs[0..made]) |*q| q.deinit();
+        for (&srcs) |*q| {
+            q.* = try single_batch.SingleBatchSource.create(alloc, .{
+                .schema = &entry,
+                .values = &views,
+                .row_count = K.len,
+            });
+            made += 1;
+        }
+        const opts = DriverOpts{
+            .n_threads = 4,
+            .n_shards = 4,
+            .key_col = 0,
+            .sort_cols = &sort_cols,
+            .group_prefix = 1,
+            .work_units = run.units,
+        };
+        try runRegionPooled(&entry, &srcs, &.{}, &.{}, &prog, opts, &result, &pool);
+        try testing.expectEqual(@as(usize, 3), result.totalRows());
+        var sum: i64 = 0;
+        for (result.shards) |sh| {
+            const sv = if (sh.rows > 0) sh.cols[1].view() else continue;
+            for (0..sh.rows) |i| sum += sv.data.bigint[i];
+        }
+        try testing.expectEqual(@as(i64, 400), sum);
+        const ex = pool.ex.?;
+        try testing.expectEqual(@as(usize, 4), ex.n_workers);
+        try testing.expectEqual(run.workers, ex.active);
+        if (buckets) |b| try testing.expectEqual(b, ex.buckets.ptr);
+        buckets = ex.buckets.ptr;
+    }
 }
 
 fn tMakeRegionOp(alloc: Allocator, prog: *const Program, entry: []const Column, views: []ColumnView, rows: usize) !exec.Query {
