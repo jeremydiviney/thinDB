@@ -1264,10 +1264,12 @@ fn hash_declaration_sources(input: engine_v2.CompileInput, h: *std.hash.Wyhash, 
 /// cross-statement broadcast cache (exec/broadcast_cache.zig): the kernel's
 /// registration, the call arguments, the session state names resolve
 /// against, and per broadcast input its subtree with every literal plus the
-/// data version of each table it reads. Null when any part has no stable
-/// identity: a session variable, a subquery, a nondeterministic or
-/// user-data call, a nested table or aggregate function, or a table outside
-/// the session database.
+/// data version of each table it reads. An uncorrelated IN subquery has
+/// already resolved to its values here, so they are part of the identity.
+/// Null when any part has no stable identity: a session variable, a
+/// subquery left in an expression, a nondeterministic or user-data call, a
+/// nested table or aggregate function, or a table outside the session
+/// database.
 pub fn broadcastInputsKey(input: engine_v2.CompileInput, call: ir.Op.TableFn, entry: *const udf_mod.TableEntry) ?u64 {
     var h = std.hash.Wyhash.init(0x62636173745f696e);
     h.update(std.mem.asBytes(&entry.process));
