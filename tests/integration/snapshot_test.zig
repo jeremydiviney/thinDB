@@ -200,3 +200,169 @@ test "snapshot: scan survives concurrent delete via retire-replace" {
     }
     try std.testing.expectEqual(@as(usize, 10), seen);
 }
+
+fn openSegmentOrders(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, unique: bool) !struct { db: *thindb.Database, t: *thindb.Table } {
+    const db = try thindb.Database.open(allocator, io, dir, .{
+        .auto_flush_rows = 10_000_000,
+        .auto_flush_bytes = 1 << 30,
+        .auto_flush_secs = 0,
+    });
+    errdefer db.close();
+    const schema = thindb.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "qty", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = unique,
+    };
+    const ok = [_][]const u8{"id"};
+    const t = try db.table("orders", schema, .{ .order_key = &ok, .row_group_size = 4 });
+    for (0..10) |i| {
+        try t.insert(&.{.{ .id = @as(i64, @intCast(i)), .qty = @as(i32, @intCast(i * 10)) }});
+    }
+    try t.flush();
+    return .{ .db = db, .t = t };
+}
+
+test "snapshot: a segment delete after the scan starts stays invisible to it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, false);
+    defer o.db.close();
+
+    var q = try thindb.scan(allocator, o.t);
+    defer q.deinit();
+    _ = try o.t.delete(.{ .col = "id", .op = .lt, .val = .{ .bigint = 5 } });
+
+    var seen: usize = 0;
+    while (try q.next()) |batch| seen += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 10), seen);
+}
+
+test "snapshot: an upsert after the scan starts never drops the row from it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, true);
+    defer o.db.close();
+
+    var q = try thindb.scan(allocator, o.t);
+    defer q.deinit();
+    try o.t.upsert(&.{.{ .id = @as(i64, 3), .qty = @as(i32, 999) }});
+
+    var qty_of_3: ?i32 = null;
+    var seen: usize = 0;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| {
+            if (batch.values[0].data.bigint[i] == 3) qty_of_3 = batch.values[1].data.int[i];
+        }
+        seen += batch.row_count;
+    }
+    try std.testing.expectEqual(@as(usize, 10), seen);
+    try std.testing.expectEqual(@as(?i32, 30), qty_of_3);
+}
+
+test "snapshot: deletes published while a scan runs stay invisible to every segment it opens" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, false);
+    defer o.db.close();
+    for (10..20) |i| try o.t.insert(&.{.{ .id = @as(i64, @intCast(i)), .qty = @as(i32, 1) }});
+    try o.t.flush();
+
+    var q = try thindb.scan(allocator, o.t);
+    defer q.deinit();
+    var seen: usize = (try q.next()).?.row_count;
+    // Several publishes per segment, the first segment's after the scan
+    // opened it and the second's before.
+    _ = try o.t.delete(.{ .col = "id", .op = .lt, .val = .{ .bigint = 2 } });
+    _ = try o.t.delete(.{ .col = "id", .op = .gte, .val = .{ .bigint = 17 } });
+    _ = try o.t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = 12 } });
+    _ = try o.t.delete(.{ .col = "id", .op = .eq, .val = .{ .bigint = 6 } });
+    while (try q.next()) |batch| seen += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 20), seen);
+
+    var after = try thindb.scan(allocator, o.t);
+    defer after.deinit();
+    var remaining: usize = 0;
+    while (try after.next()) |batch| remaining += batch.row_count;
+    try std.testing.expectEqual(@as(usize, 13), remaining);
+}
+
+fn countRows(q: *thindb.Query) !usize {
+    var n: usize = 0;
+    while (try q.next()) |batch| n += batch.row_count;
+    return n;
+}
+
+test "snapshot: scans of a table in one statement share its snapshot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, false);
+    defer o.db.close();
+
+    var snapshots: thindb.exec.Scan.StatementSnapshots = .{ .gpa = allocator };
+    defer snapshots.deinit();
+    var acc = thindb.exec.memory.MemoryAccountant.initWithPool(0, null);
+    acc.table_snapshots = &snapshots;
+
+    var first = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);
+    defer first.deinit();
+    _ = try o.t.delete(.{ .col = "id", .op = .lt, .val = .{ .bigint = 5 } });
+    try o.t.insert(&.{.{ .id = @as(i64, 100), .qty = @as(i32, 1) }});
+    try o.t.flush();
+    try o.t.insert(&.{.{ .id = @as(i64, 101), .qty = @as(i32, 1) }});
+    var second = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);
+    defer second.deinit();
+
+    try std.testing.expectEqual(@as(usize, 10), try countRows(&first));
+    try std.testing.expectEqual(@as(usize, 10), try countRows(&second));
+    var fresh = try thindb.scan(allocator, o.t);
+    defer fresh.deinit();
+    try std.testing.expectEqual(@as(usize, 7), try countRows(&fresh));
+}
+
+test "snapshot: a statement's later scan takes a fresh snapshot once a compaction retired its segments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, false);
+    defer o.db.close();
+    for (10..20) |i| try o.t.insert(&.{.{ .id = @as(i64, @intCast(i)), .qty = @as(i32, 1) }});
+    try o.t.flush();
+
+    var snapshots: thindb.exec.Scan.StatementSnapshots = .{ .gpa = allocator };
+    defer snapshots.deinit();
+    var acc = thindb.exec.memory.MemoryAccountant.initWithPool(0, null);
+    acc.table_snapshots = &snapshots;
+    {
+        var first = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 20), try countRows(&first));
+    }
+    // No scan of the table is open, so the merge commits and deletes the
+    // files of the segments the statement's snapshot names.
+    try o.t.compact();
+    var second = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 20), try countRows(&second));
+}
+
+test "snapshot: a parallel scan's workers read tombstones as of its snapshot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const o = try openSegmentOrders(allocator, std.testing.io, tmp.dir, false);
+    defer o.db.close();
+    for (10..40) |i| try o.t.insert(&.{.{ .id = @as(i64, @intCast(i)), .qty = @as(i32, 1) }});
+    try o.t.flush();
+
+    var q = try thindb.exec.ParallelScan.create(allocator, o.t, null, null, 4);
+    defer q.deinit();
+    _ = try o.t.delete(.{ .col = "id", .op = .gte, .val = .{ .bigint = 3 } });
+    try std.testing.expectEqual(@as(usize, 40), try countRows(&q));
+}

@@ -3,7 +3,7 @@
 //!
 //! Reuses the serial `Scan` wholesale: it partitions the flat row-group list
 //! into `dop` contiguous spans (see `Scan.setRange`) and runs one range-Scan
-//! per worker. All workers share ONE captured snapshot (`Scan.captureSnapshot`)
+//! per worker. All workers share ONE captured snapshot (`Scan.captureSnapshotAlloc`)
 //! so a concurrent flush can't make them disagree on segments-vs-memtable, and
 //! the orchestrator holds a single shared `ddl_lock` covering them all. The
 //! per-table block cache is already thread-safe (pinning LRU); `Scan.next()`
@@ -846,10 +846,10 @@ pub const ParallelScan = struct {
         // Dupe the entry array too (allocator-backed): every worker reads
         // this stable copy, never the live manifest ArrayList a concurrent
         // flush can realloc out from under them (#139 UAF).
-        const snap = try Scan.captureSnapshotAlloc(table, allocator);
+        const snap = try Scan.captureSnapshotAlloc(table, allocator, injected_acct orelse exec.memory.accountantOf(allocator));
         exec.prof.addPhase("pscan.create.snapshot", @intCast(exec.prof.nowTicks() - t_snap));
         var pin_held = true;
-        errdefer if (pin_held) snap.memtable_snap.release();
+        errdefer if (pin_held) snap.release(table);
         defer allocator.free(snap.segments);
 
         // Flat row-group total + per-segment prefix sums, from the STABLE
@@ -927,7 +927,7 @@ pub const ParallelScan = struct {
         exec.prof.addPhase("pscan.create.worker_scans", @intCast(exec.prof.nowTicks() - t_workers));
 
         // Each chunk pinned the memtable; drop the orchestrator's capture pin.
-        snap.memtable_snap.release();
+        snap.release(table);
         pin_held = false;
 
         const round = try allocator.alloc(?Batch, n_chunks);
@@ -1404,6 +1404,7 @@ pub const ParallelScan = struct {
                 .memtable_snap = worker.memtable_snap,
                 .memtable_row_count = worker.memtable_row_count,
                 .segments = worker.segs,
+                .tomb_epoch = worker.tomb_epoch,
             });
             passes[built] = pass;
             built += 1;

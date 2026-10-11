@@ -178,8 +178,8 @@ pub const MetaSpec = struct {
 ///   - the table is empty (the normal path emits the documented default).
 ///
 /// Held under the ddl shared lock so compaction can't retire a captured
-/// segment (and its tombstone file) mid-read; the manifest + memtable pair is
-/// read under the table mutex — the same consistency point a scan uses.
+/// segment (and its tombstone file) mid-read; it reads the statement's
+/// snapshot of the table, as its scans do.
 pub const MetaAggStats = struct {
     allocator: Allocator,
     output_schema: []Column,
@@ -187,7 +187,7 @@ pub const MetaAggStats = struct {
     views: []ColumnView,
     emitted: bool = false,
 
-    pub fn create(allocator: Allocator, table: *Table, specs: []const MetaSpec) !?Query {
+    pub fn create(allocator: Allocator, table: *Table, specs: []const MetaSpec, statement_accountant: ?*exec.memory.MemoryAccountant) !?Query {
         const cols = table.schema.columns;
         var needs_stats = false;
         for (specs) |sp| switch (sp.kind) {
@@ -207,45 +207,38 @@ pub const MetaAggStats = struct {
 
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
+        const snap = try exec.Scan.captureSnapshotAlloc(table, allocator, statement_accountant);
+        defer {
+            snap.release(table);
+            allocator.free(snap.segments);
+        }
 
-        var ids: []u64 = &.{};
-        defer if (ids.len > 0) allocator.free(ids);
         var col_stats: []storage.format.Stats = &.{};
         defer if (col_stats.len > 0) allocator.free(col_stats);
-        var total: u64 = 0;
-        var n_segs: usize = 0;
-        {
-            table.mutex.lockUncancelable(table.io);
-            defer table.mutex.unlock(table.io);
-            const segs = table.manifest.segments.items;
-            n_segs = segs.len;
-            if (needs_stats) {
-                if (n_segs == 0) return null;
-                if (table.memtable.row_count != 0) return null;
-                for (segs) |entry| {
-                    if (entry.column_stats.len < cols.len) return null; // v1 manifest
-                }
-                // Snapshot the stats each stats-dependent spec folds:
-                // seg-major, specs.len per segment.
-                col_stats = try allocator.alloc(storage.format.Stats, n_segs * specs.len);
-                for (segs, 0..) |entry, si| {
-                    for (specs, 0..) |sp, i| {
-                        col_stats[si * specs.len + i] = switch (sp.kind) {
-                            .min, .max, .sum, .avg, .count_col => entry.column_stats[sp.col_idx],
-                            .count_star => .{ .min = 0, .max = 0 },
-                        };
-                    }
+        const segs = snap.segments;
+        const n_segs = segs.len;
+        if (needs_stats) {
+            if (n_segs == 0) return null;
+            if (snap.memtable_row_count != 0) return null;
+            for (segs) |entry| {
+                if (entry.column_stats.len < cols.len) return null; // v1 manifest
+            }
+            // The stats each stats-dependent spec folds: seg-major,
+            // specs.len per segment.
+            col_stats = try allocator.alloc(storage.format.Stats, n_segs * specs.len);
+            for (segs, 0..) |entry, si| {
+                for (specs, 0..) |sp, i| {
+                    col_stats[si * specs.len + i] = switch (sp.kind) {
+                        .min, .max, .sum, .avg, .count_col => entry.column_stats[sp.col_idx],
+                        .count_star => .{ .min = 0, .max = 0 },
+                    };
                 }
             }
-            ids = try allocator.alloc(u64, n_segs);
-            for (segs, 0..) |entry, i| {
-                ids[i] = entry.segment_id;
-                total += entry.row_count;
-            }
-            total += table.memtable.row_count;
         }
-        for (ids) |segment_id| {
-            const dead = try table.tombstoneCount(segment_id);
+        var total: u64 = snap.memtable_row_count;
+        for (segs) |entry| total += entry.row_count;
+        for (segs) |entry| {
+            const dead = try table.tombstoneCountAt(entry.segment_id, snap.tomb_epoch);
             if (dead > 0) {
                 // A deleted row may have been the extreme / part of the sum /
                 // a null_count contributor.

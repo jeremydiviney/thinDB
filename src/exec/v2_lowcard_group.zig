@@ -1486,9 +1486,9 @@ const LowCardGroup = struct {
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
 
-        const snap = try Scan.captureSnapshotAlloc(table, allocator);
+        const snap = try Scan.captureSnapshotAlloc(table, allocator, exec.memory.accountantOf(allocator));
         var pin_held = true;
-        defer if (pin_held) snap.memtable_snap.release();
+        defer if (pin_held) snap.release(table);
         defer allocator.free(snap.segments);
 
         const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
@@ -1575,7 +1575,7 @@ const LowCardGroup = struct {
             };
             built += 1;
         }
-        snap.memtable_snap.release();
+        snap.release(table);
         pin_held = false;
 
         const threads = try allocator.alloc(std.Thread, n_workers);

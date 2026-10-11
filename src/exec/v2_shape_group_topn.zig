@@ -504,9 +504,9 @@ const GroupTopNPipeline = struct {
         const table = self.table;
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
-        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator);
+        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator, exec.memory.accountantOf(self.allocator));
         defer {
-            snapshot.memtable_snap.release();
+            snapshot.release(table);
             self.allocator.free(snapshot.segments);
         }
         const scan = try Scan.allocWithProjectionLoc(self.allocator, table, null, null, false, snapshot);
@@ -584,9 +584,9 @@ const GroupTopNPipeline = struct {
         const table = self.table;
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
-        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator);
+        const snapshot = try Scan.captureSnapshotAlloc(table, self.allocator, exec.memory.accountantOf(self.allocator));
         defer {
-            snapshot.memtable_snap.release();
+            snapshot.release(table);
             self.allocator.free(snapshot.segments);
         }
         var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
@@ -2288,9 +2288,9 @@ test "hashed-key emit reads rowrefs from the aggregation snapshot" {
     try t.flush();
     try t.insert(rows[6..]);
 
-    const snapshot = try Scan.captureSnapshotAlloc(t, allocator);
+    const snapshot = try Scan.captureSnapshotAlloc(t, allocator, null);
     defer {
-        snapshot.memtable_snap.release();
+        snapshot.release(t);
         allocator.free(snapshot.segments);
     }
     _ = try t.delete(.{ .col = "id", .op = .lte, .val = .{ .bigint = 7 } });

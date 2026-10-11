@@ -1404,10 +1404,10 @@ pub const MetaAggSpec = @import("agg_stats.zig").MetaSpec;
 /// table state (tombstones subtract, memtable adds); MIN/MAX declines (null)
 /// on tombstones, unflushed rows, or inexact stats — the SHAPE gate (no
 /// WHERE/GROUP BY/HAVING/derived) is the caller's job. See `agg_stats.zig`.
-pub fn metaAggStats(allocator: Allocator, table: *Table, specs: []const MetaAggSpec) !?Query {
+pub fn metaAggStats(allocator: Allocator, table: *Table, specs: []const MetaAggSpec, accountant: ?*memory.MemoryAccountant) !?Query {
     const lease = if (table.statement_gate) |gate| try gate.acquire(false) else null;
     defer if (lease) |l| l.release();
-    return @import("agg_stats.zig").MetaAggStats.create(allocator, table, specs);
+    return @import("agg_stats.zig").MetaAggStats.create(allocator, table, specs, accountant);
 }
 
 /// Scan that uses a query-scoped accountant owned by the caller (the

@@ -1124,6 +1124,9 @@ pub const CompileCtx = struct {
     /// hand out (and reclaim) the per-query budget.
     accountant: ?*exec.memory.MemoryAccountant = null,
     accountant_allocator: ?Allocator = null,
+    /// The snapshot each table's scans share, hung on the accountant for
+    /// them to find. Owned here, created with the accountant.
+    table_snapshots: ?*exec.Scan.StatementSnapshots = null,
     cancel_flag: ?*const std.atomic.Value(bool) = null,
     connection_id: ?u32 = null,
     /// Query-scoped global string dictionary (Phase 4.2 Option A). Lazily
@@ -1150,6 +1153,11 @@ pub const CompileCtx = struct {
 
     pub fn deinit(self: *CompileCtx) void {
         defer if (self.accountant) |a| a.releaseOwner(self.accountant_allocator.?);
+        if (self.table_snapshots) |snapshots| {
+            if (self.accountant) |a| a.table_snapshots = null;
+            snapshots.deinit();
+            snapshots.gpa.destroy(snapshots);
+        }
         var it = self.materialized.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit();
         self.materialized.deinit(self.allocator);
@@ -1200,15 +1208,20 @@ pub const CompileCtx = struct {
         const budget = thindb_api.autoQueryBudgetBytes(self.catalog.config.query_memory_budget);
         const pool = self.catalog.config.memory_pool;
         if (budget == 0 and pool == null and self.cancel_flag == null) return null;
+        const snapshots = try self.catalog.allocator.create(exec.Scan.StatementSnapshots);
+        errdefer self.catalog.allocator.destroy(snapshots);
+        snapshots.* = .{ .gpa = self.catalog.allocator };
         const acc = try self.catalog.allocator.create(exec.memory.MemoryAccountant);
         errdefer self.catalog.allocator.destroy(acc);
         acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
         acc.cancel_flag = self.cancel_flag;
+        acc.table_snapshots = snapshots;
         acc.connection_id = self.connection_id;
         acc.trackAllocations(self.catalog.allocator);
         try acc.retainGate(self.catalog.config.statement_gate);
         self.accountant_allocator = self.catalog.allocator;
         self.accountant = acc;
+        self.table_snapshots = snapshots;
         return acc;
     }
 
