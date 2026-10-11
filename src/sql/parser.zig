@@ -1658,7 +1658,10 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            if (distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or agg_calls.copies.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            // Over a join too: the GroupBy names a key by its input column
+            // (`g.k`), while a derived table or CTE exposes the bare name the
+            // SELECT gives it.
+            if (from_is_join or distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or agg_calls.copies.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
             if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, rename_floor, group_alias_renames);
