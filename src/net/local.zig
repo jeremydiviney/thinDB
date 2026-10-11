@@ -1479,6 +1479,11 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     // Shared thin CTEs split per reference first, so each reader's filters
     // can reach its own copy's scan.
     try cte_stages.unshareThinCtes(allocator, ctx.nodeArena(), catalog, session_cell.*, @constCast(root), ctx.udf_registry);
+    // Implied column ranges first, so they push down with the conjuncts
+    // they sit beside.
+    const t_monotone_bounds = exec.prof.nowTicks();
+    try predicate_pushdown.deriveMonotoneBounds(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
+    exec.prof.addPhase("compile.monotone_bounds", @intCast(exec.prof.nowTicks() - t_monotone_bounds));
     const t_push_join_filters = exec.prof.nowTicks();
     try predicate_pushdown.pushJoinFilters(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_join_filters", @intCast(exec.prof.nowTicks() - t_push_join_filters));
