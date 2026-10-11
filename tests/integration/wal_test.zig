@@ -946,7 +946,7 @@ test "wal: an UPDATE past the staging bound keeps the chunk it committed when a 
 
     var manifest_after: []u8 = undefined;
     var wal_after: []u8 = undefined;
-    var tomb_after: []u8 = undefined;
+    var tomb_after: ?[]u8 = undefined;
     var tomb_name_buf: [40]u8 = undefined;
     var tomb_name: []const u8 = undefined;
     {
@@ -965,7 +965,12 @@ test "wal: an UPDATE past the staging bound keeps the chunk it committed when a 
         try expectRowsOnce(live, 14, &committed, true);
         manifest_after = try t.table_dir.readFileAlloc(io, "manifest", aa, .unlimited);
         wal_after = try t.table_dir.readFileAlloc(io, "wal", aa, .unlimited);
-        tomb_after = try t.segments_dir.readFileAlloc(io, tomb_name, aa, .unlimited);
+        // The committed chunk's offsets may still be only in the log: the
+        // failed statement never reached the point that writes the file.
+        tomb_after = t.segments_dir.readFileAlloc(io, tomb_name, aa, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
     }
     {
         const db = try thindb.Database.open(a, io, tmp.dir, config);
@@ -978,7 +983,14 @@ test "wal: an UPDATE past the staging bound keeps the chunk it committed when a 
     try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/manifest", .data = manifest_after });
     try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/wal", .data = wal_after });
     const tomb_path = try std.fmt.allocPrint(aa, "main/public/t/segments/{s}", .{tomb_name});
-    try tmp.dir.writeFile(io, .{ .sub_path = tomb_path, .data = tomb_after });
+    if (tomb_after) |data| {
+        try tmp.dir.writeFile(io, .{ .sub_path = tomb_path, .data = data });
+    } else {
+        tmp.dir.deleteFile(io, tomb_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
     const db = try thindb.Database.open(a, io, tmp.dir, config);
     defer db.close();
     const live = try collectIdQty(a, try db.openTable("t", .{}));
@@ -1159,4 +1171,53 @@ test "wal: a crash right after a DELETE or UPDATE recovers exactly the live rows
         defer a.free(ids);
         try std.testing.expectEqualSlices(i64, c.live, ids);
     }
+}
+
+test "wal: a delete survives a crash that beats its tombstone file (#605)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const config: thindb.Config = .{ .wal_enabled = true, .auto_flush_secs = 0 };
+
+    var manifest: []u8 = undefined;
+    var wal: []u8 = undefined;
+    var tomb_path: []u8 = undefined;
+    {
+        const db = try thindb.Database.open(a, io, tmp.dir, config);
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+        try t.insert(&.{
+            .{ .id = @as(i64, 1), .v = @as(i32, 1) },
+            .{ .id = @as(i64, 2), .v = @as(i32, 2) },
+            .{ .id = @as(i64, 3), .v = @as(i32, 3) },
+        });
+        try t.flush();
+        tomb_path = try std.fmt.allocPrint(aa, "main/public/t/segments/{d:0>20}.tomb", .{t.manifest.segments.items[0].segment_id});
+        try sql_helpers.exec(a, db, "DELETE FROM t WHERE id = 2");
+        manifest = try t.table_dir.readFileAlloc(io, "manifest", aa, .unlimited);
+        wal = try t.table_dir.readFileAlloc(io, "wal", aa, .unlimited);
+    }
+    // The process died after the DELETE logged its offsets and before its
+    // tombstone file landed: only the log holds the delete.
+    try tmp.dir.deleteFile(io, tomb_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/manifest", .data = manifest });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/wal", .data = wal });
+
+    const db = try thindb.Database.open(a, io, tmp.dir, config);
+    defer db.close();
+    const ids = try sql_helpers.collectBigints(a, db, "SELECT id FROM t ORDER BY id");
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
 }
