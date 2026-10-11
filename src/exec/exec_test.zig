@@ -1550,6 +1550,78 @@ test "scan: a column only its fused filter reads is not gathered" {
     }
 }
 
+// Every chunk scan of a parallel scan reads one snapshot, so they share one
+// merge of its column stats: each chunk reports what a lone scan of the
+// table does and orders its fused conjuncts the same way.
+test "parallel scan: chunk scans share one merge of the snapshot's column stats" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const Row = struct { id: i64, tag: []const u8, v: i32 };
+    const tags = [_][]const u8{ "red", "green", "blue" };
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]Row = undefined;
+        for (&rows) |*r| {
+            r.* = .{ .id = next_id, .tag = tags[@intCast(@mod(next_id, 3))], .v = @intCast(@mod(next_id, 7)) };
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+
+    const expr: PredicateExpr = .{ .@"and" = &.{
+        leafExpr("v", .gte, .{ .int = 1 }),
+        leafExpr("id", .eq, .{ .bigint = 78 }),
+    } };
+    const keep = &[_][]const u8{ "v", "id" };
+
+    const lone = try exec.Scan.allocWithProjectionLoc(allocator, t, null, keep, false, null);
+    var lone_q = exec.makeQuery(allocator, lone);
+    var lone_filtered = try lone_q.filter(expr);
+    defer lone_filtered.deinit();
+
+    var base = try exec.ParallelScan.create(allocator, t, null, keep, 4);
+    const ps = exec.queryAs(exec.ParallelScan, base).?;
+    var q = try base.filter(expr);
+    defer q.deinit();
+
+    try std.testing.expect(ps.workers.len > 1);
+    try std.testing.expectEqual(schema.columns.len, ps.column_stats.len);
+    const lone_order = lone.fused_filter.?.@"and";
+    for (ps.workers) |w| {
+        const chunk = w.segment;
+        try std.testing.expectEqual(ps.column_stats.ptr, chunk.schema_stats.ptr);
+        try std.testing.expectEqualDeep(lone.cached_stats, chunk.cached_stats);
+        const order = chunk.fused_filter.?.@"and";
+        try std.testing.expectEqual(lone_order.len, order.len);
+        for (lone_order, order) |a, b| try std.testing.expectEqualStrings(a.leaf.col, b.leaf.col);
+    }
+
+    var rows_seen: usize = 0;
+    while (try q.next()) |b| rows_seen += b.row_count;
+    try std.testing.expectEqual(@as(usize, 1), rows_seen);
+}
+
 // A window keeps its input in one block arena per column, so a column holds
 // the buffers it is using and nothing else. A bump arena also kept every
 // buffer the column had outgrown, in nodes larger than the column asked for.
