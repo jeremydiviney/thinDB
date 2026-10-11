@@ -1591,7 +1591,7 @@ test "parallel scan: chunk scans share one merge of the snapshot's column stats"
 
     const expr: PredicateExpr = .{ .@"and" = &.{
         leafExpr("v", .gte, .{ .int = 1 }),
-        leafExpr("id", .eq, .{ .bigint = 78 }),
+        leafExpr("id", .gte, .{ .bigint = 78 }),
     } };
     const keep = &[_][]const u8{ "v", "id" };
 
@@ -1617,9 +1617,79 @@ test "parallel scan: chunk scans share one merge of the snapshot's column stats"
         for (lone_order, order) |a, b| try std.testing.expectEqualStrings(a.leaf.col, b.leaf.col);
     }
 
+    var lone_rows: usize = 0;
+    while (try lone_filtered.next()) |b| lone_rows += b.row_count;
     var rows_seen: usize = 0;
     while (try q.next()) |b| rows_seen += b.row_count;
-    try std.testing.expectEqual(@as(usize, 1), rows_seen);
+    try std.testing.expect(lone_rows > 0);
+    try std.testing.expectEqual(lone_rows, rows_seen);
+}
+
+// A selective filter leaves most chunk scans nothing to read. They are
+// dropped before anything is built per chunk; the kept chunks cover every
+// surviving row group, and the last one still drains the memtable.
+test "parallel scan: a selective filter drops the chunks it leaves empty" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+
+    const Row = struct { id: i64, v: i32 };
+    var next_id: i64 = 0;
+    for (0..4) |_| {
+        var rows: [100]Row = undefined;
+        for (&rows) |*r| {
+            r.* = .{ .id = next_id, .v = @intCast(@mod(next_id, 7)) };
+            next_id += 1;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+    var tail: [10]Row = undefined;
+    for (&tail) |*r| {
+        r.* = .{ .id = next_id, .v = 1 };
+        next_id += 1;
+    }
+    try t.insert(&tail);
+
+    const cases = .{
+        .{ .lo = 78, .hi = 78, .chunks = 1, .rows = 1 },
+        .{ .lo = 395, .hi = 1000, .chunks = 2, .rows = 15 },
+        .{ .lo = 40, .hi = 100, .chunks = 6, .rows = 61 },
+    };
+    inline for (cases) |c| {
+        var base = try exec.ParallelScan.create(allocator, t, null, &.{ "id", "v" }, 4);
+        const ps = exec.queryAs(exec.ParallelScan, base).?;
+        const before = ps.workers.len;
+        var q = try base.filter(.{ .@"and" = &.{
+            leafExpr("id", .gte, .{ .bigint = c.lo }),
+            leafExpr("id", .lte, .{ .bigint = c.hi }),
+        } });
+        defer q.deinit();
+        try std.testing.expect(before > c.chunks);
+        try std.testing.expectEqual(@as(usize, c.chunks), ps.workers.len);
+        for (ps.workers) |w| try std.testing.expect(w.segment.fusedActive());
+
+        var rows_seen: usize = 0;
+        while (try q.next()) |b| rows_seen += b.row_count;
+        try std.testing.expectEqual(@as(usize, c.rows), rows_seen);
+    }
 }
 
 // A window keeps its input in one block arena per column, so a column holds
@@ -4491,9 +4561,9 @@ test "filter over a fused join runs as the probe chain's last link" {
 }
 
 test "a probe chain builds each chunk's clones at the chunk's first batch" {
-    // A chunk whose row groups the scan prunes never reaches the chain, so
-    // it never builds its Compute or Filter clone. Results still match the
-    // all-serial plan.
+    // A chunk whose row groups hold no row the filter keeps never reaches
+    // the chain, so it never builds its Compute or Filter clone. Results
+    // still match the all-serial plan.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4524,8 +4594,9 @@ test "a probe chain builds each chunk's clones at the chunk's first batch" {
     try l.insert(&lrows);
     try l.flush();
     // Fewer rows than the narrowed left keeps the build on the right, so the
-    // parallel scan is the probe side.
-    var rrows: [60]struct { id: i64, rv: i32 } = undefined;
+    // parallel scan is the probe side. Its keys all fall in the left's first
+    // row group: the filter keeps two, and the second matches nothing.
+    var rrows: [30]struct { id: i64, rv: i32 } = undefined;
     for (&rrows, 0..) |*row, i| row.* = .{ .id = @intCast(i * 2), .rv = @intCast((i * 7) % 30) };
     try r.insert(&rrows);
     try r.flush();
