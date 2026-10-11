@@ -1832,6 +1832,10 @@ pub const Join = struct {
             .output_columns = output_columns,
             .views = views,
         };
+        errdefer if (self.probe_chunks.len > 0) {
+            for (self.probe_chunks) |*ch| freeProbeChunk(self.probe_chunk_alloc, ch);
+            self.probe_chunk_alloc.free(self.probe_chunks);
+        };
         self.fast_eligible = blk: {
             if (resolved_ranges.len != 0 or spec.on.len == 0 or spec.on.len > MAX_FAST_KEYS) break :blk false;
             const bkeys = if (build_is_left) left_keys else right_keys;
@@ -1852,12 +1856,15 @@ pub const Join = struct {
         // order-preserving join stays on the serial streaming probe.
         if (self.fast_eligible and spec.join_type != .full and !spec.preserve_left_order) {
             const probe = if (build_is_left) self.right else self.left;
-            self.probe_fused = probe.tryFuseProbe(.{
+            // An error can follow a partial accept (a union arm took the
+            // sink before its sibling failed), which no decline undoes: it
+            // fails the statement (#603).
+            self.probe_fused = try probe.tryFuseProbe(.{
                 .ctx = self,
                 .out_schema = self.output_schema,
                 .bind = sinkBind,
                 .process = sinkProcess,
-            }) catch false;
+            });
         }
         if (getenv("THINDB_TRACE_JOINFUSE") != null) {
             std.debug.print("[jf] create {s} fast={} on={d} ranges={d} extra={} build_left={} out_cols={d} -> probe_fused={}\n", .{

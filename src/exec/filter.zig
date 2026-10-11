@@ -295,7 +295,7 @@ pub const Filter = struct {
         // Filter degrades to a pass-through. The expr it borrows is `self.expr`,
         // which outlives the query (owned by this Filter).
         self.fused = self.upstream.tryFuseFilter(self.expr) catch false;
-        if (!self.fused and upstream.probeFusionReachable()) _ = self.tryFuseSelf();
+        if (!self.fused and upstream.probeFusionReachable()) _ = try self.tryFuseSelf();
 
         return makeQuery(allocator, self);
     }
@@ -475,15 +475,17 @@ pub const Filter = struct {
     /// (a materializing scan copies only those) and this operator passes
     /// them through, which also lets a partial aggregate above fuse into
     /// the workers. A join created above later upgrades the link
-    /// (`tryFuseProbe`). No-op when the upstream declines.
-    pub fn tryFuseSelf(self: *Filter) bool {
+    /// (`tryFuseProbe`). No-op when the upstream declines; an error fails
+    /// the statement (`pushChain`).
+    pub fn tryFuseSelf(self: *Filter) !bool {
         if (self.fused or self.chain != null or self.provenEmpty()) return false;
         const before = self.stats();
         const column_stats = if (self.cached_stats.len == 0 and before.column_stats.len > 0)
-            self.allocator.dupe(exec.ColStat, before.column_stats) catch return false
+            try self.allocator.dupe(exec.ColStat, before.column_stats)
         else
             null;
-        if (!(self.pushChain(null, self.schema, true) catch false)) {
+        errdefer if (column_stats) |owned| self.allocator.free(owned);
+        if (!try self.pushChain(null, self.schema, true)) {
             if (column_stats) |owned| self.allocator.free(owned);
             return false;
         }
@@ -504,19 +506,22 @@ pub const Filter = struct {
             };
         }
         const chain = try self.allocator.create(FilterForward);
-        errdefer self.allocator.destroy(chain);
         chain.* = .{
             .src = self,
             .inner = inner,
             .in_schema = self.upstream.outputSchema(),
         };
-        const ok = self.upstream.tryFuseProbe(.{
+        // An error can follow a partial accept (a union arm bound the chain
+        // before its sibling failed), which no decline undoes: it fails the
+        // statement, and the clones go with the chain (#603).
+        errdefer chain.deinitAll(self.allocator);
+        const ok = try self.upstream.tryFuseProbe(.{
             .ctx = chain,
             .out_schema = out_schema,
             .extends_chain = extends_chain,
             .bind = FilterForward.bindHook,
             .process = FilterForward.processHook,
-        }) catch false;
+        });
         if (!ok) {
             self.allocator.destroy(chain);
             return false;
