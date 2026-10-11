@@ -27,6 +27,7 @@ pub const AliasRename = struct {
     upstream: Query,
     output_schema: []Column,
     name_storage: []u8,
+    alias_len: usize,
     /// A join probe fused below: upstream batches are already joined (join
     /// output schema, not this wrapper's), so next() passes them through.
     probe_fused: bool = false,
@@ -62,6 +63,7 @@ pub const AliasRename = struct {
             .upstream = upstream,
             .output_schema = out_schema,
             .name_storage = name_storage,
+            .alias_len = alias.len,
         };
         return makeQuery(allocator, self);
     }
@@ -93,9 +95,19 @@ pub const AliasRename = struct {
     }
 
     fn offerPrune(self: *AliasRename, offer: exec.PruneOffer) !void {
-        if (self.probe_fused) return;
-        const idx = types.findColumn(self.output_schema, offer.column()) orelse return error.ColumnNotFound;
-        return offer.offerTo(&self.upstream, self.upstream.outputSchema()[idx].name);
+        return offer.offerTo(&self.upstream, try self.inputColumnName(offer.column()));
+    }
+
+    pub fn rowSetTargetRows(self: *AliasRename, col: []const u8) u64 {
+        return self.upstream.rowSetTargetRows(self.inputColumnName(col) catch return 0);
+    }
+
+    /// The upstream's name for output column `col`: the alias stripped.
+    /// Not read from the upstream's schema, which no longer lines up with
+    /// ours once a probe fuses below.
+    pub fn inputColumnName(self: *const AliasRename, col: []const u8) error{ColumnNotFound}![]const u8 {
+        const idx = types.findColumn(self.output_schema, col) orelse return error.ColumnNotFound;
+        return self.output_schema[idx].name[self.alias_len + 1 ..];
     }
 
     /// Forward fusion offers: the scan resolves qualified `alias.col`

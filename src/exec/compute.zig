@@ -664,8 +664,10 @@ pub const Compute = struct {
     }
 
     fn offerPrune(self: *Compute, offer: exec.PruneOffer) !void {
-        if (self.chain != null) return;
         const idx = types.findColumn(self.output_schema, offer.column()) orelse return Error.ColumnNotFound;
+        // Chained, the upstream reports the probe chain's live schema, not
+        // the one `derived` resolved against.
+        if (self.chain != null) return offer.offerTo(&self.upstream, self.sourceColumnName(idx) orelse return);
         var src_idx = idx;
         for (self.derived, self.derived_output_indices) |derived, out_idx| {
             if (out_idx != idx) continue;
@@ -676,6 +678,31 @@ pub const Compute = struct {
             break;
         }
         return offer.offerTo(&self.upstream, self.upstream.outputSchema()[src_idx].name);
+    }
+
+    pub fn rowSetTargetRows(self: *Compute, col: []const u8) u64 {
+        const name = (self.inputColumnName(col) catch return 0) orelse return 0;
+        return self.upstream.rowSetTargetRows(name);
+    }
+
+    /// The upstream's name for output column `col` when it carries an
+    /// input column unchanged; null for a computed column.
+    pub fn inputColumnName(self: *const Compute, col: []const u8) error{ColumnNotFound}!?[]const u8 {
+        return self.sourceColumnName(types.findColumn(self.output_schema, col) orelse return error.ColumnNotFound);
+    }
+
+    /// The input column output `idx` carries unchanged, by its planned
+    /// name: itself for a passthrough, the referenced column for a rename.
+    /// Null for a computed column.
+    pub fn sourceColumnName(self: *const Compute, idx: usize) ?[]const u8 {
+        for (self.derived_ir, self.derived_output_indices) |d, out_idx| {
+            if (out_idx != idx) continue;
+            return switch (d.expr) {
+                .col_ref => |name| name,
+                else => null,
+            };
+        }
+        return self.output_schema[idx].name;
     }
 
     /// Compute preserves row count (adds columns, doesn't drop rows).

@@ -853,6 +853,10 @@ pub const RadixAggregate = struct {
         if (self.top_k != null) return;
         return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
     }
+    pub fn rowSetTargetRows(self: *RadixAggregate, col: []const u8) u64 {
+        if (self.top_k != null) return 0;
+        return agg.group_row_set_target_rows(self.upstream, self.output_schema, self.group_col_indices, col);
+    }
     pub fn stats(self: *RadixAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };
     }
@@ -2160,6 +2164,10 @@ pub const RadixLeaseAggregate = struct {
     pub fn addPruneSet(self: *RadixLeaseAggregate, set: predicate.InSet) !void {
         if (self.top_k != null) return;
         return agg.prune_group_input(&self.upstream, self.output_schema, self.group_col_indices, .{ .set = set });
+    }
+    pub fn rowSetTargetRows(self: *RadixLeaseAggregate, col: []const u8) u64 {
+        if (self.top_k != null) return 0;
+        return agg.group_row_set_target_rows(self.upstream, self.output_schema, self.group_col_indices, col);
     }
     pub fn stats(self: *RadixLeaseAggregate) PipelineStats {
         return .{ .upper_rows = self.upstream.stats().upper_rows };
