@@ -76,6 +76,9 @@ pub const Ctx = struct {
     /// the pointer in `worker_state.*`, and reuse it on every later call
     /// that finds the slot non-null. State must derive only from
     /// broadcast inputs and args; partition data changes call to call.
+    /// A later statement with the same broadcast inputs and args may
+    /// reuse the state, so it may point into `worker_arena` and the
+    /// broadcast inputs' columns only: copy what it keeps of args.
     /// On paths without a worker lifetime these degrade to the
     /// per-partition arena and a call-local slot (state rebuilt per
     /// call — slower, never wrong).

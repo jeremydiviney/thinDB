@@ -174,9 +174,12 @@ pub const TvfContext = struct {
     /// its first call (allocate in worker_arena, stash the pointer in
     /// worker_state.*) and reuse it for every later partition the same
     /// worker claims. Valid contents derive only from broadcast inputs
-    /// and args — per-partition data changes call to call. Null when the
-    /// execution path has no worker lifetime (validation); kernels fall
-    /// back to the per-partition arena via the SDK.
+    /// and args — per-partition data changes call to call. A state may
+    /// outlive its statement: a later call with the same broadcast inputs
+    /// and args can reuse it, so it may point into worker_arena and the
+    /// broadcast inputs' columns only (copy what it keeps of args). Null
+    /// when the execution path has no worker lifetime (validation);
+    /// kernels fall back to the per-partition arena via the SDK.
     worker_arena: ?Allocator = null,
     worker_state: ?*?*anyopaque = null,
 };
