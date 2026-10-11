@@ -1287,34 +1287,25 @@ pub const Aggregate = struct {
                     .w64 => self.inline_table_64 = InlineTable64.init(ta, cap) catch InlineTable64.empty,
                 }
             } else if (self.int_layout) |layout| {
-                const slots: usize = switch (layout.tier) {
-                    .bits32 => blk: {
+                switch (layout.tier) {
+                    .bits32 => {
                         self.int_table_32 = IntTable32.init(ta, init_cap) catch try IntTable32.init(ta, 0);
                         if (cap > 0) self.int_table_32.?.grow_target = group_table.capacityFor(cap);
-                        break :blk self.int_table_32.?.slots.len;
                     },
-                    .bits96 => blk: {
+                    .bits96 => {
                         self.int_table_96 = IntTable96.init(ta, init_cap) catch try IntTable96.init(ta, 0);
                         if (cap > 0) self.int_table_96.?.grow_target = group_table.capacityFor(cap);
-                        break :blk self.int_table_96.?.slots.len;
                     },
-                    .bits128 => blk: {
+                    .bits128 => {
                         self.int_table_128 = IntTable128.init(ta, init_cap) catch try IntTable128.init(ta, 0);
                         if (cap > 0) self.int_table_128.?.grow_target = group_table.capacityFor(cap);
-                        break :blk self.int_table_128.?.slots.len;
                     },
-                };
-                if (init_cap > 0) {
-                    try self.allocAggCols(slots);
-                    self.gkeys_int.ensureTotalCapacityPrecise(ta, init_cap) catch {};
                 }
+                if (init_cap > 0) self.gkeys_int.ensureTotalCapacityPrecise(ta, init_cap) catch {};
             } else {
                 self.byte_table = ByteGroupTable.init(ta, init_cap) catch try ByteGroupTable.init(ta, 0);
                 if (cap > 0) self.byte_table.grow_target = group_table.capacityFor(cap);
-                if (init_cap > 0) {
-                    try self.allocAggCols(self.byte_table.slots.len);
-                    self.gkeys.ensureTotalCapacityPrecise(ta, init_cap) catch {};
-                }
+                if (init_cap > 0) self.gkeys.ensureTotalCapacityPrecise(ta, init_cap) catch {};
             }
 
             // Gate the combined COUNT(DISTINCT int) kernel per aggregate. The
@@ -2213,8 +2204,8 @@ pub const Aggregate = struct {
         }
     }
 
-    /// Allocate the per-aggregate columns to `capacity` (== the group table's
-    /// `slots.len`) and initialize every cell to its aggregate's initial value
+    /// Allocate the per-aggregate columns to `capacity` cells and initialize
+    /// every cell to its aggregate's initial value
     /// (`initialState`'s semantics, mirrored per column). Each column's kind is
     /// chosen by `aggColKind`; `.other` cells get `initialState` directly (so
     /// the per-row `updateStateRow` path sees a correctly-shaped `*AccState`).
@@ -2245,21 +2236,31 @@ pub const Aggregate = struct {
         };
     }
 
-    /// Ensure the per-aggregate columns hold at least `capacity` cells, allocating
-    /// fresh if unallocated or growing in place otherwise. New cells get the
-    /// aggregate's initial value. Idempotent when already large enough.
+    /// Ensure the per-aggregate columns hold at least `capacity` cells (one per
+    /// group assigned so far), allocating fresh if unallocated or growing
+    /// otherwise. New cells get the aggregate's initial value.
+    /// The columns follow the group count, not the group table's slot count:
+    /// a table is sized for a whole batch of potential new groups, or for its
+    /// ceiling, and filling a cell per slot for every aggregate costs far more
+    /// than the few groups a partial aggregate over one chunk finds. They
+    /// double while groups are few; past `ADAPTIVE_INITIAL` groups the input is
+    /// high-cardinality, and one jump to the `group_cap` ceiling (as the table
+    /// makes) beats copying ever-larger columns on every doubling.
     fn ensureAggColsCapacity(self: *Aggregate, capacity: usize) !void {
+        const have = self.aggColsLen();
+        if (self.agg_cols.len != 0 and have >= capacity) return;
+        const doubled = @max(capacity, have * 2);
+        const target = if (capacity > ADAPTIVE_INITIAL and self.group_cap > doubled) self.group_cap else doubled;
         if (self.agg_cols.len == 0) {
-            try self.allocAggCols(capacity);
-        } else if (self.aggColsLen() < capacity) {
-            try self.growAggCols(capacity);
+            try self.allocAggCols(target);
+        } else {
+            try self.growAggCols(target);
         }
     }
 
     /// Grow the per-aggregate columns from their current length to
     /// `new_capacity`, initializing the freshly-added region to each
-    /// aggregate's initial value. Mirrors a group-table grow: the table jumps
-    /// straight to its ceiling, so this normally fires at most once.
+    /// aggregate's initial value.
     fn growAggCols(self: *Aggregate, new_capacity: usize) !void {
         const up_schema = self.upstream.outputSchema();
         for (self.agg_cols, self.aggs, self.agg_col_indices) |*col, a, maybe_idx| {
@@ -2357,16 +2358,10 @@ pub const Aggregate = struct {
 
         if (table.needsGrow(n)) {
             try table.grow(ta, n);
-            // Couple the per-aggregate columns + key array to the table's new
-            // capacity so the new-group writes below land in bounds (gid <
-            // slots.len always) with no per-group reallocation.
+            // Couple the key array to the table's new capacity so the
+            // new-group appends below run with no per-group reallocation.
             self.gkeys_int.ensureTotalCapacityPrecise(ta, table.slots.len) catch {};
         }
-        // Ensure the per-aggregate columns are sized to the table's slot count
-        // (gids index into them directly). On the `init_cap == 0` path they are
-        // unallocated until here; otherwise a grow above may have enlarged the
-        // table past their current length.
-        try self.ensureAggColsCapacity(table.slots.len);
         // Every row could be a new group; reserve the key array for the worst
         // case up front so the per-row new-group appends below are bounds-free.
         try self.gkeys_int.ensureUnusedCapacity(ta, n);
@@ -2412,6 +2407,7 @@ pub const Aggregate = struct {
 
         // Phase (c): batched, type-specialized scatter-update over the resolved
         // gids — one tight loop per aggregate instead of a per-row type switch.
+        try self.ensureAggColsCapacity(self.n_groups);
         try self.accumulateAggsBatched(batch, self.pf_gids.items);
     }
 
@@ -2430,10 +2426,6 @@ pub const Aggregate = struct {
             // appends below run amortized-free as groups fill toward the ceiling.
             self.gkeys.ensureTotalCapacityPrecise(ta, self.byte_table.slots.len) catch {};
         }
-        // Per-aggregate columns are indexed by gid, so they must cover every slot
-        // the table can hold (gid < slots.len always). Unallocated on the
-        // `init_cap == 0` path until here; a grow above may have enlarged them.
-        try self.ensureAggColsCapacity(self.byte_table.slots.len);
 
         // Single string key: the key is the row's raw string bytes, already
         // sitting decoded in the batch — no scratch copy / length prefix. Its
@@ -2550,6 +2542,7 @@ pub const Aggregate = struct {
 
         // Phase (c): batched, type-specialized scatter-update over the resolved
         // gids — one tight loop per aggregate instead of a per-row type switch.
+        try self.ensureAggColsCapacity(self.n_groups);
         try self.accumulateAggsBatched(batch, self.pf_gids.items);
     }
 
