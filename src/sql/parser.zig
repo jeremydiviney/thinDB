@@ -1658,10 +1658,10 @@ pub const Parser = struct {
             // GroupBy emits group_cols first then aggs in registered order;
             // a Project on top reorders/keeps only the SELECT items. DISTINCT
             // always projects — its hidden COUNT(*) must not reach the output.
-            // Over a join too: the GroupBy names a key by its input column
-            // (`g.k`), while a derived table or CTE exposes the bare name the
-            // SELECT gives it.
-            if (from_is_join or distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or agg_calls.copies.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
+            // Over a join or an aliased subquery too: the GroupBy names a key
+            // by its input column (`g.k`), while a derived table or CTE
+            // exposes the bare name the SELECT gives it (#582).
+            if (from_is_join or fromAliasQualifies(from_op) or distinct or hidden_group_count or has_window or grouping_names.len > 0 or post_group_pred_derived.len > 0 or aggregate_expr_refs.len > 0 or agg_calls.copies.len > 0 or having_derived.len > 0 or order_hidden > 0 or !projMatchesGroupByOrder(proj, group_cols) or projectionHasRenamedCols(proj)) {
                 root = try self.addSelectProject(root, proj, 0);
             }
             if (group_alias_renames.len > 0) root = try self.renameAboveGroup(root, rename_floor, group_alias_renames);
@@ -7771,6 +7771,14 @@ fn orderNameSource(proj: []const ProjItem, name: []const u8) []const u8 {
 fn displayNameBinds(p: ProjItem, name: []const u8) bool {
     const display = p.display orelse return false;
     return types.columnNameEql(display, name) and (p.display_is_alias or !types.isPlainIdentifier(display));
+}
+
+/// Whether the FROM source is a subquery, CTE or view read through an
+/// alias, whose columns arrive qualified by it. An aliased table's block
+/// compiles bare (`unqualifyTableBlock`), so it needs no projection.
+fn fromAliasQualifies(from_op: ?*const ir.Op) bool {
+    const op = from_op orelse return false;
+    return op.* == .alias;
 }
 
 fn projectionHasRenamedCols(proj: []const ProjItem) bool {
