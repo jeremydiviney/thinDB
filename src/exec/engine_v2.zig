@@ -1110,7 +1110,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
     // tombstones) and returns null to fall through to the scan pipeline
     // whenever any fails.
     if (plan.where_filter == null and plan.having == null and plan.derived.len == 0 and plan.post_steps.len == 0) {
-        if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs)) |q| return q;
+        if (try tryMetaAggStats(input.allocator, table, plan.group_by.aggs, input.accountant)) |q| return q;
     }
 
     // The parallel reducer (v2_global_aggregate) hosts the combinable aggregates —
@@ -1135,7 +1135,7 @@ fn buildGlobalAggregateBase(input: CompileInput, plan: GlobalAggregatePlan) !?ex
 // COUNT(*), COUNT(col), MIN/MAX(col), or SUM/AVG(col) — COUNT(DISTINCT) is a
 // separate AggFunc and never matches. Data-side preconditions live in
 // MetaAggStats.create.
-fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []const exec.AggSpec) !?exec.Query {
+fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []const exec.AggSpec, accountant: ?*exec.memory.MemoryAccountant) !?exec.Query {
     if (aggs.len == 0) return null;
     const specs = try allocator.alloc(exec.MetaAggSpec, aggs.len);
     defer allocator.free(specs);
@@ -1166,7 +1166,7 @@ fn tryMetaAggStats(allocator: std.mem.Allocator, table: *api.Table, aggs: []cons
             else => return null,
         }
     }
-    return exec.metaAggStats(allocator, table, specs);
+    return exec.metaAggStats(allocator, table, specs, accountant);
 }
 
 // Build the global aggregate over the reduced base set, then layer the late

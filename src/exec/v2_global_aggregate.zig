@@ -1398,9 +1398,9 @@ const GlobalAggregate = struct {
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
 
-        const snap = try Scan.captureSnapshotAlloc(table, self.allocator);
+        const snap = try Scan.captureSnapshotAlloc(table, self.allocator, exec.memory.accountantOf(self.allocator));
         var pin_held = true;
-        defer if (pin_held) snap.memtable_snap.release();
+        defer if (pin_held) snap.release(table);
         defer self.allocator.free(snap.segments);
 
         const seg_start = try self.allocator.alloc(usize, snap.segment_count + 1);
@@ -1465,7 +1465,7 @@ const GlobalAggregate = struct {
             tiles = try RowGroupTiles.init(self.allocator, total_rgs, mask, n_workers, TILE_RGS);
         }
         // All worker scans now hold their own memtable pins.
-        snap.memtable_snap.release();
+        snap.release(table);
         pin_held = false;
 
         // Spawn every lane as its own pinned thread; the calling thread only

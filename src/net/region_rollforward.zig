@@ -781,9 +781,10 @@ fn poolCapBytes() usize {
 /// Data-version fingerprint of one table: memtable generation (bumped by
 /// every retire-swap — flush/delete/update/alter) + memtable row count
 /// (catches appends within a generation) + the segment set and tombstone
-/// generation. The cache UID distinguishes recreated tables. Read under the
-/// table mutex so the triple is coherent. Compaction changes the segment set
-/// without changing values — a spurious invalidation, which is safe.
+/// generation. The cache UID distinguishes recreated tables. Taken from the
+/// statement's snapshot of the table, so it names the state the statement's
+/// scans read. Compaction changes the segment set without changing values —
+/// a spurious invalidation, which is safe.
 fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
     var is_temp = false;
     const t = blk: {
@@ -795,10 +796,10 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
         }
         break :blk (sessionDb(input) orelse return null).openTable(name, .{}) catch return null;
     };
-    t.mutex.lockUncancelable(t.io);
-    defer t.mutex.unlock(t.io);
     var h = std.hash.Wyhash.init(0x7461626c65);
     if (is_temp) {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
         // Recreated small lookup tables can retain a program and its worker
         // state only when their complete schema and ordered contents match.
         // Counters restart, and allocator reuse makes pointer identity unsafe.
@@ -830,12 +831,19 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
         }
         return h.final();
     }
+    t.ddl_lock.lockSharedUncancelable(t.io);
+    defer t.ddl_lock.unlockShared(t.io);
+    const snap = Scan.captureSnapshotAlloc(t, input.allocator, input.accountant) catch return null;
+    defer {
+        snap.release(t);
+        input.allocator.free(snap.segments);
+    }
     hu(&h, 0);
     hu(&h, t.cache_uid);
-    hu(&h, t.seg_handles.tombstone_generation.load(.monotonic));
-    hu(&h, t.memtable_gen);
-    hu(&h, t.memtable.row_count);
-    for (t.manifest.segments.items) |e| {
+    hu(&h, snap.tomb_generation);
+    hu(&h, snap.memtable_gen);
+    hu(&h, snap.memtable_row_count);
+    for (snap.segments) |e| {
         hu(&h, e.segment_id);
         hu(&h, e.row_count);
     }
@@ -5165,10 +5173,10 @@ fn buildScanSources(
     // returns, so the first one adopts the lock until the region drops it.
     var lock_held = true;
     defer if (lock_held) table.ddl_lock.unlockShared(table.io);
-    const snap = try Scan.captureSnapshotAlloc(table, qa);
+    const snap = try Scan.captureSnapshotAlloc(table, qa, input.accountant);
     defer qa.free(snap.segments);
     var pin_held = true;
-    defer if (pin_held) snap.memtable_snap.release();
+    defer if (pin_held) snap.release(table);
 
     var total_rgs: usize = 0;
     var total_rows: u64 = snap.memtable_row_count;
@@ -5215,7 +5223,7 @@ fn buildScanSources(
         if (!fused) return NoMatch;
     }
     recutSourcesForPruning(qa, scans, seg_start, snap.segment_count, total_rgs);
-    snap.memtable_snap.release();
+    snap.release(table);
     pin_held = false;
     return .{ .sources = sources, .total_rows = total_rows };
 }
@@ -5293,10 +5301,10 @@ fn buildOrderedSources(
     // returns, so the first one adopts the lock until the region drops it.
     var lock_held = true;
     defer if (lock_held) table.ddl_lock.unlockShared(table.io);
-    const snap = try Scan.captureSnapshotAlloc(table, qa);
+    const snap = try Scan.captureSnapshotAlloc(table, qa, input.accountant);
     defer qa.free(snap.segments);
     var pin_held = true;
-    defer if (pin_held) snap.memtable_snap.release();
+    defer if (pin_held) snap.release(table);
 
     const route_phys = table.schema.columnIndex(route_name) orelse return NoMatch;
 
@@ -5425,7 +5433,7 @@ fn buildOrderedSources(
         const fused = s.tryFuseFilter(fexpr) catch return NoMatch;
         if (!fused) return NoMatch;
     }
-    snap.memtable_snap.release();
+    snap.release(table);
     pin_held = false;
     return .{ .sources = sources, .total_rows = total_rows, .iv_rows = iv_rows };
 }

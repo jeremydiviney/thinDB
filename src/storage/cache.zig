@@ -568,9 +568,13 @@ test "purgeTable frees one table's unpinned entries, leaves other tables and pin
 /// reference-counted, immutable list, so an invalidation can never free
 /// bytes a reader is still walking. Scans reopen a segment for every tile
 /// they claim; a per-open copy of a multi-MB list under `lock` serialized
-/// the whole worker fleet (#564). `tombstones` still returns a caller-owned
-/// dupe for callers that merge into it. Entries are pinned while a scan
-/// holds them; `retire` defers destruction to the last `release`.
+/// the whole worker fleet (#564). Entries are pinned while a scan holds
+/// them; `retire` defers destruction to the last `release`.
+///
+/// A snapshot reads tombstones as of its capture (DESIGN §6.1) through the
+/// `TombstoneEpoch` it pins (`pinEpoch`, then the `...At` readers), so a
+/// delete published mid-query never reaches a segment the query opens
+/// later.
 pub const SegmentHandles = struct {
     const segment_reader = @import("segment_reader.zig");
     const tombstone = @import("tombstone.zig");
@@ -588,6 +592,31 @@ pub const SegmentHandles = struct {
             gpa.free(self.rows);
             gpa.destroy(self);
         }
+    };
+
+    /// One state of the table's tombstones. Each publish starts a new
+    /// epoch carrying the rows it added to one segment, and the epoch it
+    /// supersedes links to it while anything pins that one. A pinned epoch
+    /// so keeps every later one alive, and a segment's list as of it is the
+    /// newest list minus what the later epochs added. `refs` counts pins,
+    /// the newest epoch's table reference and a predecessor's link.
+    pub const TombstoneEpoch = struct {
+        refs: std.atomic.Value(u32),
+        segment_id: u64 = 0,
+        /// Sorted, and none were tombstoned before. Dropped when nothing can
+        /// read through it: no older epoch was pinned when it was published.
+        added: []const u32 = &.{},
+        next: ?*TombstoneEpoch = null,
+        /// Each segment's list as of this epoch (null = none), kept on its
+        /// first read for the rest of the snapshot's segment opens.
+        views: std.AutoHashMapUnmanaged(u64, ?*Tombstones) = .empty,
+    };
+
+    /// A list ready to publish, with the epoch its publish starts.
+    pub const Pending = struct {
+        segment_id: u64,
+        tombs: *Tombstones,
+        epoch: *TombstoneEpoch,
     };
 
     pub const Entry = struct {
@@ -625,6 +654,8 @@ pub const SegmentHandles = struct {
     /// Segment-only deletes need to invalidate cached query state even when
     /// the memtable and manifest do not change, or no handle was cached.
     tombstone_generation: std.atomic.Value(u64) = .init(0),
+    /// The newest `TombstoneEpoch`, created by the first pin or publish.
+    epoch: ?*TombstoneEpoch = null,
     lock: std.atomic.Mutex = .unlocked,
 
     fn lockSpin(self: *SegmentHandles) void {
@@ -680,12 +711,27 @@ pub const SegmentHandles = struct {
         dir: std.Io.Dir,
         entry: *Entry,
     ) !?*Tombstones {
-        self.lockSpin();
-        defer self.lock.unlock();
-        try self.loadEntryTombstones(gpa, io, dir, entry);
-        const t = entry.tombs orelse return null;
-        _ = t.refs.fetchAdd(1, .monotonic);
-        return t;
+        return self.acquireTombstonesAt(gpa, io, dir, entry, null);
+    }
+
+    /// `acquireTombstones` as of `epoch` (null = the newest list).
+    pub fn acquireTombstonesAt(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        entry: *Entry,
+        epoch: ?*TombstoneEpoch,
+    ) !?*Tombstones {
+        const as_of = blk: {
+            self.lockSpin();
+            defer self.lock.unlock();
+            try self.loadEntryTombstones(gpa, io, dir, entry);
+            const current = refTombstones(entry.tombs);
+            const pinned = epoch orelse return current;
+            break :blk self.asOfLocked(gpa, pinned, entry.segment_id, current);
+        };
+        return self.finishAsOf(gpa, epoch.?, entry.segment_id, as_of);
     }
 
     /// `acquireTombstones` by segment id, for a reader that holds no handle.
@@ -697,17 +743,199 @@ pub const SegmentHandles = struct {
         dir: std.Io.Dir,
         segment_id: u64,
     ) !?*Tombstones {
+        return self.currentTombstonesAt(gpa, io, dir, segment_id, null);
+    }
+
+    /// `currentTombstones` as of `epoch` (null = the newest list).
+    pub fn currentTombstonesAt(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        segment_id: u64,
+        epoch: ?*TombstoneEpoch,
+    ) !?*Tombstones {
+        const as_of = blk: {
+            self.lockSpin();
+            defer self.lock.unlock();
+            const current = if (self.map.get(segment_id)) |entry| current: {
+                try self.loadEntryTombstones(gpa, io, dir, entry);
+                break :current refTombstones(entry.tombs);
+            } else if (self.unwritten.get(segment_id)) |t|
+                refTombstones(t)
+            else
+                try loadTombstones(gpa, io, dir, segment_id);
+            const pinned = epoch orelse return current;
+            break :blk self.asOfLocked(gpa, pinned, segment_id, current);
+        };
+        return self.finishAsOf(gpa, epoch.?, segment_id, as_of);
+    }
+
+    fn refTombstones(t: ?*Tombstones) ?*Tombstones {
+        if (t) |list| _ = list.refs.fetchAdd(1, .monotonic);
+        return t;
+    }
+
+    const AsOf = union(enum) {
+        done: ?*Tombstones,
+        /// `current` minus what the epochs after the pinned one, through
+        /// `newest`, added to the segment.
+        build: struct { current: *Tombstones, newest: *TombstoneEpoch },
+    };
+
+    /// Segment `segment_id`'s list as of `pinned`, given its newest list
+    /// `current`, whose reference this takes.
+    fn asOfLocked(self: *SegmentHandles, gpa: Allocator, pinned: *TombstoneEpoch, segment_id: u64, current: ?*Tombstones) AsOf {
+        if (pinned == self.epoch) return .{ .done = current };
+        if (pinned.views.get(segment_id)) |view| {
+            if (current) |c| c.unref(gpa);
+            return .{ .done = refTombstones(view) };
+        }
+        if (current) |c| {
+            var later = pinned.next;
+            while (later) |e| : (later = e.next) {
+                if (e.segment_id == segment_id and e.added.len > 0) return .{ .build = .{ .current = c, .newest = self.epoch.? } };
+            }
+        }
+        rememberView(gpa, pinned, segment_id, current);
+        return .{ .done = current };
+    }
+
+    fn finishAsOf(self: *SegmentHandles, gpa: Allocator, pinned: *TombstoneEpoch, segment_id: u64, as_of: AsOf) !?*Tombstones {
+        const build = switch (as_of) {
+            .done => |t| return t,
+            .build => |b| b,
+        };
+        defer build.current.unref(gpa);
+        const view = try listWithout(gpa, build.current.rows, pinned, build.newest, segment_id);
         self.lockSpin();
         defer self.lock.unlock();
-        const t = if (self.map.get(segment_id)) |entry| blk: {
-            try self.loadEntryTombstones(gpa, io, dir, entry);
-            break :blk entry.tombs orelse return null;
-        } else if (self.unwritten.get(segment_id)) |t|
-            t
-        else
-            return try loadTombstones(gpa, io, dir, segment_id);
-        _ = t.refs.fetchAdd(1, .monotonic);
-        return t;
+        if (pinned.views.get(segment_id)) |raced| {
+            if (view) |v| v.unref(gpa);
+            return refTombstones(raced);
+        }
+        rememberView(gpa, pinned, segment_id, view);
+        return view;
+    }
+
+    /// Keep `view` as `epoch`'s list of `segment_id`, which it has none of
+    /// yet. A failed allocation only costs a later open the rebuild.
+    fn rememberView(gpa: Allocator, epoch: *TombstoneEpoch, segment_id: u64, view: ?*Tombstones) void {
+        epoch.views.put(gpa, segment_id, view) catch return;
+        _ = refTombstones(view);
+    }
+
+    /// `rows` without what the epochs after `pinned`, through `newest`,
+    /// added to `segment_id` (null when nothing is left).
+    fn listWithout(gpa: Allocator, rows: []const u32, pinned: *TombstoneEpoch, newest: *TombstoneEpoch, segment_id: u64) !?*Tombstones {
+        var count: usize = 0;
+        var later = pinned;
+        while (later != newest) {
+            later = later.next.?;
+            if (later.segment_id == segment_id) count += later.added.len;
+        }
+        const removed = try gpa.alloc(u32, count);
+        defer gpa.free(removed);
+        var filled: usize = 0;
+        later = pinned;
+        while (later != newest) {
+            later = later.next.?;
+            if (later.segment_id != segment_id) continue;
+            @memcpy(removed[filled..][0..later.added.len], later.added);
+            filled += later.added.len;
+        }
+        std.sort.pdq(u32, removed, {}, std.sort.asc(u32));
+
+        const kept = try gpa.alloc(u32, rows.len);
+        var len: usize = 0;
+        var j: usize = 0;
+        for (rows) |row| {
+            while (j < removed.len and removed[j] < row) j += 1;
+            if (j < removed.len and removed[j] == row) continue;
+            kept[len] = row;
+            len += 1;
+        }
+        if (len == 0) {
+            gpa.free(kept);
+            return null;
+        }
+        const owned = gpa.realloc(kept, len) catch |err| {
+            gpa.free(kept);
+            return err;
+        };
+        errdefer gpa.free(owned);
+        return try ownTombstones(gpa, owned);
+    }
+
+    /// Pin the newest epoch for a snapshot; pair with `unpinEpoch`. Callers
+    /// hold the table mutex, so the epoch matches the rest of the snapshot.
+    pub fn pinEpoch(self: *SegmentHandles, gpa: Allocator) !*TombstoneEpoch {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const epoch = self.epoch orelse blk: {
+            const first = try gpa.create(TombstoneEpoch);
+            first.* = .{ .refs = .init(1) };
+            self.epoch = first;
+            break :blk first;
+        };
+        _ = epoch.refs.fetchAdd(1, .monotonic);
+        return epoch;
+    }
+
+    /// Another pin on an already pinned epoch.
+    pub fn repinEpoch(epoch: *TombstoneEpoch) void {
+        _ = epoch.refs.fetchAdd(1, .monotonic);
+    }
+
+    pub fn unpinEpoch(gpa: Allocator, epoch: *TombstoneEpoch) void {
+        var next: ?*TombstoneEpoch = epoch;
+        while (next) |e| {
+            if (e.refs.fetchSub(1, .acq_rel) != 1) return;
+            next = e.next;
+            gpa.free(e.added);
+            var it = e.views.valueIterator();
+            while (it.next()) |view| if (view.*) |t| t.unref(gpa);
+            e.views.deinit(gpa);
+            gpa.destroy(e);
+        }
+    }
+
+    /// The epoch a publish of `added` to `segment_id` starts, owning
+    /// `added` (sorted, newly tombstoned, allocated with `gpa`) once this
+    /// returns.
+    pub fn newEpoch(gpa: Allocator, segment_id: u64, added: []const u32) !*TombstoneEpoch {
+        const epoch = try gpa.create(TombstoneEpoch);
+        epoch.* = .{ .refs = .init(1), .segment_id = segment_id, .added = added };
+        return epoch;
+    }
+
+    pub fn releasePending(gpa: Allocator, p: Pending) void {
+        p.tombs.unref(gpa);
+        unpinEpoch(gpa, p.epoch);
+    }
+
+    /// Make `epoch`, with its one table reference, the newest. Its
+    /// additions only matter to a snapshot pinned on an older epoch.
+    fn advanceEpochLocked(self: *SegmentHandles, gpa: Allocator, epoch: *TombstoneEpoch) void {
+        const previous = self.epoch;
+        self.epoch = epoch;
+        const prev = previous orelse {
+            dropAdded(gpa, epoch);
+            return;
+        };
+        // Only the table's reference: pins take `lock`, so none can come.
+        if (prev.refs.load(.acquire) == 1) {
+            dropAdded(gpa, epoch);
+        } else {
+            _ = epoch.refs.fetchAdd(1, .monotonic);
+            prev.next = epoch;
+        }
+        unpinEpoch(gpa, prev);
+    }
+
+    fn dropAdded(gpa: Allocator, epoch: *TombstoneEpoch) void {
+        gpa.free(epoch.added);
+        epoch.added = &.{};
     }
 
     fn loadEntryTombstones(self: *SegmentHandles, gpa: Allocator, io: std.Io, dir: std.Io.Dir, entry: *Entry) !void {
@@ -723,22 +951,6 @@ pub const SegmentHandles = struct {
 
     pub fn releaseTombstones(gpa: Allocator, t: *Tombstones) void {
         t.unref(gpa);
-    }
-
-    /// The segment's tombstone row list as a caller-owned dupe (null = none),
-    /// for callers that merge into it. Same `gpa` contract as
-    /// `acquireTombstones`; `out_allocator` owns only the returned dupe.
-    pub fn tombstones(
-        self: *SegmentHandles,
-        gpa: Allocator,
-        out_allocator: Allocator,
-        io: std.Io,
-        dir: std.Io.Dir,
-        entry: *Entry,
-    ) !?[]u32 {
-        const t = (try self.acquireTombstones(gpa, io, dir, entry)) orelse return null;
-        defer t.unref(gpa);
-        return try out_allocator.dupe(u32, t.rows);
     }
 
     fn loadTombstones(gpa: Allocator, io: std.Io, dir: std.Io.Dir, segment_id: u64) !?*Tombstones {
@@ -767,14 +979,18 @@ pub const SegmentHandles = struct {
         try self.unwritten.ensureUnusedCapacity(gpa, @intCast(count));
     }
 
-    /// Make `t` segment `segment_id`'s list for every later reader, taking
-    /// the caller's reference. Readers holding the previous list keep it
-    /// until they release. Needs a `reserveTombstones` slot. Callers hold the
-    /// table mutex, so publishes don't race each other.
-    pub fn publishTombstones(self: *SegmentHandles, gpa: Allocator, segment_id: u64, t: *Tombstones) void {
+    /// Make `p.tombs` segment `p.segment_id`'s list for every later reader
+    /// and start `p.epoch`, taking the caller's references. Readers holding
+    /// the previous list keep it until they release. Needs a
+    /// `reserveTombstones` slot. Callers hold the table mutex, so publishes
+    /// don't race each other.
+    pub fn publishTombstones(self: *SegmentHandles, gpa: Allocator, p: Pending) void {
+        const segment_id = p.segment_id;
+        const t = p.tombs;
         self.lockSpin();
         defer self.lock.unlock();
         _ = self.tombstone_generation.fetchAdd(1, .monotonic);
+        self.advanceEpochLocked(gpa, p.epoch);
         const gop = self.unwritten.getOrPutAssumeCapacity(segment_id);
         if (gop.found_existing) gop.value_ptr.*.unref(gpa) else _ = self.unwritten_count.fetchAdd(1, .monotonic);
         gop.value_ptr.* = t;
@@ -866,6 +1082,8 @@ pub const SegmentHandles = struct {
 
     pub fn deinit(self: *SegmentHandles, allocator: Allocator) void {
         self.clear(allocator);
+        if (self.epoch) |e| unpinEpoch(allocator, e);
+        self.epoch = null;
         self.discardUnwrittenLocked(allocator);
         self.unwritten.deinit(allocator);
         self.map.deinit(allocator);

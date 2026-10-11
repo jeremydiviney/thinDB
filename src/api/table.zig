@@ -706,15 +706,15 @@ pub const Table = struct {
     /// Segment tombstone lists merged and ready to publish, with room
     /// reserved so `publish` can't fail.
     pub const PreparedTombstones = struct {
-        list: std.ArrayList(storage.cache.SegmentHandles.Unwritten) = .empty,
+        list: std.ArrayList(storage.cache.SegmentHandles.Pending) = .empty,
 
         pub fn publish(self: *PreparedTombstones, t: *Table) void {
-            for (self.list.items) |p| t.seg_handles.publishTombstones(t.allocator, p.segment_id, p.tombs);
+            for (self.list.items) |p| t.seg_handles.publishTombstones(t.allocator, p);
             self.list.clearRetainingCapacity();
         }
 
         pub fn deinit(self: *PreparedTombstones, gpa: Allocator) void {
-            for (self.list.items) |p| storage.cache.SegmentHandles.releaseTombstones(gpa, p.tombs);
+            for (self.list.items) |p| storage.cache.SegmentHandles.releasePending(gpa, p);
             self.list.deinit(gpa);
             self.* = undefined;
         }
@@ -727,17 +727,19 @@ pub const Table = struct {
         try prepared.list.ensureTotalCapacity(self.allocator, added.count());
         for (added.keys(), added.values()) |segment_id, offsets| {
             if (offsets.items.len == 0) continue;
-            prepared.list.appendAssumeCapacity(.{ .segment_id = segment_id, .tombs = try self.mergedTombstones(segment_id, offsets.items) });
+            prepared.list.appendAssumeCapacity(try self.mergedTombstones(segment_id, offsets.items));
         }
         try self.seg_handles.reserveTombstones(self.allocator, prepared.list.items.len);
         return prepared;
     }
 
     /// Segment `id`'s current tombstones with `offsets` (any order, may
-    /// repeat) added, sorted and deduped.
-    fn mergedTombstones(self: *Table, id: u64, offsets: []const u32) !*storage.cache.SegmentHandles.Tombstones {
+    /// repeat) added, sorted and deduped, and the epoch publishing them
+    /// starts.
+    fn mergedTombstones(self: *Table, id: u64, offsets: []const u32) !storage.cache.SegmentHandles.Pending {
         const added = try self.allocator.dupe(u32, offsets);
-        defer self.allocator.free(added);
+        var added_owned = true;
+        defer if (added_owned) self.allocator.free(added);
         std.sort.pdq(u32, added, {}, std.sort.asc(u32));
         const current = try self.seg_handles.currentTombstones(self.allocator, self.io, self.segments_dir, id);
         defer if (current) |c| storage.cache.SegmentHandles.releaseTombstones(self.allocator, c);
@@ -745,10 +747,13 @@ pub const Table = struct {
 
         const merged = try self.allocator.alloc(u32, base.len + added.len);
         var len: usize = 0;
+        // The offsets not tombstoned before, compacted to the front of `added`.
+        var fresh: usize = 0;
         var i: usize = 0;
         var j: usize = 0;
         while (i < base.len or j < added.len) {
-            const v = if (j == added.len or (i < base.len and base[i] <= added[j])) blk: {
+            const from_base = j == added.len or (i < base.len and base[i] <= added[j]);
+            const v = if (from_base) blk: {
                 i += 1;
                 break :blk base[i - 1];
             } else blk: {
@@ -758,14 +763,28 @@ pub const Table = struct {
             if (len == 0 or merged[len - 1] != v) {
                 merged[len] = v;
                 len += 1;
+                if (!from_base) {
+                    added[fresh] = v;
+                    fresh += 1;
+                }
             }
         }
         const rows = self.allocator.realloc(merged, len) catch |err| {
             self.allocator.free(merged);
             return err;
         };
-        errdefer self.allocator.free(rows);
-        return storage.cache.SegmentHandles.ownTombstones(self.allocator, rows);
+        var rows_owned = true;
+        defer if (rows_owned) self.allocator.free(rows);
+        const fresh_rows = try self.allocator.realloc(added, fresh);
+        added_owned = false;
+        var fresh_owned = true;
+        defer if (fresh_owned) self.allocator.free(fresh_rows);
+        const tombs = try storage.cache.SegmentHandles.ownTombstones(self.allocator, rows);
+        rows_owned = false;
+        errdefer storage.cache.SegmentHandles.releaseTombstones(self.allocator, tombs);
+        const epoch = try storage.cache.SegmentHandles.newEpoch(self.allocator, id, fresh_rows);
+        fresh_owned = false;
+        return .{ .segment_id = id, .tombs = tombs, .epoch = epoch };
     }
 
     fn endChunkLocked(self: *Table, s: *Statement) void {
@@ -1173,7 +1192,12 @@ pub const Table = struct {
 
     /// How many rows of segment `id` are deleted.
     pub fn tombstoneCount(self: *Table, id: u64) !usize {
-        const t = (try self.seg_handles.currentTombstones(self.allocator, self.io, self.segments_dir, id)) orelse return 0;
+        return self.tombstoneCountAt(id, null);
+    }
+
+    /// `tombstoneCount` as of a snapshot's `epoch` (null = now).
+    pub fn tombstoneCountAt(self: *Table, id: u64, epoch: ?*storage.cache.SegmentHandles.TombstoneEpoch) !usize {
+        const t = (try self.seg_handles.currentTombstonesAt(self.allocator, self.io, self.segments_dir, id, epoch)) orelse return 0;
         defer storage.cache.SegmentHandles.releaseTombstones(self.allocator, t);
         return t.rows.len;
     }
@@ -1461,17 +1485,20 @@ pub const Table = struct {
         return .{ .row = exec.avgWidth(bytes, rows), .distinct = exec.avgWidth(distinct_sum.bytes, distinct_sum.values) };
     }
 
-    /// The segment's tombstone list as a dupe owned by `allocator` (null =
-    /// none). Cached file read; caller frees, same contract as
-    /// `storage.tombstone.read`.
-    pub fn segmentTombstones(self: *Table, allocator: Allocator, entry: *storage.cache.SegmentHandles.Entry) !?[]u32 {
-        return self.seg_handles.tombstones(self.allocator, allocator, self.io, self.segments_dir, entry);
+    /// The segment's tombstone list as of a snapshot's `epoch` (null =
+    /// now), as a dupe owned by `allocator` (null = none). Cached file
+    /// read; caller frees, same contract as `storage.tombstone.read`.
+    pub fn segmentTombstones(self: *Table, allocator: Allocator, entry: *storage.cache.SegmentHandles.Entry, epoch: ?*storage.cache.SegmentHandles.TombstoneEpoch) !?[]u32 {
+        const t = (try self.acquireSegmentTombstones(entry, epoch)) orelse return null;
+        defer self.releaseSegmentTombstones(t);
+        return try allocator.dupe(u32, t.rows);
     }
 
-    /// The segment's tombstone list, shared with every other reader (null =
-    /// none); pair with `releaseSegmentTombstones`.
-    pub fn acquireSegmentTombstones(self: *Table, entry: *storage.cache.SegmentHandles.Entry) !?*storage.cache.SegmentHandles.Tombstones {
-        return self.seg_handles.acquireTombstones(self.allocator, self.io, self.segments_dir, entry);
+    /// The segment's tombstone list as of a snapshot's `epoch` (null =
+    /// now), shared with every other reader (null = none); pair with
+    /// `releaseSegmentTombstones`.
+    pub fn acquireSegmentTombstones(self: *Table, entry: *storage.cache.SegmentHandles.Entry, epoch: ?*storage.cache.SegmentHandles.TombstoneEpoch) !?*storage.cache.SegmentHandles.Tombstones {
+        return self.seg_handles.acquireTombstonesAt(self.allocator, self.io, self.segments_dir, entry, epoch);
     }
 
     pub fn releaseSegmentTombstones(self: *Table, tombs: *storage.cache.SegmentHandles.Tombstones) void {

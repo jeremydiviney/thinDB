@@ -201,12 +201,12 @@ test "a reader's shared tombstone list outlives the invalidation of a later DELE
 
     const entry = try table.acquireSegment(table.manifest.segments.items[0].segment_id);
     defer table.releaseSegment(entry);
-    try std.testing.expect((try table.acquireSegmentTombstones(entry)) == null);
+    try std.testing.expect((try table.acquireSegmentTombstones(entry, null)) == null);
 
     try helpers.exec(allocator, db, "DELETE FROM t WHERE id = 1");
-    const before = (try table.acquireSegmentTombstones(entry)).?;
+    const before = (try table.acquireSegmentTombstones(entry, null)).?;
     try std.testing.expectEqualSlices(u32, &.{1}, before.rows);
-    const again = (try table.acquireSegmentTombstones(entry)).?;
+    const again = (try table.acquireSegmentTombstones(entry, null)).?;
     try std.testing.expectEqual(before, again);
     table.releaseSegmentTombstones(again);
 
@@ -214,7 +214,7 @@ test "a reader's shared tombstone list outlives the invalidation of a later DELE
     try std.testing.expectEqualSlices(u32, &.{1}, before.rows);
     table.releaseSegmentTombstones(before);
 
-    const after = (try table.acquireSegmentTombstones(entry)).?;
+    const after = (try table.acquireSegmentTombstones(entry, null)).?;
     defer table.releaseSegmentTombstones(after);
     try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, after.rows);
 }

@@ -18,6 +18,7 @@ const simd = @import("../util/simd.zig");
 const comparison = @import("../api/comparison.zig");
 
 const engine = @import("../engine/engine.zig");
+const SegmentHandles = storage.cache.SegmentHandles;
 const ColumnStore = engine.ColumnStore;
 
 const api = @import("../api/api.zig");
@@ -294,6 +295,9 @@ pub const Scan = struct {
     /// invisible to this scan.
     memtable_snap: *engine.Memtable,
     memtable_row_count: u64,
+    /// The table's tombstones as of the snapshot, pinned like the memtable.
+    /// Null only for a count-only capture, which reads them as they are.
+    tomb_epoch: ?*SegmentHandles.TombstoneEpoch,
 
     phase: Phase = .segments,
     cur_seg_idx: usize = 0,
@@ -672,29 +676,117 @@ pub const Scan = struct {
         /// worker has duped its own copy; null when the capturer didn't ask
         /// for it (callers that only need counts).
         segments: []const storage.ManifestEntry = &.{},
+        /// The table's tombstones as of the capture; null for a count-only
+        /// capture, which reads them as they are.
+        tomb_epoch: ?*SegmentHandles.TombstoneEpoch = null,
+        /// The table's tombstone and memtable generations at the capture,
+        /// for a cache keyed by the data a statement reads. A view copied
+        /// from a worker Scan leaves them 0.
+        tomb_generation: u64 = 0,
+        memtable_gen: u64 = 0,
+
+        /// Drop the memtable and tombstone pins (not `segments`).
+        pub fn release(self: Snapshot, table: *Table) void {
+            self.memtable_snap.release();
+            if (self.tomb_epoch) |epoch| SegmentHandles.unpinEpoch(table.allocator, epoch);
+        }
+
+        /// The same view with its own pins and, when `allocator` is
+        /// non-null, its own dupe of `segments`.
+        pub fn copy(self: Snapshot, allocator: ?Allocator) !Snapshot {
+            var out = self;
+            out.segments = if (allocator) |a| try a.dupe(storage.ManifestEntry, self.segments) else &.{};
+            out.memtable_snap.acquire();
+            if (out.tomb_epoch) |epoch| SegmentHandles.repinEpoch(epoch);
+            return out;
+        }
     };
 
-    /// Capture a consistent snapshot, pinning the memtable and (when
-    /// `allocator` is non-null) duping the segment entry array so downstream
+    /// The snapshot each table's scans in one statement share, so they all
+    /// read one state of it (DESIGN §6.1). The statement's first scan of a
+    /// table takes it; the key is the table generation (`cache_uid`, which
+    /// TRUNCATE and ALTER re-mint). Owned by the statement, which hangs it
+    /// on its accountant for its scans to find.
+    pub const StatementSnapshots = struct {
+        gpa: Allocator,
+        mutex: std.Io.Mutex = .init,
+        tables: std.AutoHashMapUnmanaged(u64, Shared) = .empty,
+
+        const Shared = struct { table: *Table, snap: Snapshot };
+
+        pub fn deinit(self: *StatementSnapshots) void {
+            var it = self.tables.valueIterator();
+            while (it.next()) |shared| {
+                shared.snap.release(shared.table);
+                self.gpa.free(shared.snap.segments);
+            }
+            self.tables.deinit(self.gpa);
+        }
+
+        fn snapshotOf(self: *StatementSnapshots, table: *Table, allocator: ?Allocator) !Snapshot {
+            self.mutex.lockUncancelable(table.io);
+            defer self.mutex.unlock(table.io);
+            table.mutex.lockUncancelable(table.io);
+            defer table.mutex.unlock(table.io);
+            const uid = table.cache_uid;
+            if (self.tables.get(uid)) |shared| {
+                if (leadsManifest(shared.snap.segments, table.manifest.segments.items)) return shared.snap.copy(allocator);
+                // A compaction retired one of its segments, between scans:
+                // the files may be gone.
+                _ = self.tables.remove(uid);
+                shared.snap.release(table);
+                self.gpa.free(shared.snap.segments);
+            }
+            try self.tables.ensureUnusedCapacity(self.gpa, 1);
+            const snap = try captureLocked(table, self.gpa);
+            self.tables.putAssumeCapacityNoClobber(uid, .{ .table = table, .snap = snap });
+            return snap.copy(allocator);
+        }
+
+        /// Whether the segments a snapshot captured still lead the
+        /// manifest: flushes only append, and a compaction splices its
+        /// output in where its inputs were.
+        fn leadsManifest(captured: []const storage.ManifestEntry, live: []const storage.ManifestEntry) bool {
+            if (captured.len > live.len) return false;
+            for (captured, live[0..captured.len]) |a, b| {
+                if (a.segment_id != b.segment_id) return false;
+            }
+            return true;
+        }
+    };
+
+    /// The statement's snapshot of `table` when `accountant` carries its
+    /// `StatementSnapshots`, else a fresh one, with its own pins and (when
+    /// `allocator` is non-null) its own dupe of the segment entries, so
     /// readers never touch the live, flush-mutated manifest ArrayList. The
-    /// caller owns the returned pin (`memtable_snap.release()`) and the
-    /// `segments` dupe (`allocator.free`), releasing both once every worker
-    /// Scan has been constructed.
-    pub fn captureSnapshotAlloc(table: *Table, allocator: ?Allocator) !Snapshot {
+    /// caller holds `table.ddl_lock` shared, and releases the pins
+    /// (`release`) and frees the dupe once every worker Scan has been
+    /// constructed.
+    pub fn captureSnapshotAlloc(table: *Table, allocator: ?Allocator, statement_accountant: ?*exec.memory.MemoryAccountant) !Snapshot {
+        if (statement_accountant) |a| if (a.table_snapshots) |shared| return shared.snapshotOf(table, allocator);
         table.mutex.lockUncancelable(table.io);
         defer table.mutex.unlock(table.io);
-        const ms = table.memtable;
+        return captureLocked(table, allocator);
+    }
+
+    fn captureLocked(table: *Table, allocator: ?Allocator) !Snapshot {
         const count = table.manifest.segments.items.len;
         const segs: []storage.ManifestEntry = if (allocator) |a|
             try a.dupe(storage.ManifestEntry, table.manifest.segments.items[0..count])
         else
             &.{};
+        errdefer if (allocator) |a| a.free(segs);
+        const epoch = try table.seg_handles.pinEpoch(table.allocator);
+        const ms = table.memtable;
         ms.acquire();
         return .{
             .segment_count = count,
             .memtable_snap = ms,
             .memtable_row_count = ms.row_count,
             .segments = segs,
+            .tomb_epoch = epoch,
+            .tomb_generation = table.seg_handles.tombstone_generation.load(.monotonic),
+            .memtable_gen = table.memtable_gen,
         };
     }
 
@@ -711,7 +803,11 @@ pub const Scan = struct {
     pub fn captureSnapshot(table: *Table) Snapshot {
         // Count-only capture (no entry dupe) — for callers that read segment
         // entries under their own lock or not at all.
-        return captureSnapshotAlloc(table, null) catch unreachable;
+        table.mutex.lockUncancelable(table.io);
+        defer table.mutex.unlock(table.io);
+        const ms = table.memtable;
+        ms.acquire();
+        return .{ .segment_count = table.manifest.segments.items.len, .memtable_snap = ms, .memtable_row_count = ms.row_count };
     }
 
     pub fn allocWithProjectionLoc(
@@ -765,57 +861,34 @@ pub const Scan = struct {
         if (holds_ddl) table.ddl_lock.lockSharedUncancelable(table.io);
         errdefer if (holds_ddl) table.ddl_lock.unlockShared(table.io);
 
-        // Capture (segment_count, memtable_snap, memtable_row_count) atomically
-        // under the table mutex so we see a consistent (segments, memtable)
-        // pair. Pin the memtable via `acquire` so a subsequent flush/delete
-        // swap doesn't invalidate our pointer.
+        // Our own pins on a consistent (segments, memtable, tombstones) view,
+        // so a flush, delete or upsert swap can't invalidate it: a parallel
+        // worker's orchestrator's, else the statement's snapshot of the
+        // table. Its segment entries are our own dupe (see `Scan.segs`); a
+        // count-only capture (empty segments) can't feed a worker that reads
+        // entries.
         //
-        // Iteration is bounded by the row count we capture here, so any rows
-        // appended after we release the mutex are invisible to this scan.
-        // The remaining hazard — a concurrent writer reallocating an
-        // ArrayList we're iterating — is handled in the writer paths:
-        // `Table.insertLocked` / `insertBatch` detect a pinned memtable
-        // (`Memtable.hasSnapshotReaders`) and clone-then-replace before
-        // mutating, leaving our snapshot's buffers untouched.
-        var segment_count: usize = undefined;
-        var memtable_snap: *engine.Memtable = undefined;
-        var memtable_row_count: u64 = undefined;
-        // Owned segment-entry snapshot (see `Scan.segs`). Duped from the
-        // orchestrator's stable capture for a worker, or from the live
-        // manifest under the mutex for a standalone scan.
-        var segs: []storage.ManifestEntry = &.{};
+        // Iteration is bounded by the memtable row count captured, so rows
+        // appended later are invisible to this scan. The remaining hazard —
+        // a concurrent writer reallocating an ArrayList we're iterating — is
+        // handled in the writer paths: `Table.insertLocked` / `insertBatch`
+        // detect a pinned memtable (`Memtable.hasSnapshotReaders`) and
+        // clone-then-replace before mutating, leaving our snapshot's buffers
+        // untouched.
+        const statement_accountant = injected orelse exec.memory.accountantOf(allocator);
+        const snap = if (injected_snap) |s| try s.copy(allocator) else try captureSnapshotAlloc(table, allocator, statement_accountant);
+        const segs = snap.segments;
         errdefer allocator.free(segs);
-        if (injected_snap) |snap| {
-            // Parallel worker: reuse the orchestrator's single captured view so
-            // every worker agrees. Acquire our own pin (balanced by deinit).
-            // snap.segments length == snap.segment_count by construction; a
-            // count-only capture (empty segments) can't feed a worker that
-            // reads entries, so this dupe is the authoritative source.
-            segs = try allocator.dupe(storage.ManifestEntry, snap.segments);
-            segment_count = snap.segment_count;
-            memtable_snap = snap.memtable_snap;
-            memtable_snap.acquire();
-            memtable_row_count = snap.memtable_row_count;
-        } else {
-            table.mutex.lockUncancelable(table.io);
-            segment_count = table.manifest.segments.items.len;
-            memtable_snap = table.memtable;
-            memtable_snap.acquire();
-            memtable_row_count = memtable_snap.row_count;
-            segs = allocator.dupe(storage.ManifestEntry, table.manifest.segments.items[0..segment_count]) catch |e| {
-                memtable_snap.release();
-                table.mutex.unlock(table.io);
-                return e;
-            };
-            table.mutex.unlock(table.io);
-        }
-        errdefer memtable_snap.release();
+        errdefer snap.release(table);
+        const segment_count = snap.segment_count;
+        const memtable_snap = snap.memtable_snap;
+        const memtable_row_count = snap.memtable_row_count;
 
         // Use the injected query-scoped accountant when present. Otherwise
         // mint our own from the table's configured budget (heap-allocated
         // so all operators in the pipeline share it via a pointer) and own
         // its lifetime.
-        var owned_accountant: ?*exec.memory.MemoryAccountant = injected orelse exec.memory.accountantOf(allocator);
+        var owned_accountant: ?*exec.memory.MemoryAccountant = statement_accountant;
         var owns_accountant = false;
         if (owned_accountant == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
             const acc = try allocator.create(exec.memory.MemoryAccountant);
@@ -853,6 +926,7 @@ pub const Scan = struct {
             .segs = segs,
             .memtable_snap = memtable_snap,
             .memtable_row_count = memtable_row_count,
+            .tomb_epoch = snap.tomb_epoch,
             .decoded = decoded,
             .views = views,
             .out_phys = out_phys,
@@ -1185,6 +1259,7 @@ pub const Scan = struct {
         // the memtable was retired (a flush/delete swapped it out), it's
         // freed here.
         self.memtable_snap.release();
+        if (self.tomb_epoch) |epoch| SegmentHandles.unpinEpoch(self.table.allocator, epoch);
         // Release our shared ddl_lock — any DDL waiter on the exclusive
         // lock can now proceed once all shared holders have released.
         // Parallel workers don't hold it (the orchestrator does).
@@ -2349,7 +2424,7 @@ pub const Scan = struct {
                 }
                 const entry = self.segs[self.cur_seg_idx];
                 self.cur_seg_idx += 1;
-                const dead: u64 = try self.table.tombstoneCount(entry.segment_id);
+                const dead: u64 = try self.table.tombstoneCountAt(entry.segment_id, self.tomb_epoch);
                 const surviving: u64 = if (entry.row_count > dead) entry.row_count - dead else 0;
                 if (surviving == 0) continue;
                 return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(surviving) };
@@ -2536,7 +2611,7 @@ pub const Scan = struct {
         self.cur_seg_entry = handle;
         self.cur_segment = &handle.seg;
         self.segments_opened += 1;
-        self.cur_segment_tombs = try self.table.acquireSegmentTombstones(handle);
+        self.cur_segment_tombs = try self.table.acquireSegmentTombstones(handle, self.tomb_epoch);
         self.cur_segment_tomb = if (self.cur_segment_tombs) |t| t.rows else null;
         const rgs = self.cur_segment.?.info.row_groups;
         self.cur_rg_first_row = try self.allocator.alloc(u32, rgs.len);
