@@ -814,12 +814,17 @@ fn fxConvertBcastCounted(
 }
 
 fn bcastSum(allocator: std.mem.Allocator, db: *thindb.Database, rates_sql: []const u8) !i64 {
+    return bcastSumWith(allocator, db, "", rates_sql);
+}
+
+/// `bcastSum` under a WITH clause (`with` holds it, trailing space included).
+fn bcastSumWith(allocator: std.mem.Allocator, db: *thindb.Database, with: []const u8, rates_sql: []const u8) !i64 {
     const sql = try std.fmt.allocPrint(allocator,
-        \\SELECT id, val FROM TABLE(fx_counted(
+        \\{s}SELECT id, val FROM TABLE(fx_counted(
         \\  (SELECT amt, id, g FROM t),
         \\  ({s})
         \\) PARTITION BY g)
-    , .{rates_sql});
+    , .{ with, rates_sql });
     defer allocator.free(sql);
     var res = try run(allocator, db, sql);
     defer res.deinit();
@@ -856,6 +861,16 @@ fn expectBroadcastReuse(allocator: std.mem.Allocator, db: *thindb.Database, work
     bcast_builds.store(0, .monotonic);
     try std.testing.expectEqual(@as(i64, 0), try bcastSum(allocator, db, "SELECT g AS gg, rate FROM rates WHERE rate > 5"));
     try std.testing.expect(bcast_builds.load(.monotonic) >= 1);
+
+    // A subquery in a broadcast input keys the entry by its values, even over
+    // a CTE of the statement: other values miss and results follow them.
+    const by_base = "SELECT g AS gg, rate FROM rates WHERE g IN (SELECT DISTINCT g FROM base)";
+    bcast_builds.store(0, .monotonic);
+    inline for (.{ .{ "g <= 1", 120 }, .{ "g >= 2", 0 }, .{ "g <= 1", 120 }, .{ "g >= 2", 0 } }) |c| {
+        const with = "WITH base AS (SELECT g FROM t WHERE " ++ c[0] ++ ") ";
+        try std.testing.expectEqual(@as(i64, c[1]), try bcastSumWith(allocator, db, with, by_base));
+    }
+    try std.testing.expect(bcast_builds.load(.monotonic) <= 2 * workers);
 
     // A nondeterministic call has no identity to cache under.
     const volatile_rates = "SELECT g AS gg, rate FROM rates WHERE rand() >= 0";
