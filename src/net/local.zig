@@ -1223,6 +1223,19 @@ pub const CompileCtx = struct {
         return err;
     }
 
+    /// `executionError` for a failed operator compile. An operator refuses a
+    /// reference two of its input's columns answer to with a bare
+    /// ColumnNotFound; name it in `unbound` while the nodes the rewrites
+    /// spliced into `root` are still alive (#562).
+    fn compileError(self: *CompileCtx, err: anyerror, root: *const ir.Op, unbound: ?*?Unbound) anyerror {
+        if (err == error.ColumnNotFound) if (unbound) |out| if (out.* == null) {
+            if (unbound_refs.findAmbiguous(self.nodeArena(), self.catalog, self.session.*, root) catch null) |u| {
+                out.* = u.dupe(self.allocator) catch null;
+            }
+        };
+        return self.executionError(err);
+    }
+
     /// Get (or lazily create) the subquery arena. Resolution-time
     /// allocations from the pre-compile pass live here.
     pub fn subqueryArena(self: *CompileCtx) !Allocator {
@@ -1527,14 +1540,14 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     if (engine_v2.isSelectQuery(root)) {
         if (cte_stages.needsStaging(root) or referencesPgCatalog(root, session_cell.*)) {
             const t_staged_total = exec.prof.nowTicks();
-            const q = cte_stages.compileStaged(v2_input, root, &ctx.stage_count) catch |err| return ctx.executionError(err);
+            const q = cte_stages.compileStaged(v2_input, root, &ctx.stage_count) catch |err| return ctx.compileError(err, root, options.unbound);
             exec.prof.addPhase("compile.staged_total", @intCast(exec.prof.nowTicks() - t_staged_total));
             return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
         }
-        const q = cte_stages.compileSingleBlock(v2_input, root) catch |err| return ctx.executionError(err);
+        const q = cte_stages.compileSingleBlock(v2_input, root) catch |err| return ctx.compileError(err, root, options.unbound);
         return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
     }
-    const q = compileOp(&ctx, root) catch |err| return ctx.executionError(err);
+    const q = compileOp(&ctx, root) catch |err| return ctx.compileError(err, root, options.unbound);
     return .{ .query = q, .ctx = ctx, .session_cell = session_cell };
 }
 

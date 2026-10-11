@@ -126,3 +126,45 @@ test "a compile with nothing unbound reports none" {
     defer cq.deinit();
     try std.testing.expectEqual(@as(?thindb.net.Unbound, null), unbound);
 }
+
+test "a failed compile names a reference two columns answer to (#562)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ext2 (id BIGINT PRIMARY KEY, other INT)");
+
+    const derived = "(SELECT * FROM (SELECT 1 AS a, 2 AS b) x INNER JOIN (SELECT 1 AS a, 3 AS c) y ON x.a = y.a) w";
+    const cases = .{
+        .{ "SELECT MAX(a) FROM " ++ derived, "a" },
+        .{ "SELECT a FROM " ++ derived, "a" },
+        .{ "SELECT w.a FROM " ++ derived, "w.a" },
+        .{ "SELECT id FROM ext JOIN ext2 ON ext.id = ext2.id", "id" },
+        .{ "SELECT MAX(id) FROM ext e JOIN ext2 f ON e.id = f.id", "id" },
+        .{ "SELECT e.name FROM ext e JOIN ext2 f ON e.id = f.id WHERE id > 0", "id" },
+        .{ "WITH j AS (SELECT * FROM ext JOIN ext2 ON ext.id = ext2.id) SELECT id FROM j", "id" },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("query: {s}\n", .{c[0]});
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const root = try thindb.sql.parse(arena.allocator(), c[0]);
+        var unbound: ?thindb.net.Unbound = null;
+        defer if (unbound) |u| allocator.free(u.name());
+        try std.testing.expectError(error.ColumnNotFound, thindb.net.compileWithOptions(allocator, db, .{}, root, .{ .unbound = &unbound }));
+        const u = unbound orelse return error.TestExpectedUnbound;
+        try std.testing.expect(u == .ambiguous_column);
+        try std.testing.expectEqualStrings(c[1], u.name());
+    }
+
+    // The columns only one input has, and qualified references, still run.
+    inline for (.{
+        "SELECT MAX(b) FROM " ++ derived,
+        "SELECT ext.id, other FROM ext JOIN ext2 ON ext.id = ext2.id",
+        "SELECT f.id FROM ext e JOIN ext2 f ON e.id = f.id",
+    }) |sql| {
+        var q = try runSql(allocator, db, sql);
+        q.deinit();
+    }
+}
