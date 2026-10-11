@@ -858,7 +858,7 @@ fn expectBroadcastReuse(allocator: std.mem.Allocator, db: *thindb.Database, work
     try std.testing.expect(bcast_builds.load(.monotonic) >= 1);
 
     // A nondeterministic call has no identity to cache under.
-    const volatile_rates = "SELECT g AS gg, rate + CAST(rand() * 0 AS BIGINT) AS rate FROM rates";
+    const volatile_rates = "SELECT g AS gg, rate FROM rates WHERE rand() >= 0";
     bcast_builds.store(0, .monotonic);
     for (0..3) |_| try std.testing.expectEqual(@as(i64, 120), try bcastSum(allocator, db, volatile_rates));
     try std.testing.expect(bcast_builds.load(.monotonic) >= 3);
