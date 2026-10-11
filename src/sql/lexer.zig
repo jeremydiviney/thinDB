@@ -3,8 +3,8 @@
 //! identifiers are case-folded to ASCII lowercase so MySQL clients
 //! (with `lower_case_table_names=1`) and PG clients (which lowercase
 //! unquoted) behave the same. Backtick-quoted identifiers preserve
-//! case and may contain any non-backtick byte. String literals are
-//! single-quoted with `''` for an embedded quote.
+//! case and may contain any byte; a doubled backtick is one backtick.
+//! String literals are single-quoted with `''` for an embedded quote.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -855,21 +855,17 @@ pub const Lexer = struct {
         return Token{ .tag = .identifier, .text = content, .quoted = true };
     }
 
+    /// A backquoted identifier. As in MySQL, a doubled backtick inside is one.
     fn lexBacktickIdent(self: *Lexer) LexError!Token {
         // Backtick identifiers are a MySQL extension; PG has no such
         // quoting, so reject them on a PG connection.
         if (self.dialect == .postgres) return LexError.LexUnexpectedChar;
-        const start = self.pos;
-        self.pos += 1;
-        while (self.pos < self.src.len) : (self.pos += 1) {
-            if (self.src[self.pos] == '`') {
-                const text = self.src[start + 1 .. self.pos];
-                self.pos += 1;
-                if (text.len == 0) return LexError.LexUnexpectedChar;
-                return Token{ .tag = .identifier, .text = text, .quoted = true };
-            }
-        }
-        return LexError.LexUnterminatedIdentifier;
+        const content = self.scanQuotedContent('`', false) catch |err| return switch (err) {
+            LexError.LexUnterminatedString => LexError.LexUnterminatedIdentifier,
+            else => err,
+        };
+        if (content.len == 0) return LexError.LexUnexpectedChar;
+        return Token{ .tag = .identifier, .text = content, .quoted = true };
     }
 };
 
@@ -1101,6 +1097,26 @@ test "lexer: backtick-quoted identifier preserves case + allows spaces" {
     try std.testing.expectEqual(@as(TokenTag, .identifier), id.tag);
     try std.testing.expectEqualStrings("Foo Bar", id.text);
     try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+}
+
+test "lexer: a doubled backtick is a backtick inside a backtick identifier (#561)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "select 1 as `we``ird`, ````");
+    lx.dialect = .mysql;
+    try std.testing.expectEqual(@as(TokenTag, .kw_select), (try lx.next()).tag);
+    try std.testing.expectEqual(@as(TokenTag, .integer), (try lx.next()).tag);
+    try std.testing.expectEqual(@as(TokenTag, .kw_as), (try lx.next()).tag);
+    const weird = try lx.next();
+    try std.testing.expectEqual(@as(TokenTag, .identifier), weird.tag);
+    try std.testing.expect(weird.quoted);
+    try std.testing.expectEqualStrings("we`ird", weird.text);
+    try std.testing.expectEqual(@as(TokenTag, .comma), (try lx.next()).tag);
+    try std.testing.expectEqualStrings("`", (try lx.next()).text);
+    try std.testing.expectEqual(@as(TokenTag, .eof), (try lx.next()).tag);
+
+    var unterminated = Lexer.init(arena.allocator(), "`a``");
+    try std.testing.expectError(LexError.LexUnterminatedIdentifier, unterminated.next());
 }
 
 test "lexer: double-quote is an identifier on PG/neutral, string on MySQL" {
