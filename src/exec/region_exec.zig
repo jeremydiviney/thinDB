@@ -3158,11 +3158,23 @@ pub fn workersFor(n_threads: usize, work_units: ?usize) usize {
     return @max(1, @min(n_threads, (units + UNITS_PER_WORKER - 1) / UNITS_PER_WORKER));
 }
 
-/// Workers for one hash-exchange run. The pool's exchange stays sized to
-/// `n_threads`, so selective and broad runs of one program reuse it warm
+/// Scan workers for one hash-exchange run. The pool's exchange stays sized
+/// to `n_threads`, so selective and broad runs of one program reuse it warm
 /// instead of rebuilding it.
 fn runWorkers(opts: DriverOpts) usize {
     return workersFor(opts.n_threads, opts.work_units);
+}
+
+/// Exchanged rows a shard worker should have before another joins it. A
+/// region program costs on the order of a microsecond per row, so this is
+/// about a millisecond of work against a thread start.
+const ROWS_PER_SHARD_WORKER: usize = 1024;
+
+/// Shard workers for `rows` exchanged rows. Sized apart from the scan
+/// workers: the scan's row-group count does not predict the shard work,
+/// since a selective filter can leave few rows for an expensive program.
+fn shardWorkersFor(n_threads: usize, rows: usize) usize {
+    return @max(1, @min(n_threads, (rows + ROWS_PER_SHARD_WORKER - 1) / ROWS_PER_SHARD_WORKER));
 }
 
 /// Per-shard program outputs. Shards with zero input rows have empty stores.
@@ -4433,10 +4445,10 @@ pub fn runRegionPooled(
     ex.active = n_workers;
     for (pool.side_ex) |*sex| sex.active = n_workers;
 
-    const errs = try alloc.alloc(?anyerror, n_workers);
+    const errs = try alloc.alloc(?anyerror, opts.n_threads);
     defer alloc.free(errs);
     @memset(errs, null);
-    const threads = try alloc.alloc(std.Thread, n_workers);
+    const threads = try alloc.alloc(std.Thread, opts.n_threads);
     defer alloc.free(threads);
 
     const t0 = if (trace) exec.prof.nowTicks() else 0;
@@ -4485,9 +4497,11 @@ pub fn runRegionPooled(
     }
 
     const t1 = if (trace) exec.prof.nowTicks() else 0;
-    const bins = try packBins(alloc, ex, n_workers);
+    var exchanged: usize = 0;
+    for (0..ex.n_shards) |sh| exchanged += ex.shardRows(sh);
+    const bins = try packBins(alloc, ex, shardWorkersFor(opts.n_threads, exchanged));
     defer freeBins(alloc, bins);
-    const shard_workers = @max(1, @min(n_workers, bins.len));
+    const shard_workers = @max(1, @min(shardWorkersFor(opts.n_threads, exchanged), bins.len));
     const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, shard_workers) else null;
     defer if (shard_busy) |b| alloc.free(b);
     if (shard_busy) |b| @memset(b, 0);
@@ -4519,8 +4533,8 @@ pub fn runRegionPooled(
         var rows: usize = 0;
         for (result.shards) |s| rows += s.rows;
         const max_bin: usize = if (bins.len > 0) bins[0].rows else 0;
-        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d}/{d} parts={d} bins={d} max_bin={d}\n", .{
-            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, n_workers, opts.n_threads, opts.n_shards, bins.len, max_bin,
+        std.debug.print("[region] scan+scatter={d:.0}ms shards={d:.0}ms out_rows={d} threads={d}+{d}/{d} parts={d} bins={d} max_bin={d}\n", .{
+            exec.prof.ticksToMs(t1 - t0), exec.prof.ticksToMs(t2 - t1), rows, n_workers, shard_workers, opts.n_threads, opts.n_shards, bins.len, max_bin,
         });
         scan_phase.printTrace();
         shard_phase.printTrace();
@@ -4533,17 +4547,17 @@ pub fn runRegionPooled(
         // Per-op CPU (summed across workers; wall ≈ sum / threads when
         // load-balanced). Consolidation reported the same way.
         var con: i64 = 0;
-        for (pool.slots.items[0..n_workers]) |slot| con += slot.rw.consolidate_ticks;
+        for (pool.slots.items[0..shard_workers]) |slot| con += slot.rw.consolidate_ticks;
         std.debug.print("[region]   consolidate={d:.0}ms(cpu)", .{exec.prof.ticksToMs(con)});
         for (prog.ops, 0..) |op, oi| {
             var t: i64 = 0;
-            for (pool.slots.items[0..n_workers]) |slot| {
+            for (pool.slots.items[0..shard_workers]) |slot| {
                 if (slot.rw.op_ticks) |ticks| t += ticks[oi];
             }
             std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
         }
         std.debug.print("\n", .{});
-        printProbePhases(pool, prog, n_workers);
+        printProbePhases(pool, prog, shard_workers);
     }
 
     pool.releaseRun();
