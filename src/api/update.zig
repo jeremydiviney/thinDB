@@ -111,7 +111,7 @@ pub fn execUpdateStreaming(
         }
         wal_target = try t.commitStatementLocked(&stmt);
     }
-    try t.awaitWalDurable(wal_target);
+    try t.awaitStatementDurable(wal_target);
     return affected;
 }
 

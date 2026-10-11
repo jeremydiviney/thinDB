@@ -109,10 +109,9 @@ pub fn pickTieredGroup(t: *Table, tomb_threshold: f32) !?[]u64 {
 fn pickTombstonePressuredGroup(t: *Table, metas: []const SegMeta, threshold: f32) !?[]u64 {
     for (metas, 0..) |meta, i| {
         if (meta.rows == 0) continue;
-        const tombs = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, meta.id);
-        defer if (tombs) |arr| t.allocator.free(arr);
-        if (tombs == null) continue;
-        const ratio = @as(f32, @floatFromInt(tombs.?.len)) / @as(f32, @floatFromInt(meta.rows));
+        const dead = try t.tombstoneCount(meta.id);
+        if (dead == 0) continue;
+        const ratio = @as(f32, @floatFromInt(dead)) / @as(f32, @floatFromInt(meta.rows));
         if (ratio < threshold) continue;
 
         // Found a heavily-tombstoned segment. Grow to a run of adjacent
@@ -265,7 +264,7 @@ const MergeCursor = struct {
         var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
         errdefer seg.deinit();
 
-        const tombs = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, id);
+        const tombs = try t.readTombstones(t.allocator, id);
         errdefer if (tombs) |x| t.allocator.free(x);
 
         // NOTE: the cursor is returned by value; generations capture `&seg`,
@@ -785,7 +784,7 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64, preempt: ?*const std.atomi
         t.allocator.free(snapshots);
     }
     for (seg_ids, 0..) |id, i| {
-        snapshots[i] = try storage.tombstone.read(t.allocator, t.io, t.segments_dir, id);
+        snapshots[i] = try t.readTombstones(t.allocator, id);
     }
 
     // Snapshot every current segment's per-column sketch for the global
@@ -898,7 +897,7 @@ fn commitMergeLocked(t: *Table, pending: *PendingMerge) !bool {
     var late_keys: std.StringHashMapUnmanaged(void) = .empty;
 
     for (pending.seg_ids, pending.tomb_snapshots) |id, snap| {
-        const cur = (try storage.tombstone.read(la, t.io, t.segments_dir, id)) orelse continue;
+        const cur = (try t.readTombstones(la, id)) orelse continue;
         const old: []const u32 = snap orelse &[_]u32{};
         var late: std.ArrayList(u32) = .empty;
         var i: usize = 0;
@@ -959,7 +958,7 @@ fn commitMergeLocked(t: *Table, pending: *PendingMerge) !bool {
     // no output, every input row was already tombstoned in the snapshot, so
     // any late tombstone re-deleted an already-dropped row: nothing to do.)
     if (has_output and late_keys.count() > 0) {
-        try tombstoneKeysInSegment(t, la, &late_keys, pending.new_seg_id, sync);
+        try tombstoneKeysInSegment(t, la, &late_keys, pending.new_seg_id);
     }
 
     var candidate = t.manifest;
@@ -1033,7 +1032,6 @@ fn tombstoneKeysInSegment(
     la: std.mem.Allocator,
     map: *const std.StringHashMapUnmanaged(void),
     seg_id: u64,
-    sync: bool,
 ) !void {
     var name_buf: [32]u8 = undefined;
     const file_name = try Table.segmentFileName(&name_buf, seg_id);
@@ -1064,10 +1062,7 @@ fn tombstoneKeysInSegment(
         rg_base += rg.row_count;
     }
 
-    if (hits.items.len > 0) {
-        try t.mergeTombstones(t.allocator, seg_id, hits.items, sync);
-        t.seg_handles.invalidateTombstones(t.allocator, seg_id);
-    }
+    if (hits.items.len > 0) try t.mergeTombstones(seg_id, hits.items);
 }
 
 // ---------- tests --------------------------------------------------------

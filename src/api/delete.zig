@@ -852,3 +852,125 @@ test "keyed batch delete: rejects shapes it can't take exactly" {
         try storage.tombstone.read(allocator, io, t.segments_dir, t.manifest.segments.items[0].segment_id),
     );
 }
+
+fn liveIds(allocator: std.mem.Allocator, t: *Table) ![]i64 {
+    var q = try exec.scan(allocator, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    errdefer ids.deinit(allocator);
+    while (try q.next()) |batch| try ids.appendSlice(allocator, batch.values[0].data.bigint);
+    return ids.toOwnedSlice(allocator);
+}
+
+fn openThreeRowSegment(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !struct { db: *api.Database, t: *Table } {
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, io, dir, .{ .row_group_size = 4, .auto_flush_secs = 0 });
+    errdefer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .v = @as(i32, 1) },
+        .{ .id = @as(i64, 2), .v = @as(i32, 2) },
+        .{ .id = @as(i64, 3), .v = @as(i32, 3) },
+    });
+    try t.flush();
+    return .{ .db = db, .t = t };
+}
+
+test "delete: readers see a published tombstone before its file, and flush writes it (#605)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opened = try openThreeRowSegment(allocator, io, tmp.dir);
+    defer opened.db.close();
+    const t = opened.t;
+    const seg_id = t.manifest.segments.items[0].segment_id;
+
+    {
+        t.mutex.lockUncancelable(io);
+        defer t.mutex.unlock(io);
+        var stmt: Table.Statement = .{};
+        t.beginStatementLocked(&stmt);
+        defer t.endStatementLocked(&stmt);
+        try t.replaceRowsLocked(&stmt, .{ .segment = .{ .id = seg_id, .offsets = &.{1} } }, &.{}, 0);
+        _ = try t.commitStatementLocked(&stmt);
+    }
+    try std.testing.expectEqual(@as(?[]u32, null), try storage.tombstone.read(allocator, io, t.segments_dir, seg_id));
+    try std.testing.expect(t.seg_handles.hasUnwritten());
+    try std.testing.expectEqual(@as(usize, 1), try t.tombstoneCount(seg_id));
+    const ids = try liveIds(allocator, t);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
+
+    try t.flush();
+    try std.testing.expect(!t.seg_handles.hasUnwritten());
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, seg_id)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(tombs);
+    try std.testing.expectEqualSlices(u32, &.{1}, tombs);
+}
+
+test "delete: a tombstone file write in flight blocks no reader (#605)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opened = try openThreeRowSegment(allocator, io, tmp.dir);
+    defer opened.db.close();
+    const t = opened.t;
+    const seg_id = t.manifest.segments.items[0].segment_id;
+
+    const Deleter = struct {
+        table: *Table,
+        deleted: anyerror!usize = 0,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            var expr: predicate.PredicateExpr = .{ .leaf = .{ .col = "id", .op = .eq, .val = .{ .bigint = 2 } } };
+            predicate.validateExpr(&expr, self.table.schema.columns) catch |err| {
+                self.deleted = err;
+                return;
+            };
+            self.deleted = self.table.deleteByExpr(expr, &.{});
+        }
+    };
+
+    // Stand in for a slow file write: the deleter publishes, leaves the
+    // table mutex, then waits here while readers go on.
+    t.tomb_file_mutex.lockUncancelable(io);
+    var file_locked = true;
+    defer if (file_locked) t.tomb_file_mutex.unlock(io);
+    var deleter: Deleter = .{ .table = t };
+    const thread = try std.Thread.spawn(.{}, Deleter.run, .{&deleter});
+    var joined = false;
+    defer if (!joined) {
+        t.tomb_file_mutex.unlock(io);
+        file_locked = false;
+        thread.join();
+    };
+    while (!t.seg_handles.hasUnwritten() and !deleter.done.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(!deleter.done.load(.acquire));
+
+    const ids = try liveIds(allocator, t);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, ids);
+    try std.testing.expectEqual(@as(?[]u32, null), try storage.tombstone.read(allocator, io, t.segments_dir, seg_id));
+
+    t.tomb_file_mutex.unlock(io);
+    file_locked = false;
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 1), try deleter.deleted);
+    const tombs = (try storage.tombstone.read(allocator, io, t.segments_dir, seg_id)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(tombs);
+    try std.testing.expectEqualSlices(u32, &.{1}, tombs);
+}

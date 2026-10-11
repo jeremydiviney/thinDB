@@ -2349,9 +2349,7 @@ pub const Scan = struct {
                 }
                 const entry = self.segs[self.cur_seg_idx];
                 self.cur_seg_idx += 1;
-                const tombs = try storage.tombstone.read(self.allocator, self.io, self.table.segments_dir, entry.segment_id);
-                defer if (tombs) |t| self.allocator.free(t);
-                const dead: u64 = if (tombs) |t| t.len else 0;
+                const dead: u64 = try self.table.tombstoneCount(entry.segment_id);
                 const surviving: u64 = if (entry.row_count > dead) entry.row_count - dead else 0;
                 if (surviving == 0) continue;
                 return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(surviving) };

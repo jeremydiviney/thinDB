@@ -153,6 +153,11 @@ pub const Table = struct {
     /// word (#164, 2026-07-11 incident).
     mutex: FairMutex = .init,
 
+    /// Serializes tombstone file writes, which run outside `mutex` (#605),
+    /// against each other and against deleting a segment's files. Taken
+    /// after `mutex` when both are held, never before it.
+    tomb_file_mutex: Io.Mutex = .init,
+
     /// Reader/DDL coordination. Scans hold this SHARED for their entire
     /// lifetime (acquire on create, release on deinit). DDL operations
     /// (drop / alter / rename) and compaction commits hold it EXCLUSIVE. The
@@ -338,6 +343,9 @@ pub const Table = struct {
     pub fn close(self: *Table) void {
         const allocator = self.allocator;
         const io = self.io;
+        // Best effort: with a log, a list that misses its file comes back at
+        // open, since only a flush that wrote the file lets the log go.
+        if (self.dirs_open) self.writeTombstoneFiles() catch {};
         self.pending_deletes.deinit(allocator);
         if (self.wal) |*w| w.deinit();
         self.upsert_idx.deinit(allocator);
@@ -380,7 +388,7 @@ pub const Table = struct {
             defer self.mutex.unlock(self.io);
             wal_target = try self.insertLocked(rows);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
     }
 
     /// Explicit upsert. Identical to `insert` on a unique-key table —
@@ -399,7 +407,7 @@ pub const Table = struct {
             defer self.mutex.unlock(self.io);
             wal_target = try self.insertLocked(rows);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
     }
 
     /// Bulk-insert a wire-decoded columnar batch. Used by the TCP write
@@ -422,7 +430,7 @@ pub const Table = struct {
             defer self.mutex.unlock(self.io);
             wal_target = try self.insertBatchInner(batch_schema, views, row_count);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
     }
 
     /// Same as `insertBatch` but assumes the caller already holds
@@ -437,7 +445,7 @@ pub const Table = struct {
         row_count: usize,
     ) !void {
         const wal_target = try self.insertBatchInner(batch_schema, views, row_count);
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
     }
 
     /// INSERT IGNORE / INSERT ... ON DUPLICATE KEY UPDATE on a unique table:
@@ -458,7 +466,7 @@ pub const Table = struct {
             defer self.mutex.unlock(self.io);
             break :blk try upsert_mod.insertOnDuplicateLocked(self, batch_schema, views, row_count, action, &wal_target);
         };
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
         return counts;
     }
 
@@ -472,7 +480,7 @@ pub const Table = struct {
     ) !upsert_mod.DuplicateCounts {
         var wal_target: ?u64 = null;
         const counts = try upsert_mod.insertOnDuplicateLocked(self, batch_schema, views, row_count, action, &wal_target);
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
         return counts;
     }
 
@@ -505,9 +513,8 @@ pub const Table = struct {
 
     /// Log the memtable rows from `before_count` on and resolve their keys
     /// (last writer wins on a unique table). Up to the log record a failure
-    /// takes the rows back out, leaving the table as it was. After it, only
-    /// a tombstone write can fail, and that fences the table so a reopen
-    /// replays the log.
+    /// takes the rows back out, leaving the table as it was. After it the
+    /// insert stands; only an inline auto-flush can still fail.
     fn commitInsertLocked(self: *Table, before_count: usize) !?u64 {
         var resolution: upsert_mod.Resolution = .{};
         defer resolution.deinit(self.allocator);
@@ -520,10 +527,7 @@ pub const Table = struct {
             if (self.schema.unique) resolution = try upsert_mod.prepareResolution(self, self.memtable, self.memtable_gen, null);
             if (self.wal) |*w| wal_target = try w.appendInsert(self.memtable, before_count, @intCast(self.memtable.row_count));
         }
-        upsert_mod.commitResolution(self, &resolution) catch |err| {
-            self.requireRecovery();
-            return err;
-        };
+        upsert_mod.commitResolution(self, &resolution);
         try self.maybeAutoFlushLocked();
         return wal_target;
     }
@@ -636,7 +640,7 @@ pub const Table = struct {
             staged = null;
             self.installMemtableLocked(mt);
         }
-        try upsert_mod.commitResolution(self, &resolution);
+        upsert_mod.commitResolution(self, &resolution);
         if (replaced == .memtable or row_count > 0) s.touches_memtable = true;
         s.staged_bytes += removed_bytes + engine.memtable.columnsByteSize(rows);
         if (s.staged_bytes > self.stage_bytes) {
@@ -682,34 +686,86 @@ pub const Table = struct {
         s.steps.deinit(self.allocator);
     }
 
-    /// Log the chunk's steps as one record, then write its tombstone files,
-    /// and end the chunk. A failure up to the record leaves the chunk to
-    /// `endStatementLocked`. After it the chunk stands, and a failed
-    /// tombstone write fences the table so a reopen replays the log. A chunk
-    /// whose only change is offsets in one segment needs no record: its one
-    /// tombstone file write commits it.
+    /// Log the chunk's steps as one record, publish its tombstones, and end
+    /// the chunk. A failure up to the record leaves the chunk to
+    /// `endStatementLocked`; nothing after it can fail. The tombstone files
+    /// are written once the mutex is released (`awaitStatementDurable`):
+    /// until then the record is what makes the offsets durable, so a chunk
+    /// with any is always logged.
     fn commitStagedLocked(self: *Table, s: *Statement) !void {
         try self.ensureUsable();
-        const TombstoneFile = struct { segment_id: u64, bytes: []u8 };
-        var files: std.ArrayList(TombstoneFile) = .empty;
-        defer {
-            for (files.items) |f| self.allocator.free(f.bytes);
-            files.deinit(self.allocator);
+        var lists = try self.prepareTombstones(&s.tombstones);
+        defer lists.deinit(self.allocator);
+        if (self.wal) |*w| if (s.touches_memtable or lists.list.items.len > 0) {
+            s.wal_target = try w.appendStatement(&s.steps);
+        };
+        lists.publish(self);
+        self.endChunkLocked(s);
+    }
+
+    /// Segment tombstone lists merged and ready to publish, with room
+    /// reserved so `publish` can't fail.
+    pub const PreparedTombstones = struct {
+        list: std.ArrayList(storage.cache.SegmentHandles.Unwritten) = .empty,
+
+        pub fn publish(self: *PreparedTombstones, t: *Table) void {
+            for (self.list.items) |p| t.seg_handles.publishTombstones(t.allocator, p.segment_id, p.tombs);
+            self.list.clearRetainingCapacity();
         }
-        try files.ensureTotalCapacity(self.allocator, s.tombstones.count());
-        for (s.tombstones.keys(), s.tombstones.values()) |segment_id, offsets| {
-            const bytes = try storage.tombstone.encodeMerged(self.allocator, self.io, self.segments_dir, segment_id, offsets.items);
-            files.appendAssumeCapacity(.{ .segment_id = segment_id, .bytes = bytes });
+
+        pub fn deinit(self: *PreparedTombstones, gpa: Allocator) void {
+            for (self.list.items) |p| storage.cache.SegmentHandles.releaseTombstones(gpa, p.tombs);
+            self.list.deinit(gpa);
+            self.* = undefined;
         }
-        const logged = self.wal != null and (s.touches_memtable or files.items.len > 1);
-        if (logged) s.wal_target = try self.wal.?.appendStatement(&s.steps);
-        for (files.items, 0..) |f, i| self.writeTombstoneFile(f.segment_id, f.bytes) catch |err| {
-            if (!logged and i == 0) return err;
-            self.requireRecovery();
-            self.endChunkLocked(s);
+    };
+
+    /// Each segment's current tombstones with `added`'s offsets merged in.
+    pub fn prepareTombstones(self: *Table, added: *const engine.wal.SegmentTombstones) !PreparedTombstones {
+        var prepared: PreparedTombstones = .{};
+        errdefer prepared.deinit(self.allocator);
+        try prepared.list.ensureTotalCapacity(self.allocator, added.count());
+        for (added.keys(), added.values()) |segment_id, offsets| {
+            if (offsets.items.len == 0) continue;
+            prepared.list.appendAssumeCapacity(.{ .segment_id = segment_id, .tombs = try self.mergedTombstones(segment_id, offsets.items) });
+        }
+        try self.seg_handles.reserveTombstones(self.allocator, prepared.list.items.len);
+        return prepared;
+    }
+
+    /// Segment `id`'s current tombstones with `offsets` (any order, may
+    /// repeat) added, sorted and deduped.
+    fn mergedTombstones(self: *Table, id: u64, offsets: []const u32) !*storage.cache.SegmentHandles.Tombstones {
+        const added = try self.allocator.dupe(u32, offsets);
+        defer self.allocator.free(added);
+        std.sort.pdq(u32, added, {}, std.sort.asc(u32));
+        const current = try self.seg_handles.currentTombstones(self.allocator, self.io, self.segments_dir, id);
+        defer if (current) |c| storage.cache.SegmentHandles.releaseTombstones(self.allocator, c);
+        const base: []const u32 = if (current) |c| c.rows else &.{};
+
+        const merged = try self.allocator.alloc(u32, base.len + added.len);
+        var len: usize = 0;
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < base.len or j < added.len) {
+            const v = if (j == added.len or (i < base.len and base[i] <= added[j])) blk: {
+                i += 1;
+                break :blk base[i - 1];
+            } else blk: {
+                j += 1;
+                break :blk added[j - 1];
+            };
+            if (len == 0 or merged[len - 1] != v) {
+                merged[len] = v;
+                len += 1;
+            }
+        }
+        const rows = self.allocator.realloc(merged, len) catch |err| {
+            self.allocator.free(merged);
             return err;
         };
-        self.endChunkLocked(s);
+        errdefer self.allocator.free(rows);
+        return storage.cache.SegmentHandles.ownTombstones(self.allocator, rows);
     }
 
     fn endChunkLocked(self: *Table, s: *Statement) void {
@@ -742,15 +798,13 @@ pub const Table = struct {
     /// are dropped: it was compacted or truncated away after they had been
     /// merged.
     fn mergeReplayedTombstonesLocked(self: *Table, replayed: *const engine.wal.SegmentTombstones) !void {
-        const sync = self.syncEnabled();
         for (replayed.keys(), replayed.values()) |segment_id, offsets| {
             if (offsets.items.len == 0) continue;
             const listed = for (self.manifest.segments.items) |entry| {
                 if (entry.segment_id == segment_id) break true;
             } else false;
             if (!listed) continue;
-            try self.mergeTombstones(self.allocator, segment_id, offsets.items, sync);
-            self.seg_handles.invalidateTombstones(self.allocator, segment_id);
+            try self.mergeTombstones(segment_id, offsets.items);
         }
     }
 
@@ -806,14 +860,14 @@ pub const Table = struct {
     }
 
     /// Called outside the Table mutex (after releasing it) to wait for the
-    /// WAL through `target` to be durably fsynced. No-op when WAL disabled,
+    /// WAL through `target` to be durably fsynced, then write the tombstone
+    /// files the statement published. The wait is a no-op when WAL disabled,
     /// sync_mode is `.none`, or when an in-call flush already truncated past
     /// the target (in which case `WalWriter.truncate` has bumped synced past
     /// our offset and `awaitDurable` returns immediately).
-    pub fn awaitWalDurable(self: *Table, target: ?u64) !void {
-        if (!self.syncEnabled()) return;
-        const o = target orelse return;
-        if (self.wal) |*w| try w.awaitDurable(self.io, o);
+    pub fn awaitStatementDurable(self: *Table, target: ?u64) !void {
+        if (self.syncEnabled()) if (target) |o| if (self.wal) |*w| try w.awaitDurable(self.io, o);
+        try self.writeTombstoneFiles();
     }
 
     /// Flush the memtable to a new segment on disk and update the manifest
@@ -830,6 +884,9 @@ pub const Table = struct {
     pub fn flushLocked(self: *Table) !void {
         try self.ensureUsable();
         std.debug.assert(self.statement == null);
+        // The new checkpoint and the fresh log below stop replay from
+        // restoring a published tombstone list, so its file must hold it.
+        try self.writeTombstoneFiles();
         if (self.memtable.isEmpty()) {
             self.first_write_ts = null;
             // What the log's records wrote is in the tombstone files or was
@@ -1059,29 +1116,66 @@ pub const Table = struct {
         };
     }
 
-    pub fn mergeTombstones(self: *Table, scratch: Allocator, id: u64, offsets: []const u32, sync: bool) !void {
+    /// Add `offsets` to segment `id`'s tombstones and write the files now,
+    /// for a caller about to publish a manifest or drop the log, where no
+    /// log record carries them. Caller holds the table mutex.
+    pub fn mergeTombstones(self: *Table, id: u64, offsets: []const u32) !void {
         try self.ensureUsable();
+        var added: engine.wal.SegmentTombstones = .empty;
+        defer engine.wal.deinitSegmentTombstones(self.allocator, &added);
+        try engine.wal.addSegmentTombstones(self.allocator, &added, id, offsets);
+        var lists = try self.prepareTombstones(&added);
+        defer lists.deinit(self.allocator);
+        lists.publish(self);
+        try self.writeTombstoneFiles();
+    }
+
+    /// Write every published tombstone list its file doesn't hold yet. Runs
+    /// outside the table mutex after a statement: a full rewrite plus its
+    /// fsyncs takes seconds on a busy disk, and readers would wait it out
+    /// (#605). Readers already see the lists. Flush calls it too, before the
+    /// log the lists rely on can go.
+    pub fn writeTombstoneFiles(self: *Table) !void {
+        if (!self.seg_handles.hasUnwritten()) return;
+        self.tomb_file_mutex.lockUncancelable(self.io);
+        defer self.tomb_file_mutex.unlock(self.io);
+        var pending: std.ArrayList(storage.cache.SegmentHandles.Unwritten) = .empty;
+        defer {
+            for (pending.items) |p| storage.cache.SegmentHandles.releaseTombstones(self.allocator, p.tombs);
+            pending.deinit(self.allocator);
+        }
+        try self.seg_handles.collectUnwritten(self.allocator, &pending);
+        if (pending.items.len == 0) return;
+        try self.ensureUsable();
+        const sync = self.syncEnabled();
         // A tombstone can hide a row whose replacement so far lives only in
         // the WAL (UPDATE, upsert). Syncing the log first means power loss
         // can't keep the tombstone and lose the replacement.
         if (sync) if (self.wal) |*w| try w.awaitAllDurable(self.io);
-        storage.tombstone.merge(scratch, self.io, self.segments_dir, id, offsets, sync) catch |err| {
-            self.recordIoFailure(err);
-            return err;
-        };
+        for (pending.items) |p| {
+            const bytes = try storage.tombstone.encode(self.allocator, p.tombs.rows);
+            defer self.allocator.free(bytes);
+            storage.tombstone.writeEncoded(self.io, self.segments_dir, p.segment_id, bytes, sync) catch |err| {
+                self.recordIoFailure(err);
+                return err;
+            };
+            self.seg_handles.settleTombstones(self.allocator, p.segment_id, p.tombs);
+        }
     }
 
-    /// Replace segment `id`'s tombstone file with `bytes` from
-    /// `storage.tombstone.encodeMerged`, as `mergeTombstones` would.
-    pub fn writeTombstoneFile(self: *Table, id: u64, bytes: []const u8) !void {
-        try self.ensureUsable();
-        const sync = self.syncEnabled();
-        if (sync) if (self.wal) |*w| try w.awaitAllDurable(self.io);
-        storage.tombstone.writeEncoded(self.io, self.segments_dir, id, bytes, sync) catch |err| {
-            self.recordIoFailure(err);
-            return err;
-        };
-        self.seg_handles.invalidateTombstones(self.allocator, id);
+    /// Segment `id`'s tombstones as a dupe `allocator` owns (null = none):
+    /// the newest published list, else the file.
+    pub fn readTombstones(self: *Table, allocator: Allocator, id: u64) !?[]u32 {
+        const t = (try self.seg_handles.currentTombstones(self.allocator, self.io, self.segments_dir, id)) orelse return null;
+        defer storage.cache.SegmentHandles.releaseTombstones(self.allocator, t);
+        return try allocator.dupe(u32, t.rows);
+    }
+
+    /// How many rows of segment `id` are deleted.
+    pub fn tombstoneCount(self: *Table, id: u64) !usize {
+        const t = (try self.seg_handles.currentTombstones(self.allocator, self.io, self.segments_dir, id)) orelse return 0;
+        defer storage.cache.SegmentHandles.releaseTombstones(self.allocator, t);
+        return t.rows.len;
     }
 
     fn replaceWal(self: *Table) !void {
@@ -1142,7 +1236,7 @@ pub const Table = struct {
             deleted = try @import("delete.zig").execDelete(self, &stmt, pred);
             wal_target = try self.commitStatementLocked(&stmt);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
         return deleted;
     }
 
@@ -1168,7 +1262,7 @@ pub const Table = struct {
             deleted = try @import("delete.zig").execDeleteByExpr(self, &stmt, pred, derived);
             wal_target = try self.commitStatementLocked(&stmt);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
         return deleted;
     }
 
@@ -1210,7 +1304,7 @@ pub const Table = struct {
             deleted = try del.execDeleteKeyedBatch(self, &stmt, local_preds, counts);
             wal_target = try self.commitStatementLocked(&stmt);
         }
-        try self.awaitWalDurable(wal_target);
+        try self.awaitStatementDurable(wal_target);
         return deleted;
     }
 
@@ -1385,6 +1479,10 @@ pub const Table = struct {
     }
 
     pub fn deleteSegmentFiles(self: *Table, seg_id: u64) !void {
+        // A tombstone file write outside the table mutex must not recreate
+        // the file after this deletes it.
+        self.tomb_file_mutex.lockUncancelable(self.io);
+        defer self.tomb_file_mutex.unlock(self.io);
         // Close any cached handle first — Windows refuses to delete open files.
         self.seg_handles.retire(self.allocator, seg_id);
         if (!self.tryDeleteSegmentFiles(seg_id)) {

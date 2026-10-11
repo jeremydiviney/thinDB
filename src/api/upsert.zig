@@ -168,25 +168,23 @@ pub const Resolution = struct {
     deduped: ?*engine.Memtable = null,
     /// Those rows, ascending.
     dropped_rows: []u32 = &.{},
-    /// Tombstone files with the segment rows the new ones replace added.
-    tombstone_files: std.ArrayList(TombstoneFile) = .empty,
+    /// Segment tombstone lists with the segment rows the new ones replace
+    /// added.
+    tombstones: Table.PreparedTombstones = .{},
 
     pub fn deinit(self: *Resolution, allocator: Allocator) void {
         if (self.deduped) |mt| mt.release();
         allocator.free(self.dropped_rows);
-        for (self.tombstone_files.items) |f| allocator.free(f.bytes);
-        self.tombstone_files.deinit(allocator);
+        self.tombstones.deinit(allocator);
         self.* = undefined;
     }
 };
-
-const TombstoneFile = struct { segment_id: u64, bytes: []u8 };
 
 /// Last writer wins: each of `mt`'s unseen rows replaces the older row with
 /// its order key, in the memtable or in a flushed segment. `gen` is the
 /// memtable generation `mt` has, or gets once installed. The segment rows
 /// go into `statement_rows` when a statement collects them for its commit,
-/// and into the resolution's tombstone files otherwise.
+/// and into the resolution's tombstone lists otherwise.
 pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64, statement_rows: ?*engine.wal.SegmentTombstones) !Resolution {
     std.debug.assert(t.order_key_indices.len > 0);
     var resolution: Resolution = .{};
@@ -283,6 +281,9 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64, statem
     const key_hashes = try aa.alloc(u64, new_keys.items.len);
     for (new_keys.items, 0..) |k, i| key_hashes[i] = bloom.keyHash(k);
 
+    var replaced: engine.wal.SegmentTombstones = .empty;
+    defer engine.wal.deinitSegmentTombstones(t.allocator, &replaced);
+
     // ---- 3. For each segment, scan row groups, find matching keys. --------
     for (t.manifest.segments.items) |entry| {
         // Bloom prune: if the segment carries a key filter and none of this
@@ -348,33 +349,30 @@ pub fn prepareResolution(t: *Table, mt: *const engine.Memtable, gen: u64, statem
             row_offset += rg.row_count;
         }
 
-        if (statement_rows) |rows| {
-            try engine.wal.addSegmentTombstones(t.allocator, rows, entry.segment_id, deleted.items);
-        } else if (deleted.items.len > 0) {
-            try resolution.tombstone_files.ensureUnusedCapacity(t.allocator, 1);
-            const bytes = try storage.tombstone.encodeMerged(t.allocator, t.io, t.segments_dir, entry.segment_id, deleted.items);
-            resolution.tombstone_files.appendAssumeCapacity(.{ .segment_id = entry.segment_id, .bytes = bytes });
-        }
+        try engine.wal.addSegmentTombstones(t.allocator, statement_rows orelse &replaced, entry.segment_id, deleted.items);
     }
+    if (statement_rows == null) resolution.tombstones = try t.prepareTombstones(&replaced);
     return resolution;
 }
 
-/// Apply `resolution` once the table holds the rows it resolved. Only the
-/// tombstone file writes can fail.
-pub fn commitResolution(t: *Table, resolution: *Resolution) !void {
+/// Apply `resolution` once the table holds the rows it resolved. The
+/// tombstone files are written once the table mutex is released
+/// (`Table.awaitStatementDurable`); the log carries the rows the lists
+/// derive from, which replay resolves again.
+pub fn commitResolution(t: *Table, resolution: *Resolution) void {
     if (resolution.deduped) |mt| {
         resolution.deduped = null;
         carryIndex(t, resolution.dropped_rows, mt, t.memtable_gen + 1);
         t.installMemtableLocked(mt);
     }
-    for (resolution.tombstone_files.items) |f| try t.writeTombstoneFile(f.segment_id, f.bytes);
+    resolution.tombstones.publish(t);
 }
 
 /// Resolve the memtable rows no resolution has seen, in one step.
 pub fn applyUpsertResolution(t: *Table) !void {
     var resolution = try prepareResolution(t, t.memtable, t.memtable_gen, null);
     defer resolution.deinit(t.allocator);
-    try commitResolution(t, &resolution);
+    commitResolution(t, &resolution);
 }
 
 /// Full-key Bloom candidates for a keyed DELETE/UPDATE (#143). When the

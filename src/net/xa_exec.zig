@@ -136,6 +136,8 @@ fn rollback(allocator: Allocator, catalog: *api.Catalog, journal: *journal_mod.W
         t.manifest = manifest;
         t.installMemtableLocked(memtable);
         t.first_write_ts = null;
+        // The restored tombstone files predate the lists the branch published.
+        t.seg_handles.discardUnwritten(t.allocator);
         t.seg_handles.clear(t.allocator);
         t.cache.purgeTable(t.cache_uid);
         t.cache_uid = storage.cache.newTableUid();

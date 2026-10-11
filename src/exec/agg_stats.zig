@@ -69,11 +69,8 @@ pub const MinMaxStats = struct {
         if (segs.len == 0) return null; // empty table → defer to normal path
         for (segs) |entry| {
             if (entry.column_stats.len < cols.len) return null; // v1 manifest
-            const tombs = try storage.tombstone.read(allocator, table.io, table.segments_dir, entry.segment_id);
-            if (tombs) |t| {
-                allocator.free(t);
-                return null; // a deleted row may have been the extreme
-            }
+            // A deleted row may have been the extreme.
+            if (try table.tombstoneCount(entry.segment_id) > 0) return null;
         }
 
         const out_schema = try allocator.alloc(Column, specs.len);
@@ -248,13 +245,12 @@ pub const MetaAggStats = struct {
             total += table.memtable.row_count;
         }
         for (ids) |segment_id| {
-            const tombs = try storage.tombstone.read(allocator, table.io, table.segments_dir, segment_id);
-            if (tombs) |t| {
-                allocator.free(t);
+            const dead = try table.tombstoneCount(segment_id);
+            if (dead > 0) {
                 // A deleted row may have been the extreme / part of the sum /
                 // a null_count contributor.
                 if (needs_stats) return null;
-                total -= t.len;
+                total -= dead;
             }
         }
 

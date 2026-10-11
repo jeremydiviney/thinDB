@@ -558,7 +558,11 @@ test "purgeTable frees one table's unpinned entries, leaves other tables and pin
 ///   - `retire` when compaction deletes the files (closing our handle FIRST —
 ///     Windows refuses to delete an open file),
 ///   - `clear` on ALTER/TRUNCATE/close (the parse is schema-dependent),
-///   - `invalidateTombstones` when DELETE/UPDATE/UPSERT merges new tombstones.
+///   - `publishTombstones` when DELETE/UPDATE/UPSERT adds tombstones.
+///
+/// A published list reaches readers before its tombstone file does: it
+/// stays in `unwritten`, outranking the file, until the table writes the
+/// file outside its mutex and `settleTombstones` drops it (#605).
 ///
 /// Readers share the cached tombstone list through `acquireTombstones`: a
 /// reference-counted, immutable list, so an invalidation can never free
@@ -613,6 +617,11 @@ pub const SegmentHandles = struct {
     };
 
     map: std.AutoHashMapUnmanaged(u64, *Entry) = .empty,
+    /// Per segment, the newest published list its tombstone file doesn't
+    /// hold yet. Not handle state: `clear` keeps it, since dropping it would
+    /// bring deleted rows back.
+    unwritten: std.AutoHashMapUnmanaged(u64, *Tombstones) = .empty,
+    unwritten_count: std.atomic.Value(usize) = .init(0),
     /// Segment-only deletes need to invalidate cached query state even when
     /// the memtable and manifest do not change, or no handle was cached.
     tombstone_generation: std.atomic.Value(u64) = .init(0),
@@ -659,11 +668,11 @@ pub const SegmentHandles = struct {
     }
 
     /// The segment's tombstone list, shared (null = none, including an empty
-    /// file); pair with `releaseTombstones`. The file is read once and cached
-    /// until `invalidateTombstones`. `gpa` must be the table-lifetime
-    /// allocator: the cached list outlives any query and its last reference
-    /// can drop on any thread. A query-scoped allocator here leaves a dangling
-    /// cache entry the compactor later frees (#136).
+    /// file); pair with `releaseTombstones`. The newest published list, else
+    /// the file, read once and cached until the next publish. `gpa` must be
+    /// the table-lifetime allocator: the cached list outlives any query and
+    /// its last reference can drop on any thread. A query-scoped allocator
+    /// here leaves a dangling cache entry the compactor later frees (#136).
     pub fn acquireTombstones(
         self: *SegmentHandles,
         gpa: Allocator,
@@ -673,13 +682,43 @@ pub const SegmentHandles = struct {
     ) !?*Tombstones {
         self.lockSpin();
         defer self.lock.unlock();
-        if (!entry.tombs_loaded) {
-            entry.tombs = try loadTombstones(gpa, io, dir, entry.segment_id);
-            entry.tombs_loaded = true;
-        }
+        try self.loadEntryTombstones(gpa, io, dir, entry);
         const t = entry.tombs orelse return null;
         _ = t.refs.fetchAdd(1, .monotonic);
         return t;
+    }
+
+    /// `acquireTombstones` by segment id, for a reader that holds no handle.
+    /// Reads the file uncached when no handle is cached either.
+    pub fn currentTombstones(
+        self: *SegmentHandles,
+        gpa: Allocator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        segment_id: u64,
+    ) !?*Tombstones {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const t = if (self.map.get(segment_id)) |entry| blk: {
+            try self.loadEntryTombstones(gpa, io, dir, entry);
+            break :blk entry.tombs orelse return null;
+        } else if (self.unwritten.get(segment_id)) |t|
+            t
+        else
+            return try loadTombstones(gpa, io, dir, segment_id);
+        _ = t.refs.fetchAdd(1, .monotonic);
+        return t;
+    }
+
+    fn loadEntryTombstones(self: *SegmentHandles, gpa: Allocator, io: std.Io, dir: std.Io.Dir, entry: *Entry) !void {
+        if (entry.tombs_loaded) return;
+        if (self.unwritten.get(entry.segment_id)) |t| {
+            _ = t.refs.fetchAdd(1, .monotonic);
+            entry.tombs = t;
+        } else {
+            entry.tombs = try loadTombstones(gpa, io, dir, entry.segment_id);
+        }
+        entry.tombs_loaded = true;
     }
 
     pub fn releaseTombstones(gpa: Allocator, t: *Tombstones) void {
@@ -709,38 +748,114 @@ pub const SegmentHandles = struct {
             return null;
         }
         errdefer gpa.free(rows);
+        return try ownTombstones(gpa, rows);
+    }
+
+    /// A list holding `rows` (sorted, deduped, non-empty, allocated with
+    /// `gpa`), with the caller's one reference.
+    pub fn ownTombstones(gpa: Allocator, rows: []const u32) !*Tombstones {
         const t = try gpa.create(Tombstones);
         t.* = .{ .rows = rows, .refs = .init(1) };
         return t;
     }
 
-    /// A tombstone merge wrote new offsets for `segment_id` — drop the cached
-    /// list so the next reader re-reads the file. Readers holding the old
-    /// list keep it until they release.
-    pub fn invalidateTombstones(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
+    /// Room for `count` more `publishTombstones`, so a commit can publish
+    /// without failing.
+    pub fn reserveTombstones(self: *SegmentHandles, gpa: Allocator, count: usize) !void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        try self.unwritten.ensureUnusedCapacity(gpa, @intCast(count));
+    }
+
+    /// Make `t` segment `segment_id`'s list for every later reader, taking
+    /// the caller's reference. Readers holding the previous list keep it
+    /// until they release. Needs a `reserveTombstones` slot. Callers hold the
+    /// table mutex, so publishes don't race each other.
+    pub fn publishTombstones(self: *SegmentHandles, gpa: Allocator, segment_id: u64, t: *Tombstones) void {
         self.lockSpin();
         defer self.lock.unlock();
         _ = self.tombstone_generation.fetchAdd(1, .monotonic);
+        const gop = self.unwritten.getOrPutAssumeCapacity(segment_id);
+        if (gop.found_existing) gop.value_ptr.*.unref(gpa) else _ = self.unwritten_count.fetchAdd(1, .monotonic);
+        gop.value_ptr.* = t;
         const e = self.map.get(segment_id) orelse return;
-        if (e.tombs) |t| t.unref(allocator);
-        e.tombs = null;
-        e.tombs_loaded = false;
+        if (e.tombs) |old| old.unref(gpa);
+        _ = t.refs.fetchAdd(1, .monotonic);
+        e.tombs = t;
+        e.tombs_loaded = true;
+    }
+
+    pub const Unwritten = struct { segment_id: u64, tombs: *Tombstones };
+
+    pub fn hasUnwritten(self: *const SegmentHandles) bool {
+        return self.unwritten_count.load(.monotonic) > 0;
+    }
+
+    /// Append each unwritten list to `out`, with a reference the caller
+    /// releases.
+    pub fn collectUnwritten(self: *SegmentHandles, gpa: Allocator, out: *std.ArrayList(Unwritten)) !void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        try out.ensureUnusedCapacity(gpa, self.unwritten.count());
+        var it = self.unwritten.iterator();
+        while (it.next()) |kv| {
+            _ = kv.value_ptr.*.refs.fetchAdd(1, .monotonic);
+            out.appendAssumeCapacity(.{ .segment_id = kv.key_ptr.*, .tombs = kv.value_ptr.* });
+        }
+    }
+
+    /// Segment `segment_id`'s tombstone file now holds `t`. Drops it from
+    /// `unwritten` unless a newer list replaced it meanwhile.
+    pub fn settleTombstones(self: *SegmentHandles, gpa: Allocator, segment_id: u64, t: *Tombstones) void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        const current = self.unwritten.get(segment_id) orelse return;
+        if (current != t) return;
+        _ = self.unwritten.remove(segment_id);
+        _ = self.unwritten_count.fetchSub(1, .monotonic);
+        t.unref(gpa);
+    }
+
+    /// Forget every unwritten list, for a caller whose files now hold an
+    /// older state on purpose (an XA rollback restoring them).
+    pub fn discardUnwritten(self: *SegmentHandles, gpa: Allocator) void {
+        self.lockSpin();
+        defer self.lock.unlock();
+        self.discardUnwrittenLocked(gpa);
+        var it = self.map.valueIterator();
+        while (it.next()) |e| {
+            if (e.*.tombs) |t| t.unref(gpa);
+            e.*.tombs = null;
+            e.*.tombs_loaded = false;
+        }
+    }
+
+    fn discardUnwrittenLocked(self: *SegmentHandles, gpa: Allocator) void {
+        var it = self.unwritten.valueIterator();
+        while (it.next()) |t| t.*.unref(gpa);
+        self.unwritten.clearRetainingCapacity();
+        self.unwritten_count.store(0, .monotonic);
     }
 
     /// Compaction is about to delete this segment's files: close our handle
-    /// now (Windows can't delete an open file). Runs under the ddl exclusive
-    /// lock, so no reader holds a pin in practice; a pinned entry (defense)
-    /// is destroyed by its last `release`.
+    /// now (Windows can't delete an open file), and forget its unwritten
+    /// list. Runs under the ddl exclusive lock, so no reader holds a pin in
+    /// practice; a pinned entry (defense) is destroyed by its last `release`.
     pub fn retire(self: *SegmentHandles, allocator: Allocator, segment_id: u64) void {
         self.lockSpin();
         defer self.lock.unlock();
+        if (self.unwritten.fetchRemove(segment_id)) |kv| {
+            _ = self.unwritten_count.fetchSub(1, .monotonic);
+            kv.value.unref(allocator);
+        }
         const kv = self.map.fetchRemove(segment_id) orelse return;
         const e = kv.value;
         if (e.pins == 0) destroyEntry(allocator, e) else e.retired = true;
     }
 
-    /// Drop everything — ALTER/TRUNCATE (schema-dependent parse) and table
-    /// close. Callers hold the table exclusively; no pins outstanding.
+    /// Drop every handle — ALTER/TRUNCATE (schema-dependent parse) and table
+    /// close. Unwritten lists stay. Callers hold the table exclusively; no
+    /// pins outstanding.
     pub fn clear(self: *SegmentHandles, allocator: Allocator) void {
         self.lockSpin();
         var it = self.map.valueIterator();
@@ -751,6 +866,8 @@ pub const SegmentHandles = struct {
 
     pub fn deinit(self: *SegmentHandles, allocator: Allocator) void {
         self.clear(allocator);
+        self.discardUnwrittenLocked(allocator);
+        self.unwritten.deinit(allocator);
         self.map.deinit(allocator);
     }
 
