@@ -64,8 +64,17 @@ pub fn sort(comptime T: type, items: []T, context: anytype, allocator: std.mem.A
     try @import("util/cancellable_sort.zig").pdq(T, items, context, flag, less);
 }
 
+/// The allocator an operator built on `fallback` draws from: the query's
+/// tracked execution allocator, unless `fallback` is already one the query
+/// owns. That keeps its backing — a parallel scan's per-chunk operators stay
+/// on the retaining worker pool. Moved to the C heap, every chunk grows and
+/// frees its batch buffers through heap segments that decommit and fault
+/// back in, at a cost that scales with chunk count.
 pub fn executionAllocator(fallback: std.mem.Allocator, accountant: ?*MemoryAccountant) !std.mem.Allocator {
-    if (accountant) |a| if (a.physical_tracking) return a.executionAllocator();
+    if (accountant) |a| if (a.physical_tracking) {
+        if (ownerOf(fallback) == a) return fallback;
+        return a.executionAllocator();
+    };
     return fallback;
 }
 
@@ -970,6 +979,37 @@ test "memory: worker allocator charges the query once, even over an already-trac
     try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
     try std.testing.expectEqual(a, try workerAllocator(null, a));
+}
+
+test "memory: operators keep an allocator their query owns and move off any other" {
+    const a = std.testing.allocator;
+    var scratch = buffer_pool.Pool.init(a, 1 << 20);
+    defer scratch.drain();
+    const account = try a.create(MemoryAccountant);
+    account.* = MemoryAccountant.init(1 << 20);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const pooled = try account.wrapAllocator(scratch.allocator());
+    const kept = try executionAllocator(pooled, account);
+    try std.testing.expectEqual(pooled.ptr, kept.ptr);
+    try std.testing.expectEqual(pooled.vtable, kept.vtable);
+
+    const execution = try account.executionAllocator();
+    const moved = try executionAllocator(a, account);
+    try std.testing.expectEqual(execution.ptr, moved.ptr);
+
+    const other = try a.create(MemoryAccountant);
+    other.* = MemoryAccountant.init(1 << 20);
+    other.trackAllocations(a);
+    defer other.releaseOwner(a);
+    const foreign = try executionAllocator(try other.executionAllocator(), account);
+    try std.testing.expectEqual(execution.ptr, foreign.ptr);
+
+    var retained = BudgetAllocator.init(a);
+    try retained.attach(account);
+    defer retained.detach();
+    const borrowed = try executionAllocator(retained.allocator(), account);
+    try std.testing.expectEqual(execution.ptr, borrowed.ptr);
 }
 
 test "memory: a pooled block is charged at its size class, not the request" {
