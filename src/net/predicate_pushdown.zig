@@ -16,6 +16,10 @@
 //! duplicates into a product of per-side aggregates (see
 //! `pushAggregatesThroughCrossJoins`).
 //!
+//! And adds, beside a comparison of a monotone function of a DATE column with
+//! a constant, the range of the column it implies (see
+//! `deriveMonotoneBounds`).
+//!
 //! This is a plan rewrite (allowed — see DESIGN.md "no RUNTIME optimization"),
 //! run once after subquery resolution and before any handler compiles the tree,
 //! so every execution path (generic, silo, staged-CTE, …) benefits uniformly.
@@ -39,9 +43,15 @@ const Allocator = std.mem.Allocator;
 
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
-const PredicateExpr = @import("../exec/predicate.zig").PredicateExpr;
-const Predicate = @import("../exec/predicate.zig").Predicate;
+const predicate_mod = @import("../exec/predicate.zig");
+const PredicateExpr = predicate_mod.PredicateExpr;
+const Predicate = predicate_mod.Predicate;
+const PredicateOp = predicate_mod.PredicateOp;
 const expr_mod = @import("../exec/expr.zig");
+const Compute = @import("../exec/compute.zig").Compute;
+const SingleBatchSource = @import("../exec/single_batch.zig").SingleBatchSource;
+const scalar_common = @import("../exec/scalar_fn_common.zig");
+const ColumnView = @import("../storage/column.zig").ColumnView;
 const local = @import("local.zig");
 const api = @import("../api/api.zig");
 
@@ -1147,6 +1157,286 @@ fn collectExprRefs(arena: Allocator, e: ir.Expr, out: *std.ArrayListUnmanaged([]
     return true;
 }
 
+/// Adds, beside each conjunct of a filter that compares a column its compute
+/// derives from one DATE column, through functions that never decrease in it,
+/// with a constant (`ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1) >=
+/// '2024-01-01'`), the range of that column it implies (`d >= '2024-01-01'`).
+/// The added conjunct is a plain column comparison, which scans prune row
+/// groups by and evaluate in their kernels, where the computed form costs a
+/// per-row evaluation of every row the other conjuncts keep. The original
+/// conjunct stays and decides each row, so the range only has to hold every
+/// day the comparison holds for.
+pub fn deriveMonotoneBounds(arena: Allocator, catalog: ?*api.Catalog, session: api.Session, op: *ir.Op) anyerror!void {
+    trace_push = getenv("THINDB_TRACE_PUSHDOWN") != null;
+    const ctx = Ctx{ .arena = arena, .catalog = catalog, .session = session };
+    var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+    try walkMonotoneBounds(ctx, op, &visited);
+}
+
+fn walkMonotoneBounds(ctx: Ctx, op: *ir.Op, visited: *std.AutoHashMapUnmanaged(*const ir.Op, void)) anyerror!void {
+    switch (op.*) {
+        .scan, .single_row, .file_scan, .ddl, .show, .insert, .copy, .set_var, .admin => {},
+        .delete_op => |d| if (d.source) |s| try walkMonotoneBounds(ctx, s, visited),
+        .update_op => |u| if (u.source) |s| try walkMonotoneBounds(ctx, s, visited),
+        .select, .exclude => |p| try walkMonotoneBounds(ctx, @constCast(p.upstream), visited),
+        .limit => |l| try walkMonotoneBounds(ctx, @constCast(l.upstream), visited),
+        .order_by => |o| try walkMonotoneBounds(ctx, @constCast(o.upstream), visited),
+        .group_by => |g| try walkMonotoneBounds(ctx, @constCast(g.upstream), visited),
+        .compute => |c| try walkMonotoneBounds(ctx, @constCast(c.upstream), visited),
+        .window => |w| try walkMonotoneBounds(ctx, @constCast(w.upstream), visited),
+        .alias => |a| try walkMonotoneBounds(ctx, @constCast(a.upstream), visited),
+        .table_fn => |t| for (t.inputs) |inp| try walkMonotoneBounds(ctx, inp, visited),
+        .explain => |e| try walkMonotoneBounds(ctx, e.inner, visited),
+        .create_table_as => |c| try walkMonotoneBounds(ctx, @constCast(c.source), visited),
+        .insert_select => |i| try walkMonotoneBounds(ctx, @constCast(i.source), visited),
+        .batch => |b| for (b.statements) |s| try walkMonotoneBounds(ctx, @constCast(s), visited),
+        .materialize => |m| {
+            if (m.recursion != null) return;
+            const gop = try visited.getOrPut(ctx.arena, op);
+            if (!gop.found_existing) try walkMonotoneBounds(ctx, @constCast(m.upstream), visited);
+        },
+        .set_union => |u| {
+            try walkMonotoneBounds(ctx, @constCast(u.left), visited);
+            try walkMonotoneBounds(ctx, @constCast(u.right), visited);
+        },
+        .join => |j| {
+            try walkMonotoneBounds(ctx, @constCast(j.left), visited);
+            try walkMonotoneBounds(ctx, @constCast(j.right), visited);
+        },
+        .filter => |f| {
+            try walkMonotoneBounds(ctx, @constCast(f.upstream), visited);
+            if (f.upstream.* == .compute) try addImpliedDayRanges(ctx, op);
+        },
+    }
+}
+
+const DerivedComparison = struct { op: PredicateOp, val: types.Value };
+
+fn addImpliedDayRanges(ctx: Ctx, op: *ir.Op) anyerror!void {
+    const c = op.filter.upstream.compute;
+    var leaves: std.ArrayListUnmanaged(Predicate) = .empty;
+    try collectConjunctLeaves(ctx.arena, op.filter.predicate, &leaves);
+    var added: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+    for (c.derived) |d| {
+        if (d.expr != .call) continue;
+        var cmps: std.ArrayListUnmanaged(DerivedComparison) = .empty;
+        for (leaves.items) |leaf| {
+            if (leaf.op == .neq or leaf.as_boolean or !sameColumn(leaf.col, d.name)) continue;
+            try cmps.append(ctx.arena, .{ .op = leaf.op, .val = leaf.val });
+        }
+        if (cmps.items.len == 0) continue;
+        const col = monotoneDateArgument(d.expr) orelse continue;
+        // A column another entry derives, not one of the compute's inputs.
+        if (for (c.derived) |other| {
+            if (sameColumn(other.name, col)) break true;
+        } else false) continue;
+        const facts = try keyFacts(ctx, c.upstream, col) orelse continue;
+        if (facts.col_type != .date) continue;
+        const range = try impliedDayRange(ctx.arena, col, d.expr, cmps.items) orelse continue;
+        if (range.lo) |lo| try added.append(ctx.arena, .{ .leaf = .{ .col = col, .op = .gte, .val = .{ .date = lo } } });
+        if (range.hi) |hi| try added.append(ctx.arena, .{ .leaf = .{ .col = col, .op = .lte, .val = .{ .date = hi } } });
+    }
+    if (added.items.len == 0) return;
+    if (trace_push) std.debug.print("[ppd] {d} implied day-range conjunct(s)\n", .{added.items.len});
+    op.filter.predicate = try combine(ctx.arena, try std.mem.concat(ctx.arena, PredicateExpr, &.{ try splitConjuncts(ctx.arena, op.filter.predicate), added.items }));
+}
+
+/// The comparison leaves `pred` ANDs together, through nested ANDs.
+fn collectConjunctLeaves(arena: Allocator, pred: PredicateExpr, out: *std.ArrayListUnmanaged(Predicate)) Allocator.Error!void {
+    switch (pred) {
+        .leaf => |leaf| try out.append(arena, leaf),
+        .@"and" => |kids| for (kids) |kid| try collectConjunctLeaves(arena, kid, out),
+        else => {},
+    }
+}
+
+/// Functions that never decrease in their first argument, a DATE or
+/// DATETIME, while every other argument is constant.
+const MONOTONE_DATE_FNS = [_][]const u8{ "date_add", "date_sub", "date_add_weeks", "date_add_months", "date_add_quarters", "date_add_years", "last_day", "year", "to_days", "date" };
+
+/// The column `e` computes from through `MONOTONE_DATE_FNS` whose other
+/// arguments are literals, or null.
+fn monotoneDateArgument(e: ir.Expr) ?[]const u8 {
+    return switch (e) {
+        .col_ref => |name| name,
+        .call => |c| {
+            for (MONOTONE_DATE_FNS) |name| {
+                if (std.ascii.eqlIgnoreCase(c.fn_name, name)) break;
+            } else return null;
+            if (c.args.len == 0) return null;
+            for (c.args[1..]) |a| if (a != .lit) return null;
+            return monotoneDateArgument(c.args[0]);
+        },
+        else => null,
+    };
+}
+
+const DayRange = struct { lo: ?i32 = null, hi: ?i32 = null };
+
+/// Days the coarse pass samples across the DATE domain. The exact pass then
+/// evaluates every day of the one coarse step each bound falls in.
+const RANGE_SAMPLES = 4096;
+
+const RANGE_PROBE_NAME = "__day_range_probe";
+
+const DayBracket = struct {
+    lower: bool,
+    op: PredicateOp,
+    v: i64,
+    from: i32,
+    to: i32,
+};
+
+/// The days of DATE column `col` for which each of `cmps` can hold of
+/// `expr`, a function of `col` that never decreases in it: an empty side
+/// leaves it unbounded. Null when no comparison bounds it. The engine
+/// evaluates `expr` itself over sampled days, so the range follows exactly
+/// the values its rows compute.
+fn impliedDayRange(arena: Allocator, col: []const u8, expr: ir.Expr, cmps: []const DerivedComparison) !?DayRange {
+    const first: i64 = scalar_common.FIRST_DATE_DAYS;
+    const span: i64 = @as(i64, scalar_common.LAST_DATE_DAYS) - first;
+    const coarse = try arena.alloc(i32, RANGE_SAMPLES);
+    for (coarse, 0..) |*day, k| day.* = @intCast(first + @divFloor(span * @as(i64, @intCast(k)), RANGE_SAMPLES - 1));
+    const sampled = try evalOnDays(arena, col, expr, coarse) orelse return null;
+    if (!monotoneOutputs(sampled.ys)) return null;
+
+    var brackets: std.ArrayListUnmanaged(DayBracket) = .empty;
+    for (cmps) |cmp| {
+        const v = comparedAsI64(cmp.val, sampled.ty) orelse continue;
+        if (cmp.op != .lt and cmp.op != .lte) {
+            const want: PredicateOp = if (cmp.op == .gt) .gt else .gte;
+            if (firstHolding(sampled.ys, want, v)) |k| if (k > 0) {
+                try brackets.append(arena, .{ .lower = true, .op = want, .v = v, .from = coarse[k - 1] + 1, .to = coarse[k] });
+            };
+        }
+        if (cmp.op != .gt and cmp.op != .gte) {
+            const want: PredicateOp = if (cmp.op == .lt) .lt else .lte;
+            if (lastHolding(sampled.ys, want, v)) |k| if (k + 1 < coarse.len) {
+                try brackets.append(arena, .{ .lower = false, .op = want, .v = v, .from = coarse[k], .to = coarse[k + 1] - 1 });
+            };
+        }
+    }
+    if (brackets.items.len == 0) return null;
+
+    var days: std.ArrayListUnmanaged(i32) = .empty;
+    for (brackets.items) |b| {
+        var day = b.from;
+        while (day <= b.to) : (day += 1) try days.append(arena, day);
+    }
+    const exact = try evalOnDays(arena, col, expr, days.items) orelse return null;
+    var range: DayRange = .{};
+    var at: usize = 0;
+    for (brackets.items) |b| {
+        const ys = exact.ys[at..][0..@intCast(b.to - b.from + 1)];
+        at += ys.len;
+        if (!monotoneOutputs(ys)) return null;
+        if (b.lower) {
+            const day = b.from + @as(i32, @intCast(firstHolding(ys, b.op, b.v) orelse return null));
+            range.lo = if (range.lo) |lo| @max(lo, day) else day;
+        } else {
+            const day = b.from + @as(i32, @intCast(lastHolding(ys, b.op, b.v) orelse return null));
+            range.hi = if (range.hi) |hi| @min(hi, day) else day;
+        }
+    }
+    return range;
+}
+
+const DayOutputs = struct { ty: types.Type, ys: []const ?i64 };
+
+/// `expr` of each of `days` as the value of DATE column `col`, computed by a
+/// Compute: integer, DATE and DATETIME results read as i64, NULL as null.
+/// Null when the Compute rejects `expr` or its result is of another type.
+fn evalOnDays(arena: Allocator, col: []const u8, expr: ir.Expr, days: []const i32) !?DayOutputs {
+    const schema = try arena.dupe(types.Column, &.{.{ .name = col, .type = .date, .nullable = false }});
+    const views = try arena.dupe(ColumnView, &.{.{ .data = .{ .date = days } }});
+    const source = try SingleBatchSource.create(arena, .{ .schema = schema, .values = views, .row_count = days.len });
+    const derived = try arena.dupe(ir.Derived, &.{.{ .name = RANGE_PROBE_NAME, .expr = expr }});
+    var q = Compute.create(arena, source, derived) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer q.deinit();
+    const batch = (q.next() catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    }) orelse return null;
+    const idx = types.findColumn(batch.schema, RANGE_PROBE_NAME) orelse return null;
+    const out = batch.values[idx];
+    const ys = try arena.alloc(?i64, days.len);
+    for (ys, 0..) |*y, i| {
+        y.* = if (!out.isValid(i)) null else switch (out.data) {
+            .date => |s| s[i],
+            .datetime => |s| s[i],
+            .int => |s| s[i],
+            .bigint => |s| s[i],
+            .smallint => |s| s[i],
+            .tinyint => |s| s[i],
+            else => return null,
+        };
+    }
+    return .{ .ty = batch.schema[idx].type, .ys = ys };
+}
+
+/// Whether the non-NULL values never decrease, with NULLs only before or
+/// after them all: the shape of a function that never decreases and is NULL
+/// only where it leaves the DATE range.
+fn monotoneOutputs(ys: []const ?i64) bool {
+    var lo: usize = 0;
+    while (lo < ys.len and ys[lo] == null) lo += 1;
+    var hi = ys.len;
+    while (hi > lo and ys[hi - 1] == null) hi -= 1;
+    var prev: i64 = std.math.minInt(i64);
+    for (ys[lo..hi]) |y| {
+        const v = y orelse return false;
+        if (v < prev) return false;
+        prev = v;
+    }
+    return true;
+}
+
+/// `val` as the comparison of a `ty` column with it reads it, as an i64; null
+/// when no value of `ty` equals it.
+fn comparedAsI64(val: types.Value, ty: types.Type) ?i64 {
+    const placed = if (std.meta.activeTag(val) == types.ValueTag.fromType(ty)) val else switch (val) {
+        .text => |text| (predicate_mod.placeComparedText(text, ty, false) catch return null) orelse return null,
+        else => predicate_mod.placeComparedValue(val, ty) orelse return null,
+    };
+    return switch (placed) {
+        .date => |v| v,
+        .datetime => |v| v,
+        .int => |v| v,
+        .bigint => |v| v,
+        .smallint => |v| v,
+        .tinyint => |v| v,
+        else => null,
+    };
+}
+
+fn holds(op: PredicateOp, y: i64, v: i64) bool {
+    return switch (op) {
+        .eq => y == v,
+        .neq => y != v,
+        .lt => y < v,
+        .lte => y <= v,
+        .gt => y > v,
+        .gte => y >= v,
+    };
+}
+
+fn firstHolding(ys: []const ?i64, op: PredicateOp, v: i64) ?usize {
+    for (ys, 0..) |y, i| if (y) |value| if (holds(op, value, v)) return i;
+    return null;
+}
+
+fn lastHolding(ys: []const ?i64, op: PredicateOp, v: i64) ?usize {
+    var i = ys.len;
+    while (i > 0) {
+        i -= 1;
+        if (ys[i]) |value| if (holds(op, value, v)) return i;
+    }
+    return null;
+}
+
 const testing = std.testing;
 
 fn testSelect(cols: []const []const u8, upstream: *ir.Op) ir.Op {
@@ -1586,4 +1876,65 @@ test "cross aggregate push: a chain of cross joins splits at every product" {
     try testing.expect(inner_product.left.group_by.upstream == &x);
     try testing.expect(inner_product.right.group_by.upstream == &y);
     try testing.expect(op.select.upstream.join.right.group_by.upstream == &z);
+}
+
+fn testCall(arena: Allocator, name: []const u8, args: []const ir.Expr) !ir.Expr {
+    return expr_mod.call(arena, name, args);
+}
+
+/// `ADDDATE(LAST_DAY(SUBDATE(d, INTERVAL 1 MONTH)), 1)` as the parser lowers
+/// it: the first day of d's month, as a DATETIME.
+fn testMonthStart(arena: Allocator) !ir.Expr {
+    const back = try testCall(arena, "date_add_months", &.{ .{ .col_ref = "d" }, .{ .lit = .{ .int = -1 } } });
+    const last = try testCall(arena, "last_day", &.{back});
+    return testCall(arena, "date_add", &.{ last, .{ .lit = .{ .int = 1 } } });
+}
+
+test "implied day range: month-start comparisons with timestamp text bound the column to the months" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const range = (try impliedDayRange(arena, "d", try testMonthStart(arena), &.{
+        .{ .op = .gte, .val = .{ .text = "2024-01-01T00:00:00.000Z" } },
+        .{ .op = .lt, .val = .{ .text = "2026-11-01T00:00:00.000Z" } },
+    })).?;
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2024, 1, 1)), range.lo);
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2026, 10, 31)), range.hi);
+}
+
+test "implied day range: YEAR equality and LAST_DAY / day-shift comparisons" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const year = try testCall(arena, "year", &.{.{ .col_ref = "d" }});
+    const in_2024 = (try impliedDayRange(arena, "d", year, &.{.{ .op = .eq, .val = .{ .int = 2024 } }})).?;
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2024, 1, 1)), in_2024.lo);
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2024, 12, 31)), in_2024.hi);
+
+    const last_day = try testCall(arena, "last_day", &.{.{ .col_ref = "d" }});
+    const by_feb_15 = (try impliedDayRange(arena, "d", last_day, &.{.{ .op = .lte, .val = .{ .date = scalar_common.ymdToDays(2024, 2, 15) } }})).?;
+    try testing.expectEqual(@as(?i32, null), by_feb_15.lo);
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2024, 1, 31)), by_feb_15.hi);
+
+    const shifted = try testCall(arena, "date_add", &.{ .{ .col_ref = "d" }, .{ .lit = .{ .int = 10 } } });
+    const after = (try impliedDayRange(arena, "d", shifted, &.{.{ .op = .gt, .val = .{ .date = scalar_common.ymdToDays(2024, 1, 10) } }})).?;
+    try testing.expectEqual(@as(?i32, scalar_common.ymdToDays(2024, 1, 1)), after.lo);
+    try testing.expectEqual(@as(?i32, null), after.hi);
+}
+
+test "implied day range: a comparison every day meets bounds nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const year = try testCall(arena, "year", &.{.{ .col_ref = "d" }});
+    try testing.expectEqual(@as(?DayRange, null), try impliedDayRange(arena, "d", year, &.{.{ .op = .gte, .val = .{ .int = 0 } }}));
+}
+
+test "implied day range: only monotone functions with literal arguments qualify" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("d", monotoneDateArgument(try testMonthStart(arena)).?);
+    try testing.expect(monotoneDateArgument(try testCall(arena, "month", &.{.{ .col_ref = "d" }})) == null);
+    try testing.expect(monotoneDateArgument(try testCall(arena, "date_add", &.{ .{ .col_ref = "d" }, .{ .col_ref = "n" } })) == null);
 }
