@@ -99,6 +99,23 @@ test "sql namespace: backtick-quoted identifier survives lex + resolves" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids);
 }
 
+test "sql namespace: a doubled backtick names a column with a backtick (#561)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seed(db, "t");
+
+    var q = try runSql(allocator, db, "SELECT `id` AS `we``ird` FROM `t` ORDER BY `we``ird` ASC");
+    defer q.deinit();
+    try std.testing.expectEqualStrings("we`ird", q.outputSchema()[0].name);
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids);
+}
+
 test "sql namespace: 3-part ref SELECT * FROM main.public.t" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
