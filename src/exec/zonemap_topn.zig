@@ -636,7 +636,7 @@ const SegCache = struct {
     fn tombstones(self: *SegCache, z: *const ZonemapTopN, allocator: Allocator, seg_idx: usize) !?[]const u32 {
         if (!self.tombs_loaded[seg_idx]) {
             _ = try self.segment(z, allocator, seg_idx);
-            self.tombs[seg_idx] = try z.table.segmentTombstones(allocator, self.entries[seg_idx].?);
+            self.tombs[seg_idx] = try z.table.segmentTombstones(allocator, self.entries[seg_idx].?, z.inner_scan.tomb_epoch);
             self.tombs_loaded[seg_idx] = true;
         }
         return self.tombs[seg_idx];

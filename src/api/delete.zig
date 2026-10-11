@@ -297,7 +297,7 @@ pub const LiveSegment = struct {
     pub fn open(t: *Table, segment_id: u64) !LiveSegment {
         const handle = try t.acquireSegment(segment_id);
         errdefer t.releaseSegment(handle);
-        const on_disk = try t.segmentTombstones(t.allocator, handle);
+        const on_disk = try t.segmentTombstones(t.allocator, handle, null);
         const staged = if (t.statement) |s| s.tombstones.get(segment_id) else null;
         const tombs = if (staged != null and staged.?.items.len > 0) blk: {
             defer if (on_disk) |x| t.allocator.free(x);

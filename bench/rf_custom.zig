@@ -1484,10 +1484,10 @@ pub fn main() !void {
         table.ddl_lock.lockSharedUncancelable(table.io);
         defer table.ddl_lock.unlockShared(table.io);
         const Scan = thindb.exec.Scan;
-        const snap = try Scan.captureSnapshotAlloc(table, allocator);
+        const snap = try Scan.captureSnapshotAlloc(table, allocator, null);
         defer allocator.free(snap.segments);
         var orch_pin_held = true;
-        defer if (orch_pin_held) snap.memtable_snap.release();
+        defer if (orch_pin_held) snap.release(table);
 
         var total_rgs: usize = 0;
         const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
@@ -1533,7 +1533,7 @@ pub fn main() !void {
             const fused = try s.tryFuseFilter(filter_expr);
             if (!fused) return error.FilterNotFused;
         }
-        snap.memtable_snap.release();
+        snap.release(table);
         orch_pin_held = false;
 
         var scan_to_shard: [SCAN_COLS.len]usize = undefined;

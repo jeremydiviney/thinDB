@@ -357,6 +357,10 @@ pub const MemoryAccountant = struct {
     peak_bytes: usize = 0,
     lifetime_lease: ?@import("util/statement_gate.zig").StatementGate.LifetimeLease = null,
     cancel_flag: ?*const std.atomic.Value(bool) = null,
+    /// The table snapshots the statement's scans share (DESIGN §6.1), set
+    /// by the statement that owns this accountant; null when each scan
+    /// takes its own.
+    table_snapshots: ?*@import("exec/scan.zig").Scan.StatementSnapshots = null,
     /// Names this statement in watchdog lines; unique among its pool's.
     statement_id: u64 = 0,
     /// The wire connection running the statement (the PROCESSLIST / KILL id).
