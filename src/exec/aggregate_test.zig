@@ -459,3 +459,91 @@ test "an aggregate reports the same stats after it has emitted" {
     // checking its input's order).
     try std.testing.expectEqualDeep(before, agg.stats().column_stats);
 }
+
+test "batch compound group keys match the per-row builder byte for byte" {
+    const a = std.testing.allocator;
+    const n = 10;
+    // Rows 2, 5 and 9 are NULL in every bitmap-carrying nullable column.
+    const nulls = [_]u8{ 0b1101_1011, 0b0000_0001 };
+    const str: storage.StringView = .{
+        .offsets = &.{ 0, 5, 5, 9, 14, 14, 15, 16, 17, 17, 17 },
+        .bytes = "alphabetagammaxyz",
+    };
+    const nan = std.math.nan(f64);
+    const key_schema = [_]Column{
+        .{ .name = "i", .type = .int },
+        .{ .name = "bi", .type = .bigint, .nullable = true },
+        .{ .name = "s", .type = .string, .nullable = true },
+        .{ .name = "d", .type = .double, .nullable = true },
+        .{ .name = "f", .type = .float },
+        .{ .name = "sm", .type = .smallint },
+        .{ .name = "bo", .type = .boolean, .nullable = true },
+        .{ .name = "ti", .type = .tinyint },
+        .{ .name = "li", .type = .largeint, .nullable = true },
+        .{ .name = "u", .type = .uuid },
+        .{ .name = "dt", .type = .datetime },
+        .{ .name = "dc", .type = .{ .decimal128 = .{ .p = 30, .s = 4 } }, .nullable = true },
+        .{ .name = "vc", .type = .{ .varchar = 16 } },
+        .{ .name = "da", .type = .date, .nullable = true },
+        .{ .name = "d64", .type = .{ .decimal64 = .{ .p = 12, .s = 2 } } },
+        .{ .name = "ch", .type = .{ .char = 8 }, .nullable = true },
+        .{ .name = "js", .type = .json },
+    };
+    const values = [_]ColumnView{
+        .{ .data = .{ .int = &.{ 0, -1, 2, 3, 2147483647, -2147483648, 6, 7, 8, 9 } } },
+        .{ .data = .{ .bigint = &.{ 10, 11, 12, -13, 14, 15, 16, 17, 18, 19 } }, .nulls = &nulls },
+        .{ .data = .{ .string = str }, .nulls = &nulls },
+        .{ .data = .{ .double = &.{ 0.0, -0.0, nan, 1.5, -nan, 2.5, 3.5, -0.0, nan, 4.5 } }, .nulls = &nulls },
+        .{ .data = .{ .float = &.{ -0.0, 0.0, std.math.nan(f32), 1, 2, 3, 4, 5, 6, 7 } } },
+        .{ .data = .{ .smallint = &.{ -32768, 32767, 0, 1, 2, 3, 4, 5, 6, 7 } } },
+        // Nullable in the schema but no bitmap: every row is valid, still tagged.
+        .{ .data = .{ .boolean = &.{ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 } } },
+        .{ .data = .{ .tinyint = &.{ -128, 127, -1, 0, 1, 2, 3, 4, 5, 6 } } },
+        .{ .data = .{ .largeint = &.{ -1, 1, 2, 3, 4, 5, 6, 7, 8, std.math.maxInt(i128) } }, .nulls = &nulls },
+        .{ .data = .{ .uuid = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, std.math.maxInt(u128) } } },
+        .{ .data = .{ .datetime = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, -9 } } },
+        .{ .data = .{ .decimal128 = &.{ 100, -200, 300, 400, 500, 600, 700, 800, 900, 1000 } }, .nulls = &nulls },
+        .{ .data = .{ .varchar = str } },
+        .{ .data = .{ .date = &.{ 20000, 1, 2, 3, 4, 5, 6, 7, 8, 9 } }, .nulls = &nulls },
+        .{ .data = .{ .decimal64 = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, -10 } } },
+        .{ .data = .{ .char = str }, .nulls = &nulls },
+        .{ .data = .{ .json = str } },
+    };
+    const batch: Batch = .{ .schema = &key_schema, .values = &values, .row_count = n };
+
+    const key_sets = .{
+        &[_]usize{ 0, 1 },
+        &[_]usize{ 2, 0 },
+        &[_]usize{ 3, 4, 6 },
+        &[_]usize{ 12, 2, 15, 16 },
+        &[_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 },
+    };
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(a);
+    var spans: std.ArrayListUnmanaged([2]u32) = .empty;
+    defer spans.deinit(a);
+    inline for (key_sets) |cols| {
+        expected.clearRetainingCapacity();
+        var starts: [n + 1]u32 = undefined;
+        for (0..n) |r| {
+            starts[r] = @intCast(expected.items.len);
+            try exec.aggregate_op.buildCompoundGroupKey(a, &expected, batch, cols, @intCast(r));
+        }
+        starts[n] = @intCast(expected.items.len);
+
+        try exec.aggregate_op.buildCompoundGroupKeys(a, &blob, &spans, batch, cols);
+        try std.testing.expectEqualSlices(u8, expected.items, blob.items);
+        try std.testing.expectEqual(n, spans.items.len);
+        for (spans.items, 0..) |sp, r| {
+            try std.testing.expectEqual(starts[r], sp[0]);
+            try std.testing.expectEqual(starts[r + 1] - starts[r], sp[1]);
+        }
+    }
+
+    const empty: Batch = .{ .schema = &key_schema, .values = &values, .row_count = 0 };
+    try exec.aggregate_op.buildCompoundGroupKeys(a, &blob, &spans, empty, &.{ 0, 2 });
+    try std.testing.expectEqual(0, blob.items.len);
+    try std.testing.expectEqual(0, spans.items.len);
+}
