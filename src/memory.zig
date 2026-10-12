@@ -129,7 +129,7 @@ pub const MemorySnapshot = struct {
 };
 
 fn cacheBytes() u64 {
-    return @max(huge_page.g_slab_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic));
+    return @max(huge_page.g_slab_bytes.load(.monotonic) + huge_page.g_fallback_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic));
 }
 
 /// Unaccounted memory that earns a watchdog line: 2 GiB, or a quarter of the
