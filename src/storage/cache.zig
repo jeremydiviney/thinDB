@@ -170,7 +170,7 @@ pub const Cache = struct {
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
         return .{
             .allocator = allocator,
-            .pool = huge_page.Pool.init(allocator),
+            .pool = huge_page.Pool.init(allocator, capacity_bytes),
             .capacity_bytes = capacity_bytes,
         };
     }
