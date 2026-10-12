@@ -201,11 +201,12 @@ pub const Filter = struct {
 
         var rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty;
         errdefer freeRewritten(allocator, &rewritten);
+        var cols: ColumnLookup = .{ .schema = schema };
         const simplified = try simplifyPredicate(
             allocator,
             &rewritten,
             validated,
-            schema,
+            &cols,
             upstream.stats().column_stats,
         );
 
@@ -880,6 +881,37 @@ test "orderPredicate orders by cost then pass-fraction, keeping ties in written 
     try expectJunctionOrder(&.{ n_neq, n_eq_2, n_eq_3, s_eq, like_s }, disj.@"or");
 }
 
+test "orderPredicate folds every arm of a long IN list interleaved with another column's arms" {
+    const allocator = std.testing.allocator;
+    const schema = [_]Column{
+        .{ .name = "n", .type = .int },
+        .{ .name = "m", .type = .int },
+    };
+    const stats = [_]exec.ColStat{ .{ .min = 0, .max = 99 }, .{ .min = 0, .max = 9 } };
+
+    // Each column's arms past its max fold away, whichever column the arm
+    // before named.
+    var arms: [400]PredicateExpr = undefined;
+    for (0..200) |i| {
+        arms[2 * i] = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = @intCast(i) } } };
+        arms[2 * i + 1] = .{ .leaf = .{ .col = "m", .op = .eq, .val = .{ .int = @intCast(i) } } };
+    }
+
+    var rewritten: std.ArrayListUnmanaged([]PredicateExpr) = .empty;
+    defer {
+        for (rewritten.items) |s| allocator.free(s);
+        rewritten.deinit(allocator);
+    }
+    const ordered = try orderPredicate(allocator, &rewritten, .{ .@"or" = &arms }, &schema, &stats);
+    var kept = [_]usize{ 0, 0 };
+    for (ordered.@"or") |arm| {
+        const col = types.findColumn(&schema, arm.leaf.col).?;
+        try std.testing.expect(predicate.valueToRangeI128(arm.leaf.val).? <= stats[col].max.?);
+        kept[col] += 1;
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 100, 10 }, &kept);
+}
+
 fn expectJunctionOrder(want: []const PredicateExpr, got: []const PredicateExpr) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {
@@ -1014,8 +1046,28 @@ pub fn orderPredicate(
     schema: []const Column,
     stats: []const exec.ColStat,
 ) !PredicateExpr {
-    return simplifyPredicate(allocator, rewritten, expr, schema, stats);
+    var cols: ColumnLookup = .{ .schema = schema };
+    return simplifyPredicate(allocator, rewritten, expr, &cols, stats);
 }
+
+/// Resolves the predicate's column names against one schema for a single
+/// ordering pass, remembering the last name resolved. A literal `col IN (...)`
+/// desugars to one equality arm per literal, all naming the same column, and
+/// the pass resolves each arm's column several times (fold, key, the parent
+/// junction's key), so a long list otherwise costs thousands of linear,
+/// case-insensitive schema scans per pass, repeated by every scan it fuses into.
+const ColumnLookup = struct {
+    schema: []const Column,
+    last_name: ?[]const u8 = null,
+    last_idx: ?usize = null,
+
+    fn find(self: *ColumnLookup, name: []const u8) ?usize {
+        if (self.last_name) |last| if (std.mem.eql(u8, last, name)) return self.last_idx;
+        self.last_idx = types.findColumn(self.schema, name);
+        self.last_name = name;
+        return self.last_idx;
+    }
+};
 
 /// A level the pass rebuilt stays in `rewritten` when a level above it
 /// folds to a constant or fails, so the list is freed with its slices
@@ -1029,16 +1081,16 @@ fn simplifyPredicate(
     allocator: Allocator,
     rewritten: *std.ArrayListUnmanaged([]PredicateExpr),
     expr: PredicateExpr,
-    schema: []const Column,
+    cols: *ColumnLookup,
     stats: []const exec.ColStat,
 ) !PredicateExpr {
     switch (expr) {
-        .leaf => |p| return simplifyLeaf(p, schema, stats),
+        .leaf => |p| return simplifyLeaf(p, cols, stats),
         .@"and" => |children| {
             var survivors: std.ArrayListUnmanaged(PredicateExpr) = .empty;
             errdefer survivors.deinit(allocator);
             for (children) |child| {
-                const s = try simplifyPredicate(allocator, rewritten, child, schema, stats);
+                const s = try simplifyPredicate(allocator, rewritten, child, cols, stats);
                 switch (s) {
                     .always => |b| {
                         if (!b) {
@@ -1068,7 +1120,7 @@ fn simplifyPredicate(
             // Order conjuncts cheap+selective first, expensive last (commutative,
             // so results are unchanged) — owns the slice since the borrowed
             // `children` can't be reordered in place.
-            try sortByKey(allocator, survivors.items, schema, stats, .conjuncts);
+            try sortByKey(allocator, survivors.items, cols, stats, .conjuncts);
             const owned = try survivors.toOwnedSlice(allocator);
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
@@ -1078,7 +1130,7 @@ fn simplifyPredicate(
             var survivors: std.ArrayListUnmanaged(PredicateExpr) = .empty;
             errdefer survivors.deinit(allocator);
             for (children) |child| {
-                const s = try simplifyPredicate(allocator, rewritten, child, schema, stats);
+                const s = try simplifyPredicate(allocator, rewritten, child, cols, stats);
                 switch (s) {
                     .always => |b| {
                         if (b) {
@@ -1107,7 +1159,7 @@ fn simplifyPredicate(
             // Order disjuncts cheapest first, and within a cost class the
             // most-likely-TRUE first so the OR short-circuits early (the
             // evaluator skips already-satisfied rows in later disjuncts).
-            try sortByKey(allocator, survivors.items, schema, stats, .disjuncts);
+            try sortByKey(allocator, survivors.items, cols, stats, .disjuncts);
             const owned = try survivors.toOwnedSlice(allocator);
             errdefer allocator.free(owned);
             try rewritten.append(allocator, owned);
@@ -1119,12 +1171,12 @@ fn simplifyPredicate(
         // would otherwise add a vacuous conjunct that knocks the guided-AND
         // filter off its fused LIKE path (the Q22 regression).
         .is_not_null => |col| {
-            const idx = types.findColumn(schema, col) orelse return expr;
-            return if (!schema[idx].nullable) .{ .always = true } else expr;
+            const idx = cols.find(col) orelse return expr;
+            return if (!cols.schema[idx].nullable) .{ .always = true } else expr;
         },
         .is_null => |col| {
-            const idx = types.findColumn(schema, col) orelse return expr;
-            return if (!schema[idx].nullable) .{ .always = false } else expr;
+            const idx = cols.find(col) orelse return expr;
+            return if (!cols.schema[idx].nullable) .{ .always = false } else expr;
         },
         else => return expr,
     }
@@ -1133,15 +1185,15 @@ fn simplifyPredicate(
 /// Evaluate one comparison leaf against `[cmin, cmax]`. Returns
 /// `.always = true` (provably matches every row → droppable),
 /// `.always = false` (provably matches none → empty), or the leaf unchanged.
-fn simplifyLeaf(p: Predicate, schema: []const Column, stats: []const exec.ColStat) PredicateExpr {
+fn simplifyLeaf(p: Predicate, cols: *ColumnLookup, stats: []const exec.ColStat) PredicateExpr {
     const leaf: PredicateExpr = .{ .leaf = p };
-    if (stats.len != schema.len) return leaf;
-    const idx = types.findColumn(schema, p.col) orelse return leaf;
-    if (!predicate.typeHasRange(schema[idx].type)) return leaf;
+    if (stats.len != cols.schema.len) return leaf;
+    const idx = cols.find(p.col) orelse return leaf;
+    if (!predicate.typeHasRange(cols.schema[idx].type)) return leaf;
     const cmin = stats[idx].min orelse return leaf;
     const cmax = stats[idx].max orelse return leaf;
     const v = predicate.valueToRangeI128(p.val) orelse return leaf;
-    const non_nullable = !schema[idx].nullable;
+    const non_nullable = !cols.schema[idx].nullable;
 
     switch (p.op) {
         // `col >= v` — false iff v > cmax; true iff v <= cmin.
@@ -1184,18 +1236,18 @@ fn simplifyLeaf(p: Predicate, schema: []const Column, stats: []const exec.ColSta
 /// a wrong guess costs nothing but a suboptimal evaluation order.
 const ConjunctKey = struct { cost: u8, sel: f64 };
 
-fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.ColStat) ConjunctKey {
+fn conjunctKey(expr: PredicateExpr, cols: *ColumnLookup, stats: []const exec.ColStat) ConjunctKey {
     return switch (expr) {
-        .leaf => |p| leafKey(p, schema, stats),
-        .day_leaf => |p| leafKey(p, schema, stats),
+        .leaf => |p| leafKey(p, cols, stats),
+        .day_leaf => |p| leafKey(p, cols, stats),
         .is_null => .{ .cost = 0, .sel = 0.05 },
         .is_not_null => .{ .cost = 0, .sel = 0.95 },
         .leaf_col_col => .{ .cost = 1, .sel = 0.5 },
-        .in_set => |s| .{ .cost = 1, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
+        .in_set => |s| .{ .cost = 1, .sel = colSelectivity(s.col, cols, stats, @floatFromInt(@max(s.values.len, 1))) },
         .like => .{ .cost = 2, .sel = 0.10 },
         .not => .{ .cost = 2, .sel = 0.5 },
         .text_as_number => .{ .cost = 2, .sel = 0.5 },
-        .text_as_number_set => |s| .{ .cost = 2, .sel = colSelectivity(s.col, schema, stats, @floatFromInt(@max(s.values.len, 1))) },
+        .text_as_number_set => |s| .{ .cost = 2, .sel = colSelectivity(s.col, cols, stats, @floatFromInt(@max(s.values.len, 1))) },
         // Roll a nested group's children up so its real cost/selectivity orders
         // it against its siblings: cost is the costliest child; an AND multiplies
         // pass-fractions, an OR combines them as 1 - ∏(1 - childᵢ).
@@ -1203,7 +1255,7 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
             var cost: u8 = 0;
             var sel: f64 = 1.0;
             for (kids) |k| {
-                const kk = conjunctKey(k, schema, stats);
+                const kk = conjunctKey(k, cols, stats);
                 cost = @max(cost, kk.cost);
                 sel *= kk.sel;
             }
@@ -1213,7 +1265,7 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
             var cost: u8 = 0;
             var none: f64 = 1.0;
             for (kids) |k| {
-                const kk = conjunctKey(k, schema, stats);
+                const kk = conjunctKey(k, cols, stats);
                 cost = @max(cost, kk.cost);
                 none *= 1.0 - kk.sel;
             }
@@ -1226,10 +1278,10 @@ fn conjunctKey(expr: PredicateExpr, schema: []const Column, stats: []const exec.
     };
 }
 
-fn leafKey(p: Predicate, schema: []const Column, stats: []const exec.ColStat) ConjunctKey {
-    const idx = types.findColumn(schema, p.col) orelse return .{ .cost = 1, .sel = 0.5 };
+fn leafKey(p: Predicate, cols: *ColumnLookup, stats: []const exec.ColStat) ConjunctKey {
+    const idx = cols.find(p.col) orelse return .{ .cost = 1, .sel = 0.5 };
     // int/date/bool/decimal compares are a cheap SIMD pass; string is memcmp.
-    const cost: u8 = if (predicate.typeHasRange(schema[idx].type)) 0 else 1;
+    const cost: u8 = if (predicate.typeHasRange(cols.schema[idx].type)) 0 else 1;
     const ndv: f64 = if (idx < stats.len) switch (stats[idx].ndv) {
         .exact => |n| @floatFromInt(@max(n, 1)),
         .unknown => 0,
@@ -1260,8 +1312,8 @@ fn rangeSelectivity(p: Predicate, stats: []const exec.ColStat, idx: usize) f64 {
     };
 }
 
-fn colSelectivity(col: []const u8, schema: []const Column, stats: []const exec.ColStat, k: f64) f64 {
-    const idx = types.findColumn(schema, col) orelse return 0.5;
+fn colSelectivity(col: []const u8, cols: *ColumnLookup, stats: []const exec.ColStat, k: f64) f64 {
+    const idx = cols.find(col) orelse return 0.5;
     if (idx >= stats.len) return 0.5;
     return switch (stats[idx].ndv) {
         .exact => |n| std.math.clamp(k / @as(f64, @floatFromInt(@max(n, 1))), 0.0, 1.0),
@@ -1294,10 +1346,10 @@ const JunctionOrder = enum {
 /// a comparator that computed them made a long IN list (one OR arm per
 /// literal) cost n log n name lookups, and every comparison of the AND
 /// above it walked the whole list again.
-fn sortByKey(allocator: Allocator, items: []PredicateExpr, schema: []const Column, stats: []const exec.ColStat, order: JunctionOrder) !void {
+fn sortByKey(allocator: Allocator, items: []PredicateExpr, cols: *ColumnLookup, stats: []const exec.ColStat, order: JunctionOrder) !void {
     const keyed = try allocator.alloc(KeyedPredicate, items.len);
     defer allocator.free(keyed);
-    for (items, keyed) |expr, *k| k.* = .{ .key = conjunctKey(expr, schema, stats), .expr = expr };
+    for (items, keyed) |expr, *k| k.* = .{ .key = conjunctKey(expr, cols, stats), .expr = expr };
     std.mem.sort(KeyedPredicate, keyed, order, JunctionOrder.lessThan);
     for (items, keyed) |*expr, k| expr.* = k.expr;
 }

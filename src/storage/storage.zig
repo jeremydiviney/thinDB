@@ -1027,6 +1027,18 @@ test "dict block stores a lexicographically sorted dictionary" {
     }
 }
 
+test "DictBlock.rowCode reads each writer code width little-endian" {
+    const cases = .{
+        .{ .width = 1, .codes = &[_]u8{ 7, 0, 255 }, .want = &[_]u32{ 7, 0, 255 } },
+        .{ .width = 2, .codes = &[_]u8{ 0x34, 0x12, 0xff, 0xff, 0, 1 }, .want = &[_]u32{ 0x1234, 0xffff, 0x100 } },
+        .{ .width = 4, .codes = &[_]u8{ 0x78, 0x56, 0x34, 0x12, 1, 0, 1, 0 }, .want = &[_]u32{ 0x12345678, 0x10001 } },
+    };
+    inline for (cases) |c| {
+        const db: segment_reader.DictBlock = .{ .ndv = 0, .code_width = c.width, .offsets_region = &.{}, .dict_bytes = &.{}, .codes = c.codes };
+        for (c.want, 0..) |want, row| try std.testing.expectEqual(want, db.rowCode(row));
+    }
+}
+
 test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode to" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
