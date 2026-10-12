@@ -16,14 +16,19 @@
 //! backing allocator already pools those cheaply); larger ones are too rare and
 //! big to retain. The free-list decision uses the same `(len, alignment)`
 //! predicate on alloc and free, so a block is always classified identically both
-//! ways. Retained bytes are capped; frees past the cap evict to the backing
-//! allocator instead of retaining. Idle blocks also go back on request
-//! (`reclaim`): the shared memory budget asks when live queries need the room.
+//! ways. Retained bytes are capped. A free past the cap first evicts idle
+//! blocks of classes allocated from less recently than its own, so the retained
+//! set follows the current workload: a pool left full of one query's classes
+//! would otherwise mint and evict every block of the next query that uses
+//! different sizes. Only when no staler class can make room does the freed
+//! block itself go back. Idle blocks also go back on request (`reclaim`): the
+//! shared memory budget asks when live queries need the room.
 //!
 //! Thread-safety: workers allocate concurrently, so each size class carries its
 //! own spinlock (distinct sizes rarely contend). The pool is a process
-//! singleton wrapping `c_allocator`, mirroring util/core_scheduler.zig and the
-//! huge-page slab pool — a machine resource shared by every query.
+//! singleton, mirroring util/core_scheduler.zig and the huge-page slab pool — a
+//! machine resource shared by every query. Bypassed requests go to
+//! `c_allocator`; class blocks are minted from `mint_allocator`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -62,13 +67,25 @@ const Class = struct {
     lock: SpinLock = .{},
     head: ?*FreeNode = null,
     count: usize = 0,
+    /// Pool clock reading at this class's latest allocation; orders the
+    /// classes for eviction when a free finds the pool at its cap.
+    last_use: std.atomic.Value(u64) = .{ .raw = 0 },
+};
+
+const IdleChain = struct {
+    head: ?*FreeNode,
+    taken: usize,
 };
 
 pub const Pool = struct {
     backing: Allocator,
+    /// Source of class-sized blocks; `backing` serves the requests that
+    /// bypass the pool.
+    mint: Allocator,
     classes: [class_count]Class = [_]Class{.{}} ** class_count,
     retained_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
     cap_bytes: usize,
+    clock: std.atomic.Value(u64) = .{ .raw = 0 },
     hits: std.atomic.Value(usize) = .{ .raw = 0 },
     misses: std.atomic.Value(usize) = .{ .raw = 0 },
     minted_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
@@ -76,30 +93,53 @@ pub const Pool = struct {
     evicted_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
 
     pub fn init(backing: Allocator, cap_bytes: usize) Pool {
-        return .{ .backing = backing, .cap_bytes = cap_bytes };
+        return .{ .backing = backing, .mint = backing, .cap_bytes = cap_bytes };
     }
 
-    /// Drain every retained block back to the backing allocator. For shutdown
+    /// Drain every retained block back to the mint allocator. For shutdown
     /// and tests; never on the query path.
     pub fn drain(self: *Pool) void {
-        for (&self.classes, 0..) |*cls, i| {
-            const sz = @as(usize, 1) << @intCast(min_log2 + i);
-            cls.lock.lock();
-            var node = cls.head;
-            while (node) |n| {
-                const next = n.next;
-                const buf: [*]u8 = @ptrCast(n);
-                self.backing.rawFree(buf[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), @returnAddress());
-                node = next;
-            }
-            cls.head = null;
-            cls.count = 0;
-            cls.lock.unlock();
+        for (0..class_count) |idx| {
+            const chain = self.takeIdle(idx, std.math.maxInt(usize));
+            self.releaseChain(chain, classSize(idx));
         }
-        self.retained_bytes.store(0, .monotonic);
     }
 
-    /// Hand idle blocks back to the backing allocator until `want` bytes are
+    /// Unlink up to `limit` idle blocks of class `idx`; the caller releases
+    /// them with `releaseChain` outside the class lock.
+    fn takeIdle(self: *Pool, idx: usize, limit: usize) IdleChain {
+        const cls = &self.classes[idx];
+        cls.lock.lock();
+        const chain = cls.head;
+        var taken: usize = 0;
+        var last: ?*FreeNode = null;
+        var node = chain;
+        while (node) |n| {
+            if (taken == limit) break;
+            last = n;
+            node = n.next;
+            taken += 1;
+        }
+        cls.head = node;
+        cls.count -= taken;
+        cls.lock.unlock();
+        if (last) |l| l.next = null;
+        _ = self.retained_bytes.fetchSub(taken * classSize(idx), .monotonic);
+        return .{ .head = if (taken == 0) null else chain, .taken = taken };
+    }
+
+    fn releaseChain(self: *Pool, chain: IdleChain, sz: usize) void {
+        var freeing = chain.head;
+        var left = chain.taken;
+        while (left > 0) : (left -= 1) {
+            const n = freeing.?;
+            freeing = n.next;
+            const buf: [*]u8 = @ptrCast(n);
+            self.mint.rawFree(buf[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), @returnAddress());
+        }
+    }
+
+    /// Hand idle blocks back to the mint allocator until `want` bytes are
     /// gone or the free lists are empty; returns the bytes released. Largest
     /// classes go first: they are the blocks a general allocator maps one by
     /// one, so freeing them returns memory to the OS, where a small block
@@ -110,38 +150,44 @@ pub const Pool = struct {
         var idx: usize = class_count;
         while (idx > 0 and released < want) {
             idx -= 1;
-            const sz = classSize(idx);
-            const cls = &self.classes[idx];
-            const limit = ((want - released) +| (sz - 1)) / sz;
-            cls.lock.lock();
-            const chain = cls.head;
-            var taken: usize = 0;
-            var last: ?*FreeNode = null;
-            var node = chain;
-            while (node) |n| {
-                if (taken == limit) break;
-                last = n;
-                node = n.next;
-                taken += 1;
-            }
-            cls.head = node;
-            cls.count -= taken;
-            cls.lock.unlock();
-            if (last) |l| l.next = null;
-            _ = self.retained_bytes.fetchSub(taken * sz, .monotonic);
-            _ = self.evictions.fetchAdd(taken, .monotonic);
-            _ = self.evicted_bytes.fetchAdd(taken * sz, .monotonic);
-            var freeing = chain;
-            var left = taken;
-            while (left > 0) : (left -= 1) {
-                const n = freeing.?;
-                freeing = n.next;
-                const buf: [*]u8 = @ptrCast(n);
-                self.backing.rawFree(buf[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), @returnAddress());
-            }
-            released += taken * sz;
+            released += self.evictIdle(idx, want - released);
         }
         return released;
+    }
+
+    fn evictIdle(self: *Pool, idx: usize, want: usize) usize {
+        const sz = classSize(idx);
+        const chain = self.takeIdle(idx, (want +| (sz - 1)) / sz);
+        _ = self.evictions.fetchAdd(chain.taken, .monotonic);
+        _ = self.evicted_bytes.fetchAdd(chain.taken * sz, .monotonic);
+        self.releaseChain(chain, sz);
+        return chain.taken * sz;
+    }
+
+    /// Frees `want` idle bytes from classes allocated from less recently than
+    /// class `keep`, least recent first, so a pool at its cap follows the
+    /// classes the current workload uses. False when those classes hold too
+    /// little; the caller then evicts the block it was freeing.
+    fn evictStaleClasses(self: *Pool, keep: usize, want: usize) bool {
+        const keep_use = self.classes[keep].last_use.load(.monotonic);
+        var tried = std.StaticBitSet(class_count).initEmpty();
+        var released: usize = 0;
+        while (released < want) {
+            var victim: ?usize = null;
+            var oldest: u64 = keep_use;
+            for (&self.classes, 0..) |*cls, idx| {
+                if (idx == keep or tried.isSet(idx)) continue;
+                const use = cls.last_use.load(.monotonic);
+                if (use < oldest) {
+                    oldest = use;
+                    victim = idx;
+                }
+            }
+            const idx = victim orelse return false;
+            tried.set(idx);
+            released += self.evictIdle(idx, want - released);
+        }
+        return true;
     }
 
     pub fn allocator(self: *Pool) Allocator {
@@ -199,6 +245,7 @@ pub const Pool = struct {
         const idx = classOf(len, alignment) orelse
             return self.backing.rawAlloc(len, alignment, ret_addr);
         const cls = &self.classes[idx];
+        cls.last_use.store(self.clock.fetchAdd(1, .monotonic) + 1, .monotonic);
         cls.lock.lock();
         if (cls.head) |n| {
             cls.head = n.next;
@@ -209,10 +256,10 @@ pub const Pool = struct {
             return @ptrCast(n);
         }
         cls.lock.unlock();
-        // Miss: mint a fresh, over-aligned, class-sized block from the backing.
+        // Miss: mint a fresh, over-aligned, class-sized block.
         _ = self.misses.fetchAdd(1, .monotonic);
         _ = self.minted_bytes.fetchAdd(classSize(idx), .monotonic);
-        return self.backing.rawAlloc(classSize(idx), .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
+        return self.mint.rawAlloc(classSize(idx), .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
     }
 
     fn freeImpl(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
@@ -223,11 +270,13 @@ pub const Pool = struct {
         // Retain unless it would push us past the cap — then evict (the block was
         // minted class-sized + max-aligned, so free it exactly that way).
         const prior = self.retained_bytes.load(.monotonic);
-        if (prior + sz > self.cap_bytes) {
+        if (prior + sz > self.cap_bytes and
+            !self.evictStaleClasses(idx, prior + sz - self.cap_bytes))
+        {
             _ = self.evictions.fetchAdd(1, .monotonic);
             _ = self.evicted_bytes.fetchAdd(sz, .monotonic);
             const base: [*]u8 = buf.ptr;
-            return self.backing.rawFree(base[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
+            return self.mint.rawFree(base[0..sz], .fromByteUnits(@as(usize, 1) << max_align_log2), ret_addr);
         }
         // Counted before it is listed: a block another thread pops the moment
         // it is listed is subtracted straight away, and a count that ran
@@ -285,6 +334,14 @@ var g_ready = std.atomic.Value(bool).init(false);
 /// ~3 GiB steady state; a 1 GiB cap minted and evicted ~6 GiB per query
 /// (page faults + release ≈ 130 ms), 4 GiB and 8 GiB evicted nothing.
 const default_cap_bytes: usize = 1 << 30;
+
+/// Where the global pool mints its blocks. The Windows process heap serves
+/// blocks this size from shared segments under one lock and decommits them on
+/// free, so 12 workers minting and evicting 256 KiB blocks serialize on it:
+/// ClickBench Q33 with its blocks evicted ran 2.6-3.6 s per run off the heap
+/// against 1.0-1.2 s off VirtualAlloc. glibc serves the same sizes from
+/// per-thread arenas.
+const mint_allocator: Allocator = if (builtin.os.tag == .windows) std.heap.page_allocator else std.heap.c_allocator;
 const min_cap_bytes: usize = 64 << 20;
 const max_cap_bytes: usize = 8 << 30;
 
@@ -308,7 +365,11 @@ pub fn global() *Pool {
         g_init.lock();
         defer g_init.unlock();
         if (g_pool == null) {
-            g_pool = Pool.init(std.heap.c_allocator, capFromEnv() orelse defaultCapFor(affinity.totalMemoryBytes()));
+            g_pool = .{
+                .backing = std.heap.c_allocator,
+                .mint = mint_allocator,
+                .cap_bytes = capFromEnv() orelse defaultCapFor(affinity.totalMemoryBytes()),
+            };
             g_ready.store(true, .release);
         }
     }
@@ -395,6 +456,37 @@ test "retention cap evicts instead of growing without bound" {
     const b = try a.alloc(u8, 100 * 1024);
     a.free(b);
     try std.testing.expectEqual(@as(usize, 0), pool.retained_bytes.load(.monotonic));
+}
+
+test "a free at the cap evicts idle blocks of a staler class, never a more recent one" {
+    const kib: usize = 1024;
+    var pool = Pool.init(std.testing.allocator, 192 * kib);
+    defer pool.drain();
+    const a = pool.allocator();
+    const large_idx = 17 - min_log2;
+    const small_idx = 16 - min_log2;
+
+    const stale = try a.alloc(u8, 128 * kib);
+    const s1 = try a.alloc(u8, 64 * kib);
+    const s2 = try a.alloc(u8, 64 * kib);
+    a.free(stale);
+    a.free(s1);
+    a.free(s2);
+    try std.testing.expectEqual(@as(usize, 0), pool.classes[large_idx].count);
+    try std.testing.expectEqual(@as(usize, 2), pool.classes[small_idx].count);
+    try std.testing.expectEqual(128 * kib, pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), pool.evictions.load(.monotonic));
+
+    const large = try a.alloc(u8, 128 * kib);
+    const t1 = try a.alloc(u8, 64 * kib);
+    const t2 = try a.alloc(u8, 64 * kib);
+    a.free(t1);
+    a.free(t2);
+    a.free(large);
+    try std.testing.expectEqual(@as(usize, 0), pool.classes[large_idx].count);
+    try std.testing.expectEqual(@as(usize, 2), pool.classes[small_idx].count);
+    try std.testing.expectEqual(128 * kib, pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), pool.evictions.load(.monotonic));
 }
 
 test "reclaim releases the largest idle blocks first and stops once the request is covered" {
