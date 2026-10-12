@@ -109,5 +109,6 @@ test "tcp no delay is enabled on an accepted socket" {
     var value: c_int = 0;
     var length: c_uint = @sizeOf(c_int);
     try std.testing.expectEqual(@as(c_int, 0), libc.getsockopt(accepted.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &value, &length));
-    try std.testing.expectEqual(@as(c_int, 1), value);
+    // Darwin reports an enabled flag as the option's bit (TCP_NODELAY = 4), Linux as 1.
+    try std.testing.expect(value != 0);
 }
