@@ -25,16 +25,21 @@
 //! class's partial list. A larger block gets a region of its own, rounded up to
 //! a huge page.
 //!
-//! The footprint follows the live set rather than its high-water mark, because
-//! `capacity_bytes` only bounds live cells:
+//! The footprint is bounded by the cache's capacity, not by the high-water mark
+//! of every size class the workload touched, because `capacity_bytes` only
+//! bounds live cells:
 //!   - A slab whose last cell is freed (or a big block's region) moves to a
 //!     spare reserve that any class needing a region of that length reuses, so
-//!     blocks of columns the workload moved away from don't pin memory once
-//!     LRU evicts them. The reserve absorbs evict/insert churn without OS
-//!     calls; past `spare_limit` its oldest regions are unmapped.
-//!   - Mapped bytes never exceed `map_limit`. A request that would cross it
-//!     (heavy fragmentation, or pinned blocks holding the cache over capacity)
-//!     is served by the backing allocator and freed back there.
+//!     blocks of columns the workload moved away from don't pin their class's
+//!     memory once LRU evicts them. The reserve absorbs evict/insert churn
+//!     without OS calls (a scan larger than the cache evicts and refills on
+//!     every miss, and remapping a locked region costs more than decoding the
+//!     block); its oldest regions are unmapped only when a new mapping would
+//!     cross `map_limit`.
+//!   - Mapped bytes never exceed `map_limit`, a quarter over the capacity. A
+//!     request that would cross it with no spare left to unmap (heavy
+//!     fragmentation, or pinned blocks holding the cache over capacity) is
+//!     served by the backing allocator and freed back there.
 //! Sub-MIN_BLOCK requests (entry-metadata-sized buffers never reach here, but
 //! headers/odd sizes might) fall through to the backing allocator unchanged.
 //!
@@ -153,18 +158,13 @@ pub const Pool = struct {
     spare: std.ArrayListUnmanaged(*Region) = .empty,
     spare_bytes: usize = 0,
     mapped_bytes: usize = 0,
-    spare_limit: usize,
     map_limit: usize,
 
     /// `capacity` is the cache's live-byte budget. The pool may map up to a
-    /// quarter more for partially filled slabs, plus the spare reserve.
+    /// quarter more for partially filled slabs and the spare reserve, and at
+    /// least one full slab.
     pub fn init(backing: Allocator, capacity: usize) Pool {
-        const spare_limit = std.math.clamp(capacity / 16, SLAB_BYTES, 4 * SLAB_BYTES);
-        return .{
-            .backing = backing,
-            .spare_limit = spare_limit,
-            .map_limit = capacity +| capacity / 4 +| spare_limit,
-        };
+        return .{ .backing = backing, .map_limit = @max(capacity +| capacity / 4, SLAB_BYTES) };
     }
 
     pub fn deinit(self: *Pool) void {
@@ -311,8 +311,7 @@ pub const Pool = struct {
         slab.in_partial = false;
     }
 
-    /// Move an empty region to the spare reserve, unmapping the oldest spares
-    /// once the reserve outgrows `spare_limit`.
+    /// Move an empty region to the spare reserve.
     fn retire(self: *Pool, region: *Region) void {
         region.* = .{ .base = region.base, .len = region.len, .huge = region.huge };
         self.spare.append(self.backing, region) catch {
@@ -320,7 +319,6 @@ pub const Pool = struct {
             return;
         };
         self.spare_bytes += region.len;
-        while (self.spare_bytes > self.spare_limit) self.unmapRegion(self.popOldestSpare());
     }
 
     fn popOldestSpare(self: *Pool) *Region {
@@ -329,11 +327,14 @@ pub const Pool = struct {
         return r;
     }
 
-    /// An empty region of exactly `len`: a spare one when the reserve has it,
-    /// else a fresh mapping, unmapping spares first if that would cross
-    /// `map_limit`.
+    /// An empty region of exactly `len`: the newest spare one when the reserve
+    /// has it (leaving the oldest to unmap), else a fresh mapping, unmapping
+    /// spares first if that would cross `map_limit`.
     fn takeRegion(self: *Pool, len: usize) ?*Region {
-        for (self.spare.items, 0..) |r, i| {
+        var i = self.spare.items.len;
+        while (i > 0) {
+            i -= 1;
+            const r = self.spare.items[i];
             if (r.len != len) continue;
             _ = self.spare.orderedRemove(i);
             self.spare_bytes -= len;
@@ -655,19 +656,30 @@ test "a big block's region is reused by a block rounding to the same length" {
     try std.testing.expectEqual(@as(usize, 6 << 20), pool.mapped_bytes);
 }
 
-test "the spare reserve stays under its limit" {
-    var pool = Pool.init(std.testing.allocator, 256 << 20);
+test "spares stay mapped until a new mapping needs their room" {
+    var pool = Pool.init(std.testing.allocator, 0);
     defer pool.deinit();
     const a = pool.allocator();
+    try std.testing.expectEqual(@as(usize, 32 << 20), pool.map_limit);
 
     // Each 5 MiB block gets a 6 MiB region of its own.
-    var blocks: [10][]align(16) u8 = undefined;
+    var blocks: [5][]align(16) u8 = undefined;
     for (&blocks) |*b| b.* = try a.alignedAlloc(u8, .@"16", 5 << 20);
-    try std.testing.expectEqual(@as(usize, 60 << 20), pool.mapped_bytes);
     for (blocks) |b| a.free(b);
-    try std.testing.expectEqual(@as(usize, 32 << 20), pool.spare_limit);
     try std.testing.expectEqual(@as(usize, 30 << 20), pool.spare_bytes);
     try std.testing.expectEqual(pool.spare_bytes, pool.mapped_bytes);
+
+    // An 8 MiB region fits under the limit only once the oldest spare goes.
+    const wide = try a.alignedAlloc(u8, .@"16", 7 << 20);
+    defer a.free(wide);
+    try std.testing.expectEqual(@as(usize, 32 << 20), pool.mapped_bytes);
+    try std.testing.expectEqual(@as(usize, 24 << 20), pool.spare_bytes);
+
+    // A 6 MiB request takes the newest spare.
+    const again = try a.alignedAlloc(u8, .@"16", 5 << 20);
+    defer a.free(again);
+    try std.testing.expectEqual(blocks[4].ptr, again.ptr);
+    try std.testing.expectEqual(@as(usize, 18 << 20), pool.spare_bytes);
 }
 
 test "mapping stops at the map limit and the backing allocator serves the rest" {
