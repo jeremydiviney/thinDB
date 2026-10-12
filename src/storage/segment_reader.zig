@@ -1200,12 +1200,20 @@ pub const DictBlock = struct {
         return self.dict_bytes[a..b];
     }
 
-    /// Per-row code (little-endian, `code_width` bytes).
+    /// Per-row code (little-endian, `code_width` bytes). Fixed-width reads per
+    /// writer width: a runtime-length copy compiles to a memcpy call per row.
     pub fn rowCode(self: DictBlock, row: usize) u32 {
-        var b4: [4]u8 = .{ 0, 0, 0, 0 };
-        const off = row * self.code_width;
-        @memcpy(b4[0..self.code_width], self.codes[off .. off + self.code_width]);
-        return std.mem.readInt(u32, &b4, .little);
+        switch (self.code_width) {
+            1 => return self.codes[row],
+            2 => return std.mem.readInt(u16, self.codes[row * 2 ..][0..2], .little),
+            4 => return std.mem.readInt(u32, self.codes[row * 4 ..][0..4], .little),
+            else => {
+                var b4: [4]u8 = .{ 0, 0, 0, 0 };
+                const off = row * self.code_width;
+                @memcpy(b4[0..self.code_width], self.codes[off .. off + self.code_width]);
+                return std.mem.readInt(u32, &b4, .little);
+            },
+        }
     }
 };
 
