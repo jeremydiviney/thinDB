@@ -459,3 +459,216 @@ test "an aggregate reports the same stats after it has emitted" {
     // checking its input's order).
     try std.testing.expectEqualDeep(before, agg.stats().column_stats);
 }
+
+test "batch compound group keys match the per-row builder byte for byte" {
+    const a = std.testing.allocator;
+    const n = 10;
+    // Rows 2, 5 and 9 are NULL in every bitmap-carrying nullable column.
+    const nulls = [_]u8{ 0b1101_1011, 0b0000_0001 };
+    const str: storage.StringView = .{
+        .offsets = &.{ 0, 5, 5, 9, 14, 14, 15, 16, 17, 17, 17 },
+        .bytes = "alphabetagammaxyz",
+    };
+    const nan = std.math.nan(f64);
+    const key_schema = [_]Column{
+        .{ .name = "i", .type = .int },
+        .{ .name = "bi", .type = .bigint, .nullable = true },
+        .{ .name = "s", .type = .string, .nullable = true },
+        .{ .name = "d", .type = .double, .nullable = true },
+        .{ .name = "f", .type = .float },
+        .{ .name = "sm", .type = .smallint },
+        .{ .name = "bo", .type = .boolean, .nullable = true },
+        .{ .name = "ti", .type = .tinyint },
+        .{ .name = "li", .type = .largeint, .nullable = true },
+        .{ .name = "u", .type = .uuid },
+        .{ .name = "dt", .type = .datetime },
+        .{ .name = "dc", .type = .{ .decimal128 = .{ .p = 30, .s = 4 } }, .nullable = true },
+        .{ .name = "vc", .type = .{ .varchar = 16 } },
+        .{ .name = "da", .type = .date, .nullable = true },
+        .{ .name = "d64", .type = .{ .decimal64 = .{ .p = 12, .s = 2 } } },
+        .{ .name = "ch", .type = .{ .char = 8 }, .nullable = true },
+        .{ .name = "js", .type = .json },
+    };
+    const values = [_]ColumnView{
+        .{ .data = .{ .int = &.{ 0, -1, 2, 3, 2147483647, -2147483648, 6, 7, 8, 9 } } },
+        .{ .data = .{ .bigint = &.{ 10, 11, 12, -13, 14, 15, 16, 17, 18, 19 } }, .nulls = &nulls },
+        .{ .data = .{ .string = str }, .nulls = &nulls },
+        .{ .data = .{ .double = &.{ 0.0, -0.0, nan, 1.5, -nan, 2.5, 3.5, -0.0, nan, 4.5 } }, .nulls = &nulls },
+        .{ .data = .{ .float = &.{ -0.0, 0.0, std.math.nan(f32), 1, 2, 3, 4, 5, 6, 7 } } },
+        .{ .data = .{ .smallint = &.{ -32768, 32767, 0, 1, 2, 3, 4, 5, 6, 7 } } },
+        // Nullable in the schema but no bitmap: every row is valid, still tagged.
+        .{ .data = .{ .boolean = &.{ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 } } },
+        .{ .data = .{ .tinyint = &.{ -128, 127, -1, 0, 1, 2, 3, 4, 5, 6 } } },
+        .{ .data = .{ .largeint = &.{ -1, 1, 2, 3, 4, 5, 6, 7, 8, std.math.maxInt(i128) } }, .nulls = &nulls },
+        .{ .data = .{ .uuid = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, std.math.maxInt(u128) } } },
+        .{ .data = .{ .datetime = &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, -9 } } },
+        .{ .data = .{ .decimal128 = &.{ 100, -200, 300, 400, 500, 600, 700, 800, 900, 1000 } }, .nulls = &nulls },
+        .{ .data = .{ .varchar = str } },
+        .{ .data = .{ .date = &.{ 20000, 1, 2, 3, 4, 5, 6, 7, 8, 9 } }, .nulls = &nulls },
+        .{ .data = .{ .decimal64 = &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, -10 } } },
+        .{ .data = .{ .char = str }, .nulls = &nulls },
+        .{ .data = .{ .json = str } },
+    };
+    const batch: Batch = .{ .schema = &key_schema, .values = &values, .row_count = n };
+
+    const key_sets = .{
+        &[_]usize{ 0, 1 },
+        &[_]usize{ 2, 0 },
+        &[_]usize{ 3, 4, 6 },
+        &[_]usize{ 12, 2, 15, 16 },
+        &[_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 },
+    };
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(a);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(a);
+    var spans: std.ArrayListUnmanaged([2]u32) = .empty;
+    defer spans.deinit(a);
+    inline for (key_sets) |cols| {
+        expected.clearRetainingCapacity();
+        var starts: [n + 1]u32 = undefined;
+        for (0..n) |r| {
+            starts[r] = @intCast(expected.items.len);
+            try exec.aggregate_op.buildCompoundGroupKey(a, &expected, batch, cols, @intCast(r));
+        }
+        starts[n] = @intCast(expected.items.len);
+
+        try exec.aggregate_op.buildCompoundGroupKeys(a, &blob, &spans, batch, cols);
+        try std.testing.expectEqualSlices(u8, expected.items, blob.items);
+        try std.testing.expectEqual(n, spans.items.len);
+        for (spans.items, 0..) |sp, r| {
+            try std.testing.expectEqual(starts[r], sp[0]);
+            try std.testing.expectEqual(starts[r + 1] - starts[r], sp[1]);
+        }
+    }
+
+    const empty: Batch = .{ .schema = &key_schema, .values = &values, .row_count = 0 };
+    try exec.aggregate_op.buildCompoundGroupKeys(a, &blob, &spans, empty, &.{ 0, 2 });
+    try std.testing.expectEqual(0, blob.items.len);
+    try std.testing.expectEqual(0, spans.items.len);
+}
+
+const wide_schema = [_]Column{
+    .{ .name = "g", .type = .int, .nullable = false },
+    .{ .name = "h", .type = .int, .nullable = false },
+    .{ .name = "s", .type = .string, .nullable = false },
+    .{ .name = "v", .type = .bigint, .nullable = false },
+};
+
+/// Emits `rows` rows as one batch, row `i` in group `i % groups`: `g` is the
+/// group number, `h` and `s` are derived from it, so any subset of the three
+/// keys yields exactly `groups` groups.
+const WideBatchSource = struct {
+    allocator: std.mem.Allocator,
+    rows: usize,
+    groups: usize,
+    scratch: [wide_schema.len]ColumnStore,
+    views: [wide_schema.len]ColumnView = undefined,
+    done: bool = false,
+
+    fn init(a: std.mem.Allocator, rows: usize, groups: usize) !WideBatchSource {
+        var self = WideBatchSource{ .allocator = a, .rows = rows, .groups = groups, .scratch = undefined };
+        var inited: usize = 0;
+        errdefer for (self.scratch[0..inited]) |*c| c.deinit(a);
+        for (&self.scratch, wide_schema) |*c, col| {
+            c.* = try ColumnStore.init(a, col.type, col.nullable);
+            inited += 1;
+        }
+        return self;
+    }
+
+    pub fn next(self: *WideBatchSource) !?Batch {
+        if (self.done) return null;
+        self.done = true;
+        var buf: [16]u8 = undefined;
+        for (0..self.rows) |i| {
+            const g = i % self.groups;
+            try self.scratch[0].data.int.append(self.allocator, @intCast(g));
+            try self.scratch[1].data.int.append(self.allocator, @intCast(g * 7 + 1));
+            try self.scratch[2].data.string.appendValue(self.allocator, try std.fmt.bufPrint(&buf, "k{d}", .{g}));
+            try self.scratch[3].data.bigint.append(self.allocator, @intCast(i));
+        }
+        for (&self.scratch, &self.views) |*c, *v| v.* = c.view();
+        return .{ .schema = wide_schema[0..], .values = self.views[0..], .row_count = self.rows };
+    }
+
+    pub fn deinit(self: *WideBatchSource) void {
+        for (&self.scratch) |*c| c.deinit(self.allocator);
+    }
+
+    pub fn outputSchema(_: *WideBatchSource) []const Column {
+        return wide_schema[0..];
+    }
+
+    pub fn addPrune(_: *WideBatchSource, _: exec.Predicate) !void {}
+
+    pub fn stats(self: *WideBatchSource) exec.PipelineStats {
+        return .{ .upper_rows = self.rows };
+    }
+
+    pub fn accountant(_: *WideBatchSource) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(_: *WideBatchSource, _: *std.ArrayList(u8), _: std.mem.Allocator, _: usize) !void {}
+};
+
+/// Groups `rows` rows of `groups` groups, delivered as a single batch, by
+/// `keys`; checks every group's COUNT(*) and SUM(v) and returns the
+/// aggregate's accounted peak.
+fn wideBatchPeak(a: std.mem.Allocator, rows: usize, groups: usize, keys: []const []const u8) !usize {
+    const account = try a.create(exec.memory.MemoryAccountant);
+    account.* = exec.memory.MemoryAccountant.initWithPool(1 << 40, null);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const tracked = try account.executionAllocator();
+
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .sum, .col = "v", .as = "total" },
+    };
+    var src = try WideBatchSource.init(a, rows, groups);
+    const q = exec.makeQuery(tracked, &src);
+    var agg = q.groupBy(keys, &aggs) catch |e| {
+        src.deinit();
+        return e;
+    };
+    defer agg.deinit();
+
+    const seen = try a.alloc(bool, groups);
+    defer a.free(seen);
+    @memset(seen, false);
+    var n_seen: usize = 0;
+    while (try agg.next()) |b| {
+        for (0..b.row_count) |r| {
+            const g: usize = if (std.mem.eql(u8, keys[0], "s"))
+                try std.fmt.parseInt(usize, b.values[0].data.string.rowBytes(r)[1..], 10)
+            else
+                @intCast(b.values[0].data.int[r]);
+            try std.testing.expect(!seen[g]);
+            seen[g] = true;
+            n_seen += 1;
+            const members = (rows - g + groups - 1) / groups;
+            try std.testing.expectEqual(@as(i64, @intCast(members)), b.values[keys.len].data.bigint[r]);
+            const sum = members * g + groups * members * (members - 1) / 2;
+            try std.testing.expectEqual(@as(i64, @intCast(sum)), b.values[keys.len + 1].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqual(groups, n_seen);
+    return account.peak_bytes;
+}
+
+test "group tables grow with the groups, not with the batch" {
+    const a = std.testing.allocator;
+    const key_sets = .{ &[_][]const u8{"s"}, &[_][]const u8{ "g", "s" }, &[_][]const u8{ "g", "h" } };
+    inline for (key_sets) |keys| {
+        // Many groups in one batch: the table grows part-way through it.
+        _ = try wideBatchPeak(a, 1 << 16, 40_000, keys);
+        // The batch's own scratch costs 30-70 bytes a row; a table sized for
+        // every row of the batch would add about 84 more (its slots plus the
+        // key array kept at the table's capacity).
+        const small = try wideBatchPeak(a, 12_500, 37, keys);
+        const large = try wideBatchPeak(a, 50_000, 37, keys);
+        try std.testing.expect(large - small < 96 * (50_000 - 12_500));
+    }
+}

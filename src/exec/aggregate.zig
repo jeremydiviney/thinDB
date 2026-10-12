@@ -2345,26 +2345,37 @@ pub const Aggregate = struct {
         if (self.overflow_gid) |g| return g;
         const g = self.n_groups;
         self.n_groups += 1;
-        if (int_path) self.gkeys_int.appendAssumeCapacity(0) else try self.gkeys.append(self.allocator, &.{});
+        if (int_path) try self.gkeys_int.append(self.allocator, 0) else try self.gkeys.append(self.allocator, &.{});
         try self.initGroupCells(g);
         self.overflow_gid = g;
         return g;
+    }
+
+    /// Grow the byte table for one more group and return the empty slot `key`
+    /// now probes to. Growth follows the groups that actually arrive, not the
+    /// batch's row count: sizing for every row of a 64K-row batch built a
+    /// 128K-slot table (plus a matching key array) per worker even when it
+    /// held a few hundred groups, and the probes then missed cache across it.
+    /// A grow mid-batch only stales the look-ahead prefetches already issued.
+    fn growByteTableFor(self: *Aggregate, hash: u64, key: []const u8) !usize {
+        try self.byte_table.grow(self.allocator, 1);
+        // Couple the key array to the table's capacity so the per-group
+        // appends run amortized-free as groups fill toward the ceiling.
+        self.gkeys.ensureTotalCapacityPrecise(self.allocator, self.byte_table.slots.len) catch {};
+        return self.byte_table.getOrPut(hash, key, self.gkeys.items).slot;
+    }
+
+    /// `growByteTableFor` for the packed-integer tables.
+    fn growIntTableFor(self: *Aggregate, comptime Table: type, table: *Table, key: u128) !usize {
+        try table.grow(self.allocator, 1);
+        self.gkeys_int.ensureTotalCapacityPrecise(self.allocator, table.slots.len) catch {};
+        return table.getOrPut(Table.hashKey(key), key).slot;
     }
 
     fn accumulateBatchIntT(self: *Aggregate, batch: Batch, comptime Table: type, table: *Table) !void {
         const n = batch.row_count;
         const ta = self.allocator;
         const layout = self.int_layout.?;
-
-        if (table.needsGrow(n)) {
-            try table.grow(ta, n);
-            // Couple the key array to the table's new capacity so the
-            // new-group appends below run with no per-group reallocation.
-            self.gkeys_int.ensureTotalCapacityPrecise(ta, table.slots.len) catch {};
-        }
-        // Every row could be a new group; reserve the key array for the worst
-        // case up front so the per-row new-group appends below are bounds-free.
-        try self.gkeys_int.ensureUnusedCapacity(ta, n);
 
         // Phase (a): pack every row's key, column-major — the per-column ValueView
         // type switch runs once per group column per batch (in `orKeyColumn`)
@@ -2393,12 +2404,13 @@ pub const Aggregate = struct {
             const gid = if (probe.found) probe.gid else if (self.cap_groups and self.n_groups >= self.emit_limit.?)
                 try self.ensureOverflowGroup(true)
             else blk: {
+                const slot = if (table.needsGrow(1)) try self.growIntTableFor(Table, table, key) else probe.slot;
                 if (acct) |a| try a.reserve(.hash_aggregate, approx_per);
                 self.reserved_bytes += approx_per;
                 const new_gid = self.n_groups;
                 self.n_groups += 1;
-                table.commit(probe.slot, key, new_gid);
-                self.gkeys_int.appendAssumeCapacity(key);
+                table.commit(slot, key, new_gid);
+                try self.gkeys_int.append(ta, key);
                 try self.initGroupCells(new_gid);
                 break :blk new_gid;
             };
@@ -2419,13 +2431,6 @@ pub const Aggregate = struct {
         const n = batch.row_count;
         const ta = self.allocator;
         const aa = self.arena.allocator();
-
-        if (self.byte_table.needsGrow(n)) {
-            try self.byte_table.grow(ta, n);
-            // Couple the key array to the table's new capacity so the per-group
-            // appends below run amortized-free as groups fill toward the ceiling.
-            self.gkeys.ensureTotalCapacityPrecise(ta, self.byte_table.slots.len) catch {};
-        }
 
         // Single string key: the key is the row's raw string bytes, already
         // sitting decoded in the batch — no scratch copy / length prefix. Its
@@ -2488,19 +2493,11 @@ pub const Aggregate = struct {
                 self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, key));
             }
         } else {
-            self.pf_key_blob.clearRetainingCapacity();
-            self.pf_key_spans.clearRetainingCapacity();
-            try self.pf_key_spans.ensureTotalCapacity(ta, n);
-            while (row < n) : (row += 1) {
-                const off: u32 = @intCast(self.pf_key_blob.items.len);
-                try buildCompoundGroupKey(self.allocator, &self.pf_key_blob, batch, self.group_col_indices, row);
-                const len: u32 = @intCast(self.pf_key_blob.items.len - off);
-                self.pf_key_spans.appendAssumeCapacity(.{ off, len });
-                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, self.pf_key_blob.items[off..]));
-            }
-            // Blob is stable now → resolve each row's key slice into it.
+            try buildCompoundGroupKeys(ta, &self.pf_key_blob, &self.pf_key_spans, batch, self.group_col_indices);
             for (self.pf_key_spans.items) |sp| {
-                self.pf_keys.appendAssumeCapacity(self.pf_key_blob.items[sp[0] .. sp[0] + sp[1]]);
+                const key = self.pf_key_blob.items[sp[0] .. sp[0] + sp[1]];
+                self.pf_keys.appendAssumeCapacity(key);
+                self.pf_hashes.appendAssumeCapacity(std.hash.Wyhash.hash(0, key));
             }
         }
         const keys = self.pf_keys.items;
@@ -2523,12 +2520,13 @@ pub const Aggregate = struct {
             const gid = if (probe.found) probe.gid else if (self.cap_groups and self.n_groups >= self.emit_limit.?)
                 try self.ensureOverflowGroup(false)
             else blk: {
+                const slot = if (self.byte_table.needsGrow(1)) try self.growByteTableFor(h, key) else probe.slot;
                 const approx = key.len + self.aggs.len * @sizeOf(AccState) + 32;
                 if (acct) |a| try a.reserve(.hash_aggregate, approx);
                 self.reserved_bytes += approx;
                 const new_gid = self.n_groups;
                 self.n_groups += 1;
-                self.byte_table.commit(probe.slot, h, new_gid);
+                self.byte_table.commit(slot, h, new_gid);
                 // `key` borrows transient storage — the batch (single-string) or
                 // the reused per-batch blob (compound) — so a new group dups it
                 // into the arena to survive past this batch. Only new groups pay
@@ -4858,7 +4856,7 @@ pub fn appendIntGroupKey(
     }
 }
 
-fn buildCompoundGroupKey(
+pub fn buildCompoundGroupKey(
     allocator: Allocator,
     out: *std.ArrayList(u8),
     batch: Batch,
@@ -4937,6 +4935,148 @@ fn buildCompoundGroupKey(
                 try out.appendSlice(allocator, &b);
             },
         }
+    }
+}
+
+/// Batch form of `buildCompoundGroupKey`: serializes every row's key into
+/// `blob` and records each row's `{offset, len}` in `spans`, byte-identical to
+/// calling `buildCompoundGroupKey` on rows `0..row_count` in order. A sizing
+/// pass reserves the whole blob once, then each column is written in its own
+/// loop — one type dispatch per column instead of per row × column, and no
+/// per-field capacity checks.
+pub fn buildCompoundGroupKeys(
+    allocator: Allocator,
+    blob: *std.ArrayList(u8),
+    spans: *std.ArrayListUnmanaged([2]u32),
+    batch: Batch,
+    group_col_indices: []const usize,
+) !void {
+    try spans.resize(allocator, batch.row_count);
+    const sp = spans.items;
+
+    var fixed: u32 = 0;
+    for (group_col_indices) |ci| {
+        if (batch.schema[ci].nullable) {
+            fixed += 1;
+        } else if (fixedKeyWidth(batch.values[ci].data)) |w| {
+            fixed += w;
+        }
+    }
+    for (sp) |*s| s[1] = fixed;
+    for (group_col_indices) |ci| {
+        const view = batch.values[ci];
+        const nullable = batch.schema[ci].nullable;
+        switch (view.data) {
+            .varchar, .string, .char, .json => |sv| for (sp, 0..) |*s, r| {
+                if (nullable and !view.isValid(r)) continue;
+                s[1] += 4 + (sv.offsets[r + 1] - sv.offsets[r]);
+            },
+            else => if (nullable) {
+                const w = fixedKeyWidth(view.data).?;
+                for (sp, 0..) |*s, r| {
+                    if (view.isValid(r)) s[1] += w;
+                }
+            },
+        }
+    }
+
+    var total: usize = 0;
+    for (sp) |*s| {
+        s[0] = @intCast(total);
+        total += s[1];
+    }
+    blob.clearRetainingCapacity();
+    try blob.resize(allocator, total);
+    const out = blob.items;
+
+    // Each column's loop leaves `s[0]` just past the field it wrote, so the
+    // offsets double as per-row write cursors and end at `start + len`.
+    for (group_col_indices) |ci| {
+        if (batch.schema[ci].nullable) {
+            writeKeyColumn(true, out, sp, batch.values[ci]);
+        } else {
+            writeKeyColumn(false, out, sp, batch.values[ci]);
+        }
+    }
+    for (sp) |*s| s[0] -= s[1];
+}
+
+fn fixedKeyWidth(data: storage.column.ValueView) ?u32 {
+    return switch (data) {
+        .boolean, .tinyint => 1,
+        .smallint => 2,
+        .int, .date, .float => 4,
+        .bigint, .datetime, .decimal64, .double => 8,
+        .largeint, .decimal128, .uuid => 16,
+        .varchar, .string, .char, .json => null,
+    };
+}
+
+fn writeKeyColumn(comptime nullable: bool, out: []u8, spans: [][2]u32, view: storage.ColumnView) void {
+    switch (view.data) {
+        .int, .date => |s| writeFixedKeys(i32, nullable, out, spans, view, s),
+        .bigint, .datetime, .decimal64 => |s| writeFixedKeys(i64, nullable, out, spans, view, s),
+        .boolean => |s| writeFixedKeys(u8, nullable, out, spans, view, s),
+        .tinyint => |s| writeFixedKeys(i8, nullable, out, spans, view, s),
+        .smallint => |s| writeFixedKeys(i16, nullable, out, spans, view, s),
+        .largeint, .decimal128 => |s| writeFixedKeys(i128, nullable, out, spans, view, s),
+        .uuid => |s| writeFixedKeys(u128, nullable, out, spans, view, s),
+        .float => |s| writeFixedKeys(f32, nullable, out, spans, view, s),
+        .double => |s| writeFixedKeys(f64, nullable, out, spans, view, s),
+        .varchar, .string, .char, .json => |sv| writeStringKeys(nullable, out, spans, view, sv),
+    }
+}
+
+fn writeFixedKeys(
+    comptime T: type,
+    comptime nullable: bool,
+    out: []u8,
+    spans: [][2]u32,
+    view: storage.ColumnView,
+    values: []const T,
+) void {
+    const width = @sizeOf(T);
+    const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+    for (spans, values[0..spans.len], 0..) |*s, v, r| {
+        var c = s[0];
+        if (nullable) {
+            const valid = view.isValid(r);
+            out[c] = @intFromBool(valid);
+            c += 1;
+            if (!valid) {
+                s[0] = c;
+                continue;
+            }
+        }
+        const bits: Bits = if (@typeInfo(T) == .float) @bitCast(types.canonicalFloat(v)) else @bitCast(v);
+        std.mem.writeInt(Bits, out[c..][0..width], bits, .little);
+        s[0] = c + width;
+    }
+}
+
+fn writeStringKeys(
+    comptime nullable: bool,
+    out: []u8,
+    spans: [][2]u32,
+    view: storage.ColumnView,
+    sv: storage.StringView,
+) void {
+    for (spans, 0..) |*s, r| {
+        var c = s[0];
+        if (nullable) {
+            const valid = view.isValid(r);
+            out[c] = @intFromBool(valid);
+            c += 1;
+            if (!valid) {
+                s[0] = c;
+                continue;
+            }
+        }
+        const bytes = sv.rowBytes(r);
+        const len: u32 = @intCast(bytes.len);
+        std.mem.writeInt(u32, out[c..][0..4], len, .little);
+        @memcpy(out[c + 4 ..][0..len], bytes);
+        s[0] = c + 4 + len;
     }
 }
 
