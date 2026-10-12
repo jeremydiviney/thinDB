@@ -1896,3 +1896,77 @@ test "V2 group routes keep HAVING with post-aggregate expressions in any order (
         }
     }
 }
+
+const LC_GROUPS = 37;
+
+/// Peak charged bytes of the lowcard aggregate over scan batches of
+/// `batch_rows`, after checking its per-group COUNT, SUM, MIN and MAX.
+fn lowcardPeak(allocator: std.mem.Allocator, batch_rows: usize) !usize {
+    const rows = 100_000;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .query_memory_budget = 1 << 30,
+        .memory_budget = 1 << 30,
+        .auto_flush_secs = 0,
+        .max_dop = 1,
+    });
+    defer db.close();
+    const t = try db.table("lc", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "g", .type = .int },
+            .{ .name = "v", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"} });
+    const Row = struct { id: i64, g: i32, v: i64 };
+    const batch = try allocator.alloc(Row, rows);
+    defer allocator.free(batch);
+    for (batch, 0..) |*row, i| row.* = .{ .id = @intCast(i), .g = @intCast((i * 7) % LC_GROUPS), .v = @intCast(i) };
+    try t.insert(batch);
+    try t.flush();
+
+    const saved = thindb.exec.scan_sub_batch;
+    defer thindb.exec.scan_sub_batch = saved;
+    thindb.exec.scan_sub_batch = batch_rows;
+    const sql = "SELECT g, COUNT(*) AS n, SUM(v) AS sv, MIN(v) AS mn, MAX(v) AS mx FROM lc GROUP BY g";
+    try std.testing.expect(try planContains(allocator, db, sql, "lowcard"));
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var seen = [_]bool{false} ** LC_GROUPS;
+    while (try q.next()) |out| {
+        for (0..out.row_count) |r| {
+            const g: usize = @intCast(out.values[0].data.int[r]);
+            try std.testing.expect(!seen[g]);
+            seen[g] = true;
+            var n: i64 = 0;
+            var sum: i64 = 0;
+            var min: ?i64 = null;
+            var max: i64 = 0;
+            for (batch) |row| {
+                if (row.g != g) continue;
+                n += 1;
+                sum += row.v;
+                if (min == null) min = row.v;
+                max = row.v;
+            }
+            for ([_]i64{ n, sum, min.?, max }, 1..) |want, ci| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(want)), try cellNumber(out.values[ci], r));
+            }
+        }
+    }
+    for (seen) |s| try std.testing.expect(s);
+    return q.cq.ctx.accountant.?.peak_bytes;
+}
+
+test "V2 lowcard aggregate sizes its state by its groups, not its batch rows" {
+    const allocator = std.testing.allocator;
+    const small = try lowcardPeak(allocator, 4096);
+    const large = try lowcardPeak(allocator, 16384);
+    // The batch's own key and gid scratch costs about 18 bytes a row; a group
+    // table and accumulator arrays reserved for a whole batch of new groups
+    // added about 190 more.
+    try std.testing.expect(large -| small < 64 * (16384 - 4096));
+}

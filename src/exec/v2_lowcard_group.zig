@@ -804,10 +804,6 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
 
-    if (st.table.needsGrow(n)) try st.table.grow(allocator, n);
-    try st.counts.ensureUnusedCapacity(allocator, n);
-    try st.slots.ensureUnusedCapacity(allocator, n * n_aggs);
-    try st.ns.ensureUnusedCapacity(allocator, n * n_aggs);
     try st.keys_scratch.resize(allocator, n);
     try st.gids_scratch.resize(allocator, n);
     const keys = st.keys_scratch.items[0..n];
@@ -828,14 +824,22 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
         const key = keys[r];
         var run_end = r + 1;
         while (run_end < n and keys[run_end] == key) run_end += 1;
-        const probe = st.table.getOrPut(GroupTable.hashKey(key), key);
+        const hash = GroupTable.hashKey(key);
+        const probe = st.table.getOrPut(hash, key);
         var gid: u32 = probe.gid;
         if (!probe.found) {
             gid = @intCast(st.counts.items.len);
-            st.counts.appendAssumeCapacity(0);
-            st.slots.appendNTimesAssumeCapacity(0, n_aggs);
-            st.ns.appendNTimesAssumeCapacity(0, n_aggs);
-            st.table.commit(probe.slot, key, gid);
+            try st.counts.append(allocator, 0);
+            try st.slots.appendNTimes(allocator, 0, n_aggs);
+            try st.ns.appendNTimes(allocator, 0, n_aggs);
+            // Grown on the miss rather than per batch, so a table holding a
+            // few hundred groups never sizes itself for a whole batch of new
+            // ones. A grow only stales the look-ahead prefetches issued.
+            const slot = if (st.table.needsGrow(1)) blk: {
+                try st.table.grow(allocator, 1);
+                break :blk st.table.getOrPut(hash, key).slot;
+            } else probe.slot;
+            st.table.commit(slot, key, gid);
         }
         st.counts.items[gid] += @intCast(run_end - r);
         @memset(gids[r..run_end], gid);
