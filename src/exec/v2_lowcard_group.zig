@@ -646,6 +646,7 @@ const WState = struct {
     // the per-aggregate kernels run over dense arrays instead of re-probing;
     // `codes_scratch` holds a coded input's codes when a batch lacks the sidecar.
     // `valid_scratch` holds each row's validity byte when it rides the high word.
+    // They live on the worker's scratch allocator, the rest on the query's.
     keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
     valid_scratch: std.ArrayListUnmanaged(u8) = .empty,
     gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
@@ -673,16 +674,16 @@ const WState = struct {
         return self;
     }
 
-    fn deinit(self: *WState, allocator: Allocator) void {
+    fn deinit(self: *WState, allocator: Allocator, scratch_allocator: Allocator) void {
         for (self.dsets) |*d| d.deinit(allocator);
         if (self.dsets.len > 0) allocator.free(self.dsets);
         for (self.ssets) |*d| d.deinit(allocator);
         if (self.ssets.len > 0) allocator.free(self.ssets);
         if (self.mgid_of.len > 0) allocator.free(self.mgid_of);
-        self.keys_scratch.deinit(allocator);
-        self.valid_scratch.deinit(allocator);
-        self.gids_scratch.deinit(allocator);
-        self.codes_scratch.deinit(allocator);
+        self.keys_scratch.deinit(scratch_allocator);
+        self.valid_scratch.deinit(scratch_allocator);
+        self.gids_scratch.deinit(scratch_allocator);
+        self.codes_scratch.deinit(scratch_allocator);
         for (&self.key_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
         for (&self.distinct_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
         self.counts.deinit(allocator);
@@ -706,6 +707,8 @@ const Worker = struct {
     resolved_keys: [MAX_KEYS]usize = undefined,
     resolved_aggs: [MAX_AGGS]?usize = undefined,
     allocator: Allocator,
+    // Backs WState's per-batch scratch.
+    scratch_allocator: Allocator,
     seg_start: []const usize,
     segment_count: usize,
     total_rgs: usize,
@@ -773,8 +776,9 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
     }
 }
 
-// OR one key part into every row's packed key, column-wise so each inner loop
-// is monomorphic. A coded part normally reads the scan's code sidecar; a batch
+// Pack one key part into every row's key, column-wise so each inner loop is
+// monomorphic: the first part assigns, so the keys need no zeroing, and the
+// rest OR in. A coded part normally reads the scan's code sidecar; a batch
 // without one (tombstoned row group, memtable rows, a scan that declined
 // coding) interns each row's bytes into the same shared dict instead — slower
 // but identical codes, so any mix of batch kinds groups consistently.
@@ -782,7 +786,7 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
 // A nullable part's NULL rows pack value 0 — the batch value in a NULL slot
 // is an encoding artifact (FOR base, dict entry 0) — and `packValidity` marks
 // the others.
-fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
+fn packKeysForPart(comptime assign: bool, w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
     const p = w.parts[part_i];
     const ci = w.resolved_keys[part_i];
     const shift: u6 = @intCast(p.offset);
@@ -790,7 +794,7 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
         const sidecar: ?exec.CodedColumn = if (batch.coded) |sc| sc[ci] else null;
         if (sidecar) |cc| {
             for (keys, cc.codes[0..keys.len]) |*k, code| {
-                k.* |= @as(u64, code) << shift;
+                putKey(assign, k, @as(u64, code) << shift);
             }
         } else {
             const memo = memoFor(&w.state.key_memos[part_i], w.dicts[part_i].?);
@@ -800,7 +804,7 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
             };
             for (keys, 0..) |*k, r| {
                 const code = try memo.intern(w.allocator, sv.rowBytes(r));
-                k.* |= @as(u64, code) << shift;
+                putKey(assign, k, @as(u64, code) << shift);
             }
         }
         return;
@@ -814,17 +818,21 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
                 for (keys, s[0..keys.len], 0..) |*k, v, r| {
                     const raw: u64 = @bitCast(@as(i64, v));
                     const keep = 0 -% ((bm[r >> 3] >> @intCast(r & 7)) & @as(u64, 1));
-                    k.* |= (truncBits(raw, width) & keep) << shift;
+                    putKey(assign, k, (truncBits(raw, width) & keep) << shift);
                 }
             } else {
                 for (keys, s[0..keys.len]) |*k, v| {
                     const raw: u64 = @bitCast(@as(i64, v));
-                    k.* |= truncBits(raw, width) << shift;
+                    putKey(assign, k, truncBits(raw, width) << shift);
                 }
             }
         },
         else => return error.UnsupportedQueryShape,
     }
+}
+
+inline fn putKey(comptime assign: bool, k: *u64, bits: u64) void {
+    if (assign) k.* = bits else k.* |= bits;
 }
 
 // OR a nullable part's validity bit into every non-NULL row: into the packed
@@ -859,13 +867,13 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
 
-    try st.gids_scratch.resize(allocator, n);
-    try st.keys_scratch.resize(allocator, n);
+    try st.gids_scratch.resize(w.scratch_allocator, n);
+    try st.keys_scratch.resize(w.scratch_allocator, n);
     const gids = st.gids_scratch.items[0..n];
     const keys = st.keys_scratch.items[0..n];
     const wide = w.key_bits > 64;
     if (wide) {
-        try st.valid_scratch.resize(allocator, n);
+        try st.valid_scratch.resize(w.scratch_allocator, n);
         try groupRows(true, w, batch, keys, st.valid_scratch.items[0..n], gids);
     } else {
         try groupRows(false, w, batch, keys, st.valid_scratch.items[0..0], gids);
@@ -914,10 +922,9 @@ fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: 
     const n_aggs = w.aggs.len;
     const n = keys.len;
 
-    @memset(keys, 0);
     if (wide) @memset(valid, 0);
     for (w.parts, 0..) |p, pi| {
-        try packKeysForPart(w, batch, pi, keys);
+        if (pi == 0) try packKeysForPart(true, w, batch, pi, keys) else try packKeysForPart(false, w, batch, pi, keys);
         if (!p.nullable) continue;
         const nulls = batch.values[w.resolved_keys[pi]].nulls;
         if (wide) {
@@ -1180,7 +1187,7 @@ fn foldDistinctCoded(
             .varchar, .string, .char, .json => |s| s,
             else => return error.UnsupportedQueryShape,
         };
-        try w.state.codes_scratch.resize(w.allocator, n);
+        try w.state.codes_scratch.resize(w.scratch_allocator, n);
         const out = w.state.codes_scratch.items[0..n];
         for (out, 0..) |*c, r| {
             c.* = if (view.isValid(r)) try memo.intern(w.allocator, sv.rowBytes(r)) else 0;
@@ -1630,11 +1637,12 @@ const LowCardGroup = struct {
         var built: usize = 0;
         defer for (workers[0..built]) |*w| {
             w.source.deinit();
-            w.state.deinit(allocator);
+            w.state.deinit(allocator, w.scratch_allocator);
         };
 
-        // Worker decode buffers recycle through the process buffer pool rather
-        // than paying page faults and an OS release every query.
+        // Worker decode buffers and per-batch scratch recycle through the
+        // process buffer pool rather than paying page faults and an OS release
+        // every query (about a megabyte of fresh pages per worker otherwise).
         const scan_allocator = try exec.memory.workerAllocatorOf(allocator);
         for (workers, 0..) |*w, i| {
             var source = try openScanSource(
@@ -1663,6 +1671,7 @@ const LowCardGroup = struct {
                 .key_bits = self.key_bits,
                 .dop_parts = n_workers,
                 .allocator = allocator,
+                .scratch_allocator = scan_allocator,
                 .seg_start = seg_start,
                 .segment_count = snap.segment_count,
                 .total_rgs = total_rgs,
