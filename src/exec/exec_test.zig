@@ -1692,6 +1692,86 @@ test "parallel scan: a selective filter drops the chunks it leaves empty" {
     }
 }
 
+/// `id` 0..639 in four flushed segments of ten 16-row row groups, then
+/// 640..679 left in the memtable. `g` is 5 through the first 128 rows and
+/// `id % 10` after, so no zone map on `g` prunes a group.
+fn openClaimTable(allocator: std.mem.Allocator, dir: std.Io.Dir) !*api.Database {
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "g", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, std.testing.io, dir, .{
+        .row_group_size = 16,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    errdefer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
+    const Row = struct { id: i64, g: i64 };
+    var rows: [160]Row = undefined;
+    for (0..5) |seg| {
+        for (&rows, 0..) |*row, i| {
+            const id = seg * rows.len + i;
+            row.* = .{ .id = @intCast(id), .g = if (id < 128) 5 else @intCast(id % 10) };
+        }
+        if (seg == 4) {
+            try t.insert(rows[0..40]);
+            break;
+        }
+        try t.insert(&rows);
+        try t.flush();
+    }
+    return db;
+}
+
+test "parallel scan: a fused partial aggregate's chunks claim each surviving row group once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openClaimTable(allocator, tmp.dir);
+    defer db.close();
+    const t = try db.openTable("t", .{});
+
+    // `id >= 64` prunes the first four row groups; without a filter every
+    // group survives. `g = 5` passes ids 64..127, every tenth id after.
+    const cases = .{
+        .{ .filter = true, .survivors = 36, .counted = 64 + 51 + 4 },
+        .{ .filter = false, .survivors = 40, .counted = 680 },
+    };
+    inline for (cases) |c| {
+        var base = try exec.ParallelScan.create(allocator, t, null, &.{ "id", "g" }, 2);
+        const ps = exec.queryAs(exec.ParallelScan, base).?;
+        var q = if (c.filter) try base.filter(.{ .@"and" = &.{
+            leafExpr("id", .gte, .{ .bigint = 64 }),
+            leafExpr("g", .eq, .{ .bigint = 5 }),
+        } }) else base;
+        defer q.deinit();
+        try std.testing.expect(try q.tryFuseAggregate(&.{"g"}, &.{.{ .func = .count, .col = null, .as = "n" }}));
+        var counted: i64 = 0;
+        while (try q.next()) |b| {
+            for (b.values[1].data.bigint[0..b.row_count]) |n| counted += n;
+        }
+        try std.testing.expectEqual(@as(i64, c.counted), counted);
+
+        // No chunk takes more than an equal share of the survivors, and the
+        // one that claimed the last survivor alone drained the memtable.
+        const share = (c.survivors + ps.workers.len - 1) / ps.workers.len;
+        var scanned: u64 = 0;
+        var memtable_drains: usize = 0;
+        for (ps.workers) |w| {
+            try std.testing.expect(w.segment.rgs_scanned <= share);
+            scanned += w.segment.rgs_scanned;
+            memtable_drains += @intFromBool(w.segment.scan_memtable);
+        }
+        try std.testing.expectEqual(@as(u64, c.survivors), scanned);
+        try std.testing.expectEqual(@as(usize, 1), memtable_drains);
+    }
+}
+
 // A window keeps its input in one block arena per column, so a column holds
 // the buffers it is using and nothing else. A bump arena also kept every
 // buffer the column had outgrown, in nodes larger than the column asked for.

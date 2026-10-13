@@ -49,6 +49,7 @@ const makeQuery = exec.makeQuery;
 const predicate = @import("predicate.zig");
 const scan_mod = @import("scan.zig");
 const Scan = scan_mod.Scan;
+const rg_tiles = @import("rg_tiles.zig");
 
 const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
@@ -964,6 +965,10 @@ pub const ParallelScan = struct {
     /// its rows through instead of aggregating them.
     partial_rows: std.atomic.Value(u64) = .init(0),
     partial_groups: std.atomic.Value(u64) = .init(0),
+    /// The surviving row groups the partial aggregate's chunks claim as they
+    /// drain (`claimChunkRowGroups`), and each chunk scan's claims on them.
+    chunk_claims: ?*rg_tiles.ChunkClaims = null,
+    chunk_feeds: []rg_tiles.ChunkFeed = &.{},
 
     // Fused join probe (set via tryFuseProbe; round mode only): each round
     // worker hands its scanned batch to the sink, which probes the offering
@@ -1433,6 +1438,12 @@ pub const ParallelScan = struct {
         }
         if (self.agg_q.len > 0) self.allocator.free(self.agg_q);
         if (self.pass_plan) |p| self.allocator.free(p);
+        if (self.chunk_claims) |c| {
+            self.allocator.free(c.survivors);
+            self.allocator.free(c.seg_start);
+            self.allocator.destroy(c);
+        }
+        if (self.chunk_feeds.len > 0) self.allocator.free(self.chunk_feeds);
         for (self.compute_q[0..self.compute_built]) |q| {
             var qq = q;
             qq.deinit();
@@ -1962,8 +1973,9 @@ pub const ParallelScan = struct {
     }
 
     fn notePartials(self: *ParallelScan, rows: u64, groups: u64) void {
-        _ = self.partial_groups.fetchAdd(groups, .monotonic);
-        _ = self.partial_rows.fetchAdd(rows, .monotonic);
+        const all_groups = self.partial_groups.fetchAdd(groups, .monotonic) + groups;
+        const all_rows = self.partial_rows.fetchAdd(rows, .monotonic) + rows;
+        if (self.chunk_claims) |c| c.fine.store(all_rows >= PASS_EVIDENCE_ROWS and partialsCollapse(all_groups, all_rows), .monotonic);
     }
 
     /// Full high-cardinality lease GROUP BY replacement. The aggregate owns this
@@ -2331,7 +2343,7 @@ pub const ParallelScan = struct {
         var seen: usize = 0;
         var cut: usize = 0;
         for (self.workers, 0..) |w, c| {
-            const target = (c + 1) * surviving / n + @intFromBool((c + 1) * surviving % n != 0);
+            const target = survivorsThrough(c + 1, n, surviving);
             while (cut < total and seen < target) : (cut += 1) {
                 if (mask[cut]) seen += 1;
             }
@@ -2457,7 +2469,64 @@ pub const ParallelScan = struct {
         }
         for (self.werr) |*e| e.* = null;
         self.next_chunk.store(0, .monotonic);
+        if (self.agg_fused) try self.claimChunkRowGroups();
         try self.drainWave();
+    }
+
+    /// Have the partial aggregate's chunk scans claim the surviving row
+    /// groups as they drain (`rg_tiles.ChunkClaims`) instead of each draining
+    /// the range it was cut, so the threads finish together whatever each
+    /// group costs once the partials show cuts are cheap (#652). Partials
+    /// combine in any order (an unordered parallel scan reports no sort
+    /// order), so which chunk drains a group doesn't matter. Each chunk
+    /// claims the share of survivors an equal-count cut
+    /// (`cutOverSurvivors`) gives it. Runs after every cut: a key-set pass
+    /// (`collectKeySets`) reads the cut ranges before the drain.
+    fn claimChunkRowGroups(self: *ParallelScan) !void {
+        if (self.table == null or self.workers.len <= 1) return;
+        for (self.workers) |w| if (w != .segment) return;
+        const first = self.workers[0].segment;
+        const mask = first.survivingMask(self.allocator);
+        defer if (mask) |m| self.allocator.free(m);
+        const seg_start = try segmentStarts(self.allocator, first.segs);
+        var seg_start_owned = true;
+        defer if (seg_start_owned) self.allocator.free(seg_start);
+        const total = seg_start[first.segs.len];
+        if (mask) |m| if (m.len != total) return;
+        var surviving: usize = total;
+        if (mask) |m| {
+            surviving = 0;
+            for (m) |live| surviving += @intFromBool(live);
+        }
+        // Without a survivor the cut ranges still drain the memtable.
+        if (surviving == 0) return;
+
+        const survivors = try self.allocator.alloc(u32, surviving);
+        var survivors_owned = true;
+        defer if (survivors_owned) self.allocator.free(survivors);
+        var i: usize = 0;
+        for (0..total) |flat| if (mask == null or mask.?[flat]) {
+            survivors[i] = @intCast(flat);
+            i += 1;
+        };
+        const feeds = try self.allocator.alloc(rg_tiles.ChunkFeed, self.workers.len);
+        errdefer self.allocator.free(feeds);
+        const claims = try self.allocator.create(rg_tiles.ChunkClaims);
+        claims.* = .{ .survivors = survivors, .seg_start = seg_start, .runners = self.n_threads };
+        survivors_owned = false;
+        seg_start_owned = false;
+        self.chunk_claims = claims;
+        self.chunk_feeds = feeds;
+        const n = self.workers.len;
+        for (self.workers, feeds, 0..) |w, *feed, c| {
+            feed.* = .{ .claims = claims, .share = survivorsThrough(c + 1, n, surviving) - survivorsThrough(c, n, surviving) };
+            w.segment.resetRange(0, 0, 0, 0, false);
+            w.segment.range_feed = feed;
+        }
+        if (exec.prof.enabled) std.debug.print(
+            "[pscan] chunk-claims: surviving={d}/{d} rgs claimed by {d} chunks\n",
+            .{ surviving, total, n },
+        );
     }
 
     /// Drain chunks, in order from where the last wave stopped, until the
@@ -2542,6 +2611,7 @@ pub const ParallelScan = struct {
         const left = drainables.len - @min(self.next_chunk.load(.monotonic), drainables.len);
         const eff = @max(@as(usize, 1), @min(self.effectiveThreads(), left));
         self.eff_threads = @max(self.eff_threads, eff);
+        if (self.chunk_claims) |c| c.runners = eff;
         var t: usize = 1;
         while (t < eff) : (t += 1) {
             if (std.Thread.spawn(.{}, stealLoop, .{ self, drainables, ta })) |th| {
@@ -3104,6 +3174,21 @@ const PASS_EVIDENCE_ROWS: u64 = 16 * 1024;
 /// insert the partial paid per row bought nothing.
 fn shrinksNothing(groups: u64, rows: u64) bool {
     return groups *| 5 > rows *| 4;
+}
+
+/// Survivors in the first `c` of `n` chunks of an equal-count cut of
+/// `surviving`: ceil(c × surviving / n).
+fn survivorsThrough(c: usize, n: usize, surviving: usize) usize {
+    return c * surviving / n + @intFromBool(c * surviving % n != 0);
+}
+
+/// Partials collapse when they keep at most one group per this many rows: a
+/// cut between two chunks then splits few groups, so finer chunk claims
+/// (`rg_tiles.ChunkClaims`) cost the combine little.
+const COLLAPSE_ROWS_PER_GROUP: u64 = 16;
+
+fn partialsCollapse(groups: u64, rows: u64) bool {
+    return groups *| COLLAPSE_ROWS_PER_GROUP <= rows;
 }
 
 /// One chunk's partial GROUP BY (`tryFuseAggregate`). Pre-aggregating pays a

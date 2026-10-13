@@ -25,6 +25,7 @@ const api = @import("../api/api.zig");
 const Table = api.Table;
 
 const exec = @import("exec.zig");
+const rg_tiles = @import("rg_tiles.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
@@ -321,6 +322,11 @@ pub const Scan = struct {
     /// all others false, so the memtable is scanned exactly once and ordered
     /// last. Default true (serial scans always cover the memtable).
     scan_memtable: bool = true,
+    /// Where this scan claims its next range on reaching the end of the
+    /// current one, so one drain covers many claims (the chunks of a fused
+    /// partial aggregate pull row groups off a shared cursor). Null: the
+    /// range `setRange`/`resetRange` set is the whole scan.
+    range_feed: ?*rg_tiles.ChunkFeed = null,
     /// Whether this scan owns the table's shared ddl_lock (released in deinit).
     /// False for parallel workers — the orchestrator holds one shared lock for
     /// all of them. Default true (serial scans take and release their own).
@@ -1023,6 +1029,23 @@ pub const Scan = struct {
         self.range_end_seg = end_seg;
         self.range_end_rg = end_rg;
         self.scan_memtable = scan_memtable;
+    }
+
+    /// Move on to the next range `range_feed` hands out, keeping the open
+    /// segment when the range starts in it. False without a feed or once it
+    /// has nothing left for this scan.
+    fn claimNextRange(self: *Scan) bool {
+        const feed = self.range_feed orelse return false;
+        const range = feed.claim() orelse return false;
+        if (range.start_seg != self.cur_seg_idx) self.closeCurSegment();
+        self.cur_seg_idx = range.start_seg;
+        self.cur_rg_idx = range.start_rg;
+        self.range_start_seg = range.start_seg;
+        self.range_start_rg = range.start_rg;
+        self.range_end_seg = range.end_seg;
+        self.range_end_rg = range.end_rg;
+        self.scan_memtable = range.scan_memtable;
+        return true;
     }
 
     /// True once the cursor has reached this scan's assigned range end — the
@@ -2376,7 +2399,10 @@ pub const Scan = struct {
             if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) return false;
             const seg = self.cur_segment.?;
-            if (self.atRangeEnd()) return false;
+            if (self.atRangeEnd()) {
+                if (self.claimNextRange()) continue;
+                return false;
+            }
             if (self.cur_rg_idx >= seg.info.row_groups.len) {
                 self.closeCurSegment();
                 self.cur_seg_idx += 1;
@@ -2485,9 +2511,11 @@ pub const Scan = struct {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = self.cur_segment.?;
-            // Reached this worker's assigned range end (possibly mid-segment) —
-            // stop the segments phase and fall through to the memtable.
+            // Reached this worker's assigned range end (possibly mid-segment):
+            // take the next range if a feed hands them out, else stop the
+            // segments phase and fall through to the memtable.
             if (self.atRangeEnd()) {
+                if (self.claimNextRange()) continue;
                 self.closeCurSegment();
                 self.phase = .memtable;
                 continue;
@@ -2697,9 +2725,11 @@ pub const Scan = struct {
             if (self.cur_segment == null and !try self.openCurSegment()) break;
 
             const seg = self.cur_segment.?;
-            // Reached this worker's assigned range end (possibly mid-segment) —
-            // stop the segments phase and fall through to the memtable.
+            // Reached this worker's assigned range end (possibly mid-segment):
+            // take the next range if a feed hands them out, else stop the
+            // segments phase and fall through to the memtable.
             if (self.atRangeEnd()) {
+                if (self.claimNextRange()) continue;
                 self.closeCurSegment();
                 self.phase = .memtable;
                 continue;
