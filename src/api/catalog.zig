@@ -143,6 +143,7 @@ pub const Catalog = struct {
             if (pool_budget > 0) {
                 const pool = try allocator.create(memory.MemoryPool);
                 pool.* = memory.MemoryPool.init(pool_budget);
+                if (api.totalMemoryBytes()) |usable| pool.limit = usable;
                 owned_pool = pool;
                 cfg.memory_pool = pool;
             }

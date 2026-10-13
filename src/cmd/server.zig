@@ -603,7 +603,9 @@ const ReaperCtx = struct {
 /// keep what a finished statement freed resident until a later statement
 /// reuses it: after a full-data rollforward sweep, tens of GB that no budget
 /// counts. Once no large statement has run for six 5 s polls, the free pages
-/// go back to the system.
+/// go back to the system, and again whenever small statements have grown the
+/// process a step since (#641). Near the memory limit the pool gives memory
+/// back at once (`MemoryPool.relieve`).
 const HeapReleaseCtx = struct {
     catalog: *thindb.Catalog,
     io: Io,
@@ -614,13 +616,22 @@ const HeapReleaseCtx = struct {
         var idle: thindb.memory.IdleRelease = .{ .quiet_checks_needed = 6 };
         while (!stop_flag.load(.acquire)) {
             Io.sleep(self.io, poll, .awake) catch return;
-            if (!idle.due(pool)) continue;
+            const resident = thindb.memory.processResidentBytes() orelse continue;
+            if (resident >= pool.reliefLine()) {
+                idle.settle(pool.relieve(resident));
+                continue;
+            }
+            if (!idle.due(pool, resident)) continue;
             const start_ns = Io.Clock.awake.now(self.io).nanoseconds;
             const released = pool.releaseFreeHeap() orelse continue;
+            idle.settle(released.after.resident);
             const elapsed_ms = @divTrunc(Io.Clock.awake.now(self.io).nanoseconds - start_ns, std.time.ns_per_ms);
             const mib = 1024 * 1024;
-            std.debug.print("[mem-release] server idle: resident {d} MiB -> {d} MiB in {d} ms\n", .{
-                released.before / mib, released.after / mib, elapsed_ms,
+            const after = released.after;
+            std.debug.print("[mem-release] server idle: resident {d} MiB -> {d} MiB in {d} ms (free heap {d} MiB); now block cache {d} MiB, idle pools {d} MiB, accounted {d} MiB, unaccounted {d} MiB\n", .{
+                released.before / mib,                     after.resident / mib,      elapsed_ms,
+                (released.before -| after.resident) / mib, after.cache / mib,         after.retained / mib,
+                after.accounted / mib,                     after.unaccounted() / mib,
             });
         }
     }

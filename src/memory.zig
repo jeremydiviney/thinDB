@@ -189,8 +189,18 @@ fn idleSlack(budget: usize) usize {
 /// starts, grows by a sampling step, or is refused (`yieldIdle`). Admission
 /// compares live bytes only, so idle memory never refuses a reservation; it
 /// is given back instead.
+///
+/// No budget bounds the cache's slabs, the allocator's free pages or memory
+/// nothing accounts for, so the pool also watches the process against its
+/// usable memory (`limit`): past `reliefLine` idle memory and free heap pages
+/// go back, and a statement that grows while the process is still at
+/// `residentCeiling` is refused (`MemoryAccountant.sampleGrowth`).
 pub const MemoryPool = struct {
     budget: usize,
+    /// Resident memory the process must stay under: the usable memory the
+    /// server detected (its cgroup limit or physical RAM). Unknown leaves it
+    /// at the maximum and nothing compares resident memory against it.
+    limit: u64 = std.math.maxInt(u64),
     used: std.atomic.Value(usize) = .init(0),
     /// The highest `used` since the last `takeChargePeak`.
     charge_peak: std.atomic.Value(usize) = .init(0),
@@ -204,6 +214,14 @@ pub const MemoryPool = struct {
     idle_lock: std.atomic.Mutex = .unlocked,
     /// Held by the one thread giving idle memory back.
     yield_lock: std.atomic.Mutex = .unlocked,
+    /// The unaccounted bytes the last watchdog line reported; 0 before the
+    /// first line and once the gap has fallen back under the threshold.
+    watch_gap: std.atomic.Value(u64) = .init(0),
+    /// Resident bytes right after the last free-heap release under pressure.
+    /// Another waits until the process has grown a sampling step past it, so
+    /// statements growing near the limit don't each pay a release that finds
+    /// nothing new. Guarded by `yield_lock`.
+    relief_resident: u64 = 0,
 
     pub fn init(budget: usize) MemoryPool {
         return .{ .budget = budget };
@@ -254,18 +272,89 @@ pub const MemoryPool = struct {
         if (self.budget == std.math.maxInt(usize)) return;
         if (!self.yield_lock.tryLock()) return;
         defer self.yield_lock.unlock();
+        _ = self.reclaimIdleLocked(0);
+    }
+
+    /// Gives back what live plus idle bytes exceed the budget by, or
+    /// `pressure` bytes when that is more, plus `idleSlack`. Returns the bytes
+    /// given back. Caller holds `yield_lock`.
+    fn reclaimIdleLocked(self: *MemoryPool, pressure: u64) usize {
         const idle = self.idleBytes();
-        const excess = (self.inUse() +| idle) -| self.budget;
-        if (excess == 0) return;
-        var want: usize = @min(idle, excess +| idleSlack(self.budget));
+        const excess = @max((self.inUse() +| idle) -| self.budget, pressure);
+        if (excess == 0) return 0;
+        const asked: usize = @min(idle, excess +| idleSlack(self.budget));
+        var want = asked;
         want -|= self.scratch.reclaim_fn(&self.scratch, want);
-        if (want == 0) return;
+        if (want == 0) return asked;
         self.lockIdle();
         defer self.idle_lock.unlock();
         var source = self.scratch.next;
         while (source) |s| : (source = s.next) {
             want -|= s.reclaim_fn(s, want);
-            if (want == 0) return;
+            if (want == 0) break;
+        }
+        return asked - want;
+    }
+
+    /// Resident memory a growing statement may not pass: the limit less a
+    /// sixteenth. The margin holds what other statements grow between their
+    /// samples and the memory the kernel charges outside the resident count.
+    pub fn residentCeiling(self: *const MemoryPool) u64 {
+        return self.limit -| self.limit / 16;
+    }
+
+    /// Resident memory past which idle pools and the allocator's free pages
+    /// go back to the system: two sampling steps under the ceiling.
+    pub fn reliefLine(self: *const MemoryPool) u64 {
+        return self.residentCeiling() -| 2 * @as(u64, watchStep(self.budget));
+    }
+
+    /// Brings resident memory back under `reliefLine` once it has passed
+    /// it: idle pools give back the overshoot, then, while the process is
+    /// still over, the general allocator's free pages go back to the system.
+    /// Waits for a thread already giving memory back, whose work may be
+    /// enough. Returns resident memory afterwards.
+    pub fn relieve(self: *MemoryPool, resident: u64) u64 {
+        const line = self.reliefLine();
+        if (resident < line) return resident;
+        while (!self.yield_lock.tryLock()) std.Thread.yield() catch {};
+        defer self.yield_lock.unlock();
+        const before = affinity.processResidentBytes() orelse resident;
+        if (before < line) return before;
+        const idle_given = self.reclaimIdleLocked(before - line);
+        var now = affinity.processResidentBytes() orelse before;
+        const after_idle = now;
+        if (now >= line and now >= self.relief_resident +| watchStep(self.budget)) {
+            if (affinity.releaseFreeHeapPages()) now = affinity.processResidentBytes() orelse now;
+            self.relief_resident = now;
+        }
+        const mib = 1024 * 1024;
+        std.debug.print(
+            "[mem-relief] resident {d} MiB passed the relief line {d} MiB (limit {d} MiB): idle pools gave back {d} MiB, free heap {d} MiB; resident now {d} MiB\n",
+            .{ before / mib, line / mib, self.limit / mib, idle_given / mib, (after_idle -| now) / mib, now / mib },
+        );
+        return now;
+    }
+
+    /// True when a statement's reading of `gap` unaccounted bytes earns a
+    /// watchdog line: past `threshold` and a sampling step above the gap the
+    /// last line reported. A gap a step back under the threshold re-arms the
+    /// first line. One pool's statements share the record, so a gap that
+    /// holds still is reported once, not by every statement that sees it.
+    /// A falling gap is not reported: free heap pages that a statement's
+    /// accounted allocations reuse shrink it inside every large statement.
+    fn claimWatchLine(self: *MemoryPool, gap: u64, threshold: u64) bool {
+        const step: u64 = watchStep(self.budget);
+        var last = self.watch_gap.load(.monotonic);
+        while (true) {
+            var next = gap;
+            if (gap >= threshold) {
+                if (last != 0 and gap < last +| step) return false;
+            } else {
+                if (last == 0 or gap >= threshold -| step) return false;
+                next = 0;
+            }
+            last = self.watch_gap.cmpxchgWeak(last, next, .monotonic, .monotonic) orelse return next != 0;
         }
     }
 
@@ -305,42 +394,68 @@ pub const MemoryPool = struct {
     /// until a later statement reuses them. Null when nothing was released.
     pub fn releaseFreeHeap(self: *MemoryPool) ?HeapRelease {
         const before = affinity.processResidentBytes() orelse return null;
-        const snapshot: MemorySnapshot = .{ .resident = before, .cache = cacheBytes(), .retained = self.idleBytes(), .accounted = self.inUse() };
-        if (snapshot.unaccounted() < watchThreshold(self.budget)) return null;
+        if (self.snapshot(before).unaccounted() < watchThreshold(self.budget)) return null;
         if (!affinity.releaseFreeHeapPages()) return null;
-        return .{ .before = before, .after = affinity.processResidentBytes() orelse before };
+        return .{ .before = before, .after = self.snapshot(affinity.processResidentBytes() orelse before) };
+    }
+
+    pub fn snapshot(self: *MemoryPool, resident: u64) MemorySnapshot {
+        return .{ .resident = resident, .cache = cacheBytes(), .retained = self.idleBytes(), .accounted = self.inUse() };
     }
 };
 
-/// Resident bytes around a `MemoryPool.releaseFreeHeap`.
+/// Resident bytes before a `MemoryPool.releaseFreeHeap`, and where they are
+/// after it. The difference is what the allocator held free; what stays
+/// unaccounted afterwards is live memory no budget tracks.
 pub const HeapRelease = struct {
     before: u64,
-    after: u64,
+    after: MemorySnapshot,
 };
+
+pub fn processResidentBytes() ?u64 {
+    return affinity.processResidentBytes();
+}
 
 /// When a server gives its general allocator's free pages back: once per idle
 /// period, after a run of quiet checks. A check is quiet when the pool's
-/// charge stayed under one sampling step since the check before. Re-faulting
-/// released pages costs the next statement, so a release waits until large
-/// statements have stopped; small ones, like a stream of replicated writes,
-/// leave little behind and neither hold a release off nor start a new period.
+/// charge stayed under one sampling step since the check before and resident
+/// memory grew by less than a step. Re-faulting released pages costs the next
+/// statement, so a release waits until large statements have stopped. Small
+/// ones, like a stream of replicated writes or many concurrent lookups, don't
+/// hold a release off, but what they leave behind adds up: once resident
+/// memory has grown a step past the last release, the next quiet check
+/// releases again.
 pub const IdleRelease = struct {
     quiet_checks_needed: u32,
     quiet_checks: u32 = 0,
-    released: bool = false,
+    /// Resident bytes after this idle period's release; null until it runs.
+    released_at: ?u64 = null,
+    previous_resident: u64 = 0,
 
-    /// One check; true when the pool should release now.
-    pub fn due(self: *IdleRelease, pool: *MemoryPool) bool {
-        if (pool.takeChargePeak() >= watchStep(pool.budget)) {
+    /// One check against the process's `resident` bytes now; true when the
+    /// pool should release now.
+    pub fn due(self: *IdleRelease, pool: *MemoryPool, resident: u64) bool {
+        const step: u64 = watchStep(pool.budget);
+        const busy = pool.takeChargePeak() >= step or resident >= self.previous_resident +| step;
+        self.previous_resident = resident;
+        if (self.released_at) |at| if (busy or resident >= at +| step) {
+            self.released_at = null;
+        };
+        if (busy) {
             self.quiet_checks = 0;
-            self.released = false;
             return false;
         }
-        if (self.released) return false;
-        self.quiet_checks += 1;
+        if (self.released_at != null) return false;
+        self.quiet_checks +|= 1;
         if (self.quiet_checks < self.quiet_checks_needed) return false;
-        self.released = true;
+        self.released_at = resident;
         return true;
+    }
+
+    /// The release left `resident` bytes; growth is measured from there.
+    pub fn settle(self: *IdleRelease, resident: u64) void {
+        self.released_at = resident;
+        self.previous_resident = resident;
     }
 };
 
@@ -430,14 +545,42 @@ pub const MemoryAccountant = struct {
             return err;
         };
         self.reservation_lock.unlock();
-        if (sample) self.sampleGrowth();
+        if (sample) self.sampleGrowth() catch |err| {
+            self.exceeded.store(true, .release);
+            self.releaseAllocation(bytes);
+            return err;
+        };
     }
 
     /// The statement just grew by a sampling step: idle memory makes room for
-    /// it before the watchdog reads the process.
-    fn sampleGrowth(self: *MemoryAccountant) void {
+    /// it before the watchdog reads the process. Near the memory limit the
+    /// pool gives back idle pools and free heap pages first; a process still
+    /// at the ceiling after that refuses the growth, so the statement fails
+    /// with a budget error instead of the kernel killing the server.
+    fn sampleGrowth(self: *MemoryAccountant) Error!void {
         self.balanceIdle();
-        self.watch("growth");
+        const resident = affinity.processResidentBytes() orelse return;
+        const pool = self.pool orelse {
+            _ = self.observe(self.reading(resident), "growth");
+            return;
+        };
+        const now = pool.relieve(resident);
+        _ = self.observe(self.reading(now), "growth");
+        if (now < pool.residentCeiling()) return;
+        self.logResidentRefusal(now, pool);
+        return Error.MemoryBudgetExceeded;
+    }
+
+    fn logResidentRefusal(self: *MemoryAccountant, resident: u64, pool: *MemoryPool) void {
+        self.lock();
+        defer self.reservation_lock.unlock();
+        if (self.refusal_logged) return;
+        self.refusal_logged = true;
+        const mib = 1024 * 1024;
+        std.debug.print(
+            "[mem-audit] MemoryBudgetExceeded: stmt={d} conn={?d} grew to {d} MiB while the process holds {d} MiB, past its ceiling {d} MiB (limit {d} MiB) after idle pools and free heap went back\n",
+            .{ self.statement_id, self.connection_id, self.current_bytes / mib, resident / mib, pool.residentCeiling() / mib, pool.limit / mib },
+        );
     }
 
     fn balanceIdle(self: *MemoryAccountant) void {
@@ -546,7 +689,10 @@ pub const MemoryAccountant = struct {
             return err;
         };
         self.reservation_lock.unlock();
-        if (sample) self.sampleGrowth();
+        if (sample) self.sampleGrowth() catch |err| {
+            self.release(source, bytes);
+            return err;
+        };
     }
 
     /// True when the reservation crossed the next watchdog sampling level.
@@ -569,10 +715,12 @@ pub const MemoryAccountant = struct {
         return true;
     }
 
-    /// Compare process memory against everything accounted and log once per
-    /// statement when the difference passes `watchThreshold` — a gap in the
-    /// accounting shows up before it grows into an out-of-memory kill. Callers
-    /// sample at stage boundaries and accounted growth steps, never per row.
+    /// Compare process memory against everything accounted and log when the
+    /// difference passes `watchThreshold` — a gap in the accounting shows up
+    /// before it grows into an out-of-memory kill. Statements sharing a pool
+    /// log a gap once and again only when it rises (`claimWatchLine`); one
+    /// without a pool logs once. Callers sample at stage boundaries and
+    /// accounted growth steps, never per row.
     pub fn watch(self: *MemoryAccountant, site: []const u8) void {
         const resident = affinity.processResidentBytes() orelse return;
         _ = self.observe(self.reading(resident), site);
@@ -613,8 +761,12 @@ pub const MemoryAccountant = struct {
         _ = self.resident_peak.fetchMax(snapshot.resident, .monotonic);
         const gap = snapshot.unaccounted();
         const threshold = watchThreshold(self.budget);
-        if (gap < threshold) return false;
-        if (self.watch_logged.swap(true, .monotonic)) return false;
+        if (self.pool) |p| {
+            if (!p.claimWatchLine(gap, threshold)) return false;
+        } else {
+            if (gap < threshold) return false;
+            if (self.watch_logged.swap(true, .monotonic)) return false;
+        }
         const mib = 1024 * 1024;
         std.debug.print(
             "[mem-watch] stmt={d} conn={?d}: {d} MiB of process memory is unaccounted (threshold {d} MiB) at {s}: resident {d} MiB, accounted {d} MiB, block cache {d} MiB, idle pools {d} MiB\n",
@@ -1030,9 +1182,11 @@ test "memory: a pooled block is charged at its size class, not the request" {
     try std.testing.expectEqual(@as(usize, 0), account.current_bytes);
 }
 
-test "memory: watchdog logs one line per statement once unaccounted memory passes the threshold" {
+test "memory: watchdog logs a pool's unaccounted gap once and again only when it rises a step" {
     const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
     var pool = MemoryPool.init(64 * gib);
+    try std.testing.expectEqual(gib, watchStep(pool.budget));
     var account = MemoryAccountant.initWithPool(4 * gib, &pool);
     try std.testing.expectEqual(2 * gib, watchThreshold(account.budget));
     const within: MemorySnapshot = .{ .resident = 10 * gib, .cache = 4 * gib, .retained = gib, .accounted = 4 * gib };
@@ -1042,8 +1196,86 @@ test "memory: watchdog logs one line per statement once unaccounted memory passe
     try std.testing.expect(account.observe(beyond, "test"));
     try std.testing.expect(!account.observe(beyond, "test"));
     try std.testing.expectEqual(12 * gib, account.resident_peak.load(.monotonic));
+
+    var later = MemoryAccountant.initWithPool(4 * gib, &pool);
+    try std.testing.expect(!later.observe(beyond, "test"));
+    var drifted = beyond;
+    drifted.resident += gib - mib;
+    try std.testing.expect(!later.observe(drifted, "test"));
+    drifted.resident += mib;
+    try std.testing.expect(later.observe(drifted, "test"));
+    try std.testing.expect(!later.observe(beyond, "test"));
+    // Back under the threshold by less than a step keeps the record; a full
+    // step under re-arms the first line.
+    try std.testing.expect(!later.observe(within, "test"));
+    try std.testing.expect(!later.observe(drifted, "test"));
+    var low = within;
+    low.resident -= gib;
+    try std.testing.expect(!later.observe(low, "test"));
+    try std.testing.expectEqual(@as(u64, 0), pool.watch_gap.load(.monotonic));
+    try std.testing.expect(later.observe(beyond, "test"));
+
+    var alone = MemoryAccountant.init(4 * gib);
+    try std.testing.expect(alone.observe(beyond, "test"));
+    try std.testing.expect(!alone.observe(drifted, "test"));
     const cache_only: MemorySnapshot = .{ .resident = gib, .cache = 3 * gib, .retained = 0, .accounted = 0 };
     try std.testing.expectEqual(@as(u64, 0), cache_only.unaccounted());
+}
+
+test "memory: a statement growing while the process is at its memory ceiling is refused after idle memory went back" {
+    if (affinity.processResidentBytes() == null) return error.SkipZigTest;
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(1024 * mib);
+    pool.limit = 1 * mib;
+    try std.testing.expectEqual(@as(u64, 0), pool.reliefLine());
+    var warm = TestIdle{ .idle = 40 * mib };
+    pool.registerIdle(&warm.source);
+    defer pool.unregisterIdle(&warm.source);
+    var statement = MemoryAccountant.initWithPool(1024 * mib, &pool);
+    try std.testing.expectEqual(64 * mib, watchStep(statement.budget));
+    try statement.reserve(.sort, 32 * mib);
+    try std.testing.expectEqual(@as(usize, 0), warm.reclaims);
+    try std.testing.expectError(Error.MemoryBudgetExceeded, statement.reserve(.sort, 40 * mib));
+    try std.testing.expectEqual(@as(usize, 0), warm.idle);
+    try std.testing.expectEqual(32 * mib, statement.current_bytes);
+    try std.testing.expectEqual(32 * mib, pool.inUse());
+    statement.release(.sort, 32 * mib);
+
+    pool.limit = std.math.maxInt(u64);
+    warm.idle = 40 * mib;
+    try statement.reserve(.sort, 72 * mib);
+    try std.testing.expectEqual(40 * mib, warm.idle);
+    statement.release(.sort, 72 * mib);
+}
+
+test "memory: tracked growth at the memory ceiling fails as MemoryBudgetExceeded and refunds its charge" {
+    if (affinity.processResidentBytes() == null) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(1024 * mib);
+    pool.limit = 1 * mib;
+    const account = try a.create(MemoryAccountant);
+    account.* = MemoryAccountant.initWithPool(1024 * mib, &pool);
+    account.trackAllocations(a);
+    defer account.releaseOwner(a);
+    const alloc = try account.executionAllocator();
+    const fits = try alloc.alloc(u8, 32 * mib);
+    defer alloc.free(fits);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 40 * mib));
+    try std.testing.expectEqual(error.MemoryBudgetExceeded, allocationError(account, error.OutOfMemory));
+    try std.testing.expectEqual(32 * mib, pool.inUse());
+}
+
+test "memory: the resident ceiling is the limit less a sixteenth, relief two sampling steps under it" {
+    const gib: u64 = 1 << 30;
+    const mib: u64 = 1 << 20;
+    var pool = MemoryPool.init(14 * gib);
+    pool.limit = 20 * gib;
+    try std.testing.expectEqual(20 * gib - 1280 * mib, pool.residentCeiling());
+    try std.testing.expectEqual(20 * gib - 1280 * mib - 2 * 896 * mib, pool.reliefLine());
+    try std.testing.expectEqual(5 * gib, pool.relieve(5 * gib));
+    const unlimited = MemoryPool.init(14 * gib);
+    try std.testing.expect(unlimited.reliefLine() > 1 << 60);
 }
 
 const TestIdle = struct {
@@ -1263,28 +1495,54 @@ test "memory: statements drawing from one pool get distinct ids" {
 test "memory: an idle release waits for quiet checks and fires once per idle period" {
     var pool = MemoryPool.init(1 << 30);
     const step = watchStep(pool.budget);
-    var idle: IdleRelease = .{ .quiet_checks_needed = 2 };
-    try std.testing.expect(!idle.due(&pool));
-    try std.testing.expect(idle.due(&pool));
-    try std.testing.expect(!idle.due(&pool));
+    const rest: u64 = 4 << 30;
+    var idle: IdleRelease = .{ .quiet_checks_needed = 2, .previous_resident = rest };
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(idle.due(&pool, rest));
+    try std.testing.expect(!idle.due(&pool, rest));
     // A charge of a sampling step since the last check begins a new idle
     // period, even after it was released.
     try std.testing.expect(pool.tryReserve(step));
     pool.release(step);
-    try std.testing.expect(!idle.due(&pool));
-    try std.testing.expect(!idle.due(&pool));
-    try std.testing.expect(idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(idle.due(&pool, rest));
     // One still held holds the release off until the check after it ends.
     try std.testing.expect(pool.tryReserve(step));
-    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool, rest));
     pool.release(step);
-    try std.testing.expect(!idle.due(&pool));
-    try std.testing.expect(!idle.due(&pool));
-    try std.testing.expect(idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(idle.due(&pool, rest));
     // A smaller charge starts no new period.
     try std.testing.expect(pool.tryReserve(step - 1));
     pool.release(step - 1);
-    try std.testing.expect(!idle.due(&pool));
+    try std.testing.expect(!idle.due(&pool, rest));
+}
+
+test "memory: small statements that grow the process a step past the last release bring another" {
+    var pool = MemoryPool.init(1 << 30);
+    const step: u64 = watchStep(pool.budget);
+    const rest: u64 = 4 << 30;
+    var idle: IdleRelease = .{ .quiet_checks_needed = 2, .previous_resident = rest };
+    try std.testing.expect(!idle.due(&pool, rest));
+    try std.testing.expect(idle.due(&pool, rest));
+    idle.settle(rest - step);
+    // Slow growth, under a step per check, never makes a check busy.
+    var resident = rest - step;
+    for (0..2) |_| {
+        resident += step / 2 - 1;
+        try std.testing.expect(!idle.due(&pool, resident));
+    }
+    resident += 3;
+    try std.testing.expect(idle.due(&pool, resident));
+    try std.testing.expect(!idle.due(&pool, resident));
+    // A step of growth inside one check is activity: the release waits for
+    // the quiet checks after it.
+    resident += step;
+    try std.testing.expect(!idle.due(&pool, resident));
+    try std.testing.expect(!idle.due(&pool, resident));
+    try std.testing.expect(idle.due(&pool, resident));
 }
 
 test "memory: shared reservation rejects integer overflow" {
