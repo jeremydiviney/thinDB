@@ -1317,27 +1317,32 @@ fn radixPresized(
 /// running the join probe in its workers; Join forwards iff fused, an
 /// UNFUSED residual Filter swallows it, and table-backed blocks never call
 /// this). Each scan chunk runs scan → probe → partial aggregate on its own
-/// core; the serial combine above re-aggregates the per-chunk partials.
+/// core; the caller combines the per-chunk partials with the returned specs
+/// (`parallel_reduce.combineSpecs`), over the fused upstream's output.
 ///
 /// Gated to combinable aggregates (COUNT/SUM/MIN/MAX/ANY_VALUE, plus
 /// MAX_BY via a hidden max_by_key partial) — global and grouped alike:
 /// post-#79 an empty chunk's GLOBAL partial emits COUNT=0 and NULL for
 /// everything else, and every combine function skips NULLs (max_by skips a
-/// partial whose ord is NULL), so empty partials can't poison the result. Cardinality
-/// gate mirrors routeParallelGroupBy: only proven-small key spaces — above
-/// the radix cache line the serial combine over ~unreduced partials loses.
+/// partial whose ord is NULL), so empty partials can't poison the result.
 ///
-/// `combine_arena` must outlive the query (the combine Aggregate borrows
-/// its specs); callers pass the statement's node arena. Consumes `upstream`
-/// only on success.
-pub fn routeJoinPartialGroupBy(
+/// Declines only keys near-unique per row (`keysNearUnique`), whose partials
+/// can't shrink. The keys' NDV product is no reason to decline (issue #655):
+/// it treats the keys as independent and caps at a pre-filter row bound, so
+/// six keys over ~1K real groups priced as millions and the whole join output
+/// was copied into a partitioned aggregate. A key space that really is large
+/// shows in the realized partials, which the combine routes on
+/// (`combinesOnPartialSize`).
+///
+/// `combine_arena` must outlive the query (the combine borrows its specs);
+/// callers pass the statement's node arena. Consumes `upstream` only on
+/// success.
+pub fn fuseJoinPartialAggregate(
     combine_arena: Allocator,
     upstream: *Query,
     group_cols: []const []const u8,
     aggs: []const ir.AggSpec,
-    top_k: ?ir.Op.TopK,
-    emit_limit: ?u32,
-) !?Query {
+) !?[]const ir.AggSpec {
     const trace_pa = getenv_gr("THINDB_TRACE_PARTIALAGG") != null;
     if (trace_pa) std.debug.print("[pagg-route] enter keys={d} aggs={d}\n", .{ group_cols.len, aggs.len });
     if (!parallel_reduce.combinable(aggs)) {
@@ -1347,49 +1352,49 @@ pub fn routeJoinPartialGroupBy(
 
     const part_aggs = (try parallel_reduce.partialSpecs(combine_arena, upstream.outputSchema(), aggs)) orelse return null;
 
-    if (group_cols.len > 0) {
-        // Decline only a PROVEN-large key space. Unknown cardinality takes
-        // the partial route anyway: partials are combinable rows, and the
-        // combine below (`groupByTopK`) self-routes adaptively — worst case
-        // (unreduced partials) costs about one extra hash pass, while the
-        // common deep-CTE case (derived keys with unknowable NDV but few
-        // realized groups, e.g. a monthly roll-up) collapses in the workers.
-        const schema = upstream.outputSchema();
-        const st = upstream.stats();
-        var est: u64 = 1;
-        var known = true;
-        for (group_cols) |gc| {
-            const idx = types.findColumn(schema, gc) orelse {
-                if (trace_pa) std.debug.print("[pagg-route]   decline key not found: {s}\n", .{gc});
-                return null;
-            };
-            if (idx >= st.column_stats.len) {
-                known = false;
-                break;
-            }
-            switch (st.column_stats[idx].ndv) {
-                .exact => |nd| est *|= nd,
-                .unknown => {
-                    known = false;
-                    break;
-                },
-            }
-        }
-        if (known) {
-            est = @min(est, @max(st.upper_rows, 1));
-            const per_group = perGroupTableBytes(schema, group_cols, part_aggs);
-            if (per_group != 0 and est *| per_group > RADIX_CACHE_BYTES) return null;
-        }
+    if (keysNearUnique(upstream.stats(), upstream.outputSchema(), group_cols)) {
+        if (trace_pa) std.debug.print("[pagg-route]   decline: near-unique key\n", .{});
+        return null;
     }
 
     const fused = try upstream.tryFuseAggregate(group_cols, part_aggs);
     if (trace_pa) std.debug.print("[pagg-route]   tryFuseAggregate -> {}\n", .{fused});
     if (!fused) return null;
+    return try parallel_reduce.combineSpecs(combine_arena, aggs, part_aggs, upstream.outputSchema(), group_cols.len);
+}
 
-    // Combine specs over the partials (see `parallel_reduce.combineSpecs`);
-    // the partial schema is the fused upstream's output.
-    const combine = try parallel_reduce.combineSpecs(combine_arena, aggs, part_aggs, upstream.outputSchema(), group_cols.len);
-    return try upstream.groupByTopK(group_cols, combine, top_k, emit_limit);
+/// Rows per group below which a key is near-unique for `keysNearUnique`.
+const NEAR_UNIQUE_ROWS_PER_GROUP: u64 = 2;
+
+/// True when one key alone leaves fewer than `NEAR_UNIQUE_ROWS_PER_GROUP`
+/// rows per group: its exact NDV is a lower bound on the groups, so per-chunk
+/// partials over it barely shrink and their tables are a wasted hash pass.
+fn keysNearUnique(st: exec.PipelineStats, schema: []const types.Column, group_cols: []const []const u8) bool {
+    if (st.upper_rows == 0) return false;
+    for (group_cols) |gc| {
+        const idx = types.findColumn(schema, gc) orelse continue;
+        if (idx >= st.column_stats.len) continue;
+        switch (st.column_stats[idx].ndv) {
+            .exact => |nd| if (nd *| NEAR_UNIQUE_ROWS_PER_GROUP >= st.upper_rows) return true,
+            .unknown => {},
+        }
+    }
+    return false;
+}
+
+/// Whether a two-phase GROUP BY's combine routes once its partials are in
+/// (`RealizedInput`) rather than hashing them on one thread: keyed, no top-k
+/// or LIMIT emit (the hash aggregate's early-outs serve those), with threads
+/// to partition across. Partials that collapsed in the workers take the hash
+/// plan; partials that didn't partition, as the unsplit input would have.
+pub fn combinesOnPartialSize(
+    group_cols: []const []const u8,
+    top_k: ?ir.Op.TopK,
+    emit_limit: ?u32,
+    partition_dop: usize,
+) bool {
+    return exec.force_group_by == .auto and partition_dop > 1 and group_cols.len > 0 and
+        top_k == null and emit_limit == null;
 }
 
 fn groupKeysSortedPrefix(state: exec.SortState, group_cols: []const []const u8) bool {

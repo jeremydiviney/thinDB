@@ -3669,3 +3669,59 @@ test "join: a grouped join's keys keep their bare names outside" {
         try std.testing.expectEqualStrings(c[1], text);
     }
 }
+
+/// `dim`: keys 0..9 named `n<k>`. `fact`: ids 0..199999 across ~100 row
+/// groups, `dk = id % 10`, `g = id % 1000`, a NULL `t` every seventh row,
+/// and a column of each type a partial SUM widens or passes as is.
+fn openPartialAggDb(allocator: std.mem.Allocator, dir: std.Io.Dir) !*thindb.Database {
+    const helpers = @import("sql_helpers.zig");
+    const db = try thindb.Database.open(allocator, std.testing.io, dir, .{ .max_dop = 4, .row_group_size = 2048, .auto_flush_secs = 0 });
+    errdefer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE digit (d BIGINT PRIMARY KEY)");
+    try helpers.exec(allocator, db, "INSERT INTO digit VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)");
+    try helpers.exec(allocator, db, "CREATE TABLE dim (k BIGINT PRIMARY KEY, name VARCHAR(10) NOT NULL)");
+    try helpers.exec(allocator, db, "INSERT INTO dim SELECT d, CONCAT('n', CAST(d AS CHAR)) FROM digit");
+    try helpers.exec(allocator, db, "CREATE TABLE fact (id BIGINT PRIMARY KEY, dk BIGINT NOT NULL, g BIGINT NOT NULL, t TINYINT, s SMALLINT NOT NULL, f FLOAT NOT NULL, m DECIMAL(10,2) NOT NULL, w VARCHAR(16) NOT NULL)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO fact SELECT id, id % 10, id % 1000, CAST(NULLIF(id % 7, 0) AS TINYINT), CAST(id % 30000 AS SMALLINT),
+        \\  CAST(id % 97 AS FLOAT) / 4, CAST(id % 1000 AS DECIMAL(10,2)), CONCAT('w', CAST(id % 501 AS CHAR))
+        \\FROM (SELECT a.d + 10 * b.d + 100 * c.d + 1000 * e.d + 10000 * h.d + 100000 * j.d AS id
+        \\  FROM digit a CROSS JOIN digit b CROSS JOIN digit c CROSS JOIN digit e CROSS JOIN digit h CROSS JOIN digit j WHERE j.d < 2) x
+    );
+    inline for (.{ "digit", "dim", "fact" }) |name| {
+        const t = try db.openTable(name, .{});
+        try t.flush();
+    }
+    return db;
+}
+
+test "join: GROUP BY over a probe-fused join is exact whether chunks pre-aggregate or pass rows through" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openPartialAggDb(allocator, tmp.dir);
+    defer db.close();
+
+    // Each runs at DOP 4 and at DOP 1 as the reference. Keyed by `f.g`,
+    // every scan chunk collapses its joined rows to ~1K partial groups.
+    // Keyed by `(f.g, f.s)`, no single key is near-unique, so the scan
+    // chunks aggregate, but a group repeats only once per 30K ids: the first
+    // chunks' partials shrink nothing and the rest pass their rows through.
+    // Keyed by `f.id`, the key is unique, so the partials are never fused.
+    const aggs = "SUM(f.t) AS st, SUM(f.s) AS ss, SUM(f.f) AS sf, CAST(SUM(f.m) * 100 AS BIGINT) AS sm, COUNT(f.t) AS ct, COUNT(*) AS n, MIN(f.w) AS mw, MAX(f.dk) AS mk, MAX_BY(f.w, f.id) AS mb";
+    const cases = .{
+        .{ "SELECT {s} f.g, d.name, " ++ aggs ++ " FROM fact f JOIN dim d ON f.dk = d.k GROUP BY f.g, d.name ORDER BY f.g", true },
+        .{ "SELECT {s} f.g, f.s, d.name, ANY_VALUE(f.dk) AS av," ++ aggs ++ " FROM fact f JOIN dim d ON f.dk = d.k GROUP BY f.g, f.s, d.name ORDER BY f.g, f.s", true },
+        .{ "SELECT {s} f.id, d.name, ANY_VALUE(f.g) AS av, " ++ aggs ++ " FROM fact f JOIN dim d ON f.dk = d.k GROUP BY f.id, d.name ORDER BY f.id", false },
+    };
+    inline for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c[0]});
+        const parallel_sql = std.fmt.comptimePrint(c[0], .{""});
+        try std.testing.expectEqual(c[1], try planMentions(allocator, db, parallel_sql, "partial-agg"));
+        const parallel = try crossRowsText(allocator, db, parallel_sql);
+        defer allocator.free(parallel);
+        const serial = try crossRowsText(allocator, db, std.fmt.comptimePrint(c[0], .{"/*+ SET_VAR(thindb_max_dop = 1) */"}));
+        defer allocator.free(serial);
+        try std.testing.expectEqualStrings(serial, parallel);
+    }
+}

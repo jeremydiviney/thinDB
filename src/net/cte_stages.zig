@@ -947,11 +947,9 @@ fn collectBlockStages(
 /// is known rather than estimated. It `ensureRun`s the materialized stages
 /// its input reads, so the router sees their realized row counts and string
 /// widths — the right call for deep CTE chains where an estimate compounds
-/// badly. With `realize` it also drains an input that can hand over its
-/// buffers (a filtered table scan materializes its survivors anyway) and
-/// routes on those exact bytes through `RealizedInput`: a pre-filter row
-/// bound can price a plan out, or in, by an order of magnitude. EXPLAIN never
-/// calls `next()`, so the plan stays cheap to print and nothing runs.
+/// badly. `RouteInput` says whether it first drains an input that can hand
+/// over its buffers and routes on those exact bytes. EXPLAIN never calls
+/// `next()`, so the plan stays cheap to print and nothing runs.
 const AdaptiveGroupBy = struct {
     allocator: Allocator,
     /// Thread-safe allocator for parallel routes (global reduce workers).
@@ -964,10 +962,19 @@ const AdaptiveGroupBy = struct {
     emit_limit: ?u32,
     budget: usize,
     max_dop: usize,
-    realize: bool,
+    input: RouteInput,
     output_schema: []types.Column,
     chosen: ?exec.Query = null,
     routed: bool = false,
+
+    /// What the router sees. `.estimated`: the input's stats. `.realized`:
+    /// the drained input through `RealizedInput` when it can hand over its
+    /// buffers (a filtered table scan materializes its survivors anyway), as
+    /// a pre-filter row bound can price a plan out, or in, by an order of
+    /// magnitude. `.partials`: a two-phase GROUP BY's per-chunk partials,
+    /// realized the same way; partials that can't be handed over carry no
+    /// usable size, so they take the hash combine.
+    const RouteInput = enum { estimated, realized, partials };
 
     fn create(
         allocator: Allocator,
@@ -980,7 +987,7 @@ const AdaptiveGroupBy = struct {
         emit_limit: ?u32,
         budget: usize,
         max_dop: usize,
-        realize: bool,
+        input: RouteInput,
     ) !exec.Query {
         const schema = try exec.aggregate_op.outputSchemaFor(allocator, up.outputSchema(), group_cols, aggs);
         errdefer allocator.free(schema);
@@ -996,7 +1003,7 @@ const AdaptiveGroupBy = struct {
             .emit_limit = emit_limit,
             .budget = budget,
             .max_dop = max_dop,
-            .realize = realize,
+            .input = input,
             .output_schema = schema,
         };
         return exec.makeQuery(allocator, self);
@@ -1006,9 +1013,12 @@ const AdaptiveGroupBy = struct {
         if (self.routed) return;
         self.routed = true;
         for (self.stages) |s| try s.ensureRun();
-        if (self.realize) {
+        if (self.input != .estimated) {
             if (try self.up.takeOwnedChunks()) |owned| {
                 self.up = try group_route.RealizedInput.create(self.allocator, self.up, owned);
+            } else if (self.input == .partials) {
+                self.chosen = try self.up.groupByTopK(self.group_cols, self.aggs, self.top_k, self.emit_limit);
+                return;
             }
         }
         const trace_gb = getenv("THINDB_TRACE_GBROUTE") != null;
@@ -1037,7 +1047,7 @@ const AdaptiveGroupBy = struct {
         // A keyed GROUP BY the radix path can't carry (string keys, MAX_BY,
         // ANY_VALUE) may partition its input across cores instead of taking
         // the serial hash aggregate, when that fits the budget.
-        const partition_gate = if (self.realize) "THINDB_NO_PAGG_FALLBACK" else "THINDB_NO_PARALLEL_GROUP";
+        const partition_gate = if (self.input != .estimated) "THINDB_NO_PAGG_FALLBACK" else "THINDB_NO_PARALLEL_GROUP";
         const partition_dop: usize = if (getenv(partition_gate) == null) self.max_dop else 1;
         self.chosen = try group_route.routeGroupBy(
             self.allocator,
@@ -1089,7 +1099,7 @@ const AdaptiveGroupBy = struct {
 
 /// When a GROUP BY reads exactly one materialized stage with nothing between
 /// (a bare `FROM <cte>`), build the input as a parallel buffer scan instead of
-/// the serial MatScan so `routeJoinPartialGroupBy` can fuse the partial
+/// the serial MatScan so `fuseJoinPartialAggregate` can fuse the partial
 /// aggregate into the stripe workers. The ParallelScan counts as ONE stage use
 /// (parity with MatScan.create's bump), so it cleanly REPLACES the serial leaf
 /// — never built alongside it. Returns null for any other shape (the caller
@@ -1772,9 +1782,27 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             defer exec.prof.addPhase("compile.op.group_by", @intCast(exec.prof.nowTicks() - t_op));
             const aggs = try engine_v2.mysqlAggInputs(input, &up, g.aggs);
             // Probe-fused join below: aggregate the joined batches inside
-            // the scan workers (partial per chunk, serial combine here)
-            // instead of hashing the full join output on this thread.
-            if (try group_route.routeJoinPartialGroupBy(input.node_arena, &up, g.group_cols, aggs, g.top_k, g.emit_limit)) |q| return q;
+            // the scan workers (partial per chunk) instead of hashing the
+            // full join output on this thread. The combine routes on the
+            // partials' realized size when it may partition.
+            if (try group_route.fuseJoinPartialAggregate(input.node_arena, &up, g.group_cols, aggs)) |combine| {
+                const combine_dop: usize = if (getenv("THINDB_NO_PAGG_FALLBACK") != null) 1 else input.effectiveDop();
+                if (!group_route.combinesOnPartialSize(g.group_cols, g.top_k, g.emit_limit, combine_dop))
+                    return up.groupByTopK(g.group_cols, combine, g.top_k, g.emit_limit);
+                return AdaptiveGroupBy.create(
+                    input.allocator,
+                    try exec.memory.trackedBackend(input.catalog.allocator, input.accountant),
+                    up,
+                    &.{},
+                    g.group_cols,
+                    combine,
+                    g.top_k,
+                    g.emit_limit,
+                    input.catalog.config.query_memory_budget,
+                    input.effectiveDop(),
+                    .partials,
+                );
+            }
             try group_route.narrowToAggregateInputs(input.allocator, &up, g.group_cols, aggs);
             // When the input reads materialized stages, defer the hash-vs-sort
             // decision to runtime: priming those stages yields exact realized
@@ -1800,7 +1828,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     g.emit_limit,
                     input.catalog.config.query_memory_budget,
                     input.effectiveDop(),
-                    false,
+                    .estimated,
                 );
             }
             if (getenv("THINDB_TRACE_GBROUTE") != null) {
@@ -1824,7 +1852,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     g.emit_limit,
                     input.catalog.config.query_memory_budget,
                     input.effectiveDop(),
-                    true,
+                    .realized,
                 );
             }
             return group_route.routeGroupByDop(
