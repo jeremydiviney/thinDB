@@ -351,9 +351,9 @@ pub const Scan = struct {
     /// buffers each pull. `sub_off == sub_count` ⟺ row group exhausted.
     sub_off: usize = 0,
     sub_count: usize = 0,
-    /// Cache-aware rows-per-emit for the plain projection path (0 = emit the
-    /// full row group). Computed once at create from the projection width via
-    /// `exec.autoScanBatch`.
+    /// Cache-aware rows-per-emit for the plain projection path and for the
+    /// guided filter's survivors (0 = emit the full row group). Computed once
+    /// at create from the projection width via `exec.autoScanBatch`.
     sub_batch_rows: usize = 0,
 
     /// Physical column index for each PROJECTED column. Projection pushdown:
@@ -434,6 +434,14 @@ pub const Scan = struct {
     /// The current row group's survivor row indices (`survivorRows`), shared
     /// by every projected column's gather.
     survivor_rows: []u32 = &.{},
+    /// Survivors of the guided-filter row group `pending_rg` (of
+    /// `cur_segment`) not yet materialized: a tail of `survivor_rows`, all at
+    /// rows `>= pending_lo`, whose mask is still in `mask_buf`. Non-empty only
+    /// while `nextFiltered` emits that row group a sub-batch at a time.
+    pending_rows: []const u32 = &.{},
+    pending_rg: usize = 0,
+    pending_rg_count: u32 = 0,
+    pending_lo: usize = 0,
     /// Scratch array of borrowed cache blocks for the fused-filter fast path,
     /// one slot per projected column. Reused across `next()` calls; the pins
     /// it holds are released within each call. Freed in `deinit`.
@@ -2674,6 +2682,16 @@ pub const Scan = struct {
     fn nextFiltered(self: *Scan) !?Batch {
         const expr = self.fused_filter.?;
 
+        if (self.pending_rows.len > 0) {
+            // The loop below is what moves off a segment, so the pending row
+            // group's segment is still `cur_segment`.
+            const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+            const n = try self.materializeNextSlice(self.cur_segment.?, self.mask_buf[0..self.pending_rg_count]);
+            if (exec.prof.enabled) self.scan_materialize_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tm));
+            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
+        }
+
         while (self.phase == .segments) {
             if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) break;
@@ -2891,13 +2909,13 @@ pub const Scan = struct {
         if (matched == 0) return @as(usize, 0);
 
         const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
+        const emitted = try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
         if (exec.prof.enabled) {
             const dm: u64 = @intCast(@max(0, exec.prof.nowTicks() - _tm));
             exec.prof.add("scan.materialize_survivors", dm);
             self.scan_materialize_ticks +%= dm;
         }
-        return matched;
+        return emitted;
     }
 
     /// Evaluate one comparison `leaf` for the current row group into `out`
@@ -4072,20 +4090,60 @@ pub const Scan = struct {
         };
     }
 
-    /// Compact the survivors of every projected column into `filtered`. The
-    /// mask becomes a survivor row list once per row group and every column
-    /// gathers by index — a selective filter over a wide projection otherwise
-    /// re-walks the full mask per column (30 columns × 64K rows for ~3K
-    /// survivors) and the raw-view compaction streams every row of every
-    /// block. A dense mask keeps the branchless full pass for raw fixed-width
-    /// columns, where it beats the gather. Each column is borrowed from the
-    /// cache; the borrow pins are released before returning.
-    fn materializeSurvivors(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []const bool) !void {
+    /// Compact the survivors of every projected column into `filtered`,
+    /// returning the batch's row count. The mask becomes a survivor row list
+    /// once per row group and every column gathers by index — a selective
+    /// filter over a wide projection otherwise re-walks the full mask per
+    /// column (30 columns × 64K rows for ~3K survivors) and the raw-view
+    /// compaction streams every row of every block. Past `sub_batch_rows`
+    /// survivors only the first sub-batch is compacted; `nextFiltered` emits
+    /// the rest from `pending_rows`. A row group that keeps most of its rows
+    /// would otherwise reach the operators above as one row group of every
+    /// projected column per worker, which at high DOP no longer fits the
+    /// shared L3, and every copy downstream then runs at DRAM speed.
+    fn materializeSurvivors(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []const bool) !usize {
+        self.pending_rows = try self.survivorRows(mask);
+        self.pending_rg = rg_idx;
+        self.pending_rg_count = rg_count;
+        self.pending_lo = 0;
+        return self.materializeNextSlice(seg, mask);
+    }
+
+    /// Compact the next sub-batch of `pending_rows` and drop it from the
+    /// pending tail. The slice ends on a 64-row boundary, so every mask bit in
+    /// its row window `[pending_lo, hi)` is one of its survivors and the
+    /// window's null bitmaps start byte-aligned for the dense masked pass.
+    /// A tail of up to a quarter sub-batch rides along rather than becoming
+    /// its own batch.
+    fn materializeNextSlice(self: *Scan, seg: *storage.ReadSegment, mask: []const bool) !usize {
+        const rows = self.pending_rows;
+        const sub = self.sub_batch_rows;
+        var n = rows.len;
+        var hi: usize = self.pending_rg_count;
+        // `sub` is a positive multiple of 64 and survivor rows are distinct
+        // and ascending, so `hi > rows[0]` and the slice is never empty.
+        if (sub > 0 and rows.len > sub + sub / 4) {
+            hi = rows[sub] & ~@as(usize, 63);
+            n = std.sort.lowerBound(u32, rows, @as(u32, @intCast(hi)), cmpU32);
+        }
+        const lo = self.pending_lo;
+        try self.materializeRows(seg, self.pending_rg, self.pending_rg_count, mask[lo..hi], lo, rows[0..n]);
+        self.pending_rows = rows[n..];
+        self.pending_lo = hi;
+        return n;
+    }
+
+    /// Compact the survivors `rows` (ascending row-group indices, all inside
+    /// the window `[lo, lo + window_mask.len)` whose mask is `window_mask`) of
+    /// every projected column into `filtered`. A dense window keeps the
+    /// branchless masked pass for raw fixed-width columns, where it beats the
+    /// gather. Each column is borrowed from the cache; the borrow pins are
+    /// released before returning.
+    fn materializeRows(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, window_mask: []const bool, lo: usize, rows: []const u32) !void {
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
         var mat_kind: usize = 0;
 
-        const rows = try self.survivorRows(mask);
         const matched = rows.len;
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
@@ -4160,12 +4218,12 @@ pub const Scan = struct {
             // decode just for this column.
             if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
                 mat_kind = 7;
-                try self.appendRawSurvivors(view, mask, rows, &filtered_cols[j]);
+                try self.appendRawSurvivors(view, window_mask, lo, rows, &filtered_cols[j]);
             } else {
                 mat_kind = 8;
                 var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
                 defer owned.deinit(self.allocator);
-                try self.appendRawSurvivors(owned.view(), mask, rows, &filtered_cols[j]);
+                try self.appendRawSurvivors(owned.view(), window_mask, lo, rows, &filtered_cols[j]);
             }
         }
         if (self.emit_loc) try self.appendSurvivorLocs(rows, rg_idx);
@@ -4191,15 +4249,16 @@ pub const Scan = struct {
         return buf[0..pos];
     }
 
-    /// A raw (natively viewable) column's survivors: a sparse mask gathers by
-    /// index, a dense one takes the branchless masked compaction — which is
-    /// also the route for a converting (schema-evolved) source/destination
-    /// pair the gather declines.
-    fn appendRawSurvivors(self: *Scan, view: ColumnView, mask: []const bool, rows: []const u32, out: *ColumnStore) !void {
-        if (rows.len * SPARSE_GATHER_DIVISOR < mask.len) {
+    /// A raw (natively viewable) column's survivors `rows` in the row window
+    /// `[lo, lo + window_mask.len)` of `view`: a sparse window gathers by
+    /// index, a dense one takes the branchless masked compaction of the
+    /// window — which is also the route for a converting (schema-evolved)
+    /// source/destination pair the gather declines.
+    fn appendRawSurvivors(self: *Scan, view: ColumnView, window_mask: []const bool, lo: usize, rows: []const u32, out: *ColumnStore) !void {
+        if (rows.len * SPARSE_GATHER_DIVISOR < window_mask.len) {
             if (try engine.memtable.appendGatheredColumn(self.allocator, view, rows, out)) return;
         }
-        try engine.memtable.appendMaskedColumn(self.allocator, view, mask, out);
+        try engine.memtable.appendMaskedColumn(self.allocator, subView(view, lo, window_mask.len), window_mask, out);
     }
 
     /// Late-mat: append each survivor's packed `__rowloc` into the trailing
@@ -4644,6 +4703,7 @@ pub const Scan = struct {
         }
         self.sub_off = 0;
         self.sub_count = 0;
+        self.pending_rows = &.{};
     }
 
     /// If any tombstone offsets fall within `[rg_first, rg_first + rg_count)`,
