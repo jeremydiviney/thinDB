@@ -332,3 +332,103 @@ test "FOR-aware filter with a memtable tail (flushed segment + un-flushed rows)"
 
     try t.flush();
 }
+
+// Six columns of 8+4+4+8+8+32 estimated bytes put the scan's sub-batch at its
+// 2048-row floor, so a 16K-row group keeping 80% of its rows emits several
+// sub-batches through the dense masked pass, and one keeping 20% emits two
+// through the index gather. `r`/`nr` stay raw (full spread), `nr` with NULLs.
+const SLICE_RG: i64 = 16384;
+
+fn sliceA(i: i64) i64 {
+    return @mod(i * 7, 100);
+}
+fn sliceB(i: i64) i64 {
+    return @mod(i * 3, 50);
+}
+fn sliceR(i: i64) i64 {
+    return @mod(i * 2_400_000_000_007, std.math.maxInt(i64));
+}
+fn sliceNr(i: i64) ?i64 {
+    if (@mod(i, 3) == 0) return null;
+    return @mod(i * 1_800_000_000_011, std.math.maxInt(i64));
+}
+
+fn checkSlicedFilter(allocator: std.mem.Allocator, t: *thindb.Table, a_below: i32, rows: i64) !void {
+    const conjuncts = [_]thindb.exec.PredicateExpr{
+        thindb.leafExpr("a", .lt, .{ .int = a_below }),
+        thindb.leafExpr("b", .neq, .{ .int = -1 }),
+        thindb.leafExpr("r", .gte, .{ .bigint = 0 }),
+    };
+    var base = try thindb.scan(allocator, t);
+    var q = try base.filter(.{ .@"and" = &conjuncts });
+    defer q.deinit();
+
+    var seen = std.AutoHashMap(i64, void).init(allocator);
+    defer seen.deinit();
+    var batches: usize = 0;
+    while (try q.next()) |batch| {
+        batches += 1;
+        for (0..batch.row_count) |row| {
+            const id = batch.values[0].data.bigint[row];
+            const i = id - 1;
+            try std.testing.expectEqual(@as(i32, @intCast(sliceA(i))), batch.values[1].data.int[row]);
+            try std.testing.expectEqual(@as(i32, @intCast(sliceB(i))), batch.values[2].data.int[row]);
+            try std.testing.expectEqual(sliceR(i), batch.values[3].data.bigint[row]);
+            if (sliceNr(i)) |nr| {
+                try std.testing.expect(batch.values[4].isValid(row));
+                try std.testing.expectEqual(nr, batch.values[4].data.bigint[row]);
+            } else {
+                try std.testing.expect(!batch.values[4].isValid(row));
+            }
+            var sbuf: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&sbuf, "cat{d}", .{@mod(i, 4)}), batch.values[5].data.varchar.rowBytes(row));
+            try std.testing.expect(sliceA(i) < a_below);
+            try seen.put(id, {});
+        }
+    }
+    var want: usize = 0;
+    var i: i64 = 0;
+    while (i < rows) : (i += 1) want += @intFromBool(sliceA(i) < a_below);
+    try std.testing.expectEqual(want, seen.count());
+    try std.testing.expect(batches > @as(usize, @intCast(@divExact(rows, SLICE_RG))));
+}
+
+test "guided filter emits a row group's many survivors in sub-batches" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = @intCast(SLICE_RG) });
+    defer db.close();
+    try exec(allocator, db,
+        \\CREATE TABLE t (
+        \\  id BIGINT PRIMARY KEY, a INT NOT NULL, b INT NOT NULL,
+        \\  r BIGINT NOT NULL, nr BIGINT, s VARCHAR(32)
+        \\)
+    );
+    const rows = 2 * SLICE_RG;
+    var id: i64 = 1;
+    while (id <= rows) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "INSERT INTO t (id, a, b, r, nr, s) VALUES ");
+        const chunk_end = @min(id + 4096, rows + 1);
+        var line: [160]u8 = undefined;
+        while (id < chunk_end) : (id += 1) {
+            if (buf.items.len > 42) try buf.appendSlice(allocator, ", ");
+            const i = id - 1;
+            const s = if (sliceNr(i)) |nr|
+                try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d}, {d}, 'cat{d}')", .{ id, sliceA(i), sliceB(i), sliceR(i), nr, @mod(i, 4) })
+            else
+                try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d}, NULL, 'cat{d}')", .{ id, sliceA(i), sliceB(i), sliceR(i), @mod(i, 4) });
+            try buf.appendSlice(allocator, s);
+        }
+        try exec(allocator, db, buf.items);
+    }
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    try checkSlicedFilter(allocator, t, 80, rows);
+    try checkSlicedFilter(allocator, t, 20, rows);
+}
