@@ -41,6 +41,15 @@
 //! through a per-worker `GlobalDict.Memo` so the workers don't serialize on
 //! the dict's lock.
 //!
+//! A nullable integer key adds one validity bit, and a NULL row packs value 0
+//! with the bit clear, so the NULL group stays apart from the 0 group whatever
+//! artifact the batch holds in a NULL slot. The value bits always fit 64; the
+//! validity bits sit above them when they fit too, else in a per-row byte that
+//! becomes the group table key's high word (two INT keys, one nullable, take
+//! 65 bits), so the per-row packing stays u64 either way. COUNT(DISTINCT)
+//! keeps to keys that fit 64 bits: its composites and partition counts key by
+//! u64.
+//!
 //! COUNT(DISTINCT) takes integer, float (canonical bits), and string inputs.
 //! A string input that is itself codeable rides the same dict machinery as a
 //! 32-bit value; any other string keys an exact (gid, bytes) set per
@@ -80,7 +89,8 @@ const SortSpec = exec.SortSpec;
 
 pub const Request = @import("v2_shape_group_topn.zig").Request;
 
-const GroupTable = group_table.IntKeyMemsetTable(64);
+// 64 value bits plus one validity bit per key.
+const GroupTable = group_table.IntKeyMemsetTable(64 + MAX_KEYS);
 const DistinctSet = SiloCore.DistinctSet;
 const DistinctStrSet = group_table.DistinctStrSet;
 const CountSlotTable = group_table.CountSlotTable;
@@ -115,6 +125,10 @@ const KeyPart = struct {
     width: u8,
     // String key packed as its 32-bit global dict code (decoded at emit).
     coded: bool = false,
+    nullable: bool = false,
+    // A nullable part's validity bit in the table key, set on non-NULL rows:
+    // below 64 in the packed key, from 64 up in the row's validity byte.
+    valid_bit: u8 = 0,
 };
 
 const AggPlan = struct {
@@ -208,26 +222,35 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     // columns as 32-bit dict codes (codeability proven on the probe below),
     // packing into ≤64 bits. A derived key has no stored stats to gate on.
     var parts: [MAX_KEYS]KeyPart = undefined;
-    var key_bits: u16 = 0;
+    var value_bits: u16 = 0;
+    var n_nullable: u16 = 0;
     var n_coded: usize = 0;
     for (request.group_cols, 0..) |name, i| {
         if (findDerived(request.derived, name) != null) return null;
         const typ = columnType(table, name) orelse return null;
-        // A NULL key slot's batch value is an encoding artifact (FOR base /
-        // dict entry 0); the packed key carries no validity bit, so nullable
-        // keys decline to the NULL-tagged generic path.
-        if (columnNullable(table, name)) return null;
+        const nullable = columnNullable(table, name);
         if (isStringType(typ)) {
-            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = 32, .coded = true };
-            key_bits += 32;
+            // The scan's code sidecar carries no validity, so a nullable
+            // string key never codes.
+            if (nullable) return null;
+            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(value_bits), .width = 32, .coded = true };
             n_coded += 1;
         } else {
             const width = keyTypeBits(typ) orelse return null;
-            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(key_bits), .width = width };
-            key_bits += width;
+            parts[i] = .{ .name = name, .typ = typ, .offset = @intCast(value_bits), .width = width, .nullable = nullable };
         }
+        value_bits += parts[i].width;
+        n_nullable += @intFromBool(parts[i].nullable);
     }
-    if (key_bits > 64) return null;
+    if (value_bits > 64) return null;
+    const valid_base: u16 = if (value_bits + n_nullable <= 64) value_bits else 64;
+    var next_valid = valid_base;
+    for (parts[0..request.group_cols.len]) |*p| {
+        if (!p.nullable) continue;
+        p.valid_bit = @intCast(next_valid);
+        next_valid += 1;
+    }
+    const key_bits: u16 = valid_base + n_nullable;
 
     // Projected columns: keys plus every aggregate input, a derived input
     // expanded to the table columns its expression reads.
@@ -321,6 +344,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             .count_distinct => {
                 // Every distinct kernel skips NULL rows, so a nullable input
                 // is fine here: NULL is never a counted value.
+                if (key_bits > 64) return declineFree(allocator, aggs);
                 const col_name = agg.col orelse return declineFree(allocator, aggs);
                 const typ = inputType(table, schema, col_name) orelse return declineFree(allocator, aggs);
                 const kind: DistinctKind = if (isStringType(typ)) .string else if (isFloatType(typ)) .float else .int;
@@ -401,12 +425,13 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         const probe_schema = probe.outputSchema();
         var product: u64 = 1;
         var from_row = true;
-        for (request.group_cols) |name| {
+        for (request.group_cols, parts[0..request.group_cols.len]) |name, p| {
             const idx = types.findColumn(probe_schema, name) orelse return declineFree(allocator, aggs);
             if (idx >= st.column_stats.len) return declineFree(allocator, aggs);
             from_row = from_row and exec.fromRowOrigin(st, st.column_stats[idx]);
+            // The sketch counts values; a nullable key adds the NULL group.
             switch (st.column_stats[idx].ndv) {
-                .exact => |n| product *|= @max(n, 1),
+                .exact => |n| product *|= @max(n, 1) +| @intFromBool(p.nullable),
                 .unknown => return declineFree(allocator, aggs),
             }
         }
@@ -620,7 +645,9 @@ const WState = struct {
     // Per-batch scratch (reused): each row's packed key and resolved gid, so
     // the per-aggregate kernels run over dense arrays instead of re-probing;
     // `codes_scratch` holds a coded input's codes when a batch lacks the sidecar.
+    // `valid_scratch` holds each row's validity byte when it rides the high word.
     keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
+    valid_scratch: std.ArrayListUnmanaged(u8) = .empty,
     gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
     codes_scratch: std.ArrayListUnmanaged(u32) = .empty,
     // Intern memos for batches without the code sidecar, one per coded key
@@ -653,6 +680,7 @@ const WState = struct {
         if (self.ssets.len > 0) allocator.free(self.ssets);
         if (self.mgid_of.len > 0) allocator.free(self.mgid_of);
         self.keys_scratch.deinit(allocator);
+        self.valid_scratch.deinit(allocator);
         self.gids_scratch.deinit(allocator);
         self.codes_scratch.deinit(allocator);
         for (&self.key_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
@@ -750,6 +778,10 @@ fn driveTile(w: *Worker, have_resolved: *bool) !void {
 // without one (tombstoned row group, memtable rows, a scan that declined
 // coding) interns each row's bytes into the same shared dict instead — slower
 // but identical codes, so any mix of batch kinds groups consistently.
+//
+// A nullable part's NULL rows pack value 0 — the batch value in a NULL slot
+// is an encoding artifact (FOR base, dict entry 0) — and `packValidity` marks
+// the others.
 fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
     const p = w.parts[part_i];
     const ci = w.resolved_keys[part_i];
@@ -773,15 +805,38 @@ fn packKeysForPart(w: *Worker, batch: Batch, part_i: usize, keys: []u64) !void {
         }
         return;
     }
-    switch (batch.values[ci].data) {
+    const view = batch.values[ci];
+    switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
             const width = p.width;
-            for (keys, s[0..keys.len]) |*k, v| {
-                const raw: u64 = @bitCast(@as(i64, v));
-                k.* |= truncBits(raw, width) << shift;
+            const nulls = if (p.nullable) view.nulls else null;
+            if (nulls) |bm| {
+                for (keys, s[0..keys.len], 0..) |*k, v, r| {
+                    const raw: u64 = @bitCast(@as(i64, v));
+                    const keep = 0 -% ((bm[r >> 3] >> @intCast(r & 7)) & @as(u64, 1));
+                    k.* |= (truncBits(raw, width) & keep) << shift;
+                }
+            } else {
+                for (keys, s[0..keys.len]) |*k, v| {
+                    const raw: u64 = @bitCast(@as(i64, v));
+                    k.* |= truncBits(raw, width) << shift;
+                }
             }
         },
         else => return error.UnsupportedQueryShape,
+    }
+}
+
+// OR a nullable part's validity bit into every non-NULL row: into the packed
+// key, or into the row's validity byte when the bits ride the high word.
+fn packValidity(comptime T: type, dst: []T, nulls: ?[]const u8, bit: std.math.Log2Int(T)) void {
+    const bm = nulls orelse {
+        for (dst) |*d| d.* |= @as(T, 1) << bit;
+        return;
+    };
+    for (dst, 0..) |*d, r| {
+        const valid: T = (bm[r >> 3] >> @intCast(r & 7)) & 1;
+        d.* |= valid << bit;
     }
 }
 
@@ -804,46 +859,16 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
 
-    try st.keys_scratch.resize(allocator, n);
     try st.gids_scratch.resize(allocator, n);
-    const keys = st.keys_scratch.items[0..n];
+    try st.keys_scratch.resize(allocator, n);
     const gids = st.gids_scratch.items[0..n];
-
-    @memset(keys, 0);
-    for (0..w.parts.len) |pi| try packKeysForPart(w, batch, pi, keys);
-
-    var r: usize = 0;
-    while (r < n) {
-        const pf = r + PREFETCH_DIST;
-        if (pf < n) {
-            @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(keys[pf]))), .{ .rw = .write, .locality = 1 });
-        }
-        // Adjacent-equal run over the packed keys (the table is physically
-        // ordered, so clustered group keys arrive in runs): one probe and one
-        // count bump for the whole run.
-        const key = keys[r];
-        var run_end = r + 1;
-        while (run_end < n and keys[run_end] == key) run_end += 1;
-        const hash = GroupTable.hashKey(key);
-        const probe = st.table.getOrPut(hash, key);
-        var gid: u32 = probe.gid;
-        if (!probe.found) {
-            gid = @intCast(st.counts.items.len);
-            try st.counts.append(allocator, 0);
-            try st.slots.appendNTimes(allocator, 0, n_aggs);
-            try st.ns.appendNTimes(allocator, 0, n_aggs);
-            // Grown on the miss rather than per batch, so a table holding a
-            // few hundred groups never sizes itself for a whole batch of new
-            // ones. A grow only stales the look-ahead prefetches issued.
-            const slot = if (st.table.needsGrow(1)) blk: {
-                try st.table.grow(allocator, 1);
-                break :blk st.table.getOrPut(hash, key).slot;
-            } else probe.slot;
-            st.table.commit(slot, key, gid);
-        }
-        st.counts.items[gid] += @intCast(run_end - r);
-        @memset(gids[r..run_end], gid);
-        r = run_end;
+    const keys = st.keys_scratch.items[0..n];
+    const wide = w.key_bits > 64;
+    if (wide) {
+        try st.valid_scratch.resize(allocator, n);
+        try groupRows(true, w, batch, keys, st.valid_scratch.items[0..n], gids);
+    } else {
+        try groupRows(false, w, batch, keys, st.valid_scratch.items[0..0], gids);
     }
 
     const ns = st.ns.items;
@@ -869,6 +894,9 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
             else
                 foldExtremeInt(false, view, gids, ns, slots, n_aggs, i),
             .count_distinct => {
+                // The distinct kernels key by the packed key alone (tryBuild
+                // keeps them to keys that fit it).
+                if (wide) return error.UnsupportedQueryShape;
                 const at = @as(usize, a.distinct_index) * w.dop_parts;
                 switch (a.distinct_kind) {
                     .int, .float => try foldDistinctKernel(allocator, view, keys, st.dsets[at..][0..w.dop_parts], w.dop_parts, a.value_bits, a.tier),
@@ -878,6 +906,69 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
             },
         }
     }
+}
+
+fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: []u8, gids: []u32) !void {
+    const st = &w.state;
+    const allocator = w.allocator;
+    const n_aggs = w.aggs.len;
+    const n = keys.len;
+
+    @memset(keys, 0);
+    if (wide) @memset(valid, 0);
+    for (w.parts, 0..) |p, pi| {
+        try packKeysForPart(w, batch, pi, keys);
+        if (!p.nullable) continue;
+        const nulls = batch.values[w.resolved_keys[pi]].nulls;
+        if (wide) {
+            packValidity(u8, valid, nulls, @intCast(p.valid_bit - 64));
+        } else {
+            packValidity(u64, keys, nulls, @intCast(p.valid_bit));
+        }
+    }
+
+    var r: usize = 0;
+    while (r < n) {
+        const pf = r + PREFETCH_DIST;
+        if (pf < n) {
+            @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(tableKey(wide, keys, valid, pf)))), .{ .rw = .write, .locality = 1 });
+        }
+        // Adjacent-equal run over the packed keys (the table is physically
+        // ordered, so clustered group keys arrive in runs): one probe and one
+        // count bump for the whole run.
+        var run_end = r + 1;
+        if (wide) {
+            while (run_end < n and keys[run_end] == keys[r] and valid[run_end] == valid[r]) run_end += 1;
+        } else {
+            while (run_end < n and keys[run_end] == keys[r]) run_end += 1;
+        }
+        const key = tableKey(wide, keys, valid, r);
+        const hash = GroupTable.hashKey(key);
+        const probe = st.table.getOrPut(hash, key);
+        var gid: u32 = probe.gid;
+        if (!probe.found) {
+            gid = @intCast(st.counts.items.len);
+            try st.counts.append(allocator, 0);
+            try st.slots.appendNTimes(allocator, 0, n_aggs);
+            try st.ns.appendNTimes(allocator, 0, n_aggs);
+            // Grown on the miss rather than per batch, so a table holding a
+            // few hundred groups never sizes itself for a whole batch of new
+            // ones. A grow only stales the look-ahead prefetches issued.
+            const slot = if (st.table.needsGrow(1)) blk: {
+                try st.table.grow(allocator, 1);
+                break :blk st.table.getOrPut(hash, key).slot;
+            } else probe.slot;
+            st.table.commit(slot, key, gid);
+        }
+        st.counts.items[gid] += @intCast(run_end - r);
+        @memset(gids[r..run_end], gid);
+        r = run_end;
+    }
+}
+
+inline fn tableKey(comptime wide: bool, keys: []const u64, valid: []const u8, r: usize) u128 {
+    if (!wide) return keys[r];
+    return (@as(u128, valid[r]) << 64) | keys[r];
 }
 
 // The fold kernels walk the gid array run-at-a-time: adjacent-equal gids
@@ -1174,7 +1265,7 @@ const PartMergeJob = struct {
     counts: []CountSlotTable,
     // merged gid → packed key: a string set holds worker gids, which each
     // worker's `mgid_of` lifts to merged gids before the union.
-    merged_keys: []const u64,
+    merged_keys: []const u128,
     err: ?anyerror = null,
 };
 
@@ -1268,7 +1359,7 @@ fn mergeStrPartition(job: *PartMergeJob, d: usize) !void {
             for (src.slots, 0..) |s, i| {
                 if (!DistinctStrSet.occupied(s)) continue;
                 if (i % 4096 == 0) try exec.memory.checkCancelled(allocator);
-                cnt.insert(job.merged_keys[w.state.mgid_of[s.gid]]);
+                cnt.insert(@intCast(job.merged_keys[w.state.mgid_of[s.gid]]));
             }
         }
         return;
@@ -1286,7 +1377,7 @@ fn mergeStrPartition(job: *PartMergeJob, d: usize) !void {
             const mgid = w.state.mgid_of[s.gid];
             if (try out.insertNew(allocator, mgid, s.digest, src.bytesOf(s, &buf))) {
                 try cnt.ensureFor(allocator, 1);
-                cnt.insert(job.merged_keys[mgid]);
+                cnt.insert(@intCast(job.merged_keys[mgid]));
             }
         }
     }
@@ -1305,7 +1396,7 @@ inline fn mergeOne(allocator: Allocator, out: *DistinctSet, composite: u128, cnt
 // never have to walk slots.
 const Merged = struct {
     table: GroupTable,
-    keys: std.ArrayListUnmanaged(u64) = .empty,
+    keys: std.ArrayListUnmanaged(u128) = .empty,
     counts: std.ArrayListUnmanaged(u64) = .empty,
     slots: std.ArrayListUnmanaged(i128) = .empty,
     ns: std.ArrayListUnmanaged(u64) = .empty,
@@ -1369,7 +1460,7 @@ const LowCardGroup = struct {
         const output_schema = try allocator.alloc(Column, n_out);
         errdefer allocator.free(output_schema);
         for (parts[0..request.group_cols.len], 0..) |p, i| {
-            output_schema[i] = .{ .name = p.name, .type = p.typ, .nullable = false };
+            output_schema[i] = .{ .name = p.name, .type = p.typ, .nullable = p.nullable };
         }
         for (aggs, 0..) |a, i| {
             // SUM/AVG/MIN/MAX over a group whose every input is NULL is SQL
@@ -1619,7 +1710,7 @@ const LowCardGroup = struct {
             if (lift_gids) wst.mgid_of = try allocator.alloc(u32, wst.counts.items.len);
             for (wst.table.slots) |s| {
                 if (s.gid == group_table.EMPTY) continue;
-                const key: u64 = s.lo;
+                const key: u128 = (@as(u128, s.hi) << 64) | s.lo;
                 const wgid: usize = s.gid;
                 if (merged.table.needsGrow(1)) try merged.table.grow(allocator, 1);
                 const probe = merged.table.getOrPut(GroupTable.hashKey(key), key);
@@ -1765,12 +1856,17 @@ const LowCardGroup = struct {
         const n_aggs = self.aggs.len;
         const key = keyOfGid(merged, gid);
         for (self.parts[0..self.part_count], 0..) |p, i| {
-            if (p.coded) {
-                const code: u32 = @intCast(truncBits(key >> @intCast(p.offset), 32));
-                try appendString(a, &self.output_cols[i], self.dicts[i].?.decode(code));
+            const col = &self.output_cols[i];
+            const row = col.data.rowCount();
+            const valid = keyPartValid(key, p);
+            if (!valid) {
+                try col.data.appendNullPlaceholder(a);
+            } else if (p.coded) {
+                try appendString(a, col, self.dicts[i].?.decode(keyPartCode(key, p)));
             } else {
-                try appendInt(a, &self.output_cols[i], p.typ, unpackKeyPart(key, p));
+                try appendInt(a, col, p.typ, unpackKeyPart(key, p));
             }
+            try col.appendValidBit(a, row, valid);
         }
         for (self.aggs, 0..) |agg, i| {
             const col = &self.output_cols[self.part_count + i];
@@ -1828,7 +1924,7 @@ fn addDistinctCount(merged: *Merged, n_distinct: u16, d: usize, key: u64, count:
     merged.dcounts[@as(usize, probe.gid) * n_distinct + d] += count;
 }
 
-inline fn keyOfGid(merged: *const Merged, gid: u32) u64 {
+inline fn keyOfGid(merged: *const Merged, gid: u32) u128 {
     return merged.keys.items[gid];
 }
 
@@ -1851,15 +1947,18 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
     const merged = ctx.merged;
     for (op.parts[0..op.part_count], 0..) |p, pi| {
         if (types.columnNameEql(p.name, spec.col)) {
+            const a_key = keyOfGid(merged, a_gid);
+            const b_key = keyOfGid(merged, b_gid);
+            // NULL orders first ascending, last descending (the sort's rule).
+            const a_valid = keyPartValid(a_key, p);
+            const b_valid = keyPartValid(b_key, p);
+            if (a_valid != b_valid) return if (a_valid) .gt else .lt;
+            if (!a_valid) return .eq;
             if (p.coded) {
                 const dict = op.dicts[pi].?;
-                const ac: u32 = @intCast(truncBits(keyOfGid(merged, a_gid) >> @intCast(p.offset), 32));
-                const bc: u32 = @intCast(truncBits(keyOfGid(merged, b_gid) >> @intCast(p.offset), 32));
-                return json_binary.columnOrder(p.typ == .json, dict.decode(ac), dict.decode(bc));
+                return json_binary.columnOrder(p.typ == .json, dict.decode(keyPartCode(a_key, p)), dict.decode(keyPartCode(b_key, p)));
             }
-            const av = unpackKeyPart(keyOfGid(merged, a_gid), p);
-            const bv = unpackKeyPart(keyOfGid(merged, b_gid), p);
-            return std.math.order(av, bv);
+            return std.math.order(unpackKeyPart(a_key, p), unpackKeyPart(b_key, p));
         }
     }
     const n_aggs = op.aggs.len;
@@ -1894,9 +1993,18 @@ fn compareBySpec(ctx: SortCtx, spec: SortSpec, a_gid: u32, b_gid: u32) std.math.
     return .eq;
 }
 
+inline fn keyPartValid(key: u128, p: KeyPart) bool {
+    if (!p.nullable) return true;
+    return (key >> @intCast(p.valid_bit)) & 1 != 0;
+}
+
+inline fn keyPartCode(key: u128, p: KeyPart) u32 {
+    return @truncate(key >> @intCast(p.offset));
+}
+
 // Extract one key part and sign-extend it back to the column's value domain.
-inline fn unpackKeyPart(key: u64, p: KeyPart) i128 {
-    const raw = truncBits(key >> @intCast(p.offset), p.width);
+inline fn unpackKeyPart(key: u128, p: KeyPart) i128 {
+    const raw = truncBits(@truncate(key >> @intCast(p.offset)), p.width);
     if (p.width >= 64) return @as(i64, @bitCast(raw));
     const shift: u6 = @intCast(64 - @as(u16, p.width));
     return (@as(i64, @bitCast(raw << shift))) >> shift;

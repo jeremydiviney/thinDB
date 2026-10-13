@@ -1335,7 +1335,7 @@ fn planContains(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const
 }
 
 const GD_GROUPS = 1009;
-const GdRow = struct { id: i64, g: i32, gn: ?i32, s: ?[]const u8, c: []const u8, d: ?f64, v: ?i32 };
+const GdRow = struct { id: i64, g: i32, gn: ?i32, gb: ?i64, s: ?[]const u8, c: []const u8, d: ?f64, v: ?i32 };
 
 const GdExpected = struct {
     n: []i64,
@@ -1395,8 +1395,9 @@ const GdExpected = struct {
     }
 };
 
-// Key `g` takes the lowcard route; `gn`, the same values in a nullable
-// column, the silo's group-topN route.
+// Keys `g` and `gn` (the same values in a nullable INT column) take the
+// lowcard route; `gb`, the same values as a nullable BIGINT, packs past 64
+// bits, where COUNT(DISTINCT) leaves lowcard for the silo's group-topN route.
 fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: GdExpected, comptime key: []const u8, comptime having: []const u8, route: []const u8) !void {
     const multi_sql = "SELECT " ++ key ++ ", COUNT(DISTINCT s) AS ds, COUNT(DISTINCT c) AS dc, COUNT(DISTINCT d) AS dd, COUNT(*) AS n FROM gd GROUP BY " ++ key ++ having;
     const case_sql = "SELECT " ++ key ++ ", COUNT(DISTINCT CASE WHEN v > 0 THEN s END) AS cs, COUNT(DISTINCT IF(v > 0, id % 97, NULL)) AS ci FROM gd GROUP BY " ++ key ++ having;
@@ -1409,7 +1410,7 @@ fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: G
         var groups: usize = 0;
         while (try q.next()) |batch| {
             for (0..batch.row_count) |r| {
-                const g: usize = @intCast(batch.values[0].data.int[r]);
+                const g: usize = @intFromFloat((try cellNumber(batch.values[0], r)).?);
                 try std.testing.expect(!seen[g]);
                 seen[g] = true;
                 groups += 1;
@@ -1509,6 +1510,7 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
             .id = @intCast(i),
             .g = @intCast(g),
             .gn = @intCast(g),
+            .gb = @intCast(g),
             .s = if (all_null or p % 50 == 0) null else s_pool[p],
             .c = c_pool[(i * 5) % c_pool.len],
             .d = if (all_null or i % 13 == 0) null else if (i % 3 == 0) d_pool[i % d_pool.len] else @as(f64, @floatFromInt(i % 300)) * 0.5,
@@ -1530,6 +1532,7 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
                 .{ .name = "id", .type = .bigint },
                 .{ .name = "g", .type = .int },
                 .{ .name = "gn", .type = .int, .nullable = true },
+                .{ .name = "gb", .type = .bigint, .nullable = true },
                 .{ .name = "s", .type = .string, .nullable = true },
                 .{ .name = "c", .type = .string },
                 .{ .name = "d", .type = .double, .nullable = true },
@@ -1548,7 +1551,8 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         try expected.compute(allocator, rows, live);
         try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
         try checkGroupedDistinct(allocator, db, expected, "g", " HAVING COUNT(*) > 0", "lowcard");
-        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "V2 group-topN");
+        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "gb", " HAVING COUNT(*) > 0", "V2 group-topN");
         // The low-NDV non-nullable string folds as dict codes, the nullable
         // one by bytes; the CASE/IF inputs are derived string and int values.
         try std.testing.expect(try planContains(allocator, db, "SELECT g, COUNT(DISTINCT s), COUNT(DISTINCT c), COUNT(DISTINCT d) FROM gd GROUP BY g", "distinct string,coded,float"));
@@ -1573,7 +1577,8 @@ test "V2 grouped COUNT(DISTINCT) over strings, doubles and CASE/IF inputs on bot
         try expected.compute(allocator, rows, live);
         try checkGroupedDistinct(allocator, db, expected, "g", "", "lowcard");
         try checkGroupedDistinct(allocator, db, expected, "g", " HAVING COUNT(*) > 0", "lowcard");
-        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "V2 group-topN");
+        try checkGroupedDistinct(allocator, db, expected, "gn", " HAVING COUNT(*) > 0", "lowcard");
+        try checkGroupedDistinct(allocator, db, expected, "gb", " HAVING COUNT(*) > 0", "V2 group-topN");
 
         // A string result and a string distinct share the staged string lane.
         const mixed_sql = "SELECT g, MIN(s) AS lo, COUNT(DISTINCT s) AS ds FROM gd GROUP BY g HAVING COUNT(*) > 0";
@@ -1691,8 +1696,7 @@ const HvStats = struct { key: ?i64, n: i64, du: i64, sw: i64, sx: ?i64 };
 const HvOut = [3]?i64;
 const HvCase = struct {
     sql: []const u8,
-    // Whether the non-nullable key `g` takes the lowcard route; the nullable
-    // key `gn` always takes the group-topN route.
+    // Whether the key takes the lowcard route.
     lowcard: bool = true,
     want: *const fn (HvStats) ?HvOut,
     order_col: ?usize = null,
@@ -1866,7 +1870,7 @@ test "V2 group routes keep HAVING with post-aggregate expressions in any order (
                 .{ .sql = "SELECT " ++ k ++ ", SUM(w)*10 + COUNT(*) AS e FROM hv WHERE w < 0 GROUP BY " ++ k ++ " HAVING COUNT(*) > 0", .want = Fns.none },
             };
             for (cases) |c| {
-                const route = if (comptime std.mem.eql(u8, k, "g")) (if (c.lowcard) "lowcard" else "V2 group-topN") else "V2 group-topN";
+                const route = if (c.lowcard) "lowcard" else "V2 group-topN";
                 try checkHvCase(allocator, db, stats, c, route);
             }
         }
@@ -1969,4 +1973,164 @@ test "V2 lowcard aggregate sizes its state by its groups, not its batch rows" {
     // table and accumulator arrays reserved for a whole batch of new groups
     // added about 190 more.
     try std.testing.expect(large -| small < 64 * (16384 - 4096));
+}
+
+// Nullable integer group keys on the lowcard route. `b` holds 0 next to its
+// NULLs, and each 64-row row group draws `b` from its own range, so the
+// encoding artifact in a NULL slot differs between row groups; `a` beside `b`
+// packs 65 bits and so does the nullable BIGINT `c` alone.
+const NkRow = struct { id: i64, a: i32, b: ?i32, c: ?i64, w: i32 };
+const NkOut = [4]?i64;
+
+fn nkRow(i: usize) NkRow {
+    return .{
+        .id = @intCast(i),
+        .a = @intCast(i % 5),
+        .b = if (i % 7 == 0) null else if (i % 5 == 0) 0 else @intCast(1000 * (i / 64 % 4) + i % 3),
+        .c = if (i % 11 == 0) null else @as(i64, @intCast(i % 4)) - 1,
+        .w = @intCast(i % 13),
+    };
+}
+
+fn nkKey(r: NkRow, k: u8) ?i64 {
+    return switch (k) {
+        'a' => r.a,
+        'b' => if (r.b) |v| v else null,
+        else => r.c,
+    };
+}
+
+fn nkLess(desc: bool, x: NkOut, y: NkOut) bool {
+    for (x, y) |xv, yv| {
+        if (std.meta.eql(xv, yv)) continue;
+        const lt = if (xv) |xx| (if (yv) |yy| xx < yy else false) else true;
+        return lt != desc;
+    }
+    return false;
+}
+
+// Per group of `keys`: COUNT(*) and SUM(w), or COUNT(DISTINCT w) and COUNT(*).
+fn nkExpected(allocator: std.mem.Allocator, rows: []const NkRow, keys: []const u8, distinct: bool) ![]NkOut {
+    var out: std.ArrayList(NkOut) = .empty;
+    errdefer out.deinit(allocator);
+    var masks: std.ArrayList(u64) = .empty;
+    defer masks.deinit(allocator);
+    for (rows) |r| {
+        var key: NkOut = .{ null, null, null, null };
+        for (keys, 0..) |k, ki| key[ki] = nkKey(r, k);
+        const gi = for (out.items, 0..) |o, gi| {
+            if (std.mem.eql(?i64, o[0..keys.len], key[0..keys.len])) break gi;
+        } else blk: {
+            key[keys.len] = 0;
+            key[keys.len + 1] = 0;
+            try out.append(allocator, key);
+            try masks.append(allocator, 0);
+            break :blk out.items.len - 1;
+        };
+        const o = &out.items[gi];
+        if (distinct) {
+            masks.items[gi] |= @as(u64, 1) << @intCast(r.w);
+            o[keys.len] = @popCount(masks.items[gi]);
+            o[keys.len + 1] = o[keys.len + 1].? + 1;
+        } else {
+            o[keys.len] = o[keys.len].? + 1;
+            o[keys.len + 1] = o[keys.len + 1].? + r.w;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn checkNk(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const NkRow, sql: []const u8, keys: []const u8, distinct: bool, route: []const u8) !void {
+    errdefer std.debug.print("route={s} query: {s}\n", .{ route, sql });
+    try std.testing.expect(try planContains(allocator, db, sql, route));
+    const want = try nkExpected(allocator, rows, keys, distinct);
+    defer allocator.free(want);
+    var got: std.ArrayList(NkOut) = .empty;
+    defer got.deinit(allocator);
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            var row: NkOut = .{ null, null, null, null };
+            for (batch.values, 0..) |col, ci| {
+                if (try cellNumber(col, r)) |v| row[ci] = @intFromFloat(v);
+            }
+            try got.append(allocator, row);
+        }
+    }
+    std.mem.sort(NkOut, want, false, nkLess);
+    std.mem.sort(NkOut, got.items, false, nkLess);
+    try std.testing.expectEqualSlices(NkOut, want, got.items);
+}
+
+// `b`'s groups by count, ranked by `b` itself: NULL first ascending, last
+// descending.
+fn checkNkOrder(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const NkRow, comptime desc: bool) !void {
+    const sql = "SELECT b, COUNT(*) AS n FROM nk GROUP BY b ORDER BY b" ++ (if (desc) " DESC" else "") ++ " LIMIT 5";
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try std.testing.expect(try planContains(allocator, db, sql, "lowcard"));
+    const all = try nkExpected(allocator, rows, "b", false);
+    defer allocator.free(all);
+    for (all) |*o| o[2] = null;
+    std.mem.sort(NkOut, all, desc, nkLess);
+    var got: std.ArrayList(NkOut) = .empty;
+    defer got.deinit(allocator);
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            var row: NkOut = .{ null, null, null, null };
+            for (batch.values, 0..) |col, ci| {
+                if (try cellNumber(col, r)) |v| row[ci] = @intFromFloat(v);
+            }
+            try got.append(allocator, row);
+        }
+    }
+    try std.testing.expectEqualSlices(NkOut, all[0..@min(5, all.len)], got.items);
+}
+
+test "V2 lowcard groups nullable integer keys: NULL apart from 0, one NULL group across row groups, keys past 64 bits" {
+    const allocator = std.testing.allocator;
+    var rows: [1636]NkRow = undefined;
+    for (&rows, 0..) |*r, i| r.* = nkRow(i);
+    const flushed = 1536;
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop={d}\n", .{dop});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("nk", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "a", .type = .int },
+                .{ .name = "b", .type = .int, .nullable = true },
+                .{ .name = "c", .type = .bigint, .nullable = true },
+                .{ .name = "w", .type = .int },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 64 });
+        try t.insert(rows[0..flushed]);
+        try t.flush();
+
+        // The second pass adds memtable rows, whose batches arrive unencoded.
+        for ([_]usize{ flushed, rows.len }) |live| {
+            errdefer std.debug.print("rows={d}\n", .{live});
+            if (live == rows.len) try t.insert(rows[flushed..]);
+            const r = rows[0..live];
+            var kept: std.ArrayList(NkRow) = .empty;
+            defer kept.deinit(allocator);
+            for (r) |row| if (row.w > 2) try kept.append(allocator, row);
+            try checkNk(allocator, db, r, "SELECT a, b, COUNT(*) AS n, SUM(w) AS s FROM nk GROUP BY a, b", "ab", false, "lowcard");
+            try checkNk(allocator, db, r, "SELECT b, COUNT(*) AS n, SUM(w) AS s FROM nk GROUP BY b", "b", false, "lowcard");
+            try checkNk(allocator, db, r, "SELECT c, COUNT(*) AS n, SUM(w) AS s FROM nk GROUP BY c", "c", false, "lowcard");
+            try checkNk(allocator, db, kept.items, "SELECT a, b, COUNT(*) AS n, SUM(w) AS s FROM nk WHERE w > 2 GROUP BY a, b", "ab", false, "lowcard");
+            try checkNk(allocator, db, r, "SELECT b, COUNT(DISTINCT w) AS d, COUNT(*) AS n FROM nk GROUP BY b", "b", true, "lowcard");
+            try checkNk(allocator, db, r, "SELECT a, b, COUNT(DISTINCT w) AS d, COUNT(*) AS n FROM nk GROUP BY a, b", "ab", true, "V2 group-topN");
+            try checkNkOrder(allocator, db, r, false);
+            try checkNkOrder(allocator, db, r, true);
+        }
+    }
 }
