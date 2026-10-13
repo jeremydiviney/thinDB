@@ -577,6 +577,171 @@ test "createOverStage + fused partial aggregate drains without corruption" {
     try std.testing.expectEqual(@as(i64, @intCast(n)), total_sum);
 }
 
+/// A stage source of `batches` 8192-row batches, which the stage packs into
+/// 64K-row chunks; with `dop × CHUNK_FACTOR` of those a buffer scan steals
+/// chunk ranges, so later chunks start after earlier ones end. Row `i`: key
+/// `i` (or `i % 64` when not `unique`), `t = i % 100` (NULL when `i % 7 == 0`),
+/// `f = (i % 50) / 4`, `m = i % 1000` at scale 2, `w = "w<i % 100>"`.
+const PassStub = struct {
+    allocator: Allocator,
+    schema: [5]Column = .{
+        .{ .name = "k", .type = .{ .bigint = {} }, .nullable = false },
+        .{ .name = "t", .type = .{ .tinyint = {} }, .nullable = true },
+        .{ .name = "f", .type = .{ .float = {} }, .nullable = false },
+        .{ .name = "m", .type = .{ .decimal64 = .{ .p = 10, .s = 2 } }, .nullable = false },
+        .{ .name = "w", .type = .{ .string = {} }, .nullable = false },
+    },
+    batches: usize,
+    unique: bool,
+    emitted: usize = 0,
+    k: [ROWS]i64 = undefined,
+    t: [ROWS]i8 = undefined,
+    t_valid: [ROWS / 8]u8 = undefined,
+    f: [ROWS]f32 = undefined,
+    m: [ROWS]i64 = undefined,
+    w_offsets: [ROWS + 1]u32 = undefined,
+    w_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    views: [5]ColumnView = undefined,
+
+    const ROWS: usize = 8192;
+
+    pub fn next(self: *PassStub) !?Batch {
+        if (self.emitted == self.batches) return null;
+        const base = self.emitted * ROWS;
+        self.emitted += 1;
+        self.w_bytes.clearRetainingCapacity();
+        @memset(&self.t_valid, 0);
+        for (0..ROWS) |r| {
+            const i = base + r;
+            self.k[r] = @intCast(if (self.unique) i else i % 64);
+            self.t[r] = @intCast(i % 100);
+            if (i % 7 != 0) self.t_valid[r >> 3] |= @as(u8, 1) << @intCast(r & 7);
+            self.f[r] = @as(f32, @floatFromInt(i % 50)) / 4;
+            self.m[r] = @intCast(i % 1000);
+            self.w_offsets[r] = @intCast(self.w_bytes.items.len);
+            try self.w_bytes.print(self.allocator, "w{d}", .{i % 100});
+        }
+        self.w_offsets[ROWS] = @intCast(self.w_bytes.items.len);
+        self.views = .{
+            .{ .data = .{ .bigint = &self.k } },
+            .{ .data = .{ .tinyint = &self.t }, .nulls = &self.t_valid },
+            .{ .data = .{ .float = &self.f } },
+            .{ .data = .{ .decimal64 = &self.m } },
+            .{ .data = .{ .string = .{ .offsets = &self.w_offsets, .bytes = self.w_bytes.items } } },
+        };
+        return Batch{ .schema = &self.schema, .values = &self.views, .row_count = ROWS };
+    }
+    pub fn deinit(self: *PassStub) void {
+        self.w_bytes.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+    pub fn outputSchema(self: *PassStub) []const Column {
+        return &self.schema;
+    }
+    pub fn addPrune(_: *PassStub, _: predicate.Predicate) !void {}
+    pub fn stats(self: *PassStub) exec.PipelineStats {
+        return .{ .upper_rows = self.batches * ROWS, .sort_state = .{}, .column_stats = &.{} };
+    }
+    pub fn accountant(_: *PassStub) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+    pub fn explain(_: *PassStub, out: *std.ArrayList(u8), a: Allocator, depth: usize) !void {
+        try exec.explainLine(out, a, depth, "PassStub");
+    }
+};
+
+const pass_group_cols = [_][]const u8{"k"};
+const pass_aggs = [_]exec.AggSpec{
+    .{ .func = .count, .col = null, .as = "c" },
+    .{ .func = .count, .col = "t", .as = "ct" },
+    .{ .func = .sum, .col = "t", .as = "st" },
+    .{ .func = .sum, .col = "f", .as = "sf" },
+    .{ .func = .sum, .col = "m", .as = "sm" },
+    .{ .func = .min, .col = "w", .as = "mw" },
+    .{ .func = .max, .col = "k", .as = "mk" },
+};
+
+test "fused partial aggregate passes rows through once its partials shrink nothing" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+    const worker_alloc = std.heap.c_allocator;
+
+    const batches: usize = 80;
+    const n = batches * PassStub.ROWS;
+    const stub = try allocator.create(PassStub);
+    stub.* = .{ .allocator = allocator, .batches = batches, .unique = true };
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(exec.makeQuery(allocator, stub), null);
+
+    var up = try ParallelScan.createOverStage(allocator, worker_alloc, stage, null, 2);
+    defer up.deinit();
+    try std.testing.expect(try up.tryFuseAggregate(&pass_group_cols, &pass_aggs));
+
+    // Each key is one row, so an aggregated chunk and a passed-through one
+    // emit the same partial row: the row's own values at the partial types.
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var rows: usize = 0;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    while (try up.next()) |b| {
+        try std.testing.expectEqual(@as(usize, 8), b.values.len);
+        for (0..b.row_count) |r| {
+            const k: usize = @intCast(b.values[0].data.bigint[r]);
+            try std.testing.expect(!seen[k]);
+            seen[k] = true;
+            rows += 1;
+            const has_t = k % 7 != 0;
+            try std.testing.expectEqual(@as(i64, 1), b.values[1].data.bigint[r]);
+            try std.testing.expectEqual(@as(i64, @intFromBool(has_t)), b.values[2].data.bigint[r]);
+            try std.testing.expectEqual(has_t, b.values[3].isValid(r));
+            if (has_t) try std.testing.expectEqual(@as(i64, @intCast(k % 100)), b.values[3].data.bigint[r]);
+            try std.testing.expectEqual(@as(f64, @floatFromInt(k % 50)) / 4, b.values[4].data.double[r]);
+            try std.testing.expectEqual(@as(i128, @intCast(k % 1000)), b.values[5].data.decimal128[r]);
+            text.clearRetainingCapacity();
+            try text.print(allocator, "w{d}", .{k % 100});
+            try std.testing.expectEqualStrings(text.items, b.values[6].data.string.rowBytes(r));
+            try std.testing.expectEqual(@as(i64, @intCast(k)), b.values[7].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqual(n, rows);
+    // The first chunks aggregated, showed one group per row, and the rest
+    // passed their rows through.
+    const ps = exec.queryAs(ParallelScan, up).?;
+    try std.testing.expect(ps.partial_rows.load(.monotonic) < n);
+}
+
+test "fused partial aggregate keeps aggregating chunks whose partials shrink" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+    const worker_alloc = std.heap.c_allocator;
+
+    const batches: usize = 80;
+    const n = batches * PassStub.ROWS;
+    const stub = try allocator.create(PassStub);
+    stub.* = .{ .allocator = allocator, .batches = batches, .unique = false };
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(exec.makeQuery(allocator, stub), null);
+
+    var up = try ParallelScan.createOverStage(allocator, worker_alloc, stage, null, 2);
+    defer up.deinit();
+    try std.testing.expect(try up.tryFuseAggregate(&pass_group_cols, &pass_aggs));
+
+    var counted: i64 = 0;
+    var partial_rows: usize = 0;
+    while (try up.next()) |b| {
+        partial_rows += b.row_count;
+        for (b.values[1].data.bigint) |c| counted += c;
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(n)), counted);
+    const ps = exec.queryAs(ParallelScan, up).?;
+    try std.testing.expectEqual(@as(u64, n), ps.partial_rows.load(.monotonic));
+    try std.testing.expect(partial_rows < n / 100);
+}
+
 /// A parallel-scan worker leaf — either a range-restricted segment `Scan`
 /// (table source) or a `ChunkRangeScan` over a materialized-stage stripe
 /// (buffer source). The orchestrator above this — steal loop, fusion, merge,
@@ -783,14 +948,22 @@ pub const ParallelScan = struct {
     compute_filtered: bool = false,
 
     // Fused PARTIAL aggregate (set via tryFuseAggregate, two-phase GROUP BY):
-    // each worker drains `agg_q[i]` (a partial Aggregate over its ranged Scan)
-    // and emits its partial groups, which the materialize path concats for a
+    // each worker drains `agg_q[i]` (a PartialChunk: a partial Aggregate over
+    // its ranged Scan) and emits its partial groups, which the materialize path concats for a
     // downstream serial combine aggregate. `agg_q[i]` OWNS `workers[i]`;
     // `agg_built` drives deinit ownership. Mutually exclusive with compute fusion
     // in P1 (the gate declines when a compute already fused).
     agg_q: []Query = &.{},
     agg_built: usize = 0,
     agg_fused: bool = false,
+    /// How a chunk passes its rows through as one-row partial groups
+    /// (`PartialChunk`), or null when an aggregate has no exact one-row form.
+    pass_plan: ?[]const PassColumn = null,
+    /// Rows the chunks' partial aggregates have taken and groups they have
+    /// formed, across chunks: the evidence a starting chunk reads to pass
+    /// its rows through instead of aggregating them.
+    partial_rows: std.atomic.Value(u64) = .init(0),
+    partial_groups: std.atomic.Value(u64) = .init(0),
 
     // Fused join probe (set via tryFuseProbe; round mode only): each round
     // worker hands its scanned batch to the sink, which probes the offering
@@ -1259,6 +1432,7 @@ pub const ParallelScan = struct {
             qq.deinit();
         }
         if (self.agg_q.len > 0) self.allocator.free(self.agg_q);
+        if (self.pass_plan) |p| self.allocator.free(p);
         for (self.compute_q[0..self.compute_built]) |q| {
             var qq = q;
             qq.deinit();
@@ -1729,20 +1903,21 @@ pub const ParallelScan = struct {
             const n = self.plannedChunks();
             const q = try self.allocator.alloc(Query, n);
             self.agg_q = q;
+            const in_schema = self.out_schema;
             for (q, 0..) |*slot, i| {
                 const pcs = try self.worker_alloc.create(ProbeChunkScan);
-                pcs.* = .{ .ps = self, .chunk = i, .schema = self.out_schema };
-                slot.* = try makeQuery(self.worker_alloc, pcs).groupBy(group_cols, aggs);
+                pcs.* = .{ .ps = self, .chunk = i, .schema = in_schema };
+                slot.* = try self.partialChunk(makeQuery(self.worker_alloc, pcs), group_cols, aggs);
                 self.agg_built = i + 1;
             }
-            self.out_schema = q[0].outputSchema();
-            self.agg_fused = true;
+            try self.finishFuseAggregate(in_schema, group_cols, aggs);
             return true;
         }
         if (self.mode != .unset or self.compute_fused or self.pending_computes.items.len > 0 or self.agg_fused) return false;
         try self.shrinkToSurvivors();
         const q = try self.allocator.alloc(Query, self.workers.len);
         self.agg_q = q;
+        var in_schema = self.out_schema;
         for (self.workers, 0..) |w, i| {
             // With a fused join probe, the per-chunk pipeline aggregates the
             // JOINED batches: scan → probe (ProbeChunkScan) → partial agg.
@@ -1753,12 +1928,42 @@ pub const ParallelScan = struct {
             } else switch (w) {
                 inline else => |p| makeQuery(self.worker_alloc, p),
             };
-            q[i] = try sq.groupBy(group_cols, aggs);
+            in_schema = sq.outputSchema();
+            q[i] = try self.partialChunk(sq, group_cols, aggs);
             self.agg_built = i + 1;
         }
-        self.out_schema = q[0].outputSchema();
-        self.agg_fused = true;
+        try self.finishFuseAggregate(in_schema, group_cols, aggs);
         return true;
+    }
+
+    /// One chunk's partial aggregate over `source` (`PartialChunk`).
+    /// Doesn't consume `source` on failure.
+    fn partialChunk(self: *ParallelScan, source: Query, group_cols: []const []const u8, aggs: []const exec.AggSpec) !Query {
+        const chunk = try self.worker_alloc.create(PartialChunk);
+        errdefer self.worker_alloc.destroy(chunk);
+        const tap = try self.worker_alloc.create(ChunkTap);
+        errdefer self.worker_alloc.destroy(tap);
+        tap.* = .{ .allocator = self.worker_alloc, .source = source };
+        const agg = try makeQuery(self.worker_alloc, tap).groupBy(group_cols, aggs);
+        chunk.* = .{ .ps = self, .tap = tap, .agg = agg };
+        return makeQuery(self.worker_alloc, chunk);
+    }
+
+    fn finishFuseAggregate(self: *ParallelScan, in_schema: []const Column, group_cols: []const []const u8, aggs: []const exec.AggSpec) !void {
+        self.out_schema = self.agg_q[0].outputSchema();
+        self.agg_fused = true;
+        if (getenv("THINDB_NO_PARTIAL_PASS") != null) return;
+        self.pass_plan = try passPlan(self.allocator, in_schema, group_cols, aggs, self.out_schema);
+    }
+
+    fn partialsShrinkNothing(self: *ParallelScan) bool {
+        const rows = self.partial_rows.load(.monotonic);
+        return rows >= PASS_EVIDENCE_ROWS and shrinksNothing(self.partial_groups.load(.monotonic), rows);
+    }
+
+    fn notePartials(self: *ParallelScan, rows: u64, groups: u64) void {
+        _ = self.partial_groups.fetchAdd(groups, .monotonic);
+        _ = self.partial_rows.fetchAdd(rows, .monotonic);
     }
 
     /// Full high-cardinality lease GROUP BY replacement. The aggregate owns this
@@ -2144,9 +2349,10 @@ pub const ParallelScan = struct {
     /// Stage-adoption handshake (`VTable.takeOwnedChunks`): run the mode
     /// decision (and the materialize drain) if not yet started, then hand the
     /// worker buffers over as owned chunks. Declines in round mode (nothing
-    /// owned to give — batches stream from reused round scratch), once
-    /// emission has started, or on the partial-aggregate path (its output
-    /// feeds a combine, not a stage). The transferred stores were allocated
+    /// owned to give — batches stream from reused round scratch), or once
+    /// emission has started. On the partial-aggregate path the chunks hold
+    /// the per-chunk partials, which a combine adopts to route on their
+    /// realized size. The transferred stores were allocated
     /// from `worker_alloc`, which the returned handle carries as owner;
     /// deinit here skips them (columns cleared per WorkerBuf).
     pub fn takeOwnedChunks(self: *ParallelScan) !?exec.OwnedChunks {
@@ -2163,7 +2369,7 @@ pub const ParallelScan = struct {
             self.drain_wave_bytes = std.math.maxInt(usize);
             try self.runMaterialize();
         }
-        if (self.mode != .materialize or self.emit_cursor != 0 or self.agg_fused) return null;
+        if (self.mode != .materialize or self.emit_cursor != 0) return null;
         var n_used: usize = 0;
         for (self.wbufs) |wb| {
             if (wb.row_count > 0) n_used += 1;
@@ -2886,6 +3092,298 @@ const ProbeChunkScan = struct {
 
     pub fn explain(_: *ProbeChunkScan, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         try exec.explainLine(out, allocator, depth, "ProbeChunkScan");
+    }
+};
+
+/// Rows the chunks' partial aggregates must have taken before their shrink
+/// decides anything for the chunks still to start.
+const PASS_EVIDENCE_ROWS: u64 = 16 * 1024;
+
+/// A partial aggregate shrinks nothing when it keeps more than four groups
+/// in five rows: the combine still hashes nearly every row, so the hash
+/// insert the partial paid per row bought nothing.
+fn shrinksNothing(groups: u64, rows: u64) bool {
+    return groups *| 5 > rows *| 4;
+}
+
+/// One chunk's partial GROUP BY (`tryFuseAggregate`). Pre-aggregating pays a
+/// hash insert per row to shrink what the combine reads, which keys nearly
+/// unique within a chunk never repay. So once the chunks aggregated so far
+/// show their partials shrink nothing, a chunk that starts passes its rows
+/// through as one-row partial groups (`PassRows`) instead; the combine reads
+/// one layout either way. Only whole chunks are evidence: a key that repeats
+/// once per row group (each month of a date-sorted table) looks unique in
+/// any one row group, yet a chunk spanning several collapses it.
+const PartialChunk = struct {
+    ps: *ParallelScan,
+    /// The aggregate's input, owned through `agg`.
+    tap: *ChunkTap,
+    agg: Query,
+    pass: PassRows = .{},
+    groups: u64 = 0,
+    phase: enum { start, aggregate, pass, done } = .start,
+
+    pub fn next(self: *PartialChunk) !?Batch {
+        while (true) switch (self.phase) {
+            .start => self.phase = if (self.ps.pass_plan != null and self.ps.partialsShrinkNothing()) .pass else .aggregate,
+            .aggregate => {
+                if (try self.agg.next()) |batch| {
+                    self.groups += batch.row_count;
+                    return batch;
+                }
+                self.ps.notePartials(self.tap.rows, self.groups);
+                self.phase = .done;
+            },
+            .pass => {
+                const batch = (try self.tap.source.next()) orelse {
+                    self.phase = .done;
+                    return null;
+                };
+                return try self.pass.convert(self.ps.worker_alloc, self.ps.pass_plan.?, self.agg.outputSchema(), batch);
+            },
+            .done => return null,
+        };
+    }
+
+    pub fn deinit(self: *PartialChunk) void {
+        const alloc = self.ps.worker_alloc;
+        self.agg.deinit();
+        self.pass.deinit(alloc);
+        alloc.destroy(self);
+    }
+
+    pub fn outputSchema(self: *PartialChunk) []const Column {
+        return self.agg.outputSchema();
+    }
+
+    pub fn addPrune(self: *PartialChunk, pred: predicate.Predicate) !void {
+        return self.agg.addPrune(pred);
+    }
+
+    pub fn stats(self: *PartialChunk) exec.PipelineStats {
+        return self.agg.stats();
+    }
+
+    /// Workers never touch the (non-thread-safe) query accountant.
+    pub fn accountant(_: *PartialChunk) ?*exec.memory.MemoryAccountant {
+        return null;
+    }
+
+    pub fn explain(self: *PartialChunk, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        return self.agg.explain(out, allocator, depth);
+    }
+};
+
+/// The input of one chunk's partial aggregate: the chunk's batches, counted.
+const ChunkTap = struct {
+    allocator: Allocator,
+    source: Query,
+    rows: u64 = 0,
+
+    pub fn next(self: *ChunkTap) !?Batch {
+        const batch = (try self.source.next()) orelse return null;
+        self.rows += batch.row_count;
+        return batch;
+    }
+
+    pub fn deinit(self: *ChunkTap) void {
+        self.source.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn outputSchema(self: *ChunkTap) []const Column {
+        return self.source.outputSchema();
+    }
+
+    pub fn addPrune(self: *ChunkTap, pred: predicate.Predicate) !void {
+        return self.source.addPrune(pred);
+    }
+
+    pub fn addPruneSet(self: *ChunkTap, set: predicate.InSet) !void {
+        return self.source.addPruneSet(set);
+    }
+
+    pub fn rowSetTargetRows(self: *ChunkTap, col: []const u8) u64 {
+        return self.source.rowSetTargetRows(col);
+    }
+
+    pub fn stats(self: *ChunkTap) exec.PipelineStats {
+        return self.source.stats();
+    }
+
+    pub fn accountant(self: *ChunkTap) ?*exec.memory.MemoryAccountant {
+        return self.source.accountant();
+    }
+
+    pub fn explain(self: *ChunkTap, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
+        return self.source.explain(out, allocator, depth);
+    }
+};
+
+/// How a passed-through row fills one partial output column: with what the
+/// partial aggregate emits for a group of that row alone.
+const PassColumn = union(enum) {
+    /// The input column as is: a group key, MIN/MAX/ANY_VALUE/MAX_BY's
+    /// value, MAX_BY's key twin, or a SUM input already at its partial type.
+    view: usize,
+    /// COUNT(*).
+    one,
+    /// COUNT(col): 1 where the column is non-NULL, else 0.
+    valid: usize,
+    /// SUM of a narrower integer, as BIGINT.
+    widen_int: usize,
+    /// SUM of a FLOAT, as DOUBLE.
+    widen_float: usize,
+    /// SUM of a DECIMAL64, as DECIMAL128 at its scale.
+    widen_decimal: usize,
+};
+
+/// The pass-through layout of partial aggregate `aggs` (output `out_schema`:
+/// keys, then one column per aggregate) over `in_schema`, or null when an
+/// aggregate has no exact one-row form here.
+fn passPlan(allocator: Allocator, in_schema: []const Column, group_cols: []const []const u8, aggs: []const exec.AggSpec, out_schema: []const Column) !?[]const PassColumn {
+    if (out_schema.len != group_cols.len + aggs.len) return null;
+    const plan = try allocator.alloc(PassColumn, out_schema.len);
+    for (group_cols, plan[0..group_cols.len]) |name, *pc| {
+        const idx = types.findColumn(in_schema, name) orelse {
+            allocator.free(plan);
+            return null;
+        };
+        pc.* = .{ .view = idx };
+    }
+    for (aggs, plan[group_cols.len..], out_schema[group_cols.len..]) |a, *pc, out| {
+        pc.* = passColumn(a, in_schema, out.type) orelse {
+            allocator.free(plan);
+            return null;
+        };
+    }
+    return plan;
+}
+
+fn passColumn(a: exec.AggSpec, in_schema: []const Column, out: types.Type) ?PassColumn {
+    if (a.params != .none) return null;
+    if (a.func == .count) {
+        const name = a.col orelse return .one;
+        return .{ .valid = types.findColumn(in_schema, name) orelse return null };
+    }
+    const name = (if (a.func == .max_by_key) a.arg2_col else a.col) orelse return null;
+    const idx = types.findColumn(in_schema, name) orelse return null;
+    const in = in_schema[idx].type;
+    return switch (a.func) {
+        .min, .max, .any_value, .max_by, .max_by_key => if (std.meta.eql(in, out)) .{ .view = idx } else null,
+        .sum => switch (in) {
+            .tinyint, .smallint, .int => if (out == .bigint) .{ .widen_int = idx } else null,
+            .bigint, .largeint, .double => if (std.meta.eql(in, out)) .{ .view = idx } else null,
+            .float => if (out == .double) .{ .widen_float = idx } else null,
+            .decimal64 => |d| if (out == .decimal128 and out.decimal128.s == d.s) .{ .widen_decimal = idx } else null,
+            .decimal128 => |d| if (out == .decimal128 and out.decimal128.s == d.s) .{ .view = idx } else null,
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// One chunk's batches as one-row partial groups (`PassColumn`), into
+/// scratch reused across batches.
+const PassRows = struct {
+    views: []ColumnView = &.{},
+    scratch: []Scratch = &.{},
+
+    const Scratch = union(enum) {
+        none,
+        longs: []i64,
+        doubles: []f64,
+        wides: []i128,
+
+        fn free(self: *Scratch, alloc: Allocator) void {
+            switch (self.*) {
+                .none => {},
+                inline else => |buf| alloc.free(buf),
+            }
+            self.* = .none;
+        }
+
+        fn take(self: *Scratch, alloc: Allocator, comptime T: type, n: usize) ![]T {
+            const tag = switch (T) {
+                i64 => "longs",
+                f64 => "doubles",
+                i128 => "wides",
+                else => @compileError("PassRows scratch holds i64, f64 or i128"),
+            };
+            if (self.* == @field(std.meta.Tag(Scratch), tag)) {
+                const buf = @field(self.*, tag);
+                if (buf.len >= n) return buf[0..n];
+            }
+            self.free(alloc);
+            const buf = try alloc.alloc(T, n);
+            self.* = @unionInit(Scratch, tag, buf);
+            return buf;
+        }
+    };
+
+    fn convert(self: *PassRows, alloc: Allocator, plan: []const PassColumn, schema: []const Column, batch: Batch) !Batch {
+        if (self.views.len == 0) {
+            self.views = try alloc.alloc(ColumnView, plan.len);
+            self.scratch = alloc.alloc(Scratch, plan.len) catch |e| {
+                alloc.free(self.views);
+                self.views = &.{};
+                return e;
+            };
+            @memset(self.scratch, .none);
+        }
+        const n = batch.row_count;
+        for (plan, self.views, self.scratch) |pc, *v, *s| v.* = switch (pc) {
+            .view => |i| batch.values[i],
+            .one => blk: {
+                const out = try s.take(alloc, i64, n);
+                @memset(out, 1);
+                break :blk .{ .data = .{ .bigint = out } };
+            },
+            .valid => |i| blk: {
+                const in = batch.values[i];
+                const out = try s.take(alloc, i64, n);
+                for (out, 0..) |*o, r| o.* = @intFromBool(in.isValid(r));
+                break :blk .{ .data = .{ .bigint = out } };
+            },
+            .widen_int => |i| blk: {
+                const in = batch.values[i];
+                const out = try s.take(alloc, i64, n);
+                switch (in.data) {
+                    inline .tinyint, .smallint, .int => |src| for (out, src[0..n]) |*o, x| {
+                        o.* = x;
+                    },
+                    else => return error.UnsupportedOperatorForType,
+                }
+                break :blk .{ .data = .{ .bigint = out }, .nulls = in.nulls };
+            },
+            .widen_float => |i| blk: {
+                const in = batch.values[i];
+                const src = switch (in.data) {
+                    .float => |f| f,
+                    else => return error.UnsupportedOperatorForType,
+                };
+                const out = try s.take(alloc, f64, n);
+                for (out, src[0..n]) |*o, x| o.* = x;
+                break :blk .{ .data = .{ .double = out }, .nulls = in.nulls };
+            },
+            .widen_decimal => |i| blk: {
+                const in = batch.values[i];
+                const src = switch (in.data) {
+                    .decimal64 => |d| d,
+                    else => return error.UnsupportedOperatorForType,
+                };
+                const out = try s.take(alloc, i128, n);
+                for (out, src[0..n]) |*o, x| o.* = x;
+                break :blk .{ .data = .{ .decimal128 = out }, .nulls = in.nulls };
+            },
+        };
+        return .{ .schema = schema, .values = self.views, .row_count = n };
+    }
+
+    fn deinit(self: *PassRows, alloc: Allocator) void {
+        for (self.scratch) |*s| s.free(alloc);
+        if (self.scratch.len > 0) alloc.free(self.scratch);
+        if (self.views.len > 0) alloc.free(self.views);
     }
 };
 

@@ -1515,6 +1515,9 @@ pub const Join = struct {
     /// per-chunk pair scratches + output staging the workers write —
     /// allocated by sinkBind from the scan's thread-safe allocator.
     probe_fused: bool = false,
+    /// A partial aggregate fused below the probe (`tryFuseAggregate`): this
+    /// join's output is the scan's per-chunk partial groups.
+    agg_fused_below: bool = false,
     probe_chunks: []ProbeChunk = &.{},
     probe_chunk_alloc: Allocator = undefined,
     /// A probe-fused join ABOVE this one in a left-deep chain: our per-chunk
@@ -1988,7 +1991,8 @@ pub const Join = struct {
     pub fn tryFuseAggregate(self: *Join, group_cols: []const []const u8, aggs: []const exec.AggSpec) !bool {
         if (!self.probe_fused) return false;
         var probe = if (self.build_is_left) self.right else self.left;
-        return probe.tryFuseAggregate(group_cols, aggs);
+        self.agg_fused_below = try probe.tryFuseAggregate(group_cols, aggs);
+        return self.agg_fused_below;
     }
 
     /// A join whose probe side is THIS join (a left-deep join tail) offers
@@ -2252,6 +2256,93 @@ pub const Join = struct {
         };
     }
 
+    const BuildOutcome = enum { probe, skew, done };
+
+    /// The building phase the first pull runs: build the table, then ready
+    /// the probe. `.skew` when the build handed the join to a sort-merge
+    /// join, `.done` when the join can produce nothing.
+    fn runBuild(self: *Join) !BuildOutcome {
+        self.offerProbeKeys();
+        if (self.probe_fused and try self.empty_fused_probe()) {
+            self.finishPhase();
+            return .done;
+        }
+        // Empty-probe short-circuit: a non-FULL join whose
+        // probe (preserved) side is empty produces nothing, so
+        // skip building the other side entirely. Gated off when
+        // a skew hand-off could fire (INNER only) and transfer
+        // the probe side to an SMJ that wouldn't see the peek.
+        if (self.peeked_probe == null and
+            self.join_type != .full and
+            !self.probe_fused and
+            !(self.join_type == .inner and self.skew_detector != null))
+        {
+            if (try self.nextProbe()) |first| {
+                self.peeked_probe = first;
+            } else {
+                self.finishPhase();
+                return .done;
+            }
+        }
+        const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        try self.buildPhase();
+        if (exec.prof.enabled) {
+            self.prof_build_ticks += exec.prof.nowTicks() - _bt;
+            if (exec.prof.ticksToMs(self.prof_build_ticks) > 30.0 and !self.prof_shared_build) {
+                const build_q = if (self.build_is_left) self.left else self.right;
+                var buf: std.ArrayList(u8) = .empty;
+                defer buf.deinit(std.heap.page_allocator);
+                build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
+                std.debug.print("[hprof] join slow build ({d:.1} ms, {d} rows, {s} on={d}) build-side plan:\n{s}\n", .{
+                    exec.prof.ticksToMs(self.prof_build_ticks),
+                    self.build_rows,
+                    @tagName(self.join_type),
+                    self.left_key_indices.len,
+                    buf.items,
+                });
+            }
+        }
+        if (self.skew_smj != null) return .skew;
+        // Empty-build short-circuit: with nothing to match and
+        // no preserved probe side, the join produces nothing —
+        // skip streaming the probe entirely.
+        if (self.build_rows == 0 and !self.probeSidePreserved()) {
+            self.finishPhase();
+            return .done;
+        }
+        // Sideways info passing: an INNER join only emits probe
+        // rows whose keys fall inside the build keys' [min, max],
+        // so offer that range to the probe subtree as prune hints
+        // (zonemap row-group/segment skips). Only when the probe
+        // hasn't started — Scan.addPrune isn't safe on a running
+        // scan, and a peeked batch means workers are live.
+        if (self.join_type == .inner and self.peeked_probe == null and self.build_rows > 0) {
+            self.offerBuildKeyPrunes();
+        }
+        // FULL OUTER needs a matched-row bitmap so we can
+        // emit the unmatched build rows at the end.
+        if (self.join_type == .full) {
+            self.matched_build = try std.DynamicBitSetUnmanaged.initEmpty(
+                self.allocator,
+                self.build_rows,
+            );
+        }
+        self.passthrough = self.passThroughEligible();
+        self.phase = .probing;
+        return .probe;
+    }
+
+    /// Hand over the per-chunk partials of an aggregate fused below the probe
+    /// (`VTable.takeOwnedChunks`), so the combine above routes on their
+    /// realized size. The build runs first, as the first pull would: the scan
+    /// workers probe this join's table.
+    pub fn takeOwnedChunks(self: *Join) !?exec.OwnedChunks {
+        if (!self.agg_fused_below or self.phase != .building) return null;
+        if (try self.runBuild() != .probe) return null;
+        var probe = if (self.build_is_left) self.right else self.left;
+        return probe.takeOwnedChunks();
+    }
+
     pub fn next(self: *Join) !?Batch {
         // Skew auto-route: if buildPhase detected heavy skew and
         // handed off to SMJ, all subsequent next() calls delegate.
@@ -2260,73 +2351,8 @@ pub const Join = struct {
         while (true) {
             switch (self.phase) {
                 .building => {
-                    self.offerProbeKeys();
-                    if (self.probe_fused and try self.empty_fused_probe()) {
-                        self.finishPhase();
-                        return null;
-                    }
-                    // Empty-probe short-circuit: a non-FULL join whose
-                    // probe (preserved) side is empty produces nothing, so
-                    // skip building the other side entirely. Gated off when
-                    // a skew hand-off could fire (INNER only) and transfer
-                    // the probe side to an SMJ that wouldn't see the peek.
-                    if (self.peeked_probe == null and
-                        self.join_type != .full and
-                        !self.probe_fused and
-                        !(self.join_type == .inner and self.skew_detector != null))
-                    {
-                        if (try self.nextProbe()) |first| {
-                            self.peeked_probe = first;
-                        } else {
-                            self.finishPhase();
-                            return null;
-                        }
-                    }
-                    const _bt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-                    try self.buildPhase();
-                    if (exec.prof.enabled) {
-                        self.prof_build_ticks += exec.prof.nowTicks() - _bt;
-                        if (exec.prof.ticksToMs(self.prof_build_ticks) > 30.0 and !self.prof_shared_build) {
-                            const build_q = if (self.build_is_left) self.left else self.right;
-                            var buf: std.ArrayList(u8) = .empty;
-                            defer buf.deinit(std.heap.page_allocator);
-                            build_q.explain(&buf, std.heap.page_allocator, 0) catch {};
-                            std.debug.print("[hprof] join slow build ({d:.1} ms, {d} rows, {s} on={d}) build-side plan:\n{s}\n", .{
-                                exec.prof.ticksToMs(self.prof_build_ticks),
-                                self.build_rows,
-                                @tagName(self.join_type),
-                                self.left_key_indices.len,
-                                buf.items,
-                            });
-                        }
-                    }
+                    if (try self.runBuild() == .done) return null;
                     if (self.skew_smj) |*sm| return sm.next();
-                    // Empty-build short-circuit: with nothing to match and
-                    // no preserved probe side, the join produces nothing —
-                    // skip streaming the probe entirely.
-                    if (self.build_rows == 0 and !self.probeSidePreserved()) {
-                        self.finishPhase();
-                        return null;
-                    }
-                    // Sideways info passing: an INNER join only emits probe
-                    // rows whose keys fall inside the build keys' [min, max],
-                    // so offer that range to the probe subtree as prune hints
-                    // (zonemap row-group/segment skips). Only when the probe
-                    // hasn't started — Scan.addPrune isn't safe on a running
-                    // scan, and a peeked batch means workers are live.
-                    if (self.join_type == .inner and self.peeked_probe == null and self.build_rows > 0) {
-                        self.offerBuildKeyPrunes();
-                    }
-                    // FULL OUTER needs a matched-row bitmap so we can
-                    // emit the unmatched build rows at the end.
-                    if (self.join_type == .full) {
-                        self.matched_build = try std.DynamicBitSetUnmanaged.initEmpty(
-                            self.allocator,
-                            self.build_rows,
-                        );
-                    }
-                    self.passthrough = self.passThroughEligible();
-                    self.phase = .probing;
                 },
                 .probing => {
                     const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
