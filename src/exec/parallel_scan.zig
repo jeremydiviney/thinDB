@@ -62,6 +62,7 @@ const core_scheduler = @import("../util/core_scheduler.zig");
 const expr_mod = @import("expr.zig");
 const Expr = expr_mod.Expr;
 const ChunkRangeScan = @import("mat_stage.zig").ChunkRangeScan;
+const Aggregate = @import("aggregate.zig").Aggregate;
 const Stage = @import("mat_stage.zig").Stage;
 const MaterializedResult = @import("mat_stage.zig").MaterializedResult;
 
@@ -741,6 +742,45 @@ test "fused partial aggregate keeps aggregating chunks whose partials shrink" {
     const ps = exec.queryAs(ParallelScan, up).?;
     try std.testing.expectEqual(@as(u64, n), ps.partial_rows.load(.monotonic));
     try std.testing.expect(partial_rows < n / 100);
+}
+
+test "fused partial aggregate passes a chunk's second half once its first half shrinks nothing" {
+    const allocator = std.testing.allocator;
+    const mat_stage = @import("mat_stage.zig");
+    const worker_alloc = std.heap.c_allocator;
+
+    // 30 stage chunks cut into 4 units for one runner: its first chunk spans
+    // 8 stage chunks, and no evidence exists when it starts.
+    const batches: usize = 240;
+    const n = batches * PassStub.ROWS;
+    const stub = try allocator.create(PassStub);
+    stub.* = .{ .allocator = allocator, .batches = batches, .unique = true };
+    const set = try mat_stage.StageSet.create(allocator);
+    defer set.deinit();
+    const stage = try set.addStage(exec.makeQuery(allocator, stub), null);
+
+    var up = try ParallelScan.createOverStage(allocator, worker_alloc, stage, null, 1);
+    defer up.deinit();
+    try std.testing.expect(try up.tryFuseAggregate(&pass_group_cols, &pass_aggs));
+
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var counted: i64 = 0;
+    while (try up.next()) |b| {
+        for (0..b.row_count) |r| {
+            const k: usize = @intCast(b.values[0].data.bigint[r]);
+            try std.testing.expect(!seen[k]);
+            seen[k] = true;
+            counted += b.values[1].data.bigint[r];
+            try std.testing.expectEqual(@as(i64, @intCast(k)), b.values[7].data.bigint[r]);
+        }
+    }
+    try std.testing.expectEqual(@as(i64, @intCast(n)), counted);
+    // The first chunk aggregated 4 of its 8 stage chunks, found a group per
+    // row and passed the rest; every later chunk passed whole.
+    const ps = exec.queryAs(ParallelScan, up).?;
+    try std.testing.expectEqual(@as(u64, 4 * mat_stage.chunk_rows), ps.partial_rows.load(.monotonic));
 }
 
 /// A parallel-scan worker leaf — either a range-restricted segment `Scan`
@@ -1918,7 +1958,7 @@ pub const ParallelScan = struct {
             for (q, 0..) |*slot, i| {
                 const pcs = try self.worker_alloc.create(ProbeChunkScan);
                 pcs.* = .{ .ps = self, .chunk = i, .schema = in_schema };
-                slot.* = try self.partialChunk(makeQuery(self.worker_alloc, pcs), group_cols, aggs);
+                slot.* = try self.partialChunk(makeQuery(self.worker_alloc, pcs), i, group_cols, aggs);
                 self.agg_built = i + 1;
             }
             try self.finishFuseAggregate(in_schema, group_cols, aggs);
@@ -1940,23 +1980,23 @@ pub const ParallelScan = struct {
                 inline else => |p| makeQuery(self.worker_alloc, p),
             };
             in_schema = sq.outputSchema();
-            q[i] = try self.partialChunk(sq, group_cols, aggs);
+            q[i] = try self.partialChunk(sq, i, group_cols, aggs);
             self.agg_built = i + 1;
         }
         try self.finishFuseAggregate(in_schema, group_cols, aggs);
         return true;
     }
 
-    /// One chunk's partial aggregate over `source` (`PartialChunk`).
+    /// Chunk `index`'s partial aggregate over `source` (`PartialChunk`).
     /// Doesn't consume `source` on failure.
-    fn partialChunk(self: *ParallelScan, source: Query, group_cols: []const []const u8, aggs: []const exec.AggSpec) !Query {
+    fn partialChunk(self: *ParallelScan, source: Query, index: usize, group_cols: []const []const u8, aggs: []const exec.AggSpec) !Query {
         const chunk = try self.worker_alloc.create(PartialChunk);
         errdefer self.worker_alloc.destroy(chunk);
         const tap = try self.worker_alloc.create(ChunkTap);
         errdefer self.worker_alloc.destroy(tap);
         tap.* = .{ .allocator = self.worker_alloc, .source = source };
-        const agg = try makeQuery(self.worker_alloc, tap).groupBy(group_cols, aggs);
-        chunk.* = .{ .ps = self, .tap = tap, .agg = agg };
+        const core = try Aggregate.createOperator(self.worker_alloc, makeQuery(self.worker_alloc, tap), group_cols, aggs, null, null, null);
+        chunk.* = .{ .ps = self, .index = index, .tap = tap, .core = core, .agg = makeQuery(self.worker_alloc, core) };
         return makeQuery(self.worker_alloc, chunk);
     }
 
@@ -1976,6 +2016,17 @@ pub const ParallelScan = struct {
         const all_groups = self.partial_groups.fetchAdd(groups, .monotonic) + groups;
         const all_rows = self.partial_rows.fetchAdd(rows, .monotonic) + rows;
         if (self.chunk_claims) |c| c.fine.store(all_rows >= PASS_EVIDENCE_ROWS and partialsCollapse(all_groups, all_rows), .monotonic);
+    }
+
+    /// Row groups (stage chunks, for a buffer stripe) chunk `c`'s scan has
+    /// entered and will drain in all, or null when that total isn't known
+    /// before the chunk drains.
+    fn chunkProgress(self: *const ParallelScan, c: usize) ?ChunkProgress {
+        if (c >= self.workers.len) return null;
+        return switch (self.workers[c]) {
+            .segment => |s| if (c < self.chunk_feeds.len) .{ .entered = s.rgs_scanned, .total = self.chunk_feeds[c].share } else null,
+            .chunk => |s| .{ .entered = s.cursor - s.range.chunk_lo, .total = s.range.chunk_hi - s.range.chunk_lo },
+        };
     }
 
     /// Full high-cardinality lease GROUP BY replacement. The aggregate owns this
@@ -3191,26 +3242,66 @@ fn partialsCollapse(groups: u64, rows: u64) bool {
     return groups *| COLLAPSE_ROWS_PER_GROUP <= rows;
 }
 
+const ChunkProgress = struct { entered: u64, total: u64 };
+
 /// One chunk's partial GROUP BY (`tryFuseAggregate`). Pre-aggregating pays a
 /// hash insert per row to shrink what the combine reads, which keys nearly
 /// unique within a chunk never repay. So once the chunks aggregated so far
 /// show their partials shrink nothing, a chunk that starts passes its rows
 /// through as one-row partial groups (`PassRows`) instead; the combine reads
-/// one layout either way. Only whole chunks are evidence: a key that repeats
-/// once per row group (each month of a date-sorted table) looks unique in
-/// any one row group, yet a chunk spanning several collapses it.
+/// one layout either way.
+///
+/// A chunk that starts before that evidence exists judges itself half way
+/// (#658), or every runner's first chunk would aggregate whole: once it has
+/// aggregated half its row groups, rounded up (`chunkProgress`), and at
+/// least `PASS_EVIDENCE_ROWS` rows, a partial that shrinks nothing emits
+/// what it holds, passes the rest through and counts as evidence. Half is
+/// the least it judges on because a key that repeats once per row group
+/// (each month of a date-sorted table) looks unique in any one row group:
+/// the rest, no longer than the half judged, repeats each judged key about
+/// once more at most, and a 2× shrink barely repays the partial's hash
+/// inserts.
 const PartialChunk = struct {
     ps: *ParallelScan,
+    index: usize,
     /// The aggregate's input, owned through `agg`.
     tap: *ChunkTap,
+    /// The aggregate behind `agg`, fed a batch per round while probing.
+    core: *Aggregate,
     agg: Query,
     pass: PassRows = .{},
     groups: u64 = 0,
-    phase: enum { start, aggregate, pass, done } = .start,
+    /// The probe judges on the first batch from beyond the `judge_past`
+    /// row groups after the `probe_from` the scan had entered at the start.
+    probe_from: u64 = 0,
+    judge_past: u64 = 0,
+    /// The batch the probe pulled when it stopped aggregating: passed first.
+    held: ?Batch = null,
+    phase: enum { start, probe, aggregate, flush, pass, done } = .start,
 
     pub fn next(self: *PartialChunk) !?Batch {
         while (true) switch (self.phase) {
-            .start => self.phase = if (self.ps.pass_plan != null and self.ps.partialsShrinkNothing()) .pass else .aggregate,
+            .start => self.phase = self.firstPhase(),
+            .probe => {
+                const batch = (try self.tap.source.next()) orelse {
+                    self.phase = .aggregate;
+                    continue;
+                };
+                const progress = self.ps.chunkProgress(self.index).?;
+                if (progress.entered - self.probe_from > self.judge_past and self.tap.rows >= PASS_EVIDENCE_ROWS) {
+                    const groups: u64 = self.core.liveGroups();
+                    if (shrinksNothing(groups, self.tap.rows)) {
+                        self.ps.notePartials(self.tap.rows, groups);
+                        self.held = batch;
+                        self.phase = .flush;
+                        continue;
+                    }
+                    self.tap.pull = true;
+                    self.phase = .aggregate;
+                }
+                self.tap.fed = batch;
+                if (self.phase == .probe) try self.core.absorb();
+            },
             .aggregate => {
                 if (try self.agg.next()) |batch| {
                     self.groups += batch.row_count;
@@ -3219,15 +3310,32 @@ const PartialChunk = struct {
                 self.ps.notePartials(self.tap.rows, self.groups);
                 self.phase = .done;
             },
+            .flush => {
+                if (try self.agg.next()) |batch| return batch;
+                self.phase = .pass;
+            },
             .pass => {
-                const batch = (try self.tap.source.next()) orelse {
+                const batch = self.held orelse (try self.tap.source.next()) orelse {
                     self.phase = .done;
                     return null;
                 };
+                self.held = null;
                 return try self.pass.convert(self.ps.worker_alloc, self.ps.pass_plan.?, self.agg.outputSchema(), batch);
             },
             .done => return null,
         };
+    }
+
+    fn firstPhase(self: *PartialChunk) @FieldType(PartialChunk, "phase") {
+        const ps = self.ps;
+        if (ps.pass_plan == null) return .aggregate;
+        if (ps.partial_rows.load(.monotonic) >= PASS_EVIDENCE_ROWS) return if (ps.partialsShrinkNothing()) .pass else .aggregate;
+        const progress = ps.chunkProgress(self.index) orelse return .aggregate;
+        if (progress.total < 2) return .aggregate;
+        self.probe_from = progress.entered;
+        self.judge_past = (progress.total + 1) / 2;
+        self.tap.pull = false;
+        return .probe;
     }
 
     pub fn deinit(self: *PartialChunk) void {
@@ -3264,9 +3372,19 @@ const ChunkTap = struct {
     allocator: Allocator,
     source: Query,
     rows: u64 = 0,
+    /// A batch the chunk pulled itself, handed on before any other.
+    fed: ?Batch = null,
+    /// Whether the tap pulls `source` once `fed` is handed on; while its
+    /// chunk probes, it doesn't, so each fed batch is one round of
+    /// `Aggregate.absorb`.
+    pull: bool = true,
 
     pub fn next(self: *ChunkTap) !?Batch {
-        const batch = (try self.source.next()) orelse return null;
+        const batch = self.fed orelse blk: {
+            if (!self.pull) return null;
+            break :blk (try self.source.next()) orelse return null;
+        };
+        self.fed = null;
         self.rows += batch.row_count;
         return batch;
     }

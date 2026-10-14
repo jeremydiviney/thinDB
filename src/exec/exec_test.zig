@@ -1772,6 +1772,52 @@ test "parallel scan: a fused partial aggregate's chunks claim each surviving row
     }
 }
 
+test "parallel scan: a partial aggregate's first chunks judge themselves on half their row groups" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const RG_ROWS = 4096;
+    const db = try api.Database.open(allocator, std.testing.io, tmp.dir, .{
+        .row_group_size = RG_ROWS,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const schema = types.TableSchema{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = RG_ROWS });
+    const Row = struct { id: i64 };
+    // 56 row groups over 8 chunks: each chunk claims 7 and judges on 4.
+    const rows = try allocator.alloc(Row, 56 * RG_ROWS);
+    defer allocator.free(rows);
+    for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i) };
+    try t.insert(rows);
+    try t.flush();
+
+    var q = try exec.ParallelScan.create(allocator, t, null, &.{"id"}, 2);
+    defer q.deinit();
+    const ps = exec.queryAs(exec.ParallelScan, q).?;
+    try std.testing.expect(try q.tryFuseAggregate(&.{"id"}, &.{.{ .func = .count, .col = null, .as = "n" }}));
+    var groups: usize = 0;
+    var counted: i64 = 0;
+    while (try q.next()) |b| {
+        groups += b.row_count;
+        for (b.values[1].data.bigint[0..b.row_count]) |n| counted += n;
+    }
+    try std.testing.expectEqual(rows.len, groups);
+    try std.testing.expectEqual(@as(i64, @intCast(rows.len)), counted);
+
+    // Each id is its own group, so every chunk that aggregated before the
+    // evidence did so for half its claim, rounded up, and noted only that.
+    try std.testing.expectEqual(@as(usize, 7), ps.chunk_feeds[0].share);
+    const judged: u64 = 4 * RG_ROWS;
+    const noted = ps.partial_rows.load(.monotonic);
+    try std.testing.expect(noted > 0 and noted % judged == 0 and noted <= ps.eff_threads * judged);
+}
+
 // A window keeps its input in one block arena per column, so a column holds
 // the buffers it is using and nothing else. A bump arena also kept every
 // buffer the column had outgrown, in nodes larger than the column asked for.

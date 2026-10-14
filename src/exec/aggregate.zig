@@ -1556,6 +1556,21 @@ pub const Aggregate = struct {
         }
     }
 
+    /// Groups formed so far, read between `absorb` rounds. The count-in-slot
+    /// and FOR-narrow inline paths keep their groups in their slot tables
+    /// until emit lowers them, so `n_groups` doesn't count those yet.
+    pub fn liveGroups(self: *const Aggregate) usize {
+        if (self.group_col_indices.len == 0) return 1;
+        if (self.count_table) |t| return t.count();
+        if (self.inline_for) |plan| return switch (plan.tier) {
+            .w8 => self.inline_table_8.?.count(),
+            .w16 => self.inline_table_16.?.count(),
+            .w32 => self.inline_table_32.?.count(),
+            .w64 => self.inline_table_64.?.count(),
+        };
+        return self.n_groups;
+    }
+
     pub fn next(self: *Aggregate) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;
