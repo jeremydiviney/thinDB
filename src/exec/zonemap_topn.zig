@@ -341,7 +341,9 @@ pub const ZonemapTopN = struct {
         var layout = platform.cpuLayout(allocator) catch platform.CpuLayout{ .order = &.{}, .physical_count = 0 };
         defer layout.deinit(allocator);
         const cpu_count = @max(@as(usize, 1), layout.order.len);
-        const n_workers = @max(@as(usize, 1), @min(self.dop, @min(cpu_count, refs.len)));
+        var grant = core_scheduler.reserveWorkers(@min(self.dop, @min(cpu_count, refs.len)));
+        defer grant.release();
+        const n_workers = grant.count;
 
         var next_ref = std.atomic.Value(usize).init(0);
         var stop = std.atomic.Value(bool).init(false);

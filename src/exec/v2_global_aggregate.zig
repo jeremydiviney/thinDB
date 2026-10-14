@@ -1422,6 +1422,20 @@ const GlobalAggregate = struct {
         var n_workers = @max(@as(usize, 1), @min(self.dop, cpu_count));
         if (total_rgs > 0) n_workers = @min(n_workers, total_rgs);
 
+        // Right-size to the row groups that survive zone-map pruning, one
+        // worker per two, as the lowcard handler does: every lane opens its own
+        // scan and partitions its distinct sets n_workers ways.
+        if (self.where_filter) |w| sized: {
+            const probe = Scan.allocWithProjectionLoc(self.allocator, table, null, self.needed, false, snap) catch break :sized;
+            defer probe.deinit();
+            if (!(probe.tryFuseFilter(w) catch break :sized)) break :sized;
+            const surviving = probe.survivingWorkUnits() orelse break :sized;
+            n_workers = @max(@as(usize, 1), @min(n_workers, (surviving + 1) / 2));
+        }
+        var grant = core_scheduler.reserveWorkers(n_workers);
+        defer grant.release();
+        n_workers = grant.count;
+
         const workers = try self.allocator.alloc(Worker, n_workers);
         defer self.allocator.free(workers);
         var built: usize = 0;

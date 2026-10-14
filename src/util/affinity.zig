@@ -145,11 +145,69 @@ fn setLinuxAffinity(mask: u64) void {
     );
 }
 
-/// Unique (package, core) pairs across all sysfs CPU entries. CPUs are
-/// iterated until the first missing `cpuN` directory (kernel keeps them
-/// contiguous); an entry whose topology files are unreadable (offline CPU)
-/// is skipped rather than treated as the end.
+/// Cores this process can actually keep busy, for sizing a statement's
+/// fan-outs (CoreScheduler.workerBudget). Unlike `detect`, not capped at 64
+/// logical CPUs. Physical cores among the CPUs in the affinity set (Linux:
+/// unique (package, core) pairs, so a cpuset-confined container counts its
+/// own cores, not the host's), further capped by a cgroup v2 CPU quota
+/// (`cpu.max`) — a quota-limited container sees every host CPU in its
+/// affinity set but is throttled to the quota.
+pub fn allowedPhysicalCoreCount(allocator: std.mem.Allocator) usize {
+    const cores = switch (builtin.os.tag) {
+        .linux => linuxAllowedPhysicalCoreCount(allocator) orelse physicalCoreCount(allocator),
+        else => physicalCoreCount(allocator),
+    };
+    const quota = cgroupCpuQuotaCores() orelse return cores;
+    return @max(1, @min(cores, quota));
+}
+
+fn linuxAllowedPhysicalCoreCount(allocator: std.mem.Allocator) ?usize {
+    if (builtin.os.tag != .linux) return null;
+    var set = [_]u8{0} ** 128;
+    const rc = std.os.linux.syscall3(.sched_getaffinity, 0, set.len, @intFromPtr(&set));
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    return linuxPhysicalCoreCountIn(allocator, &set) catch null;
+}
+
+/// Smallest `cpu.max` quota along the process's cgroup v2 path, in whole
+/// cores (rounded up). Null when unlimited or not on cgroup v2.
+fn cgroupCpuQuotaCores() ?usize {
+    if (builtin.os.tag != .linux) return null;
+    var buf: [4096]u8 = undefined;
+    const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse return null;
+    var best: ?usize = null;
+    var cur: ?[]const u8 = cgroupV2SelfPath(self_cgroup) orelse "/";
+    while (cur) |p| : (cur = parentCgroupPath(p)) {
+        var path_buf: [512]u8 = undefined;
+        const dir = if (std.mem.eql(u8, p, "/")) "" else p;
+        const full = std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup{s}/cpu.max", .{dir}) catch break;
+        var file_buf: [64]u8 = undefined;
+        const text = readSmallFile(full, &file_buf) orelse continue;
+        const cores = cpuMaxCores(text) orelse continue;
+        best = if (best) |b| @min(b, cores) else cores;
+    }
+    return best;
+}
+
+/// `cpu.max` is "<quota> <period>" in microseconds, or "max <period>".
+fn cpuMaxCores(text: []const u8) ?usize {
+    var parts = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const quota = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    const period = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
+    if (period == 0) return null;
+    return @intCast(@max(1, (quota + period - 1) / period));
+}
+
 fn linuxPhysicalCoreCount(allocator: std.mem.Allocator) !usize {
+    return linuxPhysicalCoreCountIn(allocator, null);
+}
+
+/// Unique (package, core) pairs across the sysfs CPU entries, only those in
+/// `allowed` (a `cpu_set_t`) when given. CPUs are iterated until the first
+/// missing `cpuN` directory (kernel keeps them contiguous); an entry whose
+/// topology files are unreadable (offline CPU) is skipped rather than
+/// treated as the end.
+fn linuxPhysicalCoreCountIn(allocator: std.mem.Allocator, allowed: ?*const [128]u8) !usize {
     if (builtin.os.tag != .linux) return error.QueryFailed;
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(allocator);
@@ -160,6 +218,9 @@ fn linuxPhysicalCoreCount(allocator: std.mem.Allocator) !usize {
         const dir = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}", .{cpu}) catch unreachable;
         const dir_fd = linuxOpenReadonly(dir, true) orelse break;
         _ = std.os.linux.close(dir_fd);
+        if (allowed) |set| {
+            if (cpu >= set.len * 8 or set[cpu / 8] & (@as(u8, 1) << @intCast(cpu % 8)) == 0) continue;
+        }
 
         const core_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}) catch unreachable;
         const core_id = readSysfsInt(core_path) orelse continue;
@@ -413,6 +474,20 @@ test "cgroupLimitValue treats the v1 unlimited sentinel as no cap" {
     try std.testing.expectEqual(@as(?u64, null), cgroupLimitValue(9223372036854771712));
     try std.testing.expectEqual(@as(?u64, null), cgroupLimitValue(std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(?u64, 4294967296), cgroupLimitValue(4294967296));
+}
+
+test "cpuMaxCores reads a cgroup v2 CPU quota in whole cores" {
+    try std.testing.expectEqual(@as(?usize, 8), cpuMaxCores("800000 100000\n"));
+    try std.testing.expectEqual(@as(?usize, 2), cpuMaxCores("150000 100000\n"));
+    try std.testing.expectEqual(@as(?usize, 1), cpuMaxCores("50000 100000"));
+    try std.testing.expectEqual(@as(?usize, null), cpuMaxCores("max 100000\n"));
+    try std.testing.expectEqual(@as(?usize, null), cpuMaxCores(""));
+}
+
+test "allowedPhysicalCoreCount is within the physical core count" {
+    const allowed = allowedPhysicalCoreCount(std.testing.allocator);
+    try std.testing.expect(allowed >= 1);
+    try std.testing.expect(allowed <= physicalCoreCount(std.testing.allocator));
 }
 
 test "totalMemoryBytes reports usable memory" {

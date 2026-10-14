@@ -26,6 +26,7 @@ const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
 const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const rowloc = @import("rowloc.zig");
 
 const Batch = exec.Batch;
@@ -1022,7 +1023,9 @@ fn compareF64(a: f64, b: f64) i8 {
 fn emitResultStage(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: []const SiloCore.TopRow) !void {
     if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, snapshot, rows);
     if (rows.len == 0) return;
-    const workers = emitWorkerCount(op, rows.len);
+    var grant = core_scheduler.reserveWorkers(emitWorkerCount(op, rows.len));
+    defer grant.release();
+    const workers = grant.count;
     if (workers <= 1) {
         try emitPackedRange(op.allocator, op, rows, op.output_cols);
         op.row_count += rows.len;
@@ -1273,7 +1276,9 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: 
     // (an indirect comparison sort through the rows was cache-miss bound).
     // The lift, the order's own passes and the placement stripe the rows
     // over the emit workers: memory-bound and row-independent.
-    const workers = emitWorkerCount(op, rows.len);
+    var grant = core_scheduler.reserveWorkers(emitWorkerCount(op, rows.len));
+    defer grant.release();
+    const workers = grant.count;
     var order = OrderTimes{};
     const t_lift = exec.prof.nowTicks();
     const rowrefs = try allocator.alloc(i64, rows.len);

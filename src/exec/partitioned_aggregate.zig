@@ -46,6 +46,7 @@ const aggregate = @import("aggregate.zig");
 const ir = @import("../ir/ir.zig");
 const hll = @import("../util/hll.zig");
 const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -518,8 +519,9 @@ pub const PartitionedAggregate = struct {
         }
     }
 
-    /// Worker pool: thread `t` scatters slice `t` of each batch and
-    /// aggregates partition `t`.
+    /// Worker pool: unit `i` of a phase scatters slice `i` of the batch or
+    /// works partition `i`. The conn thread and the helpers claim units off
+    /// a shared cursor, so any helper count covers every unit exactly once.
     ///
     ///   .scatter   — the conn thread pulled a batch; every worker copies its
     ///                slice into a chunk and buckets the slice's rows by
@@ -530,13 +532,17 @@ pub const PartitionedAggregate = struct {
     ///   .aggregate — after the last batch, each worker runs the serial
     ///                Aggregate over its partition's rows.
     ///
-    /// The conn thread participates as worker 0 in every phase.
+    /// The conn thread claims units in every phase too.
     const Pool = struct {
         owner: *PartitionedAggregate,
+        /// Spawned helper threads.
+        helpers: usize = 0,
         batch: Batch = undefined,
         slices: usize = 0,
         mode: Mode = .scatter,
         epoch: parallel.WorkEpoch = .{},
+        next_unit: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        /// Units finished this phase.
         done: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         parked: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -546,15 +552,28 @@ pub const PartitionedAggregate = struct {
         /// Between phases a worker parks: while the conn thread pulls a
         /// slow upstream, spinning or yielding here kept every worker's core
         /// busy for the whole statement.
-        fn workerMain(pool: *Pool, worker_idx: usize) void {
+        fn workerMain(pool: *Pool) void {
             var seen: u32 = 0;
             while (true) {
                 seen = pool.epoch.waitPast(seen);
                 if (pool.stop.load(.acquire)) return;
                 _ = pool.parked.fetchSub(1, .acq_rel);
-                pool.runPhase(worker_idx);
-                _ = pool.done.fetchAdd(1, .acq_rel);
+                pool.claimUnits();
                 _ = pool.parked.fetchAdd(1, .acq_rel);
+            }
+        }
+
+        /// Run units off the cursor until none remain. A helper that wakes
+        /// late for a finished phase finds the cursor spent; one that wakes
+        /// into the next phase does that phase's units, which the cursor's
+        /// acquire makes it see the mode and batch of.
+        fn claimUnits(pool: *Pool) void {
+            const n = pool.owner.n_parts;
+            while (true) {
+                const i = pool.next_unit.fetchAdd(1, .acq_rel);
+                if (i >= n) return;
+                pool.runPhase(i);
+                _ = pool.done.fetchAdd(1, .acq_rel);
             }
         }
 
@@ -567,17 +586,19 @@ pub const PartitionedAggregate = struct {
             }
         }
 
-        /// Publish a phase, work unit 0 on this thread, wait for every
-        /// unit done AND every worker re-parked (cycles never overlap).
+        /// Publish a phase, claim units on this thread too, wait for every
+        /// unit done AND every helper re-parked (cycles never overlap). The
+        /// done count resets before the cursor reopens, so no unit of this
+        /// phase can finish into the last phase's count.
         fn runBarrier(pool: *Pool, mode: Mode) void {
-            const self = pool.owner;
-            pool.mode = mode;
+            const n = pool.owner.n_parts;
             pool.done.store(0, .release);
+            pool.mode = mode;
+            pool.next_unit.store(0, .release);
             pool.epoch.publish();
-            pool.runPhase(0);
-            const want = self.n_parts - 1;
+            pool.claimUnits();
             var spins: usize = 0;
-            while (pool.done.load(.acquire) < want or pool.parked.load(.acquire) < want) {
+            while (pool.done.load(.acquire) < n or pool.parked.load(.acquire) < pool.helpers) {
                 spins += 1;
                 if (spins < 4096) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
             }
@@ -861,24 +882,24 @@ pub const PartitionedAggregate = struct {
         var pool = Pool{ .owner = self };
         defer for (self.workers) |*w| w.hashes.deinit(self.worker_alloc);
 
-        var threads: [MAX_PARTS]?std.Thread = .{null} ** MAX_PARTS;
+        var threads: [MAX_PARTS]std.Thread = undefined;
         var spawned: usize = 0;
-        pool.parked.store(self.n_parts - 1, .release);
-        {
-            var t: usize = 1;
-            while (t < self.n_parts) : (t += 1) {
-                threads[t] = std.Thread.spawn(.{}, Pool.workerMain, .{ &pool, t }) catch null;
-                if (threads[t] != null) spawned += 1;
-            }
+        var grant = core_scheduler.reserveWorkers(self.n_parts);
+        while (spawned + 1 < grant.count) {
+            threads[spawned] = std.Thread.spawn(.{}, Pool.workerMain, .{&pool}) catch break;
+            spawned += 1;
         }
+        // Helpers wait for the first publish before touching `parked`.
+        pool.helpers = spawned;
+        pool.parked.store(spawned, .release);
         defer {
             pool.stop.store(true, .release);
             pool.epoch.publish();
-            for (threads[1..self.n_parts]) |maybe| if (maybe) |th| th.join();
+            for (threads[0..spawned]) |th| th.join();
+            grant.release();
         }
-        // Spawn failures degrade by folding every unit into the conn
-        // thread's phase work.
-        const spawn_ok = spawned == self.n_parts - 1;
+        // With no helper the conn thread folds every unit inline.
+        const spawn_ok = spawned > 0;
 
         self.track_ndv = self.core == .auto and heavyStateAggCount(self.aggs) >= 2;
         // The `auto` core settles on hash at the first round unless the keys

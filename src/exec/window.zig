@@ -27,6 +27,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const Column = types.Column;
 const Type = types.Type;
 const Value = types.Value;
@@ -653,8 +654,11 @@ pub const Window = struct {
         var g = Gather{ .win = self, .perm = perm, .arenas = arenas, .stores = stores };
         var threads: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var spawned: usize = 0;
+        var grant: core_scheduler.Workers = .{};
+        defer grant.release();
         if (self.dop > 1 and ncols >= 2 and !builtin.is_test) {
-            const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
+            grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, ncols - 1), max_drain_workers) + 1);
+            const want = grant.count - 1;
             while (spawned < want) {
                 threads[spawned] = std.Thread.spawn(.{}, Gather.run, .{&g}) catch break;
                 spawned += 1;
@@ -996,10 +1000,12 @@ pub const Window = struct {
         var n_workers: usize = 0;
         var max_tiles: usize = 1;
         var may_fan_out = self.dop > 1 and ncols >= 2 and !builtin.is_test;
+        var drain_grant: core_scheduler.Workers = .{};
         defer {
             pd.stop.store(true, .release);
             pd.epoch.publish();
             for (workers[0..n_workers]) |maybe| if (maybe) |t| t.join();
+            drain_grant.release();
             if (pd.preps.len > 0) self.allocator.free(pd.preps);
             if (pd.bounds.len > 0) self.allocator.free(pd.bounds);
         }
@@ -1022,7 +1028,8 @@ pub const Window = struct {
             self.reserved_bytes += b;
             if (may_fan_out and self.accumulated_rows + batch.row_count >= drain_fan_out_rows) {
                 may_fan_out = false;
-                const want = @min(@min(self.dop - 1, ncols - 1), max_drain_workers);
+                drain_grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, ncols - 1), max_drain_workers) + 1);
+                const want = drain_grant.count - 1;
                 while (n_workers < want) {
                     workers[n_workers] = std.Thread.spawn(.{}, ParDrain.worker, .{&pd}) catch break;
                     n_workers += 1;
@@ -1191,6 +1198,17 @@ pub const Window = struct {
     /// outweighs the sort it splits.
     const parallel_min_rows: usize = 65536;
 
+    /// Rows a parallel sort worker should have before another joins it: half
+    /// the threshold, so a just-qualifying input runs on two.
+    const parallel_rows_per_worker: usize = parallel_min_rows / 2;
+
+    /// Workers for a parallel sort or evaluation over `n` rows, held against
+    /// the machine's fan-out budget. Every phase is correct at any count.
+    fn reserveSortWorkers(self: *const Window, n: usize) core_scheduler.Workers {
+        const by_rows = std.math.divCeil(usize, n, parallel_rows_per_worker) catch 1;
+        return core_scheduler.reserveWorkers(@min(@min(self.dop, 32), by_rows));
+    }
+
     /// Partition-bucket parallel sort + evaluation for one spec:
     ///   A (parallel) fill composite keys per row range + count rows per
     ///     (worker, bucket) — bucket = partition-digest low bits, so a
@@ -1204,7 +1222,9 @@ pub const Window = struct {
     ///     across buckets (validity bit bytes excepted; those writes are
     ///     atomic RMW in setValid/setNull).
     fn evaluateSpecParallel(self: *Window, si: SpecIndices, spec_i: usize, n: usize) !void {
-        const workers: usize = @min(@max(self.dop, 2), 32);
+        var grant = self.reserveSortWorkers(n);
+        defer grant.release();
+        const workers = grant.count;
         const bucket_count: usize = @min(@as(usize, 256), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
 
         const acc = self.upstream.accountant();
@@ -1389,7 +1409,9 @@ pub const Window = struct {
     /// form the global sorted permutation, which the caller evaluates
     /// serially. Returns the perm; caller frees.
     fn buildPermutationSamplesort(self: *Window, si: SpecIndices, n: usize) ![]u32 {
-        const workers: usize = @min(@max(self.dop, 2), 32);
+        var grant = self.reserveSortWorkers(n);
+        defer grant.release();
+        const workers = grant.count;
         const bucket_count: usize = @min(@as(usize, 256), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
 
         const acc = self.upstream.accountant();
@@ -1482,6 +1504,8 @@ pub const Window = struct {
             .column = &self.output_columns[out_idx],
             .string_scratch = if (self.string_outputs[out_idx].len > 0) self.string_outputs[out_idx] else null,
         };
+        var grant = self.reserveSortWorkers(n);
+        defer grant.release();
         var job = GlobalEvalJob{
             .win = self,
             .si = si,
@@ -1489,7 +1513,7 @@ pub const Window = struct {
             .cell = cell,
             .perm = perm,
             .n = n,
-            .workers = @min(@max(self.dop, 2), 32),
+            .workers = grant.count,
         };
         var threads: [32]std.Thread = undefined;
         var spawned: usize = 0;

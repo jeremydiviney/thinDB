@@ -4063,11 +4063,14 @@ pub fn runRegionOrdered(
 ) !void {
     const alloc = pool.alloc;
     try pool.acquire(prog, opts, &.{});
+    var grant = core_scheduler.reserveWorkers(opts.n_threads);
+    defer grant.release();
+    const n_workers = grant.count;
 
-    const errs = try alloc.alloc(?anyerror, opts.n_threads);
+    const errs = try alloc.alloc(?anyerror, n_workers);
     defer alloc.free(errs);
     @memset(errs, null);
-    const threads = try alloc.alloc(std.Thread, opts.n_threads);
+    const threads = try alloc.alloc(std.Thread, n_workers);
     defer alloc.free(threads);
 
     const trace = getenv("THINDB_REGION_TRACE") != null;
@@ -4116,7 +4119,7 @@ pub fn runRegionOrdered(
     std.mem.sortUnstable(u32, order, sd_ctx, SizeDesc.less);
     const assign_col = try alloc.alloc(usize, intervals.len);
     defer alloc.free(assign_col);
-    const loads = try alloc.alloc(u64, opts.n_threads);
+    const loads = try alloc.alloc(u64, n_workers);
     defer alloc.free(loads);
     @memset(loads, 0);
     for (order) |ivi| {
@@ -4128,7 +4131,7 @@ pub fn runRegionOrdered(
         loads[best] += sd_ctx.weight(ivi);
     }
 
-    const scan_ticks = try alloc.alloc(i64, opts.n_threads);
+    const scan_ticks = try alloc.alloc(i64, n_workers);
     defer alloc.free(scan_ticks);
     @memset(scan_ticks, 0);
     const iv_ticks = try alloc.alloc(i64, intervals.len);
@@ -4148,16 +4151,16 @@ pub fn runRegionOrdered(
         .scan_ticks = scan_ticks,
         .iv_ticks = iv_ticks,
         .result = result,
-        .slots = pool.slots.items[0..opts.n_threads],
+        .slots = pool.slots.items[0..n_workers],
         .alloc = alloc,
         .errs = errs,
     };
     var spawned: usize = 0;
-    for (0..opts.n_threads - 1) |w| {
+    for (0..n_workers - 1) |w| {
         threads[w] = try std.Thread.spawn(.{}, OrderedExecPhase.worker, .{ &phase, w });
         spawned += 1;
     }
-    phase.worker(opts.n_threads - 1);
+    phase.worker(n_workers - 1);
     for (threads[0..spawned]) |t| t.join();
     for (errs) |e| if (e) |err| return err;
 
@@ -4172,20 +4175,20 @@ pub fn runRegionOrdered(
         var scan_cpu: i64 = 0;
         for (scan_ticks) |t| scan_cpu += t;
         std.debug.print("[region] ORDERED FUSED total={d:.0}ms intervals={d} direct={d} scan_cpu={d:.0}ms out_rows={d} threads={d}\n", .{
-            exec.prof.ticksToMs(t2 - t0), sources.len, phase.direct.load(.monotonic), exec.prof.ticksToMs(scan_cpu), rows, opts.n_threads,
+            exec.prof.ticksToMs(t2 - t0), sources.len, phase.direct.load(.monotonic), exec.prof.ticksToMs(scan_cpu), rows, n_workers,
         });
         var con: i64 = 0;
-        for (pool.slots.items[0..opts.n_threads]) |slot| con += slot.rw.consolidate_ticks;
+        for (pool.slots.items[0..n_workers]) |slot| con += slot.rw.consolidate_ticks;
         std.debug.print("[region]   consolidate={d:.0}ms(cpu)", .{exec.prof.ticksToMs(con)});
         for (prog.ops, 0..) |op, oi| {
             var t: i64 = 0;
-            for (pool.slots.items[0..opts.n_threads]) |slot| {
+            for (pool.slots.items[0..n_workers]) |slot| {
                 if (slot.rw.op_ticks) |ticks| t += ticks[oi];
             }
             std.debug.print(" op{d}:{s}={d:.0}ms", .{ oi, @tagName(op), exec.prof.ticksToMs(t) });
         }
         std.debug.print("\n", .{});
-        printProbePhases(pool, prog, opts.n_threads);
+        printProbePhases(pool, prog, n_workers);
     }
     pool.releaseRun();
 }
@@ -4441,7 +4444,9 @@ pub fn runRegionPooled(
         std.debug.print("[region] pool acquire={d:.0}ms\n", .{exec.prof.ticksToMs(exec.prof.nowTicks() - t_acq)});
     }
     const ex = &pool.ex.?;
-    const n_workers = runWorkers(opts);
+    var scan_grant = core_scheduler.reserveWorkers(runWorkers(opts));
+    defer scan_grant.release();
+    const n_workers = scan_grant.count;
     ex.active = n_workers;
     for (pool.side_ex) |*sex| sex.active = n_workers;
 
@@ -4486,6 +4491,7 @@ pub fn runRegionPooled(
     }
     scan_phase.worker(n_workers - 1);
     for (threads[0..spawned]) |t| t.join();
+    scan_grant.release();
     for (errs) |e| if (e) |err| return err;
 
     if (defer_sort) {
@@ -4499,9 +4505,11 @@ pub fn runRegionPooled(
     const t1 = if (trace) exec.prof.nowTicks() else 0;
     var exchanged: usize = 0;
     for (0..ex.n_shards) |sh| exchanged += ex.shardRows(sh);
-    const bins = try packBins(alloc, ex, shardWorkersFor(opts.n_threads, exchanged));
+    var shard_grant = core_scheduler.reserveWorkers(shardWorkersFor(opts.n_threads, exchanged));
+    defer shard_grant.release();
+    const bins = try packBins(alloc, ex, shard_grant.count);
     defer freeBins(alloc, bins);
-    const shard_workers = @max(1, @min(shardWorkersFor(opts.n_threads, exchanged), bins.len));
+    const shard_workers = @max(1, @min(shard_grant.count, bins.len));
     const shard_busy: ?[]i64 = if (trace) try alloc.alloc(i64, shard_workers) else null;
     defer if (shard_busy) |b| alloc.free(b);
     if (shard_busy) |b| @memset(b, 0);
