@@ -945,6 +945,9 @@ pub const ParallelScan = struct {
     // generation barrier (no std.Thread.Condition in this Zig fork): main bumps
     // `round_gen` to release them and waits on `round_done` to reach `n_chunks`.
     pool_started: bool = false,
+    /// The round pool's threads, held against the machine's fan-out budget
+    /// while the pool lives.
+    pool_workers: core_scheduler.Workers = .{},
     round_gen: std.atomic.Value(u32) = .{ .raw = 0 },
     round_done: std.atomic.Value(u32) = .{ .raw = 0 },
     pool_shutdown: std.atomic.Value(bool) = .{ .raw = false },
@@ -1664,7 +1667,9 @@ pub const ParallelScan = struct {
             .cap = cap,
         };
         for (collect.dead[0..cols.len], slot_col[0..cols.len]) |*d, c| d.store(c == null, .monotonic);
-        const threads = @max(@as(usize, 1), @min(self.n_threads, passes.len));
+        var grant = core_scheduler.reserveWorkers(@min(self.n_threads, passes.len));
+        defer grant.release();
+        const threads = grant.count;
         const states = try self.allocator.alloc(KeyCollect.State, threads);
         defer self.allocator.free(states);
         for (states) |*st| st.* = .{ .arena = std.heap.ArenaAllocator.init(self.worker_alloc) };
@@ -2632,9 +2637,9 @@ pub const ParallelScan = struct {
         self.reserved_bytes += total;
     }
 
-    /// Threads actually worth spawning: the configured DOP clamped by the work
-    /// that survives zone-map pruning (`Scan.survivingWorkUnits`) and by the
-    /// machine's idle hardware threads. Runs at spawn time — the first `next()`
+    /// Threads worth asking the fan-out budget for: the configured DOP
+    /// clamped by the work that survives zone-map pruning
+    /// (`Scan.survivingWorkUnits`). Runs at spawn time — the first `next()`
     /// — which is after the Query is composed, so the workers' prune hints are
     /// installed. No hints → full DOP.
     fn effectiveThreads(self: *ParallelScan) usize {
@@ -2646,12 +2651,7 @@ pub const ParallelScan = struct {
             @min(self.n_threads, (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD)
         else
             self.n_threads;
-        // Helpers beyond the idle hardware threads only time-slice against
-        // other statements' workers: they add spawn, join and per-worker state
-        // but no throughput. The calling thread runs regardless, and chunks are
-        // claimed from a shared cursor, so the result is the same at any count.
-        const idle = core_scheduler.global().idleHardwareThreads();
-        return @max(@as(usize, 1), @min(by_work, idle +| 1));
+        return @max(@as(usize, 1), by_work);
     }
 
     /// Spawn `effectiveThreads()-1` workers (the calling thread is the last);
@@ -2660,7 +2660,11 @@ pub const ParallelScan = struct {
     /// static per-thread slices can't (survivor count ≠ bytes for filter/regex).
     fn workSteal(self: *ParallelScan, drainables: anytype, ta: Allocator) void {
         const left = drainables.len - @min(self.next_chunk.load(.monotonic), drainables.len);
-        const eff = @max(@as(usize, 1), @min(self.effectiveThreads(), left));
+        // Chunks are claimed from a shared cursor, so the result is the same at
+        // any granted count.
+        var grant = core_scheduler.reserveWorkers(@min(self.effectiveThreads(), left));
+        defer grant.release();
+        const eff = grant.count;
         self.eff_threads = @max(self.eff_threads, eff);
         if (self.chunk_claims) |c| c.runners = eff;
         var t: usize = 1;
@@ -2961,7 +2965,8 @@ pub const ParallelScan = struct {
         self.round_done.store(0, .monotonic);
         self.pool_shutdown.store(false, .monotonic);
         @memset(self.thread_active, false);
-        const eff = self.effectiveThreads();
+        self.pool_workers = core_scheduler.reserveWorkers(self.effectiveThreads());
+        const eff = self.pool_workers.count;
         self.eff_threads = eff;
         var i: usize = 1;
         while (i < eff) : (i += 1) {
@@ -2985,6 +2990,7 @@ pub const ParallelScan = struct {
                 self.thread_active[i] = false;
             }
         }
+        self.pool_workers.release();
         self.pool_started = false;
     }
 };

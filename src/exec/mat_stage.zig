@@ -39,6 +39,7 @@ const types = @import("../types.zig");
 const engine = @import("../engine/engine.zig");
 const storage = @import("../storage/storage.zig");
 const BlockArena = @import("../util/block_arena.zig").BlockArena;
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -546,7 +547,9 @@ fn castStageColumn(
     const ov = (try exec.scalar_fn.resolve(aa, fn_name, &.{src_type})) orelse return null;
     if (ov.func.null_strategy != .propagates or ov.func.udf_kernel != null) return null;
     if (ov.func.typed_kernel == null and ov.func.kernel == null) return null;
-    const workers = @max(@as(usize, 1), @min(@min(threads, MAX_CAST_WORKERS), rows / FILL_ROWS_PER_WORKER));
+    var grant = core_scheduler.reserveWorkers(@min(@min(threads, MAX_CAST_WORKERS), rows / FILL_ROWS_PER_WORKER));
+    defer grant.release();
+    const workers = grant.count;
     if (workers == 1) return try castRows(allocator, ov, src_type, src, rows);
 
     // Kernels allocate as they append, and `allocator` may be an arena, so
@@ -583,6 +586,7 @@ fn castStageColumn(
     for (1..workers) |w| {
         if (handles[w]) |t| t.join() else jobs[w].run();
     }
+    grant.release();
     var bytes: usize = 0;
     for (jobs[0..workers]) |*job| {
         if (job.err) |err| return err;
@@ -860,7 +864,9 @@ fn fillContiguous(scratch: Allocator, store_alloc: Allocator, stores: []engine.C
         }
     };
     const fill = Fill{ .parts = parts, .preps = preps, .stores = stores, .ncols = ncols };
-    const n_workers = @max(@as(usize, 1), @min(threads, total / FILL_ROWS_PER_WORKER));
+    var grant = core_scheduler.reserveWorkers(@min(threads, total / FILL_ROWS_PER_WORKER));
+    defer grant.release();
+    const n_workers = grant.count;
     const cuts = try scratch.alloc(usize, n_workers + 1);
     for (cuts[0..n_workers], 0..) |*c, w| c.* = (w * total / n_workers) & ~@as(usize, 7);
     cuts[n_workers] = total;

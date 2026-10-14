@@ -1629,6 +1629,9 @@ const LowCardGroup = struct {
             } else probe.survivingWorkUnits() orelse break :sized;
             n_workers = @max(@as(usize, 1), @min(n_workers, @max((surviving + 1) / 2, 1)));
         }
+        var grant = core_scheduler.reserveWorkers(n_workers);
+        defer grant.release();
+        n_workers = grant.count;
         var tiles = try RowGroupTiles.init(allocator, total_rgs, surviving_mask, n_workers, TILE_RGS);
         defer tiles.deinit(allocator);
 

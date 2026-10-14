@@ -25,6 +25,7 @@ const exec = @import("exec.zig");
 const ir = @import("../ir/ir.zig");
 const types = @import("../types.zig");
 const aggregate_op = @import("aggregate.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const ColumnView = @import("../storage/storage.zig").ColumnView;
 
 /// The two-phase partial/combine split carries exactly these functions.
@@ -291,7 +292,9 @@ pub const ParallelReduceAggregate = struct {
 
     fn runWorkers(self: *ParallelReduceAggregate) !void {
         const aa = self.spec_arena.allocator();
-        self.workers = try aa.alloc(Worker, self.dop);
+        var grant = core_scheduler.reserveWorkers(self.dop);
+        defer grant.release();
+        self.workers = try aa.alloc(Worker, grant.count);
         for (self.workers) |*w| {
             w.* = .{ .arena = std.heap.ArenaAllocator.init(self.worker_alloc), .agg = undefined };
             const wa = w.arena.allocator();

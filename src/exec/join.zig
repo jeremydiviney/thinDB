@@ -33,6 +33,7 @@ const ColumnStore = engine.ColumnStore;
 
 const exec = @import("exec.zig");
 const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const Query = exec.Query;
 
 const Batch = exec.Batch;
@@ -1222,7 +1223,11 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
     var t_insert: i64 = 0;
     if (ranged_build) {
         const range_len: u64 = cap / PARALLEL_INSERT_RANGES;
-        const workers: usize = @max(@as(usize, 1), @min(threads, MAX_DIGEST_WORKERS));
+        // One count for both partition passes and the insert: the scatter
+        // writes through cursors the tag pass laid out per worker range.
+        var grant = core_scheduler.reserveWorkers(@min(threads, MAX_DIGEST_WORKERS));
+        defer grant.release();
+        const workers = grant.count;
         const ranged_rows = try partitionRows(scratch, kind, digest_views, null_safe_keys, digests, mask, std.math.log2_int(u64, range_len), workers);
         defer ranged_rows.free(scratch);
         t_insert = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -1323,7 +1328,9 @@ fn digestRange(comptime kind: FastKeyKind, views: []const ColumnView, null_safe_
 fn digestAll(kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, digests: []u64, threads: usize) void {
     const n: u32 = @intCast(digests.len);
     const by_rows: usize = n / DIGEST_ROWS_PER_WORKER;
-    const workers: usize = @max(@as(usize, 1), @min(@min(threads, by_rows), MAX_DIGEST_WORKERS));
+    var grant = core_scheduler.reserveWorkers(@min(@min(threads, by_rows), MAX_DIGEST_WORKERS));
+    defer grant.release();
+    const workers = grant.count;
     var jobs: [MAX_DIGEST_WORKERS]DigestJob = undefined;
     for (0..workers) |w| {
         jobs[w] = .{

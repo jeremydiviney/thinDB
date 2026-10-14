@@ -42,6 +42,7 @@ const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
 const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const Column = types.Column;
 const Value = types.Value;
 
@@ -603,10 +604,12 @@ pub const TableFnExec = struct {
         var dworkers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
         var n_dworkers: usize = 0;
         var max_tiles: usize = 1;
+        var drain_grant: core_scheduler.Workers = .{};
         defer {
             dp.stop.store(true, .release);
             dp.epoch.publish();
             for (dworkers[0..n_dworkers]) |maybe| if (maybe) |t| t.join();
+            drain_grant.release();
             if (dp.preps.len > 0) self.allocator.free(dp.preps);
             if (dp.bounds.len > 0) self.allocator.free(dp.bounds);
         }
@@ -621,7 +624,8 @@ pub const TableFnExec = struct {
             defer if (converts) self.releaseConverted(0, conv_views);
             if (may_fan_out and accumulated + batch.row_count >= fan_out_rows) {
                 may_fan_out = false;
-                const want = @min(@min(self.dop - 1, owned.len - 1), max_drain_workers);
+                drain_grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, owned.len - 1), max_drain_workers) + 1);
+                const want = drain_grant.count - 1;
                 while (n_dworkers < want) {
                     dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
                     n_dworkers += 1;
@@ -800,7 +804,9 @@ pub const TableFnExec = struct {
         }
 
         defer if (trace) std.debug.print("[tvf] partitions: {d:.0}ms\n", .{prof.ticksToMs(prof.nowTicks() - t0)});
-        const n_workers = if (allow_parallel) @min(self.dop, runs.items.len) else 1;
+        var grant = core_scheduler.reserveWorkers(if (allow_parallel) @min(self.dop, runs.items.len) else 1);
+        defer grant.release();
+        const n_workers = grant.count;
         if (n_workers <= 1) {
             var runner = try Runner.init(self.allocator, self, input_views, kernel_views, perm, max_run, self.output_cols);
             defer runner.deinit();
@@ -808,6 +814,7 @@ pub const TableFnExec = struct {
         } else {
             try self.executeParallel(input_views, kernel_views, perm, max_run, runs.items, n_workers);
         }
+        grant.release();
         try self.gatherPassthrough(input_views, perm, identity_perm, if (allow_parallel) self.dop else 1);
     }
 
@@ -880,7 +887,9 @@ pub const TableFnExec = struct {
             }
         };
         var ctx = Ctx{ .jobs = jobs, .perm = perm, .contiguous = contiguous };
-        const n_workers = @min(dop, jobs.len);
+        var grant = core_scheduler.reserveWorkers(@min(dop, jobs.len));
+        defer grant.release();
+        const n_workers = grant.count;
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
@@ -1119,7 +1128,9 @@ pub const TableFnExec = struct {
             groups.items.len, prof.ticksToMs(prof.nowTicks() - t_merge),
         });
         const allow_parallel = !builtin.is_test or force_parallel_in_tests;
-        const n_workers = if (allow_parallel) @min(self.dop, groups.items.len) else 1;
+        var grant = core_scheduler.reserveWorkers(if (allow_parallel) @min(self.dop, groups.items.len) else 1);
+        defer grant.release();
+        const n_workers = grant.count;
 
         // Input 0's kernel-visible columns in GROUP-CONTIGUOUS order — the
         // single-input path's bulk gather: one permuted copy per column
@@ -1191,6 +1202,7 @@ pub const TableFnExec = struct {
                 n_workers, groups.items.len, prof.ticksToMs(prof.nowTicks() - t_kernel),
             });
         }
+        grant.release();
         // Pass-through fill (sources = input 0): groups iterate in ascending
         // merged-digest order and input 0's runs are digest-ascending along
         // its sorted perm, so the group-order concat of input 0's spans IS
@@ -1714,7 +1726,9 @@ pub const TableFnExec = struct {
             .out = self.output_cols,
             .alloc = self.allocator,
         };
-        const n_workers = @min(self.dop, cols.items.len);
+        var grant = core_scheduler.reserveWorkers(@min(self.dop, cols.items.len));
+        defer grant.release();
+        const n_workers = grant.count;
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
@@ -2267,7 +2281,13 @@ pub const TableFnExec = struct {
             std.mem.sortUnstable(T, items, ctx, Ctx.less);
             return;
         }
-        const workers: usize = @min(dop, 32);
+        var grant = core_scheduler.reserveWorkers(@min(@min(dop, 32), n >> 16));
+        defer grant.release();
+        const workers = grant.count;
+        if (workers <= 1) {
+            std.mem.sortUnstable(T, items, ctx, Ctx.less);
+            return;
+        }
         const bucket_count: usize = @min(@as(usize, 128), std.math.ceilPowerOfTwoAssert(usize, workers * 4));
 
         // Deterministic evenly-strided sample → splitters. The strict order

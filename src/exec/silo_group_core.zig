@@ -6773,7 +6773,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
     }
     const sized_workers = (work_rgs + RGS_PER_GRID_WORKER - 1) / RGS_PER_GRID_WORKER;
-    const n_workers = @max(@as(usize, 1), @min(dop, @min(cpus.len, @max(sized_workers, 1))));
+    var grant = core_scheduler.reserveWorkers(@min(dop, @min(cpus.len, @max(sized_workers, 1))));
+    defer grant.release();
+    const n_workers = grant.count;
 
     // Narrow the scatter for small filtered inputs. Route blocks hold
     // `route_block_rows` rows PER BUCKET, so at the default 256 buckets a

@@ -39,6 +39,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 const gt = @import("group_table.zig");
 const prof = @import("../util/prof.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 const transform = @import("../engine/transform.zig");
 const ParallelScan = @import("parallel_scan.zig").ParallelScan;
 
@@ -937,6 +938,10 @@ pub const RadixLeaseAggregate = struct {
     cap_groups: usize,
     top_k: ?ResolvedTopK,
     dop: usize,
+    /// Threads this run was granted (`core_scheduler.reserveWorkers`), at
+    /// most `dop`. Shards and lease workers past it stay empty: both phases
+    /// claim their work off shared cursors.
+    run_threads: usize = 1,
     n_shards: usize,
     n_buckets: usize,
     bshift: u6,
@@ -1300,7 +1305,7 @@ pub const RadixLeaseAggregate = struct {
         var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
-        while (t < S) : (t += 1) {
+        while (t < @min(S, self.run_threads)) : (t += 1) {
             threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &mutex, t, &errs[t] }) catch {
                 Entry.go(self, &mutex, t, &errs[t]);
                 continue;
@@ -1447,7 +1452,7 @@ pub const RadixLeaseAggregate = struct {
         var spawned: usize = 0;
         var t: usize = 1;
         if (pscan.compute_fused) {
-            while (t < pscan.n_threads and t < MAX_LEASE_THREADS) : (t += 1) {
+            while (t < pscan.n_threads and t < self.run_threads and t < MAX_LEASE_THREADS) : (t += 1) {
                 threads[spawned] = std.Thread.spawn(.{}, Entry.queryGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
                     Entry.queryGo(self, pscan, &cursor, t, &errs[t]);
                     continue;
@@ -1456,7 +1461,7 @@ pub const RadixLeaseAggregate = struct {
             }
             Entry.queryGo(self, pscan, &cursor, 0, &errs[0]);
         } else {
-            while (t < pscan.n_threads and t < MAX_LEASE_THREADS) : (t += 1) {
+            while (t < pscan.n_threads and t < self.run_threads and t < MAX_LEASE_THREADS) : (t += 1) {
                 threads[spawned] = std.Thread.spawn(.{}, Entry.scanGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
                     Entry.scanGo(self, pscan, &cursor, t, &errs[t]);
                     continue;
@@ -1802,7 +1807,7 @@ pub const RadixLeaseAggregate = struct {
         var spawned: usize = 0;
         // Spawn dop-1 helpers; the calling thread runs the last share.
         var t: usize = 1;
-        while (t < self.dop) : (t += 1) {
+        while (t < self.run_threads) : (t += 1) {
             threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
                 Entry.go(self, &workers[t], &ctr, results); // spawn failed: run inline
                 continue;
@@ -1896,7 +1901,7 @@ pub const RadixLeaseAggregate = struct {
         var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
-        while (t < self.dop) : (t += 1) {
+        while (t < self.run_threads) : (t += 1) {
             threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
                 Entry.go(self, &workers[t], &ctr, results);
                 continue;
@@ -1982,7 +1987,7 @@ pub const RadixLeaseAggregate = struct {
         var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
-        while (t < self.dop) : (t += 1) {
+        while (t < self.run_threads) : (t += 1) {
             threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, plan, &workers[t], &ctr, results }) catch {
                 Entry.go(self, plan, &workers[t], &ctr, results);
                 continue;
@@ -2085,6 +2090,9 @@ pub const RadixLeaseAggregate = struct {
             self.prof_bucket_topk_ticks.store(0, .monotonic);
         }
 
+        var grant = core_scheduler.reserveWorkers(self.dop);
+        defer grant.release();
+        self.run_threads = grant.count;
         const t0 = prof.nowTicks();
         try self.partition();
         const t1 = prof.nowTicks();
