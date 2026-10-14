@@ -6482,6 +6482,13 @@ test "region pool: a run with little work uses fewer workers on the warm exchang
     var result = try RegionResult.init(alloc, prog.output_schema, 4);
     defer result.deinit();
 
+    // The counts below are the work-based sizing; the machine's fan-out
+    // budget would cap them at the runner's physical cores.
+    const sched = core_scheduler.global();
+    const budget_cores = sched.physical_cores;
+    sched.physical_cores = 0;
+    defer sched.physical_cores = budget_cores;
+
     // Broad, selective, broad: each run must see only its own rows, so
     // `clear` has to reach every bucket row the previous run filled.
     const runs = [_]struct { units: ?usize, workers: usize }{
