@@ -1,0 +1,78 @@
+name: external-sql
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        options: [all, sqlite, duckdb, starrocks]
+        default: all
+      protocol:
+        type: choice
+        options: [mysql, postgres]
+        default: mysql
+      dop:
+        type: choice
+        options: ['1', '4']
+        default: '1'
+      filter:
+        description: Optional source/case identifier
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  external-sql:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_arch: x86_64-linux
+          - os: windows-latest
+            zig_arch: x86_64-windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ZIG_VERSION: 0.16.0
+      RUSTUP_TOOLCHAIN: 1.94.0
+      SQL_SUITE: ${{ inputs.suite }}
+      SQL_PROTOCOL: ${{ inputs.protocol }}
+      SQL_DOP: ${{ inputs.dop }}
+      SQL_FILTER: ${{ inputs.filter }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        shell: bash
+        run: bash .github/scripts/install-zig.sh ${{ matrix.zig_arch }}
+      - name: Install test-only Rust toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal --component rustfmt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tests/external_sql/target
+          key: external-sql-${{ runner.os }}-1.94.0-${{ hashFiles('tests/external_sql/Cargo.lock') }}
+      - name: Harness tests
+        run: zig build test-external-sql-harness
+      - name: Check harness formatting
+        run: cargo fmt --manifest-path tests/external_sql/Cargo.toml --check
+      - name: Live adapter tests
+        shell: bash
+        run: zig build test-external-sql -Doptimize=ReleaseSafe -Dsql-self-test=true "-Dsql-protocol=$SQL_PROTOCOL" "-Dsql-dop=$SQL_DOP"
+      - name: Run imported suites
+        shell: bash
+        run: |
+          args=(-Doptimize=ReleaseSafe "-Dsql-suite=$SQL_SUITE" "-Dsql-protocol=$SQL_PROTOCOL" "-Dsql-dop=$SQL_DOP")
+          if [[ -n "$SQL_FILTER" ]]; then args+=("-Dsql-filter=$SQL_FILTER"); fi
+          zig build test-external-sql "${args[@]}"
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: external-sql-${{ runner.os }}-${{ inputs.protocol }}-dop${{ inputs.dop }}
+          path: tests/external_sql/artifacts/
+          if-no-files-found: warn

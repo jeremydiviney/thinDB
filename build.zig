@@ -385,6 +385,33 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(server_exe);
 
+    const external_sql = b.addSystemCommand(&.{ "cargo", "run", "--locked", "--", "--server" });
+    external_sql.setCwd(b.path("tests/external_sql"));
+    external_sql.addArtifactArg(server_exe);
+    external_sql.addArgs(&.{
+        "--suite",        b.option([]const u8, "sql-suite", "External SQL suite: all, sqlite, duckdb, starrocks") orelse "all",
+        "--protocol",     b.option([]const u8, "sql-protocol", "External SQL wire: mysql or postgres") orelse "mysql",
+        "--max-dop",      b.fmt("{d}", .{b.option(u32, "sql-dop", "External SQL server max DOP: 1 or 4") orelse 1}),
+        "--timeout",      b.fmt("{d}", .{b.option(u32, "sql-timeout", "External SQL per-statement timeout in seconds") orelse 30}),
+        "--file-timeout", b.fmt("{d}", .{b.option(u32, "sql-file-timeout", "External SQL per-file timeout in seconds") orelse 600}),
+    });
+    if (b.option([]const u8, "sql-filter", "External SQL source/case identifier filter")) |filter| {
+        external_sql.addArgs(&.{ "--filter", filter });
+    }
+    if (b.option(bool, "sql-self-test", "Exercise the external SQL adapter against a disposable server") orelse false) {
+        external_sql.addArg("--self-test");
+    }
+    if (b.option([]const u8, "sql-compare-run", "Compare to a previous external SQL results.json (absolute path)")) |previous| {
+        external_sql.addArgs(&.{ "--compare-run", previous });
+    }
+    external_sql.has_side_effects = true;
+    b.step("test-external-sql", "Run independent upstream SQL correctness suites (requires Rust)").dependOn(&external_sql.step);
+
+    const external_harness_tests = b.addSystemCommand(&.{ "cargo", "test", "--locked" });
+    external_harness_tests.setCwd(b.path("tests/external_sql"));
+    external_harness_tests.has_side_effects = true;
+    b.step("test-external-sql-harness", "Test the external SQL harness itself (requires Rust)").dependOn(&external_harness_tests.step);
+
     const run_server = b.addRunArtifact(server_exe);
     run_server.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_server.addArgs(args);
