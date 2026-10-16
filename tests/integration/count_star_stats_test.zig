@@ -84,7 +84,7 @@ fn row3(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![3]i64 {
     return out;
 }
 
-test "mixed COUNT/MIN/MAX metadata lane matches the scan path, bails on tombstones" {
+test "mixed COUNT/MIN/MAX metadata lane matches the scan path with tombstones" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -124,13 +124,14 @@ test "mixed COUNT/MIN/MAX metadata lane matches the scan path, bails on tombston
     );
 
     // Delete the row holding MIN(k) (id=499 → k=501): the stale segment
-    // stats still say 501, so the MIN/MAX lane must bail to the scan path.
+    // stats still say 501, so the lane decodes the row group's live rows.
     try exec(allocator, db, "DELETE FROM t WHERE id >= 499");
     {
         const meta = try row3(allocator, db, meta_sql);
         const scanned = try row3(allocator, db, scan_sql);
         try std.testing.expectEqual(scanned, meta);
         try std.testing.expectEqual([3]i64{ 499, 502, 498 }, meta);
+        try std.testing.expect(try metaBlocksDecoded(allocator, db, meta_sql) != null);
     }
 
     // Counts stay metadata-served under tombstones.
@@ -162,7 +163,7 @@ fn sumAvgRow(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !SumAvg
     return out;
 }
 
-test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segments and bails on tombstones" {
+test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segments, tombstones and memtable rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -208,8 +209,8 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         try std.testing.expectEqual(@as(f64, 180000.0), meta.sum_f);
     }
 
-    // Tombstones poison stored sums/null_counts — the lane must bail to the
-    // scan path and still be exact.
+    // Tombstones make the first segment's stored sums/null_counts stale, so
+    // the lane decodes its row group (one block per column: k, v, f).
     try exec(allocator, db, "DELETE FROM t WHERE id < 9");
     {
         const meta = try sumAvgRow(allocator, db, meta_sql);
@@ -221,9 +222,10 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         try std.testing.expectEqual(@as(i64, 394), meta.count_v);
         try std.testing.expectEqual(@as(f64, (120000.0 - 27.0) / 394.0), meta.avg_v);
         try std.testing.expectEqual(@as(f64, 180000.0 - 40.5), meta.sum_f);
+        try std.testing.expectEqual(@as(?usize, 3), try metaBlocksDecoded(allocator, db, meta_sql));
     }
 
-    // Unflushed memtable rows also force the scan path.
+    // Unflushed memtable rows fold in directly.
     try exec(allocator, db, "INSERT INTO t (id, k, v, f) VALUES (1000, 10, 5, 0.5)");
     {
         const meta = try sumAvgRow(allocator, db, meta_sql);
@@ -231,5 +233,133 @@ test "SUM/AVG/COUNT(nullable) metadata lane matches the scan path across segment
         try std.testing.expectEqual(scanned, meta);
         try std.testing.expectEqual(@as(i64, 359400 - 72 + 10), meta.sum_k);
         try std.testing.expectEqual(@as(i64, 395), meta.count_v);
+        try std.testing.expectEqual(@as(?usize, 3), try metaBlocksDecoded(allocator, db, meta_sql));
     }
+}
+
+/// The `MetaAggStats` lane's decoded-block count from `sql`'s EXPLAIN, or
+/// null when another plan answers `sql`.
+fn metaBlocksDecoded(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !?usize {
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    var plan = try runSql(allocator, db, explain_sql);
+    defer plan.deinit();
+    var found: ?usize = null;
+    while (try plan.next()) |b| {
+        for (0..b.row_count) |i| {
+            const text = b.values[0].data.string.rowBytes(i);
+            if (std.mem.indexOf(u8, text, "MetaAggStats") == null) continue;
+            const end = std.mem.indexOf(u8, text, " row-group blocks decoded") orelse return error.TestUnexpectedResult;
+            const start = (std.mem.lastIndexOfScalar(u8, text[0..end], ' ') orelse return error.TestUnexpectedResult) + 1;
+            found = try std.fmt.parseInt(usize, text[start..end], 10);
+        }
+    }
+    return found;
+}
+
+fn optionalInts(comptime n: usize, allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![n]?i64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    const batch = (try q.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+    var out: [n]?i64 = undefined;
+    for (&out, batch.values[0..n]) |*o, v| {
+        o.* = if (!v.isValid(0)) null else switch (v.data) {
+            .bigint => |d| d[0],
+            .int => |d| d[0],
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    while (try q.next()) |_| {}
+    return out;
+}
+
+test "MIN/MAX decode only the row groups with tombstones whose bounds can still win" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 100 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, v INT, w INT)");
+    const t = try db.openTable("t", .{});
+
+    // Ten row groups of 100 ids. k = id; v = id but NULL over row groups 3
+    // and 9; w is NULL everywhere.
+    const Row = struct { id: i64, k: i64, v: ?i32, w: ?i32 };
+    var rows: [1000]Row = undefined;
+    for (&rows, 0..) |*r, i| {
+        const rg = i / 100;
+        r.* = .{ .id = @intCast(i), .k = @intCast(i), .v = if (rg == 3 or rg == 9) null else @intCast(i), .w = null };
+    }
+    try t.insert(rows[0..]);
+    try t.flush();
+
+    const sql = "SELECT MIN(k), MAX(k), MIN(v), MAX(v), MIN(w), MAX(w) FROM t";
+    const scan_sql = sql ++ " WHERE id >= 0";
+    const Six = [6]?i64;
+
+    try std.testing.expectEqual(Six{ 0, 999, 0, 899, null, null }, try optionalInts(6, allocator, db, sql));
+    try std.testing.expectEqual(@as(?usize, 0), try metaBlocksDecoded(allocator, db, sql));
+
+    // Tombstones in row groups 5, 8 and 9 (the MAX(k) row, the MAX(v) row,
+    // and a row of the all-NULL-v row group 9). MAX(k) decodes row group 9
+    // (bound 999 > the clean 799) and stops at row group 8 (899 < 998);
+    // MAX(v) decodes row group 8 (899 > 799) and stops at row group 5. The
+    // MINs keep their clean 0, and w has no non-NULL row to visit.
+    try exec(allocator, db, "DELETE FROM t WHERE id IN (500, 899, 950, 999)");
+    try std.testing.expectEqual(Six{ 0, 998, 0, 898, null, null }, try optionalInts(6, allocator, db, sql));
+    try std.testing.expectEqual(try optionalInts(6, allocator, db, scan_sql), try optionalInts(6, allocator, db, sql));
+    try std.testing.expectEqual(@as(?usize, 2), try metaBlocksDecoded(allocator, db, sql));
+
+    // An unflushed extreme wins without a decode for MAX(k); MAX(v) still
+    // decodes row group 8.
+    try exec(allocator, db, "INSERT INTO t (id, k, v, w) VALUES (5000, 5000, -7, NULL)");
+    try std.testing.expectEqual(Six{ 0, 5000, -7, 898, null, null }, try optionalInts(6, allocator, db, sql));
+    try std.testing.expectEqual(try optionalInts(6, allocator, db, scan_sql), try optionalInts(6, allocator, db, sql));
+    try std.testing.expectEqual(@as(?usize, 1), try metaBlocksDecoded(allocator, db, sql));
+
+    try exec(allocator, db, "DELETE FROM t WHERE id = 5000");
+    try std.testing.expectEqual(Six{ 0, 998, 0, 898, null, null }, try optionalInts(6, allocator, db, sql));
+
+    // COUNT over nullable columns decodes every row group with tombstones,
+    // once per column, and MAX(v) folds the same decoded rows.
+    const count_sql = "SELECT COUNT(v), COUNT(w), MAX(v) FROM t";
+    try std.testing.expectEqual([3]?i64{ 798, 0, 898 }, try optionalInts(3, allocator, db, count_sql));
+    try std.testing.expectEqual(try optionalInts(3, allocator, db, count_sql ++ " WHERE id >= 0"), try optionalInts(3, allocator, db, count_sql));
+    try std.testing.expectEqual(@as(?usize, 6), try metaBlocksDecoded(allocator, db, count_sql));
+}
+
+test "reads past the stats lane's row budget go to the scan path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 1000 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)");
+    const t = try db.openTable("t", .{});
+
+    const Row = struct { id: i64, k: i64 };
+    const rows = try allocator.alloc(Row, 70_000);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .k = @intCast(i % 1000) };
+    try t.insert(rows);
+    try t.flush();
+
+    // One tombstone in each of the 70 row groups: k = 0.
+    try exec(allocator, db, "DELETE FROM t WHERE k = 0");
+
+    // SUM must decode all 70,000 rows, past the 65,536-row budget.
+    try std.testing.expectEqual([1]?i64{70 * 499_500}, try optionalInts(1, allocator, db, "SELECT SUM(k) FROM t"));
+    try std.testing.expectEqual(@as(?usize, null), try metaBlocksDecoded(allocator, db, "SELECT SUM(k) FROM t"));
+
+    // MAX: the first row group decoded keeps 999, which no other bound beats.
+    try std.testing.expectEqual([1]?i64{999}, try optionalInts(1, allocator, db, "SELECT MAX(k) FROM t"));
+    try std.testing.expectEqual(@as(?usize, 1), try metaBlocksDecoded(allocator, db, "SELECT MAX(k) FROM t"));
+
+    // MIN: every row group's stale min 0 beats the live 1, so the visit
+    // runs out of budget and the scan path answers.
+    try std.testing.expectEqual([1]?i64{1}, try optionalInts(1, allocator, db, "SELECT MIN(k) FROM t"));
+    try std.testing.expectEqual(@as(?usize, null), try metaBlocksDecoded(allocator, db, "SELECT MIN(k) FROM t"));
 }
