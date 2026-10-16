@@ -1,7 +1,5 @@
-mod compare;
 mod corpus;
-mod server;
-mod wire;
+use thindb_external_sql::{compare, server, wire};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;

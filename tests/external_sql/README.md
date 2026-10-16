@@ -168,14 +168,15 @@ result fingerprints/statuses. This catches differences between repeat runs or
 DOP settings. Float fingerprints are exact, even for cases whose reference
 comparison has an explicit tolerance. Use identical suite and filter choices.
 
-## Subsequent generated testing
+## Generated testing
 
-SQLancer is the next phase after accepting this deterministic baseline. It is
-not installed or invoked by these commands. Add a thinDB-specific provider;
-MySQL wire compatibility alone is insufficient to use SQLancer's MySQL grammar.
-Start with bounded integers, strings and NULLs, then implement Ternary Logic
-Partitioning before NoREC-style count comparisons. Preserve seeds, schema/data,
-query pairs and reduced reproductions, and retain discovered regressions here.
-Keep generated jobs manual until a separate rollout decision enables schedules
-or PR gating. ClickHouse corpus imports remain deferred because their engine,
-type, setting and administrative dependencies need independent review.
+The separate [SQLancer provider](sqlancer/README.md) generates bounded integer,
+string and NULL workloads and checks Ternary Logic Partitioning. Run it with
+`zig build test-sqlancer -Doptimize=ReleaseSafe`; Java 21 and Maven are needed in
+addition to Rust. The deterministic commands above do not build or run Java.
+Both suites remain independent of `zig build test`.
+
+Generated jobs are manually triggered. NoREC-style count comparisons and broader
+generated SQL coverage remain follow-ups. ClickHouse corpus imports remain
+deferred because their engine, type, setting and administrative dependencies
+need independent review.

@@ -3,6 +3,7 @@ name = "thindb-external-sql"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "thindb-external-sql"
 
 [dependencies]
 anyhow = "1"

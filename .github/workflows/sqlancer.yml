@@ -1,0 +1,92 @@
+name: sqlancer
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: First random seed
+        type: string
+        default: '0'
+      seeds:
+        description: Number of consecutive seeds (1-1000)
+        type: string
+        default: '3'
+      queries:
+        description: TLP checks per seed (1-100000)
+        type: string
+        default: '100'
+      dop:
+        type: choice
+        options: ['1', '4']
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  sqlancer:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig_arch: x86_64-linux
+          - os: windows-latest
+            zig_arch: x86_64-windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ZIG_VERSION: 0.16.0
+      RUSTUP_TOOLCHAIN: 1.94.0
+      SQLANCER_SEED: ${{ inputs.seed }}
+      SQLANCER_SEEDS: ${{ inputs.seeds }}
+      SQLANCER_QUERIES: ${{ inputs.queries }}
+      SQLANCER_DOP: ${{ inputs.dop }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Zig
+        shell: bash
+        run: bash .github/scripts/install-zig.sh ${{ matrix.zig_arch }}
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21.0.10+7'
+          cache: maven
+          cache-dependency-path: tests/external_sql/sqlancer/pom.xml
+      - name: Install test-only Rust toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal --component rustfmt
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tests/external_sql/target
+          key: sqlancer-${{ runner.os }}-1.94.0-${{ hashFiles('tests/external_sql/Cargo.lock') }}
+      - name: Harness tests
+        run: zig build test-external-sql-harness
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path tests/external_sql/Cargo.toml --check
+      - name: Generate and check SQL
+        shell: bash
+        run: |
+          zig build test-sqlancer -Doptimize=ReleaseSafe \
+            "-Dsqlancer-seed=$SQLANCER_SEED" "-Dsqlancer-seeds=$SQLANCER_SEEDS" \
+            "-Dsqlancer-queries=$SQLANCER_QUERIES" "-Dsqlancer-dop=$SQLANCER_DOP"
+      - name: Live replay and failure tests
+        shell: bash
+        run: |
+          zig build dist -Doptimize=ReleaseSafe
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          python tests/external_sql/sqlancer/validate.py \
+            --runner "tests/external_sql/target/debug/thindb-sqlancer$suffix" \
+            --server "zig-out/bin/thindb-server$suffix"
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: sqlancer-${{ runner.os }}-dop${{ inputs.dop }}
+          path: |
+            tests/external_sql/artifacts/sqlancer/
+            tests/external_sql/sqlancer/target/surefire-reports/
+          if-no-files-found: warn
