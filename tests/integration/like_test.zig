@@ -198,6 +198,8 @@ test "LIKE: a pattern expression matches per row" {
         },
         .{ "SELECT id FROM pt WHERE s LIKE pat ORDER BY id", &[_]i64{ 1, 2, 3 } },
         .{ "SELECT id FROM pt WHERE s NOT LIKE pat ORDER BY id", &[_]i64{6} },
+        .{ "SELECT id FROM t WHERE name LIKE LOWER('AL%') ESCAPE '!' ORDER BY id", &[_]i64{ 1, 2, 5 } },
+        .{ "SELECT id FROM t WHERE name LIKE LOWER('AL!%') ESCAPE '!' ORDER BY id", &[_]i64{} },
     };
     inline for (cases) |c| {
         errdefer std.debug.print("case failed: {s}\n", .{c[0]});
@@ -205,5 +207,5 @@ test "LIKE: a pattern expression matches per row" {
         defer allocator.free(ids);
         try std.testing.expectEqualSlices(i64, c[1], ids);
     }
-    try helpers.expectRunError(allocator, db, "SELECT id FROM t WHERE name LIKE LOWER('A!%') ESCAPE '!'", error.SqlExpectedValue);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM pt WHERE s LIKE pat ESCAPE '!'", error.SqlExpectedValue);
 }

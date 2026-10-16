@@ -35,6 +35,7 @@ const types = @import("../types.zig");
 const Value = types.Value;
 const ir = @import("../ir/ir.zig");
 const parse_window = @import("parse_window.zig");
+const scalar_fn = @import("../exec/scalar_fn.zig");
 const scalar_fn_common = @import("../exec/scalar_fn_common.zig");
 
 pub fn parseBoolExpr(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
@@ -651,9 +652,10 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
         return try makeBetweenExpr(p, col_dup, lo, hi, negate_predicate);
     }
 
-    // LIKE pattern  /  NOT LIKE pattern. A string literal stays on the
-    // `.like` predicate, which scans evaluate against dictionaries and zone
-    // maps; any other pattern (`LOWER('%x%')`, a CONCAT, a column) matches
+    // LIKE pattern  /  NOT LIKE pattern. A string literal, or a constant that
+    // folds to one (`LOWER('%x%')`, the usual case-insensitive search), stays
+    // on the `.like` predicate, which scans evaluate against dictionaries and
+    // zone maps; any other pattern (a column, an expression over one) matches
     // per row through the `like` scalar.
     if (p.cur.tag == .kw_like) {
         try p.advance();
@@ -666,17 +668,15 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
             escape = try p.arena.dupe(u8, p.cur.value.string);
             try p.advance();
         }
-        var pe: PredicateExpr = switch (pattern) {
-            .lit => |v| switch (v) {
-                .text => |text| .{ .like = .{
-                    .col = col_dup,
-                    .pattern = if (escape) |e| try likePatternWithEscape(p.arena, text, e) else text,
-                } },
-                else => try makeLikeCallPredicate(p, col_dup, pattern, escape),
-            },
-            .null_lit => .unknown,
-            else => try makeLikeCallPredicate(p, col_dup, pattern, escape),
-        };
+        var pe: PredicateExpr = if (pattern == .null_lit)
+            .unknown
+        else if (try scalar_fn.foldConstantText(p.arena, pattern)) |text|
+            .{ .like = .{
+                .col = col_dup,
+                .pattern = if (escape) |e| try likePatternWithEscape(p.arena, text, e) else text,
+            } }
+        else
+            try makeLikeCallPredicate(p, col_dup, pattern, escape);
         if (negate_predicate) pe = try negatePredicate(p, pe);
         return pe;
     }

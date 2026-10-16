@@ -220,6 +220,53 @@ pub fn resolveWithRegistry(
     return ResolvedOverload{ .func = chosen, .arg_casts = arg_casts };
 }
 
+/// The text `e` evaluates to when it is a text literal, or an immutable
+/// builtin returning text over arguments that fold the same way
+/// (`LOWER('%X%')`, `CONCAT('%', UPPER('x'), '%')`). The call runs once on
+/// one row through its own kernel, so the text equals what every row would
+/// compute. Null for anything else, or when the call returns NULL or fails,
+/// which leaves the expression to run per row. Folding at parse time relies
+/// on a statement's literals being in its parsed text.
+pub fn foldConstantText(arena: Allocator, e: Expr) Allocator.Error!?[]const u8 {
+    return switch (e) {
+        .lit => |v| switch (v) {
+            .text => |t| t,
+            else => null,
+        },
+        .call => |c| foldTextCall(arena, c),
+        else => null,
+    };
+}
+
+fn foldTextCall(arena: Allocator, c: Expr.Call) Allocator.Error!?[]const u8 {
+    // A call without arguments may read the session or the clock (DATABASE(),
+    // USER()), which the registry doesn't mark as volatile.
+    if (c.args.len == 0) return null;
+    const arg_types = try arena.alloc(Type, c.args.len);
+    @memset(arg_types, .string);
+    const args = try arena.alloc(ColumnView, c.args.len);
+    for (c.args, args) |arg, *view| {
+        const text = try foldConstantText(arena, arg) orelse return null;
+        var column = try ColumnStore.init(arena, .string, false);
+        try column.data.string.appendValue(arena, text);
+        view.* = column.view();
+    }
+    const overload = try resolve(arena, c.fn_name, arg_types) orelse return null;
+    if (overload.arg_casts) |casts| for (casts) |k| if (k != null) return null;
+    const f = overload.func;
+    if (f.volatility != .immutable or !f.return_type.isString()) return null;
+    if (f.typed_kernel != null or f.udf_kernel != null) return null;
+    const kernel = f.kernel orelse return null;
+    var out = try ColumnStore.init(arena, f.return_type, f.null_strategy == .kernel_managed);
+    kernel(arena, args, &out, 1) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    const view = out.view();
+    if (view.rowCount() != 1 or !view.isValid(0)) return null;
+    return try arena.dupe(u8, common.stringViewOf(view).rowBytes(0));
+}
+
 // ---------------------------------------------------------------------------
 // Decimal resolution
 //
