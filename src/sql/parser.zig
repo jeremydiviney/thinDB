@@ -8774,3 +8774,28 @@ test "SET_VAR(thindb_max_dop) hints apply to their own statement" {
         try std.testing.expectEqual(@as(?u32, null), lone.hints[0].max_dop);
     }
 }
+
+fn filterForTest(op: *const ir.Op) ?ir.Op.Filter {
+    return switch (op.*) {
+        .filter => |f| f,
+        .select => |p| filterForTest(p.upstream),
+        .exclude => |p| filterForTest(p.upstream),
+        .compute => |c| filterForTest(c.upstream),
+        .order_by => |o| filterForTest(o.upstream),
+        .limit => |l| filterForTest(l.upstream),
+        else => null,
+    };
+}
+
+test "a constant LIKE pattern folds onto the literal LIKE predicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const folded = filterForTest(try parse(aa, "SELECT id FROM t WHERE LOWER(name) LIKE LOWER('%AB%')")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(folded.predicate == .like);
+    try std.testing.expectEqualStrings("%ab%", folded.predicate.like.pattern);
+
+    const per_row = filterForTest(try parse(aa, "SELECT id FROM t WHERE name LIKE LOWER(pat)")) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(per_row.predicate != .like);
+}

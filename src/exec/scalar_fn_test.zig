@@ -387,3 +387,30 @@ test "scalar_fn: a hex literal reads as a number where the call reads one" {
     };
     inline for (cases) |c| try std.testing.expectEqual(c[3], scalar_fn.readsNumberAt(null, c[0], c[1], c[2]));
 }
+
+test "scalar_fn: a constant text expression folds through its kernel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const Expr = @import("expr.zig").Expr;
+    const text = struct {
+        fn lit(s: []const u8) Expr {
+            return .{ .lit = .{ .text = s } };
+        }
+    }.lit;
+
+    const lower: Expr = .{ .call = .{ .fn_name = "lower", .args = &.{text("%AbC%")} } };
+    try std.testing.expectEqualStrings("%abc%", (try scalar_fn.foldConstantText(aa, lower)).?);
+    const upper: Expr = .{ .call = .{ .fn_name = "upper", .args = &.{text("x")} } };
+    const concat: Expr = .{ .call = .{ .fn_name = "concat", .args = &.{ text("%"), upper, text("%") } } };
+    try std.testing.expectEqualStrings("%X%", (try scalar_fn.foldConstantText(aa, concat)).?);
+    try std.testing.expectEqualStrings("a%", (try scalar_fn.foldConstantText(aa, text("a%"))).?);
+
+    const over_column: Expr = .{ .call = .{ .fn_name = "lower", .args = &.{.{ .col_ref = "name" }} } };
+    const not_text: Expr = .{ .call = .{ .fn_name = "length", .args = &.{text("abc")} } };
+    const number_arg: Expr = .{ .call = .{ .fn_name = "lower", .args = &.{.{ .lit = .{ .int = 5 } }} } };
+    const unknown: Expr = .{ .call = .{ .fn_name = "not_a_function", .args = &.{text("x")} } };
+    for ([_]Expr{ over_column, not_text, number_arg, unknown, .{ .lit = .{ .int = 1 } } }) |e| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try scalar_fn.foldConstantText(aa, e));
+    }
+}
