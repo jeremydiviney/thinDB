@@ -931,3 +931,30 @@ test "window: a narrowed CTE keeps a window column when every derived sibling di
     defer allocator.free(ns);
     try std.testing.expectEqualSlices(i64, &[_]i64{3}, ns);
 }
+
+test "window: ORDER BY keys whose predicates compare computed operands" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    var q = try runSql(
+        allocator,
+        db,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY CASE WHEN qty % 20 = 0 THEN 0 ELSE 1 END, id DESC) AS rn, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY CASE WHEN CASE WHEN qty > 15 THEN qty ELSE 0 END > 0 THEN 0 ELSE 1 END, id) AS rn2 FROM t ORDER BY id",
+    );
+    defer q.deinit();
+    var rn: std.ArrayList(i64) = .empty;
+    defer rn.deinit(allocator);
+    var rn2: std.ArrayList(i64) = .empty;
+    defer rn2.deinit(allocator);
+    while (try q.next()) |b| {
+        try rn.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        try rn2.appendSlice(allocator, b.values[2].data.bigint[0..b.row_count]);
+    }
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 1, 2, 2, 1 }, rn.items);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 1, 2, 1, 2 }, rn2.items);
+}

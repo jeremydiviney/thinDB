@@ -902,6 +902,10 @@ pub const Parser = struct {
     window_expr_counter: usize = 0,
     window_partition_expr_refs: std.ArrayList(ir.Derived) = .empty,
     window_partition_expr_counter: usize = 0,
+    /// Computed comparison operands of predicates inside window ORDER BY
+    /// keys. The keys that compare them evaluate in the pre-window Compute,
+    /// so these need their own Compute beneath it.
+    window_order_anchors: std.ArrayList(ir.Derived) = .empty,
     order_expr_counter: usize = 0,
     /// Set by a UNION chain just before it parses a bare arm: that SELECT
     /// stops before ORDER BY / LIMIT, which belong to the whole union.
@@ -1153,6 +1157,7 @@ pub const Parser = struct {
         const agg_ref_mark = self.aggregate_expr_refs.items.len;
         const window_ref_mark = self.window_expr_refs.items.len;
         const window_partition_ref_mark = self.window_partition_expr_refs.items.len;
+        const window_order_anchor_mark = self.window_order_anchors.items.len;
         const projection_pred_mark = self.predicate_derived.items.len;
         const old_aggregate_expr_refs_enabled = self.aggregate_expr_refs_enabled;
         const old_predicate_derived_enabled = self.predicate_derived_enabled;
@@ -1166,6 +1171,7 @@ pub const Parser = struct {
         errdefer self.aggregate_expr_refs.shrinkRetainingCapacity(agg_ref_mark);
         errdefer self.window_expr_refs.shrinkRetainingCapacity(window_ref_mark);
         errdefer self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
+        errdefer self.window_order_anchors.shrinkRetainingCapacity(window_order_anchor_mark);
         errdefer self.predicate_derived.shrinkRetainingCapacity(projection_pred_mark);
         const parsed_proj = try self.parseProjection();
         self.aggregate_expr_refs_enabled = old_aggregate_expr_refs_enabled;
@@ -1256,6 +1262,8 @@ pub const Parser = struct {
         }
         const window_partition_expr_refs = try self.arena.dupe(ir.Derived, self.window_partition_expr_refs.items[window_partition_ref_mark..]);
         self.window_partition_expr_refs.shrinkRetainingCapacity(window_partition_ref_mark);
+        const window_order_anchors = try self.arena.dupe(ir.Derived, self.window_order_anchors.items[window_order_anchor_mark..]);
+        self.window_order_anchors.shrinkRetainingCapacity(window_order_anchor_mark);
 
         // Optional QUALIFY <bool_expr> — Snowflake/BigQuery/DuckDB-style
         // post-window filter. Per the SQL extension, comes after WINDOW
@@ -1616,7 +1624,7 @@ pub const Parser = struct {
             }
 
             if (has_window) {
-                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, window_order_anchors, root, &self.named_windows)) |win| {
                     root = win;
                 }
             }
@@ -1692,7 +1700,7 @@ pub const Parser = struct {
                 }
             }
             if (has_window) {
-                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, root, &self.named_windows)) |win| {
+                if (try buildWindowOp(self.arena, proj, window_expr_refs, window_partition_expr_refs, window_order_anchors, root, &self.named_windows)) |win| {
                     root = win;
                 }
             }
@@ -8199,6 +8207,7 @@ fn buildWindowOp(
     proj: []const ProjItem,
     hidden_windows: []const WindowExprRef,
     hidden_partition_exprs: []const ir.Derived,
+    order_anchors: []const ir.Derived,
     upstream: *ir.Op,
     named_windows: *const std.StringHashMapUnmanaged(ir.WindowSpec),
 ) ParseError!?*ir.Op {
@@ -8280,10 +8289,15 @@ fn buildWindowOp(
     }
 
     var window_upstream = upstream;
+    if (order_anchors.len > 0) {
+        const anchor_op = try arena.create(ir.Op);
+        anchor_op.* = .{ .compute = .{ .derived = order_anchors, .upstream = upstream } };
+        window_upstream = anchor_op;
+    }
     if (pre_window_buf.items.len > 0) {
         const derived_slice = try pre_window_buf.toOwnedSlice(arena);
         const compute_op = try arena.create(ir.Op);
-        compute_op.* = .{ .compute = .{ .derived = derived_slice, .upstream = upstream } };
+        compute_op.* = .{ .compute = .{ .derived = derived_slice, .upstream = window_upstream } };
         window_upstream = compute_op;
     }
 
