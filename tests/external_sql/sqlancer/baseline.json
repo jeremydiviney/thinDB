@@ -1,0 +1,272 @@
+{
+  "thindb_revision": "55822acb9d1000f599b3086c1d2ee2e50c30c506",
+  "sqlancer_version": "2.0.0",
+  "oracle": "TLP_WHERE",
+  "unique_generated_checks": 10000,
+  "executed_generated_checks_in_listed_runs": 41000,
+  "unexpected_failures": 0,
+  "runs": [
+    {
+      "report": "tests/external_sql/artifacts/sqlancer/run-1792109732222670400",
+      "platform": "windows",
+      "java": "21.0.10",
+      "max_dop": 1,
+      "seed_start": 0,
+      "seeds": 10,
+      "queries_per_seed": 1000,
+      "passed_checks": 10000,
+      "failed_seeds": 0,
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "provider_jar_sha256": "208841fc15381bf6ed64b7d15252a523f179ed88a0bdb9ced3c6d58b7bd41854"
+    },
+    {
+      "report": "tests/external_sql/artifacts/sqlancer/linux/run-1792109836849108182",
+      "platform": "linux",
+      "java": "21.0.12",
+      "max_dop": 1,
+      "seed_start": 0,
+      "seeds": 10,
+      "queries_per_seed": 1000,
+      "passed_checks": 10000,
+      "failed_seeds": 0,
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "provider_jar_sha256": "208841fc15381bf6ed64b7d15252a523f179ed88a0bdb9ced3c6d58b7bd41854"
+    },
+    {
+      "report": "tests/external_sql/artifacts/sqlancer/windows-dop4/run-1792110041126996500",
+      "platform": "windows",
+      "java": "21.0.10",
+      "max_dop": 4,
+      "seed_start": 0,
+      "seeds": 10,
+      "queries_per_seed": 1000,
+      "passed_checks": 10000,
+      "failed_seeds": 0,
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "provider_jar_sha256": "1c5670869b8243efdf842e577a3a76700517177087704986d5aaa159d5ac7b55"
+    },
+    {
+      "report": "tests/external_sql/artifacts/sqlancer/linux-dop4/run-1792110193343359615",
+      "platform": "linux",
+      "java": "21.0.12",
+      "max_dop": 4,
+      "seed_start": 0,
+      "seeds": 10,
+      "queries_per_seed": 1000,
+      "passed_checks": 10000,
+      "failed_seeds": 0,
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "provider_jar_sha256": "75060d3e8e23aee173bdd56096b1f9ba2903afde25e5887caefba99d0b7f6120"
+    },
+    {
+      "report": "tests/external_sql/artifacts/sqlancer/final-code/run-1792110698227064300",
+      "platform": "windows",
+      "java": "21.0.10",
+      "max_dop": 1,
+      "seed_start": 0,
+      "seeds": 1,
+      "queries_per_seed": 1000,
+      "passed_checks": 1000,
+      "failed_seeds": 0,
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "provider_jar_sha256": "75060d3e8e23aee173bdd56096b1f9ba2903afde25e5887caefba99d0b7f6120"
+    }
+  ],
+  "identical_queries_and_results_sha256_by_seed": {
+    "0": "041d067d4e47287724f00bf543d85a2308766b2c67f0562b74429338dc905ae6",
+    "1": "7e948f102a9bcc1a4f1b413d6267a559aae4eafad0175eb3c66229b474de6664",
+    "2": "a660e6622f9386762152639e8e4e9e4723a1369d6f473381f96fd246508cb093",
+    "3": "665139e5537ee0fcfa446b40f4e2a53e4c9c21494029808d6451f96db601510a",
+    "4": "3357ac982b80a26d2041d0ac52e5e525b2d9cc0130787b7f4561db2fa1a38916",
+    "5": "891ffc7fbb45e329d2fe4fbda17eb51851a4ae4cb7a1597756dca2547ca6bc37",
+    "6": "75a547ace130d77cf8d1cf6c92234e9476f6e39de745fc7671dfd7a627ff9feb",
+    "7": "7e19141d98fa1f078bb9c69514b3384e025c5851e86d62a3d445838869d860d4",
+    "8": "e5bae8bf7774d9a367fddd6f49f14a52fe466e0ba2f92dbbea826969f43e4e51",
+    "9": "2e8409b4ab18b1e7cdb620998954b130940c3e95020feb47067266024a543998"
+  },
+  "live_harness_validation": [
+    {
+      "name": "values-session-and-duplicates",
+      "exit_code": 0,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/values-session-and-duplicates/run-1792110556170119400",
+      "platform": "windows"
+    },
+    {
+      "name": "empty-results",
+      "exit_code": 0,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/empty-results/run-1792110557159509600",
+      "platform": "windows"
+    },
+    {
+      "name": "bigint-rounding-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/bigint-rounding-failure/run-1792110558141458500",
+      "platform": "windows"
+    },
+    {
+      "name": "missing-rows-reduced",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/missing-rows-reduced/run-1792110559237625900",
+      "platform": "windows"
+    },
+    {
+      "name": "replay-reduced-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/replay-reduced-failure/run-1792110560341529400",
+      "platform": "windows"
+    },
+    {
+      "name": "zero-row-shape-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/zero-row-shape-failure/run-1792110561442135500",
+      "platform": "windows"
+    },
+    {
+      "name": "unexpected-sql-error",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/unexpected-sql-error/run-1792110562440865900",
+      "platform": "windows"
+    },
+    {
+      "name": "failed-setup-stops",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/failed-setup-stops/run-1792110563419142400",
+      "platform": "windows"
+    },
+    {
+      "name": "deadline-cleanup",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/deadline-cleanup/run-1792110564428813100",
+      "platform": "windows"
+    },
+    {
+      "name": "child-startup-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/child-startup-failure/run-1792110566124183700",
+      "platform": "windows"
+    },
+    {
+      "name": "jdbc-query-timeout",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110556157473800/jdbc-query-timeout/run-1792110569006511400",
+      "platform": "windows"
+    },
+    {
+      "name": "values-session-and-duplicates",
+      "exit_code": 0,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/values-session-and-duplicates/run-1792110619405488588",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "empty-results",
+      "exit_code": 0,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/empty-results/run-1792110621858254716",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "bigint-rounding-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/bigint-rounding-failure/run-1792110624236598716",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "missing-rows-reduced",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/missing-rows-reduced/run-1792110626721831924",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "replay-reduced-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/replay-reduced-failure/run-1792110629193539440",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "zero-row-shape-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/zero-row-shape-failure/run-1792110631577127167",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "unexpected-sql-error",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/unexpected-sql-error/run-1792110633960059780",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "failed-setup-stops",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/failed-setup-stops/run-1792110636991381250",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "deadline-cleanup",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/deadline-cleanup/run-1792110639401438023",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "child-startup-failure",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/child-startup-failure/run-1792110642212876007",
+      "platform": "linux_wsl"
+    },
+    {
+      "name": "jdbc-query-timeout",
+      "exit_code": 1,
+      "verified": true,
+      "report": "tests/external_sql/artifacts/sqlancer/validation-1792110619364349246/jdbc-query-timeout/run-1792110644445760094",
+      "platform": "linux_wsl"
+    }
+  ],
+  "unit_tests": {
+    "java_windows": 10,
+    "java_linux_wsl": 10,
+    "rust_windows": 11,
+    "rust_linux_wsl": 11
+  },
+  "independence": {
+    "internal_test_command": "zig build test -Dtest-filter=\"SQL file scan:\" --summary all",
+    "internal_build_steps_passed": 17,
+    "deterministic_command": "zig build test-external-sql -Doptimize=ReleaseSafe -Dsql-filter=duckdb/count",
+    "deterministic_passed": 7,
+    "deterministic_unsupported": 1
+  },
+  "source_sha256": {
+    "tests/external_sql/sqlancer/src/main/java/org/thindb/sqlancer/ThinDBGenerator.java": "e38d570de96c563593cab64baeaf168651fc2a2d301ba1374e188da6aaf02a21",
+    "tests/external_sql/sqlancer/src/main/java/org/thindb/sqlancer/ThinDBMain.java": "229f4db91e20cf4a03e050e68d2262f439485d7dea1f5b960b5ef8e760d2a25b",
+    "tests/external_sql/sqlancer/src/main/java/org/thindb/sqlancer/ThinDBProvider.java": "7297ddc9b06d7677608e73e6140c972f48a4a4498edfd4de17f8dde8a8968d65",
+    "tests/external_sql/sqlancer/src/main/java/org/thindb/sqlancer/ThinDBTlpOracle.java": "4e19681b46639aba718454271a18db2e0470773d38d7cf8a2c5c2bb31744b6a0",
+    "tests/external_sql/sqlancer/src/test/java/org/thindb/sqlancer/ThinDBTlpTest.java": "f0c6b05d87dfe7a2776e24af382557c07259b840931a376a0e4b0185ad19ab40",
+    "tests/external_sql/sqlancer/pom.xml": "4f2a9ddce62ed0447800e8f06a5f571aad714f06cbe8f66f39f876b8e414008a",
+    "tests/external_sql/sqlancer/validate.py": "481b69cdb3a7b95781be4c3e1101f2054cbd268b575436e9445ab542a2529978",
+    "tests/external_sql/src/bin/thindb-sqlancer.rs": "13dd78ca3ad35a4b024182d479b2f2cf40e65dc8a64283794aa68b8958864885"
+  },
+  "notes": [
+    "Linux execution used Ubuntu under WSL. The hosted manual workflow has not been dispatched.",
+    "Full campaigns preceded diagnostic-only changes to preserve failures before reduction and account for partial progress. The final-code seed repeated all 1000 checks with identical queries and results.",
+    "Live fault probes intentionally returned nonzero where specified; these are harness validation, not discovered thinDB bugs.",
+    "A bounded single-table integer/text/NULL sample; no claim of exhaustive SQL correctness or broad SQLancer grammar coverage."
+  ]
+}

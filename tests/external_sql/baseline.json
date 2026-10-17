@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-15T22:33:19.546098+00:00",
+  "thindb_revision": "4dc148c5cb80492050958540d604073e78ad8162",
+  "build": "Zig 0.16.0 ReleaseSafe, x86_64",
+  "rust_toolchain": "1.94.0",
+  "sqllogictest": "0.29.1",
+  "corpus_files": 12,
+  "total_statement_and_query_checks": 9766,
+  "sqlite_query_checks": 8152,
+  "counts": {
+    "passed": 9719,
+    "unsupported": 43,
+    "semantic_difference": 2,
+    "known_bug": 2
+  },
+  "source_counts": {
+    "sqlite/select1": {
+      "passed": 1031
+    },
+    "sqlite/select2": {
+      "passed": 1031
+    },
+    "sqlite/select3": {
+      "passed": 3351
+    },
+    "sqlite/select4": {
+      "passed": 3857
+    },
+    "duckdb/count": {
+      "passed": 7,
+      "unsupported": 1
+    },
+    "duckdb/sum": {
+      "passed": 16,
+      "semantic_difference": 2,
+      "unsupported": 1
+    },
+    "duckdb/null_aggregates": {
+      "passed": 103
+    },
+    "duckdb/window": {
+      "passed": 12,
+      "unsupported": 5
+    },
+    "duckdb/like_null": {
+      "passed": 5,
+      "unsupported": 9
+    },
+    "duckdb/not_in": {
+      "passed": 7
+    },
+    "starrocks/date_diff": {
+      "passed": 42,
+      "known_bug": 2,
+      "unsupported": 27
+    },
+    "starrocks/window": {
+      "passed": 257
+    }
+  },
+  "sources_sha256": "badb3e2fc27053a27a23d1bb01c1565b8321b360d96041ac0d3cbf6d906d1b25",
+  "policies_sha256": "686878de87ff43037f0ebf1b87acd5e46e44ad2f623051d63c10c7cbc16082df",
+  "cargo_lock_sha256": "3947bdb72701f9fa532329a9f58b3aaa3caa3b69127bdecad2b139a24fdc8c34",
+  "runs": [
+    {
+      "platform": "windows",
+      "environment": "native",
+      "name": "final-mysql",
+      "protocol": "mysql",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "results_sha256": "80de19dcbc648312364004a53b9cd9e52c23800473715fe2c552dfc2c3be6b46",
+      "report": "artifacts/accepted-windows/mysql/run-1792103168124866200/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "windows",
+      "environment": "native",
+      "name": "final-postgres",
+      "protocol": "postgres",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "results_sha256": "354ef11c70dbe8b277ca2a36410dfd2b69eed7a217c835812f5363c9c417358d",
+      "report": "artifacts/accepted-windows/postgres/run-1792103168126029400/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "windows",
+      "environment": "native",
+      "name": "repeat",
+      "protocol": "mysql",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "results_sha256": "4299794a24839db297c1fa8fe34e3ad79d0974a90941c58f0ba3df429df4221e",
+      "report": "artifacts/validation-windows/repeat/run-1792102311394701800/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "windows",
+      "environment": "native",
+      "name": "mysql-4",
+      "protocol": "mysql",
+      "max_dop": 4,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "results_sha256": "b8906290c77c6eb4b537d7100670293566c575dd63885f077319ede5c7108d92",
+      "report": "artifacts/validation-windows/mysql-4/run-1792102488220691900/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "linux",
+      "environment": "Ubuntu under WSL",
+      "name": "final-mysql",
+      "protocol": "mysql",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "results_sha256": "65687d939d82c559a0acf69c9be54b94e30be723f5380263677e4593d9ce7ca1",
+      "report": "artifacts/accepted-linux/mysql/run-1792103239531906524/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "linux",
+      "environment": "Ubuntu under WSL",
+      "name": "final-postgres",
+      "protocol": "postgres",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "results_sha256": "12bd7c6d9fe1edaf74c57cb5627c2f9334762aa4fe83b16dc0e346efdbabc84a",
+      "report": "artifacts/accepted-linux/postgres/run-1792103239918523671/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "linux",
+      "environment": "Ubuntu under WSL",
+      "name": "repeat",
+      "protocol": "mysql",
+      "max_dop": 1,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "results_sha256": "7c87e08309eb23cfe5d2752c94a813a3988684c02a645c250a3aac73c0642e50",
+      "report": "artifacts/validation-linux/repeat/run-1792102359964793233/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "linux",
+      "environment": "Ubuntu under WSL",
+      "name": "dop4",
+      "protocol": "mysql",
+      "max_dop": 4,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "283ff384cc412c9c4e6c2fc54abfa7f3e8962365231862fc335a8b5bba45d95f",
+      "results_sha256": "d2c3098e594666459154b4b8aa2382419b6f712eb11dbc372ffb6e2f8b4f1da9",
+      "report": "artifacts/validation-linux/dop4/run-1792102536947926147/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    },
+    {
+      "platform": "windows",
+      "environment": "native",
+      "name": "final-code-dop4",
+      "protocol": "mysql",
+      "max_dop": 4,
+      "counts": {
+        "known_bug": 2,
+        "passed": 9719,
+        "semantic_difference": 2,
+        "unsupported": 43
+      },
+      "server_sha256": "c8cde2f50480e01aa0ceef46f7c9769932eb8acd8f35fcd6320ff4e2216442c0",
+      "results_sha256": "061be2b8dde4102381469e0f552f32c68d64b488d5191ff3f67e67caa38fbba6",
+      "report": "artifacts/final-code-windows/run-1792103427029441600/results.json",
+      "normalized_results_sha256": "b3112d9d4c678ec7d74ab77ad7d1ea8322fa57c2ff38ce9388ac530b812adde3"
+    }
+  ],
+  "validation": {
+    "harness_unit_tests_passed": 9,
+    "live_adapters": "MySQL and PostgreSQL on Windows and Linux: exact values, empty metadata, NULL/text whitespace, sessions, statement-once, timeout, disconnect, isolation",
+    "repeatability": "All listed runs have identical per-case status, result fingerprint and failure signature across repeats, DOP 1/4 and both wire protocols.",
+    "internal_tests": "zig build test -Dtest-filter=\"SQL file scan:\" --summary all: 17/17 build steps succeeded; external Rust runner not invoked",
+    "workflow": "workflow_dispatch only; commands validated locally on native Windows and WSL Linux; hosted workflow not dispatched"
+  },
+  "notes": [
+    "Counts include setup statements. Exclusions are not passes.",
+    "Known SQL failures remain executable: starrocks/date_diff:9 and starrocks/date_diff:105.",
+    "PostgreSQL Describe INSERT SELECT side effects are tracked separately in KNOWN_ISSUES.md; statement records use Simple Query exactly once.",
+    "Repeat/DOP qualification preceded the reviewed removal of backticks from fixture identifiers; final protocol runs and the final-code DOP4 run confirm identical results."
+  ]
+}

@@ -1,0 +1,22 @@
+[package]
+name = "thindb-external-sql"
+version = "0.1.0"
+edition = "2024"
+publish = false
+default-run = "thindb-external-sql"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+md-5 = "0.10"
+mysql_async = { version = "0.36", default-features = false, features = ["minimal-rust"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqllogictest = "=0.29.1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio-postgres = "0.7"
+

@@ -1,0 +1,122 @@
+[
+  {
+    "id": "sqlite/select1",
+    "suite": "sqlite",
+    "path": "upstream/sqlite/select1.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sqlite/select1.test_slow",
+    "sha256": "bc2fc271c00b7e4f35f29796cc920f0b04c1ee330d05dcf0f7715aa4c5d399e4",
+    "format": "slt"
+  },
+  {
+    "id": "sqlite/select2",
+    "suite": "sqlite",
+    "path": "upstream/sqlite/select2.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sqlite/select2.test_slow",
+    "sha256": "67ca8e85d77576cd81591c8476e9d6f87b8e46518e65acef34095f13bbe6d4dc",
+    "format": "slt"
+  },
+  {
+    "id": "sqlite/select3",
+    "suite": "sqlite",
+    "path": "upstream/sqlite/select3.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sqlite/select3.test_slow",
+    "sha256": "8f0d63d9d3064175bdb9341550117e4cc878623e790e39091e41ac328263619f",
+    "format": "slt"
+  },
+  {
+    "id": "sqlite/select4",
+    "suite": "sqlite",
+    "path": "upstream/sqlite/select4.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sqlite/select4.test_slow",
+    "sha256": "40d0651ba6791183102e5a592dbe2a252ae44cdf6174b4a69adb38edeeeef016",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/count",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/count.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/aggregate/aggregates/test_count.test",
+    "sha256": "837336bdbe5fb924e097221ddb7ff4e596cda4d6fabece9c208ef936a9cf7e55",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/sum",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/sum.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/aggregate/aggregates/test_sum.test",
+    "sha256": "4cef15f7fb47d5984eb1b51eed59a9b7b2ca89035b19b7d45b3a11c0c4ada5a6",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/null_aggregates",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/null_aggregates.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/aggregate/aggregates/test_null_aggregates.test",
+    "sha256": "242379de2f1fc21a763388c98ce999b4adb1035d201622ab76b60e4f938806d0",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/window",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/window.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/window/test_basic_window.test",
+    "sha256": "7cfa82c8b9c4eeaea66647a223cb3f22e0f16cf522dd595992de6013793eb59c",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/like_null",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/like_null.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/filter/test_like_null.test",
+    "sha256": "c425dbb6b605bf60f5fca909b8cfda9f2c9722f31ac3b7394614c3a9d94142d0",
+    "format": "slt"
+  },
+  {
+    "id": "duckdb/not_in",
+    "suite": "duckdb",
+    "path": "upstream/duckdb/not_in.test",
+    "repository": "duckdb/duckdb",
+    "revision": "e08224d653fcade680e471709e9a9035223989df",
+    "source_path": "test/sql/subquery/any_all/test_simple_not_in.test",
+    "sha256": "01ccc4a2e9adb0e93c8e075f029c4adbb57769498775bdcc3c2c0359323aa1d0",
+    "format": "slt"
+  },
+  {
+    "id": "starrocks/date_diff",
+    "suite": "starrocks",
+    "path": "upstream/starrocks/date_diff.test",
+    "repository": "StarRocks/starrocks",
+    "revision": "27069855f0c1c282732dd20b03f8f8265975cbd1",
+    "source_path": "test/sql/test_datetime/R/test_date_diff",
+    "sha256": "d8afce401afb3e8cb5571cd60d3cd2de584b3a72082c3654ebde4fb20930e500",
+    "format": "starrocks"
+  },
+  {
+    "id": "starrocks/window",
+    "suite": "starrocks",
+    "path": "upstream/starrocks/window.test",
+    "repository": "StarRocks/starrocks",
+    "revision": "27069855f0c1c282732dd20b03f8f8265975cbd1",
+    "source_path": "test/sql/test_window_function/R/test_basic_window_function",
+    "sha256": "01ee0a9b6dce87d75eb90660c1a7c09d841ff16b69d09ae9a2abb41746cf69a8",
+    "format": "starrocks"
+  }
+]

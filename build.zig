@@ -385,6 +385,61 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(server_exe);
 
+    const external_sql = b.addSystemCommand(&.{ "cargo", "run", "--locked", "--", "--server" });
+    external_sql.setCwd(b.path("tests/external_sql"));
+    external_sql.addArtifactArg(server_exe);
+    external_sql.addArgs(&.{
+        "--suite",        b.option([]const u8, "sql-suite", "External SQL suite: all, sqlite, duckdb, starrocks") orelse "all",
+        "--protocol",     b.option([]const u8, "sql-protocol", "External SQL wire: mysql or postgres") orelse "mysql",
+        "--max-dop",      b.fmt("{d}", .{b.option(u32, "sql-dop", "External SQL server max DOP: 1 or 4") orelse 1}),
+        "--timeout",      b.fmt("{d}", .{b.option(u32, "sql-timeout", "External SQL per-statement timeout in seconds") orelse 30}),
+        "--file-timeout", b.fmt("{d}", .{b.option(u32, "sql-file-timeout", "External SQL per-file timeout in seconds") orelse 600}),
+    });
+    if (b.option([]const u8, "sql-filter", "External SQL source/case identifier filter")) |filter| {
+        external_sql.addArgs(&.{ "--filter", filter });
+    }
+    if (b.option(bool, "sql-self-test", "Exercise the external SQL adapter against a disposable server") orelse false) {
+        external_sql.addArg("--self-test");
+    }
+    if (b.option([]const u8, "sql-compare-run", "Compare to a previous external SQL results.json (absolute path)")) |previous| {
+        external_sql.addArgs(&.{ "--compare-run", previous });
+    }
+    external_sql.has_side_effects = true;
+    b.step("test-external-sql", "Run independent upstream SQL correctness suites (requires Rust)").dependOn(&external_sql.step);
+
+    const external_harness_tests = b.addSystemCommand(&.{ "cargo", "test", "--locked" });
+    external_harness_tests.setCwd(b.path("tests/external_sql"));
+    external_harness_tests.has_side_effects = true;
+    b.step("test-external-sql-harness", "Test the external SQL harness itself (requires Rust)").dependOn(&external_harness_tests.step);
+
+    const sqlancer_package = b.addSystemCommand(if (@import("builtin").os.tag == .windows)
+        &.{ "cmd.exe", "/d", "/c", "mvn.cmd", "--batch-mode", "--no-transfer-progress", "verify" }
+    else
+        &.{ "mvn", "--batch-mode", "--no-transfer-progress", "verify" });
+    sqlancer_package.setCwd(b.path("tests/external_sql/sqlancer"));
+    sqlancer_package.has_side_effects = true;
+    b.step("test-sqlancer-provider", "Build and test the SQLancer provider (requires Java 21 and Maven)").dependOn(&sqlancer_package.step);
+
+    const sqlancer = b.addSystemCommand(&.{ "cargo", "run", "--locked", "--bin", "thindb-sqlancer", "--", "--server" });
+    sqlancer.setCwd(b.path("tests/external_sql"));
+    sqlancer.addArtifactArg(server_exe);
+    sqlancer.step.dependOn(&sqlancer_package.step);
+    sqlancer.addArgs(&.{
+        "--seed",            b.fmt("{d}", .{b.option(i64, "sqlancer-seed", "First SQLancer random seed") orelse 0}),
+        "--seeds",           b.fmt("{d}", .{b.option(u32, "sqlancer-seeds", "Number of consecutive SQLancer seeds") orelse 3}),
+        "--queries",         b.fmt("{d}", .{b.option(u32, "sqlancer-queries", "TLP checks per seed") orelse 100}),
+        "--max-rows",        b.fmt("{d}", .{b.option(u32, "sqlancer-max-rows", "Maximum generated rows per table") orelse 32}),
+        "--query-timeout",   b.fmt("{d}", .{b.option(u32, "sqlancer-query-timeout", "SQLancer statement timeout in seconds") orelse 10}),
+        "--seed-timeout",    b.fmt("{d}", .{b.option(u32, "sqlancer-seed-timeout", "SQLancer seed deadline in seconds") orelse 300}),
+        "--reduce-attempts", b.fmt("{d}", .{b.option(u32, "sqlancer-reduce-attempts", "Maximum row reduction attempts on TLP failure") orelse 64}),
+        "--max-dop",         b.fmt("{d}", .{b.option(u32, "sqlancer-dop", "SQLancer server max DOP: 1 or 4") orelse 1}),
+    });
+    if (b.option([]const u8, "sqlancer-replay", "Replay a saved TLP reproduction (absolute JSON path)")) |replay| {
+        sqlancer.addArgs(&.{ "--replay", replay });
+    }
+    sqlancer.has_side_effects = true;
+    b.step("test-sqlancer", "Run SQLancer TLP against disposable servers (requires Rust, Java 21 and Maven)").dependOn(&sqlancer.step);
+
     const run_server = b.addRunArtifact(server_exe);
     run_server.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_server.addArgs(args);
