@@ -723,6 +723,7 @@ pub fn deinit(self: *Self) void
 | `SortMergeJoin` | Materialize + sort both sides, streaming merge; merge-only fast-path when manifest stats prove pre-sorted |
 | `NestedLoopJoin` | Cartesian eval with per-pair predicates; used for pure-range, opaque-callback, or no-equi-keys joins |
 | `RangeSweepJoin` | Single inequality `a OP b` between two side-sorted columns — cursor-style merge, ~2× faster than NLJ on pure-range shapes |
+| `Series` | `generate_series`: an integer sequence per row of its arguments |
 | `Sink` | Terminal — collects results or yields batches to caller |
 
 Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range shape → range_sweep; both sides sorted on the join keys (per manifest stats) → SMJ; otherwise hash. Hash join's build phase runs Misra-Gries sampling — under heavy skew it transfers ownership of the built columns to an SMJ at execute time.
@@ -730,6 +731,8 @@ Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range
 A key pair can be null-safe (`KeyPair.null_safe`): an ON conjunct `a <=> b` or `a IS NOT DISTINCT FROM b` across the two inputs keys the join like `a = b`, except that a NULL key matches a NULL key. SMJ drops NULL keys, so a join with a null-safe key never takes SMJ or the skew re-route. The hash join keeps NULL as a value of that key, NLJ compares it as one, and build-key scan hints skip a null-safe key whose build side holds a NULL. When a key's types differ and a conversion can turn a value into NULL, the pair also gets a plain key on both sides' null flags, so a converted NULL matches only a NULL. An outer join's preserved-side ON conditions fold into a plain key. When every key is null-safe, they fold into a constant key pair.
 
 A table function's input relation carries each declared input column by name and in order, and a nullable column can't feed a NOT NULL field. A column of another type converts to the declared type as an INSERT into a column of that type would (§9.8 `ValueOutOfRange`). The casts `cast.assignmentCastExpr` gives (text, DATE or DATETIME into DATE or DATETIME, a number or text into DECIMAL) run as a `Compute` over the input. The pairs an INSERT converts as its rows land (one number type into another, a number or date into text, text into a number) convert each drained batch with `cast.assignColumn`. When every type already matches, the call reads the input's columns without a copy, as before. A pair the rule refuses, such as a number into a DATE, is `TableFnInputMismatch` when the call is built. A value that fails its conversion, such as text that isn't a date or a number the field can't hold, is `TableFnInputMismatch` when its batch is drained, with a diagnostic line naming the column. A converted partition or order key is sorted again even when the input arrives ordered, since converting can reorder it.
+
+`generate_series(start, stop[, step])` is a FROM source, written bare as in PostgreSQL and DuckDB or inside `TABLE(...)` as in StarRocks. Its one BIGINT column is named `generate_series`, as is the relation; an alias renames the relation and a `t(x)` column list the column. It counts from start to stop inclusive by step (1 when omitted), and is empty when the step points away from stop or an argument is NULL. A sequence that reaches a BIGINT bound ends there instead of wrapping. The arguments are integer expressions (TINYINT through BIGINT, or a LARGEINT within BIGINT's range), evaluated by a `Compute` over the single-row source that `Series` reads, so a scalar subquery can supply one. They can't read another FROM item's columns: thinDB has no LATERAL yet. A step of 0 is `SeriesStepZero` and an argument of another type `SeriesNonIntegerArgument` (§9.8).
 
 **Memtable scan**: every Scan also reads from the (potentially non-empty) memtable of the table. Memtable rows are processed identically to segment rows. This gives read-your-writes consistency.
 
@@ -1737,6 +1740,7 @@ JoinColumnNameCollision,
 MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
 TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
+SeriesStepZero, SeriesNonIntegerArgument,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1756,6 +1760,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `RecursiveCteDepthExceeded` means a `WITH RECURSIVE` CTE was still adding rows after 1000 iterations of its recursive arms (§6.6). The MySQL wire reports it as 3636 (`HY000`) with MySQL's message, `Recursive query aborted after 1001 iterations. Try increasing @@cte_max_recursion_depth to a larger value.`; the PostgreSQL wire as `54000`.
 
 `TableFnInputMismatch` means a table function's input relation doesn't fit its declared input (§6.2): a column is missing, extra, out of order, nullable where the field isn't, or of a type an INSERT into the declared type refuses, or a value failed its conversion. `TableFnExecutionMismatch` means the call's PARTITION BY contradicts the declared execution mode; `TableFnOutputMismatch` means the callback left its output columns of unequal length.
+
+`SeriesStepZero` means a `generate_series` step was 0, which would repeat its start forever; PostgreSQL, DuckDB and StarRocks refuse it too. `SeriesNonIntegerArgument` means a `generate_series` argument wasn't an integer (§6.2). The MySQL wire reports both as 1210 (`HY000`), as it does `IncorrectArgumentsToSleep`; the PostgreSQL wire as `22023`, PostgreSQL's code for a zero step.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

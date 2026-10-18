@@ -71,6 +71,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .scan, .file_scan, .ddl, .show, .copy, .single_row, .admin => {},
         .insert => |i| try resolveDuplicateAssignments(ctx, i.on_duplicate),
         .alias => |a| try resolveSubqueriesInOp(ctx, @constCast(a.upstream)),
+        .series => |s| try resolveSubqueriesInOp(ctx, s.upstream),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
         .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
@@ -819,6 +820,10 @@ const ScopeBuilder = struct {
                 .columns = if (self.with_columns) try tableFnColumns(self.ctx, t) else null,
             }),
             .file_scan => |f| try self.ranges.append(na, .{ .name = f.alias, .columns = null }),
+            .series => |sr| try self.ranges.append(na, .{
+                .name = sr.alias orelse "generate_series",
+                .columns = if (self.with_columns) try na.dupe([]const u8, &.{sr.column}) else null,
+            }),
             .single_row => {},
             .join => |j| {
                 try self.relation(j.left, depth + 1);
@@ -864,6 +869,7 @@ fn outputColumns(ctx: *CompileCtx, op: *const ir.Op, depth: u32, budget: *u32) A
         .scan => |s| return try tableColumns(ctx, s.table),
         .table_fn => |t| return try tableFnColumns(ctx, t),
         .single_row => return &.{},
+        .series => |sr| try names.append(na, sr.column),
         .alias => |a| return try outputColumns(ctx, a.upstream, depth + 1, budget),
         .materialize => |m| return try outputColumns(ctx, m.upstream, depth + 1, budget),
         .set_union => |u| return try outputColumns(ctx, u.left, depth + 1, budget),
@@ -1082,7 +1088,7 @@ fn requireOwnScope(ctx: *CompileCtx, op: *const ir.Op, depth: u32) ScopeError!vo
 fn requireRelationScope(ctx: *CompileCtx, op: *const ir.Op, depth: u32) ScopeError!void {
     if (depth >= SCOPE_DEPTH_LIMIT) return;
     switch (op.*) {
-        .scan, .file_scan, .single_row => {},
+        .scan, .file_scan, .single_row, .series => {},
         .alias => |a| try requireRelationScope(ctx, a.upstream, depth + 1),
         // A named boundary is a CTE, view or function, whose body is its own
         // statement-level scope.
@@ -2778,6 +2784,7 @@ fn replayable(ctx: *CompileCtx, op: *const ir.Op, depth: u32) bool {
     return switch (op.*) {
         .scan, .single_row, .materialize => true,
         .alias => |a| replayable(ctx, a.upstream, depth + 1),
+        .series => |sr| replayable(ctx, sr.upstream, depth + 1),
         .filter => |f| !readsSubquery(f.predicate) and replayable(ctx, f.upstream, depth + 1),
         .select, .exclude => |p| replayable(ctx, p.upstream, depth + 1),
         .compute => |c| {
@@ -3036,7 +3043,7 @@ const FreeNames = struct {
     fn copyRelation(self: *FreeNames, op: *const ir.Op, depth: u32, expand: bool) LiftError!*ir.Op {
         const na = self.ctx.nodeArena();
         switch (op.*) {
-            .scan, .file_scan, .single_row => return @constCast(op),
+            .scan, .file_scan, .single_row, .series => return @constCast(op),
             .alias => |a| {
                 var copy = a;
                 copy.upstream = try self.readRelation(a.upstream, depth + 1, expand);
@@ -3720,6 +3727,7 @@ fn exactColumns(ctx: *CompileCtx, op: *const ir.Op, depth: u32, budget: *u32) Al
         },
         .table_fn => |t| return try tableFnColumns(ctx, t),
         .single_row => return &.{},
+        .series => |sr| try names.append(na, if (sr.alias) |alias| try std.fmt.allocPrint(na, "{s}.{s}", .{ alias, sr.column }) else sr.column),
         .alias => |a| {
             const inner = (try exactColumns(ctx, a.upstream, depth + 1, budget)) orelse return null;
             for (inner) |c| try names.append(na, try std.fmt.allocPrint(na, "{s}.{s}", .{ a.alias, c }));
@@ -3948,7 +3956,7 @@ fn hoistOuterAggregates(ctx: *CompileCtx, select: *ir.Op) !void {
         if (n == 0 or path.items[n - 1].* != .compute) return;
         for (path.items[n..]) |o| if (o.* == .order_by or o.* == .limit) return;
         switch (cur.*) {
-            .scan, .file_scan, .alias, .join, .materialize, .single_row => {},
+            .scan, .file_scan, .alias, .join, .materialize, .single_row, .series => {},
             else => return,
         }
         input = path.items[n - 1].compute.upstream;

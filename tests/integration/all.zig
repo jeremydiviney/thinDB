@@ -57,6 +57,7 @@ test {
     _ = @import("union_test.zig");
     _ = @import("ctas_insert_select_test.zig");
     _ = @import("file_scan_test.zig");
+    _ = @import("generate_series_test.zig");
     _ = @import("scalar_subquery_test.zig");
     _ = @import("exists_test.zig");
     _ = @import("in_subquery_test.zig");
