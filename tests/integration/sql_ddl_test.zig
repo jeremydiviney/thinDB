@@ -856,6 +856,34 @@ test "sql ddl: CREATE TABLE PROPERTIES sets table compression" {
     } else |_| {}
 }
 
+test "sql ddl: CREATE TABLE PROPERTIES ignores StarRocks layout keys, rejects unknown and data-dropping keys" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        \\CREATE TABLE js (v1 BIGINT NULL, j1 JSON NULL) ENGINE=OLAP
+        \\DUPLICATE KEY(v1) DISTRIBUTED BY HASH(v1) BUCKETS 10
+        \\PROPERTIES ("replication_num" = "1", "Replicated_Storage" = "false",
+        \\  "enable_persistent_index" = "true", "fast_schema_evolution" = "true",
+        \\  "in_memory" = "false", "storage_format" = "v2", "colocate_with" = "g1",
+        \\  "bloom_filter_columns" = "j1", "flat_json.enable" = "true", "compression" = "ZSTD")
+    );
+    const t = try db.openTable("js", .{});
+    try std.testing.expectEqual(thindb.types.TableCompression.zstd, t.schema.compression);
+
+    const rejected = .{
+        "CREATE TABLE r (id BIGINT) PROPERTIES (\"replication_nmu\" = \"1\")",
+        "CREATE TABLE r (id BIGINT) PROPERTIES (\"partition_ttl\" = \"3 month\")",
+        "CREATE TABLE r (id BIGINT) PROPERTIES (\"partition_live_number\" = \"3\")",
+        "CREATE TABLE r (id BIGINT) PROPERTIES (\"dynamic_partition.enable\" = \"true\")",
+    };
+    inline for (rejected) |sql| try expectRunError(allocator, db, sql, error.SqlUnknownTableProperty);
+}
+
 test "sql ddl: StarRocks CREATE TABLE — DISTRIBUTED BY HASH key + BUCKETS + replication_num" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
