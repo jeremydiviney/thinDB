@@ -144,7 +144,7 @@ fn analyze(arena: Allocator, op: *const ir.Op, memo: *std.AutoHashMapUnmanaged(*
 
 fn analyzeInner(arena: Allocator, op: *const ir.Op, memo: *std.AutoHashMapUnmanaged(*const ir.Op, Info)) anyerror!Info {
     switch (op.*) {
-        .scan, .single_row, .file_scan => return .{ .keys = null, .ops = 1 },
+        .scan, .single_row, .file_scan, .series => return .{ .keys = null, .ops = 1 },
 
         .filter => |f| {
             var i = try analyze(arena, f.upstream, memo);

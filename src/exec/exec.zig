@@ -117,6 +117,11 @@ pub const Error = error{
     TableFnExecutionMismatch,
     TableFnInputMismatch,
     TableFnOutputMismatch,
+    /// `generate_series` given a step of 0, which would repeat its start
+    /// forever.
+    SeriesStepZero,
+    /// `generate_series` given an argument that isn't an integer.
+    SeriesNonIntegerArgument,
     /// Compute/projection operator: duplicate derived/final output name.
     ComputeNameCollision,
     /// Compute operator: an expression shape not yet supported in v1
@@ -1778,6 +1783,8 @@ pub const MatScan = mat_stage.MatScan;
 
 pub const AliasRename = @import("alias_rename.zig").AliasRename;
 
+pub const Series = @import("series.zig").Series;
+
 pub const join_op = @import("join.zig");
 pub const Join = join_op.Join;
 pub const JoinSpec = join_op.Spec;
@@ -1815,4 +1822,5 @@ test {
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
     _ = @import("concurrent_int_table.zig");
+    _ = @import("series.zig");
 }

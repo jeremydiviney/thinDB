@@ -146,6 +146,7 @@ const Finder = struct {
             .materialize => |m| self.walk(m.upstream),
             .window => |w| self.walk(w.upstream),
             .alias => |a| self.walk(a.upstream),
+            .series => |sr| self.walk(sr.upstream),
             .join => |j| (try self.walk(j.left)) orelse self.walk(j.right),
             .set_union => |u| (try self.walk(u.left)) orelse self.walk(u.right),
             .create_table_as => |c| self.walk(c.source),
@@ -254,6 +255,7 @@ const Finder = struct {
         const result: ?[]const Exposed = switch (op.*) {
             .scan => |s| try self.scanColumns(s),
             .single_row => &.{},
+            .series => |sr| try self.arena.dupe(Exposed, &.{.{ .qualifier = sr.alias, .bare = sr.column }}),
             .limit => |l| try self.columns(l.upstream),
             .filter => |f| try self.columns(f.upstream),
             .order_by => |o| try self.columns(o.upstream),
@@ -336,6 +338,11 @@ const Finder = struct {
         const result: ?*const NameSet = switch (op.*) {
             .scan => |s| try self.scanNames(s),
             .single_row => try self.newSet(),
+            .series => |sr| blk: {
+                const set = try self.newSet();
+                try self.add(set, sr.column);
+                break :blk set;
+            },
             .limit => |l| try self.names(l.upstream),
             .filter => |f| try self.names(f.upstream),
             .order_by => |o| try self.names(o.upstream),

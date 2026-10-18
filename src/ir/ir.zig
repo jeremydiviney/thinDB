@@ -680,6 +680,9 @@ pub const OpTag = enum(u8) {
     /// `ANALYZE TABLE`, ...). Session-local and never persisted, so it has no
     /// wire encoding.
     admin = 27,
+    /// `generate_series(start, stop[, step])` in FROM: an integer sequence
+    /// per upstream row.
+    series = 28,
 };
 
 pub const BatchOp = struct {
@@ -858,6 +861,23 @@ pub const Op = union(OpTag) {
     alias: Alias,
     table_fn: TableFn,
     admin: AdminOp,
+    series: Series,
+
+    /// `FROM generate_series(start, stop[, step])`, also spelled
+    /// `TABLE(generate_series(...))`. For each upstream row, one BIGINT row
+    /// per value from its `start` column to its `stop` column inclusive,
+    /// `step` apart (1 without a step column). The parser feeds it a Compute
+    /// over `single_row` that evaluates the call's arguments, so the
+    /// arguments are ordinary expressions to every plan pass.
+    pub const Series = struct {
+        upstream: *Op,
+        start: []const u8,
+        stop: []const u8,
+        step: ?[]const u8 = null,
+        /// `generate_series`, or the name a `t(x)` column list gives it.
+        column: []const u8,
+        alias: ?[]const u8 = null,
+    };
 
     /// `FROM TABLE(name(<subquery>) [PARTITION BY cols] [ORDER BY specs])`.
     /// The registered function's declared input schema is matched against
@@ -1091,6 +1111,10 @@ pub const Op = union(OpTag) {
                 a.upstream.deinitDecoded(allocator);
                 allocator.destroy(a.upstream);
             },
+            .series => |s| {
+                s.upstream.deinitDecoded(allocator);
+                allocator.destroy(s.upstream);
+            },
             .table_fn => |t| {
                 allocator.free(t.partition_by);
                 allocator.free(t.order_by);
@@ -1257,6 +1281,14 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .alias => |a| {
             try encodeOptString(allocator, out, a.alias);
             try encodeOp(allocator, out, a.upstream.*);
+        },
+        .series => |s| {
+            try encodeString(allocator, out, s.start);
+            try encodeString(allocator, out, s.stop);
+            try encodeOptString(allocator, out, s.step);
+            try encodeString(allocator, out, s.column);
+            try encodeOptString(allocator, out, s.alias);
+            try encodeOp(allocator, out, s.upstream.*);
         },
         .table_fn => |t| {
             try appendU32(allocator, out, @intCast(t.name.len));
@@ -2266,7 +2298,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.table_fn)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.series)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -2282,6 +2314,17 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .alias = .{ .alias = alias, .upstream = upstream } };
+        },
+        .series => blk: {
+            const start = try readString(bytes, cursor);
+            const stop = try readString(bytes, cursor);
+            const step = try decodeOptString(bytes, cursor);
+            const column = try readString(bytes, cursor);
+            const alias = try decodeOptString(bytes, cursor);
+            const upstream = try allocator.create(Op);
+            errdefer allocator.destroy(upstream);
+            upstream.* = try decodeOp(allocator, bytes, cursor);
+            break :blk Op{ .series = .{ .upstream = upstream, .start = start, .stop = stop, .step = step, .column = column, .alias = alias } };
         },
         .table_fn => blk: {
             const name = try readString(bytes, cursor);

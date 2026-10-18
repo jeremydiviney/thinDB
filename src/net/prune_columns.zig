@@ -166,6 +166,8 @@ fn walk(ctx: *Ctx, op: *ir.Op, needed: ?*const NameSet) void {
         .explain, .create_table_as, .insert_select, .batch, .delete_op, .update_op => walkRoot(ctx, op),
         .limit => |l| walk(ctx, l.upstream, needed),
         .alias => |a| walk(ctx, a.upstream, needed),
+        // The upstream's columns are the call's arguments, all read.
+        .series => |s| walk(ctx, s.upstream, null),
         .exclude => |p| {
             // Anti-projection: output = upstream minus the listed names.
             // Upstream needs whatever the consumers need, plus the listed

@@ -4438,6 +4438,8 @@ pub const Parser = struct {
                 op = try self.expandSqlFunction(def);
                 op.materialize.name = first_dup;
                 alias_in_place = false;
+            } else if (std.mem.eql(u8, first_lc, "generate_series")) {
+                return try self.seriesTarget(try self.parseSeriesCall());
             } else {
                 const format = fileFormatForFunction(first_lc) orelse return ParseError.SqlUnsupportedFileFunction;
                 op = try self.parseFileTableFunction(format);
@@ -4585,6 +4587,11 @@ pub const Parser = struct {
         try self.advance(); // TABLE
         try self.expect(.lparen);
         const fname = try self.dupedIdent();
+        if (std.ascii.eqlIgnoreCase(fname, "generate_series")) {
+            const op = try self.parseSeriesCall();
+            try self.expect(.rparen);
+            return try self.seriesTarget(op);
+        }
         try self.expect(.lparen);
         var inputs: std.ArrayList(*ir.Op) = .empty;
         defer inputs.deinit(self.arena);
@@ -4658,6 +4665,49 @@ pub const Parser = struct {
             .alias = if (resolved_name.ptr != fname.ptr) resolved_name else null,
         } });
         return .{ .name = resolved_name, .op = op };
+    }
+
+    /// `(start, stop[, step])` after `generate_series`: a Series over a
+    /// single-row Compute that evaluates the arguments.
+    fn parseSeriesCall(self: *Parser) ParseError!*ir.Op {
+        const names = [_][]const u8{ "start", "stop", "step" };
+        var derived: [names.len]ir.Derived = undefined;
+        var n: usize = 0;
+        try self.expect(.lparen);
+        while (true) {
+            if (n == names.len) return ParseError.SqlFunctionArgMismatch;
+            var arg = try self.parseValueExpr();
+            // A bare NULL parses as text; as an argument it is a NULL integer.
+            if (arg == .null_lit) arg = .{ .null_lit = .bigint };
+            derived[n] = .{ .name = names[n], .expr = arg };
+            n += 1;
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        try self.expect(.rparen);
+        if (n < 2) return ParseError.SqlFunctionArgMismatch;
+        const single = try self.allocOp(.{ .single_row = {} });
+        const args = try self.allocOp(.{ .compute = .{ .derived = try self.arena.dupe(ir.Derived, derived[0..n]), .upstream = single } });
+        return try self.allocOp(.{ .series = .{
+            .upstream = args,
+            .start = names[0],
+            .stop = names[1],
+            .step = if (n == 3) names[2] else null,
+            .column = "generate_series",
+        } });
+    }
+
+    /// `[AS] alias [(column)]` after a generate_series call. Unaliased, it
+    /// is named after the function, as a table is after itself.
+    fn seriesTarget(self: *Parser, op: *ir.Op) ParseError!FromTarget {
+        const target = try self.applyFromAlias(op, "generate_series");
+        if (op.series.alias == null) return .{ .name = target.name, .op = op, .unaliased = .in_place };
+        if (self.cur.tag == .lparen) {
+            const columns = try self.parseColumnList();
+            if (columns.len != 1) return ParseError.SqlColumnListCountMismatch;
+            op.series.column = columns[0];
+        }
+        return target;
     }
 
     fn lookupSqlFn(self: *Parser, name: []const u8) ParseError!?udf_mod.SqlTableFn {
@@ -4828,6 +4878,10 @@ pub const Parser = struct {
                 },
                 .file_scan => {
                     op.file_scan.alias = alias;
+                    return op;
+                },
+                .series => {
+                    op.series.alias = alias;
                     return op;
                 },
                 else => {},
@@ -6153,6 +6207,7 @@ pub const Parser = struct {
         return switch (op.*) {
             .scan => |s| try self.tableColumns(s.table),
             .single_row => &.{},
+            .series => |sr| try self.arena.dupe([]const u8, &.{sr.column}),
             .limit => |l| try self.sourceColumns(l.upstream),
             .filter => |f| try self.sourceColumns(f.upstream),
             .order_by => |o| try self.sourceColumns(o.upstream),

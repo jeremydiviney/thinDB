@@ -68,6 +68,16 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try out.append(allocator, '\n');
             try explainOp(allocator, out, a.upstream.*, depth + 1);
         },
+        .series => |s| {
+            try out.appendSlice(allocator, "Series ");
+            try out.appendSlice(allocator, s.column);
+            if (s.alias) |a| {
+                try out.appendSlice(allocator, " AS ");
+                try out.appendSlice(allocator, a);
+            }
+            try out.append(allocator, '\n');
+            try explainOp(allocator, out, s.upstream.*, depth + 1);
+        },
         .table_fn => |t| {
             try out.appendSlice(allocator, "TableFn ");
             try out.appendSlice(allocator, t.name);
