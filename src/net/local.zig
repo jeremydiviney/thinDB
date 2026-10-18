@@ -1378,9 +1378,9 @@ pub fn changesCatalog(op: *const ir.Op) bool {
 }
 
 /// True when a statement's only product is its result set, so it is
-/// safe to abandon once nobody can receive that result. Statements that
-/// change data or the catalog, and EXPLAIN (whose ANALYZE form runs its
-/// inner statement), are not.
+/// safe to abandon once nobody can receive that result, and safe to
+/// compile without running it. Statements that change data or the
+/// catalog are not: their compile applies the change.
 pub fn producesOnlyResult(op: *const ir.Op) bool {
     return switch (op.*) {
         .scan,
@@ -1411,8 +1411,8 @@ pub fn producesOnlyResult(op: *const ir.Op) bool {
         .set_var,
         .delete_op,
         .update_op,
-        .explain,
         => false,
+        .explain => |e| producesOnlyResult(e.inner),
     };
 }
 
@@ -2314,6 +2314,9 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
             // return the plan as a one-column result. The inner query is
             // never executed. Column name follows the connecting wire's
             // convention; JSON renders the whole tree into a single row.
+            // Compiling a write applies it, so there is no plan to show
+            // without running it.
+            if (!producesOnlyResult(e.inner)) return Error.UnsupportedOp;
             var inner = try compileSubplan(ctx, e.inner);
             const plan = inner.explainPlan(ctx.allocator) catch |err| {
                 inner.deinit();

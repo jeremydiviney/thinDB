@@ -2862,6 +2862,59 @@ test "mysql wire: COM_STMT_PREPARE on DDL — EXECUTE returns OK with no rows" {
     if (sctx.err) |e| return e;
 }
 
+test "mysql wire: COM_STMT_PREPARE of CREATE TABLE AS creates the table only at EXECUTE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("orders", schema_orders, opts_orders);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 10), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 20), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 2501;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.serveMysql(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.doHandshake(null);
+
+    try client.sendStmtPrepare("CREATE TABLE orders_copy AS SELECT * FROM orders");
+    const reply = try client.readPrepareReply(true);
+    try std.testing.expectEqual(@as(u16, 0), reply.num_columns);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try client.sendStmtExecute(reply.stmt_id, &.{});
+    const pkt = try mysql_packet.readPacket(allocator, &client.reader.interface);
+    defer allocator.free(pkt.payload);
+    try std.testing.expect(pkt.payload[0] != 0xFF);
+    if (pkt.payload[0] != 0x00) _ = try client.readResultRows(arena.allocator(), pkt.payload);
+
+    try client.sendQuery("SELECT COUNT(*) FROM orders_copy");
+    const rows = try client.readResultSet(arena.allocator());
+    try std.testing.expectEqualStrings("2", rows[0][0].?);
+
+    try client.sendQuit();
+    if (sctx.err) |e| return e;
+}
+
 test "mysql wire: COM_STMT_EXECUTE with new_params_bound_flag=0 reuses prior types" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
