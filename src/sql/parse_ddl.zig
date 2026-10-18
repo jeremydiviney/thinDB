@@ -725,6 +725,46 @@ fn stripOuterParens(body: []const u8) []const u8 {
     return s;
 }
 
+/// StarRocks table PROPERTIES keys accepted and ignored. Each sets
+/// replication, physical layout, caching, compaction, schema-change
+/// mechanics, an index, or an unenforced constraint: nothing that changes
+/// which rows a query sees, so SR-dialect DDL runs verbatim. Keys that
+/// drop data (partition_ttl, partition_live_number, dynamic_partition.*)
+/// or point at external data stay rejected.
+const IGNORED_TABLE_PROPERTIES = [_][]const u8{
+    "replication_num",
+    "replicated_storage",
+    "write_quorum",
+    "storage_medium",
+    "storage_format",
+    "storage_type",
+    "storage_volume",
+    "storage_cooldown_ttl",
+    "storage_cooldown_time",
+    "enable_persistent_index",
+    "persistent_index_type",
+    "primary_index_cache_expire_sec",
+    "fast_schema_evolution",
+    "cloud_native_fast_schema_evolution_v2",
+    "light_schema_change",
+    "in_memory",
+    "datacache.enable",
+    "enable_async_write_back",
+    "colocate_with",
+    "bucket_size",
+    "mutable_bucket_num",
+    "bloom_filter_columns",
+    "base_compaction_forbidden_time_ranges",
+    "file_bundling",
+    "enable_load_profile",
+    "flat_json.enable",
+    "flat_json.null.factor",
+    "flat_json.sparsity.factor",
+    "flat_json.column.max",
+    "unique_constraints",
+    "foreign_key_constraints",
+};
+
 /// CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [db.][schema.]name
 ///   ( column_def, ... [, PRIMARY KEY (..)] )
 ///
@@ -904,12 +944,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                     .lz4_fsst
                 else
                     return PE.SqlInvalidProjection;
-            } else if (std.ascii.eqlIgnoreCase(key, "replication_num") or std.ascii.eqlIgnoreCase(key, "storage_medium")) {
-                // StarRocks replication factor / storage tier — no
-                // single-node meaning. Accepted so SR-dialect DDL runs
-                // verbatim; values ignored.
-            } else {
-                return PE.SqlInvalidProjection;
+            } else if (!asciiEqlAny(key, &IGNORED_TABLE_PROPERTIES)) {
+                return PE.SqlUnknownTableProperty;
             }
             if (p.cur.tag != .comma) break;
             try p.advance();

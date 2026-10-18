@@ -102,6 +102,9 @@ pub const ParseError = error{
     /// `ALTER TABLE ... ADD COLUMN c ... FIRST | AFTER x`: new columns are
     /// appended.
     SqlColumnPositionUnsupported,
+    /// A CREATE TABLE PROPERTIES key that is neither a thinDB option nor a
+    /// StarRocks key thinDB knows to ignore.
+    SqlUnknownTableProperty,
     /// A CTE's or derived table's column list whose length differs from
     /// its query's SELECT list (MySQL 1353).
     SqlColumnListCountMismatch,
