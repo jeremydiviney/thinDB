@@ -4136,6 +4136,27 @@ test "sql: expanded scalar function spellings execute" {
     try std.testing.expectEqual(@as(usize, 64), b.values[18].data.string.rowBytes(0).len);
 }
 
+test "sql: date_diff reaches a month-end anniversary whatever the earlier value's time" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT date_diff('year', '2017-02-28', '2016-02-28 00:00:00.01')", 1 },
+        .{ "SELECT date_diff('month', '2017-02-28', '2016-02-28 00:00:00.001')", 12 },
+        .{ "SELECT date_diff('year', '2017-02-28 00:00:00', '2016-02-28 00:00:01')", 1 },
+        .{ "SELECT date_diff('year', '2017-02-28 00:00:00', '2016-02-29 00:00:01')", 0 },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &.{c[1]}, got);
+    }
+}
+
 test "sql: unit-first date functions and aggregate aliases execute" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
