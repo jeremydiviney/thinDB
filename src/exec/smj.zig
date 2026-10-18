@@ -680,7 +680,7 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char, .json => true,
+        .varchar, .string, .char, .json, .nested => true,
         else => false,
     };
 }
@@ -766,7 +766,7 @@ fn appendColumnValueBytes(
         .decimal64 => |s| try appendSignedKey(allocator, out, i64, s[row]),
         .decimal128 => |s| try appendSignedKey(allocator, out, i128, s[row]),
         .uuid => |s| try appendUnsignedKey(allocator, out, u128, s[row]),
-        .varchar, .string, .char, .json => |sv| try appendStringKey(allocator, out, sv.rowBytes(row)),
+        .varchar, .string, .char, .json, .nested => |sv| try appendStringKey(allocator, out, sv.rowBytes(row)),
     }
 }
 

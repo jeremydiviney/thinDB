@@ -167,7 +167,7 @@ fn initStores(allocator: Allocator, schema: []const Column) ![]engine.ColumnStor
 
 fn stringBytesInRange(view: ColumnView, lo: usize, hi: usize) usize {
     return switch (view.data) {
-        .varchar, .string, .char, .json => |sv| sv.offsets[hi] - sv.offsets[lo],
+        .varchar, .string, .char, .json, .nested => |sv| sv.offsets[hi] - sv.offsets[lo],
         else => 0,
     };
 }
@@ -175,14 +175,14 @@ fn stringBytesInRange(view: ColumnView, lo: usize, hi: usize) usize {
 /// The bytes a view's first `rows` rows occupy, validity aside.
 fn viewBytes(view: ColumnView, rows: usize) usize {
     return switch (view.data) {
-        .varchar, .string, .char, .json => |sv| sv.offsets[rows] - sv.offsets[0] + rows * @sizeOf(u32),
+        .varchar, .string, .char, .json, .nested => |sv| sv.offsets[rows] - sv.offsets[0] + rows * @sizeOf(u32),
         inline else => |values| rows * @sizeOf(std.meta.Elem(@TypeOf(values))),
     };
 }
 
 fn stringBytesAt(view: ColumnView, rows: []const u32) usize {
     return switch (view.data) {
-        .varchar, .string, .char, .json => |sv| blk: {
+        .varchar, .string, .char, .json, .nested => |sv| blk: {
             var total: usize = 0;
             for (rows) |row| total += sv.offsets[row + 1] - sv.offsets[row];
             break :blk total;
@@ -513,7 +513,7 @@ pub const PartitionedAggregate = struct {
             .uuid => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) (@as(u64, @truncate(v)) ^ @as(u64, @truncate(v >> 64))) else NULL_SENTINEL));
             },
-            .varchar, .string, .char, .json => |sv| for (hashes, 0..) |*h, row| {
+            .varchar, .string, .char, .json, .nested => |sv| for (hashes, 0..) |*h, row| {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) std.hash.Wyhash.hash(0, sv.rowBytes(row)) else NULL_SENTINEL));
             },
         }
@@ -1605,7 +1605,7 @@ const MixedInput = struct {
         for (self.batches) |*b| for (b) |*s| {
             if (s.nulls) |n| total += n.items.len;
             total += switch (s.data) {
-                .varchar, .string, .char, .json => |ss| ss.bytes.items.len + ss.offsets.items.len * @sizeOf(u32),
+                .varchar, .string, .char, .json, .nested => |ss| ss.bytes.items.len + ss.offsets.items.len * @sizeOf(u32),
                 inline else => |list| list.items.len * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
             };
         };
@@ -1653,7 +1653,7 @@ fn testFormatRow(allocator: Allocator, out: *std.ArrayList(u8), b: Batch, row: u
             continue;
         }
         switch (v.data) {
-            .varchar, .string, .char, .json => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
+            .varchar, .string, .char, .json, .nested => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
             .float => |s| try out.print(allocator, "{d}", .{s[row]}),
             .double => |s| try out.print(allocator, "{d}", .{s[row]}),
             .decimal64 => |s| try out.print(allocator, "{d}", .{s[row]}),

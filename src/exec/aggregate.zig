@@ -26,6 +26,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const json_binary = @import("json_binary.zig");
+const nested = @import("nested.zig");
 const Predicate = predicate.Predicate;
 
 pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, offer: exec.PruneOffer) !void {
@@ -358,7 +359,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
         .decimal64 => |v| .{ .decimal64 = v[row] },
         .decimal128 => |v| .{ .decimal128 = v[row] },
         .uuid => |v| .{ .uuid = v[row] },
-        .varchar, .string, .char, .json => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
+        .varchar, .string, .char, .json, .nested => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
     };
 }
 
@@ -366,7 +367,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
 /// the bank block of the value it replaces, `old` (null when there is none).
 fn replaceValueFromRow(bank: *StringBank, aa: Allocator, old: ?types.Value, view: ColumnView, row: u32) !types.Value {
     return switch (view.data) {
-        .varchar, .string, .char, .json => .{ .text = try bank.replace(aa, if (old) |v| v.text else "", stringRowBytes(view, @intCast(row))) },
+        .varchar, .string, .char, .json, .nested => .{ .text = try bank.replace(aa, if (old) |v| v.text else "", stringRowBytes(view, @intCast(row))) },
         else => valueFromRow(aa, view, row),
     };
 }
@@ -406,6 +407,7 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .uuid => |v| std.math.order(v[row], val.uuid),
         .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
         .json => |sv| json_binary.compare(sv.rowBytes(row), val.text),
+        .nested => |sv| nested.order(sv.rowBytes(row), val.text),
     };
 }
 
@@ -505,6 +507,7 @@ fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, 
         .string => try col.data.string.appendValue(allocator, value.text),
         .char => try col.data.char.appendValue(allocator, value.text),
         .json => try col.data.json.appendValue(allocator, value.text),
+        .nested => try col.data.nested.appendValue(allocator, value.text),
     }
 }
 
@@ -1169,7 +1172,7 @@ pub const Aggregate = struct {
             .single_str_key = group_col_indices.len == 1 and
                 !up_schema[group_col_indices[0]].nullable and
                 switch (up_schema[group_col_indices[0]].type) {
-                    .string, .varchar, .char, .json => true,
+                    .string, .varchar, .char, .json, .nested => true,
                     else => false,
                 },
             .top_k = resolved_top_k,
@@ -1890,7 +1893,7 @@ pub const Aggregate = struct {
                     try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, {});
                 } else switch (value_view.data) {
                     inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
-                    inline .varchar, .string, .char, .json => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    inline .varchar, .string, .char, .json, .nested => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
                     else => unreachable,
                 }
             },
@@ -1902,7 +1905,7 @@ pub const Aggregate = struct {
     fn scatterAnyValueNarrow(self: *Aggregate, col: []ValueNarrow, gids: []const u32, view: ColumnView, aa: Allocator) !void {
         switch (view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
-            inline .varchar, .string, .char, .json => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
+            inline .varchar, .string, .char, .json, .nested => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
             else => unreachable,
         }
     }
@@ -1958,7 +1961,7 @@ pub const Aggregate = struct {
                     }
                 }
             },
-            inline .varchar, .string, .char, .json => |sv, tag| {
+            inline .varchar, .string, .char, .json, .nested => |sv, tag| {
                 const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
@@ -2463,7 +2466,7 @@ pub const Aggregate = struct {
 
         const str_view: ?storage.StringView = if (coded_cc == null and self.single_str_key)
             switch (batch.values[self.group_col_indices[0]].data) {
-                .string, .varchar, .char, .json => |sv| sv,
+                .string, .varchar, .char, .json, .nested => |sv| sv,
                 else => unreachable,
             }
         else
@@ -2610,7 +2613,7 @@ pub const Aggregate = struct {
             // code back to its string via the query dictionary.
             const code = std.mem.readInt(u32, self.gkeys.items[gid][0..4], native_endian);
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char, .json => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
+                .string, .varchar, .char, .json, .nested => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
                 else => unreachable,
             }
         } else if (self.int_layout) |layout| {
@@ -2618,7 +2621,7 @@ pub const Aggregate = struct {
         } else if (self.single_str_key) {
             // Raw string bytes — no compound framing to decode.
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char, .json => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
+                .string, .varchar, .char, .json, .nested => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
                 else => unreachable,
             }
         } else {
@@ -3385,7 +3388,8 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .max_by_key => Error.AggregateUnsupportedType,
         .bit_and, .bit_or, .bit_xor => .bigint,
         .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => .largeint,
-        .group_concat => .string,
+        // Arrays concatenate into one array (ARRAY_AGG).
+        .group_concat => if (in != null and in.?.isNested()) in.? else .string,
         .udf => Error.AggregateUnsupportedType,
     };
 }
@@ -3462,7 +3466,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         },
         .group_concat => {
             const t = in orelse return Error.AggregateColumnRequired;
-            if (!t.isString()) return Error.AggregateUnsupportedType;
+            if (!t.isString() and !t.isNested()) return Error.AggregateUnsupportedType;
             if (arg2_in) |k| if (!k.isString()) return Error.AggregateUnsupportedType;
             switch (params) {
                 .concat => {},
@@ -3652,7 +3656,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMinLarge(s, simd.minOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMinFloat(s, simd.minOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMinFloat(s, simd.minOf(f64, sl[lo..hi])),
-                .varchar, .string, .char, .json => {},
+                .varchar, .string, .char, .json, .nested => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3701,7 +3705,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
-                inline .varchar, .string, .char, .json => |sv, tag| {
+                inline .varchar, .string, .char, .json, .nested => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -3729,7 +3733,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMaxLarge(s, simd.maxOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMaxFloat(s, simd.maxOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMaxFloat(s, simd.maxOf(f64, sl[lo..hi])),
-                .varchar, .string, .char, .json => {},
+                .varchar, .string, .char, .json, .nested => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3778,7 +3782,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.max_float == null or v > s.max_float.?) s.max_float = v;
                 },
-                inline .varchar, .string, .char, .json => |sv, tag| {
+                inline .varchar, .string, .char, .json, .nested => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -3965,7 +3969,7 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
             // string-family columns have an empty form — the other types
             // reaching this path are float/double, where `sv` stays null.
             const sv: ?storage.StringView = switch (view.data) {
-                .string, .varchar, .char, .json => |strv| strv,
+                .string, .varchar, .char, .json, .nested => |strv| strv,
                 else => null,
             };
             var scratch: std.ArrayList(u8) = .empty;
@@ -4062,7 +4066,8 @@ fn percentileUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u3
 /// GROUP_CONCAT: append separator + value bytes for each non-null row.
 /// `nonempty` distinguishes "no values yet" from "first value was empty".
 fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?ColumnView, row_start: u32, row_end: u32, params: ConcatParams) !void {
-    const collect = order_key != null or params.distinct;
+    // Arrays keep apart: no separator splits them again.
+    const collect = order_key != null or params.distinct or view.data == .nested;
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!view.isValid(r)) continue;
@@ -4085,6 +4090,17 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?
             c.nonempty = true;
         }
     }
+}
+
+/// A collected GROUP_CONCAT of arrays: one array of all their elements.
+fn appendConcatArrays(allocator: Allocator, col: *ColumnStore, c: *const ConcatAcc) !void {
+    const parts = try allocator.alloc([]const u8, c.entries.items.len);
+    defer allocator.free(parts);
+    for (parts, c.entries.items) |*p, e| p.* = e.value(c.buf.items);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(allocator);
+    try nested.appendConcat(allocator, &joined, nested.Array.decode(parts[0]).class, parts);
+    try col.data.nested.appendValue(allocator, joined.items);
 }
 
 /// Sort and dedupe a collected GROUP_CONCAT in place. Both sorts are stable,
@@ -4113,6 +4129,7 @@ fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
         .string => |sv| sv.rowBytes(row),
         .char => |sv| sv.rowBytes(row),
         .json => |sv| sv.rowBytes(row),
+        .nested => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -4156,7 +4173,7 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
             storage.format.writeF64(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
-        .string, .varchar, .char, .json => |sv| {
+        .string, .varchar, .char, .json, .nested => |sv| {
             const bytes = sv.rowBytes(row);
             try storage.format.appendU32(aa, out, @intCast(bytes.len));
             try out.appendSlice(aa, bytes);
@@ -4280,6 +4297,7 @@ pub fn appendAccToColumn(
                     .string => try col.data.string.appendValue(allocator, v),
                     .char => try col.data.char.appendValue(allocator, v),
                     .json => try col.data.json.appendValue(allocator, v),
+                    .nested => try col.data.nested.appendValue(allocator, v),
                     else => unreachable,
                 } else {
                     try col.data.appendNullPlaceholder(allocator);
@@ -4422,7 +4440,10 @@ pub fn appendAccToColumn(
         },
         .group_concat => {
             if (state.concat) |c| {
-                if (c.entries.items.len == 0) {
+                if (col.data == .nested) {
+                    orderConcatEntries(c, spec.params.concat.distinct);
+                    try appendConcatArrays(allocator, col, c);
+                } else if (c.entries.items.len == 0) {
                     try col.data.string.appendValue(allocator, c.buf.items);
                 } else {
                     const params = spec.params.concat;
@@ -4849,7 +4870,7 @@ pub fn appendIntGroupKey(
             const code = unpackField(u32, key, f);
             const bytes = layout.coded_dicts[i].?.decode(code);
             switch (out_cols[i].data) {
-                .varchar, .string, .char, .json => |*ss| try ss.appendValue(allocator, bytes),
+                .varchar, .string, .char, .json, .nested => |*ss| try ss.appendValue(allocator, bytes),
                 else => unreachable,
             }
             continue;
@@ -4933,7 +4954,7 @@ pub fn buildCompoundGroupKey(
                 try storage.format.appendU32(allocator, out, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
             },
-            .json => |sv| {
+            .json, .nested => |sv| {
                 const bytes = sv.rowBytes(row);
                 try storage.format.appendU32(allocator, out, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
@@ -4982,7 +5003,7 @@ pub fn buildCompoundGroupKeys(
         const view = batch.values[ci];
         const nullable = batch.schema[ci].nullable;
         switch (view.data) {
-            .varchar, .string, .char, .json => |sv| for (sp, 0..) |*s, r| {
+            .varchar, .string, .char, .json, .nested => |sv| for (sp, 0..) |*s, r| {
                 if (nullable and !view.isValid(r)) continue;
                 s[1] += 4 + (sv.offsets[r + 1] - sv.offsets[r]);
             },
@@ -5023,7 +5044,7 @@ fn fixedKeyWidth(data: storage.column.ValueView) ?u32 {
         .int, .date, .float => 4,
         .bigint, .datetime, .decimal64, .double => 8,
         .largeint, .decimal128, .uuid => 16,
-        .varchar, .string, .char, .json => null,
+        .varchar, .string, .char, .json, .nested => null,
     };
 }
 
@@ -5038,7 +5059,7 @@ fn writeKeyColumn(comptime nullable: bool, out: []u8, spans: [][2]u32, view: sto
         .uuid => |s| writeFixedKeys(u128, nullable, out, spans, view, s),
         .float => |s| writeFixedKeys(f32, nullable, out, spans, view, s),
         .double => |s| writeFixedKeys(f64, nullable, out, spans, view, s),
-        .varchar, .string, .char, .json => |sv| writeStringKeys(nullable, out, spans, view, sv),
+        .varchar, .string, .char, .json, .nested => |sv| writeStringKeys(nullable, out, spans, view, sv),
     }
 }
 
@@ -5135,7 +5156,7 @@ fn appendGroupKey(
                 try out_cols[i].data.boolean.append(allocator, key_bytes[cursor]);
                 cursor += 1;
             },
-            .varchar, .string, .char, .json => {
+            .varchar, .string, .char, .json, .nested => {
                 const len = storage.format.readU32(key_bytes[cursor .. cursor + 4]);
                 cursor += 4;
                 const bytes = key_bytes[cursor .. cursor + len];
@@ -5145,6 +5166,7 @@ fn appendGroupKey(
                     .string => |*x| x,
                     .char => |*x| x,
                     .json => |*x| x,
+                    .nested => |*x| x,
                     else => unreachable,
                 };
                 try ss.appendValue(allocator, bytes);

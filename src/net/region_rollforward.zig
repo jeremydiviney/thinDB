@@ -821,7 +821,7 @@ fn tableVersionOf(input: engine_v2.CompileInput, name: []const u8) ?u64 {
                 h.update(bits[0..@intCast((t.memtable.row_count + 7) / 8)]);
             } else hu(&h, 0);
             switch (view.data) {
-                .varchar, .string, .char, .json => |strings| {
+                .varchar, .string, .char, .json, .nested => |strings| {
                     h.update(std.mem.sliceAsBytes(strings.offsets));
                     hu(&h, strings.bytes.len);
                     h.update(strings.bytes);
@@ -2350,7 +2350,7 @@ fn valueAtRow(v: ColumnView, i: usize) !?Value {
         .largeint => |s| .{ .largeint = s[i] },
         .decimal64 => |s| .{ .decimal64 = s[i] },
         .decimal128 => |s| .{ .decimal128 = s[i] },
-        .varchar, .string, .char, .json => |s| .{ .text = s.rowBytes(i) },
+        .varchar, .string, .char, .json, .nested => |s| .{ .text = s.rowBytes(i) },
         else => NoMatch,
     };
 }
@@ -4252,7 +4252,7 @@ fn pushProbe(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, blk: Draine
 fn strBytesAt(v: ColumnView, i: usize) ?[]const u8 {
     if (!v.isValid(i)) return null;
     return switch (v.data) {
-        .varchar, .string, .char, .json => |s| s.rowBytes(i),
+        .varchar, .string, .char, .json, .nested => |s| s.rowBytes(i),
         else => null,
     };
 }

@@ -1659,7 +1659,38 @@ fn skipFsp(p: anytype) !void {
     if (fsp < 0 or fsp > 6) return PE.SqlExpectedValue;
 }
 
-pub fn parseColumnType(p: anytype) !types.Type {
+pub fn parseColumnType(p: anytype) @TypeOf(p.*).Err!types.Type {
+    var t = try parseBaseColumnType(p);
+    // PostgreSQL's `INT[]`, `TEXT[][]`. A declared bound (`INT[3]`) doesn't
+    // limit the length, as in PostgreSQL.
+    while (p.cur.tag == .lbracket) {
+        try p.advance();
+        if (p.cur.tag == .integer) try p.advance();
+        try p.expect(.rbracket);
+        t = try types.arrayOf(t);
+    }
+    return t;
+}
+
+/// StarRocks' and DuckDB's `ARRAY<T>`, cursor past `ARRAY`.
+pub fn arrayType(p: anytype) !types.Type {
+    try p.expect(.lt);
+    const element = try parseColumnType(p);
+    try closeTypeArguments(p);
+    return types.arrayOf(element);
+}
+
+/// The `>` closing a type's `<...>`. Nested types end in `>>`, which lexes
+/// as one shift token: this takes its first `>` and leaves the second.
+fn closeTypeArguments(p: anytype) !void {
+    if (p.cur.tag == .shr) {
+        p.cur = .{ .tag = .gt, .text = p.cur.text[1..] };
+        return;
+    }
+    try p.expect(.gt);
+}
+
+fn parseBaseColumnType(p: anytype) !types.Type {
     const PE = @TypeOf(p.*).Err;
     // SET('a', 'b', ...) stores its labels as comma-joined text, like ENUM.
     if (p.cur.tag == .kw_set) {
@@ -1761,6 +1792,7 @@ pub fn parseColumnType(p: anytype) !types.Type {
     }
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
     if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
+    if (asciiEqlAny(name, &.{"array"})) return arrayType(p);
     return PE.SqlExpectedKeyword;
 }
 

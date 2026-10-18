@@ -73,6 +73,21 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | Temporal | `DATE` | i32 days since 1970-01-01 UTC |
 | | `DATETIME` | i64 microseconds since 1970-01-01 UTC. No timezone awareness — applications convert at boundaries. |
 | Boolean | `BOOLEAN` | u8 (0/1) |
+| Nested | `ARRAY<T>` | One variable-width value per row in a self-contained encoding (`exec/nested.zig`): element class, count, validity bits, then the fixed-width values, or offsets and bytes. `T` is any type, an array included |
+
+An array's type points to its shape (`types.internNested`), so a type stays
+one word and two types compare by pointer. The shapes live in one
+process-wide pool that is never freed. That pool is the library's only
+global state, a deliberate exception: shapes are immutable, so every
+`Database` in the process can share them.
+
+Arrays follow StarRocks:
+- `[1, 2]`, `ARRAY[1, 2]` and `ARRAY<INT>[1, 2]` are literals, and `a[i]` counts from 1. An index out of range gives NULL.
+- An empty `[]` takes the array type beside it in a UNION arm or a CAST. Alone it is `ARRAY<BOOLEAN>`.
+- Arrays compare as their common type (`a < [1, 2]` lowers to `array_order(a, [1, 2]) < 0`). They compare element by element, a NULL element first and equal to another NULL, then the shorter first. GROUP BY, DISTINCT and ORDER BY use the same order, and an array is never pruned by zone maps or Bloom filters.
+- Text casts to an array from StarRocks' `[1, "a", null]` or PostgreSQL's `{1,a,NULL}`. An element that doesn't read as the element type is NULL. Text that isn't an array is NULL in a CAST and fails an INSERT.
+- The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
+- `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
 calendar, where year 0 is a leap year, as in StarRocks. So `0000-02-29` is a
@@ -209,7 +224,7 @@ dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
 `PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
 read `||` as concatenation.
 
-Explicitly **out of scope for v1**: `JSON`, `ARRAY`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
+Explicitly **out of scope for v1**: `JSON`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:
 - `FIXED` is `DECIMAL`.

@@ -65,7 +65,7 @@ pub const ColumnView = struct {
             .int, .date => |s| try appendLittle(i32, allocator, buf, s[row]),
             .bigint, .datetime, .decimal64 => |s| try appendLittle(i64, allocator, buf, s[row]),
             .boolean => |s| try buf.append(allocator, s[row]),
-            .varchar, .string, .char, .json => |sv| {
+            .varchar, .string, .char, .json, .nested => |sv| {
                 const bytes = sv.rowBytes(row);
                 try appendLittle(u32, allocator, buf, @intCast(bytes.len));
                 try buf.appendSlice(allocator, bytes);
@@ -128,7 +128,7 @@ pub const DistinctWidthSampler = struct {
     /// end, so consecutive chunks keep one stride.
     pub fn addStrided(self: *DistinctWidthSampler, allocator: std.mem.Allocator, view: ColumnView, first: usize, step: usize) !usize {
         const sv = switch (view.data) {
-            .varchar, .string, .char, .json => |s| s,
+            .varchar, .string, .char, .json, .nested => |s| s,
             else => return first -| view.rowCount(),
         };
         const rows = sv.rowCount();
@@ -171,6 +171,7 @@ pub const ValueView = union(TypeTag) {
     decimal128: []const i128,
     uuid: []const u128,
     json: StringView,
+    nested: StringView,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -191,6 +192,7 @@ pub const ValueView = union(TypeTag) {
             .decimal128 => |s| s.len,
             .uuid => |s| s.len,
             .json => |s| s.rowCount(),
+            .nested => |s| s.rowCount(),
         };
     }
 };
@@ -272,6 +274,7 @@ pub const OwnedData = union(TypeTag) {
     decimal128: []i128,
     uuid: []u128,
     json: OwnedStringColumn,
+    nested: OwnedStringColumn,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -292,6 +295,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal128 => |s| s.len,
             .uuid => |s| s.len,
             .json => |s| s.offsets.len - 1,
+            .nested => |s| s.offsets.len - 1,
         };
     }
 
@@ -314,6 +318,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal128 => |s| .{ .decimal128 = s },
             .uuid => |s| .{ .uuid = s },
             .json => |s| .{ .json = s.view() },
+            .nested => |s| .{ .nested = s.view() },
         };
     }
 
@@ -336,6 +341,7 @@ pub const OwnedData = union(TypeTag) {
             .decimal128 => |s| allocator.free(s),
             .uuid => |s| allocator.free(s),
             .json => |*s| s.deinit(allocator),
+            .nested => |*s| s.deinit(allocator),
         }
         self.* = undefined;
     }

@@ -12,6 +12,7 @@ const types = @import("../../types.zig");
 const Column = types.Column;
 
 const json_binary = @import("../../exec/json_binary.zig");
+const nested = @import("../../exec/nested.zig");
 
 const packet = @import("packet.zig");
 const handshake = @import("handshake.zig");
@@ -83,6 +84,8 @@ fn mysqlTypeOf(t: types.Type, protocol: Protocol) struct { type_byte: u8, decima
         .char => |n| .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = @as(u32, n) * 4, .charset = CHARSET_UTF8MB4 },
         .string => .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = 65535, .charset = CHARSET_UTF8MB4 },
         .json => .{ .type_byte = MYSQL_TYPE_JSON, .decimals = 0, .len = 4294967295, .charset = CHARSET_UTF8MB4 },
+        // MySQL has no array type; the value goes as its text, as StarRocks sends it.
+        .nested => .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = 65535, .charset = CHARSET_UTF8MB4 },
     };
 }
 
@@ -168,6 +171,7 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
         },
         .string, .varchar, .char => |sv| try scratch.appendSlice(allocator, sv.rowBytes(row)),
         .json => |sv| try appendJsonText(allocator, scratch, sv.rowBytes(row)),
+        .nested => |sv| try nested.appendText(allocator, scratch, schema_col.type, sv.rowBytes(row), .starrocks),
     }
     return scratch.items;
 }

@@ -10,6 +10,7 @@ const Column = types.Column;
 const Type = types.Type;
 
 const json_binary = @import("../../exec/json_binary.zig");
+const nested = @import("../../exec/nested.zig");
 
 const packet = @import("packet.zig");
 const wire_format = @import("../wire_format.zig");
@@ -27,6 +28,26 @@ const OID_DATE: u32 = 1082;
 const OID_TIMESTAMP: u32 = 1114;
 const OID_UUID: u32 = 2950;
 const OID_JSON: u32 = 114;
+
+/// The array type of each element OID, which a multidimensional array
+/// shares; an array of a type without one goes as text.
+fn pgArrayOid(element_oid: u32) u32 {
+    return switch (element_oid) {
+        OID_BOOL => 1000,
+        OID_INT2 => 1005,
+        OID_INT4 => 1007,
+        OID_INT8 => 1016,
+        OID_FLOAT4 => 1021,
+        OID_FLOAT8 => 1022,
+        OID_NUMERIC => 1231,
+        OID_TEXT => 1009,
+        OID_DATE => 1182,
+        OID_TIMESTAMP => 1115,
+        OID_UUID => 2951,
+        OID_JSON => 199,
+        else => OID_TEXT,
+    };
+}
 
 const TypeInfo = struct {
     oid: u32,
@@ -49,6 +70,9 @@ fn pgTypeOf(t: Type) TypeInfo {
         .uuid => .{ .oid = OID_UUID, .type_size = 16 },
         .varchar, .string, .char => .{ .oid = OID_TEXT, .type_size = -1 },
         .json => .{ .oid = OID_JSON, .type_size = -1 },
+        .nested => |n| switch (n.*) {
+            .array => |element| .{ .oid = if (element == .nested) pgTypeOf(element).oid else pgArrayOid(pgTypeOf(element).oid), .type_size = -1 },
+        },
     };
 }
 
@@ -156,6 +180,7 @@ fn formatCell(
                 try scratch.appendSlice(allocator, bytes);
             }
         },
+        .nested => |sv| try nested.appendText(allocator, scratch, schema_col.type, sv.rowBytes(row), .postgres),
     }
     return scratch.items;
 }

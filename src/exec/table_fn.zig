@@ -2039,12 +2039,12 @@ pub const TableFnExec = struct {
     pub fn inputTypeMatches(actual: types.Type, declared: types.Type) bool {
         if (std.meta.eql(actual, declared)) return true;
         const string_family = switch (actual) {
-            .varchar, .string, .char, .json => true,
+            .varchar, .string, .char, .json, .nested => true,
             else => false,
         };
         if (!string_family) return false;
         return switch (declared) {
-            .varchar, .string, .char, .json => true,
+            .varchar, .string, .char, .json, .nested => true,
             else => false,
         };
     }
@@ -2219,7 +2219,7 @@ pub const TableFnExec = struct {
             h1.update(&.{1});
             h2.update(&.{1});
             switch (v.data) {
-                .varchar, .string, .char, .json => |sv| {
+                .varchar, .string, .char, .json, .nested => |sv| {
                     const bytes = sv.rowBytes(row);
                     h1.update(bytes);
                     h2.update(bytes);
@@ -2481,7 +2481,7 @@ pub const TableFnExec = struct {
         return switch (want) {
             .tinyint, .smallint, .int, .bigint, .largeint => int_lit,
             .float, .double => int_lit or v == .float or v == .double,
-            .varchar, .string, .char, .json => v == .text,
+            .varchar, .string, .char, .json, .nested => v == .text,
             .date => v == .date or int_lit,
             .datetime => v == .datetime or int_lit,
             .boolean => v == .boolean or int_lit,
@@ -2565,6 +2565,7 @@ pub const TableFnExec = struct {
             .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
             .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
             .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
+            .nested => |sv| .{ .data = .{ .nested = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
         };
         if (v.nulls) |bm| {
             if (start % 8 == 0) {
@@ -2608,7 +2609,7 @@ pub const TableFnExec = struct {
             .decimal64 => |s| .{ .decimal64 = s[row] },
             .largeint => |s| .{ .largeint = s[row] },
             .boolean => |s| .{ .boolean = s[row] != 0 },
-            .varchar, .string, .char, .json => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+            .varchar, .string, .char, .json, .nested => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
             else => null,
         };
     }

@@ -686,6 +686,7 @@ pub const Limit = struct {
             .largeint => |s| .{ .largeint = s[k .. k + n] },
             .char => |sv| .{ .char = .{ .offsets = sv.offsets[k .. k + n + 1], .bytes = sv.bytes } },
             .json => |sv| .{ .json = .{ .offsets = sv.offsets[k .. k + n + 1], .bytes = sv.bytes } },
+            .nested => |sv| .{ .nested = .{ .offsets = sv.offsets[k .. k + n + 1], .bytes = sv.bytes } },
             .decimal64 => |s| .{ .decimal64 = s[k .. k + n] },
             .decimal128 => |s| .{ .decimal128 = s[k .. k + n] },
             .uuid => |s| .{ .uuid = s[k .. k + n] },
@@ -739,6 +740,10 @@ pub const Limit = struct {
                 .bytes = sv.bytes[0..sv.offsets[n]],
             } },
             .json => |sv| .{ .json = .{
+                .offsets = sv.offsets[0 .. n + 1],
+                .bytes = sv.bytes[0..sv.offsets[n]],
+            } },
+            .nested => |sv| .{ .nested = .{
                 .offsets = sv.offsets[0 .. n + 1],
                 .bytes = sv.bytes[0..sv.offsets[n]],
             } },

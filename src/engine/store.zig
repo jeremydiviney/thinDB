@@ -252,7 +252,7 @@ pub const ColumnStore = struct {
     pub fn reserveTotal(self: *ColumnStore, allocator: Allocator, rows_total: usize, bytes_total: usize) Allocator.Error!void {
         if (self.nulls) |*nb| try nb.ensureTotalCapacityPrecise(allocator, (rows_total + 7) >> 3);
         switch (self.data) {
-            .varchar, .string, .char, .json => |*ss| {
+            .varchar, .string, .char, .json, .nested => |*ss| {
                 try ss.offsets.ensureTotalCapacityPrecise(allocator, rows_total + 1);
                 try ss.bytes.ensureTotalCapacityPrecise(allocator, bytes_total);
             },
@@ -282,7 +282,7 @@ pub const ColumnStore = struct {
     pub fn heldBytes(self: ColumnStore) usize {
         const validity = if (self.nulls) |n| n.capacity else 0;
         return validity + switch (self.data) {
-            .varchar, .string, .char, .json => |ss| ss.offsets.capacity * @sizeOf(u32) + ss.bytes.capacity +
+            .varchar, .string, .char, .json, .nested => |ss| ss.offsets.capacity * @sizeOf(u32) + ss.bytes.capacity +
                 if (ss.wide_offsets) |wo| wo.capacity * @sizeOf(u64) else 0,
             inline else => |list| list.capacity * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
         };
@@ -292,7 +292,7 @@ pub const ColumnStore = struct {
     pub fn liveBytes(self: ColumnStore) usize {
         const validity = if (self.nulls) |n| n.items.len else 0;
         return validity + switch (self.data) {
-            .varchar, .string, .char, .json => |ss| ss.offsets.items.len * @sizeOf(u32) + ss.bytes.items.len +
+            .varchar, .string, .char, .json, .nested => |ss| ss.offsets.items.len * @sizeOf(u32) + ss.bytes.items.len +
                 if (ss.wide_offsets) |wo| wo.items.len * @sizeOf(u64) else 0,
             inline else => |list| list.items.len * @sizeOf(std.meta.Elem(@TypeOf(list.items))),
         };
@@ -306,7 +306,7 @@ pub const ColumnStore = struct {
         if (self.nulls) |n| nulls = try sizedCopy(u8, allocator, n, size);
         errdefer if (nulls) |*n| n.deinit(allocator);
         const data: DataStore = switch (self.data) {
-            inline .varchar, .string, .char, .json => |ss, tag| @unionInit(DataStore, @tagName(tag), try ss.cloneSized(allocator, size)),
+            inline .varchar, .string, .char, .json, .nested => |ss, tag| @unionInit(DataStore, @tagName(tag), try ss.cloneSized(allocator, size)),
             inline else => |list, tag| @unionInit(DataStore, @tagName(tag), try sizedCopy(std.meta.Elem(@TypeOf(list.items)), allocator, list, size)),
         };
         return .{ .data = data, .nulls = nulls };
@@ -524,8 +524,8 @@ pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start
         inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
         },
-        .varchar, .string, .char, .json => |sv| switch (dst.data) {
-            .varchar, .string, .char, .json => |*d| try d.appendRange(alloc, sv, start, end),
+        .varchar, .string, .char, .json, .nested => |sv| switch (dst.data) {
+            .varchar, .string, .char, .json, .nested => |*d| try d.appendRange(alloc, sv, start, end),
             else => unreachable,
         },
     }
@@ -666,6 +666,7 @@ pub const DataStore = union(TypeTag) {
     decimal128: std.ArrayList(i128),
     uuid: std.ArrayList(u128),
     json: StringStore,
+    nested: StringStore,
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return initCapacity(allocator, t, 0, 0);
@@ -705,6 +706,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => .{ .decimal128 = try ensuredCapList(i128, allocator, rows_cap) },
             .uuid => .{ .uuid = try ensuredCapList(u128, allocator, rows_cap) },
             .json => .{ .json = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
+            .nested => .{ .nested = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
         };
     }
 
@@ -733,6 +735,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |*list| list.deinit(allocator),
             .uuid => |*list| list.deinit(allocator),
             .json => |*ss| ss.deinit(allocator),
+            .nested => |*ss| ss.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -756,6 +759,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |l| l.items.len,
             .uuid => |l| l.items.len,
             .json => |s| s.rowCount(),
+            .nested => |s| s.rowCount(),
         };
     }
 
@@ -778,6 +782,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |l| .{ .decimal128 = l.items },
             .uuid => |l| .{ .uuid = l.items },
             .json => |s| .{ .json = s.view() },
+            .nested => |s| .{ .nested = s.view() },
         };
     }
 
@@ -800,12 +805,13 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |*l| l.clearRetainingCapacity(),
             .uuid => |*l| l.clearRetainingCapacity(),
             .json => |*s| s.clear(),
+            .nested => |*s| s.clear(),
         }
     }
 
     pub fn truncate(self: *DataStore, rows: usize) void {
         switch (self.*) {
-            .varchar, .string, .char, .json => |*s| s.truncate(rows),
+            .varchar, .string, .char, .json, .nested => |*s| s.truncate(rows),
             inline else => |*l| l.shrinkRetainingCapacity(rows),
         }
     }
@@ -832,6 +838,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |*l| try l.append(allocator, 0),
             .uuid => |*l| try l.append(allocator, 0),
             .json => |*s| try s.appendValue(allocator, ""),
+            .nested => |*s| try s.appendValue(allocator, ""),
         }
     }
 
@@ -856,6 +863,7 @@ pub const DataStore = union(TypeTag) {
             .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
             .uuid => |*l| try l.appendNTimes(allocator, 0, n),
             .json => |*s| try s.appendEmptyValues(allocator, n),
+            .nested => |*s| try s.appendEmptyValues(allocator, n),
         }
     }
 };

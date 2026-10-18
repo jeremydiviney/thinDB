@@ -310,17 +310,18 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
         .largeint, .decimal128, .uuid => true,
-        .varchar, .string, .char, .json => true,
+        .varchar, .string, .char, .json, .nested => true,
         .float, .double => true,
     };
 }
 
 /// False for JSON, which compares by MySQL's JSON rules rather than by the
-/// order or equality of its stored JSONB bytes: min/max stats, Bloom hashes
-/// and encoded-block kernels built on those bytes can't answer a JSON
-/// comparison.
+/// order or equality of its stored JSONB bytes, and for a nested value, whose
+/// canonical bytes are equal exactly when the values are but don't sort as
+/// they do: min/max stats, Bloom hashes and encoded-block kernels built on
+/// those bytes can't answer either comparison.
 pub fn bytesFollowComparison(t: @import("../types.zig").Type) bool {
-    return t != .json;
+    return t != .json and t != .nested;
 }
 
 /// How a column type uses the `Stats.sum` slot — drives both the writer's
@@ -332,7 +333,7 @@ pub fn sumKindOf(t: @import("../types.zig").Type) SumKind {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => .int,
         .float, .double => .float,
-        .varchar, .string, .char, .json => .string_min,
+        .varchar, .string, .char, .json, .nested => .string_min,
         .largeint, .decimal128, .uuid => .none,
     };
 }

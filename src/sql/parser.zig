@@ -186,6 +186,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "median", .func = .percentile },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
+    // A GROUP_CONCAT of one-element arrays, which concatenates them.
+    .{ .name = "array_agg", .func = .group_concat },
 };
 
 fn aggForName(name: []const u8, dialect: types.Dialect) ?ir.AggFunc {
@@ -2247,8 +2249,8 @@ pub const Parser = struct {
         // expression parser so binary operators and aliasing work.
         // (`GROUP BY 1` then references it as ordinal 1.)
         const scalar_led = switch (self.cur.tag) {
-            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier, .system_variable => true,
-            else => try self.prefixOperatorAhead(),
+            .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier, .system_variable, .lbracket => true,
+            else => try self.prefixOperatorAhead() or try self.arrayLiteralAhead(),
         };
         if (scalar_led) return try self.namedExprItem(item_start, try self.parseScalar());
 
@@ -2259,11 +2261,7 @@ pub const Parser = struct {
             const saved = self.cur;
             try self.advance();
             if (self.cur.tag == .lparen) {
-                var expr = try self.parseScalarCallAfterName(saved.text);
-                while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
-                    try self.advance();
-                    expr = try self.parseCastTarget(expr);
-                }
+                var expr = try self.parsePostfix(try self.parseScalarCallAfterName(saved.text));
                 expr = try self.continueBinaryFrom(expr);
                 return try self.namedExprItem(item_start, expr);
             }
@@ -2373,7 +2371,7 @@ pub const Parser = struct {
             // whole thing is a binary expression with the call as the
             // leftmost operand — lift into a .expr ProjItem. Otherwise
             // stay as a bare scalar call.
-            const scalar_atom = try self.makeScalarCallExpr(first, args);
+            const scalar_atom = try self.parsePostfix(try self.makeScalarCallExpr(first, args));
             return try self.namedExprItem(item_start, try self.continueBinaryFrom(scalar_atom));
         }
 
@@ -2395,14 +2393,10 @@ pub const Parser = struct {
             return ProjItem{ .name = name, .kind = .{ .star = qual } };
         });
 
-        // A `col::type` postfix cast (PG) and/or a trailing binary
+        // A `col::type` postfix cast (PG), a subscript and/or a trailing binary
         // operator (`qty + 1`) lift the column ref into an expression.
-        if ((self.cur.tag == .coloncolon and self.lex.dialect != .mysql) or try self.binaryOpAhead()) {
-            var expr = ir.Expr{ .col_ref = dup_col };
-            while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
-                try self.advance();
-                expr = try self.parseCastTarget(expr);
-            }
+        if ((self.cur.tag == .coloncolon and self.lex.dialect != .mysql) or self.cur.tag == .lbracket or try self.binaryOpAhead()) {
+            var expr = try self.parsePostfix(ir.Expr{ .col_ref = dup_col });
             expr = try self.continueBinaryFrom(expr);
             return try self.namedExprItem(item_start, expr);
         }
@@ -2593,8 +2587,8 @@ pub const Parser = struct {
         var depth: usize = 0;
         while (true) : (tok = try look.next()) {
             switch (tok.tag) {
-                .lparen, .kw_case => depth += 1,
-                .rparen, .kw_end => {
+                .lparen, .lbracket, .kw_case => depth += 1,
+                .rparen, .rbracket, .kw_end => {
                     if (depth == 0) return false;
                     depth -= 1;
                 },
@@ -2606,14 +2600,35 @@ pub const Parser = struct {
                     if (depth == 0) return true;
                 },
                 .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,
-                .identifier => if (depth == 0 and tok.text.ptr != self.cur.text.ptr) {
-                    if (std.ascii.eqlIgnoreCase(tok.text, "xor")) return true;
-                    var after_sounds = look;
-                    if (std.ascii.eqlIgnoreCase(tok.text, "sounds") and (try after_sounds.next()).tag == .kw_like) return true;
+                .identifier => {
+                    if (try skipArrayTypeArguments(&look, tok)) continue;
+                    if (depth == 0 and tok.text.ptr != self.cur.text.ptr) {
+                        if (std.ascii.eqlIgnoreCase(tok.text, "xor")) return true;
+                        var after_sounds = look;
+                        if (std.ascii.eqlIgnoreCase(tok.text, "sounds") and (try after_sounds.next()).tag == .kw_like) return true;
+                    }
                 },
                 else => {},
             }
         }
+    }
+
+    /// Moves `look` past the `<T>` of an `ARRAY<T>` that `tok` starts, whose
+    /// angle brackets are no comparisons. Returns whether it did.
+    fn skipArrayTypeArguments(look: *Lexer, tok: Token) ParseError!bool {
+        if (tok.quoted or !std.ascii.eqlIgnoreCase(tok.text, "array")) return false;
+        var ahead = look.*;
+        if ((try ahead.next()).tag != .lt) return false;
+        var open: usize = 1;
+        while (open > 0) switch ((try ahead.next()).tag) {
+            .lt => open += 1,
+            .gt => open -= 1,
+            .shr => open -|= 2,
+            .eof => return false,
+            else => {},
+        };
+        look.* = ahead;
+        return true;
     }
 
     /// One value: a predicate read as a value, or an arithmetic expression.
@@ -3353,10 +3368,14 @@ pub const Parser = struct {
             .col_ref => |c| c,
             else => "expr",
         };
+        const value = if (std.ascii.eqlIgnoreCase(func_name, "array_agg"))
+            ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = try self.arena.dupe(ir.Expr, args[0..1]) } }
+        else
+            try scalar_fn.toString(self.arena, args[0]);
         return .{ .default_name = try std.fmt.allocPrint(self.arena, "{s}({s}{s})", .{ func_name, distinctPrefix(func_name, distinct), arg_name }), .agg = .{
             .func = .group_concat,
             .col = null,
-            .arg_expr = try scalar_fn.toString(self.arena, args[0]),
+            .arg_expr = value,
             .arg2_expr = if (args.len == 3) args[2] else null,
             .params = .{ .concat = .{ .separator = separator, .distinct = distinct } },
         } };
@@ -3602,15 +3621,37 @@ pub const Parser = struct {
     /// nested scalar call. Aggregates and window functions are
     /// rejected — they belong at the top level of the SELECT list.
     pub fn parseCallAtom(self: *Parser) ParseError!ir.Expr {
-        var atom = try self.parseCallAtomBase();
-        // `expr::type` postfix cast (PG). Binds tighter than binary ops;
-        // rejected on MySQL (where `::` is not a cast operator).
-        while (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
-            try self.advance();
-            atom = try self.parseCastTarget(atom);
-        }
+        const atom = try self.parsePostfix(try self.parseCallAtomBase());
         try self.skipCollations();
         return try self.consumeJsonArrows(atom);
+    }
+
+    /// `expr::type` postfix casts (PG) and `arr[i]` subscripts after an
+    /// operand. Both bind tighter than binary ops; `::` is rejected on MySQL
+    /// (where it is not a cast operator).
+    pub fn parsePostfix(self: *Parser, operand: ir.Expr) ParseError!ir.Expr {
+        var atom = operand;
+        while (true) {
+            if (self.cur.tag == .lbracket) {
+                try self.advance();
+                const args = try self.arena.alloc(ir.Expr, 2);
+                args[0] = atom;
+                args[1] = try self.parseValueExpr();
+                try self.expect(.rbracket);
+                atom = ir.Expr{ .call = .{ .fn_name = scalar_fn.ELEMENT_AT_FN, .args = args } };
+            } else if (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
+                try self.advance();
+                atom = try self.parseCastTarget(atom);
+            } else return atom;
+        }
+    }
+
+    /// An `ARRAY[...]` or `ARRAY<T>[...]` literal at the cursor.
+    pub fn arrayLiteralAhead(self: *Parser) ParseError!bool {
+        if (self.cur.tag != .identifier or self.cur.quoted or !std.ascii.eqlIgnoreCase(self.cur.text, "array")) return false;
+        var look = self.lex.*;
+        const next = try look.next();
+        return next.tag == .lbracket or next.tag == .lt;
     }
 
     /// MySQL JSON extraction: `doc -> '$.path'` desugars to
@@ -3634,6 +3675,7 @@ pub const Parser = struct {
 
     fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
         if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
+        if (ty.isNested() and scalar_fn.isEmptyArrayLiteral(inner)) return scalar_fn.emptyArrayAs(self.arena, ty);
         const fn_name = if (self.lex.dialect == .postgres and ty.isString() and ty != .json)
             scalar_fn.PG_TEXT_FN
         else
@@ -3729,8 +3771,24 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, lowered.fn_name), .args = try self.arena.dupe(ir.Expr, &.{inner}) } };
     }
 
+    /// The elements of an array literal, cursor on its `[`.
+    fn parseArrayLiteral(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lbracket);
+        var elements: std.ArrayList(ir.Expr) = .empty;
+        if (self.cur.tag != .rbracket) {
+            while (true) {
+                try elements.append(self.arena, try self.parseValueExpr());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.expect(.rbracket);
+        return ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = elements.items } };
+    }
+
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
+        if (self.cur.tag == .lbracket) return try self.parseArrayLiteral();
         // EXISTS (SELECT ...) in expression position — projects a
         // boolean. Resolved by the pre-compile pass into `.lit`.
         if (self.cur.tag == .kw_exists) {
@@ -3761,7 +3819,16 @@ pub const Parser = struct {
         switch (self.cur.tag) {
             .identifier => {
                 const name = self.cur.text;
+                const quoted = self.cur.quoted;
                 try self.advance();
+                if (!quoted and std.ascii.eqlIgnoreCase(name, "array")) {
+                    // `ARRAY[a, b]` (PostgreSQL) and `ARRAY<T>[a, b]` (StarRocks).
+                    if (self.cur.tag == .lbracket) return try self.parseArrayLiteral();
+                    if (self.cur.tag == .lt) {
+                        const ty = try parse_ddl.arrayType(self);
+                        return try self.castExprToType(try self.parseArrayLiteral(), ty);
+                    }
+                }
                 if (try self.typedTemporalLiteralAfterName(name)) |lit| return lit;
                 if (self.cur.tag == .lparen) {
                     if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);

@@ -171,7 +171,7 @@ fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: Column
     switch (arg.data) {
         // A zero byte escapes to 0x00 0xFF and 0x00 0x00 ends the text, so a
         // prefix sorts before every longer text, and the next key starts clean.
-        .varchar, .string, .char, .json => |sv| {
+        .varchar, .string, .char, .json, .nested => |sv| {
             var rest = sv.rowBytes(row);
             while (std.mem.indexOfScalar(u8, rest, 0)) |zero| {
                 try key.appendSlice(allocator, rest[0 .. zero + 1]);

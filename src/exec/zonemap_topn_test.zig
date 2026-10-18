@@ -71,6 +71,7 @@ fn cellOf(arena: std.mem.Allocator, v: ColumnView, row: usize) !Cell {
         .string => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
         .char => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
         .json => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
+        .nested => |s| .{ .str = try arena.dupe(u8, s.rowBytes(row)) },
     };
 }
 

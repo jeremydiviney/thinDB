@@ -3725,7 +3725,7 @@ fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.st
             if (!valid) continue;
         }
         const d: u128 = switch (key_views[i].data) {
-            .string, .varchar, .char, .json => |sv| if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row)),
+            .string, .varchar, .char, .json, .nested => |sv| if (key_digests[i]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row)),
             else => readGenericKeyBits(key_views[i], part.typ, row) catch 0,
         };
         buf[len..][0..@sizeOf(u128)].* = @bitCast(d);
@@ -3818,7 +3818,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         for (layout.str_columns, 0..) |sc, i| {
             const view = batch.columnView(sc.source_name) orelse return error.ColumnNotFound;
             str_views_buf[i] = switch (view.data) {
-                .varchar, .string, .char, .json => |sv| sv,
+                .varchar, .string, .char, .json, .nested => |sv| sv,
                 else => return error.TypeMismatch,
             };
             str_nulls_buf[i] = view.nulls;
