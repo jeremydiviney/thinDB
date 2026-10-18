@@ -2668,6 +2668,77 @@ test "pg wire ext: pipelined Parse + Bind + Execute + Sync collects all replies"
     if (sctx.err) |e| return e;
 }
 
+test "pg wire ext: a write is applied once, at Execute, not when it is parsed" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try openCatalog(allocator, io, tmp.dir);
+    defer catalog.close();
+
+    const db = catalog.database("main").?;
+    const sc = db.schema("public").?;
+    const tbl = try sc.table("ext_once", schema_ext, opts_ext);
+    try tbl.insert(&.{
+        .{ .id = @as(i64, 1), .qty = @as(i32, 1), .tag = "a" },
+        .{ .id = @as(i64, 2), .qty = @as(i32, 2), .tag = "b" },
+    });
+    try tbl.flush();
+
+    const port: u16 = test_port_base + 373;
+    const addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var server = try thindb.servePg(allocator, io, catalog, addr, null);
+    defer server.destroy();
+    defer server.close();
+
+    var sctx: ServerCtx = .{ .server = server, .n = 1 };
+    const t = try std.Thread.spawn(.{}, ServerCtx.run, .{&sctx});
+    defer t.join();
+
+    var client = try TestClient.connect(allocator, io, addr);
+    defer client.close();
+    try client.completeStartup("postgres", "main");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const writes = [_]struct { sql: []const u8, param: ?[]const u8 }{
+        .{ .sql = "INSERT INTO ext_once SELECT id + 10, qty, tag FROM ext_once", .param = null },
+        .{ .sql = "UPDATE ext_once SET qty = qty + 1 WHERE id = $1", .param = "1" },
+        .{ .sql = "DELETE FROM ext_once WHERE id = $1", .param = "12" },
+        .{ .sql = "CREATE TABLE ext_once_copy AS SELECT * FROM ext_once", .param = null },
+    };
+    for (writes) |write| {
+        try client.sendParse("", write.sql, &.{});
+        try client.sendDescribe('S', "");
+        const params = [_]TestClient.BindParam{.{ .value = write.param, .format = 0 }};
+        try client.sendBind("", "", if (write.param != null) params[0..] else &.{}, &.{});
+        try client.sendExecute("", 0);
+        try client.sendSync();
+        const r = try client.readExtendedReplies(arena.allocator());
+        try std.testing.expect(r.error_code == null);
+        try std.testing.expectEqual(@as(u32, 1), r.no_data);
+    }
+
+    try client.sendQuery("SELECT id, qty FROM ext_once ORDER BY id");
+    const sel = try client.readQueryReply(arena.allocator());
+    const expected = [_][2][]const u8{ .{ "1", "2" }, .{ "2", "2" }, .{ "11", "1" } };
+    try std.testing.expectEqual(expected.len, sel.rows.len);
+    for (expected, sel.rows) |want, got| {
+        try std.testing.expectEqualStrings(want[0], got[0].?);
+        try std.testing.expectEqualStrings(want[1], got[1].?);
+    }
+
+    try client.sendQuery("SELECT COUNT(*) FROM ext_once_copy");
+    const copied = try client.readQueryReply(arena.allocator());
+    try std.testing.expectEqualStrings("3", copied.rows[0][0].?);
+
+    try client.sendTerminate();
+    if (sctx.err) |e| return e;
+}
+
 test "pg wire: CREATE TEMP TABLE round-trip + DISCARD ALL drops it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

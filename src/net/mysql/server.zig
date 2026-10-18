@@ -3862,17 +3862,16 @@ fn handleStmtPrepare(
 
     // Best-effort schema inference. We substitute `?` → `0` so the
     // existing parser+compiler can produce an output schema; failures
-    // here fall back to num_columns=0. Side-effect ops (DDL, INSERT)
-    // are skipped before compile so the prepare-time pass has no
-    // observable effect on the catalog or data.
+    // here fall back to num_columns=0. Only statements whose compile
+    // leaves the catalog and data alone are compiled here; compiling a
+    // write applies it.
     if (num_params <= max_prepare_param_defs_to_emit) {
         const infer_start = profiler.start();
         blk: {
             const dummy_sql = prepared.renderDummySubstitution(arena.allocator(), payload, num_params) catch break :blk;
             const tables: local.SessionTables = .{ .catalog = catalog, .session = session.asSession() };
             const dummy_op = sql.parseWithContext(arena.allocator(), dummy_sql, .mysql, &catalog.udfs, .{ .registry = &catalog.sql_fns, .db = session.current_db, .views = &catalog.views, .tables = tables.columns() }) catch break :blk;
-            if (dummy_op.* == .batch) break :blk;
-            if (isSideEffectOp(dummy_op.*)) break :blk;
+            if (!local.producesOnlyResult(dummy_op)) break :blk;
             const lease = catalog.acquireStatement(false) catch break :blk;
             defer lease.release();
             var compiled = local.compileInStatement(arena.allocator(), catalog, session.asSession(), dummy_op) catch break :blk;

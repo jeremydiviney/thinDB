@@ -439,6 +439,32 @@ test "sql: EXPLAIN result column name follows the wire dialect" {
     }
 }
 
+test "sql: EXPLAIN of a write statement is refused without applying the write" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    _ = try seedT(db);
+
+    const writes = .{
+        "EXPLAIN DELETE FROM t WHERE k = 100",
+        "EXPLAIN UPDATE t SET qty = qty + 1",
+        "EXPLAIN INSERT INTO t SELECT id + 10, k, qty, tag FROM t",
+        "EXPLAIN INSERT INTO t VALUES (9, 900, 90, 'z')",
+        "EXPLAIN CREATE TABLE t_copy AS SELECT * FROM t",
+    };
+    inline for (writes) |sql_text| {
+        try helpers.expectRunError(allocator, db, sql_text, error.UnsupportedOp);
+    }
+
+    const qty = try helpers.collectBigints(allocator, db, "SELECT qty FROM t ORDER BY id");
+    defer allocator.free(qty);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 20, 30, 40, 50 }, qty);
+    try helpers.expectRunError(allocator, db, "SELECT * FROM t_copy", error.TableNotFound);
+}
+
 test "sql: double-quoted identifiers resolve columns (neutral/PG)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

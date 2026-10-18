@@ -22,7 +22,6 @@ const sql_text = @import("../sql_text.zig");
 
 const lexer_mod = @import("../../sql/lexer.zig");
 const sql_mod = @import("../../sql/sql.zig");
-const ir = @import("../../ir/ir.zig");
 const local = @import("../local.zig");
 const types = @import("../../types.zig");
 const Column = types.Column;
@@ -583,7 +582,7 @@ pub fn dryCompileSchema(
         for (dummies) |*slot| slot.* = "0";
         const substituted = substituteDollarSql(pa, sql, dummies) catch return null;
         const op = sql_mod.parseDialect(pa, substituted.sql, .postgres) catch return null;
-        if (isSideEffect(op.*)) return null;
+        if (!local.producesOnlyResult(op)) return null;
     }
 
     const dummies_to_try = [_][]const u8{ "0", "'placeholder'" };
@@ -612,7 +611,7 @@ fn tryDryCompile(
 
     const substituted = substituteDollarSql(aa, sql, dummies) catch return null;
     const op = sql_mod.parseDialect(aa, substituted.sql, .postgres) catch return null;
-    if (isSideEffect(op.*)) return null;
+    if (!local.producesOnlyResult(op)) return null;
 
     const lease = catalog.acquireStatement(false) catch return null;
     defer lease.release();
@@ -643,13 +642,6 @@ fn tryDryCompile(
         };
     }
     return .{ .columns = cols, .names = names };
-}
-
-fn isSideEffect(op: ir.Op) bool {
-    return switch (op) {
-        .ddl, .insert, .copy, .batch => true,
-        else => false,
-    };
 }
 
 // ---------------------------------------------------------------------------
