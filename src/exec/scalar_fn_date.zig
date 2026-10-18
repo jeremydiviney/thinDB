@@ -755,15 +755,20 @@ fn unitSpan(unit: DiffUnit) UnitSpan {
 /// Whole months from `start` to `end`, negative when `end` is earlier: a
 /// month counts once the later value's day of the month and time of day
 /// reach the earlier one's, that day held to the later month's length, so
-/// 2024-01-31 to 2024-02-29 is a month.
+/// 2024-01-31 to 2024-02-29 is a month. Times only matter on that last day
+/// when the earlier value is on its own month's last day too, so
+/// 2016-02-28 00:00:01 to 2017-02-28 00:00:00 is a year but 2016-02-29
+/// 00:00:01 to 2017-02-28 00:00:00 isn't.
 fn elapsedMonths(start: i64, end: i64) i64 {
     const earlier = @min(start, end);
     const later = @max(start, end);
     const b = daysToYmd(daysFromDatetime(earlier));
     const e = daysToYmd(daysFromDatetime(later));
     var months = (@as(i64, e.year) - b.year) * 12 + (@as(i64, e.month) - b.month);
-    const day = @min(b.day, common.lastDayOfMonth(e.year, e.month));
-    const time_before = @mod(later, std.time.us_per_day) < @mod(earlier, std.time.us_per_day);
+    const last_day = common.lastDayOfMonth(e.year, e.month);
+    const day = @min(b.day, last_day);
+    const times_count = e.day != last_day or b.day == common.lastDayOfMonth(b.year, b.month);
+    const time_before = times_count and @mod(later, std.time.us_per_day) < @mod(earlier, std.time.us_per_day);
     if (e.day < day or (e.day == day and time_before)) months -= 1;
     return if (end < start) -months else months;
 }
@@ -1178,8 +1183,23 @@ test "DATE_DIFF and MONTHS_DIFF count from their second value to their first, as
         .{ "month", dt(2024, 2, 29, 12, 0, 0), dt(2024, 1, 31, 11, 0, 0), 1 },
         .{ "month", dt(2026, 2, 1, 0, 0, 0), dt(2026, 1, 1, 0, 0, 500_000), 0 },
         .{ "month", dt(2026, 1, 1, 0, 0, 0), dt(2026, 1, 31, 0, 0, 0), 0 },
+        .{ "month", dt(2017, 2, 28, 0, 0, 0), dt(2016, 2, 28, 0, 0, 1_000), 12 },
+        .{ "month", dt(2016, 2, 28, 0, 0, 1_000), dt(2017, 2, 28, 0, 0, 0), -12 },
+        .{ "month", dt(2017, 2, 28, 0, 0, 0), dt(2017, 1, 30, 0, 0, 1_000_000), 1 },
+        .{ "month", dt(2017, 2, 28, 0, 0, 0), dt(2016, 2, 29, 0, 0, 1_000_000), 11 },
+        .{ "month", dt(2017, 9, 30, 8, 0, 0), dt(2017, 8, 30, 9, 0, 0), 1 },
+        .{ "month", dt(2017, 9, 30, 8, 0, 0), dt(2017, 8, 31, 9, 0, 0), 0 },
+        .{ "month", dt(2017, 9, 29, 8, 0, 0), dt(2017, 8, 29, 9, 0, 0), 0 },
+        .{ "month", dt(2017, 5, 31, 10, 0, 0), dt(2017, 4, 30, 11, 0, 0), 1 },
+        .{ "month", dt(2017, 1, 31, 10, 0, 0), dt(2016, 12, 31, 11, 0, 0), 0 },
+        .{ "month", dt(2017, 3, 28, 0, 0, 0), dt(2017, 2, 28, 0, 0, 1_000_000), 0 },
         .{ "quarter", dt(2024, 2, 29, 0, 0, 0), dt(2023, 11, 30, 0, 0, 0), 1 },
+        .{ "quarter", dt(2017, 2, 28, 0, 0, 0), dt(2016, 11, 28, 0, 0, 1_000_000), 1 },
         .{ "year", dt(2023, 2, 28, 0, 0, 0), dt(2020, 2, 29, 0, 0, 0), 3 },
+        .{ "year", dt(2017, 2, 28, 0, 0, 0), dt(2016, 2, 28, 0, 0, 10_000), 1 },
+        .{ "year", dt(2019, 2, 28, 0, 0, 0), dt(2016, 2, 28, 0, 0, 1_000_000), 3 },
+        .{ "year", dt(2016, 2, 28, 0, 0, 0), dt(2015, 2, 28, 0, 0, 1_000_000), 0 },
+        .{ "year", dt(2021, 2, 28, 10, 0, 0), dt(2020, 2, 29, 11, 0, 0), 0 },
         .{ "year", dt(0, 1, 1, 0, 0, 0), dt(9999, 12, 31, 23, 59, 59_000_000), -9999 },
     };
     inline for (date_diff_cases) |c| try std.testing.expectEqual(@as(i64, c[3]), dateDiff(try parseDiffUnit(c[0]), c[1], c[2]));
