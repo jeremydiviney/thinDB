@@ -709,6 +709,47 @@ pub fn lastDayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView,
     while (i < row_count) : (i += 1) try out.data.date.append(allocator, lastDayFromDays(daysFromDatetime(s[i])));
 }
 
+const LastDayUnit = enum { month, quarter, year };
+
+/// LAST_DAY(d, unit), as StarRocks: the last day of d's month, quarter or
+/// year, the unit named in any case. A NULL unit gives NULL, and another
+/// unit fails the query.
+pub fn lastDayOfUnitKernel(comptime source: enum { date, datetime }) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const units = stringViewOf(args[1]);
+            for (0..row_count) |i| {
+                const unit: ?LastDayUnit = if (args[1].isValid(i)) lastDayUnitNamed(units.rowBytes(i)) orelse return error.InvalidLastDayUnit else null;
+                const valid = unit != null and args[0].isValid(i);
+                const days = if (valid) lastDayOfUnit(switch (source) {
+                    .date => args[0].data.date[i],
+                    .datetime => daysFromDatetime(args[0].data.datetime[i]),
+                }, unit.?) else 0;
+                try out.data.date.append(allocator, days);
+                try out.appendValidBit(allocator, base + i, valid);
+            }
+        }
+    }.kernel;
+}
+
+fn lastDayUnitNamed(name: []const u8) ?LastDayUnit {
+    inline for (@typeInfo(LastDayUnit).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
+fn lastDayOfUnit(days: i32, unit: LastDayUnit) i32 {
+    const ymd = daysToYmd(days);
+    const month: u32 = switch (unit) {
+        .month => ymd.month,
+        .quarter => (@as(u32, ymd.month) + 2) / 3 * 3,
+        .year => 12,
+    };
+    return common.ymdToDays(ymd.year, month, common.lastDayOfMonth(ymd.year, month));
+}
+
 // ---------------------------------------------------------------------------
 // Additional date/time names and unit-based diff/add helpers.
 // ---------------------------------------------------------------------------
