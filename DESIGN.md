@@ -883,6 +883,12 @@ MySQL, StarRocks, PostgreSQL and DuckDB bind it: `SELECT n % 2 AS n ... GROUP BY
 n` makes one group per `n`. It reaches an alias only when FROM has no such
 column. `SELECT n, t.n FROM t` names the repeat `n_1`, as `SELECT n, n` does.
 
+`ORDER BY ALL`, from DuckDB, sorts by every SELECT item from left to right, as
+`ORDER BY 1, 2, ...` would, a `*` counting each column it expands to. One
+`ASC` or `DESC` and one NULLS placement after it apply to every key. It stands
+alone: no other key follows it, and a window's ORDER BY refuses it
+(`SqlInvalidProjection`).
+
 Before preparing a fused hash join, a pure filter over an existing materialized
 stage may check that stage for a surviving probe row. An empty probe skips the
 lookup builds through a chain of non-FULL joins. The check reuses stage buffers,

@@ -7318,27 +7318,22 @@ pub const Parser = struct {
         defer self.predicate_derived_enabled = old_enabled;
         defer self.predicate_derived_scope = old_scope;
         errdefer self.predicate_derived.shrinkRetainingCapacity(anchor_mark);
-        while (true) {
+        if (self.cur.tag == .kw_all) {
+            // DuckDB's `ORDER BY ALL`: every SELECT item, left to right, as
+            // their ordinals would sort, all in one direction.
+            try self.advance();
+            const placement = try self.parseSortPlacement();
+            if (proj.len == 0 or self.cur.tag == .comma) return ParseError.SqlInvalidProjection;
+            for (proj) |p| {
+                for (try self.selectItemSortColumns(p, inputs)) |c| try self.appendSortKey(&items, &keys, c, placement);
+            }
+        } else while (true) {
             const col = if (try self.orderKeyBindsDirectly())
                 try self.parseDirectOrderKey(proj, inputs, &keys)
             else
                 try self.parseExprOrderKey(proj, &keys);
-            var desc = false;
-            if (self.cur.tag == .kw_asc) {
-                try self.advance();
-            } else if (self.cur.tag == .kw_desc) {
-                desc = true;
-                try self.advance();
-            }
-            const nulls_first = try self.parseNullsPlacement();
-            if (col) |c| {
-                // NULLs sort first ascending and last descending; the other
-                // placement sorts on whether the key is NULL ahead of it.
-                if (nulls_first) |first| if (first == desc) {
-                    try items.append(self.arena, .{ .col = try self.orderNullKey(c, &keys), .desc = first });
-                };
-                try items.append(self.arena, .{ .col = c, .desc = desc });
-            }
+            const placement = try self.parseSortPlacement();
+            if (col) |c| try self.appendSortKey(&items, &keys, c, placement);
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
@@ -7352,6 +7347,49 @@ pub const Parser = struct {
             .anchors = anchors,
             .keys = try keys.toOwnedSlice(self.arena),
         };
+    }
+
+    const SortPlacement = struct { desc: bool, nulls_first: ?bool };
+
+    /// `[ASC | DESC] [NULLS FIRST | NULLS LAST]` after a sort key.
+    fn parseSortPlacement(self: *Parser) ParseError!SortPlacement {
+        var desc = false;
+        if (self.cur.tag == .kw_asc) {
+            try self.advance();
+        } else if (self.cur.tag == .kw_desc) {
+            desc = true;
+            try self.advance();
+        }
+        return .{ .desc = desc, .nulls_first = try self.parseNullsPlacement() };
+    }
+
+    fn appendSortKey(
+        self: *Parser,
+        items: *std.ArrayList(@import("../exec/sort.zig").SortSpec),
+        keys: *std.ArrayList(ir.Derived),
+        col: []const u8,
+        placement: SortPlacement,
+    ) ParseError!void {
+        // NULLs sort first ascending and last descending; the other
+        // placement sorts on whether the key is NULL ahead of it.
+        if (placement.nulls_first) |first| if (first == placement.desc) {
+            try items.append(self.arena, .{ .col = try self.orderNullKey(col, keys), .desc = first });
+        };
+        try items.append(self.arena, .{ .col = col, .desc = placement.desc });
+    }
+
+    /// The columns a SELECT item sorts on by position: a plain column its
+    /// underlying name (the sort runs before the final projection), a
+    /// computed, aggregate or window item its output name, and a `*` each
+    /// column it expands to.
+    fn selectItemSortColumns(self: *Parser, p: ProjItem, inputs: []const ChainInput) ParseError![]const []const u8 {
+        if (p.kind == .star) return try self.starColumns(p.kind.star, inputs) orelse ParseError.SqlInvalidProjection;
+        const one = try self.arena.alloc([]const u8, 1);
+        one[0] = try self.arena.dupe(u8, switch (p.kind) {
+            .col => |c| c,
+            else => p.name,
+        });
+        return one;
     }
 
     /// Whether the ORDER BY key at the cursor is an ordinal, a column, or a
@@ -7393,29 +7431,16 @@ pub const Parser = struct {
     fn parseDirectOrderKey(self: *Parser, proj: []const ProjItem, inputs: []const ChainInput, keys: *std.ArrayList(ir.Derived)) ParseError![]const u8 {
         if (self.cur.tag == .integer) {
             // `ORDER BY <n>` — 1-based ordinal into the SELECT list
-            // (PG/MySQL). A plain column sorts on its underlying name
-            // (the sort runs before the final projection); a computed /
-            // aggregate / window item sorts on its output alias; a `*`
-            // counts one position per column it expands to.
+            // (PG/MySQL), a `*` counting one position per column it
+            // expands to.
             const k = self.cur.value.integer;
             try self.advance();
             if (k < 1) return ParseError.SqlInvalidProjection;
             var position: u64 = @intCast(k - 1);
             for (proj) |p| {
-                if (p.kind == .star) {
-                    const columns = try self.starColumns(p.kind.star, inputs) orelse return ParseError.SqlInvalidProjection;
-                    if (position < columns.len) return columns[@intCast(position)];
-                    position -= columns.len;
-                    continue;
-                }
-                if (position > 0) {
-                    position -= 1;
-                    continue;
-                }
-                return switch (p.kind) {
-                    .col => |c| try self.arena.dupe(u8, c),
-                    else => try self.arena.dupe(u8, p.name),
-                };
+                const columns = try self.selectItemSortColumns(p, inputs);
+                if (position < columns.len) return columns[@intCast(position)];
+                position -= columns.len;
             }
             return ParseError.SqlInvalidProjection;
         }
