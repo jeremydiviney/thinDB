@@ -160,6 +160,10 @@ pub const AggFunc = enum {
     /// whose `arg2_col` index is false against those whose index is true,
     /// under `params.mann_whitney` (`mannWhitneyText`). Output JSON.
     mann_whitney_u_test,
+    /// PERCENTILE_APPROX_WEIGHTED: the `params.percentile` point of the
+    /// `col` values, each counted `arg2_col` times
+    /// (`appendWeightedPercentile`). Output DOUBLE.
+    percentile_approx_weighted,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -170,7 +174,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf => return false,
     };
     return true;
 }
@@ -362,6 +366,8 @@ pub const AccState = union(enum) {
     percentile_values: std.ArrayListUnmanaged(f64),
     percentile_ints: std.ArrayListUnmanaged(i64),
     percentile_wide: std.ArrayListUnmanaged(i128),
+    /// PERCENTILE_APPROX_WEIGHTED's values with their weights.
+    weighted_values: std.ArrayListUnmanaged(WeightedValue),
     /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
     /// wide to sit inline without inflating every other group's state — so it
     /// lives behind a pointer, null until the first value is appended).
@@ -831,6 +837,8 @@ const TopKAcc = struct {
 const MannWhitneyAcc = struct {
     samples: [2]std.ArrayListUnmanaged(f64) = .{ .empty, .empty },
 };
+
+const WeightedValue = struct { value: f64, weight: f64 };
 
 const ConcatAcc = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -3349,6 +3357,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .group_concat => .{ .concat = null },
         .approx_top_k => .{ .top_k = null },
         .mann_whitney_u_test => .{ .mann_whitney = null },
+        .percentile_approx_weighted => .{ .weighted_values = .empty },
         .udf => unreachable,
     };
 }
@@ -3481,7 +3490,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .sum_distinct => aggOutputType(.sum, in),
-        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => .double,
+        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr, .percentile_approx_weighted => .double,
         .percentile, .percentile_approx => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
             break :blk if (t == .date or t == .datetime) t else .double;
@@ -3613,6 +3622,16 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
             const index = arg2_in orelse return Error.AggregateColumnRequired;
             if (!(index.isInteger() or index == .boolean)) return Error.AggregateUnsupportedType;
             if (params != .mann_whitney) return Error.AggregateInvalidParam;
+        },
+        .percentile_approx_weighted => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!(t.isInteger() or t.isDecimal() or t == .float or t == .double)) return Error.AggregateUnsupportedType;
+            const weight = arg2_in orelse return Error.AggregateColumnRequired;
+            if (!(weight.isInteger() or weight.isDecimal() or weight == .float or weight == .double)) return Error.AggregateUnsupportedType;
+            switch (params) {
+                .percentile => |p| if (p < 0.0 or p > 1.0) return Error.AggregateInvalidParam,
+                else => return Error.AggregateInvalidParam,
+            }
         },
         .udf => return Error.AggregateUnsupportedType,
     }
@@ -4048,6 +4067,12 @@ pub fn updateState(
             const value_idx = col_idx orelse return Error.AggregateColumnRequired;
             try mannWhitneyUpdate(aa, s, batch.values[value_idx], avgScaleDiv(batch.schema[value_idx].type), batch.values[index_idx], row_start, row_end);
         },
+        .percentile_approx_weighted => {
+            const weight_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
+            const weight_idx = types.findColumn(batch.schema, weight_name) orelse return Error.ColumnNotFound;
+            const value_idx = col_idx orelse return Error.AggregateColumnRequired;
+            try weightedPercentileUpdate(aa, &s.weighted_values, batch.values[value_idx], avgScaleDiv(batch.schema[value_idx].type), batch.values[weight_idx], avgScaleDiv(batch.schema[weight_idx].type), row_start, row_end);
+        },
         .udf => return Error.AggregateUnsupportedType,
     }
 }
@@ -4406,6 +4431,53 @@ fn mannWhitneyUpdate(aa: Allocator, s: *AccState, values: ColumnView, scale_div:
         if (std.math.isNan(value)) continue;
         try acc.samples[@intFromBool(numericAsF64(index, r) != 0)].append(aa, value);
     }
+}
+
+/// A row counts its weight truncated to an integer, as StarRocks casts it
+/// to BIGINT. A weight below 1 or a NaN value leaves the row out.
+fn weightedPercentileUpdate(aa: Allocator, list: *std.ArrayListUnmanaged(WeightedValue), values: ColumnView, value_scale_div: f64, weights: ColumnView, weight_scale_div: f64, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!values.isValid(r) or !weights.isValid(r)) continue;
+        const value = numericAsF64(values, r) / value_scale_div;
+        const weight = @trunc(numericAsF64(weights, r) / weight_scale_div);
+        if (std.math.isNan(value) or !std.math.isFinite(weight) or weight < 1) continue;
+        try list.append(aa, .{ .value = value, .weight = weight });
+    }
+}
+
+/// Append the value at fraction `p` of the total weight, or false when no
+/// row counted. Each value is a centroid of its weight, centered on its
+/// share of the total: the answer is linear between adjacent centers, and
+/// the first or last value beyond them. That is where StarRocks' t-digest
+/// puts it while it keeps every value, and with every weight 1 it is
+/// PERCENTILE_APPROX's place. Equal values sort by weight, so the answer
+/// doesn't depend on the order rows arrive in. Sorts `points` in place, as
+/// `appendPercentile` does.
+fn appendWeightedPercentile(allocator: Allocator, col: *ColumnStore, p: f64, points: []WeightedValue) !bool {
+    if (points.len == 0) return false;
+    std.mem.sortUnstable(WeightedValue, points, {}, struct {
+        fn less(_: void, a: WeightedValue, b: WeightedValue) bool {
+            return a.value < b.value or (a.value == b.value and a.weight < b.weight);
+        }
+    }.less);
+    var total: f64 = 0;
+    for (points) |point| total += point.weight;
+    const target = nearInteger(p * total);
+    const result = blk: {
+        var prev_center = points[0].weight / 2;
+        if (target <= prev_center) break :blk points[0].value;
+        var before = points[0].weight;
+        for (points[0 .. points.len - 1], points[1..]) |lo, hi| {
+            const center = before + hi.weight / 2;
+            if (target <= center) break :blk lo.value + (hi.value - lo.value) * ((target - prev_center) / (center - prev_center));
+            prev_center = center;
+            before += hi.weight;
+        }
+        break :blk points[points.len - 1].value;
+    };
+    try col.data.double.append(allocator, result);
+    return true;
 }
 
 /// The test's answer as StarRocks writes it: `[U, p]`, U the false-index
@@ -4893,6 +4965,12 @@ pub fn appendAccToColumn(
                 defer if (value.owned) allocator.free(value.bytes);
                 try col.data.json.appendValue(allocator, value.bytes);
             } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
+        },
+        .percentile_approx_weighted => {
+            if (!try appendWeightedPercentile(allocator, col, spec.params.percentile, state.weighted_values.items)) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             }
