@@ -128,6 +128,9 @@ pub const Error = error{
     MapArrayLengthMismatch,
     /// `array_map` given arrays of different lengths on one row.
     ArrayLengthMismatch,
+    /// `array_sort`'s comparator is no strict weak order over a row's
+    /// elements, so they have no sorted order.
+    ArraySortComparatorInconsistent,
     /// Compute/projection operator: duplicate derived/final output name.
     ComputeNameCollision,
     /// Compute operator: an expression shape not yet supported in v1

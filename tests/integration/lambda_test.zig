@@ -1,8 +1,8 @@
 //! Lambdas end-to-end: `array_map` and the StarRocks functions that read a
 //! lambda's values (`array_filter`, `any_match`, `all_match`,
-//! `array_sortby`, `map_filter`, `transform_values`, `transform_keys`), plus
-//! the plain-array forms those lower to. Results are checked by their
-//! StarRocks text.
+//! `array_sortby`, `array_sort` with a comparator, `map_filter`,
+//! `transform_values`, `transform_keys`), plus the plain-array forms those
+//! lower to. Results are checked by their StarRocks text.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -188,6 +188,42 @@ test "LAMBDA: the plain-array forms" {
 
     try expectText(allocator, db, "SELECT map_filter(map{1: 'a', 2: 'b', 3: 'c'}, [true, false, true])", "{1:\"a\",3:\"c\"}");
     try expectText(allocator, db, "SELECT map_filter(map{1: 'a', 2: 'b'}, NULL)", "{}");
+}
+
+test "LAMBDA: array_sort orders by a comparator" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try expectText(allocator, db, "SELECT array_sort([3, 2, 5, 1, 2], (x, y) -> IF(x < y, 1, IF(x = y, 0, -1)))", "[5,3,2,2,1]");
+    try expectText(allocator, db, "SELECT array_sort((x, y) -> x - y, [3, 2, 5, 1, 2])", "[1,2,2,3,5]");
+    try expectText(allocator, db, "SELECT array_sort([1.5, 0.25, 3], (x, y) -> x - y)", "[0.25,1.50,3.00]");
+    try expectText(allocator, db, "SELECT array_sort(['a', 'abcd', 'abc'], (x, y) -> length(x) - length(y))", "[\"a\",\"abc\",\"abcd\"]");
+    try expectText(allocator, db, "SELECT array_sort([[2, 3, 1], [4, 2, 1, 4], [1, 2]], (x, y) -> cardinality(x) - cardinality(y))", "[[1,2],[2,3,1],[4,2,1,4]]");
+    // Equivalent elements keep their order.
+    try expectText(allocator, db, "SELECT array_sort(['bb', 'a', 'cc', 'b'], (x, y) -> length(x) - length(y))", "[\"a\",\"b\",\"bb\",\"cc\"]");
+    try expectText(allocator, db, "SELECT array_sort([3, NULL, 1], (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 ELSE x - y END)", "[1,3,null]");
+    try expectText(allocator, db, "SELECT array_sort([], (x, y) -> x - y)", "[]");
+    try expectText(allocator, db, "SELECT array_sort(NULL, (x, y) -> x - y)", null);
+    try expectTexts(allocator, db, "SELECT array_sort(arr_2, (x, y) -> y - x) FROM t ORDER BY k", &.{ "[3,2]", "[3,2]", null, "[3,2]" });
+    try expectTexts(allocator, db, "SELECT array_sort(s, (x, y) -> CASE WHEN x IS NULL THEN 1 WHEN y IS NULL THEN -1 WHEN x < y THEN 1 WHEN x = y THEN 0 ELSE -1 END) FROM t ORDER BY k", &.{ "[\"b\",\"a\"]", null, "[\"y\",\"x\",null]", "[]" });
+
+    // An element before itself, two each before the other, an order that
+    // isn't transitive, and equivalence that isn't.
+    try std.testing.expectError(error.ArraySortComparatorInconsistent, exec(allocator, db, "SELECT array_sort([1, 2, 3], (x, y) -> CASE WHEN x = 1 THEN -1 ELSE x - y END)"));
+    try std.testing.expectError(error.ArraySortComparatorInconsistent, exec(allocator, db, "SELECT array_sort([1, 2, 3], (x, y) -> CASE WHEN (x = 1 AND y = 2) OR (x = 2 AND y = 1) THEN -1 ELSE x - y END)"));
+    try std.testing.expectError(error.ArraySortComparatorInconsistent, exec(allocator, db, "SELECT array_sort([1, 2, 3], (x, y) -> CASE WHEN (x = 1 AND y = 2) OR (x = 2 AND y = 3) OR (x = 3 AND y = 1) THEN -1 WHEN (x = 2 AND y = 1) OR (x = 3 AND y = 2) OR (x = 1 AND y = 3) THEN 1 ELSE 0 END)"));
+    try std.testing.expectError(error.ArraySortComparatorInconsistent, exec(allocator, db, "SELECT array_sort([1, 2, 3], (x, y) -> CASE WHEN x = 1 AND y = 2 THEN -1 WHEN x = 2 AND y = 1 THEN 1 ELSE 0 END)"));
+
+    // The comparator reads both elements and nothing else.
+    try std.testing.expectError(error.SqlComparatorLambdaInvalid, exec(allocator, db, "SELECT array_sort([1, 2], (x, y) -> 1)"));
+    try std.testing.expectError(error.SqlComparatorLambdaInvalid, exec(allocator, db, "SELECT array_sort([1, 2], (x, y) -> x)"));
+    try std.testing.expectError(error.SqlComparatorLambdaInvalid, exec(allocator, db, "SELECT array_sort(arr_0, (x, y) -> x - y + k) FROM t"));
+    try std.testing.expectError(error.SqlComparatorLambdaInvalid, exec(allocator, db, "SELECT array_sort([1, 2], (x, y) -> x - y + rand())"));
+    try std.testing.expectError(error.SqlComparatorLambdaInvalid, exec(allocator, db, "SELECT array_sort([1, 2], x -> x)"));
 }
 
 test "LAMBDA: over flushed row groups, in parallel" {
