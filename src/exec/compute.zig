@@ -2381,10 +2381,12 @@ fn buildCallPlan(
     // `COALESCE('2026/1/1', DATE '2026-01-02')` is text, as in StarRocks. It
     // reads as a date only where text itself fits no overload.
     if (r == null) {
-        if (try retypedCall(aa, udf_registry, c, arg_plans, arg_types)) |rewritten| {
+        const rewritten = try nestedCallRewritten(aa, c, arg_plans, arg_types) orelse
+            try retypedCall(aa, udf_registry, c, arg_plans, arg_types);
+        if (rewritten) |call| {
             for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
             built = 0;
-            return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
+            return buildCallPlan(runtime_allocator, aa, call, up_schema, udf_registry);
         }
     }
     // Text that reads as a date or datetime where the call wants one; then a
@@ -2396,6 +2398,13 @@ fn buildCallPlan(
         if (r != null) break;
         if (try coerceTemporalStringLiterals(runtime_allocator, aa, c.fn_name, arg_plans, arg_types, fit)) {
             r = try scalar_fn.resolveWithRegistry(aa, udf_registry, c.fn_name, arg_types);
+            // The text read as a date, so the other arguments convert as
+            // they would beside a date (`DATE_ADD('2023-01-01', 3/2)`).
+            if (r == null) if (try retypedCall(aa, udf_registry, c, arg_plans, arg_types)) |call| {
+                for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
+                built = 0;
+                return buildCallPlan(runtime_allocator, aa, call, up_schema, udf_registry);
+            };
         }
     }
     // Text that isn't a literal reads as a CAST to the date or datetime the
@@ -2711,6 +2720,53 @@ fn integerUnderFloatCast(e: Expr, plan: *const CallPlan) ?Expr {
     return e.call.args[0];
 }
 
+/// A call on nested values no overload accepts as written, rewritten so one
+/// does, as StarRocks reads it: a struct's subscript by a constant position
+/// is that field (`named_struct('a', x, 'b', y)[1]` is x), and an array
+/// literal of nothing but NULLs, whose elements have no type of their own,
+/// takes the type of the array beside it (`array_contains_all([NULL],
+/// maps)`). Null when neither applies, so the rewritten call can't recurse
+/// again.
+fn nestedCallRewritten(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) !?Expr {
+    if (std.ascii.eqlIgnoreCase(c.fn_name, scalar_fn.ELEMENT_AT_FN) and c.args.len == 2) {
+        const fields = arg_types[0].structFields() orelse return null;
+        const position = constantPosition(arg_plans[1]) orelse return null;
+        if (position < 1 or position > fields.len) return null;
+        const name = fields[position - 1].name;
+        const args = try aa.alloc(Expr, 2);
+        args[0] = c.args[0];
+        args[1] = .{ .lit = .{ .text = name } };
+        return Expr{ .call = .{ .fn_name = try std.mem.concat(aa, u8, &.{ scalar_fn.STRUCT_FIELD_PREFIX, name }), .args = args } };
+    }
+    const sibling = for (c.args, arg_types) |a, t| {
+        if (t.arrayElement() != null and !isNullsArrayLiteral(a)) break t;
+    } else return null;
+    var args: ?[]Expr = null;
+    for (c.args, arg_types, 0..) |a, t, i| {
+        if (!isNullsArrayLiteral(a) or std.meta.eql(t, sibling)) continue;
+        const nulls = try aa.alloc(Expr, a.call.args.len);
+        @memset(nulls, .{ .null_lit = sibling.arrayElement().? });
+        const rewritten = args orelse try aa.dupe(Expr, c.args);
+        rewritten[i] = .{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = nulls } };
+        args = rewritten;
+    }
+    return Expr{ .call = .{ .fn_name = c.fn_name, .args = args orelse return null } };
+}
+
+fn constantPosition(ap: ArgPlan) ?usize {
+    if (ap != .lit) return null;
+    return switch (ap.lit.value) {
+        inline .tinyint, .smallint, .int, .bigint => |v| std.math.cast(usize, v),
+        else => null,
+    };
+}
+
+fn isNullsArrayLiteral(e: Expr) bool {
+    if (e != .call or e.call.args.len == 0 or !std.ascii.eqlIgnoreCase(e.call.fn_name, scalar_fn.ARRAY_VALUE_FN)) return false;
+    for (e.call.args) |a| if (a != .null_lit) return false;
+    return true;
+}
+
 /// A call no overload accepts as written, with its arguments converted so
 /// one does: the arguments a function returns (GREATEST, COALESCE, IF's
 /// branches) take their common type by the result-type rule, JSON ones as
@@ -2852,9 +2908,23 @@ fn resolveWithTypedNulls(
         try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
         return r;
     }
-    if (scalar_fn.isNestedFnName(fn_name)) for ([_]Type{ try types.arrayOf(.boolean), try types.mapOf(.boolean, .boolean), .bigint }) |candidate| {
-        if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
-    };
+    if (scalar_fn.isNestedFnName(fn_name)) {
+        for ([_]Type{ try types.arrayOf(.boolean), try types.mapOf(.boolean, .boolean), .bigint }) |candidate| {
+            if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
+        }
+        // `array_contains(NULL, NULL)`: the first NULL is the array, in
+        // StarRocks' type for `[]`, and the rest its BOOLEAN elements.
+        const retyped = try aa.dupe(Type, arg_types);
+        var first = true;
+        for (arg_plans, retyped) |p, *t| if (p == .null_lit) {
+            t.* = if (first) try types.arrayOf(.boolean) else .boolean;
+            first = false;
+        };
+        if (try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped)) |r| {
+            try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
+            return r;
+        }
+    }
     return null;
 }
 
@@ -2942,18 +3012,21 @@ fn coerceTemporalStringLiterals(
 /// text literals fit. Text meets a DATETIME parameter before a DATE one, as
 /// StarRocks casts it, so `DATE_ADD('2026-01-01 10:30:00', INTERVAL 1 DAY)`
 /// keeps its time; only a function that takes a DATE alone there takes the
-/// text's day.
+/// text's day. A double or decimal meets an integer parameter only where no
+/// overload takes it whole, as the resolver lets it (`scalar_fn.convertedArgs`).
 fn temporalOverload(fn_name: []const u8, arg_plans: []const ArgPlan, arg_types: []const Type, fit: TemporalFit) ?scalar_fn.ScalarFn {
-    for ([_]bool{ false, true }) |text_meets_date| {
-        for (scalar_fn.overloadsOf(fn_name)) |f| {
-            if (!std.ascii.eqlIgnoreCase(f.name, fn_name) or !scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
-            if (fitsTemporalOverload(f, arg_plans, arg_types, fit, text_meets_date)) return f;
+    for ([_]bool{ false, true }) |drops_fraction| {
+        for ([_]bool{ false, true }) |text_meets_date| {
+            for (scalar_fn.overloadsOf(fn_name)) |f| {
+                if (!std.ascii.eqlIgnoreCase(f.name, fn_name) or !scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
+                if (fitsTemporalOverload(f, arg_plans, arg_types, fit, text_meets_date, drops_fraction)) return f;
+            }
         }
     }
     return null;
 }
 
-fn fitsTemporalOverload(f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_types: []const Type, fit: TemporalFit, text_meets_date: bool) bool {
+fn fitsTemporalOverload(f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_types: []const Type, fit: TemporalFit, text_meets_date: bool, drops_fraction: bool) bool {
     var any_coerce = false;
     for (arg_plans, arg_types, 0..) |ap, given, i| {
         const declared = scalar_fn.scalarDeclaredTypeAt(f, i);
@@ -2963,6 +3036,7 @@ fn fitsTemporalOverload(f: scalar_fn.ScalarFn, arg_plans: []const ArgPlan, arg_t
         // An integer argument meets its narrower parameter as the resolver
         // lets it (`DATE_ADD('2026-01-01', INTERVAL n + 1 DAY)`).
         if (cast.argNarrowingCost(@as(types.TypeTag, given), @as(types.TypeTag, declared)) != null) continue;
+        if (drops_fraction and declared.isInteger() and (given.isFloat() or given.isDecimal())) continue;
         const wanted = switch (declared) {
             .datetime => true,
             .date => text_meets_date,

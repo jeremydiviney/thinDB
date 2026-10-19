@@ -196,15 +196,17 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
 /// common type, which must be nested; the scalar overloads take the rest.
 fn resolveNestedConditional(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     const is_if = eql(name, "if");
-    if (!is_if and !eql(name, "ifnull") and !eql(name, "coalesce")) return null;
+    const is_nullif = eql(name, "nullif");
+    if (!is_if and !is_nullif and !eql(name, "ifnull") and !eql(name, "coalesce")) return null;
     if (is_if and (arg_types.len != 3 or arg_types[0] != .boolean)) return null;
-    if (eql(name, "ifnull") and arg_types.len != 2) return null;
+    if ((is_nullif or eql(name, "ifnull")) and arg_types.len != 2) return null;
     const branches = if (is_if) arg_types[1..] else arg_types;
     if (branches.len == 0) return null;
     const t = cast.commonTypeOf(branches) orelse return null;
     if (!t.isNested()) return null;
     for (branches) |b| if (!try castable(aa, b, t)) return null;
-    return overload(aa, name, arg_types, t, if (is_if) ifKernel else coalesceKernel);
+    const kernel: TypedKernel = if (is_if) ifKernel else if (is_nullif) nullifKernel else coalesceKernel;
+    return overload(aa, name, arg_types, t, kernel);
 }
 
 /// Functions of an array and one value compared with its elements.
@@ -247,9 +249,14 @@ fn resolveCastToArray(aa: Allocator, name: []const u8, arg_types: []const Type) 
     return null;
 }
 
-/// Whether CAST(x AS to) is defined for an x of `from`.
+/// Whether CAST(x AS to) is defined for an x of `from`, a member of a
+/// nested value. A BOOLEAN member casts to a nested type as NULL, as
+/// StarRocks casts `row(1, TRUE)` to `STRUCT<a INT, b MAP<INT, INT>>`, so
+/// `[]` and `map{}`, whose members are StarRocks' BOOLEAN placeholders, fit
+/// any array or map.
 pub fn castable(aa: Allocator, from: Type, to: Type) !bool {
     if (cast.sameRepresentation(from, to)) return true;
+    if (from == .boolean and to.isNested()) return true;
     const name = try scalar_fn.castFnName(aa, to) orelse return false;
     return try scalar_fn.resolve(aa, name, &.{from}) != null;
 }
@@ -263,11 +270,12 @@ pub fn comparedType(element: Type, t: Type) ?Type {
     return cast.commonType(element, t);
 }
 
-/// The common type of every argument's elements; null when one isn't an
-/// array or two never meet.
+/// The common type of every argument's elements, as the arrays' own common
+/// type has it (`cast.commonMember`); null when one isn't an array or two
+/// never meet.
 fn commonElementOf(arg_types: []const Type) ?Type {
     var c = arg_types[0].arrayElement() orelse return null;
-    for (arg_types[1..]) |t| c = cast.commonType(c, t.arrayElement() orelse return null) orelse return null;
+    for (arg_types[1..]) |t| c = cast.commonMember(c, t.arrayElement() orelse return null) orelse return null;
     return c;
 }
 
@@ -295,8 +303,15 @@ const AVG_EXTRA_SCALE = 6;
 // Batch plumbing
 // ---------------------------------------------------------------------------
 
-/// `src`, `rows` values of `from`, as CAST(src AS to) makes them.
+/// `src`, `rows` values of `from`, as CAST(src AS to) makes them, a
+/// BOOLEAN to a nested type as NULL (`castable`).
 fn castColumn(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows: usize) !ColumnStore {
+    if (from == .boolean and to.isNested()) {
+        var nulls = try ColumnStore.init(allocator, to, true);
+        errdefer nulls.deinit(allocator);
+        try nulls.appendNulls(allocator, rows);
+        return nulls;
+    }
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -573,6 +588,19 @@ fn coalesceKernel(allocator: Allocator, arg_types: []const Type, out_type: Type,
             if (x.view.isValid(r)) break x.view;
         } else as[as.len - 1].view;
         try appendNestedCell(allocator, out, chosen, r);
+    }
+}
+
+/// NULLIF: the first argument, NULL where it equals the second, both as
+/// their common type.
+fn nullifKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    var a = try AsType.init(allocator, args[0], arg_types[0], out_type, rows);
+    defer a.deinit(allocator);
+    var b = try AsType.init(allocator, args[1], arg_types[1], out_type, rows);
+    defer b.deinit(allocator);
+    for (0..rows) |r| {
+        const equal = a.view.isValid(r) and b.view.isValid(r) and nested.order(cellBytes(a.view, r), cellBytes(b.view, r)) == .eq;
+        if (equal) try out.appendNulls(allocator, 1) else try appendNestedCell(allocator, out, a.view, r);
     }
 }
 

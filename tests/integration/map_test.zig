@@ -189,6 +189,32 @@ test "MAP: text and empty maps beside typed maps" {
     , "{}");
 }
 
+test "MAP: NULLIF compares whole maps, and empty literals fill nested columns" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try setup(allocator, io, tmp.dir);
+        defer db.close();
+
+        try expectTexts(allocator, db, "SELECT NULLIF(s, map(3, 'c')) FROM m ORDER BY id", &.{ "{1:\"a\",2:null}", "{}", null, null, "{5:\"f\"}" });
+        try expectText(allocator, db, "SELECT NULLIF(map{1: 1}, map{1: 1})", null);
+        try expectText(allocator, db, "SELECT NULLIF(map{1: 1}, map{1: 2})", "{1:1}");
+
+        try exec(allocator, db, "CREATE TABLE nm (id INT PRIMARY KEY, a ARRAY<MAP<INT, INT>>, m MAP<INT, STRUCT<c INT, b INT>>)");
+        try exec(allocator, db, "INSERT INTO nm VALUES (1, [], map{}), (2, [map{1: 2}], map{1: named_struct('c', 3, 'b', 4)})");
+        try expectTexts(allocator, db, "SELECT a FROM nm ORDER BY id", &.{ "[]", "[{1:2}]" });
+        try expectTexts(allocator, db, "SELECT m FROM nm ORDER BY id", &.{ "{}", "{1:{\"c\":3,\"b\":4}}" });
+        const t = try db.openTable("nm", .{});
+        try t.flush();
+    }
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try expectTexts(allocator, db, "SELECT a FROM nm ORDER BY id", &.{ "[]", "[{1:2}]" });
+    try expectTexts(allocator, db, "SELECT m FROM nm ORDER BY id", &.{ "{}", "{1:{\"c\":3,\"b\":4}}" });
+}
+
 test "MAP: STR_TO_MAP cuts text into entries and each entry into a key and a value" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -205,6 +205,42 @@ test "ARRAY: comparisons meet at the common array type" {
     try expectTexts(allocator, db, "SELECT d FROM t WHERE id = 5", &.{"[0.50]"});
 }
 
+test "ARRAY: an empty, all-NULL or BOOLEAN array meets a nested sibling, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try expectText(allocator, db, "SELECT array_concat([], [[1]])", "[[1]]");
+    try expectText(allocator, db, "SELECT array_concat([NULL], [[1]])", "[null,[1]]");
+    try expectText(allocator, db, "SELECT array_concat([true], [[1]])", "[null,[1]]");
+    try expectText(allocator, db,
+        \\WITH t0 AS (SELECT c1 FROM (VALUES ([])) AS v(c1))
+        \\SELECT array_concat(c1, [map{'a': 1}]) FROM t0
+    , "[{\"a\":1}]");
+    try expectText(allocator, db, "SELECT array_contains_seq([named_struct('a', 1)], [])", "1");
+    try expectText(allocator, db, "SELECT array_contains_seq([], [named_struct('a', 1)])", "0");
+    try expectText(allocator, db, "SELECT array_contains(NULL, NULL)", null);
+    try expectText(allocator, db, "SELECT array_position(NULL, NULL)", null);
+}
+
+test "ARRAY: NULLIF compares whole arrays at their common type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try expectTexts(allocator, db, "SELECT NULLIF(a, [3, 1, 2]) FROM t ORDER BY id", &.{ null, "[]", null, "[5,null,5,4]" });
+    try expectTexts(allocator, db, "SELECT NULLIF(n, [[1, 2], [3]]) FROM t ORDER BY id", &.{ null, "[]", null, "[null,[4]]" });
+    try expectText(allocator, db, "SELECT NULLIF([1, 2], ['1', '2'])", null);
+    try expectText(allocator, db, "SELECT NULLIF([1, 2], ['1', '3'])", "[\"1\",\"2\"]");
+    try expectText(allocator, db, "SELECT NULLIF([1, NULL], [1, NULL])", null);
+}
+
 test "ARRAY: ARRAY_AGG keeps NULLs and follows ORDER BY" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
