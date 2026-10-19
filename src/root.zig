@@ -129,6 +129,7 @@ test {
     _ = @import("util/snapshot.zig");
     _ = @import("util/hll.zig");
     _ = @import("util/aes.zig");
+    _ = @import("util/xxh3.zig");
     _ = @import("util/stats.zig");
     _ = @import("util/like.zig");
     _ = @import("util/affinity.zig");

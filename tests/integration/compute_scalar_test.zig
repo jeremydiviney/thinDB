@@ -533,7 +533,7 @@ test "scalar: expanded missing-function kernels through Compute" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 2, 3 }, b.values[base_cols + 20].data.bigint[0..2]);
     try std.testing.expectEqual(@as(usize, 64), b.values[base_cols + 21].data.string.rowBytes(0).len);
     try std.testing.expectEqual(@as(usize, 32), b.values[base_cols + 22].data.string.rowBytes(0).len);
-    try std.testing.expectEqual(@as(usize, 32), b.values[base_cols + 23].data.string.rowBytes(0).len);
+    try std.testing.expectEqual(@as(i128, -98478366302105124680504504609445627880), b.values[base_cols + 23].data.largeint[0]);
     try std.testing.expectEqualStrings("10", b.values[base_cols + 24].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("255", b.values[base_cols + 25].data.string.rowBytes(0));
 }
@@ -1088,6 +1088,62 @@ test "NGRAM_SEARCH is the share of the needle's grams the haystack holds, in sin
     }
     try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH('chi', 'chi', 0)"));
     try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH(s, needle, -1) FROM ng"));
+}
+
+test "XX_HASH3_128 is XXH3-128 of its arguments run together and XX_HASH3_64 chains each hash into the next seed, as StarRocks computes them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        .{ "XX_HASH3_128('hello')", "-98478366302105124680504504609445627880" },
+        .{ "XX_HASH3_128('hello', 'world')", "-45235302294609689438180196264627189905" },
+        .{ "XX_HASH3_128('hello', 'world') = XX_HASH3_128('helloworld')", "1" },
+        .{ "XX_HASH3_128('hello', 'world', 'abc')", "45899992149942203672094639952011705760" },
+        .{ "XX_HASH3_128('hello', REPEAT('abcdefgh', 40))", "-69142760343838966408980957017265335729" },
+        .{ "XX_HASH3_128(REPEAT('abcdefgh', 40), 'hello')", "-129982448230658873377600368474277818453" },
+        .{ "BIT_SHIFT_RIGHT(XX_HASH3_128('starrocks'), 64)", "3846997910503780466" },
+        .{ "BITAND(XX_HASH3_128('starrocks'), 18446744073709551615)", "1697546255957561686" },
+        .{ "XX_HASH3_128('hello', NULL)", null },
+        .{ "TYPEOF(XX_HASH3_128('hello'))", "largeint" },
+        .{ "XX_HASH3_64('hello')", "-7685981735718036227" },
+        .{ "XX_HASH3_64('hello', 'world')", "7001965798170371843" },
+        .{ "XX_HASH3_64(NULL, 'world')", null },
+        .{ "TYPEOF(XX_HASH3_64('hello'))", "bigint" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
+
+    try helpers.exec(allocator, db, "CREATE TABLE h (id BIGINT PRIMARY KEY, a VARCHAR(16), b VARCHAR(16))");
+    try helpers.exec(allocator, db, "INSERT INTO h VALUES (1, 'hello', 'world'), (2, 'hello', 'starrocks'), (3, 'hello', NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("h", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT BIT_SHIFT_RIGHT(XX_HASH3_128(a, b), 64) FROM h ORDER BY id", &.{ "-2452210651042717451", "1559307639436096304", null });
+        try helpers.expectTexts(allocator, db, "SELECT BITAND(XX_HASH3_128(a, b), 18446744073709551615) FROM h ORDER BY id", &.{ "1087493910761260911", "8859976453967563600", null });
+    }
+}
+
+test "StarRocks' bit functions keep all 128 bits of a LARGEINT" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        .{ "BITAND(CAST(-1 AS LARGEINT), 18446744073709551615)", "18446744073709551615" },
+        .{ "BITAND(170141183460469231731687303715884105727, CAST(-18446744073709551616 AS LARGEINT))", "170141183460469231713240559642174554112" },
+        .{ "BITOR(CAST(18446744073709551616 AS LARGEINT), 1)", "18446744073709551617" },
+        .{ "BITXOR(CAST(-1 AS LARGEINT), 18446744073709551615)", "-18446744073709551616" },
+        .{ "BITNOT(CAST(18446744073709551615 AS LARGEINT))", "-18446744073709551616" },
+        .{ "BIT_SHIFT_LEFT(CAST(1 AS LARGEINT), 100)", "1267650600228229401496703205376" },
+        .{ "BIT_SHIFT_RIGHT(CAST(-18446744073709551616 AS LARGEINT), 64)", "-1" },
+        .{ "BIT_SHIFT_RIGHT(1267650600228229401496703205376, 99)", "2" },
+        .{ "TYPEOF(BITAND(CAST(1 AS LARGEINT), 1))", "largeint" },
+        .{ "TYPEOF(BITAND(6, 3))", "bigint" },
+        .{ "BITAND(6, 3)", "2" },
+        .{ "BIT_SHIFT_LEFT(1, 62)", "4611686018427387904" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
 }
 
 test "StarRocks' extra overloads: LAST_DAY by unit, STRPOS by instance, two-argument pads, ARRAY_GENERATE(n), one-argument GREATEST and LEAST, UNIX_TIMESTAMP()" {

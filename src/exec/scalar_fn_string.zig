@@ -14,6 +14,7 @@ const Type = @import("../types.zig").Type;
 
 const regex = @import("../util/regex.zig");
 const aes = @import("../util/aes.zig");
+const xxh3 = @import("../util/xxh3.zig");
 const predicate = @import("predicate.zig");
 
 // ---------------------------------------------------------------------------
@@ -903,27 +904,31 @@ fn icebergTruncateInteger(value: anytype, width: i64) !@TypeOf(value) {
     return std.math.cast(@TypeOf(value), wide - @mod(wide, width)) orelse error.ArithmeticOverflow;
 }
 
+/// `xx_hash3_64(s1, s2, ...)`: each argument is hashed with the previous
+/// hash as its seed, as StarRocks chains them, and the result is a signed
+/// BIGINT.
 pub fn xxHash3_64Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const bits = std.hash.XxHash3.hash(0, sv.rowBytes(i));
-        try out.data.bigint.append(allocator, @bitCast(bits));
+        var hash: u64 = 0;
+        for (args) |arg| hash = std.hash.XxHash3.hash(hash, stringViewOf(arg).rowBytes(i));
+        try out.data.bigint.append(allocator, @bitCast(hash));
     }
 }
 
+/// `xx_hash3_128(s1, s2, ...)`: XXH3-128 of the arguments run together,
+/// as StarRocks hashes them, and the result is a signed LARGEINT.
 pub fn xxHash3_128Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
-    const ss = stringStoreOf(out);
-    var digest: [16]u8 = undefined;
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    defer joined.deinit(allocator);
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
-        const lo = std.hash.XxHash3.hash(0, sv.rowBytes(i));
-        const hi = std.hash.XxHash3.hash(1, sv.rowBytes(i));
-        std.mem.writeInt(u64, digest[0..8], hi, .big);
-        std.mem.writeInt(u64, digest[8..16], lo, .big);
-        const hex_str = std.fmt.bytesToHex(digest, .lower);
-        try ss.appendValue(allocator, &hex_str);
+        const bytes = if (args.len == 1) stringViewOf(args[0]).rowBytes(i) else run_together: {
+            joined.clearRetainingCapacity();
+            for (args) |arg| try joined.appendSlice(allocator, stringViewOf(arg).rowBytes(i));
+            break :run_together joined.items;
+        };
+        try out.data.largeint.append(allocator, @bitCast(xxh3.hash128(0, bytes)));
     }
 }
 
