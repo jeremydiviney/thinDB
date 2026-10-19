@@ -1851,6 +1851,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "instr", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.instrKernel },
     .{ .name = "starts_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.startsWithKernel },
     .{ .name = "ends_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.endsWithKernel },
+    .{ .name = "null_or_empty", .arg_types = &.{.string}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = string.nullOrEmptyKernel },
     .{ .name = "split_part", .arg_types = &.{ .string, .string, .int }, .return_type = .string, .kernel = string.splitPartKernel },
     .{ .name = "substring_index", .arg_types = &.{ .string, .string, .int }, .return_type = .string, .kernel = string.substringIndexKernel },
     .{ .name = "strcmp", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.strcmpKernel },
@@ -1872,6 +1873,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "from_binary", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.fromBinaryKernel },
     .{ .name = "format_bytes", .arg_types = &.{.bigint}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.formatBytesKernel },
     .{ .name = "bar", .arg_types = &.{ .double, .double, .double, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.barKernel },
+    .{ .name = "equiwidth_bucket", .arg_types = &.{ .bigint, .bigint, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.equiwidthBucketKernel },
     // --- URLs ---
     .{ .name = "url_encode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlEncodeKernel },
     .{ .name = "url_decode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlDecodeKernel },
