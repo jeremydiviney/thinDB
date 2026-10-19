@@ -109,6 +109,7 @@ Maps follow StarRocks too:
 - A map holds each key once. A repeated key keeps its last value, at its last position, in a literal, `map_from_arrays`, `map_concat` and a CAST whose keys meet. Otherwise entries keep the order given. Maps compare by their keys array, then their values array, so the same entries in another order make another map.
 - An empty `map{}` or `map()` takes the map type beside it, as `[]` does. Alone it is `MAP<BOOLEAN, BOOLEAN>`.
 - `map_concat` skips NULL maps, a later map's key winning. `map_from_arrays` refuses arrays of different lengths.
+- `str_to_map(text[, entry_delimiter[, key_delimiter]])` cuts text into entries at `,` by default (an empty delimiter cuts between characters, as `split` does), and each entry into key and value at its first `:`. An entry without one is a key mapped to NULL.
 - Text casts to a map from StarRocks' `{"a":1,"b":null}`. The MySQL wire prints that text; the PostgreSQL wire, which has no map type, sends it as `text`.
 - `MAP_AGG(k, v)` skips a row whose key is NULL and keeps a NULL value. It is a GROUP_CONCAT of one-entry maps, and GROUP_CONCAT over maps merges them, a later key winning.
 
@@ -409,6 +410,8 @@ Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
 A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored; `CAST(x AS LARGEINT)`, which MySQL lacks, drops it as StarRocks does. A number and a date that meet in one result (IF and CASE branches, COALESCE, IFNULL, GREATEST, LEAST, UNION arms) meet as that number, as in StarRocks (`cast.commonType`). Beside an integer or boolean, a DATE is an INT and a DATETIME a BIGINT, widened to the integer's type. Beside a decimal, either is DOUBLE, and so is a DATETIME beside a float. A float and a DATE meet as text, as StarRocks meets them. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
+
+StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both are NULL for text that isn't a URL: one needs a scheme, and may hold no space or control character, as RFC 3986 says. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
 
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
 does, reading a double as its shortest digits, and truncates the quotient
@@ -1871,6 +1874,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `AssertTrueFailed` means `ASSERT_TRUE(cond)` met a row where `cond` is false or NULL. StarRocks fails the query there too.
 
 `InvalidWeekdayName` means `NEXT_DAY` or `PREVIOUS_DAY` was given a weekday name that is none of the seven's two-letter, three-letter or full English names. StarRocks fails the query too.
+
+`InvalidNgramLength` means `NGRAM_SEARCH` or `NGRAM_SEARCH_CASE_INSENSITIVE` was given a gram length of 0 or less. StarRocks fails the query too.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 

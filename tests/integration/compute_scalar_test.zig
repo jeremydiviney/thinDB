@@ -938,3 +938,46 @@ test "ASSERT_TRUE is true where its condition holds and fails the query on a fal
         try std.testing.expectError(error.AssertTrueFailed, helpers.exec(allocator, db, "SELECT ASSERT_TRUE(COUNT(*) = 2) FROM at"));
     }
 }
+
+test "URL functions read a URL's host and query parameters, and encode text as a form does" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE u (id BIGINT PRIMARY KEY, url VARCHAR(80), k VARCHAR(8))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO u VALUES (1, 'https://a.com/doc?k1=10&k2=3&k1=100', 'k1'), (2, 'https://u:p@b.org:8030/?x&k2=%41+b#k2=no', 'k2'),
+        \\  (3, 'https://c.net/doc?k1=10', 'k3'), (4, 'https://d.io/doc?k 1=2', 'k 1'), (5, 'mailto:me?x=1', 'x'), (6, '', 'k1'),
+        \\  (7, NULL, 'k1'), (8, 'https://e.com/?k1', 'k1'), (9, 'http://[::1]:80/', NULL)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("u", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_HOST(url) FROM u ORDER BY id", &.{ "a.com", "b.org", "c.net", null, null, null, null, "e.com", "[::1]" });
+        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_PARAMETER(url, k) FROM u ORDER BY id", &.{ "10", "A b", null, null, "1", null, null, "", null });
+        try helpers.expectTexts(allocator, db, "SELECT URL_DECODE(URL_ENCODE(url)) = url FROM u WHERE id <= 6 ORDER BY id", &.{ "1", "1", "1", "1", "1", "1" });
+    }
+    try helpers.expectText(allocator, db, "SELECT URL_ENCODE('a b/c~é*-._')", "a+b%2Fc%7E%C3%A9*-._");
+    try helpers.expectText(allocator, db, "SELECT URL_DECODE('a+b%2Fc%7e%C3%A9%2x%')", "a b/c~é%2x%");
+    try helpers.expectText(allocator, db, "SELECT URL_ENCODE(NULL)", null);
+}
+
+test "NGRAM_SEARCH is the share of the needle's grams the haystack holds, in single precision as StarRocks computes it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ng (id BIGINT PRIMARY KEY, s VARCHAR(40), needle VARCHAR(40), n INT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ng VALUES (1, 'chinese', 'china', 4), (2, 'CHINESE', 'chinese', 4), (3, 'aaaa', 'aaaaaa', 2), (4, 'chi', 'chi', 4),
+        \\  (5, NULL, 'x', 1), (6, 'abc', 'abc', NULL), (7, '000073a7-274f-46bf-bfaf-678868cc26cd', '1bd32347-274f-4a30-93f3-9087594de9cd', 4)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("ng", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(NGRAM_SEARCH(s, needle, n) AS CHAR) FROM ng ORDER BY id", &.{ "0.5", "0", "0.6000000238418579", "0", null, null, "0.15151512622833252" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(NGRAM_SEARCH_CASE_INSENSITIVE(s, needle, n) AS CHAR) FROM ng WHERE id <= 2 ORDER BY id", &.{ "0.5", "1" });
+    }
+    try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH('chi', 'chi', 0)"));
+    try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH(s, needle, -1) FROM ng"));
+}
