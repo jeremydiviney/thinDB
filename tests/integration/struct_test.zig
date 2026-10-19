@@ -69,6 +69,8 @@ test "STRUCT: constructors and CAST" {
     try expectText(allocator, db, "SELECT CAST('{\"b\": [1]}' AS STRUCT<a INT, b ARRAY<INT>>)", "{\"a\":null,\"b\":[1]}");
     try expectText(allocator, db, "SELECT CAST('[1]' AS STRUCT<a INT>)", null);
     try expectText(allocator, db, "SELECT CAST(row(1, 2) AS STRUCT<a STRING, b DOUBLE>)", "{\"a\":\"1\",\"b\":2}");
+    // A BOOLEAN field casts to a nested one as NULL, as in StarRocks.
+    try expectText(allocator, db, "SELECT CAST(row(1, TRUE) AS STRUCT<a INT, b MAP<INT, INT>>)", "{\"a\":1,\"b\":null}");
     try expectTexts(allocator, db, "SELECT CAST(s AS STRING) FROM sc ORDER BY id", &S_TEXTS);
     try expectTexts(allocator, db, "SELECT CAST(s AS STRUCT<c BIGINT, d VARCHAR(4)>) FROM sc ORDER BY id", &.{ "{\"c\":1,\"d\":\"x\"}", "{\"c\":null,\"d\":\"y\"}", null, "{\"c\":2,\"d\":null}" });
     inline for (.{ "SELECT named_struct('a')", "SELECT named_struct('a', 1, 'A', 2)", "SELECT named_struct(1, 2)" }) |sql| {
@@ -103,6 +105,13 @@ test "STRUCT: field access" {
     try expectTexts(allocator, db, "SELECT row(id, 'k').col1 FROM sc ORDER BY id", &.{ "1", "2", "3", "4" });
     try expectText(allocator, db, "SELECT named_struct('a', 1, 'b', row(2, 3)).b.col2", "3");
     try expectText(allocator, db, "SELECT [row(1, 'a'), row(2, 'b')][2].col2", "b");
+    // A constant subscript picks a field by position, from 1.
+    try expectTexts(allocator, db, "SELECT s[2] FROM sc ORDER BY id", &.{ "x", "y", null, null });
+    try expectText(allocator, db, "SELECT named_struct('a', 1, 'b', 'x')[1]", "1");
+    try expectText(allocator, db, "SELECT named_struct('a', row(5, 6))[1].col2", "6");
+    inline for (.{ "SELECT named_struct('a', 1, 'b', 'x')[3]", "SELECT named_struct('a', 1)[0]", "SELECT named_struct('a', 1).zz" }) |sql| {
+        try std.testing.expectError(error.ComputeNoSuchOverload, runSql(allocator, db, sql));
+    }
 
     var star = try runSql(allocator, db, "SELECT * FROM sc WHERE s.a = 1");
     defer star.deinit();

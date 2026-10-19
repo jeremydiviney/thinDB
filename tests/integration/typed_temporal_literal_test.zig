@@ -390,6 +390,31 @@ test "a text literal keeps its time of day in date functions and stays text wher
     try expectStrings(allocator, db, "SELECT CAST(DATE_ADD('abc', INTERVAL 1 DAY) AS CHAR) FROM one", &.{null});
 }
 
+test "a text literal reads as a date beside a fractional count, which converts as it would beside a date" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE one (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO one VALUES (1)");
+
+    // DATE_ADD reads its count as MySQL reads an integer argument, rounding;
+    // StarRocks' DAYS_ADD truncates it, as StarRocks does.
+    const cases = .{
+        .{ "DATE_ADD('2023-01-01', 1.7)", "2023-01-03 00:00:00" },
+        .{ "DATE_ADD('2023-01-01 10:30:00', 1.4)", "2023-01-02 10:30:00" },
+        .{ "DATE_ADD('2023-01-01', 2.5e0)", "2023-01-03 00:00:00" },
+        .{ "DATE_SUB('2023-01-10', 1.5)", "2023-01-08 00:00:00" },
+        .{ "DATE_ADD('2023-01-01', CAST(id AS DECIMAL(4,1)) + 0.5)", "2023-01-03 00:00:00" },
+        .{ "DAYS_ADD('2023-01-01', 1.7)", "2023-01-02 00:00:00" },
+    };
+    inline for (cases) |c| {
+        try expectStrings(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR) FROM one", &.{c[1]});
+    }
+    try expectStrings(allocator, db, "SELECT CAST(DATE_ADD('abc', 1.5) AS CHAR) FROM one", &.{null});
+}
+
 test "text that isn't a literal reads as CAST reads it where a date function wants a date or datetime, as in StarRocks (issue #412)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

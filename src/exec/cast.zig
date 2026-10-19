@@ -410,10 +410,12 @@ fn commonNested(a: Type, b: Type) ?Type {
 /// Two members of nested values (fields, elements, keys or values) meet as
 /// `commonType` has them, except that text beside a nested member reads as
 /// that type, as CAST reads it: a NULL literal, whose placeholder type is
-/// text, sits in `row(1, NULL)` beside `row(1, [2])`.
-fn commonMember(a: Type, b: Type) ?Type {
-    if (a.isNested() and b.isString() and b != .json) return a;
-    if (b.isNested() and a.isString() and a != .json) return b;
+/// text, sits in `row(1, NULL)` beside `row(1, [2])`. A BOOLEAN beside a
+/// nested member takes that type too, which it casts to as NULL, so `[]`,
+/// StarRocks' ARRAY<BOOLEAN>, meets `[[1]]`.
+pub fn commonMember(a: Type, b: Type) ?Type {
+    if (a.isNested() and ((b.isString() and b != .json) or b == .boolean)) return a;
+    if (b.isNested() and ((a.isString() and a != .json) or a == .boolean)) return b;
     return commonType(a, b);
 }
 
