@@ -43,6 +43,7 @@ const NAMES = [_][]const u8{
 
 pub fn isArrayFnName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX)) return true;
+    if (std.mem.startsWith(u8, name, scalar_fn.NESTED_VALUE_PREFIX)) return true;
     for (NAMES) |n| if (eql(name, n)) return true;
     return false;
 }
@@ -72,6 +73,7 @@ pub fn overload(aa: Allocator, name: []const u8, arg_types: []const Type, return
 /// arguments don't fit it.
 pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Allocator.Error!?ResolvedOverload {
     if (std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX)) return resolveCastToArray(aa, name, arg_types);
+    if (std.mem.startsWith(u8, name, scalar_fn.NESTED_VALUE_PREFIX)) return resolveNestedValue(aa, name, arg_types);
     if (eql(name, scalar_fn.ARRAY_VALUE_FN)) return resolveArrayValue(aa, name, arg_types);
     if (eql(name, "split")) {
         if (arg_types.len != 2 or !isText(arg_types[0]) or !isText(arg_types[1])) return null;
@@ -224,6 +226,29 @@ fn resolveArrayValue(aa: Allocator, name: []const u8, arg_types: []const Type) !
         if (!cast.sameRepresentation(t, element) or (t == .json) != (element == .json)) return null;
     }
     return overload(aa, name, arg_types, try types.arrayOf(element), arrayValueKernel);
+}
+
+/// `scalar_fn.NESTED_VALUE_PREFIX`: any nested type, from text holding a
+/// value of it encoded.
+fn resolveNestedValue(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    if (arg_types.len != 1 or !isText(arg_types[0])) return null;
+    const target = types.parseTypeText(name[scalar_fn.NESTED_VALUE_PREFIX.len..]) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidTypeText => return null,
+    };
+    if (!target.isNested()) return null;
+    return overload(aa, name, arg_types, target, nestedValueKernel);
+}
+
+fn nestedValueKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    for (0..rows) |r| {
+        const at = out.rowCount();
+        const valid = args[0].isValid(r);
+        try out.data.nested.appendValue(allocator, if (valid) cellBytes(args[0], r) else "");
+        try out.appendValidBit(allocator, at, valid);
+    }
 }
 
 /// CAST to an array (`scalar_fn.NESTED_CAST_PREFIX`): of another array,

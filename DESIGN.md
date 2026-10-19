@@ -104,7 +104,7 @@ Lambdas follow StarRocks:
 - The body is any scalar expression. It reads the row's columns, session variables and outer lambdas' parameters, and a parameter hides a column of its name. `x.a.b` over a parameter is a field path of its struct, kept whole by the parser and derived as a hidden column ahead of the body. The body runs as a Compute over the batch's elements, one row per element, beside the outer columns it reads.
 - The other lambda functions read `array_map`'s values: `array_filter(f, a, ...)` is `array_filter(a, array_map(f, a, ...))`, and so are `array_sortby`, `any_match` and `all_match` (over `array_map(f, a, ...)` alone). `map_filter`, `transform_values` and `transform_keys` take a lambda of key and value.
 - Each also takes the values themselves. `array_filter(a, flags)` and `map_filter(m, flags)` keep the places whose flag is true, so none past the flags' end and none for NULL flags. `any_match(flags)` and `all_match(flags)` are NULL where a NULL flag could change the answer. `array_sortby(a, keys, ...)` sorts by one key array after another, NULLs first and ties in order, passing over a NULL key array.
-- Not covered yet: `array_sort` with a comparator, `map_apply`, and session variables holding an array or map.
+- Not covered yet: `array_sort` with a comparator and `map_apply`.
 
 Maps follow StarRocks too:
 - `map{k: v, ...}` and `map(k, v, ...)` are literals. Their keys meet at one common type and their values at another, as array elements do. `m[k]` and `ELEMENT_AT(m, k)` give the value `k` maps to, or NULL; a NULL key matches a NULL key.
@@ -133,6 +133,11 @@ JSON follows MySQL, with StarRocks' JSON functions beside MySQL's:
 - Inside an array, map or struct a JSON value prints in single quotes (`['{"a": 1}']`), as StarRocks writes it.
 
 `IF`, `IFNULL`, `COALESCE` and `CASE` choose whole arrays, maps and structs; their branches meet at a common type.
+
+User variables follow MySQL:
+- `SET @a = expr, @b = expr, ...` takes any expression that reads no column: functions of literals, other variables and scalar subqueries. Each assignment is evaluated once the ones before it took effect, so `SET @a = 1, @b = @a + 1` gives @b 2. A session option such as `thindb_max_dop` may sit among them. A SET that fails changes no variable.
+- A variable keeps its value's type. One of DECIMAL type is kept as a DOUBLE. A variable never set reads as NULL.
+- A variable holds an array, map or struct too, read wherever a constant of its type is (`array_contains(@arr, x)`, `@m[k]`, `@s.f`, an INSERT's VALUES). A predicate that compares a column with one directly (`a = @arr`) is `UnsupportedOp`, as such a predicate pushes a literal down and a nested value isn't one.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
 calendar, where year 0 is a leap year, as in StarRocks. So `0000-02-29` is a
@@ -936,7 +941,7 @@ pub fn deinit(self: *Self) void
 | `Scan` | Read row groups from a table; prunes via manifest stats; applies tombstones via bitset |
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
-| `Compute` | Derived columns via scalar functions (with implicit coercion) |
+| `Compute` | Derived columns via scalar functions (with implicit coercion). A constant argument is repeated on every row, so a batch value whose text passes 4 GiB is `MemoryBudgetExceeded` |
 | `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`/`APPROX_WEIGHTED`, `GROUP_CONCAT`, `APPROX_TOP_K` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |

@@ -40,6 +40,9 @@ const Batch = exec.Batch;
 const PredicateExpr = exec.PredicateExpr;
 const time_fn = @import("../exec/scalar_fn_time.zig");
 const join_mod = @import("../exec/join.zig");
+const compute_mod = @import("../exec/compute.zig");
+const scalar_decimal = @import("../exec/scalar_fn_decimal.zig");
+const SessionVar = @import("../api/api.zig").SessionVar;
 
 const storage = @import("../storage/storage.zig");
 
@@ -57,7 +60,7 @@ const Error = local.Error;
 /// SQL NULL, matching MySQL's user-variable semantics (referencing `@x` before
 /// assigning it yields NULL, not an error). The optional `null` therefore covers
 /// both "never set" and "explicitly `SET @x = NULL`"; callers treat both as NULL.
-fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?@import("../types.zig").Value {
+fn lookupSessionVar(ctx: *CompileCtx, name: []const u8) !?SessionVar {
     const vars = ctx.session.vars orelse return null;
     return vars.get(name) orelse null;
 }
@@ -74,7 +77,9 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .expand => |s| try resolveSubqueriesInOp(ctx, s.upstream),
         .table_fn => |t| for (t.inputs) |inp| try resolveSubqueriesInOp(ctx, inp),
         .explain => |e| try resolveSubqueriesInOp(ctx, e.inner),
-        .set_var => |*sv| try resolveSubqueriesInExpr(ctx, &sv.value, null),
+        // `compileSetVar` resolves each assignment once those before it
+        // took effect (`evaluateSetValue`).
+        .set_var => {},
         .delete_op => |*d| {
             if (d.source) |s| try resolveSubqueriesInOp(ctx, s);
             switch (try resolveDmlPredicate(ctx, d.table, d.predicate, d.derived, &.{})) {
@@ -177,10 +182,11 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr, lowered:
         .leaf_var => |v| {
             // `col <op> @x` where @x is SQL NULL is UNKNOWN under 3VL (matches a
             // null literal on the RHS); otherwise compare against the value.
-            pred.* = if (try lookupSessionVar(ctx, v.var_name)) |resolved|
-                .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved, .from_statement = true } }
-            else
-                .unknown;
+            pred.* = if (try lookupSessionVar(ctx, v.var_name)) |resolved| leaf: {
+                // A leaf compares a column with a scalar.
+                if (resolved.type.isNested()) return Error.UnsupportedOp;
+                break :leaf .{ .leaf = .{ .col = v.col, .op = v.op, .val = resolved.value, .from_statement = true } };
+            } else .unknown;
         },
         .scalar_subquery => |sq| {
             if (try maybeResolveCorrelatedScalar(ctx, pred, sq, lowered)) return;
@@ -336,7 +342,7 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             // A variable set to SQL NULL resolves to a NULL literal; the type
             // is unknown at this point (MySQL user vars are dynamically typed),
             // so a permissive `.int` placeholder rides the null bit.
-            e.* = if (try lookupSessionVar(ctx, name)) |v| .{ .lit = v } else .{ .null_lit = .int };
+            e.* = if (try lookupSessionVar(ctx, name)) |v| try sessionVarExpr(try ctx.subqueryArena(), v) else .{ .null_lit = .int };
         },
         .call => |c| {
             // Nullary temporal functions resolve to a statement-stable
@@ -611,6 +617,50 @@ fn comparableValue(arena: Allocator, tv: TypedValue) !Value {
     var text: std.ArrayList(u8) = .empty;
     try wire_format.formatDecimal(arena, &text, mantissa, tv.ty);
     return .{ .text = try text.toOwnedSlice(arena) };
+}
+
+/// A user variable's value as an expression: an array, map or struct
+/// re-enters from its encoded bytes (`scalar_fn.NESTED_VALUE_PREFIX`).
+fn sessionVarExpr(arena: Allocator, v: SessionVar) !ir.Expr {
+    if (!v.type.isNested()) return .{ .lit = v.value };
+    const args = try arena.alloc(ir.Expr, 1);
+    args[0] = .{ .lit = v.value };
+    return .{ .call = .{ .fn_name = try exec.scalar_fn.nestedValueFnName(arena, v.type), .args = args } };
+}
+
+/// The value a SET assignment gives its variable, read once the assignments
+/// before it took effect: `value` with its subqueries and variables
+/// resolved, then, unless that leaves a literal, run as a one-row SELECT.
+/// Null for SQL NULL. A session variable carries no decimal scale, so a
+/// decimal is held as the double nearest it, as a decimal literal is
+/// (`expr.literalValue`).
+pub fn evaluateSetValue(ctx: *CompileCtx, value: *ir.Expr) !?SessionVar {
+    try resolveSubqueriesInExpr(ctx, value, null);
+    if (value.* == .null_lit) return null;
+    if (exec.expr_mod.literalValue(value.*)) |v| return .{ .value = v, .type = try compute_mod.literalType(v) };
+    const na = ctx.nodeArena();
+    const name = "__set_value";
+    const derived = try na.alloc(ir.Derived, 1);
+    derived[0] = .{ .name = name, .expr = value.* };
+    const single = try na.create(ir.Op);
+    single.* = .{ .single_row = {} };
+    const compute = try na.create(ir.Op);
+    compute.* = .{ .compute = .{ .derived = derived, .upstream = single } };
+    const columns = try na.alloc([]const u8, 1);
+    columns[0] = name;
+    const select = try na.create(ir.Op);
+    select.* = .{ .select = .{ .columns = columns, .upstream = compute } };
+    const tv = switch (try runScalarSubquery(ctx, select)) {
+        .value => |tv| tv,
+        .null_of => return null,
+    };
+    const spec = tv.ty.decimalSpec() orelse return .{ .value = tv.val, .type = tv.ty };
+    const mantissa: i128 = switch (tv.val) {
+        .decimal64 => |m| m,
+        .decimal128 => |m| m,
+        else => return Error.TypeMismatch,
+    };
+    return .{ .value = .{ .double = scalar_decimal.mantissaToDouble(mantissa, spec.s) }, .type = .double };
 }
 
 /// The value as an expression: a decimal re-enters through a cast of its

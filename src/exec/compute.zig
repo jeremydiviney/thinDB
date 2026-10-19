@@ -1121,6 +1121,7 @@ pub const Compute = struct {
                 .kernel_managed => {}, // kernel already wrote the bitmap
             }
         }
+        try ensureNarrow(plan.output);
     }
 
     /// `array_map` over a batch: the body runs once over every element of
@@ -1287,6 +1288,7 @@ pub const Compute = struct {
             .varchar, .string, .char, .json, .nested => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
             inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
+        try ensureNarrow(plan.output);
     }
 
     /// A THEN or ELSE clause's batch value. One that fails over the whole
@@ -1393,6 +1395,7 @@ pub const Compute = struct {
         buf.clear();
         var one_arg = [_]ColumnView{raw};
         try k(self.allocator, &one_arg, buf, n);
+        try ensureNarrow(buf);
         return buf.view();
     }
 
@@ -1439,6 +1442,7 @@ pub const Compute = struct {
         buf.clear();
         var one_arg = [_]ColumnView{raw};
         try k(self.allocator, &one_arg, buf, if (scalar) 1 else n);
+        try ensureNarrow(buf);
         return .{ .view = buf.view(), .scalar = scalar };
     }
 
@@ -2576,6 +2580,7 @@ fn gatheredView(allocator: Allocator, gathered: *std.ArrayList(ColumnStore), vie
     var s = try ColumnStore.initLike(allocator, view, true);
     errdefer s.deinit(allocator);
     if (!try transform.appendGatheredColumn(allocator, view, picks, &s)) return Error.ComputeUnsupportedExpr;
+    try ensureNarrow(&s);
     try gathered.append(allocator, s);
     return gathered.items[gathered.items.len - 1].view();
 }
@@ -3148,7 +3153,7 @@ fn decimalLitSlot(runtime_allocator: Allocator, aa: Allocator, e: Expr) PlanErro
     return slot;
 }
 
-fn literalType(v: types.Value) Error!Type {
+pub fn literalType(v: types.Value) Error!Type {
     return switch (v) {
         .int => .int,
         .bigint => .bigint,
@@ -3552,6 +3557,13 @@ fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n:
         .decimal128 => |x| while (i < n) : (i += 1) try buf.data.decimal128.append(allocator, x),
         .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
     }
+    try ensureNarrow(buf);
+}
+
+/// Only the Sort reads a column whose text passed 4 GiB, so a batch value
+/// that grows one is out of budget, as a join input past 2^32 rows is.
+fn ensureNarrow(column: *const ColumnStore) Error!void {
+    if (column.isWide()) return Error.MemoryBudgetExceeded;
 }
 
 fn fillNullColumn(allocator: Allocator, buf: *ColumnStore, n: usize) !void {

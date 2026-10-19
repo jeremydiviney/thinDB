@@ -725,11 +725,18 @@ pub const SetKind = enum(u8) {
     except,
 };
 
-/// `SET @name = expr` — assign a session-scoped variable. Compile
-/// resolves any subqueries inside `value`, then evaluates it as a
-/// constant (the expression must constant-fold to a single literal)
-/// and writes the result into `Session.vars` under `name`.
+/// `SET @a = x, @b = y` — assign session-scoped variables, left to right,
+/// as MySQL does: compile resolves and evaluates each value once the
+/// assignments before it have taken effect, so `SET @a = 5, @b = @a + 1`
+/// sets @b to 6.
 pub const SetVar = struct {
+    assignments: []const SetAssignment,
+};
+
+/// One assignment of a SET. The value is any constant expression; compile
+/// evaluates it once and writes the result into `Session.vars` under
+/// `name`.
+pub const SetAssignment = struct {
     name: []const u8,
     value: Expr,
     /// Set for a thinDB session option (`SET thindb_max_dop = 4`); null for a

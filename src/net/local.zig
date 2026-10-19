@@ -2403,34 +2403,49 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     return try EmptyOp.createWithCount(ctx.allocator, affected);
 }
 
-/// `SET @name = expr` — evaluate the RHS Expr (which may contain a
-/// scalar subquery resolved by the pre-compile pass into a `.lit`)
-/// and write it into `Session.vars` for use by subsequent
-/// statements. Errors if the Expr didn't constant-fold to a single
-/// literal.
+/// `SET @a = x, ...` — each assignment in turn: its value is evaluated
+/// once the ones before it took effect (`subquery_resolve.evaluateSetValue`)
+/// and written into `Session.vars` for the statements after, or into the
+/// session option it names. A statement that fails changes no variable,
+/// as in MySQL.
 fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
-    // A session variable holds a Value, which carries no decimal scale, so a
-    // decimal constant is held as the double nearest its digits.
-    const value: ?Value = switch (sv.value) {
-        .null_lit => null,
-        else => exec.expr_mod.literalValue(sv.value) orelse return Error.UnsupportedOp,
-    };
-    if (sv.session_option) |option| {
-        switch (option) {
-            .max_dop => ctx.session.max_dop = try maxDopSetting(value),
+    const PriorVar = struct { name: []const u8, value: ??thindb_api.SessionVar };
+    const had_vars = ctx.session.vars != null;
+    var prior: std.ArrayList(PriorVar) = .empty;
+    defer prior.deinit(ctx.allocator);
+    // The Session's map outlives a failed statement; one this statement
+    // created doesn't.
+    errdefer if (ctx.session.vars) |vars| {
+        if (had_vars) {
+            var i = prior.items.len;
+            while (i > 0) {
+                i -= 1;
+                vars.restore(prior.items[i].name, prior.items[i].value);
+            }
+        } else {
+            CompiledQuery.freeSessionVars(ctx.allocator, vars);
+            ctx.session.vars = null;
         }
-        return try EmptyOp.createWithCount(ctx.allocator, 0);
+    };
+    for (sv.assignments) |a| {
+        var value_expr = a.value;
+        const value = try subquery_resolve.evaluateSetValue(ctx, &value_expr);
+        if (a.session_option) |option| {
+            switch (option) {
+                .max_dop => ctx.session.max_dop = try maxDopSetting(if (value) |v| v.value else null),
+            }
+            continue;
+        }
+        // Lazily create the session's var map. Owned by the CompileCtx's
+        // allocator so it outlives the statement.
+        if (ctx.session.vars == null) {
+            const vars = try ctx.allocator.create(thindb_api.SessionVars);
+            vars.* = thindb_api.SessionVars.init(ctx.allocator);
+            ctx.session.vars = vars;
+        }
+        try prior.append(ctx.allocator, .{ .name = a.name, .value = ctx.session.vars.?.get(a.name) });
+        try ctx.session.vars.?.set(a.name, value);
     }
-
-    // Lazily create the session's var map. Owned by the CompileCtx's
-    // allocator so it outlives the statement.
-    if (ctx.session.vars == null) {
-        const vars = try ctx.allocator.create(thindb_api.SessionVars);
-        vars.* = thindb_api.SessionVars.init(ctx.allocator);
-        ctx.session.vars = vars;
-    }
-    try ctx.session.vars.?.set(sv.name, value);
-
     return try EmptyOp.createWithCount(ctx.allocator, 0);
 }
 

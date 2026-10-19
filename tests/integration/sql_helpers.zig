@@ -69,14 +69,15 @@ pub fn runSqlDialect(allocator: std.mem.Allocator, db: anytype, sql: []const u8,
     // Batch: drain everything except the last statement eagerly,
     // threading the Session (with any SET-created vars) forward.
     var session: thindb.Session = .{};
+    errdefer thindb.net.CompiledQuery.freeSessionVars(allocator, session.vars);
     const stmts = root.batch.statements;
     if (stmts.len == 0) return error.EmptyBatch;
     for (stmts[0 .. stmts.len - 1], parsed.hints[0 .. stmts.len - 1]) |stmt, hints| {
         session.statement_max_dop = hints.max_dop;
         var cq = try thindb.net.compileWithSession(allocator, db, session, stmt);
+        defer cq.deinit();
         while (try cq.next()) |_| {}
         session = cq.sessionValue();
-        cq.deinit();
     }
     session.statement_max_dop = parsed.hints[stmts.len - 1].max_dop;
     const final = try thindb.net.compileWithSession(allocator, db, session, stmts[stmts.len - 1]);
