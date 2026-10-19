@@ -1,4 +1,4 @@
-//! ARRAY and MAP values. An array is one self-contained cell of a
+//! ARRAY, MAP and STRUCT values. An array is one self-contained cell of a
 //! variable-length column:
 //!
 //!   class     u8   how elements are stored and ordered (`ElemClass`)
@@ -19,6 +19,16 @@
 //!
 //! Keys are unique: building a map (`appendMap`) keeps the last entry of a
 //! repeated key, where that entry stands.
+//!
+//! A struct is its fields in order, each stored as an array element of its
+//! own class:
+//!
+//!   tag       u8   `STRUCT_TAG`, which no element class takes
+//!   count     u32  field count, little-endian
+//!   validity  ceil(count / 8) bytes; bit i set = field i is not NULL
+//!   classes   count bytes, field i's `ElemClass`
+//!   offsets   count + 1 u32 offsets into the bytes that follow
+//!   fields    each field's bytes; a NULL field is empty
 //!
 //! The encoding is canonical: floats are stored canonicalized and NULL slots
 //! are zero or empty, so equal values have equal bytes. Grouping, DISTINCT,
@@ -91,6 +101,8 @@ const HEADER_BYTES = 5;
 pub const MAP_TAG: u8 = 0x40;
 const MAP_HEADER_BYTES = 5;
 
+pub const STRUCT_TAG: u8 = 0x41;
+
 pub fn validityBytes(count: usize) usize {
     return (count + 7) >> 3;
 }
@@ -146,9 +158,48 @@ pub const Map = struct {
     }
 };
 
+/// A decoded view over one struct value's bytes.
+pub const Struct = struct {
+    count: u32,
+    validity: []const u8,
+    classes: []const u8,
+    offsets: []const u8,
+    data: []const u8,
+
+    pub fn decode(bytes: []const u8) Struct {
+        const count = std.mem.readInt(u32, bytes[1..5], .little);
+        const vb = validityBytes(count);
+        const classes_at = HEADER_BYTES + vb;
+        const offsets_at = classes_at + count;
+        const data_at = offsets_at + 4 * (@as(usize, count) + 1);
+        return .{
+            .count = count,
+            .validity = bytes[HEADER_BYTES..][0..vb],
+            .classes = bytes[classes_at..][0..count],
+            .offsets = bytes[offsets_at..data_at],
+            .data = bytes[data_at..],
+        };
+    }
+
+    pub fn isValid(self: Struct, i: usize) bool {
+        return (self.validity[i >> 3] >> @intCast(i & 7)) & 1 == 1;
+    }
+
+    pub fn class(self: Struct, i: usize) ElemClass {
+        return @enumFromInt(self.classes[i]);
+    }
+
+    pub fn field(self: Struct, i: usize) []const u8 {
+        const start = std.mem.readInt(u32, self.offsets[4 * i ..][0..4], .little);
+        const end = std.mem.readInt(u32, self.offsets[4 * (i + 1) ..][0..4], .little);
+        return self.data[start..end];
+    }
+};
+
 /// Whether `bytes` is a value of the nested type `t`, with every length and
 /// offset in bounds, nested elements included.
 pub fn isWellFormed(bytes: []const u8, t: Type) bool {
+    if (t.structFields()) |fields| return structWellFormed(bytes, fields);
     if (t.mapTypes()) |m| {
         if (bytes.len < MAP_HEADER_BYTES or bytes[0] != MAP_TAG) return false;
         const keys_len = std.mem.readInt(u32, bytes[1..5], .little);
@@ -158,6 +209,34 @@ pub fn isWellFormed(bytes: []const u8, t: Type) bool {
         return Array.decode(map.keys).count == Array.decode(map.values).count;
     }
     return arrayWellFormed(bytes, t.arrayElement() orelse return false);
+}
+
+fn structWellFormed(bytes: []const u8, fields: []const types.StructField) bool {
+    if (bytes.len < HEADER_BYTES or bytes[0] != STRUCT_TAG) return false;
+    const count: usize = std.mem.readInt(u32, bytes[1..5], .little);
+    if (count != fields.len) return false;
+    if (bytes.len - HEADER_BYTES < validityBytes(count) + count + 4 * (count + 1)) return false;
+    const s = Struct.decode(bytes);
+    var prev: u32 = 0;
+    for (0..count + 1) |i| {
+        const off = std.mem.readInt(u32, s.offsets[4 * i ..][0..4], .little);
+        if (off < prev or off > s.data.len) return false;
+        prev = off;
+    }
+    if (prev != s.data.len) return false;
+    for (fields, 0..) |f, i| {
+        const class = ElemClass.of(f.type);
+        if (s.classes[i] != @intFromEnum(class)) return false;
+        const value = s.field(i);
+        if (!s.isValid(i)) {
+            if (value.len != 0) return false;
+            continue;
+        }
+        if (class.width()) |w| {
+            if (value.len != w) return false;
+        } else if (class == .nested and !isWellFormed(value, f.type)) return false;
+    }
+    return true;
 }
 
 fn arrayWellFormed(bytes: []const u8, element: Type) bool {
@@ -603,6 +682,72 @@ pub fn encodeMapColumn(
     }
 }
 
+/// Append one struct to `out`: row `row` of `values`, one flat view per
+/// field, each of its field's type.
+pub fn appendStruct(allocator: Allocator, out: *std.ArrayList(u8), fields: []const types.StructField, values: []const ColumnView, row: usize) !void {
+    try out.append(allocator, STRUCT_TAG);
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(fields.len), .little);
+    try out.appendSlice(allocator, &count_buf);
+    const vb_at = out.items.len;
+    try out.appendNTimes(allocator, 0, validityBytes(fields.len));
+    for (fields) |f| try out.append(allocator, @intFromEnum(ElemClass.of(f.type)));
+    const offsets_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4 * (fields.len + 1));
+    const data_at = out.items.len;
+    for (values, 0..) |v, i| {
+        if (v.isValid(row)) {
+            out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
+            var buf: [16]u8 = undefined;
+            try out.appendSlice(allocator, elementBytes(v, row, &buf));
+        }
+        std.mem.writeInt(u32, out.items[offsets_at + 4 * (i + 1) ..][0..4], @intCast(out.items.len - data_at), .little);
+    }
+}
+
+/// Build a STRUCT column of `rows` rows from one flat view per field
+/// (`appendStruct`); a row whose `row_validity` bit is clear is NULL.
+pub fn encodeStructColumn(
+    allocator: Allocator,
+    out: *ColumnStore,
+    fields: []const types.StructField,
+    values: []const ColumnView,
+    row_validity: ?[]const u8,
+    rows: usize,
+) !void {
+    var cell: std.ArrayList(u8) = .empty;
+    defer cell.deinit(allocator);
+    const ss = &out.data.nested;
+    for (0..rows) |r| {
+        const valid = storage.column.isValidBit(row_validity, r);
+        const at = out.rowCount();
+        if (valid) {
+            cell.clearRetainingCapacity();
+            try appendStruct(allocator, &cell, fields, values, r);
+            try ss.appendValue(allocator, cell.items);
+        } else {
+            try ss.appendValue(allocator, "");
+        }
+        try out.appendValidBit(allocator, at, valid);
+    }
+}
+
+/// Append field `index` of each of `rows` structs to `out`, a store of
+/// the field's type: NULL where the struct or its field is.
+pub fn appendStructField(allocator: Allocator, out: *ColumnStore, structs: ColumnView, index: usize, rows: usize) !void {
+    const sv = structs.data.nested;
+    for (0..rows) |r| {
+        if (structs.isValid(r)) {
+            const s = Struct.decode(sv.rowBytes(r));
+            if (s.isValid(index)) {
+                try appendRaw(allocator, out, s.field(index));
+                continue;
+            }
+        }
+        try out.appendNulls(allocator, 1);
+    }
+}
+
 /// Append one element's stored bytes to a store of the element type.
 pub fn appendRaw(allocator: Allocator, out: *ColumnStore, raw: []const u8) !void {
     const at = out.rowCount();
@@ -621,7 +766,8 @@ pub fn appendRaw(allocator: Allocator, out: *ColumnStore, raw: []const u8) !void
 
 /// Total order over values of one nested type. Arrays order element by
 /// element, a NULL element before any value, then the shorter array first;
-/// maps by their keys, then their values.
+/// maps by their keys, then their values; structs field by field, as
+/// arrays do.
 pub fn order(a_bytes: []const u8, b_bytes: []const u8) std.math.Order {
     // A NULL row's cell is empty; callers order NULLs themselves, but the
     // comparison must not read past it.
@@ -632,6 +778,21 @@ pub fn order(a_bytes: []const u8, b_bytes: []const u8) std.math.Order {
         const b = Map.decode(b_bytes);
         const by_keys = order(a.keys, b.keys);
         return if (by_keys != .eq) by_keys else order(a.values, b.values);
+    }
+    if (a_bytes[0] == STRUCT_TAG) {
+        const a = Struct.decode(a_bytes);
+        const b = Struct.decode(b_bytes);
+        for (0..@min(a.count, b.count)) |i| {
+            const av = a.isValid(i);
+            const bv = b.isValid(i);
+            if (!av or !bv) {
+                if (av == bv) continue;
+                return if (av) .gt else .lt;
+            }
+            const o = elementOrder(a.class(i), a.field(i), b.field(i));
+            if (o != .eq) return o;
+        }
+        return std.math.order(a.count, b.count);
     }
     const a = Array.decode(a_bytes);
     const b = Array.decode(b_bytes);
@@ -674,8 +835,24 @@ pub const TextStyle = enum {
 };
 
 /// Append the text of one value of the nested type `t` to `out`. A map is
-/// `{k:v,...}` in either style, as StarRocks writes it.
+/// `{k:v,...}` and a struct `{"name":v,...}` in either style, as StarRocks
+/// writes them.
 pub fn appendText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, bytes: []const u8, style: TextStyle) TextError!void {
+    if (t.structFields()) |fields| {
+        const s = Struct.decode(bytes);
+        try out.append(allocator, '{');
+        for (fields, 0..) |f, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try appendQuoted(allocator, out, f.name, .starrocks);
+            try out.append(allocator, ':');
+            if (!s.isValid(i)) {
+                try out.appendSlice(allocator, if (style == .starrocks) "null" else "NULL");
+                continue;
+            }
+            try appendElementText(allocator, out, f.type, s.field(i), style);
+        }
+        return out.append(allocator, '}');
+    }
     if (t.mapTypes()) |m| {
         const map = Map.decode(bytes);
         const keys = Array.decode(map.keys);
@@ -712,9 +889,9 @@ fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
     var buf: [64]u8 = undefined;
     switch (t) {
         .nested => {
-            // A map element of a PostgreSQL array is a quoted string; an
-            // array element nests in its own braces.
-            if (style == .starrocks or t.mapTypes() == null) return appendText(allocator, out, t, raw, style);
+            // A map or struct element of a PostgreSQL array is a quoted
+            // string; an array element nests in its own braces.
+            if (style == .starrocks or t.arrayElement() != null) return appendText(allocator, out, t, raw, style);
             var text: std.ArrayList(u8) = .empty;
             defer text.deinit(allocator);
             try appendText(allocator, &text, t, raw, style);
@@ -778,7 +955,8 @@ pub const ParseError = error{InvalidNestedText} || Allocator.Error;
 
 /// Encode the value of the nested type `t` that `text` spells: an array as
 /// StarRocks' `[1, 2, null]` (strings in single or double quotes) or
-/// PostgreSQL's `{1,2,NULL}`, a map as StarRocks' `{"a":1,"b":null}`. An
+/// PostgreSQL's `{1,2,NULL}`, a map as StarRocks' `{"a":1,"b":null}`, a
+/// struct as `{"name":1,...}`, fields by name, one left out NULL. An
 /// element that doesn't read as its type is NULL, as a CAST of its text is;
 /// text of another shape fails.
 pub fn parseText(allocator: Allocator, t: Type, text: []const u8, out: *std.ArrayList(u8)) ParseError!void {
@@ -799,6 +977,7 @@ const TextReader = struct {
 
     fn parseValue(r: *TextReader, allocator: Allocator, t: Type, out: *std.ArrayList(u8)) ParseError!void {
         if (t.mapTypes()) |m| return r.parseMap(allocator, m, out);
+        if (t.structFields()) |fields| return r.parseStruct(allocator, fields, out);
         return r.parseArray(allocator, t.arrayElement() orelse return error.InvalidNestedText, out);
     }
 
@@ -833,6 +1012,51 @@ const TextReader = struct {
         var rows: std.ArrayList(u32) = .empty;
         defer rows.deinit(allocator);
         try appendMap(allocator, out, m, keys.view(), values.view(), 0, keys.rowCount(), &rows);
+    }
+
+    fn parseStruct(r: *TextReader, allocator: Allocator, fields: []const types.StructField, out: *std.ArrayList(u8)) ParseError!void {
+        if (r.pos >= r.text.len or r.text[r.pos] != '{') return error.InvalidNestedText;
+        r.pos += 1;
+        const stores = try allocator.alloc(ColumnStore, fields.len);
+        defer allocator.free(stores);
+        var ready: usize = 0;
+        defer for (stores[0..ready]) |*s| s.deinit(allocator);
+        for (stores, fields) |*s, f| {
+            s.* = try ColumnStore.init(allocator, f.type, true);
+            ready += 1;
+        }
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(allocator);
+        r.skipSpace();
+        if (r.pos < r.text.len and r.text[r.pos] == '}') {
+            r.pos += 1;
+        } else while (true) {
+            r.skipSpace();
+            if (r.pos >= r.text.len) return error.InvalidNestedText;
+            const name = try r.scalarToken(allocator, ':', &scratch) orelse return error.InvalidNestedText;
+            const index = types.structFieldIndex(fields, name) orelse return error.InvalidNestedText;
+            if (stores[index].rowCount() != 0) return error.InvalidNestedText;
+            r.skipSpace();
+            if (r.pos >= r.text.len or r.text[r.pos] != ':') return error.InvalidNestedText;
+            r.pos += 1;
+            try r.parseSlot(allocator, &stores[index], fields[index].type, '}', &scratch);
+            r.skipSpace();
+            if (r.pos >= r.text.len) return error.InvalidNestedText;
+            if (r.text[r.pos] == ',') {
+                r.pos += 1;
+                continue;
+            }
+            if (r.text[r.pos] != '}') return error.InvalidNestedText;
+            r.pos += 1;
+            break;
+        }
+        const views = try allocator.alloc(ColumnView, fields.len);
+        defer allocator.free(views);
+        for (stores, views) |*s, *v| {
+            if (s.rowCount() == 0) try s.appendNulls(allocator, 1);
+            v.* = s.view();
+        }
+        try appendStruct(allocator, out, fields, views, 0);
     }
 
     /// One element of `t` onto `slots`, the text before `close` or a comma.
@@ -1064,6 +1288,49 @@ test "nested: map text round-trips, and a repeated key keeps its last entry" {
         defer out.deinit(a);
         try testing.expectError(error.InvalidNestedText, parseText(a, by_name, bad, &out));
     }
+}
+
+test "nested: struct text round-trips, orders field by field and yields its fields" {
+    const a = testing.allocator;
+    const t = try types.structOf(&.{
+        .{ .name = "id", .type = .int },
+        .{ .name = "tags", .type = try types.arrayOf(.string) },
+        .{ .name = "Note", .type = .string },
+    });
+    const cases = .{
+        .{ "{\"id\": 1, \"tags\": ['x'], \"Note\": 'n'}", "{\"id\":1,\"tags\":[\"x\"],\"Note\":\"n\"}" },
+        .{ "{'note': null, 'id': 2}", "{\"id\":2,\"tags\":null,\"Note\":null}" },
+        .{ "{}", "{\"id\":null,\"tags\":null,\"Note\":null}" },
+    };
+    var encoded: [cases.len][]u8 = undefined;
+    inline for (cases, 0..) |c, i| {
+        encoded[i] = try encodeText(a, t, c[0]);
+        try testing.expect(isWellFormed(encoded[i], t));
+        const sr = try renderText(a, t, encoded[i], .starrocks);
+        defer a.free(sr);
+        try testing.expectEqualStrings(c[1], sr);
+    }
+    defer for (encoded) |e| a.free(e);
+    try testing.expectEqual(std.math.Order.lt, order(encoded[0], encoded[1]));
+    try testing.expectEqual(std.math.Order.lt, order(encoded[2], encoded[0]));
+    try testing.expect(!isWellFormed(encoded[0], try types.structOf(&.{.{ .name = "id", .type = .int }})));
+    inline for (.{ "{'id' 1}", "{'nope': 1}", "{'id': 1, 'id': 2}", "[1]" }) |bad| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try testing.expectError(error.InvalidNestedText, parseText(a, t, bad, &out));
+    }
+
+    var col = try ColumnStore.init(a, t, true);
+    defer col.deinit(a);
+    for (encoded) |e| try appendRaw(a, &col, e);
+    try col.appendNulls(a, 1);
+    var ids = try ColumnStore.init(a, .int, true);
+    defer ids.deinit(a);
+    try appendStructField(a, &ids, col.view(), 0, 4);
+    const v = ids.view();
+    try testing.expectEqual(@as(i32, 1), v.data.int[0]);
+    try testing.expectEqual(@as(i32, 2), v.data.int[1]);
+    try testing.expect(!v.isValid(2) and !v.isValid(3));
 }
 
 test "nested: maps past the pairwise limit drop repeated keys by sorting" {

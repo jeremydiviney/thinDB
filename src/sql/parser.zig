@@ -293,6 +293,7 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_interval => "interval",
         .kw_database => "database",
         .kw_schema => "schema",
+        .kw_row => "row",
         else => null,
     };
 }
@@ -2616,11 +2617,12 @@ pub const Parser = struct {
         }
     }
 
-    /// Moves `look` past the `<...>` of an `ARRAY<T>` or `MAP<K, V>` that
-    /// `tok` starts, whose angle brackets are no comparisons. Returns whether
-    /// it did.
+    /// Moves `look` past the `<...>` of an `ARRAY<T>`, `MAP<K, V>` or
+    /// `STRUCT<...>` that `tok` starts, whose angle brackets are no
+    /// comparisons. Returns whether it did.
     fn skipNestedTypeArguments(look: *Lexer, tok: Token) ParseError!bool {
-        if (tok.quoted or !(std.ascii.eqlIgnoreCase(tok.text, "array") or std.ascii.eqlIgnoreCase(tok.text, "map"))) return false;
+        if (tok.quoted) return false;
+        if (!std.ascii.eqlIgnoreCase(tok.text, "array") and !std.ascii.eqlIgnoreCase(tok.text, "map") and !std.ascii.eqlIgnoreCase(tok.text, "struct")) return false;
         var ahead = look.*;
         if ((try ahead.next()).tag != .lt) return false;
         var open: usize = 1;
@@ -2729,6 +2731,31 @@ pub const Parser = struct {
                 v.* = args[2 * i + 1];
             }
             return try self.mapFromEntries(keys, values);
+        }
+        if ((std.ascii.eqlIgnoreCase(name, "row") or std.ascii.eqlIgnoreCase(name, "struct")) and args.len > 0) {
+            // StarRocks names the fields col1, col2, ...
+            var names: std.ArrayList(u8) = .empty;
+            for (1..args.len + 1) |i| {
+                if (i > 1) try names.append(self.arena, ',');
+                try names.print(self.arena, "col{d}", .{i});
+            }
+            return try self.structValue(names.items, args);
+        }
+        if (std.ascii.eqlIgnoreCase(name, "named_struct")) {
+            if (args.len == 0 or args.len % 2 != 0) return ParseError.SqlExpectedValue;
+            var names: std.ArrayList(u8) = .empty;
+            const values = try self.arena.alloc(ir.Expr, args.len / 2);
+            for (values, 0..) |*v, i| {
+                const field = args[2 * i];
+                if (field != .lit or field.lit != .text) return ParseError.SqlExpectedValue;
+                const field_name = field.lit.text;
+                if (field_name.len == 0 or std.mem.indexOfScalar(u8, field_name, '`') != null) return ParseError.SqlExpectedValue;
+                for (0..i) |j| if (std.ascii.eqlIgnoreCase(args[2 * j].lit.text, field_name)) return ParseError.SqlExpectedValue;
+                if (i > 0) try names.append(self.arena, ',');
+                try types.appendFieldNameText(self.arena, &names, field_name);
+                v.* = args[2 * i + 1];
+            }
+            return try self.structValue(names.items, values);
         }
         if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {
             // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, and
@@ -3674,6 +3701,17 @@ pub const Parser = struct {
             } else if (self.cur.tag == .coloncolon and self.lex.dialect != .mysql) {
                 try self.advance();
                 atom = try self.parseCastTarget(atom);
+            } else if (self.cur.tag == .dot and atom != .col_ref) {
+                // A field of a computed struct: `row(a, b).col1`, `x[1].f`.
+                // A column's own dotted names are its qualified reference.
+                try self.advance();
+                if (!self.nameAfterDot()) return ParseError.SqlExpectedIdent;
+                const field = try self.arena.dupe(u8, self.cur.text);
+                try self.advance();
+                const args = try self.arena.alloc(ir.Expr, 2);
+                args[0] = atom;
+                args[1] = .{ .lit = .{ .text = field } };
+                atom = ir.Expr{ .call = .{ .fn_name = try std.mem.concat(self.arena, u8, &.{ scalar_fn.STRUCT_FIELD_PREFIX, field }), .args = args } };
             } else return atom;
         }
     }
@@ -3836,6 +3874,13 @@ pub const Parser = struct {
         }
         try self.expect(.rbrace);
         return try self.mapFromEntries(keys.items, values.items);
+    }
+
+    /// A struct of `values`, its fields named by `names` as type text
+    /// spells them (`scalar_fn.STRUCT_VALUE_PREFIX`).
+    fn structValue(self: *Parser, names: []const u8, values: []const ir.Expr) ParseError!ir.Expr {
+        const fn_name = try std.mem.concat(self.arena, u8, &.{ scalar_fn.STRUCT_VALUE_PREFIX, names });
+        return ir.Expr{ .call = .{ .fn_name = fn_name, .args = try self.arena.dupe(ir.Expr, values) } };
     }
 
     /// `map{k: v, ...}` and `map(k, v, ...)` are `map_from_arrays([k, ...],
@@ -4053,25 +4098,39 @@ pub const Parser = struct {
 
     /// A reference, cursor after its first name: `col`, `table.col`,
     /// `table.*`, `schema.table.col` or `schema.table.*`. The schema (or
-    /// database) qualifier drops: a column resolves by its table name.
+    /// database) qualifier drops: a column resolves by its table name. Past
+    /// three names a reference is a struct field path (`t.s.a.b`), which
+    /// keeps every name for the compiler to resolve.
     fn qualifiedRef(self: *Parser, first: []const u8) ParseError!QualifiedRef {
+        var dropped: ?[]const u8 = null;
         var table: ?[]const u8 = null;
         var name = first;
         var segments: usize = 1;
         while (self.cur.tag == .dot) {
-            if (segments == 3) return ParseError.SqlExpectedIdent;
             try self.advance();
             if (self.cur.tag == .star) {
+                if (segments >= 3) return ParseError.SqlExpectedIdent;
                 try self.advance();
                 return .{ .table = name, .column = null };
             }
-            if (self.cur.tag != .identifier) return ParseError.SqlExpectedIdent;
-            table = name;
+            if (!self.nameAfterDot()) return ParseError.SqlExpectedIdent;
+            if (segments == 2) dropped = table;
+            table = if (segments >= 3)
+                try std.mem.concat(self.arena, u8, &.{ if (segments == 3) dropped.? else "", if (segments == 3) "." else "", table.?, ".", name })
+            else
+                name;
             name = self.cur.text;
             try self.advance();
             segments += 1;
         }
         return .{ .table = table, .column = name };
+    }
+
+    /// Whether the cursor holds a name after a `.`, where a keyword is a
+    /// name too, as in MySQL (`t.key`, `s.inner`).
+    fn nameAfterDot(self: *const Parser) bool {
+        if (self.cur.tag == .identifier) return true;
+        return std.mem.startsWith(u8, @tagName(self.cur.tag), "kw_") and self.cur.text.len > 0;
     }
 
     fn dupRef(self: *Parser, table: ?[]const u8, column: []const u8) ParseError![]const u8 {

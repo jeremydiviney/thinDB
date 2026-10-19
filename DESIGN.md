@@ -75,6 +75,7 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | Boolean | `BOOLEAN` | u8 (0/1) |
 | Nested | `ARRAY<T>` | One variable-width value per row in a self-contained encoding (`exec/nested.zig`): element class, count, validity bits, then the fixed-width values, or offsets and bytes. `T` is any type, an array included |
 | | `MAP<K, V>` | One variable-width value per row: a map tag, then its keys and its values as two arrays of one length. `K` is any type but a nested one; `V` is any type |
+| | `STRUCT<f T, ...>` | One variable-width value per row: a struct tag, the field count, validity and class per field, then offsets and the fields' bytes. Names live in the type, not the value. A field is any type |
 
 A nested type points to its shape (`types.internNested`), so a type stays
 one word and two types compare by pointer. The shapes live in one
@@ -98,7 +99,17 @@ Maps follow StarRocks too:
 - Text casts to a map from StarRocks' `{"a":1,"b":null}`. The MySQL wire prints that text; the PostgreSQL wire, which has no map type, sends it as `text`.
 - `MAP_AGG(k, v)` skips a row whose key is NULL and keeps a NULL value. It is a GROUP_CONCAT of one-entry maps, and GROUP_CONCAT over maps merges them, a later key winning.
 
-`IF`, `IFNULL`, `COALESCE` and `CASE` choose whole arrays and maps; their branches meet at a common type.
+Structs follow StarRocks:
+- `row(x, ...)` and `struct(x, ...)` name their fields `col1`, `col2`, ...; `named_struct('a', x, ...)` takes literal names. A struct's field names are unique ignoring case and hold no backtick; DDL field names may be keywords.
+- `s.f` reads a field, `s.f.g` a nested one; any expression takes `.f` too (`row(1, 'x').col2`, `a[1].f`). A name with a dot is a field path only when no column has that name and its owner is a STRUCT column; a missing field is an error. `t.s.f` qualifies the column by its table or alias.
+- Field paths are derived at compile time (`net/struct_paths.zig`): each path becomes a hidden column computed just above its block's FROM, and the block reads that column. Operators read a dotted name as table and column, so a hidden name has no dot. Paths in a join's ON aren't derived.
+- A CAST between structs goes by position, the target's names winning; text casts by name from StarRocks' `{"a":1,"b":"x"}`, a missing field NULL. Structs meet when they have as many fields and their fields meet pairwise, taking the first struct's names.
+- Structs compare field by field, a NULL field first and equal to another NULL, as array elements do. GROUP BY and DISTINCT use the same order.
+- The MySQL wire prints StarRocks' text; the PostgreSQL wire sends it as `text`.
+
+A NULL field, element, key or value meets the nested type beside it, so `row(1, NULL)` sits beside `row(1, [2])` in one VALUES list.
+
+`IF`, `IFNULL`, `COALESCE` and `CASE` choose whole arrays, maps and structs; their branches meet at a common type.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
 calendar, where year 0 is a leap year, as in StarRocks. So `0000-02-29` is a
@@ -235,7 +246,7 @@ dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
 `PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
 read `||` as concatenation.
 
-Explicitly **out of scope for v1**: `JSON`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
+Explicitly **out of scope for v1**: `JSON`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:
 - `FIXED` is `DECIMAL`.

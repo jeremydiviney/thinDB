@@ -44,7 +44,7 @@ pub const TypeTag = enum(u8) {
     /// metadata reports it as JSON. Phase 1 keeps the text representation;
     /// a binary JSONB form and columnar shredding are later phases.
     json = 17,
-    /// ARRAY or MAP. The payload's `Nested` gives the element types.
+    /// ARRAY, MAP or STRUCT. The payload's `Nested` gives the element types.
     /// Physically each value is one variable-length cell in the
     /// self-contained encoding of `exec/nested.zig`, so storage, the WAL and
     /// row movement treat it as bytes, the way they treat a string.
@@ -58,6 +58,15 @@ pub const Nested = union(enum) {
     /// Element type. Elements are always nullable.
     array: Type,
     map: MapTypes,
+    /// Fields in order. Names are unique, compared case-insensitively;
+    /// values are always nullable.
+    @"struct": []const StructField,
+};
+
+/// A STRUCT field.
+pub const StructField = struct {
+    name: []const u8,
+    type: Type,
 };
 
 /// A MAP's key and value types. Keys are unique within a map; values are
@@ -84,48 +93,85 @@ var nested_pool: NestedPool = .{};
 const nested_allocator = std.heap.smp_allocator;
 
 /// The interned instance of `shape`. Its element types are interned already,
-/// so two shapes are equal exactly when their shallow bytes are.
+/// so two shapes are equal exactly when their shallow bytes, field names
+/// included, are.
 pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
-    var key_buf: [1 + 2 * TYPE_KEY_BYTES]u8 = undefined;
-    const key = nestedKey(shape, &key_buf);
+    var fallback = std.heap.stackFallback(256, nested_allocator);
+    const key_allocator = fallback.get();
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(key_allocator);
+    try appendNestedKey(key_allocator, &key, shape);
     nested_pool.acquire();
     defer nested_pool.lock.unlock();
-    if (nested_pool.by_key.get(key)) |known| return known;
-    const owned_key = try nested_allocator.dupe(u8, key);
+    if (nested_pool.by_key.get(key.items)) |known| return known;
+    const owned_key = try nested_allocator.dupe(u8, key.items);
     errdefer nested_allocator.free(owned_key);
     const instance = try nested_allocator.create(Nested);
     errdefer nested_allocator.destroy(instance);
-    instance.* = shape;
+    instance.* = try ownedShape(shape);
+    errdefer freeShape(instance.*);
     try nested_pool.by_key.put(nested_allocator, owned_key, instance);
     return instance;
 }
 
-fn nestedKey(shape: Nested, buf: *[1 + 2 * TYPE_KEY_BYTES]u8) []const u8 {
-    buf[0] = @intFromEnum(std.meta.activeTag(shape));
+fn appendNestedKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), shape: Nested) !void {
+    try key.append(allocator, @intFromEnum(std.meta.activeTag(shape)));
     switch (shape) {
-        .array => |element| {
-            writeTypeKey(buf[1..][0..TYPE_KEY_BYTES], element);
-            return buf[0 .. 1 + TYPE_KEY_BYTES];
-        },
+        .array => |element| try appendTypeKey(allocator, key, element),
         .map => |m| {
-            writeTypeKey(buf[1..][0..TYPE_KEY_BYTES], m.key);
-            writeTypeKey(buf[1 + TYPE_KEY_BYTES ..][0..TYPE_KEY_BYTES], m.value);
-            return buf[0 .. 1 + 2 * TYPE_KEY_BYTES];
+            try appendTypeKey(allocator, key, m.key);
+            try appendTypeKey(allocator, key, m.value);
+        },
+        .@"struct" => |fields| for (fields) |f| {
+            var len: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len, @intCast(f.name.len), .little);
+            try key.appendSlice(allocator, &len);
+            try key.appendSlice(allocator, f.name);
+            try appendTypeKey(allocator, key, f.type);
         },
     }
 }
 
-const TYPE_KEY_BYTES = 9;
-
-fn writeTypeKey(buf: *[TYPE_KEY_BYTES]u8, t: Type) void {
-    buf[0] = @intFromEnum(std.meta.activeTag(t));
+fn appendTypeKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), t: Type) !void {
+    try key.append(allocator, @intFromEnum(std.meta.activeTag(t)));
     const payload: u64 = switch (t) {
         .varchar, .char => |n| n,
         .decimal64, .decimal128 => |spec| (@as(u64, spec.p) << 8) | spec.s,
         .nested => |n| @intFromPtr(n),
         else => 0,
     };
-    std.mem.writeInt(u64, buf[1..9], payload, .little);
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, payload, .little);
+    try key.appendSlice(allocator, &buf);
+}
+
+/// `shape` with its fields and their names copied into the pool, as the
+/// caller's may not outlive the call.
+fn ownedShape(shape: Nested) !Nested {
+    const fields = switch (shape) {
+        .@"struct" => |f| f,
+        else => return shape,
+    };
+    const owned = try nested_allocator.alloc(StructField, fields.len);
+    var named: usize = 0;
+    errdefer {
+        for (owned[0..named]) |f| nested_allocator.free(f.name);
+        nested_allocator.free(owned);
+    }
+    for (fields, owned) |f, *o| {
+        o.* = .{ .name = try nested_allocator.dupe(u8, f.name), .type = f.type };
+        named += 1;
+    }
+    return .{ .@"struct" = owned };
+}
+
+fn freeShape(shape: Nested) void {
+    const fields = switch (shape) {
+        .@"struct" => |f| f,
+        else => return,
+    };
+    for (fields) |f| nested_allocator.free(f.name);
+    nested_allocator.free(fields);
 }
 
 /// `ARRAY<element>`.
@@ -138,8 +184,20 @@ pub fn mapOf(key: Type, value: Type) error{OutOfMemory}!Type {
     return .{ .nested = try internNested(.{ .map = .{ .key = key, .value = value } }) };
 }
 
+/// `STRUCT<fields>`. The caller keeps `fields`; the type holds a copy.
+pub fn structOf(fields: []const StructField) error{OutOfMemory}!Type {
+    return .{ .nested = try internNested(.{ .@"struct" = fields }) };
+}
+
+/// The index of the field `name` names, matched case-insensitively.
+pub fn structFieldIndex(fields: []const StructField, name: []const u8) ?usize {
+    for (fields, 0..) |f, i| if (std.ascii.eqlIgnoreCase(f.name, name)) return i;
+    return null;
+}
+
 /// The canonical text of `t` (`int`, `varchar(20)`, `decimal(10,2)`,
-/// `array<array<int>>`, `map<string,int>`), which `parseTypeText` reads
+/// `array<array<int>>`, `map<string,int>`, `struct<a int,b string>`; a
+/// field name that is no plain identifier in backticks), which `parseTypeText` reads
 /// back. Where a type leaves the process (schema files, the IR wire, CAST's
 /// function name) it travels as this text, since a nested shape is a pointer.
 pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: Type) std.mem.Allocator.Error!void {
@@ -161,12 +219,43 @@ pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: 
                 try appendTypeText(allocator, out, m.value);
                 try out.append(allocator, '>');
             },
+            .@"struct" => |fields| {
+                try out.appendSlice(allocator, "struct<");
+                for (fields, 0..) |f, i| {
+                    if (i > 0) try out.append(allocator, ',');
+                    try appendFieldNameText(allocator, out, f.name);
+                    try out.append(allocator, ' ');
+                    try appendTypeText(allocator, out, f.type);
+                }
+                try out.append(allocator, '>');
+            },
         },
         else => try out.appendSlice(allocator, @tagName(t)),
     }
 }
 
+/// A STRUCT field name as type text spells it: as is when plain, else in
+/// backticks.
+pub fn appendFieldNameText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8) std.mem.Allocator.Error!void {
+    if (isPlainFieldName(name)) return out.appendSlice(allocator, name);
+    try out.append(allocator, '`');
+    try out.appendSlice(allocator, name);
+    try out.append(allocator, '`');
+}
+
 pub const TypeTextError = error{InvalidTypeText} || std.mem.Allocator.Error;
+
+/// Read comma-joined field names as `appendFieldNameText` writes them.
+pub fn parseFieldNamesText(allocator: std.mem.Allocator, text: []const u8) TypeTextError![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    var pos: usize = 0;
+    while (true) {
+        try names.append(allocator, try typeTextFieldName(text, &pos));
+        if (pos == text.len) return names.toOwnedSlice(allocator);
+        try expectTypeChar(text, &pos, ',');
+    }
+}
 
 /// Read the canonical text `appendTypeText` writes; the whole text must be
 /// one type.
@@ -195,6 +284,24 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
         try expectTypeChar(text, pos, '>');
         return mapOf(key, value);
     }
+    if (std.mem.eql(u8, name, "struct")) {
+        try expectTypeChar(text, pos, '<');
+        var fallback = std.heap.stackFallback(16 * @sizeOf(StructField), nested_allocator);
+        const allocator = fallback.get();
+        var fields: std.ArrayList(StructField) = .empty;
+        defer fields.deinit(allocator);
+        while (true) {
+            const field_name = try typeTextFieldName(text, pos);
+            try expectTypeChar(text, pos, ' ');
+            try fields.append(allocator, .{ .name = field_name, .type = try parseTypeTextAt(text, pos) });
+            if (pos.* < text.len and text[pos.*] == ',') {
+                pos.* += 1;
+                continue;
+            }
+            try expectTypeChar(text, pos, '>');
+            return structOf(fields.items);
+        }
+    }
     if (std.mem.eql(u8, name, "varchar") or std.mem.eql(u8, name, "char")) {
         try expectTypeChar(text, pos, '(');
         const n = try typeTextInt(u32, text, pos);
@@ -215,6 +322,26 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
         if (f.type == void and std.mem.eql(u8, name, f.name)) return @unionInit(Type, f.name, {});
     }
     return error.InvalidTypeText;
+}
+
+/// Whether a STRUCT field name reads back unquoted in type text.
+fn isPlainFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    return true;
+}
+
+fn typeTextFieldName(text: []const u8, pos: *usize) TypeTextError![]const u8 {
+    if (pos.* < text.len and text[pos.*] == '`') {
+        const start = pos.* + 1;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '`') orelse return error.InvalidTypeText;
+        pos.* = end + 1;
+        return text[start..end];
+    }
+    const start = pos.*;
+    while (pos.* < text.len and (std.ascii.isAlphanumeric(text[pos.*]) or text[pos.*] == '_')) pos.* += 1;
+    if (pos.* == start) return error.InvalidTypeText;
+    return text[start..pos.*];
 }
 
 fn expectTypeChar(text: []const u8, pos: *usize, c: u8) TypeTextError!void {
@@ -317,6 +444,17 @@ pub const Type = union(TypeTag) {
         return switch (self) {
             .nested => |n| switch (n.*) {
                 .map => |m| m,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// The fields of a STRUCT, or null for any other type.
+    pub fn structFields(self: Type) ?[]const StructField {
+        return switch (self) {
+            .nested => |n| switch (n.*) {
+                .@"struct" => |fields| fields,
                 else => null,
             },
             else => null,
@@ -989,7 +1127,7 @@ test "findColumn resolves names that contain dots" {
 test "nested type text round-trips, and shapes intern to one instance" {
     const a = std.testing.allocator;
     const map_type = try mapOf(.{ .varchar = 8 }, try arrayOf(.int));
-    const texts = .{ "array<array<int>>", "map<varchar(8),array<int>>", "map<int,map<string,decimal(10,2)>>" };
+    const texts = .{ "array<array<int>>", "map<varchar(8),array<int>>", "map<int,map<string,decimal(10,2)>>", "struct<a int,`b c` array<struct<x string>>>" };
     inline for (texts) |text| {
         const t = try parseTypeText(text);
         var out: std.ArrayList(u8) = .empty;
@@ -1002,4 +1140,14 @@ test "nested type text round-trips, and shapes intern to one instance" {
     try std.testing.expectEqual(Type.int, map_type.mapTypes().?.value.arrayElement().?);
     try std.testing.expect(map_type.arrayElement() == null);
     try std.testing.expectError(error.InvalidTypeText, parseTypeText("map<int>"));
+
+    var name_buf = "a".*;
+    const fields = [_]StructField{.{ .name = &name_buf, .type = .int }};
+    const struct_type = try structOf(&fields);
+    name_buf[0] = 'z';
+    try std.testing.expectEqualStrings("a", struct_type.structFields().?[0].name);
+    try std.testing.expect(std.meta.eql(struct_type, try parseTypeText("struct<a int>")));
+    try std.testing.expect(!std.meta.eql(struct_type, try parseTypeText("struct<b int>")));
+    try std.testing.expectEqual(@as(?usize, 0), structFieldIndex(struct_type.structFields().?, "A"));
+    try std.testing.expectError(error.InvalidTypeText, parseTypeText("struct<>"));
 }

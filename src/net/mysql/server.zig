@@ -2251,6 +2251,19 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
                 defer allocator.free(value);
                 return std.fmt.allocPrint(allocator, "map<{s},{s}>", .{ key, value });
             },
+            .@"struct" => |fields| {
+                var text: std.ArrayList(u8) = .empty;
+                defer text.deinit(allocator);
+                try text.appendSlice(allocator, "struct<");
+                for (fields, 0..) |f, i| {
+                    if (i > 0) try text.append(allocator, ',');
+                    const inner = try allocMysqlColumnType(allocator, f.type);
+                    defer allocator.free(inner);
+                    try text.print(allocator, "{s} {s}", .{ f.name, inner });
+                }
+                try text.append(allocator, '>');
+                return text.toOwnedSlice(allocator);
+            },
         },
     };
 }

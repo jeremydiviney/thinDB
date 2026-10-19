@@ -1690,6 +1690,26 @@ pub fn mapType(p: anytype) !types.Type {
     return types.mapOf(key, value);
 }
 
+/// StarRocks' `STRUCT<name type, ...>`, cursor past `STRUCT`. A field name
+/// may be a keyword; names are unique, ignoring case.
+pub fn structType(p: anytype) !types.Type {
+    const PE = @TypeOf(p.*).Err;
+    try p.expect(.lt);
+    var fields: std.ArrayList(types.StructField) = .empty;
+    while (true) {
+        const is_word = p.cur.tag == .identifier or std.mem.startsWith(u8, @tagName(p.cur.tag), "kw_");
+        if (!is_word or p.cur.text.len == 0 or std.mem.indexOfScalar(u8, p.cur.text, '`') != null) return PE.SqlExpectedIdent;
+        const name = p.cur.text;
+        if (types.structFieldIndex(fields.items, name) != null) return PE.SqlExpectedIdent;
+        try p.advance();
+        try fields.append(p.arena, .{ .name = name, .type = try parseColumnType(p) });
+        if (p.cur.tag != .comma) break;
+        try p.advance();
+    }
+    try closeTypeArguments(p);
+    return types.structOf(fields.items);
+}
+
 /// The `>` closing a type's `<...>`. Nested types end in `>>`, which lexes
 /// as one shift token: this takes its first `>` and leaves the second.
 fn closeTypeArguments(p: anytype) !void {
@@ -1804,6 +1824,7 @@ fn parseBaseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
     if (asciiEqlAny(name, &.{"array"})) return arrayType(p);
     if (asciiEqlAny(name, &.{"map"})) return mapType(p);
+    if (asciiEqlAny(name, &.{"struct"})) return structType(p);
     return PE.SqlExpectedKeyword;
 }
 
