@@ -148,9 +148,23 @@ exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
 
+<<<<<<< HEAD
+StarRocks' other calendar functions follow it too. `NEXT_DAY(d, weekday)`
+and `PREVIOUS_DAY(d, weekday)` give the first DATE after or before d's day
+that falls on the weekday, named by two letters, three, or in full, in any
+case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
+`DAYOFWEEK_ISO` counts Monday as 1. `TO_ISO8601` writes a DATETIME with a
+`T` and six fraction digits. `TO_DATETIME_NTZ(n[, scale])` reads seconds,
+milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
+`ADD_MONTHS` is `MONTHS_ADD`.
+
+`CAST(text AS DATE)`, `CAST(text AS DATETIME)` and `DATE(text)` read text
+the way StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
+=======
 `CAST(text AS DATE)`, `CAST(text AS DATETIME)`, `DATE(text)` and
 `TIMESTAMP(text)`, which is `CAST(text AS DATETIME)`, read text the way
 StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
+>>>>>>> origin/main
 `textToDatetime`):
 - Space around the text is ignored. Ten characters are read as
   `YYYY?MM?DD`, where each `?` is any one character but a digit
@@ -1855,6 +1869,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors. The MySQL wire reports `IncorrectArgumentsToSleep` as 1210 (`HY000`), as MySQL does; the others take the unrecognized-error code below.
 
 `AssertTrueFailed` means `ASSERT_TRUE(cond)` met a row where `cond` is false or NULL. StarRocks fails the query there too.
+
+`InvalidWeekdayName` means `NEXT_DAY` or `PREVIOUS_DAY` was given a weekday name that is none of the seven's two-letter, three-letter or full English names. StarRocks fails the query too.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 
