@@ -1893,6 +1893,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "rpad", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.rpadKernel },
     .{ .name = "repeat", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.repeatKernel },
     .{ .name = "space", .arg_types = &.{.int}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.spaceKernel },
+    .{ .name = "append_trailing_char_if_absent", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.appendTrailingCharIfAbsentKernel },
     .{ .name = "ascii", .arg_types = &.{.string}, .return_type = .int, .kernel = string.asciiKernel },
     .{ .name = "ord", .arg_types = &.{.string}, .return_type = .int, .kernel = string.ordKernel },
     .{ .name = "bit_length", .arg_types = &.{.string}, .return_type = .int, .kernel = string.bitLengthKernel },
@@ -2016,6 +2017,7 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "get_json_object", .name = "get_json_string" },
     .{ .alias = "timestamp", .name = "to_datetime" },
     .{ .alias = "add_months", .name = "months_add" },
+    .{ .alias = "dround", .name = "round" },
     // Trino's names for the Joda-Time pair.
     .{ .alias = "format_datetime", .name = "jodatime_format" },
     .{ .alias = "parse_datetime", .name = "str_to_jodatime" },

@@ -168,7 +168,8 @@ case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
 `DAYOFWEEK_ISO` counts Monday as 1. `TO_ISO8601` writes a DATETIME with a
 `T` and six fraction digits. `TO_DATETIME_NTZ(n[, scale])` reads seconds,
 milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
-`ADD_MONTHS` is `MONTHS_ADD`. `LAST_DAY(d, unit)` is the last day of d's
+`ADD_MONTHS` is `MONTHS_ADD`. `STR2DATE(text, format)` is
+`STR_TO_DATE` kept to its DATE, whatever the format holds. `LAST_DAY(d, unit)` is the last day of d's
 month, quarter or year, the unit named in any case. A NULL unit gives NULL,
 and another unit fails the query with `InvalidLastDayUnit`.
 
@@ -445,7 +446,7 @@ A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
 
-`LPAD(s, n)` and `RPAD(s, n)` pad with spaces, as in StarRocks, and a negative n gives NULL in every form, as in MySQL and StarRocks. `STRPOS(s, sub, n)` is Trino's: the character position of sub's nth occurrence, overlapping occurrences counted, from the end for a negative n. It is 0 when there are fewer occurrences or n is 0, and 1 for an empty sub. StarRocks counts bytes in both forms of STRPOS; thinDB counts characters, as INSTR and LOCATE do. `GREATEST(x)` and `LEAST(x)` of one argument are x, as in StarRocks and PostgreSQL.
+`LPAD(s, n)` and `RPAD(s, n)` pad with spaces, as in StarRocks, and a negative n gives NULL in every form, as in MySQL and StarRocks. `STRPOS(s, sub, n)` is Trino's: the character position of sub's nth occurrence, overlapping occurrences counted, from the end for a negative n. It is 0 when there are fewer occurrences or n is 0, and 1 for an empty sub. StarRocks counts bytes in both forms of STRPOS; thinDB counts characters, as INSTR and LOCATE do. `GREATEST(x)` and `LEAST(x)` of one argument are x, as in StarRocks and PostgreSQL. StarRocks' `APPEND_TRAILING_CHAR_IF_ABSENT(s, c)` appends c to s unless s is empty or already ends in c. As in StarRocks, c must be one byte, else the result is NULL.
 
 StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both read a URL or a relative reference such as `/doc?k=1` (RFC 3986 §4.1), so a URL without an authority has no host. Both are NULL for empty text, for text holding a space or control character, and where what stands before the first `:` is no scheme. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
 
@@ -733,7 +734,7 @@ The quotient's scale is StarRocks'. Only the dividend's scale decides it, and an
 
 **FLOAT is 32-bit.** `CAST(x AS FLOAT)` rounds to the nearest f32, as in StarRocks and MySQL, and a value past FLOAT's range is NULL. Arithmetic reads a FLOAT as the DOUBLE it holds, so `CAST(1.1 AS FLOAT) + 0` is 1.100000023841858. One exception follows StarRocks' planner, which rewrites `CAST(CAST(n AS FLOAT) AS DOUBLE)` to `CAST(n AS DOUBLE)`: an integer's FLOAT cast that converts again, to DOUBLE (arithmetic, `CAST(... AS DOUBLE)`, a CASE or IF branch beside a DOUBLE) or to text, converts the integer itself. So `amount / CAST(n AS FLOAT)` divides by `n` exactly. A DOUBLE, decimal or text source keeps its f32, as does a FLOAT column (a subquery's or CTE's output, an aggregate's input), and a DECIMAL target reads the f32. Comparisons and the functions StarRocks runs on FLOAT itself (`ABS`, `IFNULL` over FLOATs) don't follow StarRocks yet (#554).
 
-**`ROUND(x, n)` and `TRUNCATE(x, n)`** over DECIMAL(p,s) with a literal `n` below `s` return DECIMAL(p, max(n, 0)), as in MySQL and DuckDB. So `ROUND(1.005, 2)` is `1.01`, and a negative `n` rounds left of the point: `ROUND(15.5, -1)` is `20`. A place computed per row keeps DECIMAL(p,s), with the dropped digits zeroed.
+**`ROUND(x, n)` and `TRUNCATE(x, n)`** over DECIMAL(p,s) with a literal `n` below `s` return DECIMAL(p, max(n, 0)), as in MySQL and DuckDB. So `ROUND(1.005, 2)` is `1.01`, and a negative `n` rounds left of the point: `ROUND(15.5, -1)` is `20`. A place computed per row keeps DECIMAL(p,s), with the dropped digits zeroed. StarRocks' `DROUND` is `ROUND`.
 
 ---
 

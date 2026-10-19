@@ -1619,6 +1619,30 @@ pub fn repeatKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     }
 }
 
+/// StarRocks' APPEND_TRAILING_CHAR_IF_ABSENT(s, c): s with c appended
+/// unless s is empty or already ends in c. StarRocks gives NULL for a c
+/// that isn't one byte, a multi-byte character included.
+pub fn appendTrailingCharIfAbsentKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const cv = stringViewOf(args[1]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        const src = sv.rowBytes(i);
+        const trailing = cv.rowBytes(i);
+        const valid = allValid(args, i) and trailing.len == 1;
+        buf.clearRetainingCapacity();
+        if (valid) {
+            try buf.appendSlice(allocator, src);
+            if (src.len != 0 and src[src.len - 1] != trailing[0]) try buf.append(allocator, trailing[0]);
+        }
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
 pub fn spaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const ns = args[0].data.int;
     const ss = stringStoreOf(out);

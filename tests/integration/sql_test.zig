@@ -4238,6 +4238,53 @@ test "sql: null_or_empty is true for NULL and the empty string, and never NULL" 
     try helpers.expectText(allocator, db, "SELECT null_or_empty('x')", "0");
 }
 
+test "sql: append_trailing_char_if_absent appends one byte where it's absent" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE atc (id BIGINT PRIMARY KEY, s TEXT, c TEXT)");
+    try helpers.exec(allocator, db, "INSERT INTO atc VALUES (1, 'qwer', '@'), (2, 'qwer@', '@'), (3, '', '@'), (4, 'qwer', 'wer'), (5, 'ab', 'é'), (6, NULL, '@'), (7, 'ab', NULL), (8, 'ab', '')");
+    try helpers.expectTexts(allocator, db, "SELECT append_trailing_char_if_absent(s, c) FROM atc ORDER BY id", &.{ "qwer@", "qwer@", "", null, null, null, null, null });
+    try helpers.expectText(allocator, db, "SELECT APPEND_TRAILING_CHAR_IF_ABSENT('a b', ' ')", "a b ");
+    try helpers.expectText(allocator, db, "SELECT append_trailing_char_if_absent('/tmp', '/')", "/tmp/");
+}
+
+test "sql: str2date is str_to_date kept to the DATE" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE s2d (id BIGINT PRIMARY KEY, s TEXT, f TEXT)");
+    try helpers.exec(allocator, db, "INSERT INTO s2d VALUES (1, '2023-04-15', '%Y-%m-%d'), (2, '2023-04-15 10:11:12', '%Y-%m-%d %H:%i:%s'), (3, '15/04/2023', '%d/%m/%Y'), (4, '2023-04', '%Y-%m'), (5, 'invalid', '%Y-%m-%d'), (6, '2023-04-15abc', '%Y-%m-%d')");
+    try helpers.expectTexts(allocator, db, "SELECT CAST(str2date(s, f) AS VARCHAR(20)) FROM s2d ORDER BY id", &.{ "2023-04-15", "2023-04-15", "2023-04-15", null, null, "2023-04-15" });
+    try helpers.expectText(allocator, db, "SELECT CAST(STR2DATE('2023-04-15 10:11:12', '%Y-%m-%d %H:%i:%s') AS VARCHAR(20))", "2023-04-15");
+    try helpers.expectText(allocator, db, "SELECT typeof(str2date('20230415', '%Y%m%d'))", "date");
+    try helpers.expectTexts(allocator, db, "SELECT id FROM s2d WHERE str2date(s, f) = '2023-04-15' ORDER BY id", &.{ "1", "2", "3", "6" });
+}
+
+test "sql: dround is round" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE dr (id BIGINT PRIMARY KEY, x DOUBLE, d INT)");
+    try helpers.exec(allocator, db, "INSERT INTO dr VALUES (1, 2.5, 0), (2, 3.14159, 3), (3, NULL, 1), (4, 1.5, NULL)");
+    try helpers.expectTexts(allocator, db, "SELECT CAST(dround(x) AS VARCHAR(20)) FROM dr ORDER BY id", &.{ "3", "3", null, "2" });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(DROUND(x, d) AS VARCHAR(20)) FROM dr ORDER BY id", &.{ "3", "3.142", null, null });
+    try helpers.expectText(allocator, db, "SELECT CAST(dround(2.567, 2) AS VARCHAR(20))", "2.57");
+    try helpers.expectText(allocator, db, "SELECT dround(NULL) IS NULL", "1");
+}
+
 test "sql: date_diff reaches a month-end anniversary whatever the earlier value's time" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

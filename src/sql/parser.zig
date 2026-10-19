@@ -2958,6 +2958,12 @@ pub const Parser = struct {
             inner[0] = .{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_date"), .args = try self.arena.dupe(ir.Expr, args) } };
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "to_date"), .args = inner } };
         }
+        if (std.ascii.eqlIgnoreCase(name, "str2date") and args.len == 2) {
+            // StarRocks' STR2DATE is STR_TO_DATE kept to the DATE, whatever the format.
+            const inner = try self.arena.alloc(ir.Expr, 1);
+            inner[0] = .{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_date"), .args = try self.arena.dupe(ir.Expr, args) } };
+            return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "to_date"), .args = inner } };
+        }
         if (jsonAggregateFor(name)) |agg| return try self.jsonAggregateCall(name, agg, args, null);
         return ir.Expr{ .call = .{
             .fn_name = try self.arena.dupe(u8, name),
