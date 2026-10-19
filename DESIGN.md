@@ -142,6 +142,15 @@ exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
 
+StarRocks' other calendar functions follow it too. `NEXT_DAY(d, weekday)`
+and `PREVIOUS_DAY(d, weekday)` give the first DATE after or before d's day
+that falls on the weekday, named by two letters, three, or in full, in any
+case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
+`DAYOFWEEK_ISO` counts Monday as 1. `TO_ISO8601` writes a DATETIME with a
+`T` and six fraction digits. `TO_DATETIME_NTZ(n[, scale])` reads seconds,
+milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
+`ADD_MONTHS` is `MONTHS_ADD`.
+
 `CAST(text AS DATE)`, `CAST(text AS DATETIME)` and `DATE(text)` read text
 the way StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
 `textToDatetime`):

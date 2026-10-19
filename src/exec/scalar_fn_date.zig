@@ -393,6 +393,30 @@ pub fn fromUnixtimeKernel(allocator: Allocator, args: []const ColumnView, out: *
     }
 }
 
+/// TO_DATETIME_NTZ(n[, scale]), as StarRocks: the DATETIME `n` seconds
+/// (scale 0), milliseconds (3) or microseconds (6) from 1970-01-01 00:00:00,
+/// read with no time zone, so before 1970 too. Another scale, or a result
+/// outside years 0-9999, is NULL.
+pub fn toDatetimeNtzKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const counts = args[0].data.bigint;
+    for (0..row_count) |i| {
+        const scale: ?i32 = if (args.len < 2) 0 else if (args[1].isValid(i)) args[1].data.int[i] else null;
+        const micros_per_count: ?i64 = if (scale) |sc| switch (sc) {
+            0 => std.time.us_per_s,
+            3 => std.time.us_per_ms,
+            6 => 1,
+            else => null,
+        } else null;
+        const moment: ?i64 = if (micros_per_count != null and args[0].isValid(i))
+            datetimeInRange(std.math.mul(i64, counts[i], micros_per_count.?) catch std.math.maxInt(i64))
+        else
+            null;
+        try out.data.datetime.append(allocator, moment orelse 0);
+        try out.appendValidBit(allocator, base + i, moment != null);
+    }
+}
+
 /// FROM_UNIXTIME(n, format): that moment as DATE_FORMAT renders it.
 pub fn fromUnixtimeFormatKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();

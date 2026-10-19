@@ -141,6 +141,86 @@ pub fn weekdayKernel(comptime temporal: Temporal) Kernel {
     }.kernel;
 }
 
+/// DAYOFWEEK_ISO(d): 1 = Monday ... 7 = Sunday.
+pub fn dayofweekIsoKernel(comptime temporal: Temporal) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            for (0..row_count) |i| try out.data.int.append(allocator, weekdayOf(daysAt(args[0], i, temporal), false) + 1);
+        }
+    }.kernel;
+}
+
+/// The weekday, 0 = Monday, that NEXT_DAY and PREVIOUS_DAY read from a
+/// name: its first two letters, its first three, or all of it, in any case.
+fn weekdayNamed(name: []const u8) ?i32 {
+    for (0..7) |monday_based| {
+        const full = day_names[(monday_based + 1) % 7];
+        if (std.ascii.eqlIgnoreCase(name, full) or
+            std.ascii.eqlIgnoreCase(name, full[0..2]) or
+            std.ascii.eqlIgnoreCase(name, full[0..3])) return @intCast(monday_based);
+    }
+    return null;
+}
+
+/// NEXT_DAY(d, weekday) and PREVIOUS_DAY(d, weekday), as StarRocks: the
+/// first DATE after (or before) d's day that falls on the named weekday, so
+/// never d's day itself. Text is read as a DATETIME, so one whose time of
+/// day isn't valid is NULL. A result outside years 0-9999 is NULL, and a
+/// name that isn't a weekday fails the query.
+pub fn stepToWeekdayKernel(comptime source: enum { date, datetime, text }, comptime direction: enum { next, previous }) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const names = stringViewOf(args[1]);
+            for (0..row_count) |i| {
+                const target: ?i32 = if (args[1].isValid(i)) weekdayNamed(names.rowBytes(i)) orelse return error.InvalidWeekdayName else null;
+                const start: ?i32 = if (target == null or !args[0].isValid(i)) null else switch (source) {
+                    .date => args[0].data.date[i],
+                    .datetime => common.daysFromDatetime(args[0].data.datetime[i]),
+                    .text => if (common.textToDatetime(stringViewOf(args[0]).rowBytes(i))) |micros| common.daysFromDatetime(micros) else null,
+                };
+                const days: ?i32 = if (start) |from| blk: {
+                    const weekday = weekdayOf(from, false);
+                    const step: i64 = switch (direction) {
+                        .next => @mod(target.? - weekday - 1, 7) + 1,
+                        .previous => -(@mod(weekday - target.? - 1, 7) + 1),
+                    };
+                    const moved = @as(i64, from) + step;
+                    break :blk if (moved < common.FIRST_DATE_DAYS or moved > common.LAST_DATE_DAYS) null else @intCast(moved);
+                } else null;
+                try out.data.date.append(allocator, days orelse 0);
+                try out.appendValidBit(allocator, base + i, days != null);
+            }
+        }
+    }.kernel;
+}
+
+/// TO_ISO8601(x): a DATE as `YYYY-MM-DD`, a DATETIME as
+/// `YYYY-MM-DDThh:mm:ss.ffffff`, always with six fraction digits.
+pub fn toIso8601Kernel(comptime temporal: Temporal) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const ss = common.stringStoreOf(out);
+            var day_buf: [10]u8 = undefined;
+            var buf: [32]u8 = undefined;
+            for (0..row_count) |i| {
+                const ymd = common.daysToYmd(daysAt(args[0], i, temporal));
+                const day = std.fmt.bufPrint(&day_buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u32, @intCast(ymd.year)), ymd.month, ymd.day }) catch unreachable;
+                const text = switch (temporal) {
+                    .date => day,
+                    .datetime => blk: {
+                        const micros = args[0].data.datetime[i];
+                        const hms = common.microsToHms(micros);
+                        const fraction: u32 = @intCast(@mod(micros, std.time.us_per_s));
+                        break :blk std.fmt.bufPrint(&buf, "{s}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ day, hms.hour, hms.minute, hms.second, fraction }) catch unreachable;
+                    },
+                };
+                try ss.appendValue(allocator, text);
+            }
+        }
+    }.kernel;
+}
+
 pub fn microsecondKernel(comptime temporal: Temporal) Kernel {
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

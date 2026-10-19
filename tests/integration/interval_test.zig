@@ -687,6 +687,58 @@ test "INTERVAL n MILLISECOND, TIMESTAMPADD(MILLISECOND, ...) and DATE_TRUNC to a
     inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
 }
 
+test "NEXT_DAY, PREVIOUS_DAY, WEEK_ISO, DAYOFWEEK_ISO, TO_ISO8601, TO_DATETIME_NTZ and ADD_MONTHS, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "NEXT_DAY('2023-04-05', 'Mo')", "2023-04-10" },
+        .{ "NEXT_DAY('2023-04-05', 'Tue')", "2023-04-11" },
+        .{ "NEXT_DAY(DATE '2023-04-05', 'wednesday')", "2023-04-12" },
+        .{ "NEXT_DAY(DATETIME '2023-04-05 20:13:14', 'Thursday')", "2023-04-06" },
+        .{ "NEXT_DAY('2024-02-29', 'Thu')", "2024-03-07" },
+        .{ "NEXT_DAY('2023-02-29', 'Tuesday')", null },
+        .{ "NEXT_DAY('2023-04-05 20:13:61', 'Friday')", null },
+        .{ "NEXT_DAY('9999-12-31', 'Sun')", null },
+        .{ "NEXT_DAY('2023-04-05', NULL)", null },
+        .{ "PREVIOUS_DAY('2023-04-05', 'Mo')", "2023-04-03" },
+        .{ "PREVIOUS_DAY('2023-04-05', 'We')", "2023-03-29" },
+        .{ "PREVIOUS_DAY(DATE '0000-01-01', 'Sun')", null },
+        .{ "WEEK_ISO('2023-01-01')", "52" },
+        .{ "WEEK_ISO(DATETIME '2023-01-02 10:00:00')", "1" },
+        .{ "WEEK_ISO('')", null },
+        .{ "DAYOFWEEK_ISO('2023-01-01')", "7" },
+        .{ "DAYOFWEEK_ISO(DATE '2023-01-03')", "2" },
+        .{ "TO_ISO8601(DATE '2020-01-01')", "2020-01-01" },
+        .{ "TO_ISO8601(DATETIME '2020-01-01 00:00:00')", "2020-01-01T00:00:00.000000" },
+        .{ "TO_ISO8601(CAST('2020-01-01 13:04:05.1234' AS DATETIME(6)))", "2020-01-01T13:04:05.123400" },
+        .{ "TO_DATETIME_NTZ(1598306400)", "2020-08-24 22:00:00" },
+        .{ "TO_DATETIME_NTZ(1598306400123, 3)", "2020-08-24 22:00:00.123000" },
+        .{ "TO_DATETIME_NTZ(1598306400123456, 6)", "2020-08-24 22:00:00.123456" },
+        .{ "TO_DATETIME_NTZ(-1001, 3)", "1969-12-31 23:59:58.999000" },
+        .{ "TO_DATETIME_NTZ(1598306400, 10)", null },
+        .{ "TO_DATETIME_NTZ(9223372036854775807, 0)", null },
+        .{ "ADD_MONTHS('2024-01-31', 1)", "2024-02-29 00:00:00" },
+        .{ "ADD_MONTHS(DATE '2024-03-31', -1)", "2024-02-29 00:00:00" },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+    try std.testing.expectError(error.InvalidWeekdayName, helpers.exec(allocator, db, "SELECT NEXT_DAY('2023-04-05', 'Frid')"));
+
+    try helpers.exec(allocator, db, "CREATE TABLE nd (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, w VARCHAR(10))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO nd VALUES (1, '2023-04-01', '2023-04-01 20:13:14', 'Fr'), (2, '2023-04-07', '2023-04-07 20:13:14', 'Fri'),
+        \\  (3, '2024-02-29', NULL, 'Sunday'), (4, NULL, '2024-02-28 01:00:00', NULL)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("nd", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(NEXT_DAY(d, w) AS CHAR) FROM nd ORDER BY id", &.{ "2023-04-07", "2023-04-14", "2024-03-03", null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PREVIOUS_DAY(dt, 'Fr') AS CHAR) FROM nd ORDER BY id", &.{ "2023-03-31", "2023-03-31", null, "2024-02-23" });
+    }
+}
+
 test "TIMESTAMPDIFF(MONTH|YEAR) counts as StarRocks does: -1 for an end earlier in the same month or year (issue #418)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
