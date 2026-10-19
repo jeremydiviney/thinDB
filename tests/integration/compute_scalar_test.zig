@@ -939,6 +939,33 @@ test "ASSERT_TRUE is true where its condition holds and fails the query on a fal
     }
 }
 
+test "compute: TO_BINARY, FROM_BINARY, FORMAT_BYTES, BAR and POSITIVE follow StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE b (id BIGINT PRIMARY KEY, s VARCHAR(16), f VARCHAR(10), n BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO b VALUES (1, 'ab01', 'hex', 0), (2, 'qwE=', 'ENCODE64', 1023), (3, 'ab01', 'utf8', 1536), (4, '1', 'hex', 123456789),
+        \\  (5, '', 'encode64', -1), (6, NULL, 'hex', NULL), (7, 'abab', NULL, 1152921504606846976)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("b", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT HEX(TO_BINARY(s, f)) FROM b ORDER BY id", &.{ "AB01", "AB01", "61623031", "", null, null, null });
+        try helpers.expectTexts(allocator, db, "SELECT FROM_BINARY(TO_BINARY(s), 'encode64') FROM b ORDER BY id", &.{ "qwE=", "", "qwE=", "", "", null, "q6s=" });
+        try helpers.expectTexts(allocator, db, "SELECT FROM_BINARY(s, f) FROM b ORDER BY id", &.{ "61623031", "cXdFPQ==", "ab01", "31", "", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT FORMAT_BYTES(n) FROM b ORDER BY id", &.{ "0 B", "1023 B", "1.50 KB", "117.74 MB", null, null, "1.00 EB" });
+    }
+    try helpers.expectText(allocator, db, "SELECT FORMAT_BYTES(1048576 + 52429)", "1.05 MB");
+    try std.testing.expectError(error.InvalidBinaryFormat, helpers.exec(allocator, db, "SELECT TO_BINARY('ab', 'base32')"));
+    try helpers.expectTexts(allocator, db, "SELECT BAR(x, 0, 10, 20) FROM generate_series(0, 10, 5) AS t(x)", &.{ "", "▓▓▓▓▓▓▓▓▓▓", "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓" });
+    try helpers.expectText(allocator, db, "SELECT BAR(3, 0, 7, 4)", "▓");
+    try std.testing.expectError(error.InvalidBarArguments, helpers.exec(allocator, db, "SELECT BAR(11, 0, 10, 20)"));
+    try helpers.expectText(allocator, db, "SELECT CAST(POSITIVE(-2.50) AS CHAR)", "-2.50");
+    try helpers.expectTexts(allocator, db, "SELECT id FROM b WHERE POSITIVE(n) > 1000 ORDER BY id", &.{ "2", "3", "4", "7" });
+}
+
 test "URL functions read a URL's host and query parameters, and encode text as a form does" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

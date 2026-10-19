@@ -1853,6 +1853,12 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "soundex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.soundexKernel },
     .{ .name = "ngram_search", .arg_types = &.{ .string, .string, .int }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = string.NgramSearch(false).kernel },
     .{ .name = "ngram_search_case_insensitive", .arg_types = &.{ .string, .string, .int }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = string.NgramSearch(true).kernel },
+    .{ .name = "to_binary", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.toBinaryKernel },
+    .{ .name = "to_binary", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.toBinaryKernel },
+    .{ .name = "from_binary", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.fromBinaryKernel },
+    .{ .name = "from_binary", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.fromBinaryKernel },
+    .{ .name = "format_bytes", .arg_types = &.{.bigint}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.formatBytesKernel },
+    .{ .name = "bar", .arg_types = &.{ .double, .double, .double, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.barKernel },
     // --- URLs ---
     .{ .name = "url_encode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlEncodeKernel },
     .{ .name = "url_decode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlDecodeKernel },
