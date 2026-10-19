@@ -173,6 +173,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "countif", .func = .count_if },
     .{ .name = "bool_and", .func = .bool_and },
     .{ .name = "bool_or", .func = .bool_or },
+    .{ .name = "booland_agg", .func = .bool_and },
+    .{ .name = "boolor_agg", .func = .bool_or },
     .{ .name = "any_value", .func = .any_value },
     .{ .name = "first", .func = .first },
     .{ .name = "last", .func = .last },
@@ -190,6 +192,9 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "variance_pop", .func = .var_pop },
     .{ .name = "variance_samp", .func = .var_samp },
     .{ .name = "count_distinct", .func = .count_distinct },
+    // StarRocks' COUNT(DISTINCT x) and SUM(DISTINCT x), `impliesDistinct`.
+    .{ .name = "multi_distinct_count", .func = .count },
+    .{ .name = "multi_distinct_sum", .func = .sum },
     .{ .name = "approx_count_distinct", .func = .count_distinct },
     .{ .name = "ndv", .func = .count_distinct },
     .{ .name = "approx_count_distinct_hll_sketch", .func = .count_distinct },
@@ -213,7 +218,18 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "array_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-entry maps (`Parser.mapAggEntry`).
     .{ .name = "map_agg", .func = .group_concat },
+    // A GROUP_CONCAT of the arrays themselves, which `uniqueAggResult`
+    // reads distinct.
+    .{ .name = "array_unique_agg", .func = .group_concat },
 };
+
+fn impliesDistinct(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "multi_distinct_count") or std.ascii.eqlIgnoreCase(name, "multi_distinct_sum");
+}
+
+fn isUniqueAgg(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "array_unique_agg");
+}
 
 fn aggForName(name: []const u8, dialect: types.Dialect) ?ir.AggFunc {
     for (AggNames) |entry| {
@@ -2498,9 +2514,9 @@ pub const Parser = struct {
                 // (`MAP_AGG(k, v)[1]`, `SUM(a) / COUNT(*)`) hoists to a hidden
                 // aggregate output exactly like the nested form, then keeps
                 // parsing the expression.
-                if (self.cur.tag == .lbracket or try self.binaryOpAhead()) {
+                if (self.cur.tag == .lbracket or try self.binaryOpAhead() or isUniqueAgg(first)) {
                     const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct, filter);
-                    const expr = try self.continueBinaryFrom(try self.parsePostfix(ir.Expr{ .col_ref = agg_name }));
+                    const expr = try self.continueBinaryFrom(try self.parsePostfix(try self.uniqueAggResult(first, agg_name)));
                     return try self.namedExprItem(item_start, expr);
                 }
                 var parsed = try self.parsedAggFromArgs(first, func, args, saw_distinct);
@@ -3205,10 +3221,13 @@ pub const Parser = struct {
             if (distinct_out == null) return ParseError.SqlInvalidProjection;
             distinct = true;
         }
-        if (distinct_out) |p| p.* = distinct;
+        if (distinct_out) |p| p.* = distinct or impliesDistinct(name);
         var args: std.ArrayList(ir.Expr) = .empty;
         if (self.cur.tag == .star) {
             try self.advance();
+            try args.append(self.arena, ir.Expr{ .col_ref = "*" });
+        } else if (self.cur.tag == .rparen and !distinct and std.ascii.eqlIgnoreCase(name, "count")) {
+            // COUNT() is COUNT(*), as in StarRocks and DuckDB.
             try args.append(self.arena, ir.Expr{ .col_ref = "*" });
         } else if (self.cur.tag != .rparen) {
             const reaches_every_row = self.case_scope.reaches_every_row;
@@ -3739,7 +3758,7 @@ pub const Parser = struct {
         };
         const value = if (std.ascii.eqlIgnoreCase(func_name, "array_agg"))
             ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = try self.arena.dupe(ir.Expr, args[0..1]) } }
-        else if (std.ascii.eqlIgnoreCase(func_name, "map_agg"))
+        else if (std.ascii.eqlIgnoreCase(func_name, "map_agg") or isUniqueAgg(func_name))
             args[0]
         else
             try scalar_fn.toString(self.arena, args[0]);
@@ -3750,6 +3769,14 @@ pub const Parser = struct {
             .arg2_expr = if (args.len == 3) args[2] else null,
             .params = .{ .concat = .{ .separator = separator, .distinct = distinct } },
         } };
+    }
+
+    /// A hoisted aggregate's value: ARRAY_UNIQUE_AGG's concatenated arrays
+    /// read distinct, any other aggregate's output as it is.
+    fn uniqueAggResult(self: *Parser, func_name: []const u8, agg_name: []const u8) ParseError!ir.Expr {
+        const output = ir.Expr{ .col_ref = agg_name };
+        if (!isUniqueAgg(func_name)) return output;
+        return try self.makeScalarCallExpr("array_distinct", try self.arena.dupe(ir.Expr, &.{output}));
     }
 
     pub fn aggregateExprRefsEnabled(self: *const Parser) bool {
@@ -4329,7 +4356,7 @@ pub const Parser = struct {
                     if (ignore_nulls) return ParseError.SqlInvalidProjection;
                     if (self.aggregateFuncForName(name)) |func| {
                         const agg_name = try self.materializeAggregateExpr(name, func, nested_args, saw_distinct, filter);
-                        return ir.Expr{ .col_ref = agg_name };
+                        return try self.uniqueAggResult(name, agg_name);
                     }
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     if (saw_distinct) return ParseError.SqlInvalidProjection;

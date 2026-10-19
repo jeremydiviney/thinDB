@@ -97,6 +97,7 @@ Arrays follow StarRocks:
 - Text casts to an array from StarRocks' `[1, "a", null]` or PostgreSQL's `{1,a,NULL}`. An element that doesn't read as the element type is NULL. Text that isn't an array is NULL in a CAST and fails an INSERT.
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
 - `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
+- `ARRAY_UNIQUE_AGG(a)` is the distinct elements of a group's arrays, `array_distinct` of their concatenation: a NULL array adds nothing, a NULL element is kept once, and a group of no elements is NULL.
 - `ARRAY_GENERATE(start, end[, step])` counts from start to end, by -1 when end is below start. `ARRAY_GENERATE(n)` starts at 1, as in StarRocks, so an n below 1 counts down.
 - `cosine_similarity(a, b)`, `cosine_similarity_norm(a, b)` (the inner product, for vectors already of length 1) and `l2_distance(a, b)` (the squared distance) take two numeric arrays of one length, else `ArrayLengthMismatch`. Over FLOAT vectors, or a FLOAT vector and an integer one, they compute in single precision and return a FLOAT, as StarRocks and DuckDB do; over any other they compute in double precision and return a DOUBLE, where StarRocks still returns a FLOAT. A NULL element gives NULL, as does a cosine with a zero vector. StarRocks' `approx_cosine_similarity` and `approx_l2_distance`, which its vector indexes answer approximately, are their aliases: thinDB has no vector index, so it computes them exactly, as StarRocks does for a table without one.
 
@@ -646,8 +647,11 @@ give NULL. Each group keeps its values, as `PERCENTILE_CONT` does.
 `COUNT_IF(x)`, `BOOL_AND(x)` and `BOOL_OR(x)` read a non-boolean x as its
 truth, `CAST(x AS BOOLEAN)`, as WHERE reads a condition. So `COUNT_IF(n)`
 counts the rows where n is non-zero, and text counts where it reads as true
-(`aggregate.readsInputTruth`). A bare NULL is a numeric NULL to an aggregate
-that takes only numbers, so `SUM(NULL)` and `COVAR_SAMP(NULL, NULL)` are
+(`aggregate.readsInputTruth`). StarRocks' `BOOLOR_AGG` and `BOOLAND_AGG` are
+`BOOL_OR` and `BOOL_AND`, its `MULTI_DISTINCT_COUNT(x)` and
+`MULTI_DISTINCT_SUM(x)` are `COUNT(DISTINCT x)` and `SUM(DISTINCT x)`, and
+`COUNT()` is `COUNT(*)`, as in StarRocks and DuckDB. A bare NULL is a numeric
+NULL to an aggregate that takes only numbers, so `SUM(NULL)` and `COVAR_SAMP(NULL, NULL)` are
 NULL, as in MySQL and StarRocks. A UNION arm column that is a bare NULL on
 every row takes the other arm's type, through the nested unions a VALUES list
 builds, so `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
