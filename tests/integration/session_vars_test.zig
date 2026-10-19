@@ -355,6 +355,25 @@ test "session var: a variable holds an array, map or struct" {
     try std.testing.expectError(error.UnsupportedOp, runSql(allocator, db, "SET @arr = [9]; SELECT id FROM uv WHERE a = @arr"));
 }
 
+test "session var: a scalar subquery's array, map, struct or JSON keeps its type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SET @names = (SELECT array_agg(name ORDER BY id) FROM t); SELECT @names", "[\"alpha\",\"beta\",\"gamma\",\"delta\"]");
+    try helpers.expectText(allocator, db, "SET @names = (SELECT array_agg(name ORDER BY id) FROM t); SELECT @names[2]", "beta");
+    try helpers.expectText(allocator, db, "SET @names = (SELECT array_agg(name) FROM t); SELECT typeof(@names)", "array<varchar>");
+    try helpers.expectText(allocator, db, "SELECT array_length((SELECT array_agg(qty) FROM t))", "4");
+    try helpers.expectTexts(allocator, db, "SELECT id FROM t WHERE array_contains((SELECT array_agg(id) FROM t WHERE qty > 20), id) ORDER BY id", &.{ "3", "4" });
+    try helpers.expectText(allocator, db, "SELECT (SELECT map{1: 'x'})[1]", "x");
+    try helpers.expectText(allocator, db, "SET @s = (SELECT named_struct('a', 1, 'b', 'q')); SELECT @s.b", "q");
+    try helpers.expectText(allocator, db, "SET @j = (SELECT parse_json('{\"a\": [1, 2], \"b\": \"x\"}')); SELECT typeof(@j)", "json");
+    try helpers.expectText(allocator, db, "SET @j = (SELECT parse_json('{\"a\": [1, 2], \"b\": \"x\"}')); SELECT @j ->> '$.b'", "x");
+    try helpers.expectText(allocator, db, "SELECT json_length((SELECT parse_json('[1, 2, 3]')))", "3");
+}
+
 fn runSet(allocator: std.mem.Allocator, db: *thindb.Database, session: thindb.Session, sql: []const u8) !thindb.Session {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

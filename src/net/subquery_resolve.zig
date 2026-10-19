@@ -42,6 +42,7 @@ const time_fn = @import("../exec/scalar_fn_time.zig");
 const join_mod = @import("../exec/join.zig");
 const compute_mod = @import("../exec/compute.zig");
 const scalar_decimal = @import("../exec/scalar_fn_decimal.zig");
+const json_binary = @import("../exec/json_binary.zig");
 const SessionVar = @import("../api/api.zig").SessionVar;
 
 const storage = @import("../storage/storage.zig");
@@ -620,10 +621,18 @@ fn comparableValue(arena: Allocator, tv: TypedValue) !Value {
 }
 
 /// A user variable's value as an expression: an array, map or struct
-/// re-enters from its encoded bytes (`scalar_fn.NESTED_VALUE_PREFIX`).
+/// re-enters from its encoded bytes (`scalar_fn.NESTED_VALUE_PREFIX`), a
+/// JSON value from its text.
 fn sessionVarExpr(arena: Allocator, v: SessionVar) !ir.Expr {
-    if (!v.type.isNested()) return .{ .lit = v.value };
+    if (v.type != .json and !v.type.isNested()) return .{ .lit = v.value };
     const args = try arena.alloc(ir.Expr, 1);
+    if (v.type == .json) {
+        const bytes = v.value.text;
+        var text: std.ArrayList(u8) = .empty;
+        if (json_binary.looksBinary(bytes)) try json_binary.toText(arena, &text, bytes) else try text.appendSlice(arena, bytes);
+        args[0] = .{ .lit = .{ .text = text.items } };
+        return .{ .call = .{ .fn_name = try arena.dupe(u8, "to_json"), .args = args } };
+    }
     args[0] = .{ .lit = v.value };
     return .{ .call = .{ .fn_name = try exec.scalar_fn.nestedValueFnName(arena, v.type), .args = args } };
 }
@@ -664,8 +673,10 @@ pub fn evaluateSetValue(ctx: *CompileCtx, value: *ir.Expr) !?SessionVar {
 }
 
 /// The value as an expression: a decimal re-enters through a cast of its
-/// exact digits to its own type, since a bare decimal literal has no scale.
+/// exact digits to its own type, since a bare decimal literal has no scale,
+/// and a JSON value, an array, a map or a struct as a user variable's does.
 fn valueExpr(arena: Allocator, tv: TypedValue) !ir.Expr {
+    if (tv.ty == .json or tv.ty.isNested()) return sessionVarExpr(arena, .{ .value = tv.val, .type = tv.ty });
     if (!tv.ty.isDecimal()) return .{ .lit = tv.val };
     const args = try arena.alloc(ir.Expr, 1);
     args[0] = .{ .lit = try comparableValue(arena, tv) };
