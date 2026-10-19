@@ -2503,8 +2503,32 @@ fn buildLambdaPlan(
         } else if (ap.* != .null_lit) return Error.ComputeNoSuchOverload;
     }
 
+    var body_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    try collectColumnRefs(aa, &body_refs, lambda.body.*);
     var refs: std.ArrayListUnmanaged([]const u8) = .empty;
-    try collectColumnRefs(aa, &refs, c.args[0]);
+    // A field path over a parameter (`x.a`) derives as a column of its own
+    // ahead of the body, which reads it by that column's name.
+    var derived: std.ArrayListUnmanaged(Derived) = .empty;
+    var renames: std.ArrayListUnmanaged(predicate_mod.ColRename) = .empty;
+    for (body_refs.items) |name| {
+        if (!lambda.hasParam(name)) {
+            try refs.append(aa, name);
+            continue;
+        }
+        var segments = std.mem.splitScalar(u8, name, '.');
+        var field_expr: Expr = .{ .col_ref = segments.first() };
+        if (segments.peek() == null) continue;
+        while (segments.next()) |field| {
+            const args = try aa.alloc(Expr, 2);
+            args[0] = field_expr;
+            args[1] = .{ .lit = .{ .text = field } };
+            field_expr = .{ .call = .{ .fn_name = try std.mem.concat(aa, u8, &.{ scalar_fn.STRUCT_FIELD_PREFIX, field }), .args = args } };
+        }
+        const hidden = try std.fmt.allocPrint(aa, "__lambda_field_{d}", .{derived.items.len});
+        try derived.append(aa, .{ .name = hidden, .expr = field_expr });
+        try renames.append(aa, .{ .from = name, .to = hidden });
+    }
+    try derived.append(aa, .{ .name = LAMBDA_RESULT, .expr = try expr_mod.deepCloneRenamed(aa, lambda.body.*, renames.items) });
     const schema = try aa.alloc(Column, arrays.len + refs.items.len);
     for (lambda.params, arg_types, schema[0..arrays.len]) |param, at, *col| {
         col.* = .{ .name = param, .type = at.arrayElement() orelse some_element orelse .boolean, .nullable = true };
@@ -2517,14 +2541,13 @@ fn buildLambdaPlan(
 
     const lp = try aa.create(LambdaPlan);
     lp.* = .{ .captured = captured, .stub = .{ .schema = schema }, .body = undefined, .result_slot = undefined, .result_type = undefined };
-    const derived = [_]Derived{.{ .name = LAMBDA_RESULT, .expr = lambda.body.* }};
-    lp.body = try Compute.createWithRegistry(runtime_allocator, makeQuery(runtime_allocator, &lp.stub), &derived, udf_registry);
+    lp.body = try Compute.createWithRegistry(runtime_allocator, makeQuery(runtime_allocator, &lp.stub), derived.items, udf_registry);
     errdefer {
         var body = lp.body;
         body.deinit();
     }
     const body = exec.queryAs(Compute, lp.body).?;
-    lp.result_slot = body.derived_output_indices[0];
+    lp.result_slot = body.derived_output_indices[body.derived_output_indices.len - 1];
     lp.result_type = body.output_schema[lp.result_slot].type;
 
     const output_type = try types.arrayOf(lp.result_type);

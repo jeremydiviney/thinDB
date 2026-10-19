@@ -64,6 +64,7 @@ const predicate_pushdown = @import("predicate_pushdown.zig");
 const const_fold = @import("const_fold.zig");
 const prune_columns = @import("prune_columns.zig");
 const unbound_refs = @import("unbound_refs.zig");
+const struct_paths = @import("struct_paths.zig");
 const partition_keys = @import("partition_keys.zig");
 const pgcat = @import("pg_catalog.zig");
 
@@ -1514,6 +1515,7 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     const t_push_compute_unions = exec.prof.nowTicks();
     try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_compute_unions", @intCast(exec.prof.nowTicks() - t_push_compute_unions));
+    try struct_paths.derivePaths(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     // The two removal rewrites below delete SQL before any operator binds it,
     // so a reference that can never resolve would vanish with its unused item
     // and the statement would run. Keep the tree whole then: the binder
@@ -1578,6 +1580,9 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
 pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
     if (ctx.cancel_flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     if (engine_v2.isSelectQuery(op)) {
+        // Subquery inners compile before the statement's own passes reach
+        // them.
+        try struct_paths.derivePaths(ctx.nodeArena(), ctx.catalog, ctx.session.*, @constCast(op));
         const v2_input = engine_v2.CompileInput{
             .allocator = try ctx.executionAllocator(),
             .catalog = ctx.catalog,

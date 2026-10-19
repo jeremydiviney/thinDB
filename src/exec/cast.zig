@@ -377,22 +377,44 @@ pub fn commonType(a: Type, b: Type) ?Type {
     return null;
 }
 
-/// Two arrays meet at the array of their elements' common type, and two
-/// maps at the map of their keys' and their values' common types; a nested
-/// type meets nothing else. A failure to intern the result type reads as no
-/// common type, which the caller reports as a type mismatch.
+/// Two arrays meet at the array of their elements' common type, two maps at
+/// the map of their keys' and their values' common types, and two structs
+/// of as many fields at the struct of their fields' common types, named as
+/// the first names them; a nested type meets nothing else. A failure to
+/// intern the result type reads as no common type, which the caller reports
+/// as a type mismatch.
 fn commonNested(a: Type, b: Type) ?Type {
     if (std.meta.eql(a, b)) return a;
+    if (a.structFields()) |af| {
+        const bf = b.structFields() orelse return null;
+        if (af.len != bf.len) return null;
+        var fallback = std.heap.stackFallback(16 * @sizeOf(types.StructField), std.heap.smp_allocator);
+        const allocator = fallback.get();
+        const fields = allocator.alloc(types.StructField, af.len) catch return null;
+        defer allocator.free(fields);
+        for (fields, af, bf) |*f, x, y| f.* = .{ .name = x.name, .type = commonMember(x.type, y.type) orelse return null };
+        return types.structOf(fields) catch null;
+    }
     if (a.mapTypes()) |am| {
         const bm = b.mapTypes() orelse return null;
-        const key = commonType(am.key, bm.key) orelse return null;
-        const value = commonType(am.value, bm.value) orelse return null;
+        const key = commonMember(am.key, bm.key) orelse return null;
+        const value = commonMember(am.value, bm.value) orelse return null;
         return types.mapOf(key, value) catch null;
     }
     const a_element = a.arrayElement() orelse return null;
     const b_element = b.arrayElement() orelse return null;
-    const element = commonType(a_element, b_element) orelse return null;
+    const element = commonMember(a_element, b_element) orelse return null;
     return types.arrayOf(element) catch null;
+}
+
+/// Two members of nested values (fields, elements, keys or values) meet as
+/// `commonType` has them, except that text beside a nested member reads as
+/// that type, as CAST reads it: a NULL literal, whose placeholder type is
+/// text, sits in `row(1, NULL)` beside `row(1, [2])`.
+fn commonMember(a: Type, b: Type) ?Type {
+    if (a.isNested() and b.isString() and b != .json) return a;
+    if (b.isNested() and a.isString() and a != .json) return b;
+    return commonType(a, b);
 }
 
 /// A number and a DATE or DATETIME meet as in StarRocks, which reads the
@@ -448,8 +470,26 @@ pub fn commonTypeOf(ts: []const Type) ?Type {
 /// mantissa means a different number at another scale.
 pub fn sameRepresentation(a: Type, b: Type) bool {
     if (a.isString() and b.isString()) return true;
+    if (a.isNested() and b.isNested()) return sameNestedRepresentation(a, b);
     if (a.isDecimal() or b.isDecimal() or a.isNested() or b.isNested()) return std.meta.eql(a, b);
     return @as(TypeTag, a) == @as(TypeTag, b);
+}
+
+/// Nested types that differ at most in their structs' field names: a
+/// struct's bytes carry no names.
+fn sameNestedRepresentation(a: Type, b: Type) bool {
+    if (std.meta.eql(a, b)) return true;
+    if (!a.isNested() or !b.isNested()) return false;
+    if (a.arrayElement()) |ae| return sameNestedRepresentation(ae, b.arrayElement() orelse return false);
+    if (a.mapTypes()) |am| {
+        const bm = b.mapTypes() orelse return false;
+        return sameNestedRepresentation(am.key, bm.key) and sameNestedRepresentation(am.value, bm.value);
+    }
+    const af = a.structFields().?;
+    const bf = b.structFields() orelse return false;
+    if (af.len != bf.len) return false;
+    for (af, bf) |x, y| if (!sameNestedRepresentation(x.type, y.type)) return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

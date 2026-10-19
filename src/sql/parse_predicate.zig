@@ -865,13 +865,13 @@ fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, rhs
     };
 }
 
-/// `[...]`, `ARRAY<T>[...]`, `map{...}` or a CAST to a nested type: an
-/// operand whose comparison `nestedComparison` makes.
+/// `[...]`, `ARRAY<T>[...]`, `map{...}`, `row(...)` or a CAST to a nested
+/// type: an operand whose comparison `nestedComparison` makes.
 fn isNestedExpr(e: ir.Expr) bool {
     if (e != .call) return false;
     const name = e.call.fn_name;
     return std.ascii.eqlIgnoreCase(name, scalar_fn.ARRAY_VALUE_FN) or std.ascii.eqlIgnoreCase(name, scalar_fn.MAP_FROM_ARRAYS_FN) or
-        std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX);
+        std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX) or std.mem.startsWith(u8, name, scalar_fn.STRUCT_VALUE_PREFIX);
 }
 
 /// `lhs op rhs` over nested values, which compare as their common type:

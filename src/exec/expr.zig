@@ -66,8 +66,10 @@ pub const Expr = union(enum) {
         params: []const []const u8,
         body: *const Expr,
 
+        /// Whether `name` is a parameter, or a field path over one (`x.a`).
         pub fn hasParam(self: Lambda, name: []const u8) bool {
-            for (self.params) |p| if (types.columnNameEql(p, name)) return true;
+            const root = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+            for (self.params) |p| if (types.columnNameEql(p, root)) return true;
             return false;
         }
     };

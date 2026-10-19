@@ -76,6 +76,32 @@ test "LAMBDA: bodies read outer columns, nest, and shadow" {
     try expectTexts(allocator, db, "SELECT k FROM t WHERE k + 1 > 3 AND any_match(arr_0, k -> k + 1 > 2) ORDER BY k", &.{ "3", "4" });
 }
 
+test "LAMBDA: bodies read struct fields" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE st (id INT PRIMARY KEY, s STRUCT<a INT, b STRING>, arr ARRAY<INT>, ss ARRAY<STRUCT<a INT, b STRING>>)");
+    try exec(allocator, db,
+        \\INSERT INTO st VALUES
+        \\ (1, row(10, 'x'), [1, 2], [row(1, 'p'), row(2, 'q')]),
+        \\ (2, NULL, [3], [row(NULL, 'r')]),
+        \\ (3, row(30, 'z'), [], NULL)
+    );
+
+    try expectTexts(allocator, db, "SELECT array_map(x -> x + s.a, arr) FROM st ORDER BY id", &.{ "[11,12]", "[null]", "[]" });
+    try expectTexts(allocator, db, "SELECT array_map(x -> x.a, ss) FROM st ORDER BY id", &.{ "[1,2]", "[null]", null });
+    try expectTexts(allocator, db, "SELECT array_map(x -> concat(x.b, s.b), ss) FROM st ORDER BY id", &.{ "[\"px\",\"qx\"]", "[null]", null });
+    try expectTexts(allocator, db, "SELECT array_filter(ss, x -> x.a > 1) FROM st ORDER BY id", &.{ "[{\"a\":2,\"b\":\"q\"}]", "[]", null });
+    try expectTexts(allocator, db, "SELECT array_map(x -> row(x, s.a), arr) FROM st ORDER BY id", &.{ "[{\"col1\":1,\"col2\":10},{\"col1\":2,\"col2\":10}]", "[{\"col1\":3,\"col2\":null}]", "[]" });
+    // The parameter `s` hides the column, fields and all.
+    try expectTexts(allocator, db, "SELECT array_map(s -> s.a + 100, ss) FROM st ORDER BY id", &.{ "[101,102]", "[null]", null });
+    try expectText(allocator, db, "SELECT array_map(x -> x.n.a * 2, [named_struct('n', named_struct('a', 1)), named_struct('n', named_struct('a', 5))])", "[2,10]");
+    try expectText(allocator, db, "SELECT array_map((x, y) -> x.col1 + y.col2, [row(1, 2)], [row(10, 20)])", "[21]");
+}
+
 test "LAMBDA: predicates in bodies" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

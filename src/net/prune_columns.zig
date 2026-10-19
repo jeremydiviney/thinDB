@@ -109,14 +109,14 @@ const Ctx = struct {
     null_reason: []const u8 = "root",
 
     fn matNeed(self: *Ctx, mat: *const ir.Op) ?*MatNeed {
-        const gop = self.mats.getOrPut(self.arena, mat.materialize.upstream) catch return null;
-        if (!gop.found_existing) {
-            const mn = self.arena.create(MatNeed) catch return null;
-            mn.* = .{};
-            gop.value_ptr.* = mn;
-            self.changed = true;
-        }
-        return gop.value_ptr.*;
+        if (self.mats.get(mat.materialize.upstream)) |mn| return mn;
+        // Allocated before its entry exists, so a failure leaves no entry
+        // without a need behind it.
+        const mn = self.arena.create(MatNeed) catch return null;
+        mn.* = .{};
+        self.mats.put(self.arena, mat.materialize.upstream, mn) catch return null;
+        self.changed = true;
+        return mn;
     }
 };
 
