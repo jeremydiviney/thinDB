@@ -26,6 +26,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const json_binary = @import("json_binary.zig");
+const stats = @import("../util/stats.zig");
 const nested = @import("nested.zig");
 const Predicate = predicate.Predicate;
 
@@ -155,6 +156,10 @@ pub const AggFunc = enum {
     /// among them, counted exactly (`appendTopK`). Output
     /// ARRAY<STRUCT<item, count BIGINT>> (`topKType`).
     approx_top_k,
+    /// MANN_WHITNEY_U_TEST: the Mann–Whitney U test of the `col` values
+    /// whose `arg2_col` index is false against those whose index is true,
+    /// under `params.mann_whitney` (`mannWhitneyText`). Output JSON.
+    mann_whitney_u_test,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -165,7 +170,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .udf => return false,
     };
     return true;
 }
@@ -179,6 +184,16 @@ pub const AggParams = union(enum) {
     concat: ConcatParams,
     /// APPROX_TOP_K's k, at least 1.
     top_k: u32,
+    mann_whitney: MannWhitneyParams,
+};
+
+/// MANN_WHITNEY_U_TEST's third and fourth arguments.
+pub const MannWhitneyParams = struct {
+    alternative: Alternative = .two_sided,
+    /// Whether U moves half a unit toward its mean before it is scored.
+    continuity_correction: bool = true,
+
+    pub const Alternative = enum { two_sided, less, greater };
 };
 
 pub const ConcatParams = struct {
@@ -353,6 +368,8 @@ pub const AccState = union(enum) {
     concat: ?*ConcatAcc,
     /// APPROX_TOP_K's counts, boxed like `concat`.
     top_k: ?*TopKAcc,
+    /// MANN_WHITNEY_U_TEST's samples, boxed like `concat`.
+    mann_whitney: ?*MannWhitneyAcc,
 };
 
 fn boolUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
@@ -808,6 +825,11 @@ const CoMomentAcc = struct {
 const TopKAcc = struct {
     counts: std.StringHashMapUnmanaged(u64) = .empty,
     nulls: u64 = 0,
+};
+
+/// The values whose index is false, then those whose index is true.
+const MannWhitneyAcc = struct {
+    samples: [2]std.ArrayListUnmanaged(f64) = .{ .empty, .empty },
 };
 
 const ConcatAcc = struct {
@@ -3326,6 +3348,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .percentile, .percentile_disc, .percentile_approx => percentileState(in),
         .group_concat => .{ .concat = null },
         .approx_top_k => .{ .top_k = null },
+        .mann_whitney_u_test => .{ .mann_whitney = null },
         .udf => unreachable,
     };
 }
@@ -3474,6 +3497,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         // Arrays concatenate into one array (ARRAY_AGG).
         .group_concat => if (in != null and in.?.isNested()) in.? else .string,
         .approx_top_k => topKType(in orelse return Error.AggregateColumnRequired),
+        .mann_whitney_u_test => .json,
         .udf => Error.AggregateUnsupportedType,
     };
 }
@@ -3582,6 +3606,13 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
                 .top_k => |k| if (k == 0) return Error.AggregateInvalidParam,
                 else => return Error.AggregateInvalidParam,
             }
+        },
+        .mann_whitney_u_test => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) return Error.AggregateUnsupportedType;
+            const index = arg2_in orelse return Error.AggregateColumnRequired;
+            if (!(index.isInteger() or index == .boolean)) return Error.AggregateUnsupportedType;
+            if (params != .mann_whitney) return Error.AggregateInvalidParam;
         },
         .udf => return Error.AggregateUnsupportedType,
     }
@@ -4011,6 +4042,12 @@ pub fn updateState(
             try groupConcatUpdate(aa, s, batch.values[col_idx.?], order_key, row_start, row_end, params);
         },
         .approx_top_k => try topKUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
+        .mann_whitney_u_test => {
+            const index_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
+            const index_idx = types.findColumn(batch.schema, index_name) orelse return Error.ColumnNotFound;
+            const value_idx = col_idx orelse return Error.AggregateColumnRequired;
+            try mannWhitneyUpdate(aa, s, batch.values[value_idx], avgScaleDiv(batch.schema[value_idx].type), batch.values[index_idx], row_start, row_end);
+        },
         .udf => return Error.AggregateUnsupportedType,
     }
 }
@@ -4352,6 +4389,80 @@ fn topKUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row
         }
         gop.value_ptr.* += 1;
     }
+}
+
+/// A NaN has no rank, so it is skipped like a NULL.
+fn mannWhitneyUpdate(aa: Allocator, s: *AccState, values: ColumnView, scale_div: f64, index: ColumnView, row_start: u32, row_end: u32) !void {
+    const acc = s.mann_whitney orelse blk: {
+        const box = try aa.create(MannWhitneyAcc);
+        box.* = .{};
+        s.mann_whitney = box;
+        break :blk box;
+    };
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!values.isValid(r) or !index.isValid(r)) continue;
+        const value = numericAsF64(values, r) / scale_div;
+        if (std.math.isNan(value)) continue;
+        try acc.samples[@intFromBool(numericAsF64(index, r) != 0)].append(aa, value);
+    }
+}
+
+/// The test's answer as StarRocks writes it: `[U, p]`, U the false-index
+/// sample's statistic (the pairs of a false-index and a true-index value
+/// where the first is greater, a tie counting half), and p from the normal
+/// approximation with ties corrected for; or an error object where the
+/// test has no answer, every value being the same or a sample empty.
+fn mannWhitneyText(allocator: Allocator, acc: *const MannWhitneyAcc, params: MannWhitneyParams, out: *std.ArrayList(u8)) !void {
+    const Ranked = struct { value: f64, in_false_sample: bool };
+    const false_sample = acc.samples[0].items;
+    const true_sample = acc.samples[1].items;
+    const all = try allocator.alloc(Ranked, false_sample.len + true_sample.len);
+    defer allocator.free(all);
+    for (false_sample, all[0..false_sample.len]) |v, *e| e.* = .{ .value = v, .in_false_sample = true };
+    for (true_sample, all[false_sample.len..]) |v, *e| e.* = .{ .value = v, .in_false_sample = false };
+    std.mem.sortUnstable(Ranked, all, {}, struct {
+        fn less(_: void, a: Ranked, b: Ranked) bool {
+            return a.value < b.value;
+        }
+    }.less);
+    if (all[0].value == all[all.len - 1].value) return out.appendSlice(allocator, "{\"Error\": \"All numbers in both samples are identical.\"}");
+    if (false_sample.len == 0 or true_sample.len == 0) return out.appendSlice(allocator, "{\"Error\": \"Both samples must have numbers.\"}");
+    var false_rank_sum: f64 = 0;
+    var tie_sum: f64 = 0;
+    var i: usize = 0;
+    while (i < all.len) {
+        var j = i + 1;
+        while (j < all.len and all[j].value == all[i].value) j += 1;
+        const rank = @as(f64, @floatFromInt(i + 1 + j)) / 2;
+        for (all[i..j]) |e| {
+            if (e.in_false_sample) false_rank_sum += rank;
+        }
+        const ties: f64 = @floatFromInt(j - i);
+        tie_sum += ties * ties * ties - ties;
+        i = j;
+    }
+    const n_false: f64 = @floatFromInt(false_sample.len);
+    const n_true: f64 = @floatFromInt(true_sample.len);
+    const n = n_false + n_true;
+    const u_false = false_rank_sum - n_false * (n_false + 1) / 2;
+    const u_true = n_false * n_true - u_false;
+    const mean = n_false * n_true / 2 + if (params.continuity_correction) @as(f64, 0.5) else 0;
+    const tie_correction = 1 - tie_sum / (n * n * n - n);
+    const sd = @sqrt(tie_correction * n_false * n_true * (n + 1) / 12);
+    // LESS holds that the false-index values run below the true-index
+    // ones, so a large U for the true-index sample is its evidence.
+    const u = switch (params.alternative) {
+        .two_sided => @max(u_false, u_true),
+        .less => u_true,
+        .greater => u_false,
+    };
+    const z = (u - mean) / sd;
+    const p = switch (params.alternative) {
+        .two_sided => 2 - 2 * stats.normalCdf(@abs(z)),
+        .less, .greater => 1 - stats.normalCdf(z),
+    };
+    try out.print(allocator, "[{d}, {d}]", .{ u_false, p });
 }
 
 /// The `k` most frequent values, most frequent first. Among equal counts
@@ -4767,6 +4878,20 @@ pub fn appendAccToColumn(
         .approx_top_k => {
             if (state.top_k) |acc| {
                 try appendTopK(allocator, col, acc, spec.params.top_k, in_type orelse return Error.AggregateColumnRequired);
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
+        },
+        .mann_whitney_u_test => {
+            const acc = state.mann_whitney;
+            if (acc != null and acc.?.samples[0].items.len + acc.?.samples[1].items.len > 0) {
+                var text: std.ArrayList(u8) = .empty;
+                defer text.deinit(allocator);
+                try mannWhitneyText(allocator, acc.?, spec.params.mann_whitney, &text);
+                const value = try json_binary.normalize(allocator, text.items);
+                defer if (value.owned) allocator.free(value.bytes);
+                try col.data.json.appendValue(allocator, value.bytes);
             } else {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
