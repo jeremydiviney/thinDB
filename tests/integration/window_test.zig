@@ -958,3 +958,64 @@ test "window: ORDER BY keys whose predicates compare computed operands" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 1, 2, 2, 1 }, rn.items);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 3, 1, 2, 1, 2 }, rn2.items);
 }
+
+test "window: VAR_*, STDDEV_*, COVAR_* and CORR, over every frame shape, as their aggregates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE st (k BIGINT PRIMARY KEY, g BIGINT, v DOUBLE, y INT, d DECIMAL(10,2))");
+    try helpers.exec(allocator, db, "INSERT INTO st VALUES (1, 1, 1.5, 2, 1.25), (2, 1, 2.5, 4, 2.50), (3, 1, NULL, 5, NULL), (4, 2, 10, 1, 10.00), (5, 2, 11, 3, 11.10), (6, 2, 14, 2, 14.75)");
+    const expectTexts = helpers.expectTexts;
+
+    // A whole partition gives its GROUP BY value.
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "0.5", "0.5", "0.5", "4.333", "4.333", "4.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v), 3) FROM st GROUP BY g ORDER BY g", &.{ "0.5", "4.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(VARIANCE(v) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "0.25", "0.25", "0.25", "2.889", "2.889", "2.889" });
+    try expectTexts(allocator, db, "SELECT ROUND(STDDEV(v) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "0.5", "0.5", "0.5", "1.7", "1.7", "1.7" });
+    try expectTexts(allocator, db, "SELECT ROUND(STDDEV_SAMP(v) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "0.707", "0.707", "0.707", "2.082", "2.082", "2.082" });
+    try expectTexts(allocator, db, "SELECT ROUND(COVAR_POP(v, y) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "0.5", "0.5", "0.5", "0.333", "0.333", "0.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(COVAR_SAMP(v, y) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "1", "1", "1", "0.5", "0.5", "0.5" });
+    try expectTexts(allocator, db, "SELECT ROUND(CORR(v, y) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "1", "1", "1", "0.24", "0.24", "0.24" });
+    // A DECIMAL reads at its scale.
+    try expectTexts(allocator, db, "SELECT VAR_SAMP(d) OVER (PARTITION BY g) FROM st ORDER BY k", &.{ "0.78125", "0.78125", "0.78125", "6.1825", "6.1825", "6.1825" });
+    try expectTexts(allocator, db, "SELECT ROUND(c, 6) FROM (SELECT k, CORR(d, y) OVER () AS c FROM st) x WHERE k = 1", &.{"-0.367677"});
+
+    // A running frame, and RANGE peers, which share their last row's value.
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_POP(v) OVER (PARTITION BY g ORDER BY k), 3) FROM st ORDER BY k", &.{ "0", "0.25", "0.25", "0", "0.25", "2.889" });
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v) OVER (PARTITION BY g ORDER BY k), 3) FROM st ORDER BY k", &.{ null, "0.5", "0.5", null, "0.5", "4.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(STDDEV_POP(y) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), 3) FROM st ORDER BY k", &.{ "1.247", "1.247", "1.247", "1.344", "1.344", "1.344" });
+    // Sliding frames, where NULLs and too few values give NULL.
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v) OVER (ORDER BY k ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 3) FROM st ORDER BY k", &.{ null, "0.5", "0.5", "28.125", "0.5", "4.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(CORR(v, y) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), 3) FROM st ORDER BY k", &.{ "1", "1", "-1", "1", "0.24", "-1" });
+    try expectTexts(allocator, db, "SELECT VAR_SAMP(k) OVER (PARTITION BY g ORDER BY k DESC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM st ORDER BY k", &.{ null, "0.5", "1", null, "0.5", "1" });
+
+    // Over an expression, in an expression, and through a named window.
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v * 2) OVER (PARTITION BY g), 3) FROM st ORDER BY k", &.{ "2", "2", "2", "17.333", "17.333", "17.333" });
+    try expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(v) OVER (PARTITION BY g) / 2, 3) FROM st ORDER BY k", &.{ "0.25", "0.25", "0.25", "2.167", "2.167", "2.167" });
+    try expectTexts(allocator, db, "SELECT CASE WHEN VAR_SAMP(v) OVER w > 1 THEN 'wide' ELSE 'narrow' END FROM st WINDOW w AS (PARTITION BY g) ORDER BY k", &.{ "narrow", "narrow", "narrow", "wide", "wide", "wide" });
+
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT VAR_SAMP(s) OVER () FROM (SELECT CAST(k AS VARCHAR(5)) AS s FROM st) x"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT CORR(v) OVER () FROM st"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT VAR_SAMP(v, y) OVER () FROM st"));
+}
+
+test "window: a call over an expression needs no alias" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try seedSimple(allocator, db);
+
+    // Its default name, `sum(add(...))`, holds dots, which read as a struct
+    // path unless the window owns the name.
+    var q = try runSql(allocator, db, "SELECT id, sum(qty + 1) OVER (PARTITION BY grp) FROM t ORDER BY id ASC");
+    defer q.deinit();
+    const sums = try collectRows(i64, allocator, &q, 1);
+    defer allocator.free(sums);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 63, 63, 63, 302, 302 }, sums);
+}

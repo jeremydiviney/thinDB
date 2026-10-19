@@ -809,7 +809,7 @@ const BitwiseAcc = struct {
     value: i64 = 0,
 };
 
-const WelfordAcc = struct {
+pub const WelfordAcc = struct {
     mean: f64 = 0.0,
     m2: f64 = 0.0,
     count: u64 = 0,
@@ -817,7 +817,7 @@ const WelfordAcc = struct {
 
 /// `c` sums (x − x̄)(y − ȳ); `m2_x` and `m2_y` are each side's squared
 /// deviations, which CORR divides by.
-const CoMomentAcc = struct {
+pub const CoMomentAcc = struct {
     count: u64 = 0,
     mean_x: f64 = 0.0,
     mean_y: f64 = 0.0,
@@ -4105,21 +4105,23 @@ fn coMomentUpdate(m: *CoMomentAcc, x_view: ColumnView, x_scale_div: f64, y_view:
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!x_view.isValid(r) or !y_view.isValid(r)) continue;
-        const x = numericAsF64(x_view, r) / x_scale_div;
-        const y = numericAsF64(y_view, r) / y_scale_div;
-        m.count += 1;
-        const n: f64 = @floatFromInt(m.count);
-        const dx = x - m.mean_x;
-        m.mean_x += dx / n;
-        const dy = y - m.mean_y;
-        m.mean_y += dy / n;
-        m.c += dx * (y - m.mean_y);
-        m.m2_x += dx * (x - m.mean_x);
-        m.m2_y += dy * (y - m.mean_y);
+        coMomentStep(m, numericAsF64(x_view, r) / x_scale_div, numericAsF64(y_view, r) / y_scale_div);
     }
 }
 
-fn numericAsF64(view: ColumnView, row: usize) f64 {
+pub fn coMomentStep(m: *CoMomentAcc, x: f64, y: f64) void {
+    m.count += 1;
+    const n: f64 = @floatFromInt(m.count);
+    const dx = x - m.mean_x;
+    m.mean_x += dx / n;
+    const dy = y - m.mean_y;
+    m.mean_y += dy / n;
+    m.c += dx * (y - m.mean_y);
+    m.m2_x += dx * (x - m.mean_x);
+    m.m2_y += dy * (y - m.mean_y);
+}
+
+pub fn numericAsF64(view: ColumnView, row: usize) f64 {
     return switch (view.data) {
         inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |sl| @floatFromInt(sl[row]),
         inline .float, .double => |sl| sl[row],
@@ -4130,7 +4132,7 @@ fn numericAsF64(view: ColumnView, row: usize) f64 {
 /// COVAR_POP over one pair is 0; COVAR_SAMP and CORR need two. CORR is
 /// (c/n) / (σx·σy), as DuckDB computes it, and NULL where either side is
 /// constant, as in StarRocks and PostgreSQL (DuckDB gives NaN).
-fn coMomentResult(func: AggFunc, m: CoMomentAcc) ?f64 {
+pub fn coMomentResult(func: AggFunc, m: CoMomentAcc) ?f64 {
     const n: f64 = @floatFromInt(m.count);
     switch (func) {
         .covar_pop => return if (m.count >= 1) m.c / n else null,
@@ -4144,7 +4146,7 @@ fn coMomentResult(func: AggFunc, m: CoMomentAcc) ?f64 {
     }
 }
 
-fn welfordStep(w: *WelfordAcc, x: f64) void {
+pub fn welfordStep(w: *WelfordAcc, x: f64) void {
     w.count += 1;
     const n: f64 = @floatFromInt(w.count);
     const delta = x - w.mean;

@@ -1094,6 +1094,23 @@ pub const Parser = struct {
         return self.lex.pos;
     }
 
+    /// The function a call with OVER names. A statistic reads its
+    /// aggregate's name, so `STDDEV` and `VARIANCE` mean in a window what
+    /// they mean in the dialect's GROUP BY.
+    pub fn windowFuncForName(self: *const Parser, name: []const u8) ?ir.WindowFunc {
+        if (ir.windowFuncForName(name)) |func| return func;
+        return switch (aggForName(name, self.lex.dialect) orelse return null) {
+            .var_pop => .var_pop,
+            .var_samp => .var_samp,
+            .stddev_pop => .stddev_pop,
+            .stddev_samp => .stddev_samp,
+            .covar_pop => .covar_pop,
+            .covar_samp => .covar_samp,
+            .corr => .corr,
+            else => null,
+        };
+    }
+
     pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
         if (aggForName(name, self.lex.dialect)) |func| return func;
         if (self.udf_registry) |registry| {
@@ -2419,7 +2436,7 @@ pub const Parser = struct {
                 if (filter != null) return ParseError.SqlInvalidProjection;
                 try self.advance();
                 const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                const wfunc = ir.windowFuncForName(first) orelse
+                const wfunc = self.windowFuncForName(first) orelse
                     return ParseError.SqlInvalidProjection;
                 parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch
                     return ParseError.SqlInvalidProjection;
@@ -4250,7 +4267,7 @@ pub const Parser = struct {
                         if (saw_distinct or filter != null) return ParseError.SqlInvalidProjection;
                         try self.advance();
                         const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                        const wfunc = ir.windowFuncForName(name) orelse
+                        const wfunc = self.windowFuncForName(name) orelse
                             return ParseError.SqlInvalidProjection;
                         parse_window.validateWindowCall(wfunc, nested_args, ignore_nulls) catch
                             return ParseError.SqlInvalidProjection;
@@ -9145,7 +9162,7 @@ fn normalizeWindowCallArgs(
 
 fn windowArgNeedsPrecompute(func: ir.WindowFunc, arg_idx: usize, arg: ir.Expr) bool {
     return switch (func) {
-        .sum, .avg, .count, .min, .max => switch (arg) {
+        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => switch (arg) {
             .col_ref => false,
             else => true,
         },

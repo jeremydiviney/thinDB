@@ -46,7 +46,7 @@ pub const SpecKind = union(enum) {
 /// windows.
 pub fn isAggregateAlsoFunc(f: ir.WindowFunc) bool {
     return switch (f) {
-        .sum, .avg, .count, .min, .max => true,
+        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => true,
         else => false,
     };
 }
@@ -91,6 +91,14 @@ pub fn validateWindowCall(
         },
         .cume_dist, .percent_rank => {
             if (args.len != 0) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
+        },
+        .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
+            if (args.len != 1) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
+        },
+        .covar_pop, .covar_samp, .corr => {
+            if (args.len != 2) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
         },
     }

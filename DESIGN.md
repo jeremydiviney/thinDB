@@ -1329,6 +1329,13 @@ column; decimal offsets respect the order column's scale. `FIRST_VALUE`,
 `LAST_VALUE`, and `NTH_VALUE` honor the actual frame, including empty frames
 and `IGNORE NULLS`. Temporal range offsets and `EXCLUDE` remain unsupported.
 
+`VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `COVAR_POP`, `COVAR_SAMP`
+and `CORR` are aggregate windows too, under every name their aggregates take
+in the dialect (`VARIANCE`, `STD`, ...). Each folds its frame as its aggregate
+does, so over a whole partition it gives that partition's GROUP BY value, and
+a frame with too few non-NULL values, or pairs for the two-argument ones,
+gives NULL.
+
 Entry expressions may replace SQL-visible input names while retaining their
 original inputs under distinct physical slots. Projection expansion uses the
 same rules as ordinary SQL. Cached runs reconstruct the same entry recipe
