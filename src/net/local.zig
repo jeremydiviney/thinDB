@@ -1401,7 +1401,7 @@ pub fn producesOnlyResult(op: *const ir.Op) bool {
         .file_scan,
         .alias,
         .table_fn,
-        .series,
+        .expand,
         .admin,
         => true,
         .ddl,
@@ -1721,7 +1721,7 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
         .scan, .file_scan => {},
         .alias => |a| projWalkOp(c, allocator, a.upstream),
         .single_row => {},
-        .series => |s| projWalkOp(c, allocator, s.upstream),
+        .expand => |s| projWalkOp(c, allocator, s.upstream),
         .limit => |l| projWalkOp(c, allocator, l.upstream),
         .select => |p| {
             c.has_shaper = true;
@@ -1811,7 +1811,8 @@ fn projWalkOp(c: *ProjScan, allocator: Allocator, op: *const ir.Op) void {
 /// GROUP BY rather than passed through at a source's full width.
 fn armColumnsFixed(op: *const ir.Op) bool {
     return switch (op.*) {
-        .select, .group_by, .single_row, .series => true,
+        .select, .group_by, .single_row => true,
+        .expand => |e| !e.lateral,
         .alias => |a| armColumnsFixed(a.upstream),
         .limit => |l| armColumnsFixed(l.upstream),
         .filter => |f| armColumnsFixed(f.upstream),
@@ -2308,7 +2309,7 @@ pub fn compileOp(ctx: *CompileCtx, op: *const ir.Op) !Query {
         .set_union,
         .single_row,
         .table_fn,
-        .series,
+        .expand,
         => Error.UnsupportedOp,
         .ddl => |d| try compileDdl(ctx, d),
         .show => |s| try compileShow(ctx, s),

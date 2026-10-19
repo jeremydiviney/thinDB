@@ -122,6 +122,8 @@ pub const Error = error{
     SeriesStepZero,
     /// `generate_series` given an argument that isn't an integer.
     SeriesNonIntegerArgument,
+    /// `unnest` given an argument that isn't an array.
+    UnnestNonArrayArgument,
     /// `map_from_arrays` given key and value arrays of different lengths.
     MapArrayLengthMismatch,
     /// `array_map` given arrays of different lengths on one row.
@@ -1788,7 +1790,8 @@ pub const MatScan = mat_stage.MatScan;
 
 pub const AliasRename = @import("alias_rename.zig").AliasRename;
 
-pub const Series = @import("series.zig").Series;
+pub const expand = @import("expand.zig");
+pub const Expand = expand.Expand;
 
 pub const join_op = @import("join.zig");
 pub const Join = join_op.Join;
@@ -1831,5 +1834,5 @@ test {
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
     _ = @import("concurrent_int_table.zig");
-    _ = @import("series.zig");
+    _ = @import("expand.zig");
 }

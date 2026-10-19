@@ -680,9 +680,9 @@ pub const OpTag = enum(u8) {
     /// `ANALYZE TABLE`, ...). Session-local and never persisted, so it has no
     /// wire encoding.
     admin = 27,
-    /// `generate_series(start, stop[, step])` in FROM: an integer sequence
-    /// per upstream row.
-    series = 28,
+    /// `generate_series(...)` or `unnest(...)` in FROM: rows generated
+    /// from each upstream row.
+    expand = 28,
 };
 
 pub const BatchOp = struct {
@@ -861,22 +861,43 @@ pub const Op = union(OpTag) {
     alias: Alias,
     table_fn: TableFn,
     admin: AdminOp,
-    series: Series,
+    expand: Expand,
 
-    /// `FROM generate_series(start, stop[, step])`, also spelled
-    /// `TABLE(generate_series(...))`. For each upstream row, one BIGINT row
-    /// per value from its `start` column to its `stop` column inclusive,
-    /// `step` apart (1 without a step column). The parser feeds it a Compute
-    /// over `single_row` that evaluates the call's arguments, so the
-    /// arguments are ordinary expressions to every plan pass.
-    pub const Series = struct {
+    /// `FROM generate_series(start, stop[, step])` or `FROM unnest(array,
+    /// ...)`, also spelled `TABLE(...)`. Each upstream row expands into one
+    /// row per generated value: for a series, the integers from its `start`
+    /// column to its `stop` column inclusive, `step` apart, as one BIGINT
+    /// column; for unnest, the arrays' elements side by side, the shorter
+    /// padded with NULL. The parser feeds it a Compute that evaluates the
+    /// call's arguments, so they are ordinary expressions to every plan pass:
+    /// over `single_row` for a standalone call, or over the FROM items before
+    /// it for a lateral one.
+    pub const Expand = struct {
         upstream: *Op,
-        start: []const u8,
-        stop: []const u8,
-        step: ?[]const u8 = null,
-        /// `generate_series`, or the name a `t(x)` column list gives it.
-        column: []const u8,
+        generator: Generator,
+        /// The upstream columns holding the call's arguments, in call order:
+        /// start, stop and an optional step, or the arrays.
+        args: []const []const u8,
+        /// The generated columns: `generate_series` or `unnest`,
+        /// `unnest_1`, ... unless a `t(x, ...)` column list renames them.
+        columns: []const []const u8,
         alias: ?[]const u8 = null,
+        /// Each output row also carries its upstream row's other columns:
+        /// the call reads the FROM items before it.
+        lateral: bool = false,
+        /// A row that expands to nothing still gives one row, its generated
+        /// columns NULL: `LEFT JOIN unnest(...) ON TRUE`.
+        outer: bool = false,
+
+        pub const Generator = enum(u8) { series, unnest };
+
+        /// The name the relation goes by: its alias, or the function's.
+        pub fn name(self: Expand) []const u8 {
+            return self.alias orelse switch (self.generator) {
+                .series => "generate_series",
+                .unnest => "unnest",
+            };
+        }
     };
 
     /// `FROM TABLE(name(<subquery>) [PARTITION BY cols] [ORDER BY specs])`.
@@ -1111,9 +1132,11 @@ pub const Op = union(OpTag) {
                 a.upstream.deinitDecoded(allocator);
                 allocator.destroy(a.upstream);
             },
-            .series => |s| {
-                s.upstream.deinitDecoded(allocator);
-                allocator.destroy(s.upstream);
+            .expand => |e| {
+                allocator.free(e.args);
+                allocator.free(e.columns);
+                e.upstream.deinitDecoded(allocator);
+                allocator.destroy(e.upstream);
             },
             .table_fn => |t| {
                 allocator.free(t.partition_by);
@@ -1282,13 +1305,14 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOptString(allocator, out, a.alias);
             try encodeOp(allocator, out, a.upstream.*);
         },
-        .series => |s| {
-            try encodeString(allocator, out, s.start);
-            try encodeString(allocator, out, s.stop);
-            try encodeOptString(allocator, out, s.step);
-            try encodeString(allocator, out, s.column);
-            try encodeOptString(allocator, out, s.alias);
-            try encodeOp(allocator, out, s.upstream.*);
+        .expand => |e| {
+            try out.append(allocator, @intFromEnum(e.generator));
+            try encodeOptNames(allocator, out, e.args);
+            try encodeOptNames(allocator, out, e.columns);
+            try encodeOptString(allocator, out, e.alias);
+            try out.append(allocator, @intFromBool(e.lateral));
+            try out.append(allocator, @intFromBool(e.outer));
+            try encodeOp(allocator, out, e.upstream.*);
         },
         .table_fn => |t| {
             try appendU32(allocator, out, @intCast(t.name.len));
@@ -2328,7 +2352,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.series)) return Error.IrUnknownOp;
+    if (tag_byte > @intFromEnum(OpTag.expand)) return Error.IrUnknownOp;
     const tag: OpTag = @enumFromInt(tag_byte);
 
     return switch (tag) {
@@ -2345,16 +2369,31 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             upstream.* = try decodeOp(allocator, bytes, cursor);
             break :blk Op{ .alias = .{ .alias = alias, .upstream = upstream } };
         },
-        .series => blk: {
-            const start = try readString(bytes, cursor);
-            const stop = try readString(bytes, cursor);
-            const step = try decodeOptString(bytes, cursor);
-            const column = try readString(bytes, cursor);
+        .expand => blk: {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const generator_byte = bytes[cursor.*];
+            cursor.* += 1;
+            if (generator_byte > @intFromEnum(Op.Expand.Generator.unnest)) return Error.IrCorrupt;
+            const generator: Op.Expand.Generator = @enumFromInt(generator_byte);
+            const args = (try decodeOptNames(allocator, bytes, cursor)) orelse return Error.IrCorrupt;
+            errdefer allocator.free(args);
+            const columns = (try decodeOptNames(allocator, bytes, cursor)) orelse return Error.IrCorrupt;
+            errdefer allocator.free(columns);
             const alias = try decodeOptString(bytes, cursor);
+            const lateral = try decodeFlag(bytes, cursor);
+            const outer = try decodeFlag(bytes, cursor);
             const upstream = try allocator.create(Op);
             errdefer allocator.destroy(upstream);
             upstream.* = try decodeOp(allocator, bytes, cursor);
-            break :blk Op{ .series = .{ .upstream = upstream, .start = start, .stop = stop, .step = step, .column = column, .alias = alias } };
+            break :blk Op{ .expand = .{
+                .upstream = upstream,
+                .generator = generator,
+                .args = args,
+                .columns = columns,
+                .alias = alias,
+                .lateral = lateral,
+                .outer = outer,
+            } };
         },
         .table_fn => blk: {
             const name = try readString(bytes, cursor);

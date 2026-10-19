@@ -103,7 +103,7 @@ pub fn foldDeadBranches(op: *ir.Op) void {
         .table_fn => |t| for (t.inputs) |inp| foldDeadBranches(inp),
         .window => |w| foldDeadBranches(w.upstream),
         .alias => |a| foldDeadBranches(a.upstream),
-        .series => |s| foldDeadBranches(s.upstream),
+        .expand => |s| foldDeadBranches(s.upstream),
         .explain => |e| foldDeadBranches(@constCast(e.inner)),
         .create_table_as => |c| foldDeadBranches(@constCast(c.source)),
         .insert_select => |i| foldDeadBranches(@constCast(i.source)),

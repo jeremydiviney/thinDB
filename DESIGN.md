@@ -767,7 +767,7 @@ pub fn deinit(self: *Self) void
 | `SortMergeJoin` | Materialize + sort both sides, streaming merge; merge-only fast-path when manifest stats prove pre-sorted |
 | `NestedLoopJoin` | Cartesian eval with per-pair predicates; used for pure-range, opaque-callback, or no-equi-keys joins |
 | `RangeSweepJoin` | Single inequality `a OP b` between two side-sorted columns — cursor-style merge, ~2× faster than NLJ on pure-range shapes |
-| `Series` | `generate_series`: an integer sequence per row of its arguments |
+| `Expand` | `generate_series` and `unnest`: the rows each row of its arguments generates, beside the columns of the rows it read when lateral |
 | `Sink` | Terminal — collects results or yields batches to caller |
 
 Join routing (`.algorithm = .auto`): opaque predicate → NLJ; pure single-range shape → range_sweep; both sides sorted on the join keys (per manifest stats) → SMJ; otherwise hash. Hash join's build phase runs Misra-Gries sampling — under heavy skew it transfers ownership of the built columns to an SMJ at execute time.
@@ -776,7 +776,16 @@ A key pair can be null-safe (`KeyPair.null_safe`): an ON conjunct `a <=> b` or `
 
 A table function's input relation carries each declared input column by name and in order, and a nullable column can't feed a NOT NULL field. A column of another type converts to the declared type as an INSERT into a column of that type would (§9.8 `ValueOutOfRange`). The casts `cast.assignmentCastExpr` gives (text, DATE or DATETIME into DATE or DATETIME, a number or text into DECIMAL) run as a `Compute` over the input. The pairs an INSERT converts as its rows land (one number type into another, a number or date into text, text into a number) convert each drained batch with `cast.assignColumn`. When every type already matches, the call reads the input's columns without a copy, as before. A pair the rule refuses, such as a number into a DATE, is `TableFnInputMismatch` when the call is built. A value that fails its conversion, such as text that isn't a date or a number the field can't hold, is `TableFnInputMismatch` when its batch is drained, with a diagnostic line naming the column. A converted partition or order key is sorted again even when the input arrives ordered, since converting can reorder it.
 
-`generate_series(start, stop[, step])` is a FROM source, written bare as in PostgreSQL and DuckDB or inside `TABLE(...)` as in StarRocks. Its one BIGINT column is named `generate_series`, as is the relation; an alias renames the relation and a `t(x)` column list the column. It counts from start to stop inclusive by step (1 when omitted), and is empty when the step points away from stop or an argument is NULL. A sequence that reaches a BIGINT bound ends there instead of wrapping. The arguments are integer expressions (TINYINT through BIGINT, or a LARGEINT within BIGINT's range), evaluated by a `Compute` over the single-row source that `Series` reads, so a scalar subquery can supply one. They can't read another FROM item's columns: thinDB has no LATERAL yet. A step of 0 is `SeriesStepZero` and an argument of another type `SeriesNonIntegerArgument` (§9.8).
+`generate_series(start, stop[, step])` and `unnest(array[, array ...])` are FROM sources, written bare as in PostgreSQL and DuckDB or inside `TABLE(...)` as in StarRocks, and both run as an `Expand`. `generate_series`'s one BIGINT column is named `generate_series`, as is the relation; an alias renames the relation and a `t(x)` column list the column. It counts from start to stop inclusive by step (1 when omitted), and is empty when the step points away from stop or an argument is NULL. A sequence that reaches a BIGINT bound ends there instead of wrapping. The arguments are integer expressions (TINYINT through BIGINT, or a LARGEINT within BIGINT's range), evaluated by a `Compute` over the single-row source that `Expand` reads, so a scalar subquery can supply one. A step of 0 is `SeriesStepZero` and an argument of another type `SeriesNonIntegerArgument` (§9.8).
+
+`unnest` gives a row per array position, the arrays zipped: the longest array sets the count and a shorter one reads NULL past its end. A NULL or empty array has no positions, so `unnest` of only such arrays gives no rows. Each column takes its array's element type, which can be a struct, map, array or JSON. The columns are named `unnest`, `unnest_1`, `unnest_2` and so on, and the relation `unnest`; an alias and a column list rename them as for `generate_series`. An argument that isn't an array is `UnnestNonArrayArgument` (§9.8).
+
+A call after another FROM item is lateral when its arguments read a column or it's written `LATERAL`: it runs once per row of the FROM items before it, and each row it gives carries that row's columns. That's how PostgreSQL and StarRocks read `FROM t, unnest(t.arr)`. Its arguments' `Compute` reads those FROM items in place of the single-row source, so no join runs. A comma, CROSS JOIN, or INNER JOIN without ON adds the call's rows as they come. An INNER JOIN's ON filters them. `LEFT JOIN ... ON TRUE` also keeps a row the call gives nothing for, with NULL in the call's columns. Every other join of a lateral call is `SqlLateralJoinUnsupported`, since it would have to produce the call's rows without the row they come from:
+- a LEFT JOIN with any other ON (StarRocks refuses these too);
+- RIGHT and FULL joins, including one later in a join chain that a comma-joined lateral call starts;
+- USING and NATURAL.
+
+`LATERAL` applies only to these two calls; thinDB has no LATERAL derived table. A call that reads no other FROM item's columns is an ordinary relation, joined like a table. StarRocks refuses a LEFT JOIN of one; thinDB joins it as PostgreSQL does.
 
 **Memtable scan**: every Scan also reads from the (potentially non-empty) memtable of the table. Memtable rows are processed identically to segment rows. This gives read-your-writes consistency.
 
@@ -1784,7 +1793,7 @@ JoinColumnNameCollision,
 MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
 TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
-SeriesStepZero, SeriesNonIntegerArgument,
+SeriesStepZero, SeriesNonIntegerArgument, UnnestNonArrayArgument,
 MapArrayLengthMismatch, ArrayLengthMismatch,
 ```
 
@@ -1806,7 +1815,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 
 `TableFnInputMismatch` means a table function's input relation doesn't fit its declared input (§6.2): a column is missing, extra, out of order, nullable where the field isn't, or of a type an INSERT into the declared type refuses, or a value failed its conversion. `TableFnExecutionMismatch` means the call's PARTITION BY contradicts the declared execution mode; `TableFnOutputMismatch` means the callback left its output columns of unequal length.
 
-`SeriesStepZero` means a `generate_series` step was 0, which would repeat its start forever; PostgreSQL, DuckDB and StarRocks refuse it too. `SeriesNonIntegerArgument` means a `generate_series` argument wasn't an integer (§6.2). The MySQL wire reports both as 1210 (`HY000`), as it does `IncorrectArgumentsToSleep`; the PostgreSQL wire as `22023`, PostgreSQL's code for a zero step.
+`SeriesStepZero` means a `generate_series` step was 0, which would repeat its start forever; PostgreSQL, DuckDB and StarRocks refuse it too. `SeriesNonIntegerArgument` means a `generate_series` argument wasn't an integer, and `UnnestNonArrayArgument` that an `unnest` argument wasn't an array (§6.2). The MySQL wire reports all three as 1210 (`HY000`), as it does `IncorrectArgumentsToSleep`; the PostgreSQL wire as `22023`, PostgreSQL's code for a zero step.
 
 `MapArrayLengthMismatch` means `map_from_arrays` was given key and value arrays of different lengths, which pair no entries; StarRocks refuses them too. The wires report it as they report `SeriesStepZero`.
 

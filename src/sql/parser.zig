@@ -97,6 +97,9 @@ pub const ParseError = error{
     /// INTERSECT ALL / EXCEPT ALL: only the distinct forms are supported,
     /// as in StarRocks.
     SqlSetOpAllUnsupported,
+    /// A RIGHT, FULL, NATURAL or USING join, or a LEFT JOIN on anything but
+    /// TRUE, of an unnest or generate_series reading the FROM items before it.
+    SqlLateralJoinUnsupported,
     /// Row values of different widths compared or matched by IN.
     SqlRowValueWidthMismatch,
     /// `ALTER TABLE ... ADD COLUMN c ... FIRST | AFTER x`: new columns are
@@ -752,12 +755,21 @@ fn scanRecursiveArm(op: *const ir.Op, info: *const ir.Op.Recursive, nullable: bo
     }
 }
 
+/// The Expand generator a FROM function name calls, if any.
+fn expandGenerator(name: []const u8) ?ir.Op.Expand.Generator {
+    if (std.ascii.eqlIgnoreCase(name, "generate_series")) return .series;
+    if (std.ascii.eqlIgnoreCase(name, "unnest")) return .unnest;
+    return null;
+}
+
 const FromTarget = struct {
     name: []const u8,
     op: *ir.Op,
     /// A table, CTE or view reference written without an alias. `in_place`:
     /// the reference owns its scan node, so an alias can be set on it.
     unaliased: enum { no, in_place, wrap } = .no,
+    /// Written after LATERAL.
+    lateral: bool = false,
 };
 
 /// One join-chain input, by the range-variable name its columns qualify with.
@@ -4388,7 +4400,7 @@ pub const Parser = struct {
             return .{ .op = first.op, .sole_unaliased_name = first.name, .inputs = inputs };
         }
         var chains: std.ArrayList(JoinChain) = .empty;
-        try chains.append(self.arena, try self.parseJoinChain(first));
+        try chains.append(self.arena, try self.parseJoinChain(first, null));
         var root = chains.items[0].op;
         // A comma cross-joins whole join chains: it binds looser than JOIN,
         // so `a, b RIGHT JOIN c ON ...` right-joins c to b alone, and each
@@ -4396,7 +4408,14 @@ pub const Parser = struct {
         // between the chains become join keys at compile.
         while (self.cur.tag == .comma) {
             try self.advance();
-            const chain = try self.parseJoinChain(try self.parseFromTarget());
+            const target = try self.parseFromTarget();
+            if (try self.isLateral(target)) {
+                const chain = try self.parseJoinChain(target, root);
+                root = chain.op;
+                try chains.append(self.arena, chain);
+                continue;
+            }
+            const chain = try self.parseJoinChain(target, null);
             root = try self.crossJoin(root, chain.op);
             try chains.append(self.arena, chain);
         }
@@ -4454,8 +4473,10 @@ pub const Parser = struct {
         } });
     }
 
-    fn parseJoinChain(self: *Parser, first: FromTarget) ParseError!JoinChain {
-        var root = try self.nameJoinInput(first);
+    /// A chain of joins from `first`. A lateral call after a comma starts its
+    /// chain over `lateral_base`, the FROM items before the comma.
+    fn parseJoinChain(self: *Parser, first: FromTarget, lateral_base: ?*ir.Op) ParseError!JoinChain {
+        var root = if (lateral_base) |base| try self.lateralExpand(base, first, false) else try self.nameJoinInput(first);
 
         // Running set of names that constitute the current left
         // subtree. Each new JOIN's ON clause must reference one of
@@ -4483,15 +4504,26 @@ pub const Parser = struct {
             const straight = !natural and self.joinWordAhead("straight_join");
             const jtype: ir.JoinType = if (straight) .inner else try self.parseJoinKind();
             if (straight) try self.advance();
+            // In `a, unnest(a.xs) u RIGHT JOIN b` the outer join would need
+            // u's rows apart from the rows of a they come from.
+            if (lateral_base != null and (jtype == .right or jtype == .full)) return ParseError.SqlLateralJoinUnsupported;
             const right = try self.parseFromTarget();
-            const right_input = try self.nameJoinInput(right);
-            var right_op = right_input;
 
             // MySQL reads [INNER] JOIN, CROSS JOIN and STRAIGHT_JOIN alike:
             // an inner join whose ON / USING is optional, and a cross join
             // without one. Elsewhere CROSS JOIN takes no condition and
             // [INNER] JOIN requires one.
             const condition_optional = cross or straight or (jtype == .inner and self.lex.dialect == .mysql);
+            if (try self.isLateral(right)) {
+                if (natural) return ParseError.SqlLateralJoinUnsupported;
+                root = try self.lateralJoin(root, right, jtype, condition_optional);
+                try left_names.append(self.arena, right.name);
+                try inputs.append(self.arena, .{ .name = right.name, .op = right.op });
+                star = try self.appendInputStar(star, right.name, right.op);
+                continue;
+            }
+            const right_input = try self.nameJoinInput(right);
+            var right_op = right_input;
             const condition_allowed = !cross or self.lex.dialect == .mysql;
             const condition_follows = self.cur.tag == .kw_on or self.joinWordAhead("using");
             if (!natural and condition_optional and !(condition_allowed and condition_follows)) {
@@ -4737,6 +4769,12 @@ pub const Parser = struct {
             } });
             return try self.applyFromAlias(op, path);
         }
+        if (try self.lateralCallAhead()) {
+            try self.advance();
+            var target = try self.parseFromTarget();
+            target.lateral = true;
+            return target;
+        }
         const first = try self.expectIdent();
         const first_dup = try self.arena.dupe(u8, first);
         // Object-name lookups (CTEs, functions, views, tables) are
@@ -4750,8 +4788,8 @@ pub const Parser = struct {
                 op = try self.expandSqlFunction(def);
                 op.materialize.name = first_dup;
                 alias_in_place = false;
-            } else if (std.mem.eql(u8, first_lc, "generate_series")) {
-                return try self.seriesTarget(try self.parseSeriesCall());
+            } else if (expandGenerator(first_lc)) |generator| {
+                return try self.expandTarget(try self.parseExpandCall(generator));
             } else {
                 const format = fileFormatForFunction(first_lc) orelse return ParseError.SqlUnsupportedFileFunction;
                 op = try self.parseFileTableFunction(format);
@@ -4889,6 +4927,65 @@ pub const Parser = struct {
         };
     }
 
+    /// Whether a FROM item joined to the ones before it reads them: an
+    /// unnest or generate_series written after LATERAL or reading a column.
+    /// PostgreSQL and StarRocks read such a call as lateral without the word.
+    fn isLateral(self: *Parser, target: FromTarget) ParseError!bool {
+        if (target.op.* != .expand) return false;
+        if (target.lateral) return true;
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (target.op.expand.upstream.compute.derived) |d| try exec_compute.collectColumnRefs(self.arena, &refs, d.expr);
+        return refs.items.len > 0;
+    }
+
+    /// The lateral call `target` over `left`: its arguments evaluate over
+    /// each row of `left`, whose columns its rows carry on.
+    fn lateralExpand(self: *Parser, left: *ir.Op, target: FromTarget, outer: bool) ParseError!*ir.Op {
+        const op = try self.nameJoinInput(target);
+        op.expand.upstream.compute.upstream = left;
+        op.expand.lateral = true;
+        op.expand.outer = outer;
+        return op;
+    }
+
+    /// A JOIN of the lateral call `right` to `left`, its condition next.
+    /// CROSS JOIN, and [INNER] JOIN where it may go without a condition,
+    /// expand every row of `left`; INNER JOIN ... ON keeps the expanded rows
+    /// the condition passes; LEFT JOIN ... ON TRUE also keeps a row that
+    /// expands to nothing. Another join would have to produce the call's
+    /// rows without the rows it reads.
+    fn lateralJoin(self: *Parser, left: *ir.Op, right: FromTarget, jtype: ir.JoinType, condition_optional: bool) ParseError!*ir.Op {
+        if (jtype == .right or jtype == .full or self.joinWordAhead("using")) return ParseError.SqlLateralJoinUnsupported;
+        if (self.cur.tag != .kw_on) {
+            if (!condition_optional) return ParseError.SqlExpectedJoinOn;
+            return try self.lateralExpand(left, right, false);
+        }
+        try self.advance();
+        const on = try self.parseConditionBody();
+        const always_true = on.derived.len == 0 and on.predicate == .always and on.predicate.always;
+        if (jtype == .left) {
+            if (!always_true) return ParseError.SqlLateralJoinUnsupported;
+            return try self.lateralExpand(left, right, true);
+        }
+        var root = try self.lateralExpand(left, right, false);
+        if (always_true) return root;
+        if (on.derived.len > 0) root = try self.allocOp(.{ .compute = .{ .derived = on.derived, .upstream = root } });
+        root = try self.allocOp(.{ .filter = .{ .predicate = on.predicate, .upstream = root } });
+        if (on.derived.len == 0) return root;
+        const hidden = try self.arena.alloc([]const u8, on.derived.len);
+        for (on.derived, hidden) |d, *name| name.* = d.name;
+        return try self.allocOp(.{ .exclude = .{ .columns = hidden, .upstream = root } });
+    }
+
+    /// Whether `LATERAL unnest(` or `LATERAL generate_series(` is next.
+    fn lateralCallAhead(self: *const Parser) ParseError!bool {
+        if (!self.joinWordAhead("lateral") or self.cur.quoted) return false;
+        var look = self.lex.*;
+        const call = try look.next();
+        if (call.tag != .identifier or expandGenerator(call.text) == null) return false;
+        return (try look.next()).tag == .lparen;
+    }
+
     /// `TABLE( fname( (subquery) ) [PARTITION BY col, ...]
     ///        [ORDER BY col [ASC|DESC], ...] ) [AS] [alias]`
     /// — a table-valued UDF call. The input subquery must be parenthesized.
@@ -4899,10 +4996,10 @@ pub const Parser = struct {
         try self.advance(); // TABLE
         try self.expect(.lparen);
         const fname = try self.dupedIdent();
-        if (std.ascii.eqlIgnoreCase(fname, "generate_series")) {
-            const op = try self.parseSeriesCall();
+        if (expandGenerator(fname)) |generator| {
+            const op = try self.parseExpandCall(generator);
             try self.expect(.rparen);
-            return try self.seriesTarget(op);
+            return try self.expandTarget(op);
         }
         try self.expect(.lparen);
         var inputs: std.ArrayList(*ir.Op) = .empty;
@@ -4979,45 +5076,52 @@ pub const Parser = struct {
         return .{ .name = resolved_name, .op = op };
     }
 
-    /// `(start, stop[, step])` after `generate_series`: a Series over a
-    /// single-row Compute that evaluates the arguments.
-    fn parseSeriesCall(self: *Parser) ParseError!*ir.Op {
-        const names = [_][]const u8{ "start", "stop", "step" };
-        var derived: [names.len]ir.Derived = undefined;
-        var n: usize = 0;
+    /// The arguments after `generate_series` (start, stop[, step]) or
+    /// `unnest` (arrays): an Expand over a single-row Compute that evaluates
+    /// them, each under a name no column has, since a lateral call's Compute
+    /// runs over the FROM items before it.
+    fn parseExpandCall(self: *Parser, generator: ir.Op.Expand.Generator) ParseError!*ir.Op {
+        var derived: std.ArrayList(ir.Derived) = .empty;
         try self.expect(.lparen);
         while (true) {
-            if (n == names.len) return ParseError.SqlFunctionArgMismatch;
             var arg = try self.parseValueExpr();
-            // A bare NULL parses as text; as an argument it is a NULL integer.
-            if (arg == .null_lit) arg = .{ .null_lit = .bigint };
-            derived[n] = .{ .name = names[n], .expr = arg };
-            n += 1;
+            // A bare NULL parses as text; as a series argument it is a NULL
+            // integer.
+            if (arg == .null_lit and generator == .series) arg = .{ .null_lit = .bigint };
+            const name = try std.fmt.allocPrint(self.arena, "__expand_arg_{d}", .{derived.items.len});
+            try derived.append(self.arena, .{ .name = name, .expr = arg });
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
         try self.expect(.rparen);
-        if (n < 2) return ParseError.SqlFunctionArgMismatch;
+        const n = derived.items.len;
+        if (generator == .series and (n < 2 or n > 3)) return ParseError.SqlFunctionArgMismatch;
+        const args = try self.arena.alloc([]const u8, n);
+        for (derived.items, args) |d, *name| name.* = d.name;
+        const columns: []const []const u8 = switch (generator) {
+            .series => &.{"generate_series"},
+            .unnest => blk: {
+                const names = try self.arena.alloc([]const u8, n);
+                for (names, 0..) |*name, i| {
+                    name.* = if (i == 0) "unnest" else try std.fmt.allocPrint(self.arena, "unnest_{d}", .{i});
+                }
+                break :blk names;
+            },
+        };
         const single = try self.allocOp(.{ .single_row = {} });
-        const args = try self.allocOp(.{ .compute = .{ .derived = try self.arena.dupe(ir.Derived, derived[0..n]), .upstream = single } });
-        return try self.allocOp(.{ .series = .{
-            .upstream = args,
-            .start = names[0],
-            .stop = names[1],
-            .step = if (n == 3) names[2] else null,
-            .column = "generate_series",
-        } });
+        const compute = try self.allocOp(.{ .compute = .{ .derived = derived.items, .upstream = single } });
+        return try self.allocOp(.{ .expand = .{ .upstream = compute, .generator = generator, .args = args, .columns = columns } });
     }
 
-    /// `[AS] alias [(column)]` after a generate_series call. Unaliased, it
-    /// is named after the function, as a table is after itself.
-    fn seriesTarget(self: *Parser, op: *ir.Op) ParseError!FromTarget {
-        const target = try self.applyFromAlias(op, "generate_series");
-        if (op.series.alias == null) return .{ .name = target.name, .op = op, .unaliased = .in_place };
+    /// `[AS] alias [(column, ...)]` after a generate_series or unnest call.
+    /// Unaliased, it is named after the function, as a table is after itself.
+    fn expandTarget(self: *Parser, op: *ir.Op) ParseError!FromTarget {
+        const target = try self.applyFromAlias(op, op.expand.name());
+        if (op.expand.alias == null) return .{ .name = target.name, .op = op, .unaliased = .in_place };
         if (self.cur.tag == .lparen) {
             const columns = try self.parseColumnList();
-            if (columns.len != 1) return ParseError.SqlColumnListCountMismatch;
-            op.series.column = columns[0];
+            if (columns.len != op.expand.columns.len) return ParseError.SqlColumnListCountMismatch;
+            op.expand.columns = columns;
         }
         return target;
     }
@@ -5192,8 +5296,8 @@ pub const Parser = struct {
                     op.file_scan.alias = alias;
                     return op;
                 },
-                .series => {
-                    op.series.alias = alias;
+                .expand => {
+                    op.expand.alias = alias;
                     return op;
                 },
                 else => {},
@@ -5611,7 +5715,10 @@ pub const Parser = struct {
     /// `name.col` for each output column of a join input; null when they
     /// can't be listed.
     fn qualifiedColumns(self: *Parser, name: []const u8, op: *const ir.Op) ParseError!?[]const []const u8 {
-        const columns = try self.sourceColumns(op) orelse return null;
+        // A lateral call's rows carry the FROM items before it, but its own
+        // columns are only those it generates.
+        const own = op.* == .expand and op.expand.lateral;
+        const columns = if (own) op.expand.columns else try self.sourceColumns(op) orelse return null;
         const out = try self.arena.alloc([]const u8, columns.len);
         for (columns, out) |column, *qualified| {
             qualified.* = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ name, types.unqualifiedName(column) });
@@ -6524,7 +6631,14 @@ pub const Parser = struct {
         return switch (op.*) {
             .scan => |s| try self.tableColumns(s.table),
             .single_row => &.{},
-            .series => |sr| try self.arena.dupe([]const u8, &.{sr.column}),
+            .expand => |e| blk: {
+                if (!e.lateral) break :blk e.columns;
+                const upstream = try self.sourceColumns(e.upstream) orelse break :blk null;
+                var names: std.ArrayList([]const u8) = .empty;
+                for (upstream) |c| if (!nameIn(c, e.args)) try names.append(self.arena, c);
+                try names.appendSlice(self.arena, e.columns);
+                break :blk names.items;
+            },
             .limit => |l| try self.sourceColumns(l.upstream),
             .filter => |f| try self.sourceColumns(f.upstream),
             .order_by => |o| try self.sourceColumns(o.upstream),
