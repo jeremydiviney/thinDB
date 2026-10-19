@@ -416,6 +416,10 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.roundNKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, "truncate"))
             return try buildDecFn(aa, name, arg_types, arg_types[0], dec.truncateNKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "__iceberg_transform_truncate"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.icebergTruncateKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "__iceberg_transform_bucket"))
+            return try buildDecFn(aa, name, arg_types, .int, dec.icebergBucketKernel, .propagates);
     }
 
     // COALESCE / IFNULL — first non-null, all operands decimal/int.
@@ -1883,6 +1887,16 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "format_bytes", .arg_types = &.{.bigint}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.formatBytesKernel },
     .{ .name = "bar", .arg_types = &.{ .double, .double, .double, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.barKernel },
     .{ .name = "equiwidth_bucket", .arg_types = &.{ .bigint, .bigint, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.equiwidthBucketKernel },
+    // Iceberg's partition transforms, which StarRocks exposes for its
+    // Iceberg sinks. A DECIMAL resolves in `resolveDecimal`.
+    .{ .name = "__iceberg_transform_bucket", .arg_types = &.{ .int, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergBucketKernel },
+    .{ .name = "__iceberg_transform_bucket", .arg_types = &.{ .bigint, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergBucketKernel },
+    .{ .name = "__iceberg_transform_bucket", .arg_types = &.{ .date, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergBucketKernel },
+    .{ .name = "__iceberg_transform_bucket", .arg_types = &.{ .datetime, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergBucketKernel },
+    .{ .name = "__iceberg_transform_bucket", .arg_types = &.{ .string, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergBucketKernel },
+    .{ .name = "__iceberg_transform_truncate", .arg_types = &.{ .int, .bigint }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = string.icebergTruncateKernel },
+    .{ .name = "__iceberg_transform_truncate", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.icebergTruncateKernel },
+    .{ .name = "__iceberg_transform_truncate", .arg_types = &.{ .string, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.icebergTruncateKernel },
     // --- URLs ---
     .{ .name = "url_encode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlEncodeKernel },
     .{ .name = "url_decode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlDecodeKernel },
