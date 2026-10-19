@@ -116,6 +116,11 @@ Structs follow StarRocks:
 
 A NULL field, element, key or value meets the nested type beside it, so `row(1, NULL)` sits beside `row(1, [2])` in one VALUES list.
 
+JSON follows MySQL, with StarRocks' JSON functions beside MySQL's:
+- A path may leave out `$`. `a.b` reads as `$.a.b` and `[0]` as `$[0]`, in every JSON function and in `->`.
+- StarRocks' functions take a JSON or text document. `get_json_string` (or `get_json_object`) gives a string unquoted, another value as JSON text, and NULL for a JSON null. `get_json_int`, `get_json_double` and `get_json_bool` convert as StarRocks' CAST of JSON does, NULL where it can't. `json_query` gives the JSON value, and `json_exists` whether the path leads to one. An invalid path is NULL there, or 0 for `json_exists`. `parse_json` is NULL for text that isn't JSON.
+- MySQL's functions keep MySQL's rules where StarRocks differs. `JSON_LENGTH(doc, path)` is NULL for a missing path, where StarRocks gives 0. `JSON_REMOVE` applies its paths one after another and refuses `$`; StarRocks resolves every path against the original and ignores `$`. `JSON_CONTAINS` finds a value inside any element of an array. `doc->'b'` of a JSON null is a JSON null, not SQL NULL. Objects print MySQL's key order, shorter keys first.
+
 `IF`, `IFNULL`, `COALESCE` and `CASE` choose whole arrays, maps and structs; their branches meet at a common type.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian

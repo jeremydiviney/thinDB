@@ -6,8 +6,10 @@
 //! tree rather than a re-parse of the text.
 //!
 //! Path grammar: `$` root, `.member`, `."quoted member"`, `[index]`,
-//! `["member"]`. Wildcards are rejected. Paths are parsed once from the
-//! first row (constant in every practical call) and reused across the batch.
+//! `["member"]`. Wildcards are rejected. A path that doesn't start with `$`
+//! reads as StarRocks reads it, as if `$.` came first (`a.b` is `$.a.b`,
+//! `[0]` is `$[0]`). Paths are parsed once from the first row (constant in
+//! every practical call) and reused across the batch.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,34 +32,23 @@ const Step = jb.Step;
 
 const PathError = error{JsonPathInvalid} || Allocator.Error;
 
-/// Parse a `$`-rooted path into steps. Member names are decoded (quotes
-/// stripped for the `."..."` / `["..."]` forms). Wildcards are rejected.
+/// Parse a path into steps. Member names are decoded (quotes stripped for
+/// the `."..."` / `["..."]` forms). Wildcards are rejected.
 fn parsePath(aa: Allocator, path: []const u8) PathError![]const Step {
     var steps: std.ArrayList(Step) = .empty;
     errdefer steps.deinit(aa);
     var i: usize = 0;
     while (i < path.len and (path[i] == ' ' or path[i] == '\t')) i += 1;
-    if (i >= path.len or path[i] != '$') return PathError.JsonPathInvalid;
-    i += 1;
+    if (i >= path.len) return PathError.JsonPathInvalid;
+    if (path[i] == '$') {
+        i += 1;
+    } else if (path[i] != '[') {
+        i = try appendDotMember(aa, &steps, path, i);
+    }
     while (i < path.len) {
         switch (path[i]) {
             ' ', '\t' => i += 1,
-            '.' => {
-                i += 1;
-                if (i >= path.len) return PathError.JsonPathInvalid;
-                if (path[i] == '*') return PathError.JsonPathInvalid;
-                if (path[i] == '"') {
-                    const close = std.mem.indexOfScalarPos(u8, path, i + 1, '"') orelse
-                        return PathError.JsonPathInvalid;
-                    try steps.append(aa, .{ .member = path[i + 1 .. close] });
-                    i = close + 1;
-                } else {
-                    const key_start = i;
-                    while (i < path.len and path[i] != '.' and path[i] != '[') i += 1;
-                    if (i == key_start) return PathError.JsonPathInvalid;
-                    try steps.append(aa, .{ .member = path[key_start..i] });
-                }
-            },
+            '.' => i = try appendDotMember(aa, &steps, path, i + 1),
             '[' => {
                 i += 1;
                 if (i < path.len and path[i] == '*') return PathError.JsonPathInvalid;
@@ -85,9 +76,67 @@ fn parsePath(aa: Allocator, path: []const u8) PathError![]const Step {
     return steps.toOwnedSlice(aa);
 }
 
+/// Append the member name that starts at `start`, just past a `.`, and
+/// return the position after it.
+fn appendDotMember(aa: Allocator, steps: *std.ArrayList(Step), path: []const u8, start: usize) PathError!usize {
+    if (start >= path.len or path[start] == '*') return PathError.JsonPathInvalid;
+    if (path[start] == '"') {
+        const close = std.mem.indexOfScalarPos(u8, path, start + 1, '"') orelse
+            return PathError.JsonPathInvalid;
+        try steps.append(aa, .{ .member = path[start + 1 .. close] });
+        return close + 1;
+    }
+    var i = start;
+    while (i < path.len and path[i] != '.' and path[i] != '[') i += 1;
+    if (i == start) return PathError.JsonPathInvalid;
+    try steps.append(aa, .{ .member = path[start..i] });
+    return i;
+}
+
 fn pathStepsFromArg(aa: Allocator, path_arg: ColumnView, row: usize) !?[]const Step {
     if (!path_arg.isValid(row)) return null;
     return try parsePath(aa, stringViewOf(path_arg).rowBytes(row));
+}
+
+/// The path of a StarRocks JSON function, from the first row. An invalid
+/// path is null and finds nothing, where MySQL's functions raise
+/// `JsonPathInvalid`.
+fn starrocksPathSteps(aa: Allocator, path_arg: ColumnView) Allocator.Error!?[]const Step {
+    return pathStepsFromArg(aa, path_arg, 0) catch |err| switch (err) {
+        error.JsonPathInvalid => null,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// What a path finds in one row's document.
+const Lookup = union(enum) {
+    /// The document or the path is NULL, or the document isn't JSON.
+    null_input,
+    /// The path leads nowhere in the document, or is invalid.
+    missing,
+    value: []const u8,
+};
+
+/// One row's document as JSONB, which `found` points into.
+const RowLookup = struct {
+    norm: ?jb.Normalized = null,
+    found: Lookup,
+
+    fn deinit(self: RowLookup, aa: Allocator) void {
+        if (self.norm) |n| if (n.owned) aa.free(n.bytes);
+    }
+};
+
+/// What `steps` finds in row `row` of `(doc, path)` arguments. Null
+/// `steps` find nothing.
+fn lookupRow(aa: Allocator, args: []const ColumnView, steps: ?[]const Step, row: usize) Allocator.Error!RowLookup {
+    if (!args[0].isValid(row) or !args[1].isValid(row)) return .{ .found = .null_input };
+    const norm = jb.normalize(aa, stringViewOf(args[0]).rowBytes(row)) catch |err| switch (err) {
+        error.JsonInvalid => return .{ .found = .null_input },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const v = if (steps) |s| jb.navigate(norm.bytes, s) else null;
+    return .{ .norm = norm, .found = if (v) |x| .{ .value = x } else .missing };
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +383,208 @@ pub fn toJsonKernel(allocator: Allocator, args: []const ColumnView, out: *Column
         }
         if (!wrote) try emitNull(allocator, ss, out, base + i);
     }
+}
+
+/// JSON_LENGTH(doc, path) → int: the length of the value at `path`. SQL
+/// NULL where the path leads nowhere, as in MySQL.
+pub fn jsonLengthPathKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const base = out.data.rowCount();
+    const steps = try pathStepsFromArg(allocator, args[1], 0);
+    defer if (steps) |s| allocator.free(s);
+    for (0..row_count) |i| {
+        const row = try lookupRow(allocator, args, steps, i);
+        defer row.deinit(allocator);
+        const len: ?usize = switch (row.found) {
+            .value => |v| jb.arrayLen(v) orelse 1,
+            .null_input, .missing => null,
+        };
+        try out.data.int.append(allocator, @intCast(len orelse 0));
+        try out.appendValidBit(allocator, base + i, len != null);
+    }
+}
+
+/// JSON_REMOVE(doc, path, ...) → JSON: `doc` without the values the paths
+/// lead to, each path read against what the paths before it left, as in
+/// MySQL. A path that leads nowhere changes nothing. SQL NULL when an
+/// argument is NULL or the document isn't JSON; `$` itself is
+/// `JsonPathInvalid`, as MySQL refuses it.
+pub fn jsonRemoveKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const paths = try allocator.alloc(?[]const Step, args.len - 1);
+    @memset(paths, null);
+    defer {
+        for (paths) |p| if (p) |s| allocator.free(s);
+        allocator.free(paths);
+    }
+    for (paths, args[1..]) |*p, arg| {
+        p.* = try pathStepsFromArg(allocator, arg, 0);
+        if (p.*) |s| if (s.len == 0) return PathError.JsonPathInvalid;
+    }
+    const doc_sv = stringViewOf(args[0]);
+    rows: for (0..row_count) |i| {
+        for (args) |arg| if (!arg.isValid(i)) {
+            try emitNull(allocator, ss, out, base + i);
+            continue :rows;
+        };
+        const norm = jb.normalize(allocator, doc_sv.rowBytes(i)) catch {
+            try emitNull(allocator, ss, out, base + i);
+            continue;
+        };
+        defer if (norm.owned) allocator.free(norm.bytes);
+        var doc = norm.bytes;
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| allocator.free(o);
+        for (paths) |p| {
+            const next = try jb.removed(allocator, doc, p.?) orelse continue;
+            if (owned) |o| allocator.free(o);
+            owned = next;
+            doc = next;
+        }
+        try ss.appendValue(allocator, doc);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+/// GET_JSON_STRING(doc, path) → text: a string at `path` unquoted, any
+/// other value as JSON text. SQL NULL for a JSON null, as in StarRocks.
+pub fn getJsonStringKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const steps = try starrocksPathSteps(allocator, args[1]);
+    defer if (steps) |s| allocator.free(s);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(allocator);
+    for (0..row_count) |i| {
+        const row = try lookupRow(allocator, args, steps, i);
+        defer row.deinit(allocator);
+        switch (row.found) {
+            .value => |v| if (jb.tagOf(v) != .null) {
+                scratch.clearRetainingCapacity();
+                try jb.appendUnquoted(allocator, &scratch, v);
+                try ss.appendValue(allocator, scratch.items);
+                try out.appendValidBit(allocator, base + i, true);
+                continue;
+            },
+            .null_input, .missing => {},
+        }
+        try emitNull(allocator, ss, out, base + i);
+    }
+}
+
+/// JSON_QUERY(doc, path) → JSON: the value at `path`, a JSON null
+/// included. SQL NULL where the path leads nowhere.
+pub fn jsonQueryKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    const steps = try starrocksPathSteps(allocator, args[1]);
+    defer if (steps) |s| allocator.free(s);
+    for (0..row_count) |i| {
+        const row = try lookupRow(allocator, args, steps, i);
+        defer row.deinit(allocator);
+        switch (row.found) {
+            .value => |v| {
+                try ss.appendValue(allocator, v);
+                try out.appendValidBit(allocator, base + i, true);
+            },
+            .null_input, .missing => try emitNull(allocator, ss, out, base + i),
+        }
+    }
+}
+
+/// JSON_EXISTS(doc, path) → boolean: whether `path` leads to a value, a
+/// JSON null included. SQL NULL for a NULL or non-JSON document.
+pub fn jsonExistsKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const base = out.data.rowCount();
+    const steps = try starrocksPathSteps(allocator, args[1]);
+    defer if (steps) |s| allocator.free(s);
+    for (0..row_count) |i| {
+        const row = try lookupRow(allocator, args, steps, i);
+        defer row.deinit(allocator);
+        try out.data.boolean.append(allocator, @intFromBool(row.found == .value));
+        try out.appendValidBit(allocator, base + i, row.found != .null_input);
+    }
+}
+
+/// GET_JSON_INT(doc, path) → BIGINT, StarRocks' CAST of the value at `path`:
+/// a boolean is 1 or 0, a number drops its fraction, and text must spell an
+/// integer (`common.textInteger`). Anything else, or a value past BIGINT,
+/// is NULL.
+pub const getJsonIntKernel = castPathKernel("bigint", jsonInteger);
+
+/// GET_JSON_DOUBLE(doc, path) → DOUBLE: a boolean is 1 or 0, and text must
+/// spell a number (`common.textDouble`).
+pub const getJsonDoubleKernel = castPathKernel("double", jsonDouble);
+
+/// GET_JSON_BOOL(doc, path) → boolean: a number is true unless zero, and text
+/// is true or false as StarRocks casts it (`common.textBoolean`).
+pub const getJsonBoolKernel = castPathKernel("boolean", jsonBoolean);
+
+const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void;
+
+/// A StarRocks path function that casts the value at the path to a
+/// fixed-width type in `out.data`'s `field`: `cast` gives a row's value,
+/// null for SQL NULL. A JSON null, an array and an object cast to NULL.
+fn castPathKernel(comptime field: []const u8, comptime cast: anytype) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            if (row_count == 0) return;
+            const base = out.data.rowCount();
+            const steps = try starrocksPathSteps(allocator, args[1]);
+            defer if (steps) |s| allocator.free(s);
+            for (0..row_count) |i| {
+                const row = try lookupRow(allocator, args, steps, i);
+                defer row.deinit(allocator);
+                const value = switch (row.found) {
+                    .value => |v| cast(jb.operand(v)),
+                    .null_input, .missing => null,
+                };
+                try @field(out.data, field).append(allocator, value orelse 0);
+                try out.appendValidBit(allocator, base + i, value != null);
+            }
+        }
+    }.kernel;
+}
+
+fn jsonInteger(v: jb.Operand) ?i64 {
+    return switch (v) {
+        .boolean => |b| @intFromBool(b),
+        .number => |n| switch (n) {
+            .exact => |d| std.math.cast(i64, @divTrunc(d.m, std.math.powi(i128, 10, d.s) catch return null)),
+            .double => |x| if (x > -0x1p63 - 1 and x < 0x1p63) @intFromFloat(@trunc(x)) else null,
+        },
+        .string => |s| std.math.cast(i64, common.textInteger(s) orelse return null),
+        .null, .array, .object => null,
+    };
+}
+
+fn jsonDouble(v: jb.Operand) ?f64 {
+    return switch (v) {
+        .boolean => |b| if (b) 1 else 0,
+        .number => |n| switch (n) {
+            .exact => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10, @floatFromInt(d.s)),
+            .double => |x| x,
+        },
+        .string => |s| common.textDouble(s),
+        .null, .array, .object => null,
+    };
+}
+
+fn jsonBoolean(v: jb.Operand) ?u8 {
+    return switch (v) {
+        .boolean => |b| @intFromBool(b),
+        .number => |n| switch (n) {
+            .exact => |d| @intFromBool(d.m != 0),
+            .double => |x| @intFromBool(x != 0),
+        },
+        .string => |s| @intFromBool(common.textBoolean(s) orelse return null),
+        .null, .array, .object => null,
+    };
 }
 
 fn emitNull(allocator: Allocator, ss: anytype, out: *ColumnStore, row: usize) !void {
@@ -618,7 +869,9 @@ pub fn jsonToTextKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 
 test "parsePath rejects wildcards and malformed" {
     const aa = std.testing.allocator;
-    try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "a.b"));
+    try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "$13"));
+    try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, ""));
+    try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "a.*"));
     try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "$.*"));
     try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "$[*]"));
     try std.testing.expectError(PathError.JsonPathInvalid, parsePath(aa, "$."));
@@ -633,4 +886,53 @@ test "parsePath: members, indices, quoted names" {
     try std.testing.expectEqualStrings("b c", p[1].member);
     try std.testing.expectEqual(@as(usize, 2), p[2].index);
     try std.testing.expectEqualStrings("d.e", p[3].member);
+}
+
+test "parsePath reads a path without `$` as if `$.` came first" {
+    const aa = std.testing.allocator;
+    const cases = .{
+        .{ "a.b", "$.a.b" },
+        .{ "c1.f5[2]", "$.c1.f5[2]" },
+        .{ "[0].x", "$[0].x" },
+        .{ "\"1\"", "$.\"1\"" },
+        .{ " name", "$.name" },
+    };
+    inline for (cases) |c| {
+        const got = try parsePath(aa, c[0]);
+        defer aa.free(got);
+        const want = try parsePath(aa, c[1]);
+        defer aa.free(want);
+        try std.testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| switch (w) {
+            .member => |m| try std.testing.expectEqualStrings(m, g.member),
+            .index => |n| try std.testing.expectEqual(n, g.index),
+        };
+    }
+}
+
+test "the get_json casts follow StarRocks' CAST of JSON" {
+    const aa = std.testing.allocator;
+    const cases = .{
+        .{ "true", 1, 1.0, 1 },
+        .{ "false", 0, 0.0, 0 },
+        .{ "-1.123", -1, -1.123, 1 },
+        .{ "0.0", 0, 0.0, 0 },
+        .{ "\"1233\"", 1233, 1233.0, 1 },
+        .{ "\" 0 \"", 0, 0.0, 0 },
+        .{ "\"234.234\"", null, 234.234, null },
+        .{ "\"TRUE\"", null, null, 1 },
+        .{ "\"0.000\"", null, 0.0, null },
+        .{ "\"qwe\"", null, null, null },
+        .{ "1e30", null, 1e30, 1 },
+        .{ "null", null, null, null },
+        .{ "[1]", null, null, null },
+        .{ "{\"a\": 1}", null, null, null },
+    };
+    inline for (cases) |c| {
+        const v = try jb.encodeFromText(aa, c[0]);
+        defer aa.free(v);
+        try std.testing.expectEqual(@as(?i64, c[1]), jsonInteger(jb.operand(v)));
+        try std.testing.expectEqual(@as(?f64, c[2]), jsonDouble(jb.operand(v)));
+        try std.testing.expectEqual(@as(?u8, c[3]), jsonBoolean(jb.operand(v)));
+    }
 }

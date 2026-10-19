@@ -266,3 +266,61 @@ test "JSON: an extraction takes IS NULL, IN and arithmetic like any operand" {
     try helpers.expectTexts(allocator, db, "SELECT id FROM docs WHERE c1->'$.a' IN (1)", &.{"1"});
     try helpers.expectTexts(allocator, db, "SELECT id FROM docs WHERE c1->'$.b' + 1 > 2", &.{"2"});
 }
+
+test "JSON: StarRocks' JSON functions read a path with or without `$`, from a JSON or text document" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE docs (id INT, s VARCHAR(200), j JSON)");
+    try exec(allocator, db,
+        \\INSERT INTO docs VALUES
+        \\ (1, '{"k1":"v1","k2":2,"k3":null,"k4":[1,2],"k5":{"x":true},"a.b":7}', '{"k1":"v1","k2":2,"k3":null,"k4":[1,2],"k5":{"x":true},"a.b":7}'),
+        \\ (2, NULL, NULL),
+        \\ (3, 'not json', '{"k2":"12","k6":"true"}')
+    );
+    try helpers.expectTexts(allocator, db, "SELECT get_json_string(j, '$.k1') FROM docs ORDER BY id", &.{ "v1", null, null });
+    try helpers.expectTexts(allocator, db, "SELECT get_json_string(j, 'k1') FROM docs ORDER BY id", &.{ "v1", null, null });
+    try helpers.expectTexts(allocator, db, "SELECT get_json_object(s, 'k1') FROM docs ORDER BY id", &.{ "v1", null, null });
+    try helpers.expectText(allocator, db, "SELECT get_json_string(j, '$.k3') FROM docs WHERE id = 1", null);
+    try helpers.expectText(allocator, db, "SELECT get_json_string(j, '$.k4') FROM docs WHERE id = 1", "[1, 2]");
+    try helpers.expectText(allocator, db, "SELECT get_json_string(j, '$.\"a.b\"') FROM docs WHERE id = 1", "7");
+    try helpers.expectText(allocator, db, "SELECT get_json_string(j, '$.*') FROM docs WHERE id = 1", null);
+    try helpers.expectTexts(allocator, db, "SELECT get_json_int(j, '$.k2') FROM docs ORDER BY id", &.{ "2", null, "12" });
+    try helpers.expectTexts(allocator, db, "SELECT get_json_double(j, 'k2') FROM docs ORDER BY id", &.{ "2", null, "12" });
+    try helpers.expectTexts(allocator, db, "SELECT get_json_bool(j, '$.k6') FROM docs ORDER BY id", &.{ null, null, "1" });
+    try helpers.expectText(allocator, db, "SELECT get_json_int(j, '$.k1') FROM docs WHERE id = 1", null);
+    try helpers.expectTexts(allocator, db, "SELECT CAST(json_query(j, '$.k5') AS CHAR) FROM docs ORDER BY id", &.{ "{\"x\": true}", null, null });
+    try helpers.expectText(allocator, db, "SELECT CAST(json_query(j, '$.k3') AS CHAR) FROM docs WHERE id = 1", "null");
+    try helpers.expectText(allocator, db, "SELECT json_query(j, '$.zz') IS NULL FROM docs WHERE id = 1", "1");
+    try helpers.expectTexts(allocator, db, "SELECT json_exists(j, '$.k3') FROM docs ORDER BY id", &.{ "1", null, "0" });
+    try helpers.expectText(allocator, db, "SELECT json_exists(j, '$.k4[1]') FROM docs WHERE id = 1", "1");
+    try helpers.expectText(allocator, db, "SELECT json_exists(j, '$.k4[2]') FROM docs WHERE id = 1", "0");
+    try helpers.expectText(allocator, db, "SELECT json_exists(j, 'bad path[') FROM docs WHERE id = 1", "0");
+    try helpers.expectText(allocator, db, "SELECT CAST(parse_json('{\"a\": [1, 2]}')->'a' AS CHAR)", "[1, 2]");
+    try helpers.expectText(allocator, db, "SELECT parse_json('not json') IS NULL", "1");
+}
+
+test "JSON: JSON_LENGTH with a path and JSON_REMOVE follow MySQL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE docs (id INT, j JSON)");
+    try exec(allocator, db, "INSERT INTO docs VALUES (1, '{\"a\": [1, 2, 3], \"b\": {\"c\": 1, \"d\": 2}}'), (2, NULL)");
+    try helpers.expectTexts(allocator, db, "SELECT JSON_LENGTH(j, '$.a') FROM docs ORDER BY id", &.{ "3", null });
+    try helpers.expectText(allocator, db, "SELECT JSON_LENGTH(j, 'b') FROM docs WHERE id = 1", "2");
+    try helpers.expectText(allocator, db, "SELECT JSON_LENGTH(j, '$.zz') FROM docs WHERE id = 1", null);
+    try helpers.expectTexts(allocator, db, "SELECT CAST(JSON_REMOVE(j, '$.b.c') AS CHAR) FROM docs ORDER BY id", &.{ "{\"a\": [1, 2, 3], \"b\": {\"d\": 2}}", null });
+    // Each path applies to the result of the one before it, as in MySQL.
+    try helpers.expectText(allocator, db, "SELECT CAST(JSON_REMOVE(j, '$.a[0]', '$.a[0]', '$.zz') AS CHAR) FROM docs WHERE id = 1", "{\"a\": [3], \"b\": {\"c\": 1, \"d\": 2}}");
+    try helpers.expectText(allocator, db, "SELECT JSON_CONTAINS(j, '{\"a\": 2}') FROM docs WHERE id = 1", "1");
+
+    var q = try runSql(allocator, db, "SELECT JSON_REMOVE(j, '$') FROM docs");
+    defer q.deinit();
+    try std.testing.expectError(error.JsonPathInvalid, q.next());
+}

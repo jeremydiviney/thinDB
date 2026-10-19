@@ -3758,7 +3758,7 @@ test "mysql wire: runtime errors carry MySQL's codes, and only parse errors are 
     try expectStatementErr(&client, "SELECT FOUND_ROWS()", 1235, "42000", "SqlFoundRowsUnsupported");
     try expectStatementErr(&client, "SELECT SLEEP(-1)", 1210, "HY000", "IncorrectArgumentsToSleep");
     try expectStatementErr(&client, "SELECT id FROM big ORDER BY id DESC", 3170, "HY000", "MemoryBudgetExceeded");
-    try expectStatementErr(&client, "SELECT JSON_EXTRACT('{\"a\": 1}', 'a')", 1105, "HY000", null);
+    try expectStatementErr(&client, "SELECT JSON_EXTRACT('{\"a\": 1}', '$a')", 1105, "HY000", null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
