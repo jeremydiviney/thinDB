@@ -1355,6 +1355,10 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
                         hu(h, if (c.distinct) 3 else 2);
                         hstr(h, c.separator);
                     },
+                    .top_k => |k| {
+                        hu(h, 4);
+                        hu(h, k);
+                    },
                 }
             }
             try hashOp(h, g.upstream, entry);

@@ -196,6 +196,7 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "covar_pop", .func = .covar_pop },
     .{ .name = "covar_samp", .func = .covar_samp },
     .{ .name = "corr", .func = .corr },
+    .{ .name = "approx_top_k", .func = .approx_top_k },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
@@ -247,7 +248,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .udf, .max_by_key => null,
     };
 }
 
@@ -266,6 +267,20 @@ fn percentileFraction(e: ir.Expr) ?f64 {
     const name = e.call.fn_name;
     if (!std.mem.eql(u8, name, "to_double") and !std.mem.eql(u8, name, "to_float") and !std.mem.startsWith(u8, name, "to_decimal:")) return null;
     return percentileFraction(e.call.args[0]);
+}
+
+/// APPROX_TOP_K's k or counter count: an integer literal of at least 1.
+fn topKCount(e: ir.Expr) ?u32 {
+    const n: i128 = switch (exec_expr.literalValue(e) orelse return null) {
+        .tinyint => |x| x,
+        .smallint => |x| x,
+        .int => |x| x,
+        .bigint => |x| x,
+        .largeint => |x| x,
+        else => return null,
+    };
+    if (n < 1 or n > std.math.maxInt(u32)) return null;
+    return @intCast(n);
 }
 
 fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
@@ -3520,6 +3535,15 @@ pub const Parser = struct {
                 params = .{ .percentile = percentileFraction(args[1]) orelse return ParseError.SqlInvalidProjection };
                 value_args = args[0..1];
             }
+        }
+        if (func == .approx_top_k) {
+            // The third argument sizes StarRocks' table of counters, which
+            // exact counts have no use for.
+            if (args.len < 1 or args.len > 3) return ParseError.SqlInvalidProjection;
+            const k = if (args.len >= 2) topKCount(args[1]) orelse return ParseError.SqlInvalidProjection else 5;
+            if (args.len == 3 and topKCount(args[2]) == null) return ParseError.SqlInvalidProjection;
+            params = .{ .top_k = k };
+            value_args = args[0..1];
         }
         // COUNT(DISTINCT a, b) counts the distinct tuples with no NULL element.
         if (func == .count_distinct and value_args.len > 1) {

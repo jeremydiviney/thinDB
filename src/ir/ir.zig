@@ -109,6 +109,7 @@ fn sameAggParams(a: AggParams, b: AggParams) bool {
         .none => true,
         .percentile => |fraction| fraction == b.percentile,
         .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
+        .top_k => |k| k == b.top_k,
     };
 }
 
@@ -2008,6 +2009,10 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
                 try appendU32(allocator, out, @intCast(c.separator.len));
                 try out.appendSlice(allocator, c.separator);
             },
+            .top_k => |k| {
+                try out.append(allocator, 4);
+                try appendU32(allocator, out, k);
+            },
         }
     }
     try encodeOp(allocator, out, g.upstream.*);
@@ -2564,7 +2569,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 const arg2_col: ?[]const u8 = if (has_arg2_col != 0) try readString(bytes, cursor) else null;
                 const as = try readString(bytes, cursor);
                 // AggParams tag: 0=none, 1=percentile (f64 payload),
-                // 2=concat separator (string payload), 3=the same, DISTINCT.
+                // 2=concat separator (string payload), 3=the same, DISTINCT,
+                // 4=top_k (u32 payload).
                 // Older encoders omit it; we treat absence as .none for
                 // back-compat with pre-params IR.
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
@@ -2579,6 +2585,12 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                         break :blk2 .{ .percentile = @as(f64, @bitCast(bits)) };
                     },
                     2, 3 => .{ .concat = .{ .separator = try readString(bytes, cursor), .distinct = params_tag == 3 } },
+                    4 => blk2: {
+                        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+                        const k = readU32(bytes[cursor.* .. cursor.* + 4]);
+                        cursor.* += 4;
+                        break :blk2 .{ .top_k = k };
+                    },
                     else => return Error.IrCorrupt,
                 };
                 a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .arg2_col = arg2_col, .as = as, .params = params };
