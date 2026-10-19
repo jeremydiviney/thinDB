@@ -176,3 +176,28 @@ test "a star repeating another item's column names the repeat name_N" {
         try std.testing.expectEqualSlices(?i64, case[2], cells);
     }
 }
+
+test "SELECT * over a range join shows no staged right operand" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    const all_names: []const []const u8 = &.{ "e.id", "e.projectId", "externalPlanId", "name", "a.id", "a.projectId", "planId" };
+    const cases = .{
+        .{ .sql = "SELECT * FROM ext e INNER JOIN amort a ON e.projectId <= a.projectId", .names = all_names, .rows = 6 },
+        .{ .sql = "SELECT * FROM ext e INNER JOIN amort a ON a.id >= e.id - 199", .names = all_names, .rows = 5 },
+        .{ .sql = "SELECT * FROM ext e INNER JOIN amort a ON a.planId = e.externalPlanId AND a.id > e.id - 200", .names = all_names, .rows = 3 },
+        .{ .sql = "SELECT * FROM ext e INNER JOIN amort a ON e.id BETWEEN a.id + 199 AND a.id + 200", .names = all_names, .rows = 3 },
+        .{ .sql = "SELECT a.* FROM ext e INNER JOIN amort a ON a.id >= e.id - 199", .names = &.{ "id", "projectId", "planId" }, .rows = 5 },
+    };
+    inline for (cases) |c| {
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        try expectNames(q.outputSchema(), c.names);
+        var rows: usize = 0;
+        while (try q.next()) |batch| rows += batch.row_count;
+        try std.testing.expectEqual(@as(usize, c.rows), rows);
+    }
+}

@@ -4905,7 +4905,7 @@ pub const Parser = struct {
                 .left = left_op,
                 .right = right_op,
             } });
-            var hidden = on_plan.hidden_left;
+            var hidden = try self.joinStagedColumns(on_plan);
             if (filters_above) if (on_plan.residual) |pred| {
                 if (on_plan.residual_derived.len > 0) {
                     root = try self.allocOp(.{ .compute = .{ .derived = on_plan.residual_derived, .upstream = root } });
@@ -4917,9 +4917,10 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .filter = .{ .predicate = pred, .upstream = root } });
             };
             // A synthetic left-side ON expression (e.g. `ON upper(l.k) = r.k`)
-            // stages a hidden `__join_on_left_*` column the join key reads, as
-            // a residual stages its operands; drop them from the join output so
-            // they can't leak into `SELECT *`.
+            // stages a hidden `__join_on_left_*` column the join key reads, a
+            // range stages its right operand, and a residual stages its
+            // operands; drop them from the join output so they can't leak
+            // into `SELECT *`.
             if (hidden.len > 0) {
                 root = try self.allocOp(.{ .exclude = .{ .columns = hidden, .upstream = root } });
             }
@@ -6067,6 +6068,20 @@ pub const Parser = struct {
         };
         const columns = try self.qualifiedColumns(name, op) orelse return .unlisted;
         return .{ .merged = try std.mem.concat(self.arena, []const u8, &.{ merged, columns }) };
+    }
+
+    /// The staged ON columns a join emits: its left operands, and the right
+    /// copies its ranges read. The join drops a right key only while it is
+    /// an equality key, so a range's copy would surface beside its source.
+    fn joinStagedColumns(self: *Parser, plan: JoinOnPlan) ParseError![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        try out.appendSlice(self.arena, plan.hidden_left);
+        for (plan.ranges) |range| for (plan.right_derived) |d| {
+            if (!std.mem.eql(u8, d.name, range.right)) continue;
+            try out.append(self.arena, d.name);
+            break;
+        };
+        return out.items;
     }
 
     /// Each bare `*` over a FROM clause whose joins merged columns becomes
