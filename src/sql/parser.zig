@@ -201,6 +201,7 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "corr", .func = .corr },
     .{ .name = "approx_top_k", .func = .approx_top_k },
     .{ .name = "mann_whitney_u_test", .func = .mann_whitney_u_test },
+    .{ .name = "percentile_approx_weighted", .func = .percentile_approx_weighted },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
@@ -252,7 +253,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf, .max_by_key => null,
     };
 }
 
@@ -3527,13 +3528,17 @@ pub const Parser = struct {
 
         // PERCENTILE_CONT(x, p) stores p as an aggregate param; MEDIAN(x) is
         // percentile_cont(x, 0.5).
-        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr or func == .mann_whitney_u_test) {
-            const pair_params: ir.AggParams = if (func == .mann_whitney_u_test)
-                .{ .mann_whitney = mannWhitneyParams(args) orelse return ParseError.SqlInvalidProjection }
-            else if (args.len == 2)
-                .none
-            else
-                return ParseError.SqlInvalidProjection;
+        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr or func == .mann_whitney_u_test or func == .percentile_approx_weighted) {
+            const pair_params: ir.AggParams = switch (func) {
+                .mann_whitney_u_test => .{ .mann_whitney = mannWhitneyParams(args) orelse return ParseError.SqlInvalidProjection },
+                // The fourth argument is the t-digest's compression, which
+                // an exact answer has no use for.
+                .percentile_approx_weighted => if (args.len == 3 or args.len == 4)
+                    .{ .percentile = percentileFraction(args[2]) orelse return ParseError.SqlInvalidProjection }
+                else
+                    return ParseError.SqlInvalidProjection,
+                else => if (args.len == 2) .none else return ParseError.SqlInvalidProjection,
+            };
             var value_col: ?[]const u8 = null;
             var value_expr: ?ir.Expr = null;
             switch (args[0]) {
