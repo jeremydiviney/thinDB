@@ -1133,7 +1133,7 @@ fn ignoresDuplicates(a: ir.AggSpec) bool {
     if (a.col == null or a.udf_arg_cols.len != 0) return false;
     return switch (a.func) {
         .min, .max, .any_value, .bool_and, .bool_or, .bit_and, .bit_or, .unsigned_bit_and, .unsigned_bit_or, .max_by, .max_by_key, .count_distinct, .sum_distinct, .avg_distinct => true,
-        .count, .sum, .avg, .count_if, .first, .last, .bit_xor, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf => false,
+        .count, .sum, .avg, .count_if, .first, .last, .bit_xor, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .udf => false,
     };
 }
 

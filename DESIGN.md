@@ -149,7 +149,6 @@ exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
 
-<<<<<<< HEAD
 StarRocks' other calendar functions follow it too. `NEXT_DAY(d, weekday)`
 and `PREVIOUS_DAY(d, weekday)` give the first DATE after or before d's day
 that falls on the weekday, named by two letters, three, or in full, in any
@@ -159,13 +158,9 @@ case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
 milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
 `ADD_MONTHS` is `MONTHS_ADD`.
 
-`CAST(text AS DATE)`, `CAST(text AS DATETIME)` and `DATE(text)` read text
-the way StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
-=======
 `CAST(text AS DATE)`, `CAST(text AS DATETIME)`, `DATE(text)` and
 `TIMESTAMP(text)`, which is `CAST(text AS DATETIME)`, read text the way
 StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
->>>>>>> origin/main
 `textToDatetime`):
 - Space around the text is ignored. Ten characters are read as
   `YYYY?MM?DD`, where each `?` is any one character but a digit
@@ -525,7 +520,10 @@ once (`AggNames`), so every aggregate path computes the same one. A
 population statistic over one value is 0; a sample one is NULL below two.
 Over a DECIMAL, every lane folds the raw mantissas, as AVG does, and
 `aggregate.welfordResult` divides the variance by 10^(2·scale) where they
-all finish.
+all finish. `COVAR_POP(x, y)`, `COVAR_SAMP(x, y)` and `CORR(x, y)` read the
+pairs where neither side is NULL, by the same rule; CORR is also NULL where
+either side is constant, as in StarRocks and PostgreSQL, where DuckDB gives
+NaN.
 
 `PERCENTILE_CONT(x, p)` (and `MEDIAN(x)`, its p = 0.5) interpolates at index
 p×(n−1) of the sorted values, as PostgreSQL and DuckDB do.
@@ -835,7 +833,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |

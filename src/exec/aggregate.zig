@@ -146,6 +146,11 @@ pub const AggFunc = enum {
     /// PERCENTILE_APPROX, computed exactly at the place StarRocks' t-digest
     /// estimates (`percentilePlace`). Output as `percentile`.
     percentile_approx,
+    /// COVAR_POP, COVAR_SAMP and CORR of `col` and `arg2_col`, over the rows
+    /// where neither is NULL (`coMomentResult`). Output DOUBLE.
+    covar_pop,
+    covar_samp,
+    corr,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -155,7 +160,7 @@ pub const AggFunc = enum {
 /// excluded; count/sum/min/max/avg/stddev/variance all keep fixed-size state.
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
-        .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
+        .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
         .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf => return false,
     };
     return true;
@@ -306,6 +311,8 @@ pub const AccState = union(enum) {
     /// Welford's online algorithm: numerically stable variance/stddev.
     /// Covers stddev_pop, stddev_samp, var_pop, var_samp.
     welford: WelfordAcc,
+    /// Welford's update over (x, y) pairs, for covar_pop, covar_samp, corr.
+    comoment: CoMomentAcc,
     /// Exact distinct count: set of arena-dup'd value bytes, plus a flag that
     /// tracks the empty string. `""` is one distinct value (≠ NULL) but is
     /// hugely common in optional text columns; the flag counts it once instead
@@ -775,6 +782,17 @@ const WelfordAcc = struct {
     mean: f64 = 0.0,
     m2: f64 = 0.0,
     count: u64 = 0,
+};
+
+/// `c` sums (x − x̄)(y − ȳ); `m2_x` and `m2_y` are each side's squared
+/// deviations, which CORR divides by.
+const CoMomentAcc = struct {
+    count: u64 = 0,
+    mean_x: f64 = 0.0,
+    mean_y: f64 = 0.0,
+    c: f64 = 0.0,
+    m2_x: f64 = 0.0,
+    m2_y: f64 = 0.0,
 };
 
 const ConcatAcc = struct {
@@ -3280,6 +3298,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         else
             .{ .distinct_exact = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
+        .covar_pop, .covar_samp, .corr => .{ .comoment = .{} },
         .count_distinct => blk: {
             if (in) |t| if (intKeyBits(t)) |vb| break :blk if (vb <= 32)
                 .{ .distinct_int32 = .empty }
@@ -3423,7 +3442,7 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .sum_distinct => aggOutputType(.sum, in),
-        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp => .double,
+        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => .double,
         .percentile, .percentile_approx => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
             break :blk if (t == .date or t == .datetime) t else .double;
@@ -3473,6 +3492,12 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         .count => return,
         .sum, .avg, .sum_distinct, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
             const t = in orelse return Error.AggregateColumnRequired;
+            if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) {
+                return Error.AggregateUnsupportedType;
+            }
+        },
+        .covar_pop, .covar_samp, .corr => for ([_]?Type{ in, arg2_in }) |arg| {
+            const t = arg orelse return Error.AggregateColumnRequired;
             if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) {
                 return Error.AggregateUnsupportedType;
             }
@@ -3925,6 +3950,12 @@ pub fn updateState(
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => {
             try welfordUpdate(s, batch.values[col_idx.?], row_start, row_end);
         },
+        .covar_pop, .covar_samp, .corr => {
+            const y_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
+            const y_idx = types.findColumn(batch.schema, y_name) orelse return Error.ColumnNotFound;
+            const x_idx = col_idx orelse return Error.AggregateColumnRequired;
+            coMomentUpdate(&s.comoment, batch.values[x_idx], avgScaleDiv(batch.schema[x_idx].type), batch.values[y_idx], avgScaleDiv(batch.schema[y_idx].type), row_start, row_end);
+        },
         .count_distinct => {
             try distinctUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
         },
@@ -3963,6 +3994,51 @@ fn welfordUpdate(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !
                 if (!view.isValid(r)) continue;
                 welfordStep(&s.welford, @as(f64, v));
             }
+        },
+        else => unreachable,
+    }
+}
+
+/// A pair with a NULL on either side is skipped. A DECIMAL reads at its
+/// scale, so the co-moment is in the values' own units.
+fn coMomentUpdate(m: *CoMomentAcc, x_view: ColumnView, x_scale_div: f64, y_view: ColumnView, y_scale_div: f64, row_start: u32, row_end: u32) void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!x_view.isValid(r) or !y_view.isValid(r)) continue;
+        const x = numericAsF64(x_view, r) / x_scale_div;
+        const y = numericAsF64(y_view, r) / y_scale_div;
+        m.count += 1;
+        const n: f64 = @floatFromInt(m.count);
+        const dx = x - m.mean_x;
+        m.mean_x += dx / n;
+        const dy = y - m.mean_y;
+        m.mean_y += dy / n;
+        m.c += dx * (y - m.mean_y);
+        m.m2_x += dx * (x - m.mean_x);
+        m.m2_y += dy * (y - m.mean_y);
+    }
+}
+
+fn numericAsF64(view: ColumnView, row: usize) f64 {
+    return switch (view.data) {
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |sl| @floatFromInt(sl[row]),
+        inline .float, .double => |sl| sl[row],
+        else => unreachable,
+    };
+}
+
+/// COVAR_POP over one pair is 0; COVAR_SAMP and CORR need two. CORR is
+/// (c/n) / (σx·σy), as DuckDB computes it, and NULL where either side is
+/// constant, as in StarRocks and PostgreSQL (DuckDB gives NaN).
+fn coMomentResult(func: AggFunc, m: CoMomentAcc) ?f64 {
+    const n: f64 = @floatFromInt(m.count);
+    switch (func) {
+        .covar_pop => return if (m.count >= 1) m.c / n else null,
+        .covar_samp => return if (m.count >= 2) m.c / (n - 1) else null,
+        .corr => {
+            if (m.count < 2) return null;
+            const deviations = @sqrt(m.m2_x / n) * @sqrt(m.m2_y / n);
+            return if (deviations == 0) null else (m.c / n) / deviations;
         },
         else => unreachable,
     }
@@ -4514,6 +4590,14 @@ pub fn appendAccToColumn(
                 try col.data.double.append(allocator, if (func == .avg_distinct) distinct.sum / @as(f64, @floatFromInt(distinct.count)) else distinct.sum);
             },
             else => unreachable,
+        },
+        .covar_pop, .covar_samp, .corr => {
+            if (coMomentResult(func, state.comoment)) |out| {
+                try col.data.double.append(allocator, out);
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
         },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
             const w = state.welford;
