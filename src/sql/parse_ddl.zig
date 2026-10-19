@@ -1773,10 +1773,21 @@ fn parseBaseColumnType(p: anytype) !types.Type {
         }
         return numericModifiers(p, .double);
     }
-    if (asciiEqlAny(name, &.{ "decimal", "numeric", "dec", "fixed" })) {
+    // StarRocks' DECIMAL32/64/128(p[, s]) name the width that holds p digits:
+    // 9, 18 or 38 at most.
+    const width_digits: ?i64 = if (std.ascii.eqlIgnoreCase(name, "decimal32"))
+        9
+    else if (std.ascii.eqlIgnoreCase(name, "decimal64"))
+        18
+    else if (std.ascii.eqlIgnoreCase(name, "decimal128"))
+        38
+    else
+        null;
+    if (width_digits != null or asciiEqlAny(name, &.{ "decimal", "numeric", "dec", "fixed" })) {
         // MySQL's defaults: DECIMAL = DECIMAL(10, 0), DECIMAL(p) = DECIMAL(p, 0).
         var p_raw: i64 = 10;
         var s_raw: i64 = 0;
+        if (width_digits != null and p.cur.tag != .lparen) return PE.SqlExpectedToken;
         if (p.cur.tag == .lparen) {
             try p.advance();
             if (p.cur.tag != .integer) return PE.SqlExpectedValue;
@@ -1791,7 +1802,7 @@ fn parseBaseColumnType(p: anytype) !types.Type {
             try p.expect(.rparen);
         }
         try skipIntegerModifiers(p);
-        if (p_raw < 1 or p_raw > 38 or s_raw < 0 or s_raw > p_raw) return PE.SqlExpectedValue;
+        if (p_raw < 1 or p_raw > (width_digits orelse 38) or s_raw < 0 or s_raw > p_raw) return PE.SqlExpectedValue;
         const p_u: u8 = @intCast(p_raw);
         const s_u: u8 = @intCast(s_raw);
         return if (p_u <= 18)
