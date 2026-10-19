@@ -1176,6 +1176,38 @@ test "sql: ORDER BY ordinal counts each column a star expands to" {
     try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlCtx(allocator, db, "SELECT *, 1 AS one FROM o ORDER BY 6"));
 }
 
+test "sql: ORDER BY ALL sorts by every SELECT item, left to right" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, k BIGINT NOT NULL, qty BIGINT, big BIGINT NOT NULL, PRIMARY KEY (id))");
+    try helpers.exec(allocator, db, "INSERT INTO o VALUES (1, 1, 5, 30), (2, 2, NULL, 10), (3, 1, 2, 20), (4, 2, 7, 40), (5, 3, NULL, 50)");
+
+    const cases = .{
+        .{ "SELECT k, id FROM o ORDER BY ALL", &[_]?i64{ 1, 1, 1, 3, 2, 2, 2, 4, 3, 5 } },
+        .{ "SELECT k, id FROM o ORDER BY ALL DESC", &[_]?i64{ 3, 5, 2, 4, 2, 2, 1, 3, 1, 1 } },
+        .{ "SELECT qty, id FROM o ORDER BY ALL NULLS LAST", &[_]?i64{ 2, 3, 5, 1, 7, 4, null, 2, null, 5 } },
+        .{ "SELECT * FROM o WHERE k = 2 ORDER BY ALL", &[_]?i64{ 2, 2, null, 10, 4, 2, 7, 40 } },
+        .{ "SELECT 0 - id AS neg, k FROM o ORDER BY ALL", &[_]?i64{ -5, 3, -4, 2, -3, 1, -2, 2, -1, 1 } },
+        .{ "SELECT k, COUNT(*) AS n FROM o GROUP BY k ORDER BY ALL DESC", &[_]?i64{ 3, 1, 2, 2, 1, 2 } },
+        .{ "SELECT k FROM o UNION ALL SELECT id FROM o WHERE id < 3 ORDER BY ALL", &[_]?i64{ 1, 1, 1, 2, 2, 2, 3 } },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSqlCtx(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(?i64, c[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlCtx(allocator, db, "SELECT k FROM o ORDER BY ALL, k"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlCtx(allocator, db, "SELECT k, ROW_NUMBER() OVER (ORDER BY ALL) FROM o"));
+}
+
 test "sql: ORDER BY an expression sorts on its value" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
