@@ -1000,6 +1000,31 @@ test "sql ddl: MySQL type aliases map onto thinDB types" {
     try std.testing.expectEqualSlices(i64, &.{2224}, got);
 }
 
+test "sql ddl: StarRocks DECIMAL32/64/128(p, s) are DECIMAL(p, s) within their width" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE dn (id INT PRIMARY KEY, a DECIMAL32(9, 2), b decimal64(18,5), c Decimal128(38, 10), d DECIMAL64(7))");
+    const t = try db.openTable("dn", .{});
+    try std.testing.expectEqual(thindb.types.DecimalSpec{ .p = 9, .s = 2 }, t.schema.columns[1].type.decimal64);
+    try std.testing.expectEqual(thindb.types.DecimalSpec{ .p = 18, .s = 5 }, t.schema.columns[2].type.decimal64);
+    try std.testing.expectEqual(thindb.types.DecimalSpec{ .p = 38, .s = 10 }, t.schema.columns[3].type.decimal128);
+    try std.testing.expectEqual(thindb.types.DecimalSpec{ .p = 7, .s = 0 }, t.schema.columns[4].type.decimal64);
+
+    try exec(allocator, db, "INSERT INTO dn VALUES (1, 1234567.89, 1.5, 0.1234567891, 42)");
+    try helpers.expectText(allocator, db, "SELECT CAST(CAST(b * 2 AS DECIMAL64(10, 2)) AS VARCHAR(20)) FROM dn", "3.00");
+    try helpers.expectText(allocator, db, "SELECT CAST(a + d AS VARCHAR(20)) FROM dn", "1234609.89");
+
+    try std.testing.expectError(error.SqlExpectedValue, exec(allocator, db, "CREATE TABLE bad (a DECIMAL32(10, 2))"));
+    try std.testing.expectError(error.SqlExpectedValue, exec(allocator, db, "CREATE TABLE bad (a DECIMAL64(19, 2))"));
+    try std.testing.expectError(error.SqlExpectedValue, exec(allocator, db, "SELECT CAST(1 AS DECIMAL128(39, 2))"));
+    try std.testing.expectError(error.SqlExpectedToken, exec(allocator, db, "CREATE TABLE bad (a DECIMAL64)"));
+}
+
 test "sql ddl: index and constraint clauses are accepted, only PRIMARY KEY is kept" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

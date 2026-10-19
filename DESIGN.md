@@ -329,6 +329,8 @@ MySQL DDL type names without a type of their own map onto the table above:
 - `TIME` is `STRING`, holding the `HH:MM:SS[.ffffff]` text.
 - `ENUM` and `SET` are `STRING`; their label lists are not enforced.
 
+StarRocks' `DECIMAL32(p, s)`, `DECIMAL64(p, s)` and `DECIMAL128(p, s)` are `DECIMAL(p, s)`, in DDL and CAST. The precision is required and at most 9, 18 or 38, the digits the named width holds.
+
 A TIME function (`HOUR`, `TIME_TO_SEC`, `TIME`, `TIMEDIFF`, `ADDTIME` and the rest) reads a number argument as MySQL does. It reads the `HHMMSS` digits, or a DATETIME from 14 digits on. A number past 838:59:59, or one whose minute or second is past 59, is no TIME and gives NULL. Text past the range clamps to 838:59:59 instead.
 
 `NOW()` and its synonyms (`CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `SYSDATE`, `UTC_TIMESTAMP`) read the clock once per statement. In the MySQL dialect the bare forms give whole seconds and `NOW(n)` truncates to `n` fraction digits, as MySQL does. The other dialects keep microseconds. A column's `DEFAULT CURRENT_TIMESTAMP` also keeps microseconds, since a DATETIME stores no declared precision. `UNIX_TIMESTAMP()` with no argument is the same clock's whole seconds since 1970.
