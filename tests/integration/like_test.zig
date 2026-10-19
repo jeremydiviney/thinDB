@@ -148,6 +148,29 @@ test "REGEXP functions read each row's own pattern, replacement and match type" 
     }
 }
 
+test "REGEXP_COUNT, REGEXP_EXTRACT and REGEXP_EXTRACT_ALL count and cut out every match" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE rx (id BIGINT PRIMARY KEY, s VARCHAR(20), p VARCHAR(40), g BIGINT)");
+    try exec(allocator, db,
+        \\INSERT INTO rx VALUES (1, 'AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 1), (2, 'a1b22c333', '[0-9]+', 0),
+        \\  (3, 'abc', 'z', 0), (4, 'abc', '', 0), (5, NULL, 'a', 0), (6, 'abc', NULL, 0), (7, 'AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 3),
+        \\  (8, 'ab', 'a|(x)', 1)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("rx", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_COUNT(s, p) AS CHAR) FROM rx ORDER BY id", &.{ "2", "3", "0", "4", null, null, "1", "1" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_EXTRACT(s, p, g) FROM rx ORDER BY id", &.{ "b", "1", "", "", null, null, "", "" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_EXTRACT_ALL(s, p, g) FROM rx ORDER BY id", &.{ "[\"b\",\"x\"]", "[\"1\",\"22\",\"333\"]", "[]", "[\"\",\"\",\"\",\"\"]", null, null, "[]", "[\"\"]" });
+    }
+    try helpers.expectText(allocator, db, "SELECT REGEXP_EXTRACT_ALL('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 2)", "[\"d\",\"e\"]");
+    try helpers.expectText(allocator, db, "SELECT REGEXP_EXTRACT('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0)", "bCd");
+    try std.testing.expectError(error.RegexInvalidPattern, exec(allocator, db, "SELECT REGEXP_COUNT('abc', '(a')"));
+}
+
 test "LIKE: backslash escapes by default, ESCAPE names another character" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

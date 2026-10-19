@@ -22,6 +22,7 @@ const ResolvedOverload = scalar_fn.ResolvedOverload;
 const TypedKernel = scalar_fn.TypedKernel;
 const cast = @import("cast.zig");
 const common = @import("scalar_fn_common.zig");
+const string = @import("scalar_fn_string.zig");
 const nested = @import("nested.zig");
 const json_binary = @import("json_binary.zig");
 const Error = @import("exec.zig").Error;
@@ -36,7 +37,7 @@ const NAMES = [_][]const u8{
     "array_remove",           "array_append",       "array_concat",     "arrays_overlap",
     "array_contains_all",     "array_contains_seq", "array_intersect",  scalar_fn.ARRAY_ORDER_FN,
     "array_filter",           "any_match",          "all_match",        "array_sortby",
-    "array_map",
+    "array_map",              "regexp_extract_all",
 };
 
 pub fn isArrayFnName(name: []const u8) bool {
@@ -74,6 +75,10 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     if (eql(name, "split")) {
         if (arg_types.len != 2 or !isText(arg_types[0]) or !isText(arg_types[1])) return null;
         return overload(aa, name, arg_types, try types.arrayOf(.string), splitKernel);
+    }
+    if (eql(name, "regexp_extract_all")) {
+        if (arg_types.len != 3 or !isText(arg_types[0]) or !isText(arg_types[1]) or !arg_types[2].isInteger()) return null;
+        return overload(aa, name, arg_types, try types.arrayOf(.string), regexpExtractAllKernel);
     }
     if (eql(name, "array_generate")) {
         if (arg_types.len < 2 or arg_types.len > 3) return null;
@@ -625,6 +630,30 @@ fn splitKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, ar
             while (it.next()) |part| try appendText(allocator, &b.elements, part);
         }
         try b.endRow(allocator, true);
+    }
+    try b.finish(allocator, out);
+}
+
+/// REGEXP_EXTRACT_ALL(s, pattern, group): capture group `group` of every
+/// match (`string.regexGroup`), each search resuming where the last match
+/// ended; empty when the pattern has no such group.
+fn regexpExtractAllKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    var b = try ArrayBuilder.init(allocator, .string);
+    defer b.deinit(allocator);
+    var call = string.RegexCall.init(allocator, args[1], null);
+    defer call.deinit();
+    const text = common.stringViewOf(args[0]);
+    for (0..rows) |r| {
+        const valid = try call.at(r) != null and args[0].isValid(r) and args[2].isValid(r);
+        if (valid) {
+            const s = text.rowBytes(r);
+            const group = intAt(args[2], r).?;
+            var pos: usize = 0;
+            while (try call.next(s, &pos)) |slots| try appendText(allocator, &b.elements, string.regexGroup(s, slots, group) orelse break);
+        }
+        try b.endRow(allocator, valid);
     }
     try b.finish(allocator, out);
 }

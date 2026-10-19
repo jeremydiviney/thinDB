@@ -64,7 +64,7 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
 /// allocates ~nothing per row. Each row may give its own pattern and match
 /// type. The last pair compiled is kept, so a constant pattern compiles
 /// once per batch, and a column of them once per change.
-const RegexCall = struct {
+pub const RegexCall = struct {
     allocator: Allocator,
     patterns: ColumnView,
     match_types: ?ColumnView,
@@ -78,11 +78,11 @@ const RegexCall = struct {
         match_type: []u8,
     };
 
-    fn init(allocator: Allocator, patterns: ColumnView, match_types: ?ColumnView) RegexCall {
+    pub fn init(allocator: Allocator, patterns: ColumnView, match_types: ?ColumnView) RegexCall {
         return .{ .allocator = allocator, .patterns = patterns, .match_types = match_types, .scratch = regex.Scratch.init(allocator) };
     }
 
-    fn deinit(self: *RegexCall) void {
+    pub fn deinit(self: *RegexCall) void {
         self.release();
         self.scratch.deinit();
     }
@@ -99,7 +99,7 @@ const RegexCall = struct {
     /// The regex `row` names, or null when its pattern or match type is
     /// NULL. Compiled even when the row's other arguments are NULL, so a
     /// malformed pattern fails the call as it does in MySQL.
-    fn at(self: *RegexCall, row: usize) !?*regex.Regex {
+    pub fn at(self: *RegexCall, row: usize) !?*regex.Regex {
         if (!self.patterns.isValid(row)) return null;
         const pattern = stringViewOf(self.patterns).rowBytes(row);
         var match_type: []const u8 = "";
@@ -132,6 +132,18 @@ const RegexCall = struct {
         @memset(c.slots, null);
         if (!try c.re.findNth(&self.scratch, s, start, occurrence, c.slots)) return null;
         return .{ c.slots[0].?, c.slots[1].? };
+    }
+
+    /// The capture slots of the first match at or after byte `pos.*` of
+    /// the pattern `at` last gave, `pos.*` moving to where the search
+    /// after it resumes; null when there is none.
+    pub fn next(self: *RegexCall, s: []const u8, pos: *usize) !?[]const ?usize {
+        const c = &self.compiled.?;
+        if (pos.* > s.len) return null;
+        @memset(c.slots, null);
+        if (!try c.re.findWith(&self.scratch, s, pos.*, c.slots)) return null;
+        pos.* = regex.afterMatch(s, c.slots[0].?, c.slots[1].?);
+        return c.slots;
     }
 };
 
@@ -1177,6 +1189,56 @@ pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *
         try ss.appendValue(allocator, if (bounds) |b| src[b[0]..b[1]] else "");
         try out.appendValidBit(allocator, base + i, bounds != null);
     }
+}
+
+/// REGEXP_COUNT(s, pattern): how many times `pattern` matches `s`, each
+/// search resuming where the last match ended.
+pub fn regexpCountKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    var call = RegexCall.init(allocator, args[1], null);
+    defer call.deinit();
+    const sv = stringViewOf(args[0]);
+    for (0..row_count) |i| {
+        const valid = try call.at(i) != null and args[0].isValid(i);
+        var count: i64 = 0;
+        if (valid) {
+            var pos: usize = 0;
+            while (try call.next(sv.rowBytes(i), &pos)) |_| count += 1;
+        }
+        try out.data.bigint.append(allocator, count);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// REGEXP_EXTRACT(s, pattern, group): capture group `group` of the first
+/// match (`regexGroup`); '' when nothing matches or there is no such group.
+pub fn regexpExtractKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var call = RegexCall.init(allocator, args[1], null);
+    defer call.deinit();
+    const sv = stringViewOf(args[0]);
+    for (0..row_count) |i| {
+        const valid = try call.at(i) != null and allValid(args, i);
+        var text: []const u8 = "";
+        if (valid) {
+            const s = sv.rowBytes(i);
+            var pos: usize = 0;
+            if (try call.next(s, &pos)) |slots| text = regexGroup(s, slots, args[2].data.bigint[i]) orelse "";
+        }
+        try ss.appendValue(allocator, text);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// The text of capture group `group` (0 the whole match) in a match's
+/// `slots`: '' when the group took no part in the match, null when the
+/// pattern has no such group.
+pub fn regexGroup(s: []const u8, slots: []const ?usize, group: i64) ?[]const u8 {
+    if (group < 0 or @as(u64, @intCast(group)) >= slots.len / 2) return null;
+    const g: usize = @intCast(group);
+    const start = slots[2 * g] orelse return "";
+    return s[start..slots[2 * g + 1].?];
 }
 
 pub fn bitLengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
