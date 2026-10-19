@@ -1622,6 +1622,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "date_add_hours", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddHoursKernel },
     .{ .name = "date_add_minutes", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMinutesKernel },
     .{ .name = "date_add_seconds", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddSecondsKernel },
+    .{ .name = "date_add_millis", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMillisKernel },
     .{ .name = "date_add_micros", .arg_types = &.{ .datetime, .bigint }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.datetimeAddMicrosKernel },
     .{ .name = "unix_timestamp", .arg_types = &.{.datetime}, .return_type = .bigint, .kernel = date.unixTimestampKernel },
     .{ .name = "from_unixtime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeKernel },
