@@ -3141,8 +3141,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.create_zig_function)) return Error.IrCorrupt;
-    const tag: DdlTag = @enumFromInt(t);
+    const tag = std.enums.fromInt(DdlTag, t) orelse return Error.IrCorrupt;
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try decodeCreateNamespace(bytes, cursor) },
         .drop_database => DdlOp{ .drop_database = try decodeDropNamespace(bytes, cursor) },
@@ -3870,6 +3869,41 @@ test "ir: database and schema ddl round-trip with their existence flags" {
                 try std.testing.expectEqualStrings(root.ddl.drop_schema.name, ns.name);
                 try std.testing.expectEqual(root.ddl.drop_schema.if_exists, ns.if_exists);
             },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "ir: view ddl round-trips" {
+    const allocator = std.testing.allocator;
+    const cases = [_]Op{
+        .{ .ddl = .{ .create_view = .{ .name = "mv", .or_replace = false, .materialized = true, .body = "SELECT a FROM t" } } },
+        .{ .ddl = .{ .drop_view = .{ .name = "v", .if_exists = true, .materialized = false } } },
+        .{ .ddl = .{ .refresh_view = "mv" } },
+    };
+
+    for (cases) |root| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, root);
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+
+        try std.testing.expect(decoded == .ddl);
+        switch (decoded.ddl) {
+            .create_view => |cv| {
+                try std.testing.expectEqualStrings(root.ddl.create_view.name, cv.name);
+                try std.testing.expectEqualStrings(root.ddl.create_view.body, cv.body);
+                try std.testing.expectEqual(root.ddl.create_view.or_replace, cv.or_replace);
+                try std.testing.expectEqual(root.ddl.create_view.materialized, cv.materialized);
+            },
+            .drop_view => |dv| {
+                try std.testing.expectEqualStrings(root.ddl.drop_view.name, dv.name);
+                try std.testing.expectEqual(root.ddl.drop_view.if_exists, dv.if_exists);
+                try std.testing.expectEqual(root.ddl.drop_view.materialized, dv.materialized);
+            },
+            .refresh_view => |name| try std.testing.expectEqualStrings(root.ddl.refresh_view, name),
             else => return error.TestUnexpectedResult,
         }
     }
