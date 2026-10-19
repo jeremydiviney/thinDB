@@ -200,6 +200,7 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "covar_samp", .func = .covar_samp },
     .{ .name = "corr", .func = .corr },
     .{ .name = "approx_top_k", .func = .approx_top_k },
+    .{ .name = "mann_whitney_u_test", .func = .mann_whitney_u_test },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
@@ -251,7 +252,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .udf, .max_by_key => null,
     };
 }
 
@@ -284,6 +285,40 @@ fn topKCount(e: ir.Expr) ?u32 {
     };
     if (n < 1 or n > std.math.maxInt(u32)) return null;
     return @intCast(n);
+}
+
+/// MANN_WHITNEY_U_TEST's optional third and fourth arguments: a literal
+/// 'two-sided', 'less' or 'greater', and an integer literal, nonzero to
+/// correct for continuity.
+fn mannWhitneyParams(args: []const ir.Expr) ?exec_aggregate.MannWhitneyParams {
+    if (args.len < 2 or args.len > 4) return null;
+    var params: exec_aggregate.MannWhitneyParams = .{};
+    if (args.len >= 3) {
+        const text = switch (exec_expr.literalValue(args[2]) orelse return null) {
+            .text => |s| s,
+            else => return null,
+        };
+        params.alternative = if (std.ascii.eqlIgnoreCase(text, "two-sided"))
+            .two_sided
+        else if (std.ascii.eqlIgnoreCase(text, "less"))
+            .less
+        else if (std.ascii.eqlIgnoreCase(text, "greater"))
+            .greater
+        else
+            return null;
+    }
+    if (args.len == 4) {
+        const correction: i128 = switch (exec_expr.literalValue(args[3]) orelse return null) {
+            .tinyint => |x| x,
+            .smallint => |x| x,
+            .int => |x| x,
+            .bigint => |x| x,
+            .largeint => |x| x,
+            else => return null,
+        };
+        params.continuity_correction = correction != 0;
+    }
+    return params;
 }
 
 fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
@@ -3492,8 +3527,13 @@ pub const Parser = struct {
 
         // PERCENTILE_CONT(x, p) stores p as an aggregate param; MEDIAN(x) is
         // percentile_cont(x, 0.5).
-        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr) {
-            if (args.len != 2) return ParseError.SqlInvalidProjection;
+        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr or func == .mann_whitney_u_test) {
+            const pair_params: ir.AggParams = if (func == .mann_whitney_u_test)
+                .{ .mann_whitney = mannWhitneyParams(args) orelse return ParseError.SqlInvalidProjection }
+            else if (args.len == 2)
+                .none
+            else
+                return ParseError.SqlInvalidProjection;
             var value_col: ?[]const u8 = null;
             var value_expr: ?ir.Expr = null;
             switch (args[0]) {
@@ -3522,6 +3562,7 @@ pub const Parser = struct {
                 .arg_expr = value_expr,
                 .arg2_col = key_col,
                 .arg2_expr = key_expr,
+                .params = pair_params,
             } };
         }
 

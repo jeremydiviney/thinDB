@@ -282,6 +282,37 @@ test "aggregate: APPROX_TOP_K counts each value, NULL included, most frequent fi
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT APPROX_TOP_K(x, id) FROM tk"));
 }
 
+test "aggregate: MANN_WHITNEY_U_TEST ranks the false-index sample against the true, as StarRocks does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE mw (id BIGINT PRIMARY KEY, x INT, t BOOLEAN, m DECIMAL(6,2), s VARCHAR(8))");
+    try helpers.exec(allocator, db, "INSERT INTO mw VALUES (1, 11, true, 1.10, 'a'), (2, 22, false, 2.20, 'b'), (3, 33, true, 3.30, 'c'), " ++
+        "(4, NULL, NULL, NULL, NULL), (5, -11, true, -1.10, 'd'), (6, NULL, NULL, NULL, NULL)");
+    const identical = "{\"Error\": \"All numbers in both samples are identical.\"}";
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("mw", .{})).flush();
+        // StarRocks' answers.
+        try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t) AS STRING) FROM mw", "[2, 1]");
+        try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t, 'less') AS STRING) FROM mw", "[2, 0.8144533152386512]");
+        try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(m, t, 'GREATER') AS STRING) FROM mw", "[2, 0.5]");
+        try helpers.expectTexts(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t, 'less') AS STRING) FROM mw GROUP BY id % 3 ORDER BY id % 3", &.{ identical, identical, "[1, 0.9772498680518208]" });
+        try helpers.expectText(allocator, db, "SELECT MANN_WHITNEY_U_TEST(x, t) FROM mw WHERE id > 100", null);
+        try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t) AS STRING) FROM mw WHERE t", "{\"Error\": \"Both samples must have numbers.\"}");
+    }
+    try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t, 'two-sided') AS STRING) FROM TABLE(generate_series(1, 10)) AS numbers(x), TABLE(generate_series(0, 1)) AS idx(t)", "[50, 0.9697360424200407]");
+    try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(x, t, 'two-sided', 0) AS STRING) FROM TABLE(generate_series(1, 10)) AS numbers(x), TABLE(generate_series(0, 1)) AS idx(t)", "[50, 1]");
+    try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(c1, c2) AS STRING) FROM (VALUES (1, true), (1, false), (2, true), (2, false), (3, false), (3, NULL)) AS v(c1, c2)", "[4, 0.7609067270751142]");
+    try helpers.expectText(allocator, db, "SELECT CAST(MANN_WHITNEY_U_TEST(1, 1) AS STRING)", identical);
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT MANN_WHITNEY_U_TEST(x, t, 'sideways') FROM mw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT MANN_WHITNEY_U_TEST(x, t, 'less', id) FROM mw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT MANN_WHITNEY_U_TEST(x) FROM mw"));
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT MANN_WHITNEY_U_TEST(s, t) FROM mw"));
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

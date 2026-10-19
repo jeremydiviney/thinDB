@@ -923,7 +923,7 @@ fn groupState(
                     payload += keptValueWidth(st, schema, key_idx.?);
                 }
             },
-            .count_distinct, .sum_distinct, .avg_distinct, .approx_top_k => {
+            .count_distinct, .sum_distinct, .avg_distinct, .approx_top_k, .mann_whitney_u_test => {
                 group += 16;
                 out_fixed += 16;
                 const i = in_idx orelse continue;
