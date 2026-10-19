@@ -436,6 +436,8 @@ StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the ho
 
 Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s` as `hex` (the default), `encode64` (padded base64) or `utf8` (the bytes as they are), named in any case. Text that isn't hex or base64 gives '', and empty base64 NULL, as in StarRocks. `FROM_BINARY(b[, format])` writes bytes in the same formats, hex in capitals. `FORMAT_BYTES(n)` writes a byte count in the largest binary unit it reaches, `B` through `EB`, with two decimals past `B` (`1.50 KB`); a negative count is NULL. `BAR(size, min, max, width)` draws `width` `▓` characters scaled by where `size` falls in `[min, max]`, in whole characters. `POSITIVE(x)` is `+x`.
 
+`AES_ENCRYPT(text, key[, iv[, mode[, aad]]])` and `AES_DECRYPT(bytes, key[, iv[, mode[, aad]]])` take StarRocks' arguments, of which the first two are MySQL's. `mode` is `AES_<128|192|256>_<ECB|CBC|CFB|CFB1|CFB8|CFB128|OFB|CTR|GCM>` in any case, AES_128_ECB by default, CFB being CFB128. The key folds into the mode's key length by XOR, as MySQL folds it. The IV is zero-padded or cut to 16 bytes, an empty IV is StarRocks' default `STARROCKS_16BYTE`, and ECB ignores it, so a NULL IV doesn't make ECB NULL. ECB and CBC pad with PKCS#7. GCM uses the IV's first 12 bytes as its nonce, takes `aad` as its additional data, and writes the nonce, the ciphertext and the 16-byte tag. Decryption reads its nonce from those bytes. Any other NULL argument gives NULL, and so does decrypting bytes the mode can't have written, such as broken padding or a tag that doesn't match. A mode that isn't one, or an `aad` beside a mode other than GCM, raises `InvalidEncryptionMode`. std carries AES for 128- and 256-bit keys only, so `util/aes.zig` expands the keys of all three sizes for std's rounds.
+
 Regular expressions (`util/regex.zig`) are RE2's linear-time subset, POSIX bracket classes such as `[[:lower:]]` included. Every `REGEXP_*` function reads each row's own pattern. `REGEXP_COUNT(s, p)` counts the matches, each search resuming where the last match ended, or one character on after an empty match. `REGEXP_EXTRACT(s, p, group)` is a capture group of the first match, where group 0 is the whole match. It gives '' when nothing matches or the group took no part in the match. `REGEXP_EXTRACT_ALL(s, p, group)` is the array of that group across every match. Both give '' or an empty array for a group the pattern doesn't have, as StarRocks does. Unlike StarRocks, which gives NULL for a malformed pattern read from a column, thinDB fails the query with `RegexInvalidPattern`, as MySQL does.
 
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
@@ -1951,6 +1953,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `InvalidBinaryFormat` means `TO_BINARY` or `FROM_BINARY` was given a format other than `hex`, `encode64` or `utf8`. StarRocks fails the query too.
 
 `InvalidBarArguments` means `BAR` was given a size outside `[min, max]`, a min not below its max, or a negative width, which StarRocks also refuses.
+
+`InvalidEncryptionMode` means `AES_ENCRYPT` or `AES_DECRYPT` was given a mode other than `AES_<128|192|256>_<ECB|CBC|CFB|CFB1|CFB8|CFB128|OFB|CTR|GCM>`, or additional data beside a mode other than GCM. StarRocks fails the query too.
 
 `InvalidTeradataFormat` means `TO_TERA_DATE` or `TO_TERA_TIMESTAMP` was given a format with something other than Teradata's elements and separators, which StarRocks also refuses.
 
