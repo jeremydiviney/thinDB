@@ -364,6 +364,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
                     e.* = .{ .lit = .{ .date = @intCast(@divFloor(ctx.now_micros, std.time.us_per_day)) } };
                     return;
                 }
+                if (std.ascii.eqlIgnoreCase(c.fn_name, "unix_timestamp")) {
+                    e.* = .{ .lit = .{ .bigint = @divFloor(ctx.now_micros, std.time.us_per_s) } };
+                    return;
+                }
                 if (std.ascii.eqlIgnoreCase(c.fn_name, "last_insert_id")) {
                     e.* = .{ .lit = .{ .bigint = std.math.cast(i64, ctx.session.last_insert_id) orelse std.math.maxInt(i64) } };
                     return;

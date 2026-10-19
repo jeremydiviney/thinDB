@@ -82,7 +82,7 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
         return overload(aa, name, arg_types, try types.arrayOf(.string), regexpExtractAllKernel);
     }
     if (eql(name, "array_generate")) {
-        if (arg_types.len < 2 or arg_types.len > 3) return null;
+        if (arg_types.len < 1 or arg_types.len > 3) return null;
         for (arg_types) |t| if (!t.isInteger()) return null;
         return overload(aa, name, arg_types, try types.arrayOf(.bigint), generateKernel);
     }
@@ -677,17 +677,18 @@ fn regexpExtractAllKernel(allocator: Allocator, arg_types: []const Type, out_typ
     try b.finish(allocator, out);
 }
 
-/// ARRAY_GENERATE(start, end[, step]): start, start + step, ... up to and
-/// including end. The step defaults to 1, or -1 when end is below start; a
-/// step away from end, or of 0, gives an empty array.
+/// ARRAY_GENERATE([start, ]end[, step]): start, start + step, ... up to and
+/// including end, start being 1 when left out. The step defaults to 1, or -1
+/// when end is below start; a step away from end, or of 0, gives an empty
+/// array.
 fn generateKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
     _ = arg_types;
     _ = out_type;
     var b = try ArrayBuilder.init(allocator, .bigint);
     defer b.deinit(allocator);
     for (0..rows) |r| {
-        const start = intAt(args[0], r);
-        const end = intAt(args[1], r);
+        const start = if (args.len == 1) 1 else intAt(args[0], r);
+        const end = intAt(args[if (args.len == 1) 0 else 1], r);
         const step = if (args.len == 3) intAt(args[2], r) else if (start != null and end != null and end.? < start.?) @as(?i64, -1) else 1;
         if (start == null or end == null or step == null) {
             try b.endRow(allocator, false);

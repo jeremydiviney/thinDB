@@ -96,6 +96,7 @@ Arrays follow StarRocks:
 - Text casts to an array from StarRocks' `[1, "a", null]` or PostgreSQL's `{1,a,NULL}`. An element that doesn't read as the element type is NULL. Text that isn't an array is NULL in a CAST and fails an INSERT.
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
 - `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
+- `ARRAY_GENERATE(start, end[, step])` counts from start to end, by -1 when end is below start. `ARRAY_GENERATE(n)` starts at 1, as in StarRocks, so an n below 1 counts down.
 - `cosine_similarity(a, b)`, `cosine_similarity_norm(a, b)` (the inner product, for vectors already of length 1) and `l2_distance(a, b)` (the squared distance) take two numeric arrays of one length, else `ArrayLengthMismatch`. Over FLOAT vectors, or a FLOAT vector and an integer one, they compute in single precision and return a FLOAT, as StarRocks and DuckDB do; over any other they compute in double precision and return a DOUBLE, where StarRocks still returns a FLOAT. A NULL element gives NULL, as does a cosine with a zero vector. StarRocks' `approx_cosine_similarity` and `approx_l2_distance`, which its vector indexes answer approximately, are their aliases: thinDB has no vector index, so it computes them exactly, as StarRocks does for a table without one.
 
 Lambdas follow StarRocks:
@@ -157,7 +158,9 @@ case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
 `DAYOFWEEK_ISO` counts Monday as 1. `TO_ISO8601` writes a DATETIME with a
 `T` and six fraction digits. `TO_DATETIME_NTZ(n[, scale])` reads seconds,
 milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
-`ADD_MONTHS` is `MONTHS_ADD`.
+`ADD_MONTHS` is `MONTHS_ADD`. `LAST_DAY(d, unit)` is the last day of d's
+month, quarter or year, the unit named in any case. A NULL unit gives NULL,
+and another unit fails the query with `InvalidLastDayUnit`.
 
 `JODATIME_FORMAT(x, pattern)` writes a DATE or DATETIME under a Joda-Time
 pattern, and `STR_TO_JODATIME(text, pattern)` reads one into a DATETIME.
@@ -318,7 +321,7 @@ MySQL DDL type names without a type of their own map onto the table above:
 
 A TIME function (`HOUR`, `TIME_TO_SEC`, `TIME`, `TIMEDIFF`, `ADDTIME` and the rest) reads a number argument as MySQL does. It reads the `HHMMSS` digits, or a DATETIME from 14 digits on. A number past 838:59:59, or one whose minute or second is past 59, is no TIME and gives NULL. Text past the range clamps to 838:59:59 instead.
 
-`NOW()` and its synonyms (`CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `SYSDATE`, `UTC_TIMESTAMP`) read the clock once per statement. In the MySQL dialect the bare forms give whole seconds and `NOW(n)` truncates to `n` fraction digits, as MySQL does. The other dialects keep microseconds. A column's `DEFAULT CURRENT_TIMESTAMP` also keeps microseconds, since a DATETIME stores no declared precision.
+`NOW()` and its synonyms (`CURRENT_TIMESTAMP`, `LOCALTIME`, `LOCALTIMESTAMP`, `SYSDATE`, `UTC_TIMESTAMP`) read the clock once per statement. In the MySQL dialect the bare forms give whole seconds and `NOW(n)` truncates to `n` fraction digits, as MySQL does. The other dialects keep microseconds. A column's `DEFAULT CURRENT_TIMESTAMP` also keeps microseconds, since a DATETIME stores no declared precision. `UNIX_TIMESTAMP()` with no argument is the same clock's whole seconds since 1970.
 
 A DATETIME column may declare `ON UPDATE CURRENT_TIMESTAMP`, as in MySQL 8.4. The rule applies to a single-table UPDATE, a joined UPDATE, and the update branch of `INSERT ... ON DUPLICATE KEY UPDATE`:
 - The statement sets the column to its timestamp in each row where some other column changes value.
@@ -431,6 +434,8 @@ Adjacent string literals concatenate (`'a' 'b'` is `'ab'`).
 A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number, as in MySQL (`d + 0`). A DATETIME's fraction rounds to the second, since the declared precision isn't stored; `CAST(x AS LARGEINT)`, which MySQL lacks, drops it as StarRocks does. A number and a date that meet in one result (IF and CASE branches, COALESCE, IFNULL, GREATEST, LEAST, UNION arms) meet as that number, as in StarRocks (`cast.commonType`). Beside an integer or boolean, a DATE is an INT and a DATETIME a BIGINT, widened to the integer's type. Beside a decimal, either is DOUBLE, and so is a DATETIME beside a float. A float and a DATE meet as text, as StarRocks meets them. In the MySQL dialect, the aggregates that take only numbers read a temporal input as that number. These are SUM, AVG, their DISTINCT forms, the STDDEV and VARIANCE family and BIT_AND/OR/XOR, so `SUM(d)` adds YYYYMMDD values. The other dialects reject them with `AggregateUnsupportedType`, as StarRocks does.
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
+
+`LPAD(s, n)` and `RPAD(s, n)` pad with spaces, as in StarRocks, and a negative n gives NULL in every form, as in MySQL and StarRocks. `STRPOS(s, sub, n)` is Trino's: the character position of sub's nth occurrence, overlapping occurrences counted, from the end for a negative n. It is 0 when there are fewer occurrences or n is 0, and 1 for an empty sub. StarRocks counts bytes in both forms of STRPOS; thinDB counts characters, as INSTR and LOCATE do. `GREATEST(x)` and `LEAST(x)` of one argument are x, as in StarRocks and PostgreSQL.
 
 StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both read a URL or a relative reference such as `/doc?k=1` (RFC 3986 §4.1), so a URL without an authority has no host. Both are NULL for empty text, for text holding a space or control character, and where what stands before the first `:` is no scheme. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
 
@@ -1967,6 +1972,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `AssertTrueFailed` means `ASSERT_TRUE(cond)` met a row where `cond` is false or NULL. StarRocks fails the query there too.
 
 `InvalidWeekdayName` means `NEXT_DAY` or `PREVIOUS_DAY` was given a weekday name that is none of the seven's two-letter, three-letter or full English names. StarRocks fails the query too.
+
+`InvalidLastDayUnit` means `LAST_DAY` was given a unit other than month, quarter or year, named in any case. StarRocks fails the query too.
 
 `InvalidNgramLength` means `NGRAM_SEARCH` or `NGRAM_SEARCH_CASE_INSENSITIVE` was given a gram length of 0 or less. StarRocks fails the query too.
 

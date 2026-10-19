@@ -1054,3 +1054,87 @@ test "NGRAM_SEARCH is the share of the needle's grams the haystack holds, in sin
     try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH('chi', 'chi', 0)"));
     try std.testing.expectError(error.InvalidNgramLength, helpers.exec(allocator, db, "SELECT NGRAM_SEARCH(s, needle, -1) FROM ng"));
 }
+
+test "StarRocks' extra overloads: LAST_DAY by unit, STRPOS by instance, two-argument pads, ARRAY_GENERATE(n), one-argument GREATEST and LEAST, UNIX_TIMESTAMP()" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        .{ "CAST(LAST_DAY('2023-02-12', 'month') AS CHAR)", "2023-02-28" },
+        .{ "CAST(LAST_DAY('2023-05-10', 'Quarter') AS CHAR)", "2023-06-30" },
+        .{ "CAST(LAST_DAY('2023-11-10', 'QUARTER') AS CHAR)", "2023-12-31" },
+        .{ "CAST(LAST_DAY('2024-02-10 10:00:00', 'year') AS CHAR)", "2024-12-31" },
+        .{ "CAST(LAST_DAY(DATE '2024-02-10', 'month') AS CHAR)", "2024-02-29" },
+        .{ "LAST_DAY('2023-05-10', NULL)", null },
+        .{ "LAST_DAY(NULL, 'month')", null },
+        .{ "TYPEOF(LAST_DAY('2023-05-10', 'year'))", "date" },
+        .{ "STRPOS('abc', 'b', 1)", "2" },
+        .{ "STRPOS('abcabc', 'abc', 2)", "4" },
+        .{ "STRPOS('abcabc', 'abc', 3)", "0" },
+        .{ "STRPOS('hello world hello', 'hello', 2)", "13" },
+        .{ "STRPOS('abcabc', 'abc', -1)", "4" },
+        .{ "STRPOS('abcabc', 'abc', -2)", "1" },
+        .{ "STRPOS('abcabc', 'abc', -3)", "0" },
+        .{ "STRPOS('aaa', 'aa', 2)", "2" },
+        .{ "STRPOS('aaa', 'aa', -1)", "2" },
+        .{ "STRPOS('aaa', 'aa', -2)", "1" },
+        .{ "STRPOS('abc', '', 5)", "1" },
+        .{ "STRPOS('abc', '', -2)", "1" },
+        .{ "STRPOS('abc', '', 0)", "0" },
+        .{ "STRPOS('', 'abc', 1)", "0" },
+        .{ "STRPOS('abc', 'abc', 0)", "0" },
+        .{ "STRPOS('中文中文', '文', 2)", "4" },
+        .{ "STRPOS('中文中文', '文', -2)", "2" },
+        .{ "STRPOS('abc', 'b', NULL)", null },
+        .{ "LPAD('test', 8)", "    test" },
+        .{ "LPAD('test', 2)", "te" },
+        .{ "LPAD('test', 0)", "" },
+        .{ "RPAD('test', 8)", "test    " },
+        .{ "LPAD('中文', 3)", " 中文" },
+        .{ "RPAD('中文', 5)", "中文   " },
+        .{ "LPAD('test', -1)", null },
+        .{ "RPAD('test', -1, 'x')", null },
+        .{ "LPAD('test', -1, '')", null },
+        .{ "LPAD(NULL, 3)", null },
+        .{ "LPAD('test', NULL)", null },
+        .{ "ARRAY_GENERATE(9)", "[1,2,3,4,5,6,7,8,9]" },
+        .{ "ARRAY_GENERATE(1)", "[1]" },
+        .{ "ARRAY_GENERATE(0)", "[1,0]" },
+        .{ "ARRAY_GENERATE(-3)", "[1,0,-1,-2,-3]" },
+        .{ "ARRAY_GENERATE(NULL)", null },
+        .{ "LEAST(5)", "5" },
+        .{ "GREATEST(5)", "5" },
+        .{ "LEAST('x')", "x" },
+        .{ "CAST(GREATEST(5.5) AS CHAR)", "5.5" },
+        .{ "CAST(GREATEST(DATE '2024-01-01') AS CHAR)", "2024-01-01" },
+        .{ "LEAST(NULL)", null },
+        .{ "UNIX_TIMESTAMP() > 1700000000", "1" },
+        .{ "UNIX_TIMESTAMP() = UNIX_TIMESTAMP(NOW())", "1" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
+    inline for (.{ "'week'", "'day'", "''", "'months'" }) |unit| {
+        try std.testing.expectError(error.InvalidLastDayUnit, helpers.exec(allocator, db, "SELECT LAST_DAY('2023-05-10', " ++ unit ++ ")"));
+    }
+
+    try helpers.exec(allocator, db, "CREATE TABLE ov (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, unit VARCHAR(8), s VARCHAR(20), sub VARCHAR(20), n INT, ts BIGINT)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ov VALUES (1, '2020-02-12', '2020-02-12 08:08:14', 'month', 'hello world', 'world', 1, UNIX_TIMESTAMP()),
+        \\  (2, '2021-03-28', '2021-03-28 08:08:14', 'quarter', 'hello world', 'world', -1, UNIX_TIMESTAMP()),
+        \\  (3, '2022-04-28', '2022-04-28 08:08:14', 'year', 'abcabc', 'abc', 2, UNIX_TIMESTAMP()),
+        \\  (4, NULL, NULL, NULL, 'test', NULL, -1, NULL)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("ov", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(LAST_DAY(d, unit) AS CHAR) FROM ov ORDER BY id", &.{ "2020-02-29", "2021-03-31", "2022-12-31", null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(LAST_DAY(dt, unit) AS CHAR) FROM ov ORDER BY id", &.{ "2020-02-29", "2021-03-31", "2022-12-31", null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(LAST_DAY(d, 'quarter') AS CHAR) FROM ov ORDER BY id", &.{ "2020-03-31", "2021-03-31", "2022-06-30", null });
+        try helpers.expectTexts(allocator, db, "SELECT STRPOS(s, sub, n) FROM ov ORDER BY id", &.{ "7", "7", "4", null });
+        try helpers.expectTexts(allocator, db, "SELECT LPAD(s, n + 9) FROM ov ORDER BY id", &.{ "hello worl", "hello wo", "     abcabc", "    test" });
+        try helpers.expectTexts(allocator, db, "SELECT RPAD(s, n) FROM ov ORDER BY id", &.{ "h", null, "ab", null });
+        try helpers.expectTexts(allocator, db, "SELECT ARRAY_GENERATE(n) FROM ov ORDER BY id", &.{ "[1]", "[1,0,-1]", "[1,2]", "[1,0,-1]" });
+        try helpers.expectTexts(allocator, db, "SELECT GREATEST(n) FROM ov ORDER BY id", &.{ "1", "-1", "2", "-1" });
+        try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FROM ov WHERE ts > 1700000000", &.{"3"});
+    }
+}
