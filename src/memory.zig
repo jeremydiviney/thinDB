@@ -866,6 +866,16 @@ pub fn estimateRowBytes(schema: []const types.Column) usize {
     return total;
 }
 
+/// `rows + more` for an operator that holds its input whole and addresses
+/// the rows with u32. Rows of no columns cost the accountant nothing (a
+/// join under `COUNT(*)`), so the count itself is the limit: past it the
+/// input exceeds what the operator can hold, refused as an exhausted budget
+/// is.
+pub fn addHeldRows(rows: u32, more: usize) error{MemoryBudgetExceeded}!u32 {
+    const sum = std.math.add(usize, rows, more) catch return error.MemoryBudgetExceeded;
+    return std.math.cast(u32, sum) orelse error.MemoryBudgetExceeded;
+}
+
 pub fn estimateColumnBytes(t: types.Type) usize {
     return switch (t) {
         .boolean, .tinyint => 1,
@@ -875,6 +885,13 @@ pub fn estimateColumnBytes(t: types.Type) usize {
         .largeint, .decimal128, .uuid => 16,
         .varchar, .string, .char, .json, .nested => 32,
     };
+}
+
+test "memory: held rows past u32 exceed the budget instead of wrapping" {
+    try std.testing.expectEqual(@as(u32, 7), try addHeldRows(3, 4));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), try addHeldRows(std.math.maxInt(u32) - 1, 1));
+    try std.testing.expectError(error.MemoryBudgetExceeded, addHeldRows(std.math.maxInt(u32), 1));
+    try std.testing.expectError(error.MemoryBudgetExceeded, addHeldRows(1, std.math.maxInt(usize)));
 }
 
 test "memory: shared pool constrains accountants across queries" {

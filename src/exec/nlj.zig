@@ -523,19 +523,22 @@ pub const NestedLoopJoin = struct {
         const left_row_bytes = exec.memory.estimateRowBytes(self.left.outputSchema());
         const right_row_bytes = exec.memory.estimateRowBytes(self.right.outputSchema());
 
-        while (try self.left.next()) |batch| {
-            if (acc) |a| try a.reserve(.nested_loop, batch.row_count * left_row_bytes);
-            for (batch.values, 0..) |v, i| {
-                try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
-            }
-            self.left_rows += @intCast(batch.row_count);
-        }
         while (try self.right.next()) |batch| {
             if (acc) |a| try a.reserve(.nested_loop, batch.row_count * right_row_bytes);
             for (batch.values, 0..) |v, i| {
                 try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
             }
-            self.right_rows += @intCast(batch.row_count);
+            self.right_rows = try exec.memory.addHeldRows(self.right_rows, batch.row_count);
+        }
+        // With nothing on the right and no preserved left, the join is
+        // empty: skip reading the left, as the hash join skips its probe.
+        if (self.right_rows == 0 and self.join_type != .left and self.join_type != .full) return;
+        while (try self.left.next()) |batch| {
+            if (acc) |a| try a.reserve(.nested_loop, batch.row_count * left_row_bytes);
+            for (batch.values, 0..) |v, i| {
+                try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
+            }
+            self.left_rows = try exec.memory.addHeldRows(self.left_rows, batch.row_count);
         }
     }
 
