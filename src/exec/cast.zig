@@ -377,11 +377,18 @@ pub fn commonType(a: Type, b: Type) ?Type {
     return null;
 }
 
-/// Two arrays meet at the array of their elements' common type; an array
-/// meets nothing else. A failure to intern that array type reads as no
+/// Two arrays meet at the array of their elements' common type, and two
+/// maps at the map of their keys' and their values' common types; a nested
+/// type meets nothing else. A failure to intern the result type reads as no
 /// common type, which the caller reports as a type mismatch.
 fn commonNested(a: Type, b: Type) ?Type {
     if (std.meta.eql(a, b)) return a;
+    if (a.mapTypes()) |am| {
+        const bm = b.mapTypes() orelse return null;
+        const key = commonType(am.key, bm.key) orelse return null;
+        const value = commonType(am.value, bm.value) orelse return null;
+        return types.mapOf(key, value) catch null;
+    }
     const a_element = a.arrayElement() orelse return null;
     const b_element = b.arrayElement() orelse return null;
     const element = commonType(a_element, b_element) orelse return null;

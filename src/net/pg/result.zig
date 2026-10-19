@@ -71,7 +71,10 @@ fn pgTypeOf(t: Type) TypeInfo {
         .varchar, .string, .char => .{ .oid = OID_TEXT, .type_size = -1 },
         .json => .{ .oid = OID_JSON, .type_size = -1 },
         .nested => |n| switch (n.*) {
-            .array => |element| .{ .oid = if (element == .nested) pgTypeOf(element).oid else pgArrayOid(pgTypeOf(element).oid), .type_size = -1 },
+            // PostgreSQL gives an array of arrays its element's array type.
+            .array => |element| .{ .oid = if (element.arrayElement() != null) pgTypeOf(element).oid else pgArrayOid(pgTypeOf(element).oid), .type_size = -1 },
+            // PostgreSQL has no map type; a map travels as its text.
+            .map => .{ .oid = OID_TEXT, .type_size = -1 },
         },
     };
 }

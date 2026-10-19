@@ -219,7 +219,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         _ = try p.parseScalar();
         return .unknown;
     }
-    if (try p.prefixOperatorAhead() or p.cur.tag == .system_variable or p.cur.tag == .lbracket or try p.arrayLiteralAhead() or try literalLedAhead(p)) {
+    if (try p.prefixOperatorAhead() or p.cur.tag == .system_variable or p.cur.tag == .lbracket or try p.nestedLiteralAhead() or try literalLedAhead(p)) {
         return try parseScalarLhs(p);
     }
     // `@var op X` — a session var on the LHS (constant guard, e.g.
@@ -849,7 +849,7 @@ fn makeScalarExprPredicate(p: anytype, col: []const u8, op: PredicateOp, expr: i
 }
 
 fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    if (isArrayExpr(rhs)) return arrayComparison(p, .{ .col_ref = col }, op, rhs);
+    if (isNestedExpr(rhs)) return nestedComparison(p, .{ .col_ref = col }, op, rhs);
     const expr = if (exec_expr.hexLiteralBytes(rhs)) |bytes| try hexComparand(p, bytes, .{ .col_ref = col }) else rhs;
     return switch (leafOperand(expr)) {
         .col_ref => |rhs_dup| .{ .leaf_col_col = .{ .left = col, .op = op, .right = rhs_dup } },
@@ -865,16 +865,18 @@ fn makeComparisonExprPredicate(p: anytype, col: []const u8, op: PredicateOp, rhs
     };
 }
 
-/// `[...]`, `ARRAY<T>[...]` or a CAST to an array type: an operand whose
-/// comparison `arrayComparison` makes.
-fn isArrayExpr(e: ir.Expr) bool {
+/// `[...]`, `ARRAY<T>[...]`, `map{...}` or a CAST to a nested type: an
+/// operand whose comparison `nestedComparison` makes.
+fn isNestedExpr(e: ir.Expr) bool {
     if (e != .call) return false;
-    return std.ascii.eqlIgnoreCase(e.call.fn_name, scalar_fn.ARRAY_VALUE_FN) or std.mem.startsWith(u8, e.call.fn_name, scalar_fn.NESTED_CAST_PREFIX);
+    const name = e.call.fn_name;
+    return std.ascii.eqlIgnoreCase(name, scalar_fn.ARRAY_VALUE_FN) or std.ascii.eqlIgnoreCase(name, scalar_fn.MAP_FROM_ARRAYS_FN) or
+        std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX);
 }
 
-/// `lhs op rhs` over arrays, which compare as their common type: their
-/// order (`scalar_fn.ARRAY_ORDER_FN`) against 0.
-fn arrayComparison(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
+/// `lhs op rhs` over nested values, which compare as their common type:
+/// their order (`scalar_fn.ARRAY_ORDER_FN`) against 0.
+fn nestedComparison(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const args = try p.arena.alloc(ir.Expr, 2);
     args[0] = lhs;
     args[1] = rhs;
@@ -1126,7 +1128,7 @@ fn parseParenthesizedScalarComparison(p: anytype) @TypeOf(p.*).Err!PredicateExpr
 }
 
 pub fn makeExprComparisonPredicate(p: anytype, lhs_operand: ir.Expr, op: PredicateOp, rhs_operand: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
-    if (isArrayExpr(lhs_operand) or isArrayExpr(rhs_operand)) return arrayComparison(p, lhs_operand, op, rhs_operand);
+    if (isNestedExpr(lhs_operand) or isNestedExpr(rhs_operand)) return nestedComparison(p, lhs_operand, op, rhs_operand);
     const lhs, const rhs = try hexResolved(p, lhs_operand, rhs_operand);
     const lhs_col = switch (lhs) {
         .col_ref => |c| c,

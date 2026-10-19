@@ -813,11 +813,11 @@ pub const Memtable = struct {
                     try ss.appendValue(self.allocator, enc);
                 }
             },
-            // Arrays arrive encoded (a CAST or constructor built them); text
-            // or a foreign encoding is refused rather than stored as one.
+            // Nested values arrive encoded (a CAST or constructor built
+            // them); text or a foreign encoding is refused rather than stored
+            // as one.
             .nested => |*ss| {
-                const element = self.schema.columns[col_idx].type.arrayElement() orelse return Error.TypeMismatch;
-                if (!nested.isWellFormed(value, element)) return Error.TypeMismatch;
+                if (!nested.isWellFormed(value, self.schema.columns[col_idx].type)) return Error.TypeMismatch;
                 try ss.appendValue(self.allocator, value);
             },
             else => return Error.TypeMismatch,

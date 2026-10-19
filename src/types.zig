@@ -44,8 +44,8 @@ pub const TypeTag = enum(u8) {
     /// metadata reports it as JSON. Phase 1 keeps the text representation;
     /// a binary JSONB form and columnar shredding are later phases.
     json = 17,
-    /// ARRAY. The payload's `Nested` gives the element type. Physically each
-    /// value is one variable-length cell holding its elements in the
+    /// ARRAY or MAP. The payload's `Nested` gives the element types.
+    /// Physically each value is one variable-length cell in the
     /// self-contained encoding of `exec/nested.zig`, so storage, the WAL and
     /// row movement treat it as bytes, the way they treat a string.
     nested = 18,
@@ -57,6 +57,14 @@ pub const TypeTag = enum(u8) {
 pub const Nested = union(enum) {
     /// Element type. Elements are always nullable.
     array: Type,
+    map: MapTypes,
+};
+
+/// A MAP's key and value types. Keys are unique within a map; values are
+/// always nullable.
+pub const MapTypes = struct {
+    key: Type,
+    value: Type,
 };
 
 /// Process-wide on purpose, like the time zone cache: a shape is immutable
@@ -78,7 +86,7 @@ const nested_allocator = std.heap.smp_allocator;
 /// The interned instance of `shape`. Its element types are interned already,
 /// so two shapes are equal exactly when their shallow bytes are.
 pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
-    var key_buf: [10]u8 = undefined;
+    var key_buf: [1 + 2 * TYPE_KEY_BYTES]u8 = undefined;
     const key = nestedKey(shape, &key_buf);
     nested_pool.acquire();
     defer nested_pool.lock.unlock();
@@ -92,22 +100,32 @@ pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
     return instance;
 }
 
-fn nestedKey(shape: Nested, buf: *[10]u8) []const u8 {
+fn nestedKey(shape: Nested, buf: *[1 + 2 * TYPE_KEY_BYTES]u8) []const u8 {
     buf[0] = @intFromEnum(std.meta.activeTag(shape));
     switch (shape) {
         .array => |element| {
-            @memset(buf[1..], 0);
-            buf[1] = @intFromEnum(std.meta.activeTag(element));
-            const payload: u64 = switch (element) {
-                .varchar, .char => |n| n,
-                .decimal64, .decimal128 => |spec| (@as(u64, spec.p) << 8) | spec.s,
-                .nested => |n| @intFromPtr(n),
-                else => 0,
-            };
-            std.mem.writeInt(u64, buf[2..10], payload, .little);
-            return buf[0..10];
+            writeTypeKey(buf[1..][0..TYPE_KEY_BYTES], element);
+            return buf[0 .. 1 + TYPE_KEY_BYTES];
+        },
+        .map => |m| {
+            writeTypeKey(buf[1..][0..TYPE_KEY_BYTES], m.key);
+            writeTypeKey(buf[1 + TYPE_KEY_BYTES ..][0..TYPE_KEY_BYTES], m.value);
+            return buf[0 .. 1 + 2 * TYPE_KEY_BYTES];
         },
     }
+}
+
+const TYPE_KEY_BYTES = 9;
+
+fn writeTypeKey(buf: *[TYPE_KEY_BYTES]u8, t: Type) void {
+    buf[0] = @intFromEnum(std.meta.activeTag(t));
+    const payload: u64 = switch (t) {
+        .varchar, .char => |n| n,
+        .decimal64, .decimal128 => |spec| (@as(u64, spec.p) << 8) | spec.s,
+        .nested => |n| @intFromPtr(n),
+        else => 0,
+    };
+    std.mem.writeInt(u64, buf[1..9], payload, .little);
 }
 
 /// `ARRAY<element>`.
@@ -115,10 +133,15 @@ pub fn arrayOf(element: Type) error{OutOfMemory}!Type {
     return .{ .nested = try internNested(.{ .array = element }) };
 }
 
+/// `MAP<key, value>`.
+pub fn mapOf(key: Type, value: Type) error{OutOfMemory}!Type {
+    return .{ .nested = try internNested(.{ .map = .{ .key = key, .value = value } }) };
+}
+
 /// The canonical text of `t` (`int`, `varchar(20)`, `decimal(10,2)`,
-/// `array<array<int>>`), which `parseTypeText` reads back. Where a type
-/// leaves the process (schema files, the IR wire, CAST's function name) it
-/// travels as this text, since a nested shape is a pointer.
+/// `array<array<int>>`, `map<string,int>`), which `parseTypeText` reads
+/// back. Where a type leaves the process (schema files, the IR wire, CAST's
+/// function name) it travels as this text, since a nested shape is a pointer.
 pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: Type) std.mem.Allocator.Error!void {
     var buf: [32]u8 = undefined;
     switch (t) {
@@ -129,6 +152,13 @@ pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: 
             .array => |element| {
                 try out.appendSlice(allocator, "array<");
                 try appendTypeText(allocator, out, element);
+                try out.append(allocator, '>');
+            },
+            .map => |m| {
+                try out.appendSlice(allocator, "map<");
+                try appendTypeText(allocator, out, m.key);
+                try out.append(allocator, ',');
+                try appendTypeText(allocator, out, m.value);
                 try out.append(allocator, '>');
             },
         },
@@ -156,6 +186,14 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
         const element = try parseTypeTextAt(text, pos);
         try expectTypeChar(text, pos, '>');
         return arrayOf(element);
+    }
+    if (std.mem.eql(u8, name, "map")) {
+        try expectTypeChar(text, pos, '<');
+        const key = try parseTypeTextAt(text, pos);
+        try expectTypeChar(text, pos, ',');
+        const value = try parseTypeTextAt(text, pos);
+        try expectTypeChar(text, pos, '>');
+        return mapOf(key, value);
     }
     if (std.mem.eql(u8, name, "varchar") or std.mem.eql(u8, name, "char")) {
         try expectTypeChar(text, pos, '(');
@@ -268,6 +306,18 @@ pub const Type = union(TypeTag) {
         return switch (self) {
             .nested => |n| switch (n.*) {
                 .array => |element| element,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// The key and value types of a MAP, or null for any other type.
+    pub fn mapTypes(self: Type) ?MapTypes {
+        return switch (self) {
+            .nested => |n| switch (n.*) {
+                .map => |m| m,
+                else => null,
             },
             else => null,
         };
@@ -934,4 +984,22 @@ test "findColumn resolves names that contain dots" {
     try std.testing.expectEqual(@as(?usize, 0), findColumn(&text_named, "t.a + 1"));
     try std.testing.expectEqual(@as(?usize, 0), findColumn(&text_named, "d.t.a + 1"));
     try std.testing.expectEqual(@as(?usize, null), findColumn(&text_named, "e.id"));
+}
+
+test "nested type text round-trips, and shapes intern to one instance" {
+    const a = std.testing.allocator;
+    const map_type = try mapOf(.{ .varchar = 8 }, try arrayOf(.int));
+    const texts = .{ "array<array<int>>", "map<varchar(8),array<int>>", "map<int,map<string,decimal(10,2)>>" };
+    inline for (texts) |text| {
+        const t = try parseTypeText(text);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try appendTypeText(a, &out, t);
+        try std.testing.expectEqualStrings(text, out.items);
+    }
+    try std.testing.expect(std.meta.eql(map_type, try parseTypeText("map<varchar(8),array<int>>")));
+    try std.testing.expect(!std.meta.eql(map_type, try mapOf(.{ .varchar = 9 }, try arrayOf(.int))));
+    try std.testing.expectEqual(Type.int, map_type.mapTypes().?.value.arrayElement().?);
+    try std.testing.expect(map_type.arrayElement() == null);
+    try std.testing.expectError(error.InvalidTypeText, parseTypeText("map<int>"));
 }

@@ -122,6 +122,8 @@ pub const Error = error{
     SeriesStepZero,
     /// `generate_series` given an argument that isn't an integer.
     SeriesNonIntegerArgument,
+    /// `map_from_arrays` given key and value arrays of different lengths.
+    MapArrayLengthMismatch,
     /// Compute/projection operator: duplicate derived/final output name.
     ComputeNameCollision,
     /// Compute operator: an expression shape not yet supported in v1
@@ -1808,6 +1810,7 @@ test {
     _ = @import("scalar_fn_test.zig");
     _ = @import("scalar_fn_json.zig");
     _ = @import("scalar_fn_array.zig");
+    _ = @import("scalar_fn_map.zig");
     _ = nested;
     _ = @import("scalar_fn_date.zig");
     _ = @import("time_zone.zig");

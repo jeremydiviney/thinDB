@@ -5,56 +5,9 @@
 const std = @import("std");
 const thindb = @import("thindb");
 const helpers = @import("sql_helpers.zig");
-const runSql = helpers.runSql;
 const exec = helpers.exec;
-const freeStrings = helpers.freeStrings;
-
-/// The first column of `sql`'s result as text, NULL as null: an array as
-/// StarRocks prints it, anything else as `helpers.columnText` does.
-fn texts(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]?[]u8 {
-    var q = try runSql(allocator, db, sql);
-    defer q.deinit();
-    const t = q.outputSchema()[0].type;
-    if (!t.isNested()) return helpers.columnText(allocator, &q);
-    var out: std.ArrayList(?[]u8) = .empty;
-    errdefer {
-        for (out.items) |v| if (v) |x| allocator.free(x);
-        out.deinit(allocator);
-    }
-    while (try q.next()) |batch| {
-        const col = batch.values[0];
-        for (0..batch.row_count) |row| {
-            const text: ?[]u8 = if (!col.isValid(row)) null else blk: {
-                var buf: std.ArrayList(u8) = .empty;
-                errdefer buf.deinit(allocator);
-                try thindb.exec.nested.appendText(allocator, &buf, t, col.data.nested.rowBytes(row), .starrocks);
-                break :blk try buf.toOwnedSlice(allocator);
-            };
-            errdefer if (text) |x| allocator.free(x);
-            try out.append(allocator, text);
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn expectTexts(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: []const ?[]const u8) !void {
-    const got = try texts(allocator, db, sql);
-    defer freeStrings(allocator, got);
-    errdefer std.debug.print("query: {s}\n", .{sql});
-    try std.testing.expectEqual(expected.len, got.len);
-    for (expected, got) |e, g| {
-        if (e == null or g == null) {
-            if (e != null or g != null) std.debug.print("expected {?s}, got {?s}\n", .{ e, g });
-            try std.testing.expect(e == null and g == null);
-            continue;
-        }
-        try std.testing.expectEqualStrings(e.?, g.?);
-    }
-}
-
-fn expectText(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: ?[]const u8) !void {
-    try expectTexts(allocator, db, sql, &.{expected});
-}
+const expectTexts = helpers.expectTexts;
+const expectText = helpers.expectText;
 
 fn setup(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
@@ -164,6 +117,22 @@ test "ARRAY: functions" {
     try expectText(allocator, db, "SELECT array_sort(array_intersect([1, 2, 2, 3], [2, 3, 4]))", "[2,3]");
 }
 
+test "ARRAY: IF, IFNULL, COALESCE and CASE choose whole arrays" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try expectTexts(allocator, db, "SELECT IF(id > 2, a, [0]) FROM t ORDER BY id", &.{ "[0]", "[0]", null, "[5,null,5,4]" });
+    try expectTexts(allocator, db, "SELECT IF(id > 2, NULL, s) FROM t ORDER BY id", &.{ "[\"b\",\"a\",null]", "[]", null, null });
+    try expectTexts(allocator, db, "SELECT IFNULL(a, [9]) FROM t ORDER BY id", &.{ "[3,1,2]", "[]", "[9]", "[5,null,5,4]" });
+    try expectTexts(allocator, db, "SELECT COALESCE(n, NULL, [[7]]) FROM t ORDER BY id", &.{ "[[1,2],[3]]", "[]", "[[7]]", "[null,[4]]" });
+    try expectTexts(allocator, db, "SELECT COALESCE(a, [2.5]) FROM t ORDER BY id", &.{ "[3.0,1.0,2.0]", "[]", "[2.5]", "[5.0,null,5.0,4.0]" });
+    try expectTexts(allocator, db, "SELECT CASE WHEN id = 1 THEN a WHEN id = 2 THEN [8] END FROM t ORDER BY id", &.{ "[3,1,2]", "[8]", null, null });
+}
+
 test "ARRAY: grouping, ordering and equality compare whole arrays" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -219,6 +188,7 @@ test "ARRAY: ARRAY_AGG keeps NULLs and follows ORDER BY" {
 
     try expectText(allocator, db, "SELECT array_agg(v ORDER BY id) FROM g", "[10,null,30,20,10]");
     try expectTexts(allocator, db, "SELECT array_agg(v ORDER BY id) FROM g GROUP BY k ORDER BY k", &.{ "[10,null,10]", "[30,20]" });
+    try expectTexts(allocator, db, "SELECT array_sort(array_agg(v)) FROM g GROUP BY s ORDER BY s", &.{ "[20]", "[10,10,30]", "[null]" });
     try expectText(allocator, db, "SELECT array_agg(DISTINCT v) FROM g", "[null,10,20,30]");
     try expectText(allocator, db, "SELECT array_agg(s ORDER BY s DESC, id) FROM g", "[\"y\",\"x\",\"x\",\"x\",null]");
     try expectText(allocator, db, "SELECT array_agg(a ORDER BY id) FROM g", "[[1],[2,3],null,[],[1]]");

@@ -2262,18 +2262,18 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
 
 /// Whether `name` in `op`'s output has no type of its own, so it takes
 /// `other`, the other arm's: a bare NULL does, and so does `[]` beside an
-/// array.
+/// array or `map{}` beside a map.
 fn outputIsTypeless(op: *const ir.Op, name: []const u8, other: types.Type) bool {
     const e = outputLiteral(op, name) orelse return false;
-    return e == .null_lit or (other.isNested() and scalar_fn.isEmptyArrayLiteral(e));
+    return e == .null_lit or scalar_fn.isEmptyNestedLiteral(e, other);
 }
 
-/// `name = NULL` or `name = []` typed as `ty`, replacing the arm's output
-/// slot in place.
+/// `name = NULL`, `name = []` or `name = map{}` typed as `ty`, replacing
+/// the arm's output slot in place.
 fn typedDerived(arena: std.mem.Allocator, op: *const ir.Op, col_name: []const u8, ty: types.Type) !ir.Derived {
     const name = try arena.dupe(u8, col_name);
     if (outputLiteral(op, col_name).? == .null_lit) return .{ .name = name, .expr = .{ .null_lit = ty } };
-    return .{ .name = name, .expr = try scalar_fn.emptyArrayAs(arena, ty) };
+    return .{ .name = name, .expr = try scalar_fn.emptyNestedAs(arena, ty) };
 }
 
 /// The expression `name` in `op`'s output derives from on every row, followed

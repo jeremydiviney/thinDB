@@ -4066,7 +4066,7 @@ fn percentileUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u3
 /// GROUP_CONCAT: append separator + value bytes for each non-null row.
 /// `nonempty` distinguishes "no values yet" from "first value was empty".
 fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?ColumnView, row_start: u32, row_end: u32, params: ConcatParams) !void {
-    // Arrays keep apart: no separator splits them again.
+    // Nested values keep apart: no separator splits them again.
     const collect = order_key != null or params.distinct or view.data == .nested;
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
@@ -4092,14 +4092,19 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?
     }
 }
 
-/// A collected GROUP_CONCAT of arrays: one array of all their elements.
-fn appendConcatArrays(allocator: Allocator, col: *ColumnStore, c: *const ConcatAcc) !void {
+/// A collected GROUP_CONCAT of arrays: one array of all their elements; of
+/// maps: one map of all their entries, a key in several keeping its last.
+fn appendConcatNested(allocator: Allocator, col: *ColumnStore, c: *const ConcatAcc) !void {
     const parts = try allocator.alloc([]const u8, c.entries.items.len);
     defer allocator.free(parts);
     for (parts, c.entries.items) |*p, e| p.* = e.value(c.buf.items);
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(allocator);
-    try nested.appendConcat(allocator, &joined, nested.Array.decode(parts[0]).class, parts);
+    if (parts[0][0] == nested.MAP_TAG) {
+        try nested.appendMapConcat(allocator, &joined, parts);
+    } else {
+        try nested.appendConcat(allocator, &joined, nested.Array.decode(parts[0]).class, parts);
+    }
     try col.data.nested.appendValue(allocator, joined.items);
 }
 
@@ -4442,7 +4447,7 @@ pub fn appendAccToColumn(
             if (state.concat) |c| {
                 if (col.data == .nested) {
                     orderConcatEntries(c, spec.params.concat.distinct);
-                    try appendConcatArrays(allocator, col, c);
+                    try appendConcatNested(allocator, col, c);
                 } else if (c.entries.items.len == 0) {
                     try col.data.string.appendValue(allocator, c.buf.items);
                 } else {

@@ -188,6 +188,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
     .{ .name = "array_agg", .func = .group_concat },
+    // A GROUP_CONCAT of one-entry maps (`Parser.mapAggEntry`).
+    .{ .name = "map_agg", .func = .group_concat },
 };
 
 fn aggForName(name: []const u8, dialect: types.Dialect) ?ir.AggFunc {
@@ -2250,7 +2252,7 @@ pub const Parser = struct {
         // (`GROUP BY 1` then references it as ordinal 1.)
         const scalar_led = switch (self.cur.tag) {
             .plus, .minus, .tilde, .integer, .big_integer, .floating, .string, .kw_true, .kw_false, .kw_null, .at_identifier, .system_variable, .lbracket => true,
-            else => try self.prefixOperatorAhead() or try self.arrayLiteralAhead(),
+            else => try self.prefixOperatorAhead() or try self.nestedLiteralAhead(),
         };
         if (scalar_led) return try self.namedExprItem(item_start, try self.parseScalar());
 
@@ -2351,12 +2353,13 @@ pub const Parser = struct {
             // aggregate lowering expects. Aggregates only accept a single
             // column-ref arg (or `*` for COUNT(*)); reject anything else.
             if (self.aggregateFuncForName(first)) |func| {
-                // An aggregate continued by an operator (`SUM(a) / COUNT(*)`)
-                // hoists to a hidden aggregate output exactly like the nested
-                // form, then keeps parsing the expression.
-                if (try self.binaryOpAhead()) {
+                // An aggregate continued by a subscript or an operator
+                // (`MAP_AGG(k, v)[1]`, `SUM(a) / COUNT(*)`) hoists to a hidden
+                // aggregate output exactly like the nested form, then keeps
+                // parsing the expression.
+                if (self.cur.tag == .lbracket or try self.binaryOpAhead()) {
                     const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct);
-                    const expr = try self.continueBinaryFrom(ir.Expr{ .col_ref = agg_name });
+                    const expr = try self.continueBinaryFrom(try self.parsePostfix(ir.Expr{ .col_ref = agg_name }));
                     return try self.namedExprItem(item_start, expr);
                 }
                 const parsed = try self.parsedAggFromArgs(first, func, args, saw_distinct);
@@ -2587,13 +2590,13 @@ pub const Parser = struct {
         var depth: usize = 0;
         while (true) : (tok = try look.next()) {
             switch (tok.tag) {
-                .lparen, .lbracket, .kw_case => depth += 1,
-                .rparen, .rbracket, .kw_end => {
+                .lparen, .lbracket, .lbrace, .kw_case => depth += 1,
+                .rparen, .rbracket, .rbrace, .kw_end => {
                     if (depth == 0) return false;
                     depth -= 1;
                 },
                 .eof, .semicolon => return false,
-                .comma, .kw_when, .kw_then, .kw_else, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
+                .comma, .colon, .kw_when, .kw_then, .kw_else, .kw_from, .kw_as, .kw_where, .kw_group, .kw_order, .kw_limit, .kw_offset, .kw_having, .kw_window, .kw_qualify, .kw_union, .kw_intersect, .kw_except, .kw_into, .kw_on => {
                     if (depth == 0) return false;
                 },
                 .eq, .neq, .lt, .lte, .gt, .gte, .null_safe_eq, .kw_is, .kw_in, .kw_between, .kw_like, .kw_regexp, .kw_and, .amp_amp, .kw_or, .kw_not => {
@@ -2601,7 +2604,7 @@ pub const Parser = struct {
                 },
                 .pipe_pipe => if (depth == 0 and self.lex.dialect == .mysql) return true,
                 .identifier => {
-                    if (try skipArrayTypeArguments(&look, tok)) continue;
+                    if (try skipNestedTypeArguments(&look, tok)) continue;
                     if (depth == 0 and tok.text.ptr != self.cur.text.ptr) {
                         if (std.ascii.eqlIgnoreCase(tok.text, "xor")) return true;
                         var after_sounds = look;
@@ -2613,10 +2616,11 @@ pub const Parser = struct {
         }
     }
 
-    /// Moves `look` past the `<T>` of an `ARRAY<T>` that `tok` starts, whose
-    /// angle brackets are no comparisons. Returns whether it did.
-    fn skipArrayTypeArguments(look: *Lexer, tok: Token) ParseError!bool {
-        if (tok.quoted or !std.ascii.eqlIgnoreCase(tok.text, "array")) return false;
+    /// Moves `look` past the `<...>` of an `ARRAY<T>` or `MAP<K, V>` that
+    /// `tok` starts, whose angle brackets are no comparisons. Returns whether
+    /// it did.
+    fn skipNestedTypeArguments(look: *Lexer, tok: Token) ParseError!bool {
+        if (tok.quoted or !(std.ascii.eqlIgnoreCase(tok.text, "array") or std.ascii.eqlIgnoreCase(tok.text, "map"))) return false;
         var ahead = look.*;
         if ((try ahead.next()).tag != .lt) return false;
         var open: usize = 1;
@@ -2715,6 +2719,17 @@ pub const Parser = struct {
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = try self.arena.dupe(ir.Expr, args) } };
         }
         if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
+        if (std.ascii.eqlIgnoreCase(name, "map")) {
+            // StarRocks' `map(k1, v1, k2, v2, ...)`.
+            if (args.len % 2 != 0) return ParseError.SqlExpectedValue;
+            const keys = try self.arena.alloc(ir.Expr, args.len / 2);
+            const values = try self.arena.alloc(ir.Expr, args.len / 2);
+            for (keys, values, 0..) |*k, *v, i| {
+                k.* = args[2 * i];
+                v.* = args[2 * i + 1];
+            }
+            return try self.mapFromEntries(keys, values);
+        }
         if (std.ascii.eqlIgnoreCase(name, "timestampadd") and args.len == 3) {
             // `TIMESTAMPADD(unit, n, x)` is `x + INTERVAL n unit`, and
             // takes that step's range checks and result type.
@@ -3029,7 +3044,8 @@ pub const Parser = struct {
             }
         }
         if (self.aggregateFuncForName(name) == .group_concat) {
-            const canonical = try self.parseConcatCallTail(args.items, distinct);
+            const values = if (std.ascii.eqlIgnoreCase(name, "map_agg")) try self.mapAggEntry(args.items) else args.items;
+            const canonical = try self.parseConcatCallTail(values, distinct);
             try self.expect(.rparen);
             return canonical;
         }
@@ -3053,6 +3069,20 @@ pub const Parser = struct {
         var tok = self.cur;
         while (tok.tag == .lparen) tok = try look.next();
         return tok.tag == .kw_null;
+    }
+
+    /// MAP_AGG(k, v) concatenates each row's one-entry map. A row with a
+    /// NULL key adds none, as in StarRocks: its entry is NULL, which
+    /// GROUP_CONCAT skips.
+    fn mapAggEntry(self: *Parser, args: []const ir.Expr) ParseError![]const ir.Expr {
+        if (args.len != 2) return ParseError.SqlInvalidProjection;
+        const if_args = try self.arena.alloc(ir.Expr, 3);
+        if_args[0] = try self.isNullValue(args[0]);
+        if_args[1] = .{ .null_lit = .string };
+        if_args[2] = try self.mapFromEntries(try self.arena.dupe(ir.Expr, args[0..1]), try self.arena.dupe(ir.Expr, args[1..2]));
+        const entry = try self.arena.alloc(ir.Expr, 1);
+        entry[0] = .{ .call = .{ .fn_name = "if", .args = if_args } };
+        return entry;
     }
 
     /// The rest of a `GROUP_CONCAT([DISTINCT] v [, v ...] [ORDER BY k [ASC |
@@ -3370,6 +3400,8 @@ pub const Parser = struct {
         };
         const value = if (std.ascii.eqlIgnoreCase(func_name, "array_agg"))
             ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = try self.arena.dupe(ir.Expr, args[0..1]) } }
+        else if (std.ascii.eqlIgnoreCase(func_name, "map_agg"))
+            args[0]
         else
             try scalar_fn.toString(self.arena, args[0]);
         return .{ .default_name = try std.fmt.allocPrint(self.arena, "{s}({s}{s})", .{ func_name, distinctPrefix(func_name, distinct), arg_name }), .agg = .{
@@ -3646,11 +3678,13 @@ pub const Parser = struct {
         }
     }
 
-    /// An `ARRAY[...]` or `ARRAY<T>[...]` literal at the cursor.
-    pub fn arrayLiteralAhead(self: *Parser) ParseError!bool {
-        if (self.cur.tag != .identifier or self.cur.quoted or !std.ascii.eqlIgnoreCase(self.cur.text, "array")) return false;
+    /// An `ARRAY[...]`, `ARRAY<T>[...]` or `MAP{...}` literal at the cursor.
+    pub fn nestedLiteralAhead(self: *Parser) ParseError!bool {
+        if (self.cur.tag != .identifier or self.cur.quoted) return false;
         var look = self.lex.*;
         const next = try look.next();
+        if (std.ascii.eqlIgnoreCase(self.cur.text, "map")) return next.tag == .lbrace;
+        if (!std.ascii.eqlIgnoreCase(self.cur.text, "array")) return false;
         return next.tag == .lbracket or next.tag == .lt;
     }
 
@@ -3675,7 +3709,7 @@ pub const Parser = struct {
 
     fn castExprToType(self: *Parser, inner: ir.Expr, ty: types.Type) ParseError!ir.Expr {
         if (inner == .null_lit) return ir.Expr{ .null_lit = ty };
-        if (ty.isNested() and scalar_fn.isEmptyArrayLiteral(inner)) return scalar_fn.emptyArrayAs(self.arena, ty);
+        if (scalar_fn.isEmptyNestedLiteral(inner, ty)) return scalar_fn.emptyNestedAs(self.arena, ty);
         const fn_name = if (self.lex.dialect == .postgres and ty.isString() and ty != .json)
             scalar_fn.PG_TEXT_FN
         else
@@ -3786,6 +3820,34 @@ pub const Parser = struct {
         return ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = elements.items } };
     }
 
+    /// The entries of a map literal, cursor on its `{`.
+    fn parseMapLiteral(self: *Parser) ParseError!ir.Expr {
+        try self.expect(.lbrace);
+        var keys: std.ArrayList(ir.Expr) = .empty;
+        var values: std.ArrayList(ir.Expr) = .empty;
+        if (self.cur.tag != .rbrace) {
+            while (true) {
+                try keys.append(self.arena, try self.parseValueExpr());
+                try self.expect(.colon);
+                try values.append(self.arena, try self.parseValueExpr());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+        }
+        try self.expect(.rbrace);
+        return try self.mapFromEntries(keys.items, values.items);
+    }
+
+    /// `map{k: v, ...}` and `map(k, v, ...)` are `map_from_arrays([k, ...],
+    /// [v, ...])`, so the keys and the values each meet at their common type
+    /// as an array literal's elements do.
+    fn mapFromEntries(self: *Parser, keys: []const ir.Expr, values: []const ir.Expr) ParseError!ir.Expr {
+        const args = try self.arena.alloc(ir.Expr, 2);
+        args[0] = .{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = keys } };
+        args[1] = .{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = values } };
+        return ir.Expr{ .call = .{ .fn_name = scalar_fn.MAP_FROM_ARRAYS_FN, .args = args } };
+    }
+
     fn parseCallAtomBase(self: *Parser) ParseError!ir.Expr {
         if (self.cur.tag == .kw_case) return try self.parseCaseExpr();
         if (self.cur.tag == .lbracket) return try self.parseArrayLiteral();
@@ -3829,6 +3891,7 @@ pub const Parser = struct {
                         return try self.castExprToType(try self.parseArrayLiteral(), ty);
                     }
                 }
+                if (!quoted and std.ascii.eqlIgnoreCase(name, "map") and self.cur.tag == .lbrace) return try self.parseMapLiteral();
                 if (try self.typedTemporalLiteralAfterName(name)) |lit| return lit;
                 if (self.cur.tag == .lparen) {
                     if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);
