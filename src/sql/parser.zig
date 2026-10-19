@@ -193,6 +193,9 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     // StarRocks' low-cardinality PERCENTILE_DISC: the same answer.
     .{ .name = "percentile_disc_lc", .func = .percentile_disc },
     .{ .name = "percentile_approx", .func = .percentile_approx },
+    .{ .name = "covar_pop", .func = .covar_pop },
+    .{ .name = "covar_samp", .func = .covar_samp },
+    .{ .name = "corr", .func = .corr },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
@@ -244,7 +247,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .udf, .max_by_key => null,
     };
 }
 
@@ -3471,7 +3474,7 @@ pub const Parser = struct {
 
         // PERCENTILE_CONT(x, p) stores p as an aggregate param; MEDIAN(x) is
         // percentile_cont(x, 0.5).
-        if (func == .max_by) {
+        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr) {
             if (args.len != 2) return ParseError.SqlInvalidProjection;
             var value_col: ?[]const u8 = null;
             var value_expr: ?ir.Expr = null;
@@ -3491,7 +3494,10 @@ pub const Parser = struct {
                 },
                 else => key_expr = args[1],
             }
-            const default_name = try self.arena.dupe(u8, "max_by(expr)");
+            const default_name = if (func == .max_by)
+                try self.arena.dupe(u8, "max_by(expr)")
+            else
+                try std.fmt.allocPrint(self.arena, "{s}({s},{s})", .{ func_name, value_col orelse "expr", key_col orelse "expr" });
             return .{ .default_name = default_name, .agg = .{
                 .func = func,
                 .col = value_col,

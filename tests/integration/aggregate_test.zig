@@ -215,6 +215,37 @@ test "aggregate: PERCENTILE_CONT keeps DECIMAL, BIGINT, DATE and DATETIME exact;
     try std.testing.expectError(error.AggregateInvalidParam, helpers.exec(allocator, db, "SELECT PERCENTILE_DISC(d, 1.5) FROM pt"));
 }
 
+test "aggregate: COVAR_POP, COVAR_SAMP and CORR read the pairs with no NULL, grouped or not" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE cv (id BIGINT PRIMARY KEY, g BIGINT, x BIGINT, y BIGINT, d DECIMAL(10,2), f DOUBLE)");
+    try helpers.exec(allocator, db, "INSERT INTO cv VALUES " ++
+        "(1, 1, 1, 10, 1.50, 1.5), (2, 0, 2, 25, 3.25, 2.0), (3, 1, 3, 30, 0.75, 9.0), (4, 0, 4, NULL, NULL, NULL), " ++
+        "(5, 1, NULL, 50, 2.00, 4.0), (6, 0, 8, 70, NULL, 3.0), (7, 1, 9, 90, NULL, NULL), (8, 0, 10, 100, 1.25, NULL), " ++
+        "(9, 2, 5, 7, 4.00, 1.0), (10, 3, 6, 6, NULL, NULL), (11, 3, 7, 6, NULL, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("cv", .{})).flush();
+        // DuckDB's answers, but for CORR's NULL where it gives NaN.
+        try helpers.expectText(allocator, db, "SELECT ROUND(COVAR_SAMP(x, y), 9) FROM cv", "85.458333333");
+        try helpers.expectText(allocator, db, "SELECT ROUND(COVAR_POP(x, y), 9) FROM cv", "75.962962963");
+        try helpers.expectText(allocator, db, "SELECT ROUND(CORR(x, y), 9) FROM cv", "0.709767618");
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(COVAR_SAMP(x, y), 9) FROM cv GROUP BY g ORDER BY g", &.{ "155", "173.333333333", null, "0" });
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(COVAR_POP(x, y), 9) FROM cv GROUP BY g ORDER BY g", &.{ "103.333333333", "115.555555556", "0", "0" });
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(CORR(x, y), 9) FROM cv GROUP BY g ORDER BY g", &.{ "0.986241383", "1", null, null });
+        try helpers.expectText(allocator, db, "SELECT ROUND(COVAR_POP(d, f), 9) FROM cv", "-2.55");
+        try helpers.expectText(allocator, db, "SELECT ROUND(CORR(d, f), 9) FROM cv", "-0.738866656");
+        try helpers.expectText(allocator, db, "SELECT ROUND(COVAR_POP(d, x), 9) FROM cv GROUP BY g ORDER BY 1 DESC LIMIT 1", "0");
+        try helpers.expectText(allocator, db, "SELECT ROUND(COVAR_SAMP(x * 2, y + 1), 9) FROM cv", "170.916666667");
+        try helpers.expectText(allocator, db, "SELECT COVAR_SAMP(x, y) FILTER (WHERE g = 2) FROM cv", null);
+    }
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT CORR(x, 'a') FROM cv"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COVAR_POP(x) FROM cv"));
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
