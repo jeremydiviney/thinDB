@@ -209,3 +209,60 @@ test "agg on expr: SUM(CASE WHEN ...) — revenue when active" {
     // active amounts: 100 + 200 + 75 = 375
     try std.testing.expectEqual(@as(i64, 375), batch.values[0].data.bigint[0]);
 }
+
+fn salesDb(allocator: std.mem.Allocator, dir: anytype) !*thindb.Database {
+    const db = try thindb.Database.open(allocator, std.testing.io, dir, .{});
+    errdefer db.close();
+    try exec(allocator, db, "CREATE TABLE sales (id INT, product VARCHAR(20), amount INT, qty INT)");
+    try exec(allocator, db, "INSERT INTO sales VALUES (1, 'A', 100, 10), (2, 'B', 150, 20), (3, 'A', 200, 15), (4, 'B', 250, 25), (5, 'C', 300, 30)");
+    try exec(allocator, db, "CREATE TABLE products (product VARCHAR(20), category VARCHAR(20))");
+    try exec(allocator, db, "INSERT INTO products VALUES ('A', 'tools'), ('C', 'tools'), ('B', 'toys')");
+    return db;
+}
+
+test "agg on expr: FILTER (WHERE ...) aggregates only the rows its condition holds for" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try salesDb(allocator, tmp.dir);
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FILTER (WHERE qty > 15) FROM sales", "3");
+    try helpers.expectText(allocator, db, "SELECT SUM(amount) FILTER (WHERE product = 'A') - SUM(amount) FROM sales", "-700");
+    try helpers.expectTexts(allocator, db, "SELECT MAX(amount) FILTER (WHERE amount < 220) FROM sales GROUP BY product ORDER BY product", &.{ "200", "150", null });
+    try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FILTER (WHERE qty > 15) FROM sales GROUP BY product ORDER BY product", &.{ "0", "2", "1" });
+    try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT product) FILTER (WHERE amount > 120) FROM sales", "3");
+    try helpers.expectText(allocator, db, "SELECT GROUP_CONCAT(product ORDER BY id) FILTER (WHERE qty >= 20) FROM sales", "B,B,C");
+    try helpers.expectText(allocator, db, "SELECT MAX_BY(product, amount) FILTER (WHERE qty < 30) FROM sales", "B");
+    // An ARRAY_AGG the filter leaves empty is NULL, not `[NULL]`.
+    try helpers.expectTexts(allocator, db, "SELECT ARRAY_AGG(product) FILTER (WHERE qty < 20) FROM sales GROUP BY id ORDER BY id", &.{ "[\"A\"]", null, "[\"A\"]", null, null });
+    try helpers.expectText(allocator, db, "SELECT ARRAY_AGG(DISTINCT product) FILTER (WHERE qty < 20) FROM sales", "[\"A\"]");
+    try helpers.expectTexts(allocator, db, "SELECT product FROM sales GROUP BY product HAVING SUM(qty) FILTER (WHERE amount > 120) > 20 ORDER BY product", &.{ "B", "C" });
+    try helpers.expectTexts(allocator, db, "SELECT product FROM sales GROUP BY product ORDER BY COUNT(*) FILTER (WHERE qty > 15) DESC, product", &.{ "B", "C", "A" });
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM sales)) FROM sales", "2");
+    try helpers.expectText(allocator, db, "SELECT SUM(amount) FILTER (WHERE product IN (SELECT product FROM products WHERE category = 'tools')) FROM sales", "600");
+    try helpers.expectText(allocator, db, "SELECT CAST(JSON_ARRAYAGG(product) FILTER (WHERE id < 3) AS CHAR) FROM sales", "[\"A\", \"B\"]");
+    // Without `( WHERE` after it, FILTER names the column.
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) filter FROM sales", "5");
+}
+
+test "agg on expr: a filtered and an unfiltered call of one aggregate keep their own values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try salesDb(allocator, tmp.dir);
+    defer db.close();
+
+    var q = try runSql(allocator, db, "SELECT SUM(amount), SUM(amount) FILTER (WHERE product = 'A'), SUM(amount) FILTER (WHERE product = 'B') FROM sales");
+    defer q.deinit();
+    const batch = (try q.next()) orelse return error.NoRows;
+    try std.testing.expectEqual(@as(usize, 3), batch.values.len);
+    const sums = [_]i64{ 1000, 300, 400 };
+    for (batch.values, sums) |column, want| try std.testing.expectEqual(want, switch (column.data) {
+        .bigint => |s| s[0],
+        .int => |s| s[0],
+        else => return error.TestUnexpectedType,
+    });
+
+    try helpers.expectRunError(allocator, db, "SELECT SUM(qty) FILTER (WHERE id < 3) OVER () FROM sales", error.SqlInvalidProjection);
+}
