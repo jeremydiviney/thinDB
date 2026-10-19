@@ -966,6 +966,41 @@ test "compute: TO_BINARY, FROM_BINARY, FORMAT_BYTES, BAR and POSITIVE follow Sta
     try helpers.expectTexts(allocator, db, "SELECT id FROM b WHERE POSITIVE(n) > 1000 ORDER BY id", &.{ "2", "3", "4", "7" });
 }
 
+test "EQUIWIDTH_BUCKET counts whole-width buckets from min, as StarRocks does" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        .{ "5, 0, 10, 3", "1" },
+        .{ "9, 0, 10, 3", "3" },
+        .{ "10, 0, 10, 3", "3" },
+        .{ "7, 0, 10, 4", "3" },
+        .{ "0, 0, 10, 20", "0" },
+        .{ "10, 0, 10, 20", "10" },
+        .{ "10, 0, 10, 1", "1" },
+        .{ "3, 1, 10, 2", "0" },
+        .{ "99, 0, 100, 7", "7" },
+        .{ "10, 2, 10, 3", "4" },
+        .{ "-5, -10, -1, 4", "2" },
+        .{ "5, -10, 10, 4", "3" },
+        .{ "100, 50, 9223372036854775807, 3", "0" },
+        .{ "9223372036854775807, 0, 9223372036854775807, 2", "2" },
+        .{ "NULL, 0, 10, 3", null },
+        .{ "5, 0, NULL, 3", null },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT EQUIWIDTH_BUCKET(" ++ c[0] ++ ")", c[1]);
+    try helpers.expectTexts(allocator, db, "SELECT EQUIWIDTH_BUCKET(r, 0, 10, 3) FROM TABLE(generate_series(0, 10)) AS s(r)", &.{ "0", "0", "0", "1", "1", "1", "2", "2", "2", "3", "3" });
+    inline for (.{ "11, 0, 10, 3", "1, 2, 10, 3", "5, 10, 0, 3", "5, 5, 5, 3", "5, 0, 10, 0", "5, 0, 10, -2" }) |args| {
+        try std.testing.expectError(error.InvalidEquiwidthBucketArguments, helpers.exec(allocator, db, "SELECT EQUIWIDTH_BUCKET(" ++ args ++ ")"));
+    }
+
+    try helpers.exec(allocator, db, "CREATE TABLE h (id BIGINT PRIMARY KEY, v INT)");
+    try helpers.exec(allocator, db, "INSERT INTO h VALUES (1, 2), (2, NULL), (3, 50), (4, 100)");
+    try helpers.expectTexts(allocator, db, "SELECT EQUIWIDTH_BUCKET(v, 0, 100, 7) FROM h ORDER BY id", &.{ "0", null, "3", "7" });
+}
+
 test "AES_ENCRYPT and AES_DECRYPT in every StarRocks mode, with MySQL's key folding" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -1170,6 +1170,17 @@ pub fn endsWithKernel(allocator: Allocator, args: []const ColumnView, out: *Colu
     }
 }
 
+/// NULL_OR_EMPTY(s): whether `s` is NULL or the empty string, never NULL.
+pub fn nullOrEmptyKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        const empty = !args[0].isValid(i) or sv.rowBytes(i).len == 0;
+        try out.data.boolean.append(allocator, @intFromBool(empty));
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
 pub fn splitPartKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     const delim_sv = stringViewOf(args[1]);
@@ -2073,6 +2084,34 @@ pub fn barKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
         try ss.appendValue(allocator, buf.items);
         try out.appendValidBit(allocator, base + i, valid);
     }
+}
+
+/// EQUIWIDTH_BUCKET(value, min, max, buckets): StarRocks' bucket of `value`
+/// among buckets of one whole width laid from `min`, counting from 0. The
+/// width is (max - min) / buckets rounded down, or 1 where that is 0, so
+/// values near `max` can land in bucket `buckets` or later. A min not below
+/// max, a value outside [min, max] or a bucket count below 1 is
+/// `InvalidEquiwidthBucketArguments`.
+pub fn equiwidthBucketKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const values = args[0].data.bigint;
+    const mins = args[1].data.bigint;
+    const maxes = args[2].data.bigint;
+    const bucket_counts = args[3].data.bigint;
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        const valid = allValid(args, i);
+        const bucket = if (valid) try equiwidthBucket(values[i], mins[i], maxes[i], bucket_counts[i]) else 0;
+        try out.data.bigint.append(allocator, bucket);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+fn equiwidthBucket(value: i64, min: i64, max: i64, buckets: i64) !i64 {
+    if (min >= max or value < min or value > max or buckets < 1) return error.InvalidEquiwidthBucketArguments;
+    const width = @max(1, @divFloor(@as(i128, max) - min, buckets));
+    // Only over a range wider than half of BIGINT's can the bucket pass
+    // BIGINT, and there it wraps as BIGINT arithmetic does.
+    return @truncate(@divFloor(@as(i128, value) - min, width));
 }
 
 // ---------------------------------------------------------------------------
