@@ -432,7 +432,7 @@ A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number
 
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
 
-StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both are NULL for text that isn't a URL: one needs a scheme, and may hold no space or control character, as RFC 3986 says. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
+StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both read a URL or a relative reference such as `/doc?k=1` (RFC 3986 §4.1), so a URL without an authority has no host. Both are NULL for empty text, for text holding a space or control character, and where what stands before the first `:` is no scheme. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
 
 Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s` as `hex` (the default), `encode64` (padded base64) or `utf8` (the bytes as they are), named in any case. Text that isn't hex or base64 gives '', and empty base64 NULL, as in StarRocks. `FROM_BINARY(b[, format])` writes bytes in the same formats, hex in capitals. `FORMAT_BYTES(n)` writes a byte count in the largest binary unit it reaches, `B` through `EB`, with two decimals past `B` (`1.50 KB`); a negative count is NULL. `BAR(size, min, max, width)` draws `width` `▓` characters scaled by where `size` falls in `[min, max]`, in whole characters. `POSITIVE(x)` is `+x`.
 
@@ -577,6 +577,15 @@ comes first, then the values in order, so the answer doesn't depend on the
 order rows arrive in. k and the counter count are integer literals of at
 least 1, else `SqlInvalidProjection`. Exact counts keep one entry per
 distinct value in each group, as `COUNT(DISTINCT)` does.
+
+`COUNT_IF(x)`, `BOOL_AND(x)` and `BOOL_OR(x)` read a non-boolean x as its
+truth, `CAST(x AS BOOLEAN)`, as WHERE reads a condition. So `COUNT_IF(n)`
+counts the rows where n is non-zero, and text counts where it reads as true
+(`aggregate.readsInputTruth`). A bare NULL is a numeric NULL to an aggregate
+that takes only numbers, so `SUM(NULL)` and `COVAR_SAMP(NULL, NULL)` are
+NULL, as in MySQL and StarRocks. A UNION arm column that is a bare NULL on
+every row takes the other arm's type, through the nested unions a VALUES list
+builds, so `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
 
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
 and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
