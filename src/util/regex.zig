@@ -4,8 +4,9 @@
 //!
 //! Supported syntax (the common POSIX/RE2 subset):
 //!   literals, `.` (any byte except '\n'), `[...]` / `[^...]` classes
-//!   with ranges, shorthands `\d \w \s \D \W \S`, escapes (`\.` `\n`
-//!   `\t` `\\` etc), quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy
+//!   with ranges and POSIX classes (`[[:alpha:]]`, `[[:^digit:]]`),
+//!   shorthands `\d \w \s \D \W \S`, escapes (`\.` `\n` `\t` `\\`
+//!   etc), quantifiers `* + ? {n} {n,} {n,m}` (greedy and lazy
 //!   `*? +? ??`), alternation `|`, capturing `( )` and non-capturing
 //!   `(?: )` groups, anchors `^ $` (the text's start and end, or any
 //!   line's with `Options.multiline`), word boundaries `\b \B`.
@@ -279,6 +280,7 @@ const Parser = struct {
                 return self.node(.{ .class = cc });
             }
             first = false;
+            if (try self.parsePosixClass(&cc)) continue;
             var lo: u8 = undefined;
             if (c == '\\') {
                 _ = self.advance();
@@ -315,7 +317,52 @@ const Parser = struct {
         }
         return Error.RegexInvalidPattern; // unterminated class
     }
+
+    /// Adds the POSIX class at the cursor, such as `[:alpha:]` or its
+    /// complement `[:^alpha:]`, to `cc`, and says whether there was one.
+    fn parsePosixClass(self: *Parser, cc: *CharClass) Error!bool {
+        const rest = self.pat[self.pos..];
+        if (!std.mem.startsWith(u8, rest, "[:")) return false;
+        const close = std.mem.indexOfPos(u8, rest, 2, ":]") orelse return false;
+        const negated = rest[2] == '^';
+        const name = rest[if (negated) 3 else 2..close];
+        const has = for (POSIX_CLASSES) |pc| {
+            if (std.mem.eql(u8, pc.name, name)) break pc.has;
+        } else return Error.RegexInvalidPattern;
+        for (0..256) |b| if (has(@intCast(b)) != negated) cc.add(@intCast(b));
+        self.pos += close + 2;
+        return true;
+    }
 };
+
+const POSIX_CLASSES = [_]struct { name: []const u8, has: *const fn (u8) bool }{
+    .{ .name = "alnum", .has = std.ascii.isAlphanumeric },
+    .{ .name = "alpha", .has = std.ascii.isAlphabetic },
+    .{ .name = "ascii", .has = std.ascii.isAscii },
+    .{ .name = "blank", .has = isBlank },
+    .{ .name = "cntrl", .has = std.ascii.isControl },
+    .{ .name = "digit", .has = std.ascii.isDigit },
+    .{ .name = "graph", .has = isGraph },
+    .{ .name = "lower", .has = std.ascii.isLower },
+    .{ .name = "print", .has = std.ascii.isPrint },
+    .{ .name = "punct", .has = isPunct },
+    .{ .name = "space", .has = std.ascii.isWhitespace },
+    .{ .name = "upper", .has = std.ascii.isUpper },
+    .{ .name = "word", .has = isWordByte },
+    .{ .name = "xdigit", .has = std.ascii.isHex },
+};
+
+fn isBlank(b: u8) bool {
+    return b == ' ' or b == '\t';
+}
+
+fn isGraph(b: u8) bool {
+    return std.ascii.isPrint(b) and b != ' ';
+}
+
+fn isPunct(b: u8) bool {
+    return isGraph(b) and !std.ascii.isAlphanumeric(b);
+}
 
 fn unescapeByte(c: u8) u8 {
     return switch (c) {
@@ -1094,7 +1141,7 @@ pub const Regex = struct {
 /// Where the search after a match resumes: its end, or past the whole
 /// UTF-8 character after an empty match, so the next search can't find
 /// the same empty match or start inside a character.
-fn afterMatch(input: []const u8, m_start: usize, m_end: usize) usize {
+pub fn afterMatch(input: []const u8, m_start: usize, m_end: usize) usize {
     if (m_end > m_start) return m_end;
     var next = m_end + 1;
     while (next < input.len and input[next] & 0xC0 == 0x80) next += 1;
@@ -1567,6 +1614,20 @@ test "regex: class edge cases ([]a] literal ], ranges, trailing -)" {
     try expectMatch("^[a-]+$", "a-a-", true); // trailing - is literal
     try expectMatch("^[0-9A-Fa-f]+$", "1aF", true);
     try expectMatch("^[0-9A-Fa-f]+$", "1aG", false);
+}
+
+test "regex: POSIX classes inside brackets" {
+    try expectMatch("^[[:lower:]]+C[[:lower:]]+$", "bCd", true);
+    try expectMatch("^[[:lower:]]+$", "bCd", false);
+    try expectMatch("^[[:alpha:][:digit:]_]+$", "a1_Z", true);
+    try expectMatch("^[[:^digit:]]+$", "ab c", true);
+    try expectMatch("^[[:^digit:]]+$", "ab1", false);
+    try expectMatch("^[^[:space:]]+$", "a\tb", false);
+    try expectMatch("^[[:punct:]]+$", "!?.", true);
+    try expectMatch("^[[:xdigit:]]+$", "0fA", true);
+    // Without its closing ":]", "[:" is two members.
+    try expectMatch("^[[:a]+$", "[:a", true);
+    try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "[[:nope:]]"));
 }
 
 test "regex: greedy vs lazy replace" {

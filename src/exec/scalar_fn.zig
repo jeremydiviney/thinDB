@@ -1380,6 +1380,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
     .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
     .{ .name = "regexp_instr", .arg_types = &.{ .string, .string, .bigint, .bigint, .bigint, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpInstrKernel },
+    .{ .name = "regexp_count", .arg_types = &.{ .string, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = string.regexpCountKernel },
+    .{ .name = "regexp_extract", .arg_types = &.{ .string, .string, .bigint }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.regexpExtractKernel },
     // --- json ---
     .{ .name = "json_extract", .arg_types = &.{ .json, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonExtractKernel },
     .{ .name = "json_value", .arg_types = &.{ .json, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.jsonValueKernel },
