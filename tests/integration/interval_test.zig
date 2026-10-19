@@ -664,6 +664,29 @@ test "YEARS_ADD(dt, n) through MICROSECONDS_ADD(dt, n), and the _SUB of each, mo
     }
 }
 
+test "INTERVAL n MILLISECOND, TIMESTAMPADD(MILLISECOND, ...) and DATE_TRUNC to a millisecond or microsecond, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "ADDDATE('2023-10-31 23:59:59', INTERVAL 1 MILLISECOND)", "2023-10-31 23:59:59.001000" },
+        .{ "ADDDATE('2023-10-31 23:59:59', INTERVAL 4000000 MILLISECOND)", "2023-11-01 01:06:39" },
+        .{ "DATETIME '2023-10-31 23:59:59' - INTERVAL 2 MILLISECONDS", "2023-10-31 23:59:58.998000" },
+        .{ "DATE_SUB(DATE '2023-10-31', INTERVAL 1 MILLISECOND)", "2023-10-30 23:59:59.999000" },
+        .{ "DATETIME '9999-12-31 23:59:59.999' + INTERVAL 1 MILLISECOND", null },
+        .{ "TIMESTAMPADD(MILLISECOND, 1, '2019-01-02 00:00:00')", "2019-01-02 00:00:00.001000" },
+        .{ "TIMESTAMPADD(SQL_TSI_MICROSECOND, 7, '2019-01-02 00:00:00')", "2019-01-02 00:00:00.000007" },
+        .{ "DATE_TRUNC('millisecond', '2023-10-31 23:59:59.001002')", "2023-10-31 23:59:59.001000" },
+        .{ "DATE_TRUNC('milliseconds', '2023-10-31')", "2023-10-31 00:00:00" },
+        .{ "DATE_TRUNC('microsecond', '2023-10-31 23:59:59.001002')", "2023-10-31 23:59:59.001002" },
+        .{ "DATE_TRUNC('millisecond', DATETIME '1969-12-31 23:59:59.999999')", "1969-12-31 23:59:59.999000" },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+}
+
 test "TIMESTAMPDIFF(MONTH|YEAR) counts as StarRocks does: -1 for an end earlier in the same month or year (issue #418)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

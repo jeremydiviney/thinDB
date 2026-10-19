@@ -385,6 +385,7 @@ fn intervalUnit(word: []const u8) ?IntervalUnit {
         .{ "hour", .{ .fn_name = "date_add_hours" } },
         .{ "minute", .{ .fn_name = "date_add_minutes" } },
         .{ "second", .{ .fn_name = "date_add_seconds" } },
+        .{ "millisecond", .{ .fn_name = "date_add_millis" } },
         .{ "microsecond", .{ .fn_name = "date_add_micros" } },
     };
     const singular = if (word.len > 1 and (word[word.len - 1] == 's' or word[word.len - 1] == 'S')) word[0 .. word.len - 1] else word;
@@ -9164,7 +9165,7 @@ fn reverseRangeOp(op: PredicateOp) PredicateOp {
 }
 
 test "no scalar UDF can take a function that syntax lowers to" {
-    const units = [_][]const u8{ "day", "week", "month", "quarter", "year", "hour", "minute", "second", "microsecond" };
+    const units = [_][]const u8{ "day", "week", "month", "quarter", "year", "hour", "minute", "second", "millisecond", "microsecond" };
     for (units) |unit| try std.testing.expect(scalar_fn.isReservedScalarUdfName(intervalUnit(unit).?.fn_name));
     for (EXTRACT_FIELDS ++ EXTRACT_COMPOUND_FNS) |name| try std.testing.expect(scalar_fn.isReservedScalarUdfName(name));
     for (std.enums.values(scalar_fn.BitOperator)) |op| {

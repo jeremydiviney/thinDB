@@ -169,6 +169,7 @@ fn DatetimeAddSteps(comptime step_micros: i64) type {
 pub const datetimeAddHoursKernel = DatetimeAddSteps(std.time.us_per_hour).kernel;
 pub const datetimeAddMinutesKernel = DatetimeAddSteps(std.time.us_per_min).kernel;
 pub const datetimeAddSecondsKernel = DatetimeAddSteps(std.time.us_per_s).kernel;
+pub const datetimeAddMillisKernel = DatetimeAddSteps(std.time.us_per_ms).kernel;
 pub const datetimeAddMicrosKernel = DatetimeAddSteps(1).kernel;
 
 /// The DATE `days` names, or null outside years 0-9999.
@@ -529,7 +530,7 @@ pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     // The unit is the same for every row, so identify it ONCE — the per-row
     // hot loop is then a branch-free arithmetic truncation, not six repeated
     // case-insensitive string compares.
-    const unit = try parseDateUnit(stringViewOf(args[0]).rowBytes(0));
+    const unit = try parseFineUnit(stringViewOf(args[0]).rowBytes(0));
     const s = args[1].data.datetime[0..row_count];
 
     const base = out.data.datetime.items.len;
@@ -540,20 +541,23 @@ pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     switch (unit) {
         // Sub-day units are a floor to a fixed micro-quantum — a comptime
         // divisor that lowers to a multiply-shift and vectorizes.
+        .microsecond => @memcpy(dst, s),
+        .millisecond => truncToQuantum(std.time.us_per_ms, s, dst),
         .second => truncToQuantum(us, s, dst),
         .minute => truncToQuantum(60 * us, s, dst),
         .hour => truncToQuantum(3600 * us, s, dst),
         .day => truncToQuantum(86_400 * us, s, dst),
         // Week/month/quarter/year boundaries aren't fixed micro-quanta from
         // the epoch — scalar calendar math.
-        .week, .month, .quarter, .year => for (dst, s) |*d, v| {
-            d.* = truncCalendar(v, unit);
+        inline .week, .month, .quarter, .year => |u| for (dst, s) |*d, v| {
+            d.* = truncCalendar(v, @field(DateUnit, @tagName(u)));
         },
     }
 }
 
-/// A unit named by the constant string argument of `date_trunc` and
-/// `timestampadd`. `DiffUnit` adds to it for `date_diff` and `timestampdiff`.
+/// A unit named by the constant string argument of `timestampadd`.
+/// `DiffUnit` adds StarRocks' millisecond and microsecond to it for
+/// `date_trunc`, `date_diff` and `timestampdiff`.
 const DateUnit = enum { second, minute, hour, day, week, month, quarter, year };
 
 /// An unknown unit fails the call: a value passed through unchanged would be a
@@ -725,7 +729,11 @@ pub fn monthnameFromDatetimeKernel(allocator: Allocator, args: []const ColumnVie
 pub const DiffUnit = enum { microsecond, millisecond, second, minute, hour, day, week, month, quarter, year };
 
 fn parseDiffUnit(text: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
-    const unit = if (std.ascii.startsWithIgnoreCase(text, "sql_tsi_")) text["sql_tsi_".len..] else text;
+    return parseFineUnit(if (std.ascii.startsWithIgnoreCase(text, "sql_tsi_")) text["sql_tsi_".len..] else text);
+}
+
+/// A `DateUnit`, or millisecond or microsecond.
+fn parseFineUnit(unit: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
     if (std.ascii.eqlIgnoreCase(unit, "microsecond") or std.ascii.eqlIgnoreCase(unit, "microseconds")) return .microsecond;
     if (std.ascii.eqlIgnoreCase(unit, "millisecond") or std.ascii.eqlIgnoreCase(unit, "milliseconds")) return .millisecond;
     return switch (try parseDateUnit(unit)) {
