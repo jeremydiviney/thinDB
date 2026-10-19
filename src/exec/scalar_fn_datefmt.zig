@@ -1,6 +1,8 @@
 //! MySQL's date format specifiers, shared by DATE_FORMAT (formatting) and
 //! STR_TO_DATE (parsing), and MySQL's week numbering (sql_time.cc
 //! calc_week), which %U %u %V %v %X %x and WEEK / YEARWEEK / WEEKOFYEAR read.
+//! Also StarRocks' other formats: Joda-Time patterns (JODATIME_FORMAT,
+//! STR_TO_JODATIME) and Teradata's (TO_TERA_DATE, TO_TERA_TIMESTAMP).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -627,6 +629,447 @@ pub fn strToDateKernel(allocator: Allocator, args: []const ColumnView, out: *Col
         try out.data.datetime.append(allocator, micros orelse 0);
         try out.appendValidBit(allocator, base + i, micros != null);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Joda-Time patterns: JODATIME_FORMAT, STR_TO_JODATIME
+// ---------------------------------------------------------------------------
+
+/// The letters a Joda-Time pattern gives meaning to. Any other letter is
+/// literal text, as StarRocks prints it.
+const JODA_LETTERS = "GCYxweEyDMdaKhHkmsSzZ";
+
+/// A run of one pattern letter, or, where `letter` is 0, literal text:
+/// `JodaPattern.literals[start..][0..count]`.
+const JodaToken = struct { letter: u8, count: u32, start: u32 = 0 };
+
+/// A Joda pattern split into tokens. A kernel keeps one and compiles again
+/// only when a row's pattern differs from the one before.
+const JodaPattern = struct {
+    source: std.ArrayList(u8) = .empty,
+    tokens: std.ArrayList(JodaToken) = .empty,
+    literals: std.ArrayList(u8) = .empty,
+    compiled: bool = false,
+
+    fn deinit(p: *JodaPattern, allocator: Allocator) void {
+        p.source.deinit(allocator);
+        p.tokens.deinit(allocator);
+        p.literals.deinit(allocator);
+    }
+
+    /// Text in single quotes is literal, and `''` is one quote, in quotes or
+    /// out. An unclosed quote runs to the end, as in StarRocks.
+    fn compile(p: *JodaPattern, allocator: Allocator, pattern: []const u8) !void {
+        if (p.compiled and std.mem.eql(u8, p.source.items, pattern)) return;
+        p.compiled = false;
+        p.source.clearRetainingCapacity();
+        try p.source.appendSlice(allocator, pattern);
+        p.tokens.clearRetainingCapacity();
+        p.literals.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < pattern.len) {
+            const c = pattern[i];
+            if (c == '\'') {
+                i += 1;
+                if (i < pattern.len and pattern[i] == '\'') {
+                    try p.appendLiteral(allocator, "'");
+                    i += 1;
+                    continue;
+                }
+                while (i < pattern.len) {
+                    if (pattern[i] != '\'') {
+                        try p.appendLiteral(allocator, pattern[i .. i + 1]);
+                        i += 1;
+                    } else if (i + 1 < pattern.len and pattern[i + 1] == '\'') {
+                        try p.appendLiteral(allocator, "'");
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (std.mem.indexOfScalar(u8, JODA_LETTERS, c) == null) {
+                try p.appendLiteral(allocator, pattern[i .. i + 1]);
+                i += 1;
+                continue;
+            }
+            var end = i + 1;
+            while (end < pattern.len and pattern[end] == c) end += 1;
+            try p.tokens.append(allocator, .{ .letter = c, .count = @intCast(end - i) });
+            i = end;
+        }
+        p.compiled = true;
+    }
+
+    /// Literal text joins the literal token before it, whose bytes end the
+    /// literals so far.
+    fn appendLiteral(p: *JodaPattern, allocator: Allocator, text: []const u8) !void {
+        const tokens = p.tokens.items;
+        if (tokens.len > 0 and tokens[tokens.len - 1].letter == 0) {
+            tokens[tokens.len - 1].count += @intCast(text.len);
+        } else {
+            try p.tokens.append(allocator, .{ .letter = 0, .count = @intCast(text.len), .start = @intCast(p.literals.items.len) });
+        }
+        try p.literals.appendSlice(allocator, text);
+    }
+
+    fn literal(p: *const JodaPattern, t: JodaToken) []const u8 {
+        return p.literals.items[t.start..][0..t.count];
+    }
+};
+
+/// A name in full for four or more pattern letters, else its first three.
+fn jodaName(name: []const u8, count: usize) []const u8 {
+    return if (count >= 4) name else name[0..3];
+}
+
+/// A year under `yy` is its last two digits; under any other count it is
+/// whole, padded to the count.
+fn appendJodaYear(buf: *std.ArrayList(u8), allocator: Allocator, year: i32, count: usize) !void {
+    if (count == 2) return appendPadded(buf, allocator, @mod(year, 100), 2);
+    try appendPadded(buf, allocator, year, count);
+}
+
+/// Appends `days` + `micros_into_day` rendered under a Joda pattern. A
+/// number is padded to its letter count. A DATETIME carries no zone, so a
+/// zone renders as UTC.
+fn formatJoda(allocator: Allocator, buf: *std.ArrayList(u8), p: *const JodaPattern, days: i32, micros_into_day: i64) !void {
+    const ymd = common.daysToYmd(days);
+    const hms = common.microsToHms(micros_into_day);
+    const iso = calcWeek(days, .{ .monday_first = true, .week_year = true });
+    for (p.tokens.items) |t| {
+        const n: usize = t.count;
+        switch (t.letter) {
+            0 => try buf.appendSlice(allocator, p.literal(t)),
+            'G' => try buf.appendSlice(allocator, if (ymd.year > 0) "AD" else "BC"),
+            'C' => try appendPadded(buf, allocator, @divFloor(ymd.year, 100), n),
+            'Y', 'y' => try appendJodaYear(buf, allocator, ymd.year, n),
+            'x' => try appendJodaYear(buf, allocator, iso.year, n),
+            'w' => try appendPadded(buf, allocator, iso.week, n),
+            'e' => try appendPadded(buf, allocator, weekdayOf(days, false) + 1, n),
+            'E' => try buf.appendSlice(allocator, jodaName(day_names[@intCast(weekdayOf(days, true))], n)),
+            'D' => try appendPadded(buf, allocator, days - common.ymdToDays(ymd.year, 1, 1) + 1, n),
+            'M' => if (n >= 3)
+                try buf.appendSlice(allocator, jodaName(month_names[@as(usize, ymd.month) - 1], n))
+            else
+                try appendPadded(buf, allocator, ymd.month, n),
+            'd' => try appendPadded(buf, allocator, ymd.day, n),
+            'a' => try buf.appendSlice(allocator, if (hms.hour < 12) "AM" else "PM"),
+            'K' => try appendPadded(buf, allocator, hms.hour % 12, n),
+            'h' => try appendPadded(buf, allocator, if (hms.hour % 12 == 0) 12 else hms.hour % 12, n),
+            'H' => try appendPadded(buf, allocator, hms.hour, n),
+            'k' => try appendPadded(buf, allocator, if (hms.hour == 0) 24 else hms.hour, n),
+            'm' => try appendPadded(buf, allocator, hms.minute, n),
+            's' => try appendPadded(buf, allocator, hms.second, n),
+            'S' => {
+                var digits: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&digits, "{d:0>6}", .{@as(u32, @intCast(@mod(micros_into_day, std.time.us_per_s)))}) catch unreachable;
+                try buf.appendSlice(allocator, digits[0..@min(n, 6)]);
+                if (n > 6) try buf.appendNTimes(allocator, '0', n - 6);
+            },
+            'z' => try buf.appendSlice(allocator, "UTC"),
+            'Z' => try buf.appendSlice(allocator, switch (n) {
+                1 => "+0000",
+                2 => "+00:00",
+                else => "UTC",
+            }),
+            // `compile` makes tokens only of literal text and JODA_LETTERS.
+            else => unreachable,
+        }
+    }
+}
+
+fn isJodaNumber(t: JodaToken) bool {
+    return switch (t.letter) {
+        0, 'G', 'E', 'a', 'z', 'Z' => false,
+        'M' => t.count < 3,
+        else => true,
+    };
+}
+
+/// The DATETIME `text` spells under a Joda pattern, or null where the text
+/// doesn't match all of the pattern or names no real time. A number
+/// followed straight by another reads exactly its letter count of digits,
+/// as in Joda (`yyyyMMdd`); any other reads as many as its field can hold.
+/// Fields the pattern doesn't name are those of 1970-01-01 00:00:00. A
+/// two-digit `yy` year below 70 is in the 2000s, as in MySQL. A zone or a
+/// century can't be read, so they give NULL.
+fn parseJoda(p: *const JodaPattern, text: []const u8) ?i64 {
+    var year: i32 = 1970;
+    var month: i32 = 1;
+    var day: i32 = 1;
+    var day_of_year: ?i32 = null;
+    var week_year: ?i32 = null;
+    var week_number: ?i32 = null;
+    var weekday: i32 = 1;
+    var hour: i32 = 0;
+    var half_day_hour = false;
+    var pm = false;
+    var minute: i32 = 0;
+    var second: i32 = 0;
+    var micro: i32 = 0;
+    var pos: usize = 0;
+    const tokens = p.tokens.items;
+    for (tokens, 0..) |t, ti| {
+        switch (t.letter) {
+            0 => {
+                const lit = p.literal(t);
+                if (text.len - pos < lit.len or !std.ascii.eqlIgnoreCase(text[pos..][0..lit.len], lit)) return null;
+                pos += lit.len;
+                continue;
+            },
+            'E' => {
+                _ = readName(text, &pos, &day_names, t.count < 4) orelse return null;
+                continue;
+            },
+            'a', 'G' => {
+                const options: [2][]const u8 = if (t.letter == 'a') .{ "AM", "PM" } else .{ "AD", "BC" };
+                if (text.len - pos < 2) return null;
+                const word = text[pos..][0..2];
+                if (std.ascii.eqlIgnoreCase(word, options[1])) {
+                    if (t.letter == 'a') pm = true else return null;
+                } else if (!std.ascii.eqlIgnoreCase(word, options[0])) return null;
+                pos += 2;
+                continue;
+            },
+            'M' => if (t.count >= 3) {
+                month = @intCast((readName(text, &pos, &month_names, t.count == 3) orelse return null) + 1);
+                continue;
+            },
+            'C', 'z', 'Z' => return null,
+            else => {},
+        }
+        const followed_by_number = ti + 1 < tokens.len and isJodaNumber(tokens[ti + 1]);
+        const max_digits: usize = if (followed_by_number) t.count else switch (t.letter) {
+            'y', 'Y', 'x', 'S' => 9,
+            'D' => 3,
+            'e' => 1,
+            else => 2,
+        };
+        const number = readNumber(text, &pos, max_digits) orelse return null;
+        const v = number.value;
+        switch (t.letter) {
+            'y', 'Y' => year = if (t.count == 2 and number.digits == 2) twoDigitYear(v) else v,
+            'x' => week_year = if (t.count == 2 and number.digits == 2) twoDigitYear(v) else v,
+            'w' => week_number = v,
+            'e' => weekday = v,
+            'D' => day_of_year = v,
+            'M' => month = v,
+            'd' => day = v,
+            'H' => hour = v,
+            'k' => hour = if (v == 24) 0 else if (v >= 1) v else return null,
+            'K' => {
+                if (v > 11) return null;
+                hour = v;
+                half_day_hour = true;
+            },
+            'h' => {
+                if (v < 1 or v > 12) return null;
+                hour = @mod(v, 12);
+                half_day_hour = true;
+            },
+            'm' => minute = v,
+            's' => second = v,
+            'S' => micro = if (number.digits <= 6)
+                v * std.math.pow(i32, 10, @intCast(6 - number.digits))
+            else
+                @divTrunc(v, std.math.pow(i32, 10, @intCast(number.digits - 6))),
+            else => unreachable,
+        }
+    }
+    if (pos != text.len) return null;
+    if (half_day_hour and pm) hour += 12;
+
+    var days: i32 = undefined;
+    if (week_year != null or week_number != null) {
+        const w = week_number orelse 1;
+        if (w < 1 or w > 53 or weekday < 1 or weekday > 7) return null;
+        const wy = week_year orelse year;
+        if (wy < 0 or wy > 9999) return null;
+        const jan4 = common.ymdToDays(wy, 1, 4);
+        days = jan4 - weekdayOf(jan4, false) + (w - 1) * 7 + weekday - 1;
+        if (calcWeek(days, .{ .monday_first = true, .week_year = true }).year != wy) return null;
+    } else {
+        if (year < 0 or year > 9999) return null;
+        if (day_of_year) |doy| {
+            if (doy < 1 or doy > daysInYear(year)) return null;
+            days = common.ymdToDays(year, 1, 1) + doy - 1;
+        } else {
+            if (month < 1 or month > 12 or day < 1) return null;
+            if (day > common.lastDayOfMonth(year, @intCast(month))) return null;
+            days = common.ymdToDays(year, @intCast(month), @intCast(day));
+        }
+    }
+    if (hour > 23 or minute > 59 or second > 59) return null;
+    const seconds = (@as(i64, hour) * 60 + minute) * 60 + second;
+    return @as(i64, days) * std.time.us_per_day + seconds * std.time.us_per_s + micro;
+}
+
+/// JODATIME_FORMAT(x, pattern), and Trino's FORMAT_DATETIME: x rendered
+/// under a Joda-Time pattern (`formatJoda`).
+pub fn jodaFormatKernel(comptime temporal: Temporal) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const patterns = stringViewOf(args[1]);
+            const ss = common.stringStoreOf(out);
+            var pattern: JodaPattern = .{};
+            defer pattern.deinit(allocator);
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            for (0..row_count) |i| {
+                const valid = args[0].isValid(i) and args[1].isValid(i);
+                buf.clearRetainingCapacity();
+                if (valid) {
+                    try pattern.compile(allocator, patterns.rowBytes(i));
+                    const micros: i64 = switch (temporal) {
+                        .date => 0,
+                        .datetime => @mod(args[0].data.datetime[i], std.time.us_per_day),
+                    };
+                    try formatJoda(allocator, &buf, &pattern, daysAt(args[0], i, temporal), micros);
+                }
+                try ss.appendValue(allocator, buf.items);
+                try out.appendValidBit(allocator, base + i, valid);
+            }
+        }
+    }.kernel;
+}
+
+/// STR_TO_JODATIME(text, pattern), and Trino's PARSE_DATETIME: the DATETIME
+/// `text` spells under a Joda-Time pattern (`parseJoda`).
+pub fn strToJodaKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    const texts = stringViewOf(args[0]);
+    const patterns = stringViewOf(args[1]);
+    var pattern: JodaPattern = .{};
+    defer pattern.deinit(allocator);
+    for (0..row_count) |i| {
+        var micros: ?i64 = null;
+        if (args[0].isValid(i) and args[1].isValid(i)) {
+            try pattern.compile(allocator, patterns.rowBytes(i));
+            micros = parseJoda(&pattern, texts.rowBytes(i));
+        }
+        try out.data.datetime.append(allocator, micros orelse 0);
+        try out.appendValidBit(allocator, base + i, micros != null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Teradata formats: TO_TERA_DATE, TO_TERA_TIMESTAMP
+// ---------------------------------------------------------------------------
+
+const TeraElement = enum { year4, year2, month, day, hour24, hour, minute, second, am, pm };
+
+const TeraEntry = struct { text: []const u8, element: TeraElement };
+
+/// A Teradata format's elements, each before any shorter one it starts with.
+const TERA_ELEMENTS = [_]TeraEntry{
+    .{ .text = "yyyy", .element = .year4 },
+    .{ .text = "yy", .element = .year2 },
+    .{ .text = "mm", .element = .month },
+    .{ .text = "dd", .element = .day },
+    .{ .text = "hh24", .element = .hour24 },
+    .{ .text = "hh", .element = .hour },
+    .{ .text = "mi", .element = .minute },
+    .{ .text = "ss", .element = .second },
+    .{ .text = "am", .element = .am },
+    .{ .text = "pm", .element = .pm },
+};
+
+const TERA_SEPARATORS = "-/,.;: ";
+
+/// The element `fmt` spells at `pos`, or null for a separator.
+fn teraElementAt(fmt: []const u8, pos: usize) error{InvalidTeradataFormat}!?TeraEntry {
+    if (std.mem.indexOfScalar(u8, TERA_SEPARATORS, fmt[pos]) != null) return null;
+    for (TERA_ELEMENTS) |e| if (std.mem.startsWith(u8, fmt[pos..], e.text)) return e;
+    return error.InvalidTeradataFormat;
+}
+
+/// The DATETIME `text` spells under a Teradata format, or null where it
+/// doesn't. Elements are lowercase. A number reads up to its element's
+/// width of digits, at least one, and a separator must match itself. `am`
+/// or `pm` must match the text, in any case, and makes `hh` a 12-hour
+/// hour; text past the format's end is ignored. Fields the format doesn't
+/// name are those of 1970-01-01 00:00:00, and `yy` reads as in MySQL.
+pub fn parseTeradata(text: []const u8, fmt: []const u8) error{InvalidTeradataFormat}!?i64 {
+    var f: usize = 0;
+    while (f < fmt.len) {
+        const e = try teraElementAt(fmt, f) orelse {
+            f += 1;
+            continue;
+        };
+        f += e.text.len;
+    }
+
+    var year: i32 = 1970;
+    var month: i32 = 1;
+    var day: i32 = 1;
+    var hour: i32 = 0;
+    var half_day: ?bool = null;
+    var minute: i32 = 0;
+    var second: i32 = 0;
+    var pos: usize = 0;
+    f = 0;
+    while (f < fmt.len) {
+        const e = try teraElementAt(fmt, f) orelse {
+            if (pos >= text.len or text[pos] != fmt[f]) return null;
+            pos += 1;
+            f += 1;
+            continue;
+        };
+        f += e.text.len;
+        switch (e.element) {
+            .am, .pm => {
+                if (text.len - pos < 2 or !std.ascii.eqlIgnoreCase(text[pos..][0..2], e.text)) return null;
+                pos += 2;
+                half_day = e.element == .pm;
+                continue;
+            },
+            else => {},
+        }
+        const width: usize = if (e.element == .year4) 4 else 2;
+        const v = (readNumber(text, &pos, width) orelse return null).value;
+        switch (e.element) {
+            .year4 => year = v,
+            .year2 => year = twoDigitYear(v),
+            .month => month = v,
+            .day => day = v,
+            .hour24, .hour => hour = v,
+            .minute => minute = v,
+            .second => second = v,
+            .am, .pm => unreachable,
+        }
+    }
+    if (half_day) |pm| {
+        if (hour < 1 or hour > 12) return null;
+        hour = @mod(hour, 12) + @as(i32, if (pm) 12 else 0);
+    }
+    if (month < 1 or month > 12 or day < 1 or day > common.lastDayOfMonth(year, @intCast(month))) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+    const seconds = (@as(i64, hour) * 60 + minute) * 60 + second;
+    return @as(i64, common.ymdToDays(year, @intCast(month), @intCast(day))) * std.time.us_per_day + seconds * std.time.us_per_s;
+}
+
+/// TO_TERA_DATE(text, format) and TO_TERA_TIMESTAMP(text, format)
+/// (`parseTeradata`).
+pub fn teradataKernel(comptime temporal: Temporal) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const base = out.data.rowCount();
+            const texts = stringViewOf(args[0]);
+            const formats = stringViewOf(args[1]);
+            for (0..row_count) |i| {
+                const micros = if (args[0].isValid(i) and args[1].isValid(i)) try parseTeradata(texts.rowBytes(i), formats.rowBytes(i)) else null;
+                switch (temporal) {
+                    .date => try out.data.date.append(allocator, if (micros) |m| common.daysFromDatetime(m) else 0),
+                    .datetime => try out.data.datetime.append(allocator, micros orelse 0),
+                }
+                try out.appendValidBit(allocator, base + i, micros != null);
+            }
+        }
+    }.kernel;
 }
 
 test "week numbering matches MySQL's modes across year boundaries" {
