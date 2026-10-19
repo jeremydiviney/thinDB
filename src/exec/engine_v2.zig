@@ -1699,28 +1699,15 @@ pub fn resolveTable(catalog: *api.Catalog, session: api.Session, ref: ir.TableRe
         }
     }
 
-    var db_name: ?[]const u8 = ref.database orelse session.current_db;
-    var schema_name: []const u8 = ref.schema orelse session.current_schema;
-    if (ref.database == null and ref.schema != null) {
-        if (splitDoubleUnderscore(ref.schema.?)) |parts| {
-            db_name = parts.db;
-            schema_name = parts.schema;
-        }
-    }
-    const resolved_db = catalog.database(db_name orelse return error.NoDatabaseSelected) orelse return error.DatabaseNotFound;
-    const schema = resolved_db.schema(schema_name) orelse return error.SchemaNotFound;
+    const ns = try catalog.tableNamespace(session, ref.database, ref.schema);
+    const resolved_db = catalog.database(ns.db) orelse return error.DatabaseNotFound;
+    const schema = resolved_db.schema(ns.schema) orelse return error.SchemaNotFound;
     {
         schema.tables_mutex.lockUncancelable(schema.io);
         defer schema.tables_mutex.unlock(schema.io);
         if (schema.tables.get(ref.name)) |t| return t;
     }
     return schema.openTable(ref.name, .{});
-}
-
-fn splitDoubleUnderscore(s: []const u8) ?struct { db: []const u8, schema: []const u8 } {
-    const pos = std.mem.indexOf(u8, s, "__") orelse return null;
-    if (pos == 0 or pos + 2 >= s.len) return null;
-    return .{ .db = s[0..pos], .schema = s[pos + 2 ..] };
 }
 
 test "engine v2 classifies scan filter group order limit as grouped topn" {
