@@ -919,3 +919,22 @@ test "TRIM removes spaces, a character set, or whole copies of a string" {
     defer allocator.free(matched);
     try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, matched);
 }
+
+test "ASSERT_TRUE is true where its condition holds and fails the query on a false or NULL one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE at (id BIGINT PRIMARY KEY, v BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO at VALUES (1, 10), (2, 20), (3, NULL)");
+
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("at", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(ASSERT_TRUE(v > 0) AS CHAR) FROM at WHERE id <= 2 ORDER BY id", &.{ "1", "1" });
+        try helpers.expectText(allocator, db, "SELECT CAST(ASSERT_TRUE(COUNT(v) = 2 AND COUNT(DISTINCT v) = 2) AS CHAR) FROM at", "1");
+        try std.testing.expectError(error.AssertTrueFailed, helpers.exec(allocator, db, "SELECT ASSERT_TRUE(v > 10) FROM at"));
+        try std.testing.expectError(error.AssertTrueFailed, helpers.exec(allocator, db, "SELECT ASSERT_TRUE(v > 0) FROM at"));
+        try std.testing.expectError(error.AssertTrueFailed, helpers.exec(allocator, db, "SELECT ASSERT_TRUE(COUNT(*) = 2) FROM at"));
+    }
+}

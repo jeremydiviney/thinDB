@@ -700,7 +700,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
-    inline for (.{ "charset", "collation", "benchmark" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
+    inline for (.{ "charset", "collation", "typeof", "benchmark" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (keyFnParts(name) != null) return true;
     if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
@@ -724,14 +724,16 @@ pub fn isReservedScalarUdfName(name: []const u8) bool {
     return std.mem.startsWith(u8, name, "__") or nameResolvable(null, canonicalName(name));
 }
 
-/// CHARSET(x) and COLLATION(x) depend on x's type alone, so they take any
-/// argument, NULL too.
+/// CHARSET(x), COLLATION(x) and TYPEOF(x) depend on x's type alone, so they
+/// take any argument, NULL too.
 fn resolveCharset(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len != 1) return null;
     const kernel: TypedKernel = if (std.ascii.eqlIgnoreCase(name, "charset"))
         string.charsetKernel
     else if (std.ascii.eqlIgnoreCase(name, "collation"))
         string.collationKernel
+    else if (std.ascii.eqlIgnoreCase(name, "typeof"))
+        string.typeofKernel
     else
         return null;
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
@@ -1556,6 +1558,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "nullif", .arg_types = &.{ .boolean, .boolean }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = cond.nullifBooleanKernel },
     .{ .name = "nullif", .arg_types = &.{ .date, .date }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = cond.nullifDateKernel },
     .{ .name = "nullif", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = cond.nullifDatetimeKernel },
+    .{ .name = "assert_true", .arg_types = &.{.boolean}, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = cond.assertTrueKernel },
     // --- date/time component extractors ---
     // NB: now() / current_date() are deferred — Zig 0.16's std.Io.Clock
     // needs an Io instance; kernel signature doesn't carry one yet.
@@ -1918,6 +1921,7 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "ceiling", .name = "ceil" },
     .{ .alias = "char", .name = "chr" },
     .{ .alias = "get_json_object", .name = "get_json_string" },
+    .{ .alias = "timestamp", .name = "to_datetime" },
     .{ .alias = "add_months", .name = "months_add" },
 };
 
