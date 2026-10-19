@@ -102,6 +102,8 @@ pub const ParseError = error{
     SqlLateralJoinUnsupported,
     /// Row values of different widths compared or matched by IN.
     SqlRowValueWidthMismatch,
+    /// `DEFAULT NULL` on a NOT NULL or PRIMARY KEY column (MySQL 1067).
+    SqlInvalidDefault,
     /// `ALTER TABLE ... ADD COLUMN c ... FIRST | AFTER x`: new columns are
     /// appended.
     SqlColumnPositionUnsupported,
@@ -6773,7 +6775,7 @@ pub const Parser = struct {
             try self.advance();
             if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
             try self.advance();
-            const val = try self.parseScalar();
+            const val = try self.parseAssignedValue();
             if (ir.assignmentIndex(assigns.items, null, col_name)) |prior| {
                 assigns.items[prior].value = val;
             } else try assigns.append(self.arena, .{ .col = col_name, .value = val });
@@ -6796,6 +6798,14 @@ pub const Parser = struct {
             .predicate = pred,
             .derived = derived,
         } });
+    }
+
+    /// An UPDATE SET value: an expression, or DEFAULT for the column's
+    /// default.
+    fn parseAssignedValue(self: *Parser) ParseError!ir.Expr {
+        if (self.cur.tag != .kw_default) return try self.parseScalar();
+        try self.advance();
+        return .{ .col_ref = ir.column_default_ref };
     }
 
     /// MySQL's DELETE / UPDATE modifiers, which mean nothing to a
