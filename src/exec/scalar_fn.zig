@@ -859,6 +859,14 @@ pub const ELEMENT_AT_FN = "element_at";
 /// them tests against 0: `a < [1, 2]` is `array_order(a, [1, 2]) < 0`.
 pub const ARRAY_ORDER_FN = "array_order";
 
+/// Internal: `array_sort(a, (x, y) -> c)` is
+/// `ARRAY_SORT_CMP_FN(a, array_map((x, y) -> c, ARRAY_PAIRS_LEFT_FN(a), ARRAY_PAIRS_RIGHT_FN(a)))`.
+/// The two pair arrays hold row-major every ordered pair of a row's
+/// elements, so the comparator's value for each pair orders them.
+pub const ARRAY_PAIRS_LEFT_FN = "__array_pairs_left";
+pub const ARRAY_PAIRS_RIGHT_FN = "__array_pairs_right";
+pub const ARRAY_SORT_CMP_FN = "__array_sort_cmp";
+
 fn nestedCastFnName(arena: Allocator, ty: Type) Allocator.Error![]const u8 {
     return nestedTypedFnName(arena, NESTED_CAST_PREFIX, ty);
 }

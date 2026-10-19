@@ -41,10 +41,13 @@ const NAMES = [_][]const u8{
     "l2_distance",
 };
 
+/// The internal names `array_sort` with a comparator lowers to.
+const COMPARATOR_SORT_NAMES = [_][]const u8{ scalar_fn.ARRAY_PAIRS_LEFT_FN, scalar_fn.ARRAY_PAIRS_RIGHT_FN, scalar_fn.ARRAY_SORT_CMP_FN };
+
 pub fn isArrayFnName(name: []const u8) bool {
     if (std.mem.startsWith(u8, name, scalar_fn.NESTED_CAST_PREFIX)) return true;
     if (std.mem.startsWith(u8, name, scalar_fn.NESTED_VALUE_PREFIX)) return true;
-    for (NAMES) |n| if (eql(name, n)) return true;
+    for (NAMES ++ COMPARATOR_SORT_NAMES) |n| if (eql(name, n)) return true;
     return false;
 }
 
@@ -109,6 +112,8 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
         if (eql(name, "array_length") or eql(name, "cardinality")) return overload(aa, name, arg_types, .int, lengthKernel);
         if (eql(name, "array_distinct")) return overload(aa, name, arg_types, array, distinctKernel);
         if (eql(name, "array_sort") and element != .json) return overload(aa, name, arg_types, array, sortKernel);
+        if (eql(name, scalar_fn.ARRAY_PAIRS_LEFT_FN)) return overload(aa, name, arg_types, array, PairsKernel(.left));
+        if (eql(name, scalar_fn.ARRAY_PAIRS_RIGHT_FN)) return overload(aa, name, arg_types, array, PairsKernel(.right));
         if (eql(name, "reverse") or eql(name, "array_reverse")) return overload(aa, name, arg_types, array, reverseKernel);
         if (eql(name, "array_min") and element != .json) return overload(aa, name, arg_types, element, minKernel);
         if (eql(name, "array_max") and element != .json) return overload(aa, name, arg_types, element, maxKernel);
@@ -157,6 +162,12 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     if (eql(name, "array_sortby")) {
         for (arg_types[1..]) |t| if (t.arrayElement() == null) return null;
         return overload(aa, name, arg_types, array, sortByKernel);
+    }
+    if (eql(name, scalar_fn.ARRAY_SORT_CMP_FN)) {
+        if (arg_types.len != 2) return null;
+        const c = arg_types[1].arrayElement() orelse return null;
+        if (!c.isInteger() and !c.isFloat() and !c.isDecimal()) return null;
+        return overload(aa, name, arg_types, array, sortByComparatorKernel);
     }
     if (eql(name, scalar_fn.ELEMENT_AT_FN)) {
         if (arg_types.len != 2 or !arg_types[1].isInteger()) return null;
@@ -1012,6 +1023,139 @@ fn sortByKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, a
         try b.endRow(allocator, true);
     }
     try b.finish(allocator, out);
+}
+
+const PairSide = enum { left, right };
+
+/// `ARRAY_PAIRS_LEFT_FN` and `ARRAY_PAIRS_RIGHT_FN`: a row of n elements as
+/// the first (`left`) or second (`right`) elements of its n² ordered pairs,
+/// the pair (i, j) at place i * n + j.
+fn PairsKernel(comptime side: PairSide) TypedKernel {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+            _ = out_type;
+            const element = arg_types[0].arrayElement().?;
+            var fa = try FlatAs.init(allocator, arg_types[0], args[0], element, rows);
+            defer fa.deinit(allocator);
+            var b = try ArrayBuilder.init(allocator, element);
+            defer b.deinit(allocator);
+            for (0..rows) |r| {
+                const s = fa.start(r);
+                const n = fa.end(r) - s;
+                for (0..n) |i| switch (side) {
+                    .left => for (0..n) |_| try b.appendOne(allocator, fa.elements.view, s + i),
+                    .right => try b.appendRange(allocator, fa.elements.view, s, s + n),
+                };
+                try b.endRow(allocator, args[0].isValid(r));
+            }
+            try b.finish(allocator, out);
+        }
+    }.kernel;
+}
+
+/// Whether the comparator puts element i before element j, its value for
+/// the pair (i, j) being negative. A NULL value puts neither first.
+const PairOrder = struct {
+    before: []const bool,
+    n: usize,
+
+    fn less(self: PairOrder, i: usize, j: usize) bool {
+        return self.before[i * self.n + j];
+    }
+};
+
+/// `ARRAY_SORT_CMP_FN(arr, cmp)`: `arr` ordered by the comparator's values
+/// `cmp` for its pairs (`PairsKernel`), ties in order. The comparator must
+/// be a strict weak order over the row's elements, or the statement fails
+/// with `ArraySortComparatorInconsistent`: an order that puts an element
+/// before itself, or each of two before the other, or isn't transitive has
+/// no sorted answer.
+fn sortByComparatorKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = out_type;
+    const element = arg_types[0].arrayElement().?;
+    var fa = try FlatAs.init(allocator, arg_types[0], args[0], element, rows);
+    defer fa.deinit(allocator);
+    var cmp = try FlatAs.init(allocator, arg_types[1], args[1], .double, rows);
+    defer cmp.deinit(allocator);
+    var b = try ArrayBuilder.init(allocator, element);
+    defer b.deinit(allocator);
+    var before: std.ArrayList(bool) = .empty;
+    defer before.deinit(allocator);
+    var order: std.ArrayList(usize) = .empty;
+    defer order.deinit(allocator);
+    var scratch: std.ArrayList(usize) = .empty;
+    defer scratch.deinit(allocator);
+    const values = cmp.elements.view;
+    for (0..rows) |r| {
+        if (!args[0].isValid(r)) {
+            try b.endRow(allocator, false);
+            continue;
+        }
+        const s = fa.start(r);
+        const n = fa.end(r) - s;
+        if (cmp.end(r) - cmp.start(r) != n * n) return Error.ArrayLengthMismatch;
+        before.clearRetainingCapacity();
+        for (cmp.start(r)..cmp.end(r)) |k| try before.append(allocator, values.isValid(k) and values.data.double[k] < 0);
+        const pairs: PairOrder = .{ .before = before.items, .n = n };
+        order.clearRetainingCapacity();
+        for (0..n) |i| try order.append(allocator, i);
+        try scratch.resize(allocator, n);
+        mergeSortBy(pairs, order.items, scratch.items);
+        if (!sortedConsistently(pairs, order.items)) return Error.ArraySortComparatorInconsistent;
+        for (order.items) |i| try b.appendOne(allocator, fa.elements.view, s + i);
+        try b.endRow(allocator, true);
+    }
+    try b.finish(allocator, out);
+}
+
+/// A stable bottom-up merge sort of `order` by `pairs`, which ends in
+/// bounds whatever the comparator answers, so an inconsistent one is caught
+/// after the sort (`sortedConsistently`).
+fn mergeSortBy(pairs: PairOrder, order: []usize, scratch: []usize) void {
+    const n = order.len;
+    var src = order;
+    var dst = scratch;
+    var width: usize = 1;
+    while (width < n) : (width *= 2) {
+        var lo: usize = 0;
+        while (lo < n) : (lo += 2 * width) {
+            const mid = @min(lo + width, n);
+            const hi = @min(lo + 2 * width, n);
+            var i = lo;
+            var j = mid;
+            for (lo..hi) |k| {
+                if (i < mid and (j >= hi or !pairs.less(src[j], src[i]))) {
+                    dst[k] = src[i];
+                    i += 1;
+                } else {
+                    dst[k] = src[j];
+                    j += 1;
+                }
+            }
+        }
+        std.mem.swap([]usize, &src, &dst);
+    }
+    if (src.ptr != order.ptr) @memcpy(order, src);
+}
+
+/// Whether `sorted`, sorted by `pairs`, shows a strict weak order: its
+/// elements fall into runs, a new run starting where the element before
+/// comes first, every element of a run equivalent to every other (neither before
+/// the other), and every element before every one of a later run. A strict
+/// weak order always sorts so, and an order that sorts so is one.
+fn sortedConsistently(pairs: PairOrder, sorted: []const usize) bool {
+    var run_start: usize = 0;
+    for (sorted, 0..) |x, p| {
+        if (p > 0 and pairs.less(sorted[p - 1], x)) run_start = p;
+        for (sorted[0..run_start]) |earlier| {
+            if (!pairs.less(earlier, x) or pairs.less(x, earlier)) return false;
+        }
+        for (sorted[run_start..p]) |peer| {
+            if (pairs.less(peer, x) or pairs.less(x, peer)) return false;
+        }
+        if (pairs.less(x, x)) return false;
+    }
+    return true;
 }
 
 fn minKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {

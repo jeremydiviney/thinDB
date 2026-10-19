@@ -105,7 +105,8 @@ Lambdas follow StarRocks:
 - The body is any scalar expression. It reads the row's columns, session variables and outer lambdas' parameters, and a parameter hides a column of its name. `x.a.b` over a parameter is a field path of its struct, kept whole by the parser and derived as a hidden column ahead of the body. The body runs as a Compute over the batch's elements, one row per element, beside the outer columns it reads.
 - The other lambda functions read `array_map`'s values: `array_filter(f, a, ...)` is `array_filter(a, array_map(f, a, ...))`, and so are `array_sortby`, `any_match` and `all_match` (over `array_map(f, a, ...)` alone). `map_filter`, `transform_values` and `transform_keys` take a lambda of key and value.
 - Each also takes the values themselves. `array_filter(a, flags)` and `map_filter(m, flags)` keep the places whose flag is true, so none past the flags' end and none for NULL flags. `any_match(flags)` and `all_match(flags)` are NULL where a NULL flag could change the answer. `array_sortby(a, keys, ...)` sorts by one key array after another, NULLs first and ties in order, passing over a NULL key array.
-- Not covered yet: `array_sort` with a comparator and `map_apply`.
+- `array_sort(a, (x, y) -> c)` sorts each row's elements by a comparator: a negative value puts `x` before `y`, and equivalent elements keep their order. The comparator must read both its parameters and nothing else, and call nothing nondeterministic, or the statement fails with `SqlComparatorLambdaInvalid`, as StarRocks refuses it. It runs over every ordered pair of a row's elements, so it costs the square of the array's length, and when its answers are no strict weak order (an element before itself, two each before the other, or an order or equivalence that isn't transitive) the statement fails with `ArraySortComparatorInconsistent`.
+- Not covered yet: `map_apply`.
 
 Maps follow StarRocks too:
 - `map{k: v, ...}` and `map(k, v, ...)` are literals. Their keys meet at one common type and their values at another, as array elements do. `m[k]` and `ELEMENT_AT(m, k)` give the value `k` maps to, or NULL; a NULL key matches a NULL key.
@@ -1993,7 +1994,7 @@ MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
 TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
 SeriesStepZero, SeriesNonIntegerArgument, UnnestNonArrayArgument,
-MapArrayLengthMismatch, ArrayLengthMismatch,
+MapArrayLengthMismatch, ArrayLengthMismatch, ArraySortComparatorInconsistent,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -2039,6 +2040,7 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `MapArrayLengthMismatch` means `map_from_arrays` was given key and value arrays of different lengths, which pair no entries; StarRocks refuses them too. The wires report it as they report `SeriesStepZero`.
 
 `ArrayLengthMismatch` means a function that pairs arrays element by element, a lambda's arrays or `array_sortby`'s keys, was given arrays of different lengths on one row; StarRocks refuses them too. The wires report it as they report `MapArrayLengthMismatch`.
+`ArraySortComparatorInconsistent` means `array_sort`'s comparator gave a row's elements no strict weak order, so they have no sorted order; StarRocks refuses such a comparator too. The wires report it as they report `ArrayLengthMismatch`.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

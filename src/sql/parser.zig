@@ -151,6 +151,10 @@ pub const ParseError = error{
     /// A recursive CTE without a column list whose first arm's column names
     /// aren't known at parse time (it selects `*` over an unknown table).
     SqlRecursiveCteColumnsUnknown,
+    /// `array_sort(a, (x, y) -> c)` whose comparator doesn't read both its
+    /// parameters, reads anything else, or calls a nondeterministic
+    /// function, as StarRocks refuses.
+    SqlComparatorLambdaInvalid,
 } || LexError;
 
 /// `postgres` and `mysql` name the function a name means in that dialect
@@ -3286,6 +3290,12 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(name, "any_match") or std.ascii.eqlIgnoreCase(name, "all_match")) {
             return try self.callOf(name, &.{try self.callOf("array_map", args)});
         }
+        if (std.ascii.eqlIgnoreCase(name, "array_sort")) {
+            if (args.len != 2 or !try self.comparatorLambda(args[0].lambda)) return ParseError.SqlComparatorLambdaInvalid;
+            const left = try self.callOf(scalar_fn.ARRAY_PAIRS_LEFT_FN, &.{first});
+            const right = try self.callOf(scalar_fn.ARRAY_PAIRS_RIGHT_FN, &.{first});
+            return try self.callOf(scalar_fn.ARRAY_SORT_CMP_FN, &.{ first, try self.callOf("array_map", &.{ args[0], left, right }) });
+        }
         const map_fns = [_][]const u8{ "map_filter", "transform_values", "transform_keys" };
         for (map_fns) |f| {
             if (!std.ascii.eqlIgnoreCase(name, f)) continue;
@@ -3299,6 +3309,39 @@ pub const Parser = struct {
             return try self.callOf(scalar_fn.MAP_FROM_ARRAYS_FN, &.{ mapped, values });
         }
         return null;
+    }
+
+    /// Whether `l` compares its two elements and nothing else, as StarRocks
+    /// wants of `array_sort`'s comparator: its body reads both parameters,
+    /// no other column, and calls no nondeterministic function.
+    fn comparatorLambda(self: *Parser, l: ir.Expr.Lambda) ParseError!bool {
+        if (l.params.len != 2) return false;
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        try exec_compute.collectColumnRefs(self.arena, &refs, l.body.*);
+        var read = [2]bool{ false, false };
+        for (refs.items) |ref| {
+            const root = ref[0 .. std.mem.indexOfScalar(u8, ref, '.') orelse ref.len];
+            const param = for (l.params, 0..) |p, i| {
+                if (types.columnNameEql(p, root)) break i;
+            } else return false;
+            read[param] = true;
+        }
+        return read[0] and read[1] and !callsNondeterministic(l.body.*);
+    }
+
+    fn callsNondeterministic(e: ir.Expr) bool {
+        return switch (e) {
+            .call => |c| isNondeterministicFn(c.fn_name) or for (c.args) |a| {
+                if (callsNondeterministic(a)) break true;
+            } else false,
+            .case => |cs| blk: {
+                for (cs.operands) |o| if (callsNondeterministic(o.expr)) break :blk true;
+                for (cs.branches) |br| if (callsNondeterministic(br.then)) break :blk true;
+                break :blk if (cs.else_branch) |eb| callsNondeterministic(eb.*) else false;
+            },
+            .lambda => |inner| callsNondeterministic(inner.body.*),
+            else => false,
+        };
     }
 
     fn callOf(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
