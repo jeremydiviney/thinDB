@@ -739,6 +739,66 @@ test "NEXT_DAY, PREVIOUS_DAY, WEEK_ISO, DAYOFWEEK_ISO, TO_ISO8601, TO_DATETIME_N
     }
 }
 
+test "JODATIME_FORMAT, STR_TO_JODATIME, TO_TERA_DATE and TO_TERA_TIMESTAMP, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    // StarRocks' answers, but for the zone: StarRocks writes its session zone.
+    const cases = .{
+        .{ "JODATIME_FORMAT('2023-04-15', 'yyyy-MM-dd')", "2023-04-15" },
+        .{ "JODATIME_FORMAT('2023-04-15 23:45:12', 'yyyy-MM-dd''T''HH:mm:ssZZ')", "2023-04-15T23:45:12+00:00" },
+        .{ "JODATIME_FORMAT('2023-04-15 15:30:00', 'yyyy-MM-dd hh:mm:ssa')", "2023-04-15 03:30:00PM" },
+        .{ "JODATIME_FORMAT('2023-12-25', 'YYYY-''W''ww-e')", "2023-W52-1" },
+        .{ "JODATIME_FORMAT('2023-08-03', 'MMM dd')", "Aug 03" },
+        .{ "JODATIME_FORMAT(DATE '2023-08-03', 'EEEE, MMMM d, yy D')", "Thursday, August 3, 23 215" },
+        .{ "JODATIME_FORMAT('2023-02-29', 'yyyy-MM-dd')", null },
+        .{ "JODATIME_FORMAT('2023-04-15', 'HH:mm:ss==a--b==cc--aa')", "00:00:00==AM--b==cc--AM" },
+        .{ "JODATIME_FORMAT('2023-01-01 00:00:00.038000', 'HH:mm:ss.SSSSS')", "00:00:00.03800" },
+        .{ "JODATIME_FORMAT('2023-01-01 00:00:00.038000', 'ss.S')", "00.0" },
+        .{ "JODATIME_FORMAT('2023-06-25 00:00:00', 'yyyyMMdd--''0123')", "20230625--0123" },
+        .{ "JODATIME_FORMAT('2023-06-25 12:00:00', 'k K h ''it''''s'' ''''x')", "12 0 12 it's '2023" },
+        .{ "FORMAT_DATETIME(PARSE_DATETIME('2024-04-01', 'yyyy-MM-dd'), 'yyyy-ww')", "2024-14" },
+        .{ "STR_TO_JODATIME('2024-04-01', 'yyyy-MM-dd')", "2024-04-01 00:00:00" },
+        .{ "STR_TO_JODATIME('20240401 0930', 'yyyyMMdd HHmm')", "2024-04-01 09:30:00" },
+        .{ "STR_TO_JODATIME('aug 3, 2023 9:05:07.25 pm', 'MMM d, yyyy h:mm:ss.SS a')", "2023-08-03 21:05:07.250000" },
+        .{ "STR_TO_JODATIME('2024-W14-1', 'xxxx-''W''ww-e')", "2024-04-01 00:00:00" },
+        .{ "STR_TO_JODATIME('2024-04-01 extra', 'yyyy-MM-dd')", null },
+        .{ "STR_TO_JODATIME('2023-02-29', 'yyyy-MM-dd')", null },
+        .{ "TO_TERA_DATE('2020-02-02 00:00:00', 'yyyy-mm-dd')", "2020-02-02" },
+        .{ "TO_TERA_DATE('1988', 'yyyy')", "1988-01-01" },
+        .{ "TO_TERA_DATE('04.1988,08', 'mm.yyyy,dd')", "1988-04-08" },
+        .{ "TO_TERA_DATE(';198804:08', ';yyyymm:dd')", "1988-04-08" },
+        .{ "TO_TERA_DATE('1988/04/08', 'yy/mm/dd')", null },
+        .{ "TO_TERA_DATE(NULL, 'yyyy')", null },
+        .{ "TO_TERA_TIMESTAMP('1988/04/08 2', 'yyyy/mm/dd hh')", "1988-04-08 02:00:00" },
+        .{ "TO_TERA_TIMESTAMP('1988/04/08 2:3:4', 'yyyy/mm/dd hh24:mi:ss')", "1988-04-08 02:03:04" },
+        .{ "TO_TERA_TIMESTAMP('1988/04/08 02 pm:3:4', 'yyyy/mm/dd hh pm:mi:ss')", "1988-04-08 14:03:04" },
+        .{ "TO_TERA_TIMESTAMP('1988/04/08 12 AM:3:4', 'yyyy/mm/dd hh am:mi:ss')", "1988-04-08 00:03:04" },
+        .{ "TO_TERA_TIMESTAMP('1988/04/08 02 pm:3:4', 'yyyy/mm/dd hh am:mi:ss')", null },
+        .{ "TO_TERA_TIMESTAMP('1988/04/0800 02 pm:3:4', 'yyyy/mm/dd hh am:mi:ss')", null },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+    try std.testing.expectError(error.InvalidTeradataFormat, helpers.exec(allocator, db, "SELECT TO_TERA_DATE(';198804:08', ';YYYYmm:dd')"));
+    try std.testing.expectError(error.InvalidTeradataFormat, helpers.exec(allocator, db, "SELECT TO_TERA_DATE('1988/04/08', 'xyz/mm/dd')"));
+
+    try helpers.exec(allocator, db, "CREATE TABLE jt (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, s VARCHAR(40), f VARCHAR(40))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO jt VALUES (1, '2023-04-01', '2023-04-02 20:13:14', '2023-04-02 20:13:14', 'yyyy-MM-dd HH:mm:ss'),
+        \\  (2, '2024-12-30', '2024-12-30 08:00:00', '30/12/24', 'dd/MM/yy'), (3, NULL, NULL, NULL, 'yyyy')
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("jt", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT JODATIME_FORMAT(d, 'xxxx-ww EEE') FROM jt ORDER BY id", &.{ "2023-13 Sat", "2025-01 Mon", null });
+        try helpers.expectTexts(allocator, db, "SELECT JODATIME_FORMAT(dt, f) FROM jt ORDER BY id", &.{ "2023-04-02 20:13:14", "30/12/24", null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(STR_TO_JODATIME(s, f) AS CHAR) FROM jt ORDER BY id", &.{ "2023-04-02 20:13:14", "2024-12-30 00:00:00", null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(TO_TERA_DATE(s, 'yyyy-mm-dd hh24:mi:ss') AS CHAR) FROM jt ORDER BY id", &.{ "2023-04-02", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(TO_TERA_TIMESTAMP(s, 'yyyy-mm-dd hh24:mi:ss') AS CHAR) FROM jt ORDER BY id", &.{ "2023-04-02 20:13:14", null, null });
+    }
+}
+
 test "TIMESTAMPDIFF(MONTH|YEAR) counts as StarRocks does: -1 for an end earlier in the same month or year (issue #418)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

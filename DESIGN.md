@@ -159,6 +159,31 @@ case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
 milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
 `ADD_MONTHS` is `MONTHS_ADD`.
 
+`JODATIME_FORMAT(x, pattern)` writes a DATE or DATETIME under a Joda-Time
+pattern, and `STR_TO_JODATIME(text, pattern)` reads one into a DATETIME.
+Trino's `FORMAT_DATETIME` and `PARSE_DATETIME` are the same pair. A pattern
+is runs of Joda's letters (`yyyy`, `MM`, `MMM`, `dd`, `HH`, `hh`, `a`,
+`mm`, `ss`, `SSS`, `E`, `D`, `w`, `x`, `e`, ...); text in single quotes,
+any other letter, and anything else is literal. An unclosed quote runs to
+the end, as in StarRocks. A number is padded to its letter count, `yy` is
+the year's last two digits, and `S` is that many leading digits of the
+fraction. A DATETIME carries no zone, so `Z` and `z` write UTC (`+00:00`
+for `ZZ`); StarRocks writes its session zone there. Reading follows Joda:
+the text must match the whole pattern, literals in any case. A number
+followed straight by another reads exactly its letter count of digits
+(`yyyyMMdd`), and any other reads as many as its field holds. Fields the
+pattern doesn't name are those of 1970-01-01 00:00:00, and a two-digit
+year below 70 is in the 2000s, as in MySQL. A zone or century can't be
+read, and text that doesn't read, or names no real time, is NULL.
+
+`TO_TERA_DATE(text, format)` and `TO_TERA_TIMESTAMP(text, format)` read
+Teradata formats. These are the lowercase elements `yyyy`, `yy`, `mm`, `dd`,
+`hh`, `hh24`, `mi`, `ss`, `am` and `pm`, and the separators `- / , . ; :`
+and space. Anything else is `InvalidTeradataFormat`. A number reads one
+digit up to its element's width, and a separator must match itself. `am` or
+`pm` must match the text and makes `hh` a 12-hour hour, so `'02 pm'` under
+`hh am` is NULL, as in StarRocks. Text past the format's end is ignored.
+
 `CAST(text AS DATE)`, `CAST(text AS DATETIME)`, `DATE(text)` and
 `TIMESTAMP(text)`, which is `CAST(text AS DATETIME)`, read text the way
 StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
@@ -1926,6 +1951,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `InvalidBinaryFormat` means `TO_BINARY` or `FROM_BINARY` was given a format other than `hex`, `encode64` or `utf8`. StarRocks fails the query too.
 
 `InvalidBarArguments` means `BAR` was given a size outside `[min, max]`, a min not below its max, or a negative width, which StarRocks also refuses.
+
+`InvalidTeradataFormat` means `TO_TERA_DATE` or `TO_TERA_TIMESTAMP` was given a format with something other than Teradata's elements and separators, which StarRocks also refuses.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 

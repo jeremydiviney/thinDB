@@ -1691,6 +1691,11 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "previous_day", .arg_types = &.{ .string, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = datefmt.stepToWeekdayKernel(.text, .previous) },
     .{ .name = "previous_day", .arg_types = &.{ .date, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = datefmt.stepToWeekdayKernel(.date, .previous) },
     .{ .name = "to_iso8601", .arg_types = &.{.date}, .return_type = .string, .kernel = datefmt.toIso8601Kernel(.date) },
+    .{ .name = "jodatime_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.jodaFormatKernel(.datetime) },
+    .{ .name = "jodatime_format", .arg_types = &.{ .date, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = datefmt.jodaFormatKernel(.date) },
+    .{ .name = "str_to_jodatime", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.strToJodaKernel },
+    .{ .name = "to_tera_date", .arg_types = &.{ .string, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = datefmt.teradataKernel(.date) },
+    .{ .name = "to_tera_timestamp", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.teradataKernel(.datetime) },
     .{ .name = "to_iso8601", .arg_types = &.{.datetime}, .return_type = .string, .kernel = datefmt.toIso8601Kernel(.datetime) },
     .{ .name = "microsecond", .arg_types = &.{.date}, .return_type = .int, .kernel = datefmt.microsecondKernel(.date) },
     .{ .name = "microsecond", .arg_types = &.{.datetime}, .return_type = .int, .kernel = datefmt.microsecondKernel(.datetime) },
@@ -1938,6 +1943,9 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "get_json_object", .name = "get_json_string" },
     .{ .alias = "timestamp", .name = "to_datetime" },
     .{ .alias = "add_months", .name = "months_add" },
+    // Trino's names for the Joda-Time pair.
+    .{ .alias = "format_datetime", .name = "jodatime_format" },
+    .{ .alias = "parse_datetime", .name = "str_to_jodatime" },
 };
 
 pub fn canonicalName(name: []const u8) []const u8 {
