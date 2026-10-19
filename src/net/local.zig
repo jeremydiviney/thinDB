@@ -2732,7 +2732,10 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
         },
         .create_view => |cv| {
             const db_name = try currentDbName(ctx.session.*);
-            if (!cv.or_replace and catalog.views.contains(db_name, cv.name)) return Error.TableAlreadyExists;
+            if (!cv.or_replace and catalog.views.contains(db_name, cv.name)) {
+                if (cv.if_not_exists) return try EmptyOp.create(ctx.allocator);
+                return Error.TableAlreadyExists;
+            }
             // Validate the defining query parses now, not at first use.
             {
                 var va = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -2751,7 +2754,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 return try EmptyOp.create(ctx.allocator);
             }
             const sc = try currentPersistentSchema(catalog, ctx.session.*);
-            var mv = try buildMaterializedView(ctx, catalog, sc, cv.name, cv.body, if (cv.or_replace) .replace else .create);
+            var mv = try buildMaterializedView(ctx, catalog, sc, cv.name, cv.body, if (cv.or_replace) .replace else .create, !cv.deferred);
             defer mv.build.deinit();
             mv.build.publish() catch |e| return thindb_api.remapError(Error, e);
             // The view is registered only once its table stands, and a table
@@ -2780,7 +2783,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             defer def.deinit(ctx.allocator);
             if (!def.materialized) return Error.UnsupportedOp;
             const sc = try currentPersistentSchema(catalog, ctx.session.*);
-            var mv = try buildMaterializedView(ctx, catalog, sc, name, def.body, .refresh);
+            var mv = try buildMaterializedView(ctx, catalog, sc, name, def.body, .refresh, true);
             defer mv.build.deinit();
             mv.build.publish() catch |e| return thindb_api.remapError(Error, e);
             ctx.affected_rows = @intCast(mv.rows);
@@ -2803,8 +2806,9 @@ const MaterializedViewBuild = struct {
 /// `TableBuild` the caller publishes: until then the table that holds the
 /// name, if any, keeps its rows, so a query that fails part way changes
 /// nothing. `.create` refuses a name a table holds; `.replace` (CREATE OR
-/// REPLACE) and `.refresh` take it over. The parsed IR lives in a local
-/// arena that outlives the drain.
+/// REPLACE) and `.refresh` take it over. Without `fill` the table gets the
+/// query's columns and no rows. The parsed IR lives in a local arena that
+/// outlives the drain.
 fn buildMaterializedView(
     ctx: *CompileCtx,
     catalog: *Catalog,
@@ -2812,6 +2816,7 @@ fn buildMaterializedView(
     name: []const u8,
     body: []const u8,
     mode: enum { create, replace, refresh },
+    fill: bool,
 ) anyerror!MaterializedViewBuild {
     var pa = std.heap.ArenaAllocator.init(ctx.allocator);
     defer pa.deinit();
@@ -2858,7 +2863,7 @@ fn buildMaterializedView(
         },
     } catch |e| return thindb_api.remapError(Error, e);
     errdefer build.deinit();
-    const rows = try insertAll(&source, build.table);
+    const rows = if (fill) try insertAll(&source, build.table) else 0;
     return .{ .build = build, .rows = rows };
 }
 

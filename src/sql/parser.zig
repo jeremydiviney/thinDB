@@ -111,6 +111,10 @@ pub const ParseError = error{
     /// A CREATE TABLE PROPERTIES key that is neither a thinDB option nor a
     /// StarRocks key thinDB knows to ignore.
     SqlUnknownTableProperty,
+    /// A materialized view option that a view holding what its last REFRESH
+    /// wrote can't honor: REFRESH ASYNC, a REFRESH of some partitions,
+    /// partition retention, or a transparent rewrite of a stale view.
+    SqlMatviewOptionUnsupported,
     /// A CTE's or derived table's column list whose length differs from
     /// its query's SELECT list (MySQL 1353).
     SqlColumnListCountMismatch,

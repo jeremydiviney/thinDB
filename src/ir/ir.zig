@@ -203,7 +203,12 @@ pub const DdlOp = union(enum) {
 pub const CreateView = struct {
     name: []const u8,
     or_replace: bool,
+    /// An existing view of the name is kept and the statement does nothing.
+    if_not_exists: bool = false,
     materialized: bool,
+    /// A materialized view whose backing table stays empty until its first
+    /// REFRESH (StarRocks' REFRESH DEFERRED).
+    deferred: bool = false,
     /// Raw defining-query text (everything after `AS`).
     body: []const u8,
 };
@@ -1865,7 +1870,9 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try appendU32(allocator, out, @intCast(cv.name.len));
             try out.appendSlice(allocator, cv.name);
             try out.append(allocator, @intFromBool(cv.or_replace));
+            try out.append(allocator, @intFromBool(cv.if_not_exists));
             try out.append(allocator, @intFromBool(cv.materialized));
+            try out.append(allocator, @intFromBool(cv.deferred));
             try appendU32(allocator, out, @intCast(cv.body.len));
             try out.appendSlice(allocator, cv.body);
         },
@@ -3141,8 +3148,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(DdlTag.create_zig_function)) return Error.IrCorrupt;
-    const tag: DdlTag = @enumFromInt(t);
+    const tag = std.enums.fromInt(DdlTag, t) orelse return Error.IrCorrupt;
     return switch (tag) {
         .create_database => DdlOp{ .create_database = try decodeCreateNamespace(bytes, cursor) },
         .drop_database => DdlOp{ .drop_database = try decodeDropNamespace(bytes, cursor) },
@@ -3268,15 +3274,16 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
         },
         .create_view => blk: {
             const name = try readString(bytes, cursor);
-            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
-            const or_replace = bytes[cursor.*] != 0;
-            const materialized = bytes[cursor.* + 1] != 0;
-            cursor.* += 2;
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const flags = bytes[cursor.*..][0..4];
+            cursor.* += 4;
             const body = try readString(bytes, cursor);
             break :blk DdlOp{ .create_view = .{
                 .name = name,
-                .or_replace = or_replace,
-                .materialized = materialized,
+                .or_replace = flags[0] != 0,
+                .if_not_exists = flags[1] != 0,
+                .materialized = flags[2] != 0,
+                .deferred = flags[3] != 0,
                 .body = body,
             } };
         },
@@ -3872,6 +3879,29 @@ test "ir: database and schema ddl round-trip with their existence flags" {
             },
             else => return error.TestUnexpectedResult,
         }
+    }
+}
+
+test "ir: create view round-trips its flags" {
+    const allocator = std.testing.allocator;
+    const cases = [_]CreateView{
+        .{ .name = "v", .or_replace = true, .materialized = false, .body = "SELECT 1" },
+        .{ .name = "mv", .or_replace = false, .if_not_exists = true, .materialized = true, .deferred = true, .body = "SELECT a FROM t" },
+    };
+    for (cases) |cv| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try encode(allocator, &buf, .{ .ddl = .{ .create_view = cv } });
+
+        var decoded = try decode(allocator, buf.items);
+        defer decoded.deinitDecoded(allocator);
+        const got = decoded.ddl.create_view;
+        try std.testing.expectEqualStrings(cv.name, got.name);
+        try std.testing.expectEqualStrings(cv.body, got.body);
+        try std.testing.expectEqual(cv.or_replace, got.or_replace);
+        try std.testing.expectEqual(cv.if_not_exists, got.if_not_exists);
+        try std.testing.expectEqual(cv.materialized, got.materialized);
+        try std.testing.expectEqual(cv.deferred, got.deferred);
     }
 }
 

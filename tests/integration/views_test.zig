@@ -53,6 +53,50 @@ test "view expands; materialized view snapshots + refreshes" {
     try std.testing.expectEqual(@as(i64, 140), try firstInt(allocator, db, "SELECT s FROM totals WHERE region = 'east'", false));
 }
 
+test "materialized view: StarRocks' clauses before AS, REFRESH DEFERRED and IF NOT EXISTS" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seed(allocator, db);
+
+    try exec(allocator, db,
+        \\CREATE MATERIALIZED VIEW mv1 COMMENT 'by region' PARTITION BY date_trunc('day', region)
+        \\DISTRIBUTED BY HASH(region) BUCKETS 4 ORDER BY (region) REFRESH IMMEDIATE MANUAL
+        \\PROPERTIES ('replication_num' = '1', 'session.insert_timeout' = '3600', 'transparent_mv_rewrite_mode' = 'false', 'partition_refresh_number' = '1')
+        \\AS SELECT region, SUM(amt) AS s FROM sales GROUP BY region
+    );
+    try std.testing.expectEqual(@as(i64, 40), try firstInt(allocator, db, "SELECT s FROM mv1 WHERE region = 'east'", false));
+
+    try exec(allocator, db, "CREATE MATERIALIZED VIEW mv2 DISTRIBUTED BY RANDOM REFRESH DEFERRED MANUAL AS SELECT id, amt FROM sales");
+    try std.testing.expectEqual(@as(i64, 0), try firstInt(allocator, db, "SELECT COUNT(*) FROM mv2", false));
+    try exec(allocator, db, "REFRESH MATERIALIZED VIEW mv2 WITH SYNC MODE");
+    try std.testing.expectEqual(@as(i64, 3), try firstInt(allocator, db, "SELECT COUNT(*) FROM mv2", false));
+    try exec(allocator, db, "INSERT INTO sales (id, region, amt) VALUES (4, 'west', 5)");
+    try exec(allocator, db, "REFRESH MATERIALIZED VIEW mv2 FORCE WITH ASYNC MODE");
+    try std.testing.expectEqual(@as(i64, 4), try firstInt(allocator, db, "SELECT COUNT(*) FROM mv2", false));
+
+    try exec(allocator, db, "CREATE MATERIALIZED VIEW IF NOT EXISTS mv2 AS SELECT 1 AS x");
+    try std.testing.expectEqual(@as(i64, 4), try firstInt(allocator, db, "SELECT COUNT(*) FROM mv2", false));
+    try exec(allocator, db, "CREATE VIEW IF NOT EXISTS east AS SELECT 1 AS amt");
+    try std.testing.expectEqual(@as(i64, 40), try firstInt(allocator, db, "SELECT SUM(amt) FROM east", true));
+    try helpers.expectRunError(allocator, db, "CREATE MATERIALIZED VIEW mv2 AS SELECT 1 AS x", error.TableAlreadyExists);
+
+    const refused = .{
+        .{ "CREATE MATERIALIZED VIEW mv3 REFRESH ASYNC AS SELECT id FROM sales", error.SqlMatviewOptionUnsupported },
+        .{ "CREATE MATERIALIZED VIEW mv3 REFRESH DEFERRED ASYNC START('2026-01-01') EVERY (INTERVAL 1 DAY) AS SELECT id FROM sales", error.SqlMatviewOptionUnsupported },
+        .{ "CREATE MATERIALIZED VIEW mv3 PROPERTIES ('partition_ttl' = '2 day') AS SELECT id FROM sales", error.SqlMatviewOptionUnsupported },
+        .{ "CREATE MATERIALIZED VIEW mv3 PROPERTIES ('transparent_mv_rewrite_mode' = 'true') AS SELECT id FROM sales", error.SqlMatviewOptionUnsupported },
+        .{ "REFRESH MATERIALIZED VIEW mv2 PARTITION START ('2026-01-01') END ('2026-02-01')", error.SqlMatviewOptionUnsupported },
+        .{ "CREATE MATERIALIZED VIEW mv3 PROPERTIES ('no_such_key' = '1') AS SELECT id FROM sales", error.SqlUnknownTableProperty },
+        .{ "CREATE MATERIALIZED VIEW mv3 REFRESH MANUAL REFRESH MANUAL AS SELECT id FROM sales", error.SqlExpectedKeyword },
+        .{ "CREATE MATERIALIZED VIEW mv3 REFRESH DEFERRED AS SELECT id FROM sales", error.SqlExpectedKeyword },
+        .{ "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS mv3 AS SELECT id FROM sales", error.SqlExpectedKeyword },
+    };
+    inline for (refused) |c| try helpers.expectRunError(allocator, db, c[0], c[1]);
+}
+
 test "views + materialized views survive a reopen" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

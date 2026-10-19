@@ -93,6 +93,7 @@ const NOT_SUPPORTED = [_][]const u8{
     "SqlSetOpAllUnsupported",
     "SqlLateralJoinUnsupported",
     "SqlColumnPositionUnsupported",
+    "SqlMatviewOptionUnsupported",
     "SqlFoundRowsUnsupported",
     "SqlPrepareExecuteUnsupported",
     "LexCharsetUnsupported",

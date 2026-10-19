@@ -645,16 +645,20 @@ pub fn parseCreateFunctionBody(p: anytype, or_replace: bool) !*ir.Op {
     } } });
 }
 
-/// CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS <select>. The defining
-/// query is captured as raw text (to end of statement), mirroring the
-/// inline-function body capture. `MATERIALIZED VIEW` builds a backing table
-/// at compile time; a plain view is expanded inline at reference.
+/// CREATE [OR REPLACE] [MATERIALIZED] VIEW [IF NOT EXISTS] name AS <select>.
+/// The defining query is captured as raw text (to end of statement),
+/// mirroring the inline-function body capture. `MATERIALIZED VIEW` builds a
+/// backing table at compile time, after StarRocks' clauses
+/// (`parseMatviewClauses`); a plain view is expanded inline at reference.
 pub fn parseCreateViewBody(p: anytype, or_replace: bool, materialized: bool) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
+    const if_not_exists = try parseIfNotExists(p);
+    if (if_not_exists and or_replace) return PE.SqlExpectedKeyword;
     const name = try p.dupedIdentLower();
     // Explicit view column lists (`VIEW v (a, b) AS ...`) are not supported
     // in v1 — the column names come from the SELECT's own output.
     if (p.cur.tag == .lparen) return PE.SqlExpectedKeyword;
+    const deferred = materialized and try parseMatviewClauses(p);
     if (p.cur.tag != .kw_as) return PE.SqlExpectedKeyword;
 
     // Raw body capture by lexer position (see parseCreateFunctionBody): the
@@ -685,13 +689,155 @@ pub fn parseCreateViewBody(p: anytype, or_replace: bool, materialized: bool) !*i
     return try p.allocOp(.{ .ddl = .{ .create_view = .{
         .name = name,
         .or_replace = or_replace,
+        .if_not_exists = if_not_exists,
         .materialized = materialized,
+        .deferred = deferred,
         .body = try p.arena.dupe(u8, body),
     } } });
 }
 
-/// REFRESH MATERIALIZED VIEW name. `refresh` was matched contextually by the
-/// caller (parseStatement); this consumes it and the rest.
+/// StarRocks' clauses between a materialized view's name and AS, each at
+/// most once and in any order: COMMENT 'text', PARTITION BY expr,
+/// DISTRIBUTED BY {HASH (cols) | RANDOM} [BUCKETS n], ORDER BY (cols),
+/// REFRESH [IMMEDIATE | DEFERRED] MANUAL and PROPERTIES (...). Partitioning,
+/// distribution and sort order shape StarRocks' storage and change nothing
+/// here. A view refreshes only when REFRESH MATERIALIZED VIEW runs, so
+/// REFRESH ASYNC is refused. True when DEFERRED leaves the view empty until
+/// its first REFRESH.
+fn parseMatviewClauses(p: anytype) !bool {
+    const PE = @TypeOf(p.*).Err;
+    const Clause = enum { comment, partition, distributed, order, refresh, properties };
+    var seen: std.EnumSet(Clause) = .initEmpty();
+    var deferred = false;
+    while (p.cur.tag != .kw_as) {
+        const clause: Clause = if (isBareWord(p, "comment"))
+            .comment
+        else if (p.cur.tag == .kw_partition)
+            .partition
+        else if (isBareWord(p, "distributed"))
+            .distributed
+        else if (p.cur.tag == .kw_order)
+            .order
+        else if (isBareWord(p, "refresh"))
+            .refresh
+        else if (isBareWord(p, "properties"))
+            .properties
+        else
+            return PE.SqlExpectedKeyword;
+        if (seen.contains(clause)) return PE.SqlExpectedKeyword;
+        seen.insert(clause);
+        try p.advance();
+        switch (clause) {
+            .comment => _ = try parsePropertyText(p),
+            .partition => {
+                try p.expect(.kw_by);
+                try skipMatviewPartitionExpr(p);
+            },
+            .distributed => {
+                try p.expect(.kw_by);
+                if (isBareWord(p, "hash")) {
+                    try p.advance();
+                    try skipParenGroup(p);
+                } else if (isBareWord(p, "random")) {
+                    try p.advance();
+                } else return PE.SqlExpectedKeyword;
+                if (isBareWord(p, "buckets")) {
+                    try p.advance();
+                    try p.expect(.integer);
+                }
+            },
+            .order => {
+                try p.expect(.kw_by);
+                try skipParenGroup(p);
+            },
+            .refresh => {
+                if (isBareWord(p, "deferred")) {
+                    deferred = true;
+                    try p.advance();
+                } else if (isBareWord(p, "immediate")) {
+                    try p.advance();
+                }
+                if (isBareWord(p, "async")) return PE.SqlMatviewOptionUnsupported;
+                if (!isBareWord(p, "manual")) return PE.SqlExpectedKeyword;
+                try p.advance();
+            },
+            .properties => {
+                try p.expect(.lparen);
+                while (true) {
+                    const key = try parsePropertyText(p);
+                    try p.expect(.eq);
+                    try checkMatviewProperty(p, key, try parsePropertyText(p));
+                    if (p.cur.tag != .comma) break;
+                    try p.advance();
+                }
+                try p.expect(.rparen);
+            },
+        }
+    }
+    return deferred;
+}
+
+/// A materialized view's PARTITION BY expression, up to the next clause.
+fn skipMatviewPartitionExpr(p: anytype) !void {
+    const PE = @TypeOf(p.*).Err;
+    var depth: usize = 0;
+    var empty = true;
+    while (true) : (empty = false) {
+        switch (p.cur.tag) {
+            .lparen => depth += 1,
+            .rparen => depth -|= 1,
+            .eof, .semicolon => return PE.SqlExpectedKeyword,
+            else => if (depth == 0 and (p.cur.tag == .kw_as or p.cur.tag == .kw_order or isBareWord(p, "distributed") or
+                isBareWord(p, "refresh") or isBareWord(p, "properties") or isBareWord(p, "comment")))
+            {
+                if (empty) return PE.SqlExpectedIdent;
+                return;
+            },
+        }
+        try p.advance();
+    }
+}
+
+/// StarRocks' materialized view PROPERTIES keys that change nothing for a
+/// view thinDB refreshes whole and on demand: how StarRocks batches a
+/// partition refresh, when it rewrites a query over the base tables to read
+/// the view (thinDB never does), and the table keys a CREATE TABLE ignores.
+const IGNORED_MATVIEW_PROPERTIES = [_][]const u8{
+    "partition_refresh_number",
+    "partition_refresh_strategy",
+    "auto_refresh_partitions_limit",
+    "mv_rewrite_staleness_second",
+    "query_rewrite_consistency",
+    "enable_query_rewrite",
+    "force_external_table_query_rewrite",
+    "colocate_mv",
+};
+
+/// Partition retention drops a view's old rows and a transparent rewrite
+/// answers a read of a stale view from its base tables: options a view
+/// that holds what its last REFRESH wrote can't honor. A `session.` key
+/// sets a variable for StarRocks' refresh task.
+fn checkMatviewProperty(p: anytype, key: []const u8, value: []const u8) !void {
+    const PE = @TypeOf(p.*).Err;
+    if (asciiEqlAny(key, &.{ "partition_ttl", "partition_ttl_number", "partition_retention_condition" })) {
+        return PE.SqlMatviewOptionUnsupported;
+    }
+    if (std.ascii.eqlIgnoreCase(key, "transparent_mv_rewrite_mode")) {
+        if (!std.ascii.eqlIgnoreCase(value, "false")) return PE.SqlMatviewOptionUnsupported;
+        return;
+    }
+    if (std.ascii.startsWithIgnoreCase(key, "session.")) return;
+    if (!asciiEqlAny(key, &IGNORED_MATVIEW_PROPERTIES) and !asciiEqlAny(key, &IGNORED_TABLE_PROPERTIES)) {
+        return PE.SqlUnknownTableProperty;
+    }
+}
+
+/// REFRESH MATERIALIZED VIEW name [FORCE] [WITH {SYNC | ASYNC} MODE].
+/// `refresh` was matched contextually by the caller (parseStatement); this
+/// consumes it and the rest. A refresh always rebuilds the whole view before
+/// the statement returns, which StarRocks' FORCE and SYNC MODE ask for, and
+/// ASYNC MODE's refresh is simply done by then. StarRocks' PARTITION form,
+/// refreshing only some of the view, is refused.
 pub fn parseRefresh(p: anytype) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     try p.advance(); // consume "refresh"
@@ -700,6 +846,15 @@ pub fn parseRefresh(p: anytype) !*ir.Op {
     if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
     try p.advance();
     const name = try p.dupedIdentLower();
+    if (p.cur.tag == .kw_partition) return PE.SqlMatviewOptionUnsupported;
+    if (isBareWord(p, "force")) try p.advance();
+    if (p.cur.tag == .kw_with) {
+        try p.advance();
+        if (!isBareWord(p, "sync") and !isBareWord(p, "async")) return PE.SqlExpectedKeyword;
+        try p.advance();
+        if (!isBareWord(p, "mode")) return PE.SqlExpectedKeyword;
+        try p.advance();
+    }
     return try p.allocOp(.{ .ddl = .{ .refresh_view = name } });
 }
 
