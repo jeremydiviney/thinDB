@@ -7325,32 +7325,41 @@ pub const Parser = struct {
         return .{ .predicate = pred, .derived = derived };
     }
 
-    /// Parse `SET @name = expr`. The RHS is a general Expr so users
-    /// can write `SET @cutoff = (SELECT MAX(amount) FROM orders)` —
-    /// the pre-compile pass resolves any scalar subquery into a
-    /// literal, and `compileSetVar` requires the result to be a `.lit`.
+    /// Parse `SET @a = expr, thindb_max_dop = n, ...`. A value is any
+    /// expression, a subquery included (`SET @cutoff = (SELECT MAX(amount)
+    /// FROM orders)`); `compileSetVar` evaluates the assignments in order.
     pub fn parseSetVar(self: *Parser) ParseError!*ir.Op {
         try self.expect(.kw_set);
+        if (try self.atSessionOption() == null and self.cur.tag != .at_identifier) {
+            if (self.lex.dialect != .mysql) return ParseError.SqlExpectedIdent;
+            return try self.parseIgnoredSet();
+        }
+        var assignments: std.ArrayList(ir.SetAssignment) = .empty;
+        while (true) {
+            try assignments.append(self.arena, try self.parseSetAssignment());
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        return try self.allocOp(.{ .set_var = .{ .assignments = assignments.items } });
+    }
+
+    fn parseSetAssignment(self: *Parser) ParseError!ir.SetAssignment {
         if (try self.atSessionOption()) |option| {
             try self.advance();
             if (self.cur.tag != .eq and self.cur.tag != .kw_to) return ParseError.SqlExpectedToken;
             try self.advance();
-            const value_expr: ir.Expr = if (self.cur.tag == .kw_default) default: {
+            const value: ir.Expr = if (self.cur.tag == .kw_default) default: {
                 try self.advance();
                 break :default .{ .lit = .{ .bigint = 0 } };
             } else try self.parseScalar();
-            return try self.allocOp(.{ .set_var = .{ .name = option.sqlName(), .value = value_expr, .session_option = option } });
+            return .{ .name = option.sqlName(), .value = value, .session_option = option };
         }
-        if (self.cur.tag != .at_identifier) {
-            if (self.lex.dialect != .mysql) return ParseError.SqlExpectedIdent;
-            return try self.parseIgnoredSet();
-        }
+        if (self.cur.tag != .at_identifier) return ParseError.SqlExpectedIdent;
         const name = try self.arena.dupe(u8, self.cur.text);
         try self.advance();
         if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
         try self.advance();
-        const value_expr = try self.parseScalar();
-        return try self.allocOp(.{ .set_var = .{ .name = name, .value = value_expr } });
+        return .{ .name = name, .value = try self.parseScalar() };
     }
 
     /// A thinDB session option named after SET: `thindb_max_dop`, also
@@ -9542,14 +9551,19 @@ test "SET thindb_max_dop parses as a session option in every spelling" {
 
     inline for (.{ "SET thindb_max_dop = 4", "SET THINDB_MAX_DOP TO 4", "SET SESSION thindb_max_dop = 4", "SET @@thindb_max_dop = 4", "SET @@session.thindb_max_dop = 4" }) |sql| {
         const op = try parseDialect(aa, sql, .mysql);
-        try std.testing.expectEqual(ir.SessionOption.max_dop, op.set_var.session_option.?);
-        try std.testing.expectEqual(@as(i32, 4), op.set_var.value.lit.int);
+        try std.testing.expectEqual(ir.SessionOption.max_dop, op.set_var.assignments[0].session_option.?);
+        try std.testing.expectEqual(@as(i32, 4), op.set_var.assignments[0].value.lit.int);
     }
     const reset = try parseDialect(aa, "SET thindb_max_dop = DEFAULT", .neutral);
-    try std.testing.expectEqual(@as(i64, 0), reset.set_var.value.lit.bigint);
+    try std.testing.expectEqual(@as(i64, 0), reset.set_var.assignments[0].value.lit.bigint);
 
     const user_var = try parseDialect(aa, "SET @thindb_max_dop = 4", .mysql);
-    try std.testing.expect(user_var.set_var.session_option == null);
+    try std.testing.expect(user_var.set_var.assignments[0].session_option == null);
+    const both = try parseDialect(aa, "SET @a = 1, thindb_max_dop = 2, @b = @a + 1", .mysql);
+    try std.testing.expectEqual(@as(usize, 3), both.set_var.assignments.len);
+    try std.testing.expectEqualStrings("a", both.set_var.assignments[0].name);
+    try std.testing.expectEqual(ir.SessionOption.max_dop, both.set_var.assignments[1].session_option.?);
+    try std.testing.expectEqualStrings("b", both.set_var.assignments[2].name);
     const other = try parseDialect(aa, "SET SESSION sql_mode = ''", .mysql);
     try std.testing.expect(other.* != .set_var);
 }

@@ -289,8 +289,12 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
             try explainOp(allocator, out, i.source.*, depth + 1);
         },
         .set_var => |sv| {
-            try out.appendSlice(allocator, "SetVar @");
-            try out.appendSlice(allocator, sv.name);
+            try out.appendSlice(allocator, "SetVar");
+            for (sv.assignments, 0..) |a, i| {
+                try out.appendSlice(allocator, if (i == 0) " " else ", ");
+                if (a.session_option == null) try out.append(allocator, '@');
+                try out.appendSlice(allocator, a.name);
+            }
             try out.append(allocator, '\n');
         },
         .delete_op => |d| {

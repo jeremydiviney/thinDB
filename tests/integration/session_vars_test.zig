@@ -306,3 +306,88 @@ test "session option: SET thindb_max_dop rejects a value that is not a count" {
     try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "SET thindb_max_dop = -1"));
     try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "SET thindb_max_dop = 'four'"));
 }
+
+test "session var: SET takes any constant expression, assigned left to right" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SET @a = 5, @b = @a + 1, @c = concat(upper('x'), @b); SELECT @c", "X6");
+    // `@z` is read before its own assignment, as in MySQL.
+    try expectVarItems(allocator, db, "SET @y = @z, @z = 1; SELECT @y, @z", &.{ "@y", "@z" }, &.{ null, 1 });
+    try helpers.expectText(allocator, db, "SET @d = 1.5 * 3; SELECT @d", "4.5");
+    try helpers.expectText(allocator, db, "SET @u = uuid(); SELECT length(@u)", "36");
+    try helpers.expectText(allocator, db, "SET @n = NULL; SELECT @n", null);
+    try helpers.expectText(allocator, db, "SET @m = (SELECT MAX(qty) FROM t) + 1; SELECT @m", "41");
+    try helpers.expectText(allocator, db, "SET @e = (SELECT MAX(qty) FROM t WHERE qty > 100); SELECT @e", null);
+    try helpers.expectText(allocator, db, "SET @a = 1, thindb_max_dop = 2, @b = @a + 1; SELECT @b", "2");
+
+    try std.testing.expectError(error.ColumnNotFound, runSql(allocator, db, "SET @bad = nosuchcol; SELECT 1"));
+    try std.testing.expectError(error.SubqueryMultipleRows, runSql(allocator, db, "SET @two = (SELECT id FROM t); SELECT 1"));
+}
+
+test "session var: a variable holds an array, map or struct" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SET @arr = [3, 1, 2]; SELECT @arr", "[3,1,2]");
+    try helpers.expectText(allocator, db, "SET @arr = array_generate(4); SELECT array_length(array_append(@arr, 9))", "5");
+    try helpers.expectTexts(allocator, db, "SET @arr = [3, 1]; SELECT id FROM t WHERE array_contains(@arr, id) ORDER BY id", &.{ "1", "3" });
+    try helpers.expectText(allocator, db, "SET @m = map{1: 'x', 2: 'y'}; SELECT @m[2]", "y");
+    try helpers.expectText(allocator, db, "SET @s = named_struct('a', 1, 'b', 'q'); SELECT @s.b", "q");
+    try helpers.expectText(
+        allocator,
+        db,
+        "SET @arr = array_generate(1, 100); SELECT array_sum(array_map(x -> array_contains(@arr, x), array_generate(1, 1000)))",
+        "100",
+    );
+
+    try exec(allocator, db, "CREATE TABLE uv (id INT PRIMARY KEY, a ARRAY<INT>, m MAP<INT, VARCHAR(8)>)");
+    try exec(allocator, db, "SET @arr = [3, 1, 2], @mm = map{1: 'x'}; INSERT INTO uv VALUES (1, @arr, @mm), (2, [9], NULL)");
+    try helpers.expectTexts(allocator, db, "SELECT a FROM uv ORDER BY id", &.{ "[3,1,2]", "[9]" });
+    try helpers.expectTexts(allocator, db, "SELECT m FROM uv ORDER BY id", &.{ "{1:\"x\"}", null });
+    // A column compared with a nested variable has no literal to push down.
+    try std.testing.expectError(error.UnsupportedOp, runSql(allocator, db, "SET @arr = [9]; SELECT id FROM uv WHERE a = @arr"));
+}
+
+fn runSet(allocator: std.mem.Allocator, db: *thindb.Database, session: thindb.Session, sql: []const u8) !thindb.Session {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var cq = try thindb.net.compileWithSession(allocator, db, session, try thindb.sql.parse(arena.allocator(), sql));
+    defer cq.deinit();
+    while (try cq.next()) |_| {}
+    return cq.sessionValue();
+}
+
+fn varInt(session: thindb.Session, name: []const u8) !?i64 {
+    const set = session.vars.?.get(name) orelse return null;
+    return switch ((set orelse return error.TestUnexpectedResult).value) {
+        inline .tinyint, .smallint, .int, .bigint => |v| v,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+test "session var: a SET that fails changes no variable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // The first SET of a session to fail leaves no variables behind.
+    try std.testing.expectError(error.ColumnNotFound, runSet(allocator, db, .{}, "SET @a = 1, @bad = nosuchcol"));
+
+    var session = try runSet(allocator, db, .{}, "SET @k = 1");
+    defer thindb.net.CompiledQuery.freeSessionVars(allocator, session.vars);
+    try std.testing.expectError(error.ColumnNotFound, runSet(allocator, db, session, "SET @k = 2, @j = 3, @k = 4, @bad = nosuchcol"));
+    try std.testing.expectEqual(@as(?i64, 1), try varInt(session, "k"));
+    try std.testing.expectEqual(@as(?i64, null), try varInt(session, "j"));
+    session = try runSet(allocator, db, session, "SET @k = @k + 1, @j = @k");
+    try std.testing.expectEqual(@as(?i64, 2), try varInt(session, "k"));
+    try std.testing.expectEqual(@as(?i64, 2), try varInt(session, "j"));
+}

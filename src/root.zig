@@ -29,6 +29,7 @@ pub const Catalog = api.Catalog;
 pub const TempNamespace = api.TempNamespace;
 pub const Session = api.Session;
 pub const SessionVars = api.SessionVars;
+pub const SessionVar = api.SessionVar;
 pub const Dialect = api.Dialect;
 /// Namespace type in the Catalog → Database → Schema → Table hierarchy.
 /// Distinct from the table column-schema type `thindb.TableSchema`.

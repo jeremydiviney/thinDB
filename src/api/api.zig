@@ -437,6 +437,13 @@ pub const Session = struct {
     }
 };
 
+/// A user variable's value and its type. An array, map or struct holds
+/// its encoded bytes in `.text`, which only its `type` reads.
+pub const SessionVar = struct {
+    value: @import("../types.zig").Value,
+    type: @import("../types.zig").Type,
+};
+
 /// Per-connection variable storage. Names and string values are
 /// duped into the backing arena so they outlive the SQL statement
 /// that defined them.
@@ -444,7 +451,7 @@ pub const SessionVars = struct {
     arena: std.heap.ArenaAllocator,
     /// `null` map value = a variable explicitly `SET @x = NULL` (SQL NULL),
     /// distinct from an absent key (undefined variable).
-    map: std.StringHashMapUnmanaged(?@import("../types.zig").Value) = .empty,
+    map: std.StringHashMapUnmanaged(?SessionVar) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SessionVars {
         return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -458,20 +465,33 @@ pub const SessionVars = struct {
 
     /// Outer optional: present iff the variable was set. Inner optional: the
     /// value, or `null` for a variable set to SQL NULL.
-    pub fn get(self: *const SessionVars, name: []const u8) ??@import("../types.zig").Value {
+    pub fn get(self: *const SessionVars, name: []const u8) ??SessionVar {
         return self.map.get(name);
     }
 
     /// Set / overwrite a variable. `null` stores SQL NULL. String values are
     /// dup'd into the arena so the caller's backing storage can go away.
-    pub fn set(self: *SessionVars, name: []const u8, value: ?@import("../types.zig").Value) !void {
+    pub fn set(self: *SessionVars, name: []const u8, value: ?SessionVar) !void {
         const arena_alloc = self.arena.allocator();
         const owned_name = try arena_alloc.dupe(u8, name);
-        const owned_value: ?@import("../types.zig").Value = if (value) |v| switch (v) {
-            .text => |s| .{ .text = try arena_alloc.dupe(u8, s) },
-            else => v,
+        const owned_value: ?SessionVar = if (value) |v| .{
+            .value = switch (v.value) {
+                .text => |s| .{ .text = try arena_alloc.dupe(u8, s) },
+                else => v.value,
+            },
+            .type = v.type,
         } else null;
         try self.map.put(self.arena.child_allocator, owned_name, owned_value);
+    }
+
+    /// Put back what `get` gave before a `set` of `name`. It doesn't
+    /// allocate, so a statement that fails can always undo its assignments.
+    pub fn restore(self: *SessionVars, name: []const u8, prior: ??SessionVar) void {
+        const value = prior orelse {
+            _ = self.map.remove(name);
+            return;
+        };
+        if (self.map.getPtr(name)) |slot| slot.* = value;
     }
 };
 

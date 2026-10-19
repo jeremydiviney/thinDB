@@ -277,6 +277,15 @@ pub const ColumnStore = struct {
         };
     }
 
+    /// True when the store's text passed 4 GiB (`StringStore.wide_offsets`),
+    /// which `view` can't show.
+    pub fn isWide(self: ColumnStore) bool {
+        return switch (self.data) {
+            .varchar, .string, .char, .json, .nested => |ss| ss.isWide(),
+            else => false,
+        };
+    }
+
     /// Bytes the store's buffers hold, spare capacity included: what
     /// `deinit` hands back to the allocator.
     pub fn heldBytes(self: ColumnStore) usize {

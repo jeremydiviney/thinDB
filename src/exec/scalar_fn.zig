@@ -860,8 +860,21 @@ pub const ELEMENT_AT_FN = "element_at";
 pub const ARRAY_ORDER_FN = "array_order";
 
 fn nestedCastFnName(arena: Allocator, ty: Type) Allocator.Error![]const u8 {
+    return nestedTypedFnName(arena, NESTED_CAST_PREFIX, ty);
+}
+
+/// Internal: `__nested_value:<type>('<bytes>')`, the array, map or struct
+/// whose encoded bytes the text holds, as a user variable keeps one
+/// (`SET @a = [1, 2]`).
+pub const NESTED_VALUE_PREFIX = "__nested_value:";
+
+pub fn nestedValueFnName(arena: Allocator, ty: Type) Allocator.Error![]const u8 {
+    return nestedTypedFnName(arena, NESTED_VALUE_PREFIX, ty);
+}
+
+fn nestedTypedFnName(arena: Allocator, prefix: []const u8, ty: Type) Allocator.Error![]const u8 {
     var text: std.ArrayList(u8) = .empty;
-    try text.appendSlice(arena, NESTED_CAST_PREFIX);
+    try text.appendSlice(arena, prefix);
     try types.appendTypeText(arena, &text, ty);
     return text.items;
 }
