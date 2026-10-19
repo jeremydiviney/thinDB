@@ -454,7 +454,8 @@ pub fn appendBinaryRow(
 
     for (schema, 0..) |col, ci| {
         const view = values[ci];
-        if (!view.isValid(row)) {
+        // StarRocks shows a bitmap as NULL, as the text protocol does.
+        if (!view.isValid(row) or col.type == .bitmap) {
             const bit: usize = ci + 2;
             out.items[nullmap_start + bit / 8] |= @as(u8, 1) << @as(u3, @intCast(bit % 8));
             continue;
@@ -530,6 +531,7 @@ fn appendBinaryCell(
             try packet.appendLenEncString(allocator, out, text);
         },
         .varchar, .char, .string, .json, .nested => |sv| try packet.appendLenEncString(allocator, out, sv.rowBytes(row)),
+        .bitmap => unreachable, // appendBinaryRow sends a bitmap as NULL
     }
 }
 

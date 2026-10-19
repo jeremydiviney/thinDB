@@ -581,6 +581,8 @@ fn appendSqlValue(aa: Allocator, out: *std.ArrayList(u8), t: Type, arg: ColumnVi
             defer aa.free(value);
             try out.appendSlice(aa, value);
         },
+        // StarRocks has no JSON form of a bitmap; it shows one as NULL.
+        .bitmap => try jb.appendNull(aa, out),
         .boolean => |s| try jb.appendBool(aa, out, s[row] != 0),
         inline .tinyint, .smallint, .int, .bigint => |s| try jb.appendInt(aa, out, s[row]),
         .largeint => |s| {

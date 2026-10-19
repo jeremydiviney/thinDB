@@ -487,7 +487,7 @@ fn appendText(allocator: Allocator, out: *ColumnStore, text: []const u8) !void {
 /// once floats are canonical.
 fn cellBytes(v: ColumnView, i: usize) []const u8 {
     return switch (v.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(i),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.rowBytes(i),
         inline else => |s| std.mem.asBytes(&s[i]),
     };
 }
@@ -513,6 +513,7 @@ fn cellOrder(v: ColumnView, i: usize, j: usize) std.math.Order {
     return switch (v.data) {
         .varchar, .string, .char, .json => |sv| std.mem.order(u8, sv.rowBytes(i), sv.rowBytes(j)),
         .nested => |sv| nested.order(sv.rowBytes(i), sv.rowBytes(j)),
+        .bitmap => |sv| std.mem.order(u8, sv.rowBytes(i), sv.rowBytes(j)),
         .float => |s| types.floatOrder(s[i], s[j]),
         .double => |s| types.floatOrder(s[i], s[j]),
         inline else => |s| std.math.order(s[i], s[j]),

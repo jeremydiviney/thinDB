@@ -210,6 +210,10 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "covar_samp", .func = .covar_samp },
     .{ .name = "corr", .func = .corr },
     .{ .name = "approx_top_k", .func = .approx_top_k },
+    .{ .name = "bitmap_agg", .func = .bitmap_agg },
+    .{ .name = "bitmap_union", .func = .bitmap_union },
+    .{ .name = "bitmap_union_count", .func = .bitmap_union_count },
+    .{ .name = "bitmap_intersect", .func = .bitmap_intersect },
     .{ .name = "mann_whitney_u_test", .func = .mann_whitney_u_test },
     .{ .name = "percentile_approx_weighted", .func = .percentile_approx_weighted },
     .{ .name = "group_concat", .func = .group_concat },
@@ -274,6 +278,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
+        inline .bitmap_agg, .bitmap_union, .bitmap_union_count, .bitmap_intersect => |b| @tagName(b),
         .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf, .max_by_key => null,
     };
 }

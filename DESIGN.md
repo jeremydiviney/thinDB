@@ -76,6 +76,7 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | Nested | `ARRAY<T>` | One variable-width value per row in a self-contained encoding (`exec/nested.zig`): element class, count, validity bits, then the fixed-width values, or offsets and bytes. `T` is any type, an array included |
 | | `MAP<K, V>` | One variable-width value per row: a map tag, then its keys and its values as two arrays of one length. `K` is any type but a nested one; `V` is any type |
 | | `STRUCT<f T, ...>` | One variable-width value per row: a struct tag, the field count, validity and class per field, then offsets and the fields' bytes. Names live in the type, not the value. A field is any type |
+| Set | `BITMAP` | One variable-width value per row in StarRocks' serialized form (`exec/bitmap.zig`): a set of unsigned 64-bit integers |
 
 A nested type points to its shape (`types.internNested`), so a type stays
 one word and two types compare by pointer. The shapes live in one
@@ -127,6 +128,15 @@ Structs follow StarRocks:
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire sends it as `text`.
 
 A NULL field, element, key or value meets the nested type beside it, so `row(1, NULL)` sits beside `row(1, [2])` in one VALUES list.
+
+Bitmaps follow StarRocks:
+- A `BITMAP` is a set of unsigned 64-bit integers, a Roaring bitmap in memory (`exec/bitmap.zig`). A stored value is StarRocks' serialized form, so `bitmap_to_binary` gives and `bitmap_from_binary` takes the bytes StarRocks does. Each set is stored in one layout: EMPTY, a SINGLE, a SET of up to 32 members, then Roaring with a container run-length encoded where that is smaller. So equal sets have equal bytes, and GROUP BY and DISTINCT group them. A bitmap from outside is rewritten into that layout when it is read or inserted.
+- A bitmap has no literal and takes no DEFAULT (`SqlInvalidDefault`). It nests in no ARRAY, MAP or STRUCT, and compares with nothing (`PredicateTypeMismatch`). The MySQL and PostgreSQL wires send a bitmap as NULL, as StarRocks shows one; `bitmap_to_string`, `bitmap_to_base64` and `bitmap_to_binary` read it.
+- A member is an integer in [0, 2^64). `to_bitmap(x)` and `BITMAP_AGG(x)` take an integer, a boolean, or text that spells one. Any other value (negative, too large, text that spells none) is NULL in `to_bitmap` and skipped by `BITMAP_AGG`. `bitmap_from_string` reads a comma-separated list, skipping empty items, and is NULL when an item is no member.
+- `bitmap_count` is 0 for NULL. `bitmap_min` and `bitmap_max` are LARGEINT, NULL for the empty set. `bitmap_to_array` gives BIGINTs: a member past BIGINT's range is `ValueOutOfRange`, where StarRocks wraps it negative. `bitmap_hash` is the set of the text's 32-bit MurmurHash3 under StarRocks' seed, a number hashed as its text.
+- `bitmap_subset_in_range(bm, start, end)` keeps the members in [start, end). `bitmap_subset_limit(bm, start, limit)` keeps the first `limit` members from `start` up, or for a negative limit the last ones up to `start`. `sub_bitmap(bm, offset, len)` keeps `len` members from 0-based rank `offset`, counted from the end when negative. Each is NULL when it keeps none.
+- `BITMAP_UNION(bm)`, `BITMAP_INTERSECT(bm)` and `BITMAP_AGG(x)` are NULL over no input; `BITMAP_UNION_COUNT(bm)` is 0. `BITMAP_UNION_INT(x)` is `COUNT(DISTINCT x)` (§3.4).
+- Not covered: `AGGREGATE KEY` tables and `BITMAP_UNION` columns, `unnest_bitmap`, `intersect_count`, `bitmap_hash64`, `subdivide_bitmap`, and the `_state`, `_union` and `_merge` combinators.
 
 JSON follows MySQL, with StarRocks' JSON functions beside MySQL's:
 - A path may leave out `$`. `a.b` reads as `$.a.b` and `[0]` as `$[0]`, in every JSON function and in `->`.
@@ -325,7 +335,7 @@ Some clause words aren't reserved in MySQL: `TEMP`, `TEMPORARY`, `MATERIALIZED`,
 `FOLLOWING` and `RESPECT`. They are keywords only where they open their clause,
 so they can name a table, a column, an alias or a CTE without quotes.
 
-Explicitly **out of scope for v1**: `JSON`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
+Explicitly **out of scope for v1**: `JSON`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:
 - `FIXED` is `DECIMAL`.

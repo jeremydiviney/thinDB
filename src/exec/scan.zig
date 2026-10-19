@@ -66,6 +66,7 @@ fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
         .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .nested => |sv| .{ .data = .{ .nested = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .bitmap => |sv| .{ .data = .{ .bitmap = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
     };
 }
 
@@ -1071,7 +1072,7 @@ pub const Scan = struct {
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
             if (col.nullable) return null;
             switch (col.type) {
-                .varchar, .string, .char, .json, .nested => {},
+                .varchar, .string, .char, .json, .nested, .bitmap => {},
                 else => return null,
             }
             const low_card = j < self.cached_stats.len and switch (self.cached_stats[j].ndv) {
@@ -1136,7 +1137,7 @@ pub const Scan = struct {
             if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
             if (col.nullable) return null;
             return switch (col.type) {
-                .varchar, .string, .char, .json, .nested => j,
+                .varchar, .string, .char, .json, .nested, .bitmap => j,
                 else => null,
             };
         }
@@ -2246,6 +2247,7 @@ pub const Scan = struct {
             .char => .{ .data = .{ .char = sc } },
             .json => .{ .data = .{ .json = sc } },
             .nested => .{ .data = .{ .nested = sc } },
+            .bitmap => .{ .data = .{ .bitmap = sc } },
             else => unreachable,
         };
     }
@@ -2301,7 +2303,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char, .json, .nested => |s| s.view(),
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s.view(),
                 else => unreachable,
             };
             const memo = self.codeMemo(j);
@@ -2365,7 +2367,7 @@ pub const Scan = struct {
             }
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
-                .varchar, .string, .char, .json, .nested => |s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                 else => return error.TypeMismatch,
             };
             for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
@@ -2373,7 +2375,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char, .json, .nested => |s| s.view(),
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s.view(),
                 else => return error.TypeMismatch,
             };
             for (0..rg_count) |i| digests[i] = exec.stringKeyDigest(sv.rowBytes(i));
@@ -2993,7 +2995,7 @@ pub const Scan = struct {
         }
 
         switch (col_type) {
-            .varchar, .string, .char, .json, .nested => {
+            .varchar, .string, .char, .json, .nested, .bitmap => {
                 const lit: []const u8 = switch (leaf.val) {
                     .text => |t| t,
                     else => return false,
@@ -3340,7 +3342,7 @@ pub const Scan = struct {
             return true;
         }
         switch (col_type) {
-            .varchar, .string, .char, .json, .nested => {
+            .varchar, .string, .char, .json, .nested, .bitmap => {
                 if (block.encoding == .fsst) {
                     return try self.evalFsstInSet(block.bytes, rg_count, flags, set.values, set.negate, active, out);
                 }
@@ -3353,6 +3355,7 @@ pub const Scan = struct {
                     .char => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
                     .json => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
                     .nested => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
+                    .bitmap => |sv| rawStringInSet(sv, view, rg_count, text_set, set.negate, active, out),
                     else => return false,
                 }
                 return true;
@@ -3704,7 +3707,7 @@ pub const Scan = struct {
         const pred_phys = types.findColumn(self.table.schema.columns, lp.col) orelse return false;
         const col_type = self.table.schema.columns[pred_phys].type;
         switch (col_type) {
-            .varchar, .string, .char, .json, .nested => {},
+            .varchar, .string, .char, .json, .nested, .bitmap => {},
             else => return false,
         }
 
@@ -3723,7 +3726,7 @@ pub const Scan = struct {
         if (block.encoding == .raw) {
             const view = storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding) orelse return false;
             const sv = switch (view.data) {
-                .varchar, .string, .char, .json, .nested => |s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                 else => return false,
             };
             const plan = predicate.compileLike(lp.pattern);
@@ -4344,7 +4347,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char, .json, .nested => |s| s.view(),
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s.view(),
                 else => unreachable,
             };
             const memo = self.codeMemo(j);
@@ -4405,7 +4408,7 @@ pub const Scan = struct {
             }
         } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
             const sv = switch (view.data) {
-                .varchar, .string, .char, .json, .nested => |s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                 else => return error.TypeMismatch,
             };
             for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(sv.rowBytes(row));
@@ -4413,7 +4416,7 @@ pub const Scan = struct {
             var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
             defer owned.deinit(self.allocator);
             const sv = switch (owned.data) {
-                .varchar, .string, .char, .json, .nested => |s| s.view(),
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s.view(),
                 else => return error.TypeMismatch,
             };
             for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(sv.rowBytes(row));
@@ -4424,7 +4427,7 @@ pub const Scan = struct {
     /// coded group key (downstream reads the sidecar codes, not this column).
     fn fillEmptyStrings(self: *Scan, out: *ColumnStore, n: usize) !void {
         switch (out.data) {
-            .varchar, .string, .char, .json, .nested => |*ss| {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
                 var i: usize = 0;
                 while (i < n) : (i += 1) try ss.appendValue(self.allocator, "");
             },
@@ -4597,7 +4600,7 @@ pub const Scan = struct {
                 try self.code_bufs[j].resize(self.allocator, matched);
                 const codes = self.code_bufs[j].items[0..matched];
                 const sv = switch (src.data) {
-                    .varchar, .string, .char, .json, .nested => |s| s,
+                    .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                     else => unreachable,
                 };
                 const memo = self.codeMemo(j);
@@ -4617,7 +4620,7 @@ pub const Scan = struct {
                 try self.hash_bufs[j].resize(self.allocator, matched);
                 const digests = self.hash_bufs[j].items[0..matched];
                 const sv = switch (src.data) {
-                    .varchar, .string, .char, .json, .nested => |s| s,
+                    .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                     else => return error.TypeMismatch,
                 };
                 var k: usize = 0;

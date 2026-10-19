@@ -59,8 +59,8 @@ pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows:
             try l.ensureUnusedCapacity(alloc, rows.len);
             for (rows) |r| l.appendAssumeCapacity(s[r]);
         },
-        .varchar, .string, .char, .json, .nested => |s| switch (store.data) {
-            .varchar, .string, .char, .json, .nested => |*d| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| switch (store.data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*d| {
                 var bytes: usize = 0;
                 for (rows) |r| bytes += s.rowBytes(r).len;
                 try d.ensureUnusedValueCapacity(alloc, rows.len, bytes);
@@ -132,7 +132,7 @@ pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnVie
                 l.appendAssumeCapacity(@field(srcs[r >> REF_ROW_BITS].data, @tagName(tag))[r & REF_ROW_MASK]);
             }
         },
-        .varchar, .string, .char, .json, .nested => |*d| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*d| {
             var bytes: usize = 0;
             for (refs) |r| bytes += stringViewOf(srcs[r >> REF_ROW_BITS]).rowBytes(r & REF_ROW_MASK).len;
             try d.ensureUnusedValueCapacity(alloc, refs.len, bytes);
@@ -186,8 +186,8 @@ pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usi
         inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
             try @field(dst.data, @tagName(tag)).append(alloc, s[i]);
         },
-        .varchar, .string, .char, .json, .nested => |s| switch (dst.data) {
-            .varchar, .string, .char, .json, .nested => |*d| try d.appendValue(alloc, s.rowBytes(i)),
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| switch (dst.data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*d| try d.appendValue(alloc, s.rowBytes(i)),
             else => unreachable,
         },
     }
@@ -207,8 +207,8 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
             try l.ensureUnusedCapacity(alloc, ords.len);
             for (ords) |o| l.appendAssumeCapacity(if (o == NO_MATCH) 0 else vals[o]);
         },
-        .varchar, .string, .char, .json, .nested => |sv| switch (dst.data) {
-            .varchar, .string, .char, .json, .nested => |*d| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| switch (dst.data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*d| {
                 var bytes: usize = 0;
                 for (ords) |o| {
                     if (o != NO_MATCH) bytes += sv.rowBytes(o).len;
@@ -233,8 +233,8 @@ fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, 
             try l.ensureUnusedCapacity(alloc, count);
             l.appendNTimesAssumeCapacity(s[row], count);
         },
-        .varchar, .string, .char, .json, .nested => |s| switch (dst.data) {
-            .varchar, .string, .char, .json, .nested => |*d| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| switch (dst.data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*d| {
                 const bytes = s.rowBytes(row);
                 try d.ensureUnusedValueCapacity(alloc, count, bytes.len * count);
                 for (0..count) |_| d.appendValueAssumeCapacity(bytes);
@@ -276,7 +276,7 @@ fn viewOrderRows(v: ColumnView, a: usize, b: usize) std.math.Order {
 
 fn stringViewOf(v: ColumnView) storage.StringView {
     return switch (v.data) {
-        .varchar, .string, .char, .json, .nested => |s| s,
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
         else => unreachable,
     };
 }
@@ -291,7 +291,7 @@ fn stringViewOf(v: ColumnView) storage.StringView {
 /// column is stored at another width still co-locates every equal key.
 fn routeKeyBytes(v: ColumnView, r: usize, wide: *i64) []const u8 {
     return switch (v.data) {
-        .varchar, .string, .char, .json, .nested => |s| s.rowBytes(r),
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| s.rowBytes(r),
         inline .tinyint, .smallint, .int, .bigint => |s| blk: {
             wide.* = s[r];
             break :blk std.mem.asBytes(wide);
@@ -1116,7 +1116,7 @@ pub const MemberFilter = struct {
     pub fn mask(self: *const MemberFilter, v: ColumnView, n: usize, out: []bool) !void {
         if (self.is_str) {
             const sv = switch (v.data) {
-                .varchar, .string, .char, .json, .nested => stringViewOf(v),
+                .varchar, .string, .char, .json, .nested, .bitmap => stringViewOf(v),
                 else => return error.UnsupportedQueryShape,
             };
             for (0..n) |i| {
@@ -1264,7 +1264,7 @@ pub const ViewCol = struct { src: usize, column: Column };
 
 fn is_string_view_type(t: types.Type) bool {
     return switch (t) {
-        .varchar, .string, .char, .json, .nested => true,
+        .varchar, .string, .char, .json, .nested, .bitmap => true,
         else => false,
     };
 }
@@ -1275,7 +1275,7 @@ fn is_string_view_type(t: types.Type) bool {
 /// as it is.
 fn view_as(v: ColumnView, t: types.Type) ColumnView {
     const strings = switch (v.data) {
-        .varchar, .string, .char, .json, .nested => |s| s,
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
         else => return v,
     };
     return .{
@@ -1285,6 +1285,7 @@ fn view_as(v: ColumnView, t: types.Type) ColumnView {
             .char => .{ .char = strings },
             .json => .{ .json = strings },
             .nested => .{ .nested = strings },
+            .bitmap => .{ .bitmap = strings },
             else => unreachable, // Program.build pairs a text column only with a text type.
         },
         .nulls = v.nulls,
@@ -3066,7 +3067,7 @@ pub const RegionWorker = struct {
 fn sliceViewRange(sa: Allocator, v: ColumnView, lo: usize, hi: usize) !ColumnView {
     const data: @TypeOf(v.data) = switch (v.data) {
         inline .int, .bigint, .boolean, .float, .double, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .uuid => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), s[lo..hi]),
-        inline .varchar, .string, .char, .json, .nested => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), .{
+        inline .varchar, .string, .char, .json, .nested, .bitmap => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), .{
             .offsets = s.offsets[lo .. hi + 1],
             .bytes = s.bytes,
         }),
@@ -3543,7 +3544,7 @@ pub const RegionPool = struct {
 fn storeRetainedBytes(c: *const ColumnStore) usize {
     return switch (c.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
-        .varchar, .string, .char, .json, .nested => |s| blk: {
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| blk: {
             var n: usize = s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity;
             if (s.wide_offsets) |w| n += w.capacity * @sizeOf(u64);
             break :blk n;
@@ -4860,7 +4861,7 @@ fn fillConst(alloc: Allocator, store: *ColumnStore, v: ?types.Value, n: usize) !
         .datetime => |*l| try l.appendNTimes(alloc, constI64(val), n),
         .float => |*l| try l.appendNTimes(alloc, @floatCast(constF64(val)), n),
         .double => |*l| try l.appendNTimes(alloc, constF64(val), n),
-        .varchar, .string, .char, .json, .nested => |*d| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*d| {
             const s = switch (val) {
                 .text => |t| t,
                 else => return error.UnsupportedQueryShape,
@@ -5246,7 +5247,7 @@ test "source claims: a warm run hands each worker its previous sources first" {
 fn tAppendStr(alloc: Allocator, store: *ColumnStore, s: ?[]const u8) !void {
     if (s == null) return store.appendNulls(alloc, 1);
     switch (store.data) {
-        .varchar, .string, .char, .json, .nested => |*d| try d.appendValue(alloc, s.?),
+        .varchar, .string, .char, .json, .nested, .bitmap => |*d| try d.appendValue(alloc, s.?),
         else => unreachable,
     }
     if (store.nulls != null) try store.appendValidBit(alloc, store.rowCount() - 1, true);

@@ -496,7 +496,7 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char, .json, .nested => true,
+        .varchar, .string, .char, .json, .nested, .bitmap => true,
         else => false,
     };
 }
@@ -522,6 +522,7 @@ fn cmpCells(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32) std.math.
         .char => return std.mem.order(u8, left.data.char.rowBytes(lrow), right.data.char.rowBytes(rrow)),
         .json => return json_binary.compare(left.data.json.rowBytes(lrow), right.data.json.rowBytes(rrow)),
         .nested => return nested.order(left.data.nested.rowBytes(lrow), right.data.nested.rowBytes(rrow)),
+        .bitmap => return std.mem.order(u8, left.data.bitmap.rowBytes(lrow), right.data.bitmap.rowBytes(rrow)),
     }
 }
 
@@ -561,5 +562,6 @@ fn cmpInColumn(col: ColumnView, a: u32, b: u32) std.math.Order {
         .char => std.mem.order(u8, col.data.char.rowBytes(a), col.data.char.rowBytes(b)),
         .json => json_binary.compare(col.data.json.rowBytes(a), col.data.json.rowBytes(b)),
         .nested => nested.order(col.data.nested.rowBytes(a), col.data.nested.rowBytes(b)),
+        .bitmap => std.mem.order(u8, col.data.bitmap.rowBytes(a), col.data.bitmap.rowBytes(b)),
     };
 }

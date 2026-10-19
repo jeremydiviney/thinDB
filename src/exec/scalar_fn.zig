@@ -54,11 +54,18 @@ const json = @import("scalar_fn_json.zig");
 const array = @import("scalar_fn_array.zig");
 const map = @import("scalar_fn_map.zig");
 const struct_fns = @import("scalar_fn_struct.zig");
+const bitmap_fns = @import("scalar_fn_bitmap.zig");
 
 /// Whether `name` is an array, map or struct function, which take nested
 /// arguments no declared parameter type names.
 pub fn isNestedFnName(name: []const u8) bool {
     return array.isArrayFnName(name) or map.isMapFnName(name) or struct_fns.isStructFnName(name);
+}
+
+/// Whether `name` is a BITMAP function, whose BITMAP parameters no declared
+/// parameter type names either.
+pub fn isBitmapFnName(name: []const u8) bool {
+    return bitmap_fns.isBitmapFnName(name);
 }
 const inet = @import("scalar_fn_inet.zig");
 const common = @import("scalar_fn_common.zig");
@@ -142,6 +149,7 @@ pub fn resolveWithRegistry(
     if (try array.resolveArray(aa, name, arg_types)) |ov| return ov;
     if (try map.resolveMap(aa, name, arg_types)) |ov| return ov;
     if (try struct_fns.resolveStruct(aa, name, arg_types)) |ov| return ov;
+    if (try bitmap_fns.resolveBitmap(aa, name, arg_types)) |ov| return ov;
     // Decimal-involving calls resolve to scale-aware typed kernels (the static
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
@@ -704,7 +712,7 @@ fn resolveJson(aa: Allocator, name: []const u8, arg_types: []const Type) !?Resol
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
     if (std.mem.startsWith(u8, name, CAST_TIME_PREFIX)) return true;
-    if (isNestedFnName(name)) return true;
+    if (isNestedFnName(name) or isBitmapFnName(name)) return true;
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
@@ -806,7 +814,7 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
         .varchar, .char, .string => "to_string",
         .json => "to_json",
         .nested => return try nestedCastFnName(arena, ty),
-        .decimal64, .decimal128, .uuid => return null,
+        .decimal64, .decimal128, .uuid, .bitmap => return null,
     };
     return try arena.dupe(u8, name);
 }

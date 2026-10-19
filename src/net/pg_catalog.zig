@@ -123,7 +123,7 @@ fn typeOid(t: types.Type) i32 {
         .datetime => 1114,
         .decimal64, .decimal128 => 1700,
         .uuid => 2950,
-        .varchar, .string, .char, .json, .nested => 25,
+        .varchar, .string, .char, .json, .nested, .bitmap => 25,
     };
 }
 fn typeLen(t: types.Type) i16 {
@@ -370,6 +370,7 @@ fn pgDataTypeName(t: types.Type) []const u8 {
         .varchar, .char => "character varying",
         .string => "text",
         .json => "json",
+        .bitmap => "bitmap",
         .nested => |n| switch (n.*) {
             .array => "ARRAY",
             .map, .@"struct" => "text",

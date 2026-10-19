@@ -71,6 +71,7 @@ fn columnRowOrder(col: ColumnStore, a: u32, b: u32, comptime json_values: bool) 
         .char => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .json => |s| json_binary.columnOrder(json_values, s.rowBytesWide(a), s.rowBytesWide(b)),
         .nested => |s| nested.order(s.rowBytesWide(a), s.rowBytesWide(b)),
+        .bitmap => |s| std.mem.order(u8, s.rowBytesWide(a), s.rowBytesWide(b)),
         .tinyint => |l| std.math.order(l.items[a], l.items[b]),
         .smallint => |l| std.math.order(l.items[a], l.items[b]),
         .largeint => |l| std.math.order(l.items[a], l.items[b]),
@@ -103,6 +104,7 @@ fn viewRowOrder(va: ColumnView, a: usize, vb: ColumnView, b: usize, comptime jso
         .char => |s| std.mem.order(u8, s.rowBytes(a), vb.data.char.rowBytes(b)),
         .json => |s| json_binary.columnOrder(json_values, s.rowBytes(a), vb.data.json.rowBytes(b)),
         .nested => |s| nested.order(s.rowBytes(a), vb.data.nested.rowBytes(b)),
+        .bitmap => |s| std.mem.order(u8, s.rowBytes(a), vb.data.bitmap.rowBytes(b)),
         .tinyint => |l| std.math.order(l[a], vb.data.tinyint[b]),
         .smallint => |l| std.math.order(l[a], vb.data.smallint[b]),
         .largeint => |l| std.math.order(l[a], vb.data.largeint[b]),
@@ -164,6 +166,7 @@ pub fn subViewAligned(v: ColumnView, off: usize, n: usize) ColumnView {
         .char => |sv| .{ .data = .{ .char = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .json => |sv| .{ .data = .{ .json = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .nested => |sv| .{ .data = .{ .nested = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
+        .bitmap => |sv| .{ .data = .{ .bitmap = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
     };
 }
 
@@ -196,7 +199,7 @@ pub fn appendAllColumn(
         // per-value loop this replaces cost ~28ns/string and dominated the
         // parallel-scan worker deep copy (41M string appends on a 3.16M-row
         // 13-string-column scan).
-        .varchar, .string, .char, .json, .nested => |sv| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             try appendStrRange(allocator, out, sv, 0, sv.rowCount());
         },
         .float => |s| switch (out.data) {
@@ -318,6 +321,7 @@ pub fn appendColumnRange(
         .char => |sv| try appendStrRange(allocator, out, sv, start, end),
         .json => |sv| try appendStrRange(allocator, out, sv, start, end),
         .nested => |sv| try appendStrRange(allocator, out, sv, start, end),
+        .bitmap => |sv| try appendStrRange(allocator, out, sv, start, end),
     }
     if (out.nulls != null) {
         try out.appendValidityRangeFrom(allocator, dst_start, view.nulls, start, n);
@@ -347,9 +351,9 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
     const base_row = out.data.rowCount();
     var prep = PreparedAppend{ .base_row = base_row };
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             const ss = switch (out.data) {
-                .varchar, .string, .char, .json, .nested => |*s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |*s| s,
                 else => unreachable,
             };
             const total: usize = sv.offsets[n] - sv.offsets[0];
@@ -363,7 +367,7 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
         },
         else => {
             switch (out.data) {
-                .varchar, .string, .char, .json, .nested => unreachable,
+                .varchar, .string, .char, .json, .nested, .bitmap => unreachable,
                 inline else => |*list| try list.resize(allocator, base_row + n),
             }
         },
@@ -381,9 +385,9 @@ pub fn prepareAppend(allocator: Allocator, view: ColumnView, n: usize, out: *Col
 pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
     if (hi <= lo) return;
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             const ss = switch (out.data) {
-                .varchar, .string, .char, .json, .nested => |*s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |*s| s,
                 else => unreachable,
             };
             const src0 = sv.offsets[0];
@@ -423,7 +427,7 @@ pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStor
 
 fn writeFixedSlice(comptime T: type, s: []const T, lo: usize, hi: usize, out: *ColumnStore, prep: PreparedAppend) void {
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => unreachable,
+        .varchar, .string, .char, .json, .nested, .bitmap => unreachable,
         inline else => |*list| {
             if (comptime std.meta.Child(@TypeOf(list.items)) == T) {
                 @memcpy(list.items[prep.base_row + lo ..][0 .. hi - lo], s[lo..hi]);
@@ -439,6 +443,7 @@ inline fn appendStrRange(allocator: Allocator, out: *ColumnStore, sv: storage.St
         .char => |*ss| try ss.appendRange(allocator, sv, start, end),
         .json => |*ss| try ss.appendRange(allocator, sv, start, end),
         .nested => |*ss| try ss.appendRange(allocator, sv, start, end),
+        .bitmap => |*ss| try ss.appendRange(allocator, sv, start, end),
         else => unreachable,
     }
 }
@@ -456,6 +461,7 @@ inline fn appendStrValue(allocator: Allocator, out: *ColumnStore, bytes: []const
         .char => |*ss| try ss.appendValue(allocator, bytes),
         .json => |*ss| try ss.appendValue(allocator, bytes),
         .nested => |*ss| try ss.appendValue(allocator, bytes),
+        .bitmap => |*ss| try ss.appendValue(allocator, bytes),
         else => unreachable,
     }
 }
@@ -466,7 +472,7 @@ inline fn appendStrValue(allocator: Allocator, out: *ColumnStore, bytes: []const
 /// only when the column is (or would go) wide.
 fn gatherStrByIndices(allocator: Allocator, sv: storage.StringView, indices: []const u32, out: *ColumnStore) !void {
     const ss = switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*s| s,
+        .varchar, .string, .char, .json, .nested, .bitmap => |*s| s,
         else => unreachable,
     };
     var total: usize = 0;
@@ -535,6 +541,7 @@ pub fn appendOneRow(
         .char => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .json => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .nested => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
+        .bitmap => |sv| try appendStrValue(allocator, out, sv.rowBytes(row)),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| try list.append(allocator, s[row]),
             else => unreachable,
@@ -657,7 +664,7 @@ pub fn appendDictRows(allocator: Allocator, raw: []const u8, row_count: u32, fla
     var total_bytes: usize = 0;
     for (rows) |row| total_bytes += db.dictValue(db.rowCode(row)).len;
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
             try ss.ensureUnusedValueCapacity(allocator, rows.len, total_bytes);
             for (rows) |row| ss.appendValueAssumeCapacity(db.dictValue(db.rowCode(row)));
         },
@@ -673,7 +680,7 @@ pub fn appendFsstRows(allocator: Allocator, fv: storage.segment_reader.FsstView,
     var scratch: std.ArrayListUnmanaged(u8) = .empty;
     defer scratch.deinit(allocator);
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
             for (rows) |row| {
                 const comp = fv.block.rowComp(row);
                 try scratch.resize(allocator, storage.fsst.decodedSizeBound(comp.len));
@@ -779,6 +786,7 @@ pub fn appendByIndices(
         .char => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .json => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .nested => |sv| try gatherStrByIndices(allocator, sv, indices, out),
+        .bitmap => |sv| try gatherStrByIndices(allocator, sv, indices, out),
         .decimal64 => |s| switch (out.data) {
             .decimal64 => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
@@ -964,6 +972,7 @@ fn appendMaskedValues(
         .char => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .json => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .nested => |sv| try appendMaskedStringy(allocator, sv, mask, out),
+        .bitmap => |sv| try appendMaskedStringy(allocator, sv, mask, out),
         .float => |s| switch (out.data) {
             .float => |*list| try compactInto(f32, allocator, s, mask, list),
             .double => |*list| try compactIntoConvert(f32, f64, allocator, s, mask, list),
@@ -1034,7 +1043,7 @@ fn appendMaskedValues(
 pub fn appendGatheredColumn(allocator: Allocator, view: ColumnView, rows: []const u32, out: *ColumnStore) !bool {
     const dst_start = out.data.rowCount();
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| try appendGatheredStringy(allocator, sv, rows, out),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| try appendGatheredStringy(allocator, sv, rows, out),
         inline else => |s, tag| switch (out.data) {
             tag => |*list| try gatherInto(std.meta.Child(@TypeOf(s)), allocator, s, rows, list),
             else => return false,
@@ -1064,7 +1073,7 @@ fn appendGatheredStringy(allocator: Allocator, sv: anytype, rows: []const u32, o
     var total: usize = 0;
     for (rows) |row| total += sv.offsets[row + 1] - sv.offsets[row];
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
             try ss.ensureUnusedValueCapacity(allocator, rows.len, total);
             for (rows) |row| ss.appendValueAssumeCapacity(sv.rowBytes(row));
         },
@@ -1087,7 +1096,7 @@ fn appendMaskedStringy(allocator: Allocator, sv: anytype, mask: []const bool, ou
     const n = mask.len;
     const src_span: usize = if (n == 0) 0 else sv.offsets[n] - sv.offsets[0];
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
             try ss.ensureUnusedValueCapacity(allocator, n, src_span);
             for (mask, 0..) |m, row| {
                 if (m) ss.appendValueAssumeCapacity(sv.rowBytes(row));
@@ -1194,6 +1203,12 @@ pub fn applyPermutation(
             errdefer dst.deinit(allocator);
             for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
             break :blk DataStore{ .nested = dst };
+        },
+        .bitmap => |s| blk: {
+            var dst = try StringStore.init(allocator);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| try dst.appendValue(allocator, s.view().rowBytes(p));
+            break :blk DataStore{ .bitmap = dst };
         },
         .decimal64 => |l| blk: {
             var dst: std.ArrayList(i64) = try .initCapacity(allocator, perm.len);

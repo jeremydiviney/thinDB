@@ -265,7 +265,7 @@ fn cellToValue(col: Column, text: ?[]const u8) !?Value {
         .boolean => Value{ .boolean = try parseBoolText(s) },
         .float => Value{ .float = std.fmt.parseFloat(f32, s) catch return Error.CopyMalformedRow },
         .double => Value{ .double = std.fmt.parseFloat(f64, s) catch return Error.CopyMalformedRow },
-        .date, .datetime, .uuid, .decimal64, .decimal128, .varchar, .string, .char, .json, .nested => Value{ .text = s },
+        .date, .datetime, .uuid, .decimal64, .decimal128, .varchar, .string, .char, .json, .nested, .bitmap => Value{ .text = s },
     };
 }
 
@@ -334,7 +334,8 @@ fn handleCopyTo(
                 if (out_i > 0) try line.append(allocator, '\t');
                 const col = batch.schema[col_idx];
                 const view = batch.values[col_idx];
-                if (!view.isValid(r_idx)) {
+                // A bitmap reads as NULL, as in a query's result.
+                if (!view.isValid(r_idx) or col.type == .bitmap) {
                     try line.appendSlice(allocator, "\\N");
                     continue;
                 }
@@ -402,6 +403,7 @@ fn formatCellText(
             try out.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));
         },
         .string, .varchar, .char, .json, .nested => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
+        .bitmap => unreachable, // the COPY loop writes a bitmap as NULL
     }
 }
 

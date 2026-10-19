@@ -13,6 +13,7 @@ test {
     _ = @import("json_test.zig");
     _ = @import("array_test.zig");
     _ = @import("map_test.zig");
+    _ = @import("bitmap_test.zig");
     _ = @import("struct_test.zig");
     _ = @import("lambda_test.zig");
     _ = @import("views_test.zig");

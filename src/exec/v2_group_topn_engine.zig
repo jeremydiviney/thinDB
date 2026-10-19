@@ -883,7 +883,7 @@ fn runHarness(
     if (force_hash and derived.len == 0) {
         outer: for (shape.group_key_inputs) |input| {
             switch (input.source_type) {
-                .varchar, .string, .char, .json, .nested => {},
+                .varchar, .string, .char, .json, .nested, .bitmap => {},
                 else => continue,
             }
             for (shape.aggregate_inputs) |ai| {
