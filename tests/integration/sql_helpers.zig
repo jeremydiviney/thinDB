@@ -225,7 +225,7 @@ pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
         for (0..batch.row_count) |row| {
             const text: ?[]u8 = if (!col.isValid(row)) null else switch (col.data) {
                 .string, .varchar, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
-                inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
+                inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
                 .nested => |sv| blk: {
                     var buf: std.ArrayList(u8) = .empty;
                     errdefer buf.deinit(allocator);

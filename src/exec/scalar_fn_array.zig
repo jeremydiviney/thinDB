@@ -130,9 +130,13 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     }
     if (eql(name, "cosine_similarity") or eql(name, "cosine_similarity_norm") or eql(name, "l2_distance")) {
         if (arg_types.len != 2) return null;
+        var any_float = false;
+        var any_wide = false;
         for (arg_types) |t| {
             const e = t.arrayElement() orelse return null;
             if (!(e.isInteger() or e.isDecimal() or e.isFloat() or e == .boolean)) return null;
+            any_float = any_float or e == .float;
+            any_wide = any_wide or e == .double or e.isDecimal();
         }
         const kernel = if (eql(name, "l2_distance"))
             VectorKernel(.l2_distance)
@@ -140,7 +144,7 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
             VectorKernel(.cosine_similarity)
         else
             VectorKernel(.inner_product);
-        return overload(aa, name, arg_types, .double, kernel);
+        return overload(aa, name, arg_types, if (any_float and !any_wide) .float else .double, kernel);
     }
     if (eql(name, "array_filter")) {
         if (arg_types.len != 2) return null;
@@ -1007,58 +1011,66 @@ const VectorMeasure = enum { cosine_similarity, inner_product, l2_distance };
 /// COSINE_SIMILARITY(a, b), COSINE_SIMILARITY_NORM(a, b) (the inner product,
 /// for vectors already of length 1) and L2_DISTANCE(a, b) (the squared
 /// distance), as StarRocks defines them, over equal-length numeric arrays in
-/// double precision. A NULL array or element gives NULL, as does a cosine
-/// with a zero vector; arrays of different lengths are `ArrayLengthMismatch`.
+/// the precision of `out_type`: FLOAT for FLOAT vectors, as StarRocks and
+/// DuckDB compute them, else DOUBLE. A NULL array or element gives NULL, as
+/// does a cosine with a zero vector; arrays of different lengths are
+/// `ArrayLengthMismatch`.
 fn VectorKernel(comptime measure: VectorMeasure) TypedKernel {
     return struct {
         fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
-            _ = out_type;
-            var a = try FlatAs.init(allocator, arg_types[0], args[0], .double, rows);
-            defer a.deinit(allocator);
-            var b = try FlatAs.init(allocator, arg_types[1], args[1], .double, rows);
-            defer b.deinit(allocator);
-            const av = a.elements.view;
-            const bv = b.elements.view;
-            for (0..rows) |r| {
-                if (!args[0].isValid(r) or !args[1].isValid(r)) {
-                    try out.appendNulls(allocator, 1);
-                    continue;
-                }
-                const as = a.start(r);
-                const bs = b.start(r);
-                const n = a.end(r) - as;
-                if (b.end(r) - bs != n) return Error.ArrayLengthMismatch;
-                var dot: f64 = 0;
-                var a_norm: f64 = 0;
-                var b_norm: f64 = 0;
-                var any_null = false;
-                for (0..n) |i| {
-                    if (!av.isValid(as + i) or !bv.isValid(bs + i)) {
-                        any_null = true;
-                        break;
-                    }
-                    const x = av.data.double[as + i];
-                    const y = bv.data.double[bs + i];
-                    switch (measure) {
-                        .l2_distance => dot += (x - y) * (x - y),
-                        .inner_product => dot += x * y,
-                        .cosine_similarity => {
-                            dot += x * y;
-                            a_norm += x * x;
-                            b_norm += y * y;
-                        },
-                    }
-                }
-                const zero_vector = measure == .cosine_similarity and (a_norm == 0 or b_norm == 0);
-                if (any_null or zero_vector) {
-                    try out.appendNulls(allocator, 1);
-                    continue;
-                }
-                const value = if (measure == .cosine_similarity) dot / (@sqrt(a_norm) * @sqrt(b_norm)) else dot;
-                try appendValue(allocator, out, "double", value);
-            }
+            if (out_type == .float) return measureVectors(f32, measure, allocator, arg_types, args, out, rows);
+            return measureVectors(f64, measure, allocator, arg_types, args, out, rows);
         }
     }.kernel;
+}
+
+fn measureVectors(comptime F: type, comptime measure: VectorMeasure, allocator: Allocator, arg_types: []const Type, args: []const ColumnView, out: *ColumnStore, rows: usize) !void {
+    const element: Type = if (F == f32) .float else .double;
+    const field = if (F == f32) "float" else "double";
+    var a = try FlatAs.init(allocator, arg_types[0], args[0], element, rows);
+    defer a.deinit(allocator);
+    var b = try FlatAs.init(allocator, arg_types[1], args[1], element, rows);
+    defer b.deinit(allocator);
+    const av = a.elements.view;
+    const bv = b.elements.view;
+    for (0..rows) |r| {
+        if (!args[0].isValid(r) or !args[1].isValid(r)) {
+            try out.appendNulls(allocator, 1);
+            continue;
+        }
+        const as = a.start(r);
+        const bs = b.start(r);
+        const n = a.end(r) - as;
+        if (b.end(r) - bs != n) return Error.ArrayLengthMismatch;
+        var dot: F = 0;
+        var a_norm: F = 0;
+        var b_norm: F = 0;
+        var any_null = false;
+        for (0..n) |i| {
+            if (!av.isValid(as + i) or !bv.isValid(bs + i)) {
+                any_null = true;
+                break;
+            }
+            const x = @field(av.data, field)[as + i];
+            const y = @field(bv.data, field)[bs + i];
+            switch (measure) {
+                .l2_distance => dot += (x - y) * (x - y),
+                .inner_product => dot += x * y,
+                .cosine_similarity => {
+                    dot += x * y;
+                    a_norm += x * x;
+                    b_norm += y * y;
+                },
+            }
+        }
+        const zero_vector = measure == .cosine_similarity and (a_norm == 0 or b_norm == 0);
+        if (any_null or zero_vector) {
+            try out.appendNulls(allocator, 1);
+            continue;
+        }
+        const value = if (measure == .cosine_similarity) dot / (@sqrt(a_norm) * @sqrt(b_norm)) else dot;
+        try appendValue(allocator, out, field, value);
+    }
 }
 
 /// ARRAY_AVG: the mean of the elements that aren't NULL, a DECIMAL's
