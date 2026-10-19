@@ -356,6 +356,15 @@ pub const OnDuplicate = struct {
 /// `col` under this prefix; compile resolves it before anything evaluates.
 pub const insert_values_prefix = "__insert_values__.";
 
+/// `DEFAULT` as an expression VALUES cell or an UPDATE assignment parses to
+/// a reference to this name; compile puts the column's default in its place
+/// before anything evaluates.
+pub const column_default_ref = "__column_default__";
+
+pub fn isColumnDefault(expr: Expr) bool {
+    return expr == .col_ref and std.mem.eql(u8, expr.col_ref, column_default_ref);
+}
+
 pub const InsertOp = struct {
     mode: InsertMode = .insert,
     table: TableRef,
@@ -371,6 +380,9 @@ pub const InsertOp = struct {
     /// order. Each holds its bytes as text, and a numeric column takes their
     /// integer instead, as MySQL stores one (12594).
     hex_cells: []const InsertCell = &.{},
+    /// The cells written as DEFAULT, in row then column order. Each holds
+    /// null and takes its column's default.
+    default_cells: []const InsertCell = &.{},
     on_duplicate: ?OnDuplicate = null,
 };
 
@@ -1193,6 +1205,7 @@ pub const Op = union(OpTag) {
                 for (i.rows) |row| allocator.free(row);
                 allocator.free(i.rows);
                 allocator.free(i.hex_cells);
+                allocator.free(i.default_cells);
                 if (i.on_duplicate) |od| freeDecodedOnDuplicate(od, allocator);
             },
             .batch => |b| {
@@ -1818,16 +1831,19 @@ fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) Enco
     try encodeOptNames(allocator, out, i.columns);
     try appendU32(allocator, out, @intCast(i.rows.len));
     var next_hex: usize = 0;
+    var next_default: usize = 0;
     for (i.rows, 0..) |row, r| {
         try appendU32(allocator, out, @intCast(row.len));
         for (row, 0..) |maybe_v, c| {
             const hex = next_hex < i.hex_cells.len and i.hex_cells[next_hex].row == r and i.hex_cells[next_hex].column == c;
             if (hex) next_hex += 1;
+            const default = next_default < i.default_cells.len and i.default_cells[next_default].row == r and i.default_cells[next_default].column == c;
+            if (default) next_default += 1;
             if (maybe_v) |v| {
                 try out.append(allocator, if (hex) INSERT_HEX_CELL else 1);
                 try encodeValue(allocator, out, v);
             } else {
-                try out.append(allocator, 0);
+                try out.append(allocator, if (default) INSERT_DEFAULT_CELL else 0);
             }
         }
     }
@@ -1837,6 +1853,9 @@ fn encodeInsert(allocator: Allocator, out: *std.ArrayList(u8), i: InsertOp) Enco
 /// The presence byte of a VALUES cell written as a hex literal: present
 /// (non-zero) to a reader that predates it.
 const INSERT_HEX_CELL: u8 = 2;
+/// The presence byte of a VALUES cell written as DEFAULT, which holds no
+/// value.
+const INSERT_DEFAULT_CELL: u8 = 3;
 
 /// Set in an INSERT's mode byte when an ON DUPLICATE KEY UPDATE clause
 /// follows its rows or source. The encoding without one is unchanged, so
@@ -3190,6 +3209,8 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
     errdefer for (rows[0..inited]) |r| allocator.free(r);
     var hex_cells: std.ArrayList(InsertCell) = .empty;
     errdefer hex_cells.deinit(allocator);
+    var default_cells: std.ArrayList(InsertCell) = .empty;
+    errdefer default_cells.deinit(allocator);
     for (rows, 0..) |*r, row| {
         if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
         const ncells = readU32(bytes[cursor.* .. cursor.* + 4]);
@@ -3200,8 +3221,10 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const presence = bytes[cursor.*];
             cursor.* += 1;
-            if (presence == INSERT_HEX_CELL) try hex_cells.append(allocator, .{ .row = @intCast(row), .column = @intCast(column) });
-            v.* = if (presence != 0) try decodeValue(bytes, cursor) else null;
+            const cell: InsertCell = .{ .row = @intCast(row), .column = @intCast(column) };
+            if (presence == INSERT_HEX_CELL) try hex_cells.append(allocator, cell);
+            if (presence == INSERT_DEFAULT_CELL) try default_cells.append(allocator, cell);
+            v.* = if (presence != 0 and presence != INSERT_DEFAULT_CELL) try decodeValue(bytes, cursor) else null;
         }
         r.* = cells;
         inited += 1;
@@ -3214,6 +3237,7 @@ fn decodeInsert(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         .columns = cols_opt,
         .rows = rows,
         .hex_cells = try hex_cells.toOwnedSlice(allocator),
+        .default_cells = try default_cells.toOwnedSlice(allocator),
         .on_duplicate = on_duplicate,
     };
 }
@@ -3886,6 +3910,26 @@ test "ir: an insert's hex-literal cells round-trip" {
     try std.testing.expectEqualStrings("12", decoded.insert.rows[0][1].?.text);
     try std.testing.expect(decoded.insert.rows[0][2] == null);
     try std.testing.expectEqualStrings("C", decoded.insert.rows[1][2].?.text);
+}
+
+test "ir: an insert's DEFAULT cells round-trip apart from NULL cells" {
+    const allocator = std.testing.allocator;
+    const row1 = [_]?Value{ null, .{ .bigint = 1 }, null };
+    const row2 = [_]?Value{ .{ .bigint = 2 }, null, null };
+    const rows = [_][]const ?Value{ &row1, &row2 };
+    const defaults = [_]InsertCell{ .{ .row = 0, .column = 0 }, .{ .row = 1, .column = 2 } };
+    const root: Op = .{ .insert = .{ .table = .{ .name = "t" }, .columns = null, .rows = &rows, .default_cells = &defaults } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expectEqualSlices(InsertCell, &defaults, decoded.insert.default_cells);
+    try std.testing.expect(decoded.insert.rows[0][0] == null);
+    try std.testing.expect(decoded.insert.rows[0][2] == null);
+    try std.testing.expectEqual(@as(i64, 2), decoded.insert.rows[1][0].?.bigint);
 }
 
 test "ir: ON DUPLICATE KEY UPDATE round-trips on VALUES and SELECT inserts" {

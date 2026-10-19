@@ -275,6 +275,16 @@ A DATETIME column may declare `ON UPDATE CURRENT_TIMESTAMP`, as in MySQL 8.4. Th
 
 REPLACE and INSERT use the DEFAULT as usual. The WAL logs an updated row's values, so replay never reads the clock again. `SHOW CREATE TABLE`, `SHOW COLUMNS` and `information_schema.COLUMNS.EXTRA` report the clause as MySQL 8.4 does.
 
+A column's DEFAULT fills it where an INSERT omits it, and where a VALUES row or `INSERT ... SET` writes `DEFAULT` in its place:
+- the default value;
+- the wall clock for `DEFAULT CURRENT_TIMESTAMP`;
+- the next id for an AUTO_INCREMENT column;
+- otherwise NULL.
+
+A NOT NULL column without a default has nothing to give, so writing `DEFAULT` for it fails as omitting it does (`ColumnNotFound`). `UPDATE t SET c = DEFAULT` sets c to its default the same way. Two cases refuse an AUTO_INCREMENT column with `UnsupportedOp`: an UPDATE, and a `DEFAULT` cell in VALUES rows that hold an expression. Those rows stream through INSERT ... SELECT, which reserves no ids. A joined UPDATE doesn't take `DEFAULT`.
+
+`DEFAULT NULL` declares the default a nullable column already has. On a NOT NULL or PRIMARY KEY column it's `SqlInvalidDefault`, as MySQL refuses it (1067).
+
 ### 3.2 Schema and order key
 
 Every table requires an **order key** at creation. The order key is one or more columns by which rows in every segment are physically sorted. It is the engine's only mechanism for:

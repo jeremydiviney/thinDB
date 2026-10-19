@@ -1121,6 +1121,7 @@ fn parseInsertLike(p: anytype, mode_in: ir.InsertMode) !*ir.Op {
 const InsertRows = struct {
     literal: std.ArrayList([]const ?Value) = .empty,
     hex_cells: std.ArrayList(ir.InsertCell) = .empty,
+    default_cells: std.ArrayList(ir.InsertCell) = .empty,
     exprs: std.ArrayList([]const ir.Expr) = .empty,
     as_exprs: bool = false,
     row_vals: std.ArrayList(?Value) = .empty,
@@ -1161,6 +1162,19 @@ const InsertRows = struct {
     }
 
     fn cell(self: *InsertRows, p: anytype) !bool {
+        if (p.cur.tag == .kw_default) {
+            try p.advance();
+            if (self.as_exprs) {
+                try self.cells.append(p.arena, .{ .col_ref = ir.column_default_ref });
+            } else {
+                try self.default_cells.append(p.arena, .{
+                    .row = @intCast(self.literal.items.len),
+                    .column = @intCast(self.row_vals.items.len),
+                });
+                try self.row_vals.append(p.arena, null);
+            }
+            return true;
+        }
         const literal = try literalCellAhead(p);
         if (!self.as_exprs) {
             if (!literal) return false;
@@ -1220,6 +1234,7 @@ const InsertRows = struct {
             .columns = columns,
             .rows = self.literal.items,
             .hex_cells = self.hex_cells.items,
+            .default_cells = self.default_cells.items,
             .on_duplicate = on_duplicate,
         } });
     }
@@ -1425,6 +1440,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
     var is_pk = false;
     var saw_not_null = false;
     var default_value: ?types.Value = null;
+    var default_null = false;
     var default_now = false;
     var on_update_now = false;
     while (true) {
@@ -1455,7 +1471,10 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             // (the compile path validates it once the schema is known).
             .kw_default => {
                 try p.advance();
-                if (try skipCurrentTimestamp(p)) {
+                if (p.cur.tag == .kw_null) {
+                    try p.advance();
+                    default_null = true;
+                } else if (try skipCurrentTimestamp(p)) {
                     default_now = true;
                 } else if (p.cur.isHexLiteral()) {
                     default_value = exec_expr.hexStoredValue((try p.parseValue()).text, ty);
@@ -1550,6 +1569,7 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
             else => break,
         }
     }
+    if (default_null and !nullable) return PE.SqlInvalidDefault;
     return .{
         .def = .{
             .name = name,

@@ -242,3 +242,65 @@ test "ON UPDATE CURRENT_TIMESTAMP: ALTER adds, changes and drops it; LIKE and re
     try expectIds(allocator, db, "SELECT id FROM al WHERE stamp > " ++ recent, &.{2});
     try expectIds(allocator, db, "SELECT id FROM al WHERE stamp = " ++ old_ts, &.{1});
 }
+
+test "DEFAULT NULL: a nullable column's default, refused on a NOT NULL one" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT, a INT DEFAULT NULL, b VARCHAR(10) NULL DEFAULT NULL COMMENT 'x')");
+    try exec(allocator, db, "INSERT INTO t (id) VALUES (1)");
+    try helpers.expectTexts(allocator, db, "SELECT concat(id, ',', coalesce(a, 'NULL'), ',', coalesce(b, 'NULL')) FROM t", &.{"1,NULL,NULL"});
+
+    inline for (.{
+        "CREATE TABLE u (a INT NOT NULL DEFAULT NULL)",
+        "CREATE TABLE u (a INT DEFAULT NULL NOT NULL)",
+        "CREATE TABLE u (a INT PRIMARY KEY DEFAULT NULL)",
+    }) |sql| try expectRunError(allocator, db, sql, error.SqlInvalidDefault);
+}
+
+test "DEFAULT as a VALUES cell or an UPDATE value takes the column's default" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL DEFAULT 100, note VARCHAR(16), ts DATETIME DEFAULT CURRENT_TIMESTAMP)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, DEFAULT, DEFAULT, DEFAULT), (2, 5, 'x', DEFAULT)");
+    try exec(allocator, db, "INSERT INTO t (id, qty) VALUES (3, DEFAULT)");
+    // Rows with an expression cell take the INSERT ... SELECT path.
+    try exec(allocator, db, "INSERT INTO t (id, qty, note) VALUES (4, DEFAULT, concat('a', 'b')), (2 + 3, 7 * 2, DEFAULT)");
+    try exec(allocator, db, "INSERT INTO t SET id = 6, qty = DEFAULT");
+    const rows = "SELECT concat(id, ',', qty, ',', coalesce(note, 'NULL'), ',', CASE WHEN ts IS NULL THEN 'no ts' ELSE 'ts' END) FROM t ORDER BY id";
+    try helpers.expectTexts(allocator, db, rows, &.{ "1,100,NULL,ts", "2,5,x,ts", "3,100,NULL,ts", "4,100,ab,ts", "5,14,NULL,ts", "6,100,NULL,ts" });
+
+    try exec(allocator, db, "UPDATE t SET qty = DEFAULT, note = DEFAULT WHERE id IN (2, 4)");
+    try helpers.expectTexts(allocator, db, "SELECT concat(id, ',', qty, ',', coalesce(note, 'NULL')) FROM t WHERE id IN (2, 4) ORDER BY id", &.{ "2,100,NULL", "4,100,NULL" });
+
+    // A NOT NULL column without a default has nothing to give, as when an
+    // INSERT omits it.
+    try exec(allocator, db, "CREATE TABLE r (id INT, v INT NOT NULL)");
+    try expectRunError(allocator, db, "INSERT INTO r VALUES (1, DEFAULT)", thindb.net.Error.ColumnNotFound);
+    try expectRunError(allocator, db, "INSERT INTO r VALUES (1 + 1, DEFAULT)", thindb.net.Error.ColumnNotFound);
+}
+
+test "DEFAULT as a VALUES cell of an AUTO_INCREMENT column takes the next id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE a (id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(8))");
+    try exec(allocator, db, "INSERT INTO a (id, name) VALUES (DEFAULT, 'x'), (DEFAULT, 'y')");
+    try exec(allocator, db, "INSERT INTO a VALUES (10, DEFAULT)");
+    try exec(allocator, db, "INSERT INTO a VALUES (DEFAULT, 'z')");
+    try helpers.expectTexts(allocator, db, "SELECT concat(id, ',', coalesce(name, 'NULL')) FROM a ORDER BY id", &.{ "1,x", "2,y", "10,NULL", "11,z" });
+    // Expression rows stream through INSERT ... SELECT, which reserves no
+    // ids, and an UPDATE has none to give.
+    try expectRunError(allocator, db, "INSERT INTO a VALUES (DEFAULT, concat('a', 'b'))", thindb.net.Error.UnsupportedOp);
+    try expectRunError(allocator, db, "UPDATE a SET id = DEFAULT WHERE id = 1", thindb.net.Error.UnsupportedOp);
+}

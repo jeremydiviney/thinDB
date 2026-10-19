@@ -2392,7 +2392,8 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     var assigns: std.ArrayList(update_mod.Assignment) = .empty;
     for (u.assignments, named) |src, *name| {
         name.* = src.col;
-        try assigns.append(aa, .{ .col = src.col, .value = hexAssigned(t.schema, src.col, src.value) });
+        const value = if (ir.isColumnDefault(src.value)) try insertFillExpr(ctx, aa, t.schema.columns[t.schema.columnIndex(src.col) orelse return Error.ColumnNotFound]) else hexAssigned(t.schema, src.col, src.value);
+        try assigns.append(aa, .{ .col = src.col, .value = value });
     }
     try assigns.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, named));
 
@@ -2941,7 +2942,7 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     defer arena.deinit();
     const aa = arena.allocator();
 
-    var source = try compileSubplan(ctx, try hexStoredInsertSource(aa, op, t));
+    var source = try compileSubplan(ctx, try defaultFilledInsertSource(ctx, aa, op, t, try hexStoredInsertSource(aa, op, t)));
     defer source.deinit();
 
     const src_schema = source.outputSchema();
@@ -3583,7 +3584,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
     }
     var rows_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer rows_arena.deinit();
-    const rows = try hexResolvedRows(rows_arena.allocator(), op, tbl_schema);
+    const rows = try defaultResolvedRows(ctx, rows_arena.allocator(), op, tbl_schema, try hexResolvedRows(rows_arena.allocator(), op, tbl_schema));
     for (rows) |row| {
         if (row.len != source_widths) return Error.BadRequest;
         for (schema_to_source, 0..) |maybe_src, si| {
@@ -3790,6 +3791,78 @@ fn hexStoredNamed(aa: Allocator, source: *ir.Op, numeric: []const []const u8) Al
     }
     const out = try aa.create(ir.Op);
     out.* = copy;
+    return out;
+}
+
+/// An INSERT's expression VALUES rows (`parse_ddl.valuesQuery`) with each
+/// DEFAULT cell computing its column's fill (`insertFillExpr`). `source`
+/// itself when no cell is DEFAULT.
+fn defaultFilledInsertSource(ctx: *CompileCtx, aa: Allocator, op: ir.InsertSelect, t: *ApiTable, source: *ir.Op) !*ir.Op {
+    var copy = source.*;
+    switch (copy) {
+        .set_union => |*u| {
+            u.left = try defaultFilledInsertSource(ctx, aa, op, t, u.left);
+            u.right = try defaultFilledInsertSource(ctx, aa, op, t, u.right);
+            if (u.left == source.set_union.left and u.right == source.set_union.right) return source;
+        },
+        .select => |*s| {
+            if (s.upstream.* != .compute) return source;
+            var compute = s.upstream.compute;
+            var derived: ?[]ir.Derived = null;
+            for (compute.derived, 0..) |d, i| {
+                if (!ir.isColumnDefault(d.expr)) continue;
+                const target = if (op.columns) |cols|
+                    t.schema.columnIndex(cols[i]) orelse return Error.ColumnNotFound
+                else
+                    i;
+                if (target >= t.schema.columns.len) return Error.BadRequest;
+                const out = derived orelse try aa.dupe(ir.Derived, compute.derived);
+                out[i].expr = try insertFillExpr(ctx, aa, t.schema.columns[target]);
+                derived = out;
+            }
+            compute.derived = derived orelse return source;
+            const filled = try aa.create(ir.Op);
+            filled.* = .{ .compute = compute };
+            s.upstream = filled;
+        },
+        else => return source,
+    }
+    const out = try aa.create(ir.Op);
+    out.* = copy;
+    return out;
+}
+
+/// The rows with each DEFAULT cell holding its column's default: the DEFAULT
+/// value, the wall clock for DEFAULT CURRENT_TIMESTAMP, else NULL, which an
+/// AUTO_INCREMENT column fills with its next id. `rows` itself when no cell
+/// is DEFAULT.
+fn defaultResolvedRows(ctx: *CompileCtx, aa: Allocator, op: ir.InsertOp, schema: TableSchema, rows: []const []const ?Value) ![]const []const ?Value {
+    if (op.default_cells.len == 0) return rows;
+    const out = try aa.dupe([]const ?Value, rows);
+    var copied_row: ?u32 = null;
+    var copy: []?Value = &.{};
+    for (op.default_cells) |cell| {
+        if (cell.row >= out.len or cell.column >= out[cell.row].len) return Error.BadRequest;
+        const target = if (op.columns) |cols|
+            schema.columnIndex(cols[cell.column]) orelse return Error.ColumnNotFound
+        else
+            cell.column;
+        if (target >= schema.columns.len) return Error.BadRequest;
+        const col = schema.columns[target];
+        if (copied_row != cell.row) {
+            copy = try aa.dupe(?Value, out[cell.row]);
+            out[cell.row] = copy;
+            copied_row = cell.row;
+        }
+        copy[cell.column] = if (col.default_value) |dv|
+            dv
+        else if (col.default_now)
+            nowDatetime(ctx)
+        else if (col.nullable or col.auto_increment)
+            null
+        else
+            return Error.ColumnNotFound;
+    }
     return out;
 }
 
