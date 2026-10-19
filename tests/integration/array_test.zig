@@ -117,7 +117,7 @@ test "ARRAY: functions" {
     try expectText(allocator, db, "SELECT array_sort(array_intersect([1, 2, 2, 3], [2, 3, 4]))", "[2,3]");
 }
 
-test "ARRAY: cosine_similarity, cosine_similarity_norm and l2_distance" {
+test "ARRAY: cosine_similarity, cosine_similarity_norm and l2_distance, and their APPROX_ forms" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -134,7 +134,14 @@ test "ARRAY: cosine_similarity, cosine_similarity_norm and l2_distance" {
         try expectTexts(allocator, db, "SELECT ROUND(cosine_similarity_norm(data, data), 3) FROM v ORDER BY id", &.{ "0.14", "0.14", "0.14", null });
         try expectTexts(allocator, db, "SELECT cosine_similarity(i, [3, 4]) FROM v ORDER BY id", &.{ "0.9838699100999074", null, null, null });
         try expectTexts(allocator, db, "SELECT l2_distance(i, [3, 4]) FROM v ORDER BY id", &.{ "8", "25", null, null });
+        try expectTexts(allocator, db, "SELECT approx_l2_distance([3, 4], i) FROM v ORDER BY approx_l2_distance([3, 4], i), id", &.{ null, null, "8", "25" });
+        try expectTexts(allocator, db, "SELECT APPROX_COSINE_SIMILARITY(i, [3, 4]) FROM v ORDER BY id", &.{ "0.9838699100999074", null, null, null });
     }
+    // A FLOAT vector's measure is a FLOAT, summed as one: StarRocks' answer,
+    // where the exact squared distance is 500100015.
+    try expectText(allocator, db, "SELECT l2_distance(ARRAY<FLOAT>[10000, 10001, 10002, 10003, 10004], [1, 1, 1, 1, 1])", "500100000");
+    try expectText(allocator, db, "SELECT l2_distance(ARRAY<DOUBLE>[10000, 10001, 10002, 10003, 10004], [1, 1, 1, 1, 1])", "500100015");
+    try expectText(allocator, db, "SELECT typeof(l2_distance(ARRAY<FLOAT>[1], [2]))", "float");
     try expectText(allocator, db, "SELECT l2_distance([], [])", "0");
     try std.testing.expectError(error.ArrayLengthMismatch, exec(allocator, db, "SELECT cosine_similarity([1, 2], [1, 2, 3])"));
 }

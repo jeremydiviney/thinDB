@@ -1946,6 +1946,10 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     // Trino's names for the Joda-Time pair.
     .{ .alias = "format_datetime", .name = "jodatime_format" },
     .{ .alias = "parse_datetime", .name = "str_to_jodatime" },
+    // StarRocks' names for a measure its vector index answers; without an
+    // index it computes the measure exactly, as thinDB always does.
+    .{ .alias = "approx_l2_distance", .name = "l2_distance" },
+    .{ .alias = "approx_cosine_similarity", .name = "cosine_similarity" },
 };
 
 pub fn canonicalName(name: []const u8) []const u8 {
