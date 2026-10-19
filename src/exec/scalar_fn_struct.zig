@@ -56,8 +56,9 @@ pub fn resolveStruct(aa: Allocator, name: []const u8, arg_types: []const Type) A
 }
 
 /// CAST to a struct: of another struct of as many fields, field by field in
-/// order as each field's CAST converts it; of text or JSON, read as the
-/// struct it spells (`nested.parseText`).
+/// order as each field's CAST converts it; of JSON, the struct it holds
+/// (`nested.fromJson`); of text, read as the struct it spells
+/// (`nested.parseText`).
 fn resolveCastToStruct(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len != 1) return null;
     const target = types.parseTypeText(name[scalar_fn.NESTED_CAST_PREFIX.len..]) catch |err| switch (err) {
@@ -71,6 +72,7 @@ fn resolveCastToStruct(aa: Allocator, name: []const u8, arg_types: []const Type)
         for (fields, to) |f, t| if (!try castable(aa, f.type, t.type)) return null;
         return overload(aa, name, arg_types, target, castStructKernel);
     }
+    if (from == .json) return overload(aa, name, arg_types, target, array.jsonNestedKernel);
     if (from.isString()) return overload(aa, name, arg_types, target, array.parseNestedKernel);
     return null;
 }
