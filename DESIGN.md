@@ -1900,6 +1900,8 @@ Each rename is followed by a directory sync. When a schema opens, it resolves an
 
 Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
 
+SQL's `ALTER TABLE` takes MySQL's spellings of the actions. `ADD [COLUMN] (def, ...)` adds each listed column at the end and, as in MySQL, takes no `FIRST` or `AFTER`.
+
 ### 9.3 Inserts
 
 ```zig
