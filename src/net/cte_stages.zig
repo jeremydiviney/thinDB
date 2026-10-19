@@ -50,7 +50,7 @@ pub const StageMap = std.AutoHashMapUnmanaged(*const ir.Op, *mat_stage.Stage);
 /// operators over the leaf, no table-backed V2 handler applies.
 pub fn needsStaging(op: *const ir.Op) bool {
     return switch (op.*) {
-        .materialize, .join, .window, .set_union, .single_row, .file_scan, .table_fn, .series => true,
+        .materialize, .join, .window, .set_union, .single_row, .file_scan, .table_fn, .expand => true,
         .select => |p| needsStaging(p.upstream),
         .exclude => |p| needsStaging(p.upstream),
         .filter => |f| needsStaging(f.upstream),
@@ -154,7 +154,7 @@ fn wrapWindowsInMaterialize(node_arena: Allocator, op: *ir.Op, cse: *const MatCs
         .group_by => |*g| try wrapWindowChild(node_arena, &g.upstream, cse, scope),
         .compute => |*c| try wrapWindowChild(node_arena, &c.upstream, cse, scope),
         .alias => |*a| try wrapWindowChild(node_arena, &a.upstream, cse, scope),
-        .series => |*s| try wrapWindowChild(node_arena, &s.upstream, cse, scope),
+        .expand => |*s| try wrapWindowChild(node_arena, &s.upstream, cse, scope),
         .limit => |*l| try wrapWindowChild(node_arena, &l.upstream, cse, scope),
         .window => |*w| try wrapWindowChild(node_arena, &w.upstream, cse, scope),
         .table_fn => |*t| {
@@ -297,7 +297,7 @@ fn countMatRefs(allocator: Allocator, op: *const ir.Op, cse: *MatCse) anyerror!v
         .group_by => |g| try countMatRefs(allocator, g.upstream, cse),
         .compute => |c| try countMatRefs(allocator, c.upstream, cse),
         .alias => |a| try countMatRefs(allocator, a.upstream, cse),
-        .series => |s| try countMatRefs(allocator, s.upstream, cse),
+        .expand => |s| try countMatRefs(allocator, s.upstream, cse),
         .limit => |l| try countMatRefs(allocator, l.upstream, cse),
         .window => |w| try countMatRefs(allocator, w.upstream, cse),
         .table_fn => |t| for (t.inputs) |inp| try countMatRefs(allocator, inp, cse),
@@ -426,7 +426,7 @@ fn blockReads(allocator: Allocator, op: *const ir.Op, cse: *const MatCse, map: *
         .group_by => |g| try blockReads(allocator, g.upstream, cse, map, reads),
         .compute => |c| try blockReads(allocator, c.upstream, cse, map, reads),
         .alias => |a| try blockReads(allocator, a.upstream, cse, map, reads),
-        .series => |s| try blockReads(allocator, s.upstream, cse, map, reads),
+        .expand => |s| try blockReads(allocator, s.upstream, cse, map, reads),
         .limit => |l| try blockReads(allocator, l.upstream, cse, map, reads),
         .window => |w| try blockReads(allocator, w.upstream, cse, map, reads),
         .table_fn => |t| for (t.inputs) |inp| try blockReads(allocator, inp, cse, map, reads),
@@ -541,7 +541,7 @@ fn collectStages(
         .group_by => |g| try collectStages(input, g.upstream, set, map, cse, pins),
         .compute => |c| try collectStages(input, c.upstream, set, map, cse, pins),
         .alias => |a| try collectStages(input, a.upstream, set, map, cse, pins),
-        .series => |s| try collectStages(input, s.upstream, set, map, cse, pins),
+        .expand => |s| try collectStages(input, s.upstream, set, map, cse, pins),
         .limit => |l| try collectStages(input, l.upstream, set, map, cse, pins),
         .window => |w| try collectStages(input, w.upstream, set, map, cse, pins),
         .table_fn => |t| for (t.inputs) |inp| try collectStages(input, inp, set, map, cse, pins),
@@ -570,7 +570,7 @@ fn blockSource(op: *const ir.Op) BlockSource {
     while (true) {
         switch (cur.*) {
             .scan => return .table,
-            .file_scan, .single_row, .series => return .leaf,
+            .file_scan, .single_row, .expand => return .leaf,
             .materialize => return .mat,
             .join => return .join,
             .window => return .window,
@@ -933,7 +933,7 @@ fn collectBlockStages(
         .group_by => |g| try collectBlockStages(allocator, g.upstream, map, out),
         .compute => |c| try collectBlockStages(allocator, c.upstream, map, out),
         .alias => |a| try collectBlockStages(allocator, a.upstream, map, out),
-        .series => |s| try collectBlockStages(allocator, s.upstream, map, out),
+        .expand => |s| try collectBlockStages(allocator, s.upstream, map, out),
         .limit => |l| try collectBlockStages(allocator, l.upstream, map, out),
         .window => |w| try collectBlockStages(allocator, w.upstream, map, out),
         .join => |j| {
@@ -1532,17 +1532,25 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
             return (try tryPgCatalogLeaf(input, s)) orelse error.UnsupportedQueryShape;
         },
         .single_row => return local.SingleRowSource.create(input.allocator),
-        .series => |s| {
-            var args = try compileBlock(input, s.upstream, map);
-            var series = exec.Series.create(input.allocator, args, s.start, s.stop, s.step, s.column) catch |err| {
-                args.deinit();
-                return err;
-            };
-            if (s.alias) |alias| {
-                errdefer series.deinit();
-                return exec.AliasRename.create(input.allocator, series, alias);
+        .expand => |e| {
+            var args = try compileBlock(input, e.upstream, map);
+            errdefer args.deinit();
+            // A lateral call's carried columns keep their own qualifiers, so
+            // its alias qualifies only the columns it generates.
+            const columns = try input.node_arena.alloc([]const u8, e.columns.len);
+            for (e.columns, columns) |column, *name| {
+                name.* = if (e.alias) |alias| try std.fmt.allocPrint(input.node_arena, "{s}.{s}", .{ alias, column }) else column;
             }
-            return series;
+            return exec.Expand.create(input.allocator, args, .{
+                .generator = switch (e.generator) {
+                    .series => .series,
+                    .unnest => .unnest,
+                },
+                .args = e.args,
+                .columns = columns,
+                .lateral = e.lateral,
+                .outer = e.outer,
+            });
         },
         .file_scan => |f| {
             const base = try exec.fileScan(input.allocator, input.catalog.io, input.catalog.config.file_scan_access, f, null);

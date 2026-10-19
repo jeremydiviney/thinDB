@@ -67,7 +67,12 @@ const Pass = struct {
             },
             .alias => |a| try self.qualifiers.append(self.arena, a.alias),
             .table_fn => |t| if (t.alias) |a| try self.qualifiers.append(self.arena, a),
-            .series => |s| if (s.alias) |a| try self.qualifiers.append(self.arena, a),
+            .expand => |e| {
+                if (e.alias) |a| try self.qualifiers.append(self.arena, a);
+                // Only the compiled schema shows whether an array's elements
+                // are structs.
+                if (e.generator == .unnest) self.engaged = true;
+            },
             else => {},
         }
         if (!self.engaged) {
@@ -368,6 +373,12 @@ const Pass = struct {
             },
             .join => |j| return self.columnOf(j.left, name) orelse self.columnOf(j.right, name),
             .set_union => |u| return self.columnOf(u.left, name),
+            .expand => |e| {
+                for (e.columns) |c| {
+                    if (nameMatches(c, name) or qualifiedNameMatches(e.alias, c, name)) return .{ .type = null };
+                }
+                return if (e.lateral) self.columnOf(e.upstream, name) else null;
+            },
             else => return null,
         }
     }
@@ -417,7 +428,7 @@ fn childSlots(op: *ir.Op, buf: *[2]**ir.Op) []const **ir.Op {
         else => {
             buf[0] = switch (op.*) {
                 .alias => |*a| &a.upstream,
-                .series => |*s| &s.upstream,
+                .expand => |*s| &s.upstream,
                 .create_table_as => |*c| &c.source,
                 .insert_select => |*i| &i.source,
                 .explain => |*e| &e.inner,
@@ -453,6 +464,13 @@ fn isStar(name: []const u8) bool {
 
 fn nameMatches(column: []const u8, name: []const u8) bool {
     return types.columnNameEql(column, name) or types.columnNameEql(types.unqualifiedName(column), name);
+}
+
+/// Whether `name` is `qualifier.column`.
+fn qualifiedNameMatches(qualifier: ?[]const u8, column: []const u8, name: []const u8) bool {
+    const q = qualifier orelse return false;
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    return types.columnNameEql(name[0..dot], q) and types.columnNameEql(name[dot + 1 ..], column);
 }
 
 fn contains(names: []const []const u8, name: []const u8) bool {

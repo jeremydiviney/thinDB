@@ -60,6 +60,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "IncorrectArgumentsToSleep")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "SeriesStepZero")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "SeriesNonIntegerArgument")) return .wrong_arguments;
+    if (std.mem.eql(u8, err_name, "UnnestNonArrayArgument")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "MapArrayLengthMismatch")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "ArrayLengthMismatch")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "MemoryBudgetExceeded")) return .memory_budget_exceeded;
@@ -89,6 +90,7 @@ const NOT_SUPPORTED = [_][]const u8{
     "SqlUnsupportedFileFunction",
     "SqlUnsupportedFileOption",
     "SqlSetOpAllUnsupported",
+    "SqlLateralJoinUnsupported",
     "SqlColumnPositionUnsupported",
     "SqlFoundRowsUnsupported",
     "SqlPrepareExecuteUnsupported",
@@ -118,6 +120,7 @@ test "classify recognizes known errors" {
         .{ "IncorrectArgumentsToSleep", Category.wrong_arguments },
         .{ "SeriesStepZero", Category.wrong_arguments },
         .{ "SeriesNonIntegerArgument", Category.wrong_arguments },
+        .{ "UnnestNonArrayArgument", Category.wrong_arguments },
         .{ "MapArrayLengthMismatch", Category.wrong_arguments },
         .{ "ArrayLengthMismatch", Category.wrong_arguments },
         .{ "SqlOnColumnAmbiguous", Category.ambiguous_column },

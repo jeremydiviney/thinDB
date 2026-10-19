@@ -474,7 +474,7 @@ fn collectPins(arena: Allocator, op: *const ir.Op, map: *const cte_stages.StageM
         .group_by => |g| try collectPins(arena, g.upstream, map, pins),
         .compute => |c| try collectPins(arena, c.upstream, map, pins),
         .alias => |a| try collectPins(arena, a.upstream, map, pins),
-        .series => |s| try collectPins(arena, s.upstream, map, pins),
+        .expand => |s| try collectPins(arena, s.upstream, map, pins),
         .limit => |l| try collectPins(arena, l.upstream, map, pins),
         .window => |w| try collectPins(arena, w.upstream, map, pins),
         .table_fn => |t| for (t.inputs) |inp| try collectPins(arena, inp, map, pins),
@@ -508,7 +508,7 @@ fn bindSelfRefs(allocator: Allocator, op: *const ir.Op, info: *const ir.Op.Recur
         .group_by => |g| try bindSelfRefs(allocator, g.upstream, info, working, map),
         .compute => |c| try bindSelfRefs(allocator, c.upstream, info, working, map),
         .alias => |a| try bindSelfRefs(allocator, a.upstream, info, working, map),
-        .series => |s| try bindSelfRefs(allocator, s.upstream, info, working, map),
+        .expand => |s| try bindSelfRefs(allocator, s.upstream, info, working, map),
         .limit => |l| try bindSelfRefs(allocator, l.upstream, info, working, map),
         .window => |w| try bindSelfRefs(allocator, w.upstream, info, working, map),
         .join => |j| {
