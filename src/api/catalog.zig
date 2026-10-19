@@ -571,6 +571,13 @@ pub const Catalog = struct {
                     try appendSqlTypeName(list, allocator, element);
                     try list.append(allocator, '>');
                 },
+                .map => |m| {
+                    try list.appendSlice(allocator, "MAP<");
+                    try appendSqlTypeName(list, allocator, m.key);
+                    try list.appendSlice(allocator, ", ");
+                    try appendSqlTypeName(list, allocator, m.value);
+                    try list.append(allocator, '>');
+                },
             },
         }
     }

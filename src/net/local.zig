@@ -4177,7 +4177,7 @@ pub const InsertColumnBuilder = struct {
                 } else if (col.type == .nested) {
                     if (v != .text) return Error.TypeMismatch;
                     exec.nested.parseText(self.allocator, col.type, v.text, sb) catch |err| return switch (err) {
-                        error.InvalidArrayText => Error.TypeMismatch,
+                        error.InvalidNestedText => Error.TypeMismatch,
                         error.OutOfMemory => error.OutOfMemory,
                     };
                 } else {

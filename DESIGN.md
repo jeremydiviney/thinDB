@@ -74,8 +74,9 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | | `DATETIME` | i64 microseconds since 1970-01-01 UTC. No timezone awareness — applications convert at boundaries. |
 | Boolean | `BOOLEAN` | u8 (0/1) |
 | Nested | `ARRAY<T>` | One variable-width value per row in a self-contained encoding (`exec/nested.zig`): element class, count, validity bits, then the fixed-width values, or offsets and bytes. `T` is any type, an array included |
+| | `MAP<K, V>` | One variable-width value per row: a map tag, then its keys and its values as two arrays of one length. `K` is any type but a nested one; `V` is any type |
 
-An array's type points to its shape (`types.internNested`), so a type stays
+A nested type points to its shape (`types.internNested`), so a type stays
 one word and two types compare by pointer. The shapes live in one
 process-wide pool that is never freed. That pool is the library's only
 global state, a deliberate exception: shapes are immutable, so every
@@ -88,6 +89,16 @@ Arrays follow StarRocks:
 - Text casts to an array from StarRocks' `[1, "a", null]` or PostgreSQL's `{1,a,NULL}`. An element that doesn't read as the element type is NULL. Text that isn't an array is NULL in a CAST and fails an INSERT.
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
 - `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
+
+Maps follow StarRocks too:
+- `map{k: v, ...}` and `map(k, v, ...)` are literals. Their keys meet at one common type and their values at another, as array elements do. `m[k]` and `ELEMENT_AT(m, k)` give the value `k` maps to, or NULL; a NULL key matches a NULL key.
+- A map holds each key once. A repeated key keeps its last value, at its last position, in a literal, `map_from_arrays`, `map_concat` and a CAST whose keys meet. Otherwise entries keep the order given. Maps compare by their keys array, then their values array, so the same entries in another order make another map.
+- An empty `map{}` or `map()` takes the map type beside it, as `[]` does. Alone it is `MAP<BOOLEAN, BOOLEAN>`.
+- `map_concat` skips NULL maps, a later map's key winning. `map_from_arrays` refuses arrays of different lengths.
+- Text casts to a map from StarRocks' `{"a":1,"b":null}`. The MySQL wire prints that text; the PostgreSQL wire, which has no map type, sends it as `text`.
+- `MAP_AGG(k, v)` skips a row whose key is NULL and keeps a NULL value. It is a GROUP_CONCAT of one-entry maps, and GROUP_CONCAT over maps merges them, a later key winning.
+
+`IF`, `IFNULL`, `COALESCE` and `CASE` choose whole arrays and maps; their branches meet at a common type.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
 calendar, where year 0 is a leap year, as in StarRocks. So `0000-02-29` is a
@@ -224,7 +235,7 @@ dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
 `PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
 read `||` as concatenation.
 
-Explicitly **out of scope for v1**: `JSON`, `MAP`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
+Explicitly **out of scope for v1**: `JSON`, `STRUCT`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:
 - `FIXED` is `DECIMAL`.
@@ -1756,6 +1767,7 @@ MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
 TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
 SeriesStepZero, SeriesNonIntegerArgument,
+MapArrayLengthMismatch,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1777,6 +1789,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `TableFnInputMismatch` means a table function's input relation doesn't fit its declared input (§6.2): a column is missing, extra, out of order, nullable where the field isn't, or of a type an INSERT into the declared type refuses, or a value failed its conversion. `TableFnExecutionMismatch` means the call's PARTITION BY contradicts the declared execution mode; `TableFnOutputMismatch` means the callback left its output columns of unequal length.
 
 `SeriesStepZero` means a `generate_series` step was 0, which would repeat its start forever; PostgreSQL, DuckDB and StarRocks refuse it too. `SeriesNonIntegerArgument` means a `generate_series` argument wasn't an integer (§6.2). The MySQL wire reports both as 1210 (`HY000`), as it does `IncorrectArgumentsToSleep`; the PostgreSQL wire as `22023`, PostgreSQL's code for a zero step.
+
+`MapArrayLengthMismatch` means `map_from_arrays` was given key and value arrays of different lengths, which pair no entries; StarRocks refuses them too. The wires report it as they report `SeriesStepZero`.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

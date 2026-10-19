@@ -211,9 +211,10 @@ pub fn freeStrings(allocator: std.mem.Allocator, values: []?[]u8) void {
 }
 
 /// The first column of a result as text, NULL as null, the way the MySQL
-/// wire prints it: a boolean is 1 or 0 and a LARGEINT keeps every digit.
-/// Free with `freeStrings`.
+/// wire prints it: a boolean is 1 or 0, a LARGEINT keeps every digit, and an
+/// array or map reads as StarRocks prints it. Free with `freeStrings`.
 pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
+    const t = q.outputSchema()[0].type;
     var out: std.ArrayList(?[]u8) = .empty;
     errdefer {
         for (out.items) |v| if (v) |x| allocator.free(x);
@@ -225,6 +226,12 @@ pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
             const text: ?[]u8 = if (!col.isValid(row)) null else switch (col.data) {
                 .string, .varchar, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
                 inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
+                .nested => |sv| blk: {
+                    var buf: std.ArrayList(u8) = .empty;
+                    errdefer buf.deinit(allocator);
+                    try thindb.exec.nested.appendText(allocator, &buf, t, sv.rowBytes(row), .starrocks);
+                    break :blk try buf.toOwnedSlice(allocator);
+                },
                 else => return error.TestUnexpectedType,
             };
             errdefer if (text) |x| allocator.free(x);
@@ -232,6 +239,30 @@ pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// Expect the first column of `sql`'s result to read as `expected`
+/// (`columnText`), NULL as null.
+pub fn expectTexts(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: []const ?[]const u8) !void {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    const got = try columnText(allocator, &q);
+    defer freeStrings(allocator, got);
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try std.testing.expectEqual(expected.len, got.len);
+    for (expected, got) |e, g| {
+        if (e == null or g == null) {
+            if (e != null or g != null) std.debug.print("expected {?s}, got {?s}\n", .{ e, g });
+            try std.testing.expect(e == null and g == null);
+            continue;
+        }
+        try std.testing.expectEqualStrings(e.?, g.?);
+    }
+}
+
+/// `expectTexts` of a one-row result.
+pub fn expectText(allocator: std.mem.Allocator, db: anytype, sql: []const u8, expected: ?[]const u8) !void {
+    try expectTexts(allocator, db, sql, &.{expected});
 }
 
 /// `collectBigints` over `runSqlCtx`.

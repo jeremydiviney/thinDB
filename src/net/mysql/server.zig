@@ -2244,6 +2244,13 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
                 defer allocator.free(inner);
                 return std.fmt.allocPrint(allocator, "array<{s}>", .{inner});
             },
+            .map => |m| {
+                const key = try allocMysqlColumnType(allocator, m.key);
+                defer allocator.free(key);
+                const value = try allocMysqlColumnType(allocator, m.value);
+                defer allocator.free(value);
+                return std.fmt.allocPrint(allocator, "map<{s},{s}>", .{ key, value });
+            },
         },
     };
 }

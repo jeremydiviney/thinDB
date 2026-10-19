@@ -12,6 +12,7 @@ test {
     _ = @import("uuid_test.zig");
     _ = @import("json_test.zig");
     _ = @import("array_test.zig");
+    _ = @import("map_test.zig");
     _ = @import("views_test.zig");
     _ = @import("recursive_cte_test.zig");
     _ = @import("where_expr_test.zig");

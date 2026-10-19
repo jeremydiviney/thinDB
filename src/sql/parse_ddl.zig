@@ -1680,6 +1680,16 @@ pub fn arrayType(p: anytype) !types.Type {
     return types.arrayOf(element);
 }
 
+/// StarRocks' `MAP<K, V>`, cursor past `MAP`.
+pub fn mapType(p: anytype) !types.Type {
+    try p.expect(.lt);
+    const key = try parseColumnType(p);
+    try p.expect(.comma);
+    const value = try parseColumnType(p);
+    try closeTypeArguments(p);
+    return types.mapOf(key, value);
+}
+
 /// The `>` closing a type's `<...>`. Nested types end in `>>`, which lexes
 /// as one shift token: this takes its first `>` and leaves the second.
 fn closeTypeArguments(p: anytype) !void {
@@ -1793,6 +1803,7 @@ fn parseBaseColumnType(p: anytype) !types.Type {
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
     if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
     if (asciiEqlAny(name, &.{"array"})) return arrayType(p);
+    if (asciiEqlAny(name, &.{"map"})) return mapType(p);
     return PE.SqlExpectedKeyword;
 }
 

@@ -2585,10 +2585,10 @@ fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar
 /// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`), or a
 /// sibling array's element type (`ARRAY_APPEND(arr, NULL)`), then to the
 /// declared parameter types of each overload of the right arity
-/// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`), and last to an array or an
-/// index, which no declared parameter names (`ARRAY_LENGTH(NULL)`,
-/// `arr[NULL]`): a strict function's answer for NULL input is NULL whichever
-/// overload runs.
+/// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`), and last to an array, a map or
+/// an index, which no declared parameter names (`ARRAY_LENGTH(NULL)`,
+/// `MAP_SIZE(NULL)`, `arr[NULL]`): a strict function's answer for NULL input
+/// is NULL whichever overload runs.
 fn resolveWithTypedNulls(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -2622,7 +2622,7 @@ fn resolveWithTypedNulls(
         try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
         return r;
     }
-    if (scalar_fn.isArrayFnName(fn_name)) for ([_]Type{ try types.arrayOf(.boolean), .bigint }) |candidate| {
+    if (scalar_fn.isNestedFnName(fn_name)) for ([_]Type{ try types.arrayOf(.boolean), try types.mapOf(.boolean, .boolean), .bigint }) |candidate| {
         if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
     };
     return null;

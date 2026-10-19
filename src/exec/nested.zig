@@ -1,5 +1,5 @@
-//! ARRAY values. A value is one self-contained cell of a variable-length
-//! column:
+//! ARRAY and MAP values. An array is one self-contained cell of a
+//! variable-length column:
 //!
 //!   class     u8   how elements are stored and ordered (`ElemClass`)
 //!   count     u32  element count, little-endian
@@ -10,10 +10,20 @@
 //!             variable classes: count + 1 u32 offsets into the bytes that
 //!                  follow, then those bytes; a NULL element is empty
 //!
+//! A map is its keys and its values as two arrays of one length:
+//!
+//!   tag       u8   `MAP_TAG`, which no element class takes
+//!   keys_len  u32  byte length of the keys array, little-endian
+//!   keys      an array of the key type
+//!   values    an array of the value type
+//!
+//! Keys are unique: building a map (`appendMap`) keeps the last entry of a
+//! repeated key, where that entry stands.
+//!
 //! The encoding is canonical: floats are stored canonicalized and NULL slots
-//! are zero or empty, so equal arrays have equal bytes. Grouping, DISTINCT,
+//! are zero or empty, so equal values have equal bytes. Grouping, DISTINCT,
 //! joins and hashing compare bytes. Ordering decodes (`order`), and needs no
-//! type since the class byte says how to compare.
+//! type since the leading byte says how to compare.
 //!
 //! Kernels work on whole batches: `flatten` turns a column of arrays into one
 //! flat column of their elements plus per-row offsets, existing kernels run
@@ -78,6 +88,9 @@ pub const ElemClass = enum(u8) {
 
 const HEADER_BYTES = 5;
 
+pub const MAP_TAG: u8 = 0x40;
+const MAP_HEADER_BYTES = 5;
+
 pub fn validityBytes(count: usize) usize {
     return (count + 7) >> 3;
 }
@@ -115,9 +128,39 @@ pub const Array = struct {
     }
 };
 
-/// Whether `bytes` is an array whose elements have `element`'s class, with
-/// every length and offset in bounds, nested elements included.
-pub fn isWellFormed(bytes: []const u8, element: Type) bool {
+/// A decoded view over one map value's bytes: two arrays of one count.
+pub const Map = struct {
+    keys: []const u8,
+    values: []const u8,
+
+    pub fn decode(bytes: []const u8) Map {
+        const keys_len = std.mem.readInt(u32, bytes[1..5], .little);
+        return .{
+            .keys = bytes[MAP_HEADER_BYTES..][0..keys_len],
+            .values = bytes[MAP_HEADER_BYTES + keys_len ..],
+        };
+    }
+
+    pub fn count(self: Map) u32 {
+        return Array.decode(self.keys).count;
+    }
+};
+
+/// Whether `bytes` is a value of the nested type `t`, with every length and
+/// offset in bounds, nested elements included.
+pub fn isWellFormed(bytes: []const u8, t: Type) bool {
+    if (t.mapTypes()) |m| {
+        if (bytes.len < MAP_HEADER_BYTES or bytes[0] != MAP_TAG) return false;
+        const keys_len = std.mem.readInt(u32, bytes[1..5], .little);
+        if (bytes.len - MAP_HEADER_BYTES < keys_len) return false;
+        const map = Map.decode(bytes);
+        if (!arrayWellFormed(map.keys, m.key) or !arrayWellFormed(map.values, m.value)) return false;
+        return Array.decode(map.keys).count == Array.decode(map.values).count;
+    }
+    return arrayWellFormed(bytes, t.arrayElement() orelse return false);
+}
+
+fn arrayWellFormed(bytes: []const u8, element: Type) bool {
     if (bytes.len < HEADER_BYTES) return false;
     const class = ElemClass.of(element);
     if (bytes[0] != @intFromEnum(class)) return false;
@@ -136,10 +179,9 @@ pub fn isWellFormed(bytes: []const u8, element: Type) bool {
     }
     if (prev != data.len) return false;
     if (class == .nested) {
-        const inner = element.arrayElement() orelse return false;
         const a = Array.decode(bytes);
         for (0..count) |i| {
-            if (a.isValid(i) and !isWellFormed(a.element(i), inner)) return false;
+            if (a.isValid(i) and !isWellFormed(a.element(i), element)) return false;
         }
     }
     return true;
@@ -148,7 +190,38 @@ pub fn isWellFormed(bytes: []const u8, element: Type) bool {
 /// Append one array to `out`: rows [start, end) of `elements`, a flat view
 /// of the element type.
 pub fn appendEncoded(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, elements: ColumnView, start: usize, end: usize) !void {
-    const count = end - start;
+    try appendEncodedRows(allocator, out, class, elements, RowRange{ .start = start, .end = end });
+}
+
+const RowRange = struct {
+    start: usize,
+    end: usize,
+
+    fn len(self: RowRange) usize {
+        return self.end - self.start;
+    }
+
+    fn at(self: RowRange, i: usize) usize {
+        return self.start + i;
+    }
+};
+
+const PickedRows = struct {
+    rows: []const u32,
+
+    fn len(self: PickedRows) usize {
+        return self.rows.len;
+    }
+
+    fn at(self: PickedRows, i: usize) usize {
+        return self.rows[i];
+    }
+};
+
+/// Append one array of the rows of `elements` that `rows`, a `RowRange` or
+/// `PickedRows`, names.
+fn appendEncodedRows(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, elements: ColumnView, rows: anytype) !void {
+    const count = rows.len();
     try out.append(allocator, @intFromEnum(class));
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(count), .little);
@@ -156,14 +229,14 @@ pub fn appendEncoded(allocator: Allocator, out: *std.ArrayList(u8), class: ElemC
     const vb_at = out.items.len;
     try out.appendNTimes(allocator, 0, validityBytes(count));
     for (0..count) |i| {
-        if (elements.isValid(start + i)) out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
+        if (elements.isValid(rows.at(i))) out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
     }
     if (class.width()) |w| {
         const at = out.items.len;
         try out.appendNTimes(allocator, 0, count * w);
         for (0..count) |i| {
-            if (!elements.isValid(start + i)) continue;
-            writeFixed(out.items[at + i * w ..][0..w], elements, start + i);
+            if (!elements.isValid(rows.at(i))) continue;
+            writeFixed(out.items[at + i * w ..][0..w], elements, rows.at(i));
         }
         return;
     }
@@ -171,9 +244,172 @@ pub fn appendEncoded(allocator: Allocator, out: *std.ArrayList(u8), class: ElemC
     try out.appendNTimes(allocator, 0, 4 * (count + 1));
     const data_at = out.items.len;
     for (0..count) |i| {
-        if (elements.isValid(start + i)) try out.appendSlice(allocator, varBytes(elements, start + i));
+        if (elements.isValid(rows.at(i))) try out.appendSlice(allocator, varBytes(elements, rows.at(i)));
         std.mem.writeInt(u32, out.items[offsets_at + 4 * (i + 1) ..][0..4], @intCast(out.items.len - data_at), .little);
     }
+}
+
+/// Append one map of `map_types`: the entries of rows [start, end) of
+/// `keys` and `values`, flat columns of the key and value types, with a
+/// repeated key's last entry kept where it stands. `scratch` is working
+/// space a caller reuses across calls.
+pub fn appendMap(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    map_types: types.MapTypes,
+    keys: ColumnView,
+    values: ColumnView,
+    start: usize,
+    end: usize,
+    scratch: *std.ArrayList(u32),
+) !void {
+    try uniqueKeyRows(allocator, ViewKeys{ .view = keys }, start, end, scratch);
+    try out.append(allocator, MAP_TAG);
+    const len_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4);
+    const keys_at = out.items.len;
+    const picked: PickedRows = .{ .rows = scratch.items };
+    try appendEncodedRows(allocator, out, ElemClass.of(map_types.key), keys, picked);
+    std.mem.writeInt(u32, out.items[len_at..][0..4], @intCast(out.items.len - keys_at), .little);
+    try appendEncodedRows(allocator, out, ElemClass.of(map_types.value), values, picked);
+}
+
+/// Up to this many entries, a map finds repeated keys by comparing every
+/// pair; past it, by sorting.
+const PAIRWISE_REPEATS_MAX = 16;
+
+/// The rows of [start, end) of `keys` that no later row repeats, in order.
+/// `keys` is a `ViewKeys` or `ArrayKeys`.
+fn uniqueKeyRows(allocator: Allocator, keys: anytype, start: usize, end: usize, rows: *std.ArrayList(u32)) !void {
+    rows.clearRetainingCapacity();
+    if (end - start <= PAIRWISE_REPEATS_MAX) {
+        outer: for (start..end) |i| {
+            for (i + 1..end) |j| if (keys.order(i, j) == .eq) continue :outer;
+            try rows.append(allocator, @intCast(i));
+        }
+        return;
+    }
+    for (start..end) |i| try rows.append(allocator, @intCast(i));
+    // A stable sort keeps one key's rows in order, so each run ends at its
+    // last.
+    std.sort.block(u32, rows.items, keys, struct {
+        fn lessThan(k: @TypeOf(keys), x: u32, y: u32) bool {
+            return k.order(x, y) == .lt;
+        }
+    }.lessThan);
+    var kept: usize = 0;
+    for (rows.items, 0..) |row, i| {
+        if (i + 1 < rows.items.len and keys.order(row, rows.items[i + 1]) == .eq) continue;
+        rows.items[kept] = row;
+        kept += 1;
+    }
+    rows.shrinkRetainingCapacity(kept);
+    std.mem.sort(u32, rows.items, {}, std.sort.asc(u32));
+}
+
+/// Keys as rows of a flat column.
+const ViewKeys = struct {
+    view: ColumnView,
+
+    /// Two rows in element order, NULL first.
+    fn order(self: ViewKeys, i: usize, j: usize) std.math.Order {
+        const iv = self.view.isValid(i);
+        const jv = self.view.isValid(j);
+        if (!iv or !jv) return if (iv == jv) .eq else if (iv) .gt else .lt;
+        var bi: [16]u8 = undefined;
+        var bj: [16]u8 = undefined;
+        return elementOrder(classOfView(self.view), elementBytes(self.view, i, &bi), elementBytes(self.view, j, &bj));
+    }
+};
+
+/// Keys as the elements of an encoded array.
+const ArrayKeys = struct {
+    array: Array,
+
+    fn order(self: ArrayKeys, i: usize, j: usize) std.math.Order {
+        const iv = self.array.isValid(i);
+        const jv = self.array.isValid(j);
+        if (!iv or !jv) return if (iv == jv) .eq else if (iv) .gt else .lt;
+        return elementOrder(self.array.class, self.array.element(i), self.array.element(j));
+    }
+};
+
+/// Append the map of every entry of `parts`, maps of one type, one map
+/// after another: a key in several keeps its last entry, where it stands.
+pub fn appendMapConcat(allocator: Allocator, out: *std.ArrayList(u8), parts: []const []const u8) !void {
+    const key_parts = try allocator.alloc([]const u8, parts.len);
+    defer allocator.free(key_parts);
+    const value_parts = try allocator.alloc([]const u8, parts.len);
+    defer allocator.free(value_parts);
+    for (parts, key_parts, value_parts) |p, *k, *v| {
+        const map = Map.decode(p);
+        k.* = map.keys;
+        v.* = map.values;
+    }
+    var keys_buf: std.ArrayList(u8) = .empty;
+    defer keys_buf.deinit(allocator);
+    try appendConcat(allocator, &keys_buf, Array.decode(key_parts[0]).class, key_parts);
+    var values_buf: std.ArrayList(u8) = .empty;
+    defer values_buf.deinit(allocator);
+    try appendConcat(allocator, &values_buf, Array.decode(value_parts[0]).class, value_parts);
+    const keys = Array.decode(keys_buf.items);
+    var picked: std.ArrayList(u32) = .empty;
+    defer picked.deinit(allocator);
+    try uniqueKeyRows(allocator, ArrayKeys{ .array = keys }, 0, keys.count, &picked);
+    try out.append(allocator, MAP_TAG);
+    const len_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4);
+    const keys_at = out.items.len;
+    try appendPickedElements(allocator, out, keys, picked.items);
+    std.mem.writeInt(u32, out.items[len_at..][0..4], @intCast(out.items.len - keys_at), .little);
+    try appendPickedElements(allocator, out, Array.decode(values_buf.items), picked.items);
+}
+
+/// Append the array of `a`'s elements at `picked`, in that order.
+fn appendPickedElements(allocator: Allocator, out: *std.ArrayList(u8), a: Array, picked: []const u32) !void {
+    try out.append(allocator, @intFromEnum(a.class));
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(picked.len), .little);
+    try out.appendSlice(allocator, &count_buf);
+    const vb_at = out.items.len;
+    try out.appendNTimes(allocator, 0, validityBytes(picked.len));
+    for (picked, 0..) |p, i| {
+        if (a.isValid(p)) out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
+    }
+    if (a.class.width() != null) {
+        for (picked) |p| try out.appendSlice(allocator, a.element(p));
+        return;
+    }
+    const offsets_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4 * (picked.len + 1));
+    const data_at = out.items.len;
+    for (picked, 0..) |p, i| {
+        try out.appendSlice(allocator, a.element(p));
+        std.mem.writeInt(u32, out.items[offsets_at + 4 * (i + 1) ..][0..4], @intCast(out.items.len - data_at), .little);
+    }
+}
+
+fn classOfView(v: ColumnView) ElemClass {
+    return switch (v.data) {
+        .tinyint => .i8,
+        .smallint => .i16,
+        .int, .date => .i32,
+        .bigint, .datetime, .decimal64 => .i64,
+        .largeint, .decimal128 => .i128,
+        .uuid => .u128,
+        .float => .f32,
+        .double => .f64,
+        .boolean => .boolean,
+        .varchar, .string, .char, .json => .bytes,
+        .nested => .nested,
+    };
+}
+
+/// Row `row` of `v` as an array stores it as an element.
+fn elementBytes(v: ColumnView, row: usize, buf: *[16]u8) []const u8 {
+    const w = classOfView(v).width() orelse return varBytes(v, row);
+    writeFixed(buf[0..w], v, row);
+    return buf[0..w];
 }
 
 fn varBytes(v: ColumnView, row: usize) []const u8 {
@@ -293,6 +529,80 @@ pub fn flatten(allocator: Allocator, element: Type, arrays: ColumnView, rows: us
     return flat;
 }
 
+/// The entries of a column of maps, as flat key and value columns, with row
+/// r's entries at [offsets[r], offsets[r + 1]). A NULL row has none.
+pub const FlatMap = struct {
+    keys: ColumnStore,
+    values: ColumnStore,
+    offsets: std.ArrayList(u32),
+
+    pub fn deinit(self: *FlatMap, allocator: Allocator) void {
+        self.keys.deinit(allocator);
+        self.values.deinit(allocator);
+        self.offsets.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub fn flattenMap(allocator: Allocator, map_types: types.MapTypes, maps: ColumnView, rows: usize) !FlatMap {
+    var keys = try ColumnStore.init(allocator, map_types.key, true);
+    errdefer keys.deinit(allocator);
+    var values = try ColumnStore.init(allocator, map_types.value, true);
+    errdefer values.deinit(allocator);
+    var flat: FlatMap = .{ .keys = keys, .values = values, .offsets = .empty };
+    errdefer flat.offsets.deinit(allocator);
+    try flat.offsets.ensureTotalCapacity(allocator, rows + 1);
+    flat.offsets.appendAssumeCapacity(0);
+    const sv = maps.data.nested;
+    for (0..rows) |r| {
+        if (maps.isValid(r)) {
+            const map = Map.decode(sv.rowBytes(r));
+            try appendElements(allocator, &flat.keys, Array.decode(map.keys));
+            try appendElements(allocator, &flat.values, Array.decode(map.values));
+        }
+        flat.offsets.appendAssumeCapacity(@intCast(flat.keys.rowCount()));
+    }
+    return flat;
+}
+
+fn appendElements(allocator: Allocator, out: *ColumnStore, a: Array) !void {
+    for (0..a.count) |i| {
+        if (a.isValid(i)) try appendRaw(allocator, out, a.element(i)) else try out.appendNulls(allocator, 1);
+    }
+}
+
+/// Build a MAP column of `rows` rows: row r holds the entries
+/// [offsets[r], offsets[r + 1]) of `keys` and `values` (`appendMap`),
+/// unless `row_validity` clears its bit, which makes it NULL.
+pub fn encodeMapColumn(
+    allocator: Allocator,
+    out: *ColumnStore,
+    map_types: types.MapTypes,
+    keys: ColumnView,
+    values: ColumnView,
+    offsets: []const u32,
+    row_validity: ?[]const u8,
+    rows: usize,
+) !void {
+    var cell: std.ArrayList(u8) = .empty;
+    defer cell.deinit(allocator);
+    var scratch: std.ArrayList(u32) = .empty;
+    defer scratch.deinit(allocator);
+    const ss = &out.data.nested;
+    for (0..rows) |r| {
+        const valid = storage.column.isValidBit(row_validity, r);
+        const at = out.rowCount();
+        if (valid) {
+            cell.clearRetainingCapacity();
+            try appendMap(allocator, &cell, map_types, keys, values, offsets[r], offsets[r + 1], &scratch);
+            try ss.appendValue(allocator, cell.items);
+        } else {
+            try ss.appendValue(allocator, "");
+        }
+        try out.appendValidBit(allocator, at, valid);
+    }
+}
+
 /// Append one element's stored bytes to a store of the element type.
 pub fn appendRaw(allocator: Allocator, out: *ColumnStore, raw: []const u8) !void {
     const at = out.rowCount();
@@ -309,15 +619,22 @@ pub fn appendRaw(allocator: Allocator, out: *ColumnStore, raw: []const u8) !void
     try out.appendValidBit(allocator, at, true);
 }
 
-/// Total order over arrays of one type: element by element, a NULL element
-/// before any value, then the shorter array first.
+/// Total order over values of one nested type. Arrays order element by
+/// element, a NULL element before any value, then the shorter array first;
+/// maps by their keys, then their values.
 pub fn order(a_bytes: []const u8, b_bytes: []const u8) std.math.Order {
     // A NULL row's cell is empty; callers order NULLs themselves, but the
     // comparison must not read past it.
     if (a_bytes.len < HEADER_BYTES or b_bytes.len < HEADER_BYTES) return std.math.order(a_bytes.len, b_bytes.len);
+    if (a_bytes[0] != b_bytes[0]) return std.math.order(a_bytes[0], b_bytes[0]);
+    if (a_bytes[0] == MAP_TAG) {
+        const a = Map.decode(a_bytes);
+        const b = Map.decode(b_bytes);
+        const by_keys = order(a.keys, b.keys);
+        return if (by_keys != .eq) by_keys else order(a.values, b.values);
+    }
     const a = Array.decode(a_bytes);
     const b = Array.decode(b_bytes);
-    if (a.class != b.class) return std.math.order(@intFromEnum(a.class), @intFromEnum(b.class));
     for (0..@min(a.count, b.count)) |i| {
         const av = a.isValid(i);
         const bv = b.isValid(i);
@@ -356,8 +673,22 @@ pub const TextStyle = enum {
     postgres,
 };
 
-/// Append the text of one array of `t` to `out`.
+/// Append the text of one value of the nested type `t` to `out`. A map is
+/// `{k:v,...}` in either style, as StarRocks writes it.
 pub fn appendText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, bytes: []const u8, style: TextStyle) TextError!void {
+    if (t.mapTypes()) |m| {
+        const map = Map.decode(bytes);
+        const keys = Array.decode(map.keys);
+        const values = Array.decode(map.values);
+        try out.append(allocator, '{');
+        for (0..keys.count) |i| {
+            if (i > 0) try out.append(allocator, ',');
+            try appendSlotText(allocator, out, m.key, keys, i, style);
+            try out.append(allocator, ':');
+            try appendSlotText(allocator, out, m.value, values, i, style);
+        }
+        return out.append(allocator, '}');
+    }
     const element = t.arrayElement().?;
     const a = Array.decode(bytes);
     try out.append(allocator, if (style == .starrocks) '[' else '{');
@@ -372,10 +703,23 @@ pub fn appendText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, bytes:
     try out.append(allocator, if (style == .starrocks) ']' else '}');
 }
 
+fn appendSlotText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, a: Array, i: usize, style: TextStyle) TextError!void {
+    if (!a.isValid(i)) return out.appendSlice(allocator, if (style == .starrocks) "null" else "NULL");
+    try appendElementText(allocator, out, t, a.element(i), style);
+}
+
 fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw: []const u8, style: TextStyle) TextError!void {
     var buf: [64]u8 = undefined;
     switch (t) {
-        .nested => try appendText(allocator, out, t, raw, style),
+        .nested => {
+            // A map element of a PostgreSQL array is a quoted string; an
+            // array element nests in its own braces.
+            if (style == .starrocks or t.mapTypes() == null) return appendText(allocator, out, t, raw, style);
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try appendText(allocator, &text, t, raw, style);
+            try appendQuoted(allocator, out, text.items, style);
+        },
         .json => {
             var text: std.ArrayList(u8) = .empty;
             defer text.deinit(allocator);
@@ -430,18 +774,19 @@ fn postgresNeedsQuotes(text: []const u8) bool {
     return false;
 }
 
-pub const ParseError = error{InvalidArrayText} || Allocator.Error;
+pub const ParseError = error{InvalidNestedText} || Allocator.Error;
 
-/// Encode the array that `text` spells as a value of `t`: StarRocks'
-/// `[1, 2, null]` (strings in single or double quotes) or PostgreSQL's
-/// `{1,2,NULL}`. An element that doesn't read as the element type is NULL,
-/// as a CAST of its text is; text that isn't an array at all fails.
+/// Encode the value of the nested type `t` that `text` spells: an array as
+/// StarRocks' `[1, 2, null]` (strings in single or double quotes) or
+/// PostgreSQL's `{1,2,NULL}`, a map as StarRocks' `{"a":1,"b":null}`. An
+/// element that doesn't read as its type is NULL, as a CAST of its text is;
+/// text of another shape fails.
 pub fn parseText(allocator: Allocator, t: Type, text: []const u8, out: *std.ArrayList(u8)) ParseError!void {
     var reader: TextReader = .{ .text = text };
     reader.skipSpace();
-    try reader.parseArray(allocator, t, out);
+    try reader.parseValue(allocator, t, out);
     reader.skipSpace();
-    if (reader.pos != text.len) return error.InvalidArrayText;
+    if (reader.pos != text.len) return error.InvalidNestedText;
 }
 
 const TextReader = struct {
@@ -452,13 +797,64 @@ const TextReader = struct {
         while (r.pos < r.text.len and std.ascii.isWhitespace(r.text[r.pos])) r.pos += 1;
     }
 
-    fn parseArray(r: *TextReader, allocator: Allocator, t: Type, out: *std.ArrayList(u8)) ParseError!void {
-        const element = t.arrayElement() orelse return error.InvalidArrayText;
-        if (r.pos >= r.text.len) return error.InvalidArrayText;
+    fn parseValue(r: *TextReader, allocator: Allocator, t: Type, out: *std.ArrayList(u8)) ParseError!void {
+        if (t.mapTypes()) |m| return r.parseMap(allocator, m, out);
+        return r.parseArray(allocator, t.arrayElement() orelse return error.InvalidNestedText, out);
+    }
+
+    fn parseMap(r: *TextReader, allocator: Allocator, m: types.MapTypes, out: *std.ArrayList(u8)) ParseError!void {
+        if (r.pos >= r.text.len or r.text[r.pos] != '{') return error.InvalidNestedText;
+        r.pos += 1;
+        var keys = try ColumnStore.init(allocator, m.key, true);
+        defer keys.deinit(allocator);
+        var values = try ColumnStore.init(allocator, m.value, true);
+        defer values.deinit(allocator);
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(allocator);
+        r.skipSpace();
+        if (r.pos < r.text.len and r.text[r.pos] == '}') {
+            r.pos += 1;
+        } else while (true) {
+            try r.parseSlot(allocator, &keys, m.key, ':', &scratch);
+            r.skipSpace();
+            if (r.pos >= r.text.len or r.text[r.pos] != ':') return error.InvalidNestedText;
+            r.pos += 1;
+            try r.parseSlot(allocator, &values, m.value, '}', &scratch);
+            r.skipSpace();
+            if (r.pos >= r.text.len) return error.InvalidNestedText;
+            if (r.text[r.pos] == ',') {
+                r.pos += 1;
+                continue;
+            }
+            if (r.text[r.pos] != '}') return error.InvalidNestedText;
+            r.pos += 1;
+            break;
+        }
+        var rows: std.ArrayList(u32) = .empty;
+        defer rows.deinit(allocator);
+        try appendMap(allocator, out, m, keys.view(), values.view(), 0, keys.rowCount(), &rows);
+    }
+
+    /// One element of `t` onto `slots`, the text before `close` or a comma.
+    fn parseSlot(r: *TextReader, allocator: Allocator, slots: *ColumnStore, t: Type, close: u8, scratch: *std.ArrayList(u8)) ParseError!void {
+        r.skipSpace();
+        if (r.pos >= r.text.len) return error.InvalidNestedText;
+        if (t == .nested) {
+            if (r.bareWordIs("null")) return slots.appendNulls(allocator, 1);
+            scratch.clearRetainingCapacity();
+            try r.parseValue(allocator, t, scratch);
+            return appendRaw(allocator, slots, scratch.items);
+        }
+        const token = try r.scalarToken(allocator, close, scratch) orelse return slots.appendNulls(allocator, 1);
+        if (!try appendTextElement(allocator, slots, t, token)) try slots.appendNulls(allocator, 1);
+    }
+
+    fn parseArray(r: *TextReader, allocator: Allocator, element: Type, out: *std.ArrayList(u8)) ParseError!void {
+        if (r.pos >= r.text.len) return error.InvalidNestedText;
         const close: u8 = switch (r.text[r.pos]) {
             '[' => ']',
             '{' => '}',
-            else => return error.InvalidArrayText,
+            else => return error.InvalidNestedText,
         };
         r.pos += 1;
         var elements = try ColumnStore.init(allocator, element, true);
@@ -469,29 +865,14 @@ const TextReader = struct {
         if (r.pos < r.text.len and r.text[r.pos] == close) {
             r.pos += 1;
         } else while (true) {
+            try r.parseSlot(allocator, &elements, element, close, &scratch);
             r.skipSpace();
-            if (r.pos >= r.text.len) return error.InvalidArrayText;
-            if (element == .nested) {
-                if (r.bareWordIs("null")) {
-                    try elements.appendNulls(allocator, 1);
-                } else {
-                    scratch.clearRetainingCapacity();
-                    try r.parseArray(allocator, element, &scratch);
-                    try appendRaw(allocator, &elements, scratch.items);
-                }
-            } else {
-                const token = try r.scalarToken(allocator, close, &scratch);
-                if (token) |tok| {
-                    if (!try appendTextElement(allocator, &elements, element, tok)) try elements.appendNulls(allocator, 1);
-                } else try elements.appendNulls(allocator, 1);
-            }
-            r.skipSpace();
-            if (r.pos >= r.text.len) return error.InvalidArrayText;
+            if (r.pos >= r.text.len) return error.InvalidNestedText;
             if (r.text[r.pos] == ',') {
                 r.pos += 1;
                 continue;
             }
-            if (r.text[r.pos] != close) return error.InvalidArrayText;
+            if (r.text[r.pos] != close) return error.InvalidNestedText;
             r.pos += 1;
             break;
         }
@@ -507,6 +888,7 @@ const TextReader = struct {
     }
 
     /// The next element's text, unquoted, or null for an unquoted NULL.
+    /// It ends at a comma or `close` outside brackets.
     fn scalarToken(r: *TextReader, allocator: Allocator, close: u8, scratch: *std.ArrayList(u8)) ParseError!?[]const u8 {
         const c = r.text[r.pos];
         if (c == '"' or c == '\'') {
@@ -516,7 +898,7 @@ const TextReader = struct {
                 if (r.text[r.pos] == '\\' and r.pos + 1 < r.text.len) r.pos += 1;
                 try scratch.append(allocator, r.text[r.pos]);
             }
-            if (r.pos >= r.text.len) return error.InvalidArrayText;
+            if (r.pos >= r.text.len) return error.InvalidNestedText;
             r.pos += 1;
             return scratch.items;
         }
@@ -532,7 +914,7 @@ const TextReader = struct {
             if (depth == 0 and (ch == ',' or ch == close)) break;
         }
         const token = std.mem.trim(u8, r.text[start..r.pos], " \t\r\n");
-        if (token.len == 0) return error.InvalidArrayText;
+        if (token.len == 0) return error.InvalidNestedText;
         if (std.ascii.eqlIgnoreCase(token, "null")) return null;
         return token;
     }
@@ -615,7 +997,7 @@ test "nested: text round-trips through the encoding" {
     inline for (cases) |c| {
         const bytes = try encodeText(a, c[0], c[1]);
         defer a.free(bytes);
-        try testing.expect(isWellFormed(bytes, c[0].arrayElement().?));
+        try testing.expect(isWellFormed(bytes, c[0]));
         const sr = try renderText(a, c[0], bytes, .starrocks);
         defer a.free(sr);
         try testing.expectEqualStrings(c[2], sr);
@@ -636,7 +1018,7 @@ test "nested: unreadable elements are NULL, malformed text fails" {
     inline for (.{ "", "1,2", "[1,2", "[1,,2]", "[1] x" }) |bad| {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(a);
-        try testing.expectError(error.InvalidArrayText, parseText(a, int_array, bad, &out));
+        try testing.expectError(error.InvalidNestedText, parseText(a, int_array, bad, &out));
     }
 }
 
@@ -657,6 +1039,72 @@ test "nested: equal arrays have equal bytes, and order is element-wise" {
     for (0..texts.len) |i| for (0..texts.len) |j| {
         try testing.expectEqual(std.math.order(i, j), order(encoded[i], encoded[j]));
     };
+}
+
+test "nested: map text round-trips, and a repeated key keeps its last entry" {
+    const a = testing.allocator;
+    const by_name = try types.mapOf(.string, .int);
+    const cases = .{
+        .{ by_name, "{'a': 1, \"b\": null}", "{\"a\":1,\"b\":null}" },
+        .{ by_name, "{}", "{}" },
+        .{ by_name, "{'a': 1, 'b': 2, 'a': 3}", "{\"b\":2,\"a\":3}" },
+        .{ try types.mapOf(.int, try types.arrayOf(.double)), "{1: [1.5, null], 2: null}", "{1:[1.5,null],2:null}" },
+        .{ try types.arrayOf(try types.mapOf(.int, .string)), "[{1: 'x'}, null, {}]", "[{1:\"x\"},null,{}]" },
+    };
+    inline for (cases) |c| {
+        const bytes = try encodeText(a, c[0], c[1]);
+        defer a.free(bytes);
+        try testing.expect(isWellFormed(bytes, c[0]));
+        const sr = try renderText(a, c[0], bytes, .starrocks);
+        defer a.free(sr);
+        try testing.expectEqualStrings(c[2], sr);
+    }
+    inline for (.{ "{'a' 1}", "{'a': 1", "['a']", "{'a': 1,}" }) |bad| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try testing.expectError(error.InvalidNestedText, parseText(a, by_name, bad, &out));
+    }
+}
+
+test "nested: maps past the pairwise limit drop repeated keys by sorting" {
+    const a = testing.allocator;
+    const t = try types.mapOf(.int, .int);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(a);
+    try text.append(a, '{');
+    for (0..40) |i| {
+        if (i > 0) try text.append(a, ',');
+        try text.print(a, "{d}:{d}", .{ (i * 7) % 20, i });
+    }
+    try text.append(a, '}');
+    const bytes = try encodeText(a, t, text.items);
+    defer a.free(bytes);
+    const map = Map.decode(bytes);
+    try testing.expectEqual(@as(u32, 20), map.count());
+    const keys = Array.decode(map.keys);
+    const values = Array.decode(map.values);
+    for (0..keys.count) |i| {
+        const k = std.mem.readInt(i32, keys.element(i)[0..4], .little);
+        const v = std.mem.readInt(i32, values.element(i)[0..4], .little);
+        try testing.expectEqual(@as(i32, @intCast((@as(usize, @intCast(v)) * 7) % 20)), k);
+        try testing.expect(v >= 20);
+    }
+}
+
+test "nested: concatenated maps keep each key's last entry" {
+    const a = testing.allocator;
+    const t = try types.mapOf(.string, .int);
+    const first = try encodeText(a, t, "{'a': 1, 'b': 2}");
+    defer a.free(first);
+    const second = try encodeText(a, t, "{'c': null, 'a': 3}");
+    defer a.free(second);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try appendMapConcat(a, &out, &.{ first, second });
+    try testing.expect(isWellFormed(out.items, t));
+    const text = try renderText(a, t, out.items, .starrocks);
+    defer a.free(text);
+    try testing.expectEqualStrings("{\"b\":2,\"c\":null,\"a\":3}", text);
 }
 
 test "nested: flatten and encodeColumn are inverses" {

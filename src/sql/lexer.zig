@@ -164,6 +164,9 @@ pub const TokenTag = enum {
     rparen, // )
     lbracket, // [ (array literal, subscript)
     rbracket, // ]
+    lbrace, // { (map literal)
+    rbrace, // }
+    colon, // : (map literal entry)
     semicolon, // ;
     /// `?` placeholder used by MySQL prepared-statement clients. The
     /// SQL parser does not accept this in the v1 SELECT/INSERT grammar;
@@ -286,6 +289,14 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return Token{ .tag = .rbracket, .text = self.src[start..self.pos] };
             },
+            '{' => {
+                self.pos += 1;
+                return Token{ .tag = .lbrace, .text = self.src[start..self.pos] };
+            },
+            '}' => {
+                self.pos += 1;
+                return Token{ .tag = .rbrace, .text = self.src[start..self.pos] };
+            },
             ';' => {
                 self.pos += 1;
                 return Token{ .tag = .semicolon, .text = self.src[start..self.pos] };
@@ -356,7 +367,8 @@ pub const Lexer = struct {
                     self.pos += 2;
                     return Token{ .tag = .coloncolon, .text = self.src[start..self.pos] };
                 }
-                return LexError.LexUnexpectedChar;
+                self.pos += 1;
+                return Token{ .tag = .colon, .text = self.src[start..self.pos] };
             },
             '$' => {
                 // `$N` numbered placeholder vs PG dollar-quoted string
@@ -1298,14 +1310,14 @@ test "lexer: unterminated backtick errors cleanly" {
 test "lexer: operators including != <> <= >= <=> ! and the bitwise ones" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h <=> i & j && k | l ^ m << n >> ~o != !!p[q]");
+    var lx = Lexer.init(arena.allocator(), "a != b <> c <= d >= e < f > g = h <=> i & j && k | l ^ m << n >> ~o != !!p[q] {r:s}");
     const expected_tags = [_]TokenTag{
         .identifier, .neq,          .identifier, .neq,        .identifier, .lte,        .identifier,
         .gte,        .identifier,   .lt,         .identifier, .gt,         .identifier, .eq,
         .identifier, .null_safe_eq, .identifier, .amp,        .identifier, .amp_amp,    .identifier,
         .pipe,       .identifier,   .caret,      .identifier, .shl,        .identifier, .shr,
         .tilde,      .identifier,   .neq,        .bang,       .bang,       .identifier, .lbracket,
-        .identifier, .rbracket,
+        .identifier, .rbracket,     .lbrace,     .identifier, .colon,      .identifier, .rbrace,
     };
     for (expected_tags) |tag| {
         try std.testing.expectEqual(tag, (try lx.next()).tag);

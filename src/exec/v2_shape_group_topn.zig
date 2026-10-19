@@ -1695,7 +1695,9 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 if (agg.arg2_col != null or params.distinct) return traceDecline(request, "ordered or distinct group_concat");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
-                if (!isStringKeyType(input_type)) return traceDecline(request, "group_concat input type");
+                // Nested values concatenate into one value, which this lane's
+                // separator join can't build.
+                if (!isStringKeyType(input_type) or input_type.isNested()) return traceDecline(request, "group_concat input type");
                 if (next_string_state_index >= MAX_STRING_AGG_SLOTS) return traceDecline(request, "string aggregate slot count");
                 if (next_concat_state_index >= MAX_CONCAT_SLOTS) return traceDecline(request, "concat slot count");
                 const str_input_idx = addStringAggInput(&string_aggregate_inputs, &string_aggregate_input_count, col_name) orelse return traceDecline(request, "string aggregate input");

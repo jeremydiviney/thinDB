@@ -47,11 +47,11 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-fn isText(t: Type) bool {
+pub fn isText(t: Type) bool {
     return t.isString() and t != .json;
 }
 
-fn overload(aa: Allocator, name: []const u8, arg_types: []const Type, return_type: Type, kernel: TypedKernel) !?ResolvedOverload {
+pub fn overload(aa: Allocator, name: []const u8, arg_types: []const Type, return_type: Type, kernel: TypedKernel) !?ResolvedOverload {
     return .{
         .func = .{
             .name = name,
@@ -82,11 +82,19 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
         if (arg_types.len != 2 or !arg_types[1].isInteger()) return null;
         return overload(aa, name, arg_types, try types.arrayOf(arg_types[0]), repeatKernel);
     }
+    if (try resolveNestedConditional(aa, name, arg_types)) |ov| return ov;
     if (arg_types.len == 0) return null;
+    if (eql(name, "to_string") and arg_types.len == 1 and arg_types[0].isNested()) return overload(aa, name, arg_types, .string, toStringKernel);
+    if (eql(name, scalar_fn.ARRAY_ORDER_FN)) {
+        if (arg_types.len != 2) return null;
+        const t = orderedType(arg_types[0], arg_types[1]) orelse return null;
+        if (!t.isNested()) return null;
+        if (!try castable(aa, arg_types[0], t) or !try castable(aa, arg_types[1], t)) return null;
+        return overload(aa, name, arg_types, .int, orderKernel);
+    }
     const array = arg_types[0];
     const element = array.arrayElement() orelse return null;
     if (arg_types.len == 1) {
-        if (eql(name, "to_string")) return overload(aa, name, arg_types, .string, toStringKernel);
         if (eql(name, "to_json")) return overload(aa, name, arg_types, .json, toJsonKernel);
         if (eql(name, "array_length") or eql(name, "cardinality")) return overload(aa, name, arg_types, .int, lengthKernel);
         if (eql(name, "array_distinct")) return overload(aa, name, arg_types, array, distinctKernel);
@@ -138,15 +146,25 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     if (eql(name, "array_concat")) return overload(aa, name, arg_types, try types.arrayOf(c), concatKernel);
     if (eql(name, "array_intersect")) return overload(aa, name, arg_types, try types.arrayOf(c), intersectKernel);
     if (arg_types.len != 2) return null;
-    if (eql(name, scalar_fn.ARRAY_ORDER_FN)) {
-        const t = orderedType(arg_types[0], arg_types[1]) orelse return null;
-        if (!try castable(aa, arg_types[0], t) or !try castable(aa, arg_types[1], t)) return null;
-        return overload(aa, name, arg_types, .int, orderKernel);
-    }
     if (eql(name, "arrays_overlap")) return overload(aa, name, arg_types, .boolean, overlapKernel);
     if (eql(name, "array_contains_all")) return overload(aa, name, arg_types, .boolean, containsAllKernel);
     if (eql(name, "array_contains_seq")) return overload(aa, name, arg_types, .boolean, containsSeqKernel);
     return null;
+}
+
+/// IF, IFNULL and COALESCE over arrays and maps: the branches meet at their
+/// common type, which must be nested; the scalar overloads take the rest.
+fn resolveNestedConditional(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
+    const is_if = eql(name, "if");
+    if (!is_if and !eql(name, "ifnull") and !eql(name, "coalesce")) return null;
+    if (is_if and (arg_types.len != 3 or arg_types[0] != .boolean)) return null;
+    if (eql(name, "ifnull") and arg_types.len != 2) return null;
+    const branches = if (is_if) arg_types[1..] else arg_types;
+    if (branches.len == 0) return null;
+    const t = cast.commonTypeOf(branches) orelse return null;
+    if (!t.isNested()) return null;
+    for (branches) |b| if (!try castable(aa, b, t)) return null;
+    return overload(aa, name, arg_types, t, if (is_if) ifKernel else coalesceKernel);
 }
 
 /// Functions of an array and one value compared with its elements.
@@ -183,12 +201,12 @@ fn resolveCastToArray(aa: Allocator, name: []const u8, arg_types: []const Type) 
         if (!try castable(aa, from_element, target_element)) return null;
         return overload(aa, name, arg_types, target, castArrayKernel);
     }
-    if (from.isString()) return overload(aa, name, arg_types, target, parseArrayKernel);
+    if (from.isString()) return overload(aa, name, arg_types, target, parseNestedKernel);
     return null;
 }
 
 /// Whether CAST(x AS to) is defined for an x of `from`.
-fn castable(aa: Allocator, from: Type, to: Type) !bool {
+pub fn castable(aa: Allocator, from: Type, to: Type) !bool {
     if (cast.sameRepresentation(from, to)) return true;
     const name = try scalar_fn.castFnName(aa, to) orelse return false;
     return try scalar_fn.resolve(aa, name, &.{from}) != null;
@@ -198,7 +216,7 @@ fn castable(aa: Allocator, from: Type, to: Type) !bool {
 /// in: text beside elements that aren't reads as the element type, as CAST
 /// reads it (so a NULL literal, whose placeholder type is text, takes the
 /// element type); otherwise their common type.
-fn comparedType(element: Type, t: Type) ?Type {
+pub fn comparedType(element: Type, t: Type) ?Type {
     if (isText(t) and !isText(element)) return element;
     return cast.commonType(element, t);
 }
@@ -264,17 +282,17 @@ fn castColumn(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows:
 
 /// A column of `rows` values as type `to`: the column itself where it
 /// already is one, else its CAST, which this owns.
-const AsType = struct {
+pub const AsType = struct {
     view: ColumnView,
     owned: ?ColumnStore = null,
 
-    fn init(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows: usize) !AsType {
+    pub fn init(allocator: Allocator, src: ColumnView, from: Type, to: Type, rows: usize) !AsType {
         if (cast.sameRepresentation(from, to)) return .{ .view = src };
         const converted = try castColumn(allocator, src, from, to, rows);
         return .{ .view = converted.view(), .owned = converted };
     }
 
-    fn deinit(self: *AsType, allocator: Allocator) void {
+    pub fn deinit(self: *AsType, allocator: Allocator) void {
         if (self.owned) |*o| o.deinit(allocator);
     }
 };
@@ -362,7 +380,7 @@ fn intAt(v: ColumnView, row: usize) ?i64 {
     };
 }
 
-fn appendValue(allocator: Allocator, out: *ColumnStore, comptime field: []const u8, value: anytype) !void {
+pub fn appendValue(allocator: Allocator, out: *ColumnStore, comptime field: []const u8, value: anytype) !void {
     try @field(out.data, field).append(allocator, value);
     try out.appendValidBit(allocator, out.rowCount() - 1, true);
 }
@@ -409,7 +427,7 @@ fn cellOrder(v: ColumnView, i: usize, j: usize) std.math.Order {
 }
 
 /// The first of `v`'s rows [start, end) equal to row `j` of `x`.
-fn findIn(v: ColumnView, start: usize, end: usize, x: ColumnView, j: usize) ?usize {
+pub fn findIn(v: ColumnView, start: usize, end: usize, x: ColumnView, j: usize) ?usize {
     for (start..end) |i| if (cellsEqual(v, i, x, j)) return i;
     return null;
 }
@@ -436,7 +454,9 @@ fn castArrayKernel(allocator: Allocator, arg_types: []const Type, out_type: Type
     try nested.encodeColumn(allocator, out, nested.ElemClass.of(target), fa.elements.view, fa.flat.offsets.items, args[0].nulls, rows);
 }
 
-fn parseArrayKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+/// Text or JSON read as the nested value it spells; NULL where it spells
+/// none.
+pub fn parseNestedKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
     const sv = common.stringViewOf(args[0]);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
@@ -455,13 +475,51 @@ fn parseArrayKernel(allocator: Allocator, arg_types: []const Type, out_type: Typ
             cell.clearRetainingCapacity();
             nested.parseText(allocator, out_type, raw, &cell) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                error.InvalidArrayText => break :blk false,
+                error.InvalidNestedText => break :blk false,
             };
             break :blk true;
         };
         try ss.appendValue(allocator, if (valid) cell.items else "");
         try out.appendValidBit(allocator, at, valid);
     }
+}
+
+/// IF(c, a, b): `a` where `c` is true, else `b` (a NULL `c` is false).
+fn ifKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    var a = try AsType.init(allocator, args[1], arg_types[1], out_type, rows);
+    defer a.deinit(allocator);
+    var b = try AsType.init(allocator, args[2], arg_types[2], out_type, rows);
+    defer b.deinit(allocator);
+    for (0..rows) |r| {
+        const chosen = if (args[0].isValid(r) and args[0].data.boolean[r] != 0) a.view else b.view;
+        try appendNestedCell(allocator, out, chosen, r);
+    }
+}
+
+/// IFNULL and COALESCE: each row's first non-NULL argument.
+fn coalesceKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    const as = try allocator.alloc(AsType, args.len);
+    defer allocator.free(as);
+    var ready: usize = 0;
+    defer for (as[0..ready]) |*x| x.deinit(allocator);
+    for (as, args, arg_types) |*x, a, t| {
+        x.* = try AsType.init(allocator, a, t, out_type, rows);
+        ready += 1;
+    }
+    for (0..rows) |r| {
+        const chosen = for (as) |x| {
+            if (x.view.isValid(r)) break x.view;
+        } else as[as.len - 1].view;
+        try appendNestedCell(allocator, out, chosen, r);
+    }
+}
+
+/// Append row `r` of a nested `v` to `out`, NULL as NULL.
+fn appendNestedCell(allocator: Allocator, out: *ColumnStore, v: ColumnView, r: usize) !void {
+    const at = out.rowCount();
+    const valid = v.isValid(r);
+    try out.data.nested.appendValue(allocator, if (valid) v.data.nested.rowBytes(r) else "");
+    try out.appendValidBit(allocator, at, valid);
 }
 
 fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
@@ -1088,9 +1146,8 @@ fn orderedType(a: Type, b: Type) ?Type {
     return cast.commonType(a, b);
 }
 
-/// ARRAY_ORDER: -1, 0 or 1 as the first array sorts before, with or after
-/// the second, both as `orderedType`: element by element, a NULL element
-/// first, then the shorter first.
+/// ARRAY_ORDER: -1, 0 or 1 as the first nested value sorts before, with or
+/// after the second, both as `orderedType` (`nested.order`).
 fn orderKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
     _ = out_type;
     const t = orderedType(arg_types[0], arg_types[1]) orelse return Error.ComputeNoSuchOverload;
