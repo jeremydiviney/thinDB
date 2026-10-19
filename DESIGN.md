@@ -151,7 +151,9 @@ so `DATE '2026-01-31' + INTERVAL 1 MONTH` is 2026-02-28 00:00:00, and a
 DATETIME written into a DATE column lands as its day. `INTERVAL`,
 `TIMESTAMPADD` and `TIMESTAMPDIFF` take StarRocks' MILLISECOND beside
 MySQL's units, and `DATE_TRUNC` and `DATE_DIFF` take MILLISECOND and
-MICROSECOND too. One deliberate
+MICROSECOND too. `DATE_DIFF`'s unit is text and may differ by row, as in
+StarRocks; a bare word there is the unit when it names one, as in
+`DATE_DIFF(day, a, b)`, and a column otherwise. One deliberate
 exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.

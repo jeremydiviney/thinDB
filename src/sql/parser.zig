@@ -51,6 +51,7 @@ const exec_compute = @import("../exec/compute.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const datefmt = @import("../exec/scalar_fn_datefmt.zig");
 const date_text = @import("../exec/scalar_fn_common.zig");
+const date_fn = @import("../exec/scalar_fn_date.zig");
 const time_fn = @import("../exec/scalar_fn_time.zig");
 const PredicateExpr = exec_predicate.PredicateExpr;
 const PredicateOp = exec_predicate.PredicateOp;
@@ -2828,6 +2829,9 @@ pub const Parser = struct {
             else => return args,
         };
         if (std.mem.eql(u8, unit, "*")) return args;
+        // DATE_DIFF's unit is any text, so a bare word naming no unit is a
+        // column whose rows name the units.
+        if (std.ascii.eqlIgnoreCase(name, "date_diff") and !date_fn.isDiffUnit(unit)) return args;
         const normalized = try self.arena.alloc(ir.Expr, args.len);
         @memcpy(normalized, args);
         normalized[0] = .{ .lit = .{ .text = try self.arena.dupe(u8, unit) } };
