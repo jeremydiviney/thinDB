@@ -580,6 +580,12 @@ pub fn element(arr: []const u8, idx: usize) ?[]const u8 {
     return arr[off..][0..valueLen(arr[off..])];
 }
 
+/// Member `i` of an object value, members in key order.
+pub fn memberAt(obj: []const u8, i: usize) Member {
+    const index: u32 = @intCast(i);
+    return .{ .key = memberKey(obj, index), .val = memberValue(obj, index) };
+}
+
 pub const Step = union(enum) { member: []const u8, index: usize };
 
 pub fn navigate(root: []const u8, steps: []const Step) ?[]const u8 {
@@ -768,6 +774,49 @@ pub fn operand(v: []const u8) Operand {
 /// expression's value) is that value, any other text a JSON string.
 pub fn textOperand(text: []const u8) Operand {
     return if (looksBinary(text)) operand(text) else .{ .string = text };
+}
+
+/// StarRocks' CAST of a JSON value to BIGINT: a boolean is 1 or 0, a number
+/// drops its fraction, and text must spell an integer
+/// (`common.textInteger`). Anything else, or a value past BIGINT, is null.
+pub fn castInteger(v: Operand) ?i64 {
+    return switch (v) {
+        .boolean => |b| @intFromBool(b),
+        .number => |n| switch (n) {
+            .exact => |d| std.math.cast(i64, @divTrunc(d.m, std.math.powi(i128, 10, d.s) catch return null)),
+            .double => |x| if (x > -0x1p63 - 1 and x < 0x1p63) @intFromFloat(@trunc(x)) else null,
+        },
+        .string => |s| std.math.cast(i64, common.textInteger(s) orelse return null),
+        .null, .array, .object => null,
+    };
+}
+
+/// StarRocks' CAST of a JSON value to DOUBLE: a boolean is 1 or 0, and text
+/// must spell a number (`common.textDouble`).
+pub fn castDouble(v: Operand) ?f64 {
+    return switch (v) {
+        .boolean => |b| if (b) 1 else 0,
+        .number => |n| switch (n) {
+            .exact => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10, @floatFromInt(d.s)),
+            .double => |x| x,
+        },
+        .string => |s| common.textDouble(s),
+        .null, .array, .object => null,
+    };
+}
+
+/// StarRocks' CAST of a JSON value to BOOLEAN: a number is true unless zero,
+/// and text is true or false as StarRocks casts it (`common.textBoolean`).
+pub fn castBoolean(v: Operand) ?u8 {
+    return switch (v) {
+        .boolean => |b| @intFromBool(b),
+        .number => |n| switch (n) {
+            .exact => |d| @intFromBool(d.m != 0),
+            .double => |x| @intFromBool(x != 0),
+        },
+        .string => |s| @intFromBool(common.textBoolean(s) orelse return null),
+        .null, .array, .object => null,
+    };
 }
 
 fn digitsNumber(digits: []const u8) Number {

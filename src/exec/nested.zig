@@ -901,7 +901,7 @@ fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
             var text: std.ArrayList(u8) = .empty;
             defer text.deinit(allocator);
             if (json_binary.looksBinary(raw)) try json_binary.toText(allocator, &text, raw) else try text.appendSlice(allocator, raw);
-            if (style == .starrocks) try out.appendSlice(allocator, text.items) else try appendQuoted(allocator, out, text.items, style);
+            if (style == .starrocks) try appendSingleQuoted(allocator, out, text.items) else try appendQuoted(allocator, out, text.items, style);
         },
         .varchar, .string, .char => try appendQuoted(allocator, out, raw, style),
         .boolean => try out.appendSlice(allocator, if (style == .postgres) (if (raw[0] != 0) "t" else "f") else (if (raw[0] != 0) "1" else "0")),
@@ -940,6 +940,17 @@ fn appendQuoted(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8,
         try out.append(allocator, c);
     }
     try out.append(allocator, '"');
+}
+
+/// StarRocks prints a JSON element in single quotes; the escapes keep the
+/// text one `parseText` reads back.
+fn appendSingleQuoted(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    try out.append(allocator, '\'');
+    for (text) |c| {
+        if (c == '\'' or c == '\\') try out.append(allocator, '\\');
+        try out.append(allocator, c);
+    }
+    try out.append(allocator, '\'');
 }
 
 fn postgresNeedsQuotes(text: []const u8) bool {
@@ -1143,6 +1154,236 @@ const TextReader = struct {
         return token;
     }
 };
+
+pub const JsonError = error{NotJson} || TextError;
+
+/// Append the JSONB value of one value of the nested type `t`: an array is a
+/// JSON array; a map an object, each key by its text; a struct an object of
+/// its fields by name. A NULL element is a JSON null, and a date, time or
+/// UUID a string. A float JSON can't hold (NaN, infinite) or a NULL map key
+/// fails.
+pub fn appendJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, bytes: []const u8) JsonError!void {
+    if (t.arrayElement()) |element| {
+        const a = Array.decode(bytes);
+        var elems: std.ArrayList(u8) = .empty;
+        defer elems.deinit(allocator);
+        const offsets = try allocator.alloc(u32, a.count);
+        defer allocator.free(offsets);
+        for (offsets, 0..) |*o, i| {
+            o.* = @intCast(elems.items.len);
+            try appendSlotJson(allocator, &elems, element, a, i);
+        }
+        return json_binary.appendArray(allocator, out, elems.items, offsets);
+    }
+    var keys: std.ArrayList(u8) = .empty;
+    defer keys.deinit(allocator);
+    var values: std.ArrayList(u8) = .empty;
+    defer values.deinit(allocator);
+    var ends: std.ArrayList(MemberEnds) = .empty;
+    defer ends.deinit(allocator);
+    if (t.mapTypes()) |m| {
+        const map = Map.decode(bytes);
+        const key_array = Array.decode(map.keys);
+        const value_array = Array.decode(map.values);
+        for (0..key_array.count) |i| {
+            if (!key_array.isValid(i)) return error.NotJson;
+            try appendPlainText(allocator, &keys, m.key, key_array.element(i));
+            try appendSlotJson(allocator, &values, m.value, value_array, i);
+            try ends.append(allocator, .{ .key = keys.items.len, .value = values.items.len });
+        }
+    } else {
+        const s = Struct.decode(bytes);
+        for (t.structFields().?, 0..) |f, i| {
+            try keys.appendSlice(allocator, f.name);
+            if (s.isValid(i)) try appendElementJson(allocator, &values, f.type, s.field(i)) else try json_binary.appendNull(allocator, &values);
+            try ends.append(allocator, .{ .key = keys.items.len, .value = values.items.len });
+        }
+    }
+    const members = try allocator.alloc(json_binary.Member, ends.items.len);
+    defer allocator.free(members);
+    var prev: MemberEnds = .{ .key = 0, .value = 0 };
+    for (members, ends.items) |*member, e| {
+        member.* = .{ .key = keys.items[prev.key..e.key], .val = values.items[prev.value..e.value] };
+        prev = e;
+    }
+    try json_binary.appendObject(allocator, out, members);
+}
+
+/// Where one object member's key and value end in the buffers `appendJson`
+/// builds them in.
+const MemberEnds = struct { key: usize, value: usize };
+
+fn appendSlotJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, a: Array, i: usize) JsonError!void {
+    if (!a.isValid(i)) return json_binary.appendNull(allocator, out);
+    try appendElementJson(allocator, out, t, a.element(i));
+}
+
+fn appendElementJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw: []const u8) JsonError!void {
+    var buf: [64]u8 = undefined;
+    switch (t) {
+        .nested => try appendJson(allocator, out, t, raw),
+        .json => {
+            const doc = json_binary.normalize(allocator, raw) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.JsonInvalid => return error.NotJson,
+            };
+            defer if (doc.owned) allocator.free(doc.bytes);
+            try out.appendSlice(allocator, doc.bytes);
+        },
+        .varchar, .string, .char => try json_binary.appendString(allocator, out, raw),
+        .boolean => try json_binary.appendBool(allocator, out, raw[0] != 0),
+        .tinyint => try json_binary.appendInt(allocator, out, @as(i8, @bitCast(raw[0]))),
+        .smallint => try json_binary.appendInt(allocator, out, std.mem.readInt(i16, raw[0..2], .little)),
+        .int => try json_binary.appendInt(allocator, out, std.mem.readInt(i32, raw[0..4], .little)),
+        .bigint => try json_binary.appendInt(allocator, out, std.mem.readInt(i64, raw[0..8], .little)),
+        .largeint => {
+            const v = std.mem.readInt(i128, raw[0..16], .little);
+            if (std.math.cast(i64, v)) |small| return json_binary.appendInt(allocator, out, small);
+            try json_binary.appendNumber(allocator, out, .decimal, try std.fmt.bufPrint(&buf, "{d}", .{v}));
+        },
+        .float => {
+            // Through its shortest text, so 1.1 stays 1.1 and not the
+            // DOUBLE nearest the FLOAT.
+            var fbuf: [common.FLOAT_TEXT_MAX]u8 = undefined;
+            const x: f32 = @bitCast(std.mem.readInt(u32, raw[0..4], .little));
+            if (!std.math.isFinite(x)) return error.NotJson;
+            try json_binary.appendDouble(allocator, out, std.fmt.parseFloat(f64, common.floatText(&fbuf, x, .plain)) catch x);
+        },
+        .double => {
+            const x: f64 = @bitCast(std.mem.readInt(u64, raw[0..8], .little));
+            if (!std.math.isFinite(x)) return error.NotJson;
+            try json_binary.appendDouble(allocator, out, x);
+        },
+        .decimal64 => |spec| try json_binary.appendNumber(allocator, out, .decimal, dec.formatDecimal(&buf, std.mem.readInt(i64, raw[0..8], .little), spec.s)),
+        .decimal128 => |spec| try json_binary.appendNumber(allocator, out, .decimal, dec.formatDecimal(&buf, std.mem.readInt(i128, raw[0..16], .little), spec.s)),
+        .date, .datetime, .uuid => {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try appendPlainText(allocator, &text, t, raw);
+            try json_binary.appendString(allocator, out, text.items);
+        },
+    }
+}
+
+/// An element's text unquoted: text as it is, anything else as it prints.
+fn appendPlainText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw: []const u8) TextError!void {
+    switch (t) {
+        .varchar, .string, .char => try out.appendSlice(allocator, raw),
+        .json => if (json_binary.looksBinary(raw)) try json_binary.appendUnquoted(allocator, out, raw) else try out.appendSlice(allocator, raw),
+        .date, .datetime, .uuid => {
+            // These print quoted.
+            const at = out.items.len;
+            try appendElementText(allocator, out, t, raw, .starrocks);
+            std.mem.copyForwards(u8, out.items[at..], out.items[at + 1 .. out.items.len - 1]);
+            out.shrinkRetainingCapacity(out.items.len - 2);
+        },
+        else => try appendElementText(allocator, out, t, raw, .starrocks),
+    }
+}
+
+pub const FromJsonError = error{JsonShape} || Allocator.Error;
+
+/// Encode the value of the nested type `t` that the JSONB value `v` holds:
+/// an array of a JSON array; a map of a JSON object, each key read as the
+/// key type; a struct of a JSON array's elements in order or of a JSON
+/// object's members by field name, one missing NULL. An element converts
+/// as `appendJsonElement` converts it, NULL where it can't. A value of any
+/// other shape fails.
+pub fn fromJson(allocator: Allocator, t: Type, v: []const u8, out: *std.ArrayList(u8)) FromJsonError!void {
+    const tag = json_binary.tagOf(v);
+    if (t.mapTypes()) |m| {
+        if (tag != .object) return error.JsonShape;
+        const count = json_binary.arrayLen(v).?;
+        var keys = try ColumnStore.init(allocator, m.key, true);
+        defer keys.deinit(allocator);
+        var values = try ColumnStore.init(allocator, m.value, true);
+        defer values.deinit(allocator);
+        for (0..count) |i| {
+            const member = json_binary.memberAt(v, i);
+            if (!try appendTextElement(allocator, &keys, m.key, member.key)) try keys.appendNulls(allocator, 1);
+            try appendJsonElement(allocator, &values, m.value, member.val);
+        }
+        var rows: std.ArrayList(u32) = .empty;
+        defer rows.deinit(allocator);
+        return appendMap(allocator, out, m, keys.view(), values.view(), 0, count, &rows);
+    }
+    if (t.structFields()) |fields| {
+        if (tag != .array and tag != .object) return error.JsonShape;
+        const stores = try allocator.alloc(ColumnStore, fields.len);
+        defer allocator.free(stores);
+        var ready: usize = 0;
+        defer for (stores[0..ready]) |*s| s.deinit(allocator);
+        for (stores, fields, 0..) |*s, f, i| {
+            s.* = try ColumnStore.init(allocator, f.type, true);
+            ready += 1;
+            const found = if (tag == .array) json_binary.element(v, i) else json_binary.member(v, f.name);
+            if (found) |x| try appendJsonElement(allocator, s, f.type, x) else try s.appendNulls(allocator, 1);
+        }
+        const views = try allocator.alloc(ColumnView, fields.len);
+        defer allocator.free(views);
+        for (stores, views) |*s, *view| view.* = s.view();
+        return appendStruct(allocator, out, fields, views, 0);
+    }
+    const element = t.arrayElement().?;
+    if (tag != .array) return error.JsonShape;
+    const count = json_binary.arrayLen(v).?;
+    var elements = try ColumnStore.init(allocator, element, true);
+    defer elements.deinit(allocator);
+    for (0..count) |i| try appendJsonElement(allocator, &elements, element, json_binary.element(v, i).?);
+    try appendEncoded(allocator, out, ElemClass.of(element), elements.view(), 0, count);
+}
+
+/// Append the element of `t` the JSON value `v` converts to, as StarRocks'
+/// CAST from JSON converts it: JSON stays as it is (a JSON null too); for
+/// any other type a JSON null is NULL. Text takes a JSON string's
+/// characters and any other value's JSON text; a number or boolean takes a
+/// number, a boolean or text spelling one (`json_binary.castInteger`); a
+/// nested type the value of its shape; any other type the CAST of the
+/// value's text. NULL where nothing converts.
+fn appendJsonElement(allocator: Allocator, out: *ColumnStore, t: Type, v: []const u8) FromJsonError!void {
+    if (t == .json) return appendRaw(allocator, out, v);
+    const tag = json_binary.tagOf(v);
+    if (tag == .null) return out.appendNulls(allocator, 1);
+    const value = json_binary.operand(v);
+    const at = out.rowCount();
+    switch (out.data) {
+        .nested => |*ss| {
+            var cell: std.ArrayList(u8) = .empty;
+            defer cell.deinit(allocator);
+            fromJson(allocator, t, v, &cell) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.JsonShape => return out.appendNulls(allocator, 1),
+            };
+            try ss.appendValue(allocator, cell.items);
+        },
+        .varchar, .string, .char => |*ss| switch (value) {
+            .string => |s| try ss.appendValue(allocator, s),
+            else => {
+                var text: std.ArrayList(u8) = .empty;
+                defer text.deinit(allocator);
+                try json_binary.toText(allocator, &text, v);
+                try ss.appendValue(allocator, text.items);
+            },
+        },
+        .boolean => |*l| try l.append(allocator, json_binary.castBoolean(value) orelse return out.appendNulls(allocator, 1)),
+        .float => |*l| try l.append(allocator, @floatCast(json_binary.castDouble(value) orelse return out.appendNulls(allocator, 1))),
+        .double => |*l| try l.append(allocator, json_binary.castDouble(value) orelse return out.appendNulls(allocator, 1)),
+        inline .tinyint, .smallint, .int, .bigint => |*l| {
+            const T = std.meta.Elem(@TypeOf(l.items));
+            const x = json_binary.castInteger(value) orelse return out.appendNulls(allocator, 1);
+            try l.append(allocator, std.math.cast(T, x) orelse return out.appendNulls(allocator, 1));
+        },
+        else => {
+            if (tag == .array or tag == .object) return out.appendNulls(allocator, 1);
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(allocator);
+            try json_binary.appendUnquoted(allocator, &text, v);
+            if (!try appendTextElement(allocator, out, t, text.items)) try out.appendNulls(allocator, 1);
+            return;
+        },
+    }
+    try out.appendValidBit(allocator, at, true);
+}
 
 /// Append the element `text` reads as; false when it reads as no value of
 /// `t`, which makes the element NULL.

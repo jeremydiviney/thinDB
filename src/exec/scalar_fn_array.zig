@@ -87,6 +87,7 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     if (try resolveNestedConditional(aa, name, arg_types)) |ov| return ov;
     if (arg_types.len == 0) return null;
     if (eql(name, "to_string") and arg_types.len == 1 and arg_types[0].isNested()) return overload(aa, name, arg_types, .string, toStringKernel);
+    if (eql(name, "to_json") and arg_types.len == 1 and arg_types[0].isNested()) return overload(aa, name, arg_types, .json, toJsonKernel);
     if (eql(name, scalar_fn.ARRAY_ORDER_FN)) {
         if (arg_types.len != 2) return null;
         const t = orderedType(arg_types[0], arg_types[1]) orelse return null;
@@ -97,7 +98,6 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     const array = arg_types[0];
     const element = array.arrayElement() orelse return null;
     if (arg_types.len == 1) {
-        if (eql(name, "to_json")) return overload(aa, name, arg_types, .json, toJsonKernel);
         if (eql(name, "array_length") or eql(name, "cardinality")) return overload(aa, name, arg_types, .int, lengthKernel);
         if (eql(name, "array_distinct")) return overload(aa, name, arg_types, array, distinctKernel);
         if (eql(name, "array_sort") and element != .json) return overload(aa, name, arg_types, array, sortKernel);
@@ -203,8 +203,9 @@ fn resolveArrayValue(aa: Allocator, name: []const u8, arg_types: []const Type) !
 }
 
 /// CAST to an array (`scalar_fn.NESTED_CAST_PREFIX`): of another array,
-/// element by element as each element's CAST converts it; of text or JSON,
-/// read as the array it spells (`nested.parseText`).
+/// element by element as each element's CAST converts it; of JSON, the
+/// array it holds (`nested.fromJson`); of text, read as the array it
+/// spells (`nested.parseText`).
 fn resolveCastToArray(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len != 1) return null;
     const target = types.parseTypeText(name[scalar_fn.NESTED_CAST_PREFIX.len..]) catch |err| switch (err) {
@@ -217,6 +218,7 @@ fn resolveCastToArray(aa: Allocator, name: []const u8, arg_types: []const Type) 
         if (!try castable(aa, from_element, target_element)) return null;
         return overload(aa, name, arg_types, target, castArrayKernel);
     }
+    if (from == .json) return overload(aa, name, arg_types, target, jsonNestedKernel);
     if (from.isString()) return overload(aa, name, arg_types, target, parseNestedKernel);
     return null;
 }
@@ -470,28 +472,48 @@ fn castArrayKernel(allocator: Allocator, arg_types: []const Type, out_type: Type
     try nested.encodeColumn(allocator, out, nested.ElemClass.of(target), fa.elements.view, fa.flat.offsets.items, args[0].nulls, rows);
 }
 
-/// Text or JSON read as the nested value it spells; NULL where it spells
-/// none.
+/// Text read as the nested value it spells; NULL where it spells none.
 pub fn parseNestedKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
     const sv = common.stringViewOf(args[0]);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
     var cell: std.ArrayList(u8) = .empty;
     defer cell.deinit(allocator);
     const ss = &out.data.nested;
     for (0..rows) |r| {
         const at = out.rowCount();
         const valid = args[0].isValid(r) and blk: {
-            var raw = sv.rowBytes(r);
-            if (arg_types[0] == .json and json_binary.looksBinary(raw)) {
-                text.clearRetainingCapacity();
-                try json_binary.toText(allocator, &text, raw);
-                raw = text.items;
-            }
             cell.clearRetainingCapacity();
-            nested.parseText(allocator, out_type, raw, &cell) catch |err| switch (err) {
+            nested.parseText(allocator, out_type, sv.rowBytes(r), &cell) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 error.InvalidNestedText => break :blk false,
+            };
+            break :blk true;
+        };
+        try ss.appendValue(allocator, if (valid) cell.items else "");
+        try out.appendValidBit(allocator, at, valid);
+    }
+}
+
+/// JSON read as the nested value it holds (`nested.fromJson`); NULL where
+/// it holds none.
+pub fn jsonNestedKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
+    const sv = common.stringViewOf(args[0]);
+    var cell: std.ArrayList(u8) = .empty;
+    defer cell.deinit(allocator);
+    const ss = &out.data.nested;
+    for (0..rows) |r| {
+        const at = out.rowCount();
+        const valid = args[0].isValid(r) and blk: {
+            const doc = json_binary.normalize(allocator, sv.rowBytes(r)) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.JsonInvalid => break :blk false,
+            };
+            defer if (doc.owned) allocator.free(doc.bytes);
+            cell.clearRetainingCapacity();
+            nested.fromJson(allocator, out_type, doc.bytes, &cell) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.JsonShape => break :blk false,
             };
             break :blk true;
         };
@@ -553,28 +575,26 @@ fn toStringKernel(allocator: Allocator, arg_types: []const Type, out_type: Type,
     }
 }
 
-/// An array as the JSON array its StarRocks text spells; NULL where that
-/// text is no JSON (a NaN element).
+/// An array, map or struct as JSON (`nested.appendJson`); NULL where JSON
+/// can't hold it (a NaN element, a NULL map key).
 fn toJsonKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
     _ = out_type;
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(allocator);
     for (0..rows) |r| {
         if (!args[0].isValid(r)) {
             try out.appendNulls(allocator, 1);
             continue;
         }
-        text.clearRetainingCapacity();
-        try nested.appendText(allocator, &text, arg_types[0], args[0].data.nested.rowBytes(r), .starrocks);
-        const doc = json_binary.encodeFromText(allocator, text.items) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
+        doc.clearRetainingCapacity();
+        nested.appendJson(allocator, &doc, arg_types[0], args[0].data.nested.rowBytes(r)) catch |err| switch (err) {
+            error.NotJson => {
                 try out.appendNulls(allocator, 1);
                 continue;
             },
+            else => |e| return e,
         };
-        defer allocator.free(doc);
-        try appendText(allocator, out, doc);
+        try appendText(allocator, out, doc.items);
     }
 }
 

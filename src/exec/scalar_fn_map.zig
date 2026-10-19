@@ -84,8 +84,9 @@ pub fn resolveMap(aa: Allocator, name: []const u8, arg_types: []const Type) Allo
 }
 
 /// CAST to a map: of another map, its keys and values each as their CAST
-/// converts them, keys that meet merging; of text or JSON, read as the map
-/// it spells (`nested.parseText`).
+/// converts them, keys that meet merging; of JSON, the map its object
+/// holds (`nested.fromJson`); of text, read as the map it spells
+/// (`nested.parseText`).
 fn resolveCastToMap(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len != 1) return null;
     const target = types.parseTypeText(name[scalar_fn.NESTED_CAST_PREFIX.len..]) catch |err| switch (err) {
@@ -98,6 +99,7 @@ fn resolveCastToMap(aa: Allocator, name: []const u8, arg_types: []const Type) !?
         if (!try castable(aa, m.key, to.key) or !try castable(aa, m.value, to.value)) return null;
         return overload(aa, name, arg_types, target, castMapKernel);
     }
+    if (from == .json) return overload(aa, name, arg_types, target, array.jsonNestedKernel);
     if (from.isString()) return overload(aa, name, arg_types, target, array.parseNestedKernel);
     return null;
 }

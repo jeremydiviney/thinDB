@@ -515,15 +515,15 @@ pub fn jsonExistsKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 /// a boolean is 1 or 0, a number drops its fraction, and text must spell an
 /// integer (`common.textInteger`). Anything else, or a value past BIGINT,
 /// is NULL.
-pub const getJsonIntKernel = castPathKernel("bigint", jsonInteger);
+pub const getJsonIntKernel = castPathKernel("bigint", jb.castInteger);
 
 /// GET_JSON_DOUBLE(doc, path) → DOUBLE: a boolean is 1 or 0, and text must
 /// spell a number (`common.textDouble`).
-pub const getJsonDoubleKernel = castPathKernel("double", jsonDouble);
+pub const getJsonDoubleKernel = castPathKernel("double", jb.castDouble);
 
 /// GET_JSON_BOOL(doc, path) → boolean: a number is true unless zero, and text
 /// is true or false as StarRocks casts it (`common.textBoolean`).
-pub const getJsonBoolKernel = castPathKernel("boolean", jsonBoolean);
+pub const getJsonBoolKernel = castPathKernel("boolean", jb.castBoolean);
 
 const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void;
 
@@ -549,42 +549,6 @@ fn castPathKernel(comptime field: []const u8, comptime cast: anytype) Kernel {
             }
         }
     }.kernel;
-}
-
-fn jsonInteger(v: jb.Operand) ?i64 {
-    return switch (v) {
-        .boolean => |b| @intFromBool(b),
-        .number => |n| switch (n) {
-            .exact => |d| std.math.cast(i64, @divTrunc(d.m, std.math.powi(i128, 10, d.s) catch return null)),
-            .double => |x| if (x > -0x1p63 - 1 and x < 0x1p63) @intFromFloat(@trunc(x)) else null,
-        },
-        .string => |s| std.math.cast(i64, common.textInteger(s) orelse return null),
-        .null, .array, .object => null,
-    };
-}
-
-fn jsonDouble(v: jb.Operand) ?f64 {
-    return switch (v) {
-        .boolean => |b| if (b) 1 else 0,
-        .number => |n| switch (n) {
-            .exact => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10, @floatFromInt(d.s)),
-            .double => |x| x,
-        },
-        .string => |s| common.textDouble(s),
-        .null, .array, .object => null,
-    };
-}
-
-fn jsonBoolean(v: jb.Operand) ?u8 {
-    return switch (v) {
-        .boolean => |b| @intFromBool(b),
-        .number => |n| switch (n) {
-            .exact => |d| @intFromBool(d.m != 0),
-            .double => |x| @intFromBool(x != 0),
-        },
-        .string => |s| @intFromBool(common.textBoolean(s) orelse return null),
-        .null, .array, .object => null,
-    };
 }
 
 fn emitNull(allocator: Allocator, ss: anytype, out: *ColumnStore, row: usize) !void {
@@ -931,8 +895,8 @@ test "the get_json casts follow StarRocks' CAST of JSON" {
     inline for (cases) |c| {
         const v = try jb.encodeFromText(aa, c[0]);
         defer aa.free(v);
-        try std.testing.expectEqual(@as(?i64, c[1]), jsonInteger(jb.operand(v)));
-        try std.testing.expectEqual(@as(?f64, c[2]), jsonDouble(jb.operand(v)));
-        try std.testing.expectEqual(@as(?u8, c[3]), jsonBoolean(jb.operand(v)));
+        try std.testing.expectEqual(@as(?i64, c[1]), jb.castInteger(jb.operand(v)));
+        try std.testing.expectEqual(@as(?f64, c[2]), jb.castDouble(jb.operand(v)));
+        try std.testing.expectEqual(@as(?u8, c[3]), jb.castBoolean(jb.operand(v)));
     }
 }

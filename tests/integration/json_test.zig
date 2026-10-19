@@ -324,3 +324,36 @@ test "JSON: JSON_LENGTH with a path and JSON_REMOVE follow MySQL" {
     defer q.deinit();
     try std.testing.expectError(error.JsonPathInvalid, q.next());
 }
+
+test "JSON: CAST to an array, map or struct reads the value the JSON holds, and to_json writes one back" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE docs (id INT, j JSON)");
+    try exec(allocator, db,
+        \\INSERT INTO docs VALUES
+        \\ (1, '[1, 2.7, "3", "x", true]'),
+        \\ (2, '{"1": 1, "2": true, "3": null, "4": [5, 6], "5": {"a": "it''s"}}'),
+        \\ (3, '"abc"'),
+        \\ (4, NULL)
+    );
+    try helpers.expectTexts(allocator, db, "SELECT CAST(j AS ARRAY<INT>) FROM docs ORDER BY id", &.{ "[1,2,3,null,1]", null, null, null });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(j AS ARRAY<STRING>) FROM docs ORDER BY id", &.{ "[\"1\",\"2.7\",\"3\",\"x\",\"true\"]", null, null, null });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(j AS MAP<INT, STRING>) FROM docs ORDER BY id", &.{ null, "{1:\"1\",2:\"true\",3:null,4:\"[5, 6]\",5:\"{\\\"a\\\": \\\"it's\\\"}\"}", null, null });
+    try helpers.expectText(allocator, db, "SELECT CAST(j AS MAP<STRING, JSON>) FROM docs WHERE id = 2", "{\"1\":'1',\"2\":'true',\"3\":'null',\"4\":'[5, 6]',\"5\":'{\"a\": \"it\\'s\"}'}");
+    try helpers.expectText(allocator, db, "SELECT CAST(j AS MAP<STRING, ARRAY<INT>>) FROM docs WHERE id = 2", "{\"1\":null,\"2\":null,\"3\":null,\"4\":[5,6],\"5\":null}");
+    // A JSON array fills a struct's fields in order, an object by name.
+    try helpers.expectTexts(allocator, db, "SELECT CAST(j AS STRUCT<a INT, b DOUBLE>) FROM docs ORDER BY id", &.{ "{\"a\":1,\"b\":2.7}", "{\"a\":null,\"b\":null}", null, null });
+    try helpers.expectText(allocator, db, "SELECT CAST(j->'$.\"5\"' AS STRUCT<a STRING, z INT>) FROM docs WHERE id = 2", "{\"a\":\"it's\",\"z\":null}");
+    try helpers.expectText(allocator, db, "SELECT CAST(parse_json('[[1, {\"k\": [2]}]]') AS ARRAY<STRUCT<x INT, y MAP<STRING, ARRAY<BIGINT>>>>)", "[{\"x\":1,\"y\":{\"k\":[2]}}]");
+
+    try helpers.expectText(allocator, db, "SELECT CAST(to_json(map{1: 'a', 2: NULL}) AS CHAR)", "{\"1\": \"a\", \"2\": null}");
+    try helpers.expectText(allocator, db, "SELECT CAST(CAST(map{'k': [1.5, NULL]} AS JSON) AS CHAR)", "{\"k\": [1.5, null]}");
+    try helpers.expectText(allocator, db, "SELECT CAST(to_json(named_struct('a', 1, 'b', DATE '2024-01-02', 'c', true)) AS CHAR)", "{\"a\": 1, \"b\": \"2024-01-02\", \"c\": true}");
+    try helpers.expectText(allocator, db, "SELECT CAST(to_json([CAST('{\"x\": 1}' AS JSON)]) AS CHAR)", "[{\"x\": 1}]");
+    try helpers.expectText(allocator, db, "SELECT to_json(map{NULL: 1})", null);
+    try helpers.expectText(allocator, db, "SELECT CAST(CAST(to_json(map{'a': [1, 2]}) AS MAP<STRING, ARRAY<INT>>) AS STRING)", "{\"a\":[1,2]}");
+}
