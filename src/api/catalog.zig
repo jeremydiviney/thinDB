@@ -578,6 +578,15 @@ pub const Catalog = struct {
                     try appendSqlTypeName(list, allocator, m.value);
                     try list.append(allocator, '>');
                 },
+                .@"struct" => |fields| {
+                    try list.appendSlice(allocator, "STRUCT<");
+                    for (fields, 0..) |f, i| {
+                        if (i > 0) try list.appendSlice(allocator, ", ");
+                        try list.print(allocator, "`{s}` ", .{f.name});
+                        try appendSqlTypeName(list, allocator, f.type);
+                    }
+                    try list.append(allocator, '>');
+                },
             },
         }
     }

@@ -372,7 +372,7 @@ fn pgDataTypeName(t: types.Type) []const u8 {
         .json => "json",
         .nested => |n| switch (n.*) {
             .array => "ARRAY",
-            .map => "text",
+            .map, .@"struct" => "text",
         },
     };
 }

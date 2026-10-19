@@ -53,11 +53,12 @@ const dec = @import("scalar_fn_decimal.zig");
 const json = @import("scalar_fn_json.zig");
 const array = @import("scalar_fn_array.zig");
 const map = @import("scalar_fn_map.zig");
+const struct_fns = @import("scalar_fn_struct.zig");
 
-/// Whether `name` is an array or map function, which take nested arguments
-/// no declared parameter type names.
+/// Whether `name` is an array, map or struct function, which take nested
+/// arguments no declared parameter type names.
 pub fn isNestedFnName(name: []const u8) bool {
-    return array.isArrayFnName(name) or map.isMapFnName(name);
+    return array.isArrayFnName(name) or map.isMapFnName(name) or struct_fns.isStructFnName(name);
 }
 const inet = @import("scalar_fn_inet.zig");
 const common = @import("scalar_fn_common.zig");
@@ -140,6 +141,7 @@ pub fn resolveWithRegistry(
     const name = if (std.mem.eql(u8, name_in, PG_TEXT_FN)) "to_string" else name_in;
     if (try array.resolveArray(aa, name, arg_types)) |ov| return ov;
     if (try map.resolveMap(aa, name, arg_types)) |ov| return ov;
+    if (try struct_fns.resolveStruct(aa, name, arg_types)) |ov| return ov;
     // Decimal-involving calls resolve to scale-aware typed kernels (the static
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
@@ -809,6 +811,14 @@ pub const ARRAY_VALUE_FN = "array_value";
 /// The function a map literal lowers to: `map{k: v}` and `map(k, v)` are
 /// `map_from_arrays([k], [v])`.
 pub const MAP_FROM_ARRAYS_FN = "map_from_arrays";
+
+/// The functions a struct constructor lowers to: `row(a, b)` is
+/// `struct_value:col1,col2(a, b)`, its field names in the function's name
+/// as type text spells them (`types.appendFieldNameText`).
+pub const STRUCT_VALUE_PREFIX = "struct_value:";
+
+/// The functions field access lowers to: `s.a` is `struct_field:a(s, 'a')`.
+pub const STRUCT_FIELD_PREFIX = "struct_field:";
 
 /// Whether `e` is `[]` and `ty` an array, or `e` is `map{}` or `map()`
 /// and `ty` a map. Those literals have no element types of their own, so

@@ -73,8 +73,9 @@ fn pgTypeOf(t: Type) TypeInfo {
         .nested => |n| switch (n.*) {
             // PostgreSQL gives an array of arrays its element's array type.
             .array => |element| .{ .oid = if (element.arrayElement() != null) pgTypeOf(element).oid else pgArrayOid(pgTypeOf(element).oid), .type_size = -1 },
-            // PostgreSQL has no map type; a map travels as its text.
-            .map => .{ .oid = OID_TEXT, .type_size = -1 },
+            // PostgreSQL has no map type, and a struct has no fixed composite
+            // type; each travels as its text.
+            .map, .@"struct" => .{ .oid = OID_TEXT, .type_size = -1 },
         },
     };
 }

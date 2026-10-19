@@ -502,7 +502,8 @@ test "a schema- or database-qualified column resolves by its table name" {
         };
     }
     try helpers.expectRunError(allocator, db, "SELECT main.t.nope FROM t", error.ColumnNotFound);
-    try helpers.expectRunError(allocator, db, "SELECT a.main.t.id FROM t", error.SqlExpectedIdent);
+    // Four names make a struct field path, which t has none of.
+    try helpers.expectRunError(allocator, db, "SELECT a.main.t.id FROM t", error.ColumnNotFound);
 }
 
 fn setupShadowed(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {

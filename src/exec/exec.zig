@@ -1811,6 +1811,7 @@ test {
     _ = @import("scalar_fn_json.zig");
     _ = @import("scalar_fn_array.zig");
     _ = @import("scalar_fn_map.zig");
+    _ = @import("scalar_fn_struct.zig");
     _ = nested;
     _ = @import("scalar_fn_date.zig");
     _ = @import("time_zone.zig");
