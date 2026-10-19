@@ -83,6 +83,12 @@ process-wide pool that is never freed. That pool is the library's only
 global state, a deliberate exception: shapes are immutable, so every
 `Database` in the process can share them.
 
+`TYPEOF(x)` names x's type as StarRocks does: `varchar` for any text, a
+decimal by the width its precision implies (`decimal32(9, 2)`,
+`decimal128(19, 2)`), and nested types spelled out (`map<int,varchar>`,
+`struct<a int, b date>`). An integer literal is an INT here, where
+StarRocks types it by size, so `TYPEOF(1)` is `int`, not `tinyint`.
+
 Arrays follow StarRocks:
 - `[1, 2]`, `ARRAY[1, 2]` and `ARRAY<INT>[1, 2]` are literals, and `a[i]` counts from 1. An index out of range gives NULL.
 - An empty `[]` takes the array type beside it in a UNION arm or a CAST. Alone it is `ARRAY<BOOLEAN>`.
@@ -139,8 +145,9 @@ exception: StarRocks' `CAST('0000-02-29' AS DATE)` is NULL, because its text
 reader, unlike its calendar, has no February 29 in year 0. thinDB reads it as
 the day it is, so every reader agrees with the one calendar.
 
-`CAST(text AS DATE)`, `CAST(text AS DATETIME)` and `DATE(text)` read text
-the way StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
+`CAST(text AS DATE)`, `CAST(text AS DATETIME)`, `DATE(text)` and
+`TIMESTAMP(text)`, which is `CAST(text AS DATETIME)`, read text the way
+StarRocks' backend casts a column (`scalar_fn_common.textToDate`,
 `textToDatetime`):
 - Space around the text is ignored. Ten characters are read as
   `YYYY?MM?DD`, where each `?` is any one character but a digit
@@ -1843,6 +1850,8 @@ Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagate
 `InvalidTemporalLiteral` means a DATE or DATETIME was compared with a string constant that doesn't read as a date or datetime (§3.1), as in `d = ''`, `d = 'abc'` or `d < '2026-09-31'`. The statement fails when it is planned, before it returns or changes any rows. The constant comes from the statement itself: written in its text, the value of a constant expression or a scalar subquery, or a user variable it reads. The rule is the same for every comparison form: `=`, `<>`, `<`, `<=>`, BETWEEN, IN, CASE, HAVING, a JOIN's ON and NULLIF. A NULL, a text column, a CAST, and rows an IN subquery returns never raise it. Neither does a bound parameter (MySQL's COM_STMT_EXECUTE, a PostgreSQL Bind) or a value an embedded caller passes in a predicate or an expression: the comparison matches no row, as MySQL's binary protocol returns no rows with a warning. Text equal to one of the statement's bound parameters counts as bound wherever it appears. DML staged in an XA branch replays from its encoded plan, which doesn't record where a value came from, so a bad constant there matches nothing instead of failing XA COMMIT. The MySQL wire reports the error as 1525 (`HY000`) with MySQL's message, `Incorrect DATE value: 'abc'`. The PostgreSQL wire reports it as `22007` with the same message. MySQL raises 1525 for the same constants in the text protocol, with two exceptions that only warn and skip the value: BETWEEN and an IN list of two or more values. thinDB fails those too. MySQL's UPDATE and DELETE raise 1292 (`Incorrect date value`) where thinDB raises 1525.
 
 Scalar functions reject bad arguments with their own errors, which reach a client under their names: `JsonInvalid` (malformed JSON text or JSONB bytes), `JsonNullMemberName` (a NULL key in `JSON_OBJECT` / `JSON_OBJECTAGG`), `IncorrectArgumentsToSleep` (a NULL or negative `SLEEP`), `RegexInvalidPattern`, `RegexInvalidMatchType` (a `match_type` letter outside `c i m n u`), `RegexInvalidReturnOption` (a `REGEXP_INSTR` return option other than 0 or 1) and `RegexIndexOutOfBounds` (a `REGEXP_*` position below 1 or past the end of the subject). MySQL raises the same conditions as errors. The MySQL wire reports `IncorrectArgumentsToSleep` as 1210 (`HY000`), as MySQL does; the others take the unrecognized-error code below.
+
+`AssertTrueFailed` means `ASSERT_TRUE(cond)` met a row where `cond` is false or NULL. StarRocks fails the query there too.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 

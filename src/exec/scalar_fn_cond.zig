@@ -327,3 +327,14 @@ pub fn nullifStringKernel(allocator: Allocator, args: []const ColumnView, out: *
         try out.appendValidBit(allocator, base + i, a_valid and !matches);
     }
 }
+
+/// ASSERT_TRUE(cond): true where `cond` is, and an error on the first row
+/// where it is false or NULL, as in StarRocks.
+pub fn assertTrueKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        if (!args[0].isValid(i) or args[0].data.boolean[i] == 0) return error.AssertTrueFailed;
+        try out.data.boolean.append(allocator, 1);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}

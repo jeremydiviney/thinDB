@@ -877,6 +877,62 @@ pub const charsetKernel = typeNamedKernel("utf8mb4", "utf8mb4", "binary");
 /// does (`@@collation_connection`), JSON as utf8mb4_bin.
 pub const collationKernel = typeNamedKernel("utf8mb4_general_ci", "utf8mb4_bin", "binary");
 
+/// TYPEOF(x): the name StarRocks gives the argument's type. Like CHARSET it
+/// depends on the type alone, so the result is never NULL.
+pub fn typeofKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = out_type;
+    _ = args;
+    var name: std.ArrayList(u8) = .empty;
+    defer name.deinit(allocator);
+    try appendStarRocksTypeName(allocator, &name, arg_types[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    for (0..row_count) |row| {
+        try ss.appendValue(allocator, name.items);
+        try out.appendValidBit(allocator, base + row, true);
+    }
+}
+
+/// StarRocks names a decimal by its backing width, which follows from the
+/// precision alone, so DECIMAL(19, 2) is a decimal128 though this engine
+/// backs it as one too and DECIMAL(9, 2) a decimal32 though this engine
+/// backs it with 64 bits.
+fn appendStarRocksTypeName(allocator: Allocator, out: *std.ArrayList(u8), t: Type) Allocator.Error!void {
+    switch (t) {
+        .varchar, .string => try out.appendSlice(allocator, "varchar"),
+        .char => try out.appendSlice(allocator, "char"),
+        .decimal64, .decimal128 => |spec| {
+            const width: u8 = if (spec.p <= 9) 32 else if (spec.p <= 18) 64 else 128;
+            try out.print(allocator, "decimal{d}({d}, {d})", .{ width, spec.p, spec.s });
+        },
+        .nested => |n| switch (n.*) {
+            .array => |element| {
+                try out.appendSlice(allocator, "array<");
+                try appendStarRocksTypeName(allocator, out, element);
+                try out.append(allocator, '>');
+            },
+            .map => |m| {
+                try out.appendSlice(allocator, "map<");
+                try appendStarRocksTypeName(allocator, out, m.key);
+                try out.append(allocator, ',');
+                try appendStarRocksTypeName(allocator, out, m.value);
+                try out.append(allocator, '>');
+            },
+            .@"struct" => |fields| {
+                try out.appendSlice(allocator, "struct<");
+                for (fields, 0..) |f, i| {
+                    if (i > 0) try out.appendSlice(allocator, ", ");
+                    try out.appendSlice(allocator, f.name);
+                    try out.append(allocator, ' ');
+                    try appendStarRocksTypeName(allocator, out, f.type);
+                }
+                try out.append(allocator, '>');
+            },
+        },
+        else => try out.appendSlice(allocator, @tagName(t)),
+    }
+}
+
 fn typeNamedKernel(comptime text: []const u8, comptime json: []const u8, comptime other: []const u8) common.TypedKernelFn {
     return struct {
         fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
