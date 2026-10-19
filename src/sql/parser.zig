@@ -3498,7 +3498,7 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     value_col = try self.arena.dupe(u8, c);
                 },
-                else => value_expr = args[0],
+                else => value_expr = if (func == .max_by) args[0] else numericNullArg(args[0]),
             }
             var key_col: ?[]const u8 = null;
             var key_expr: ?ir.Expr = null;
@@ -3507,7 +3507,7 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     key_col = try self.arena.dupe(u8, c);
                 },
-                else => key_expr = args[1],
+                else => key_expr = if (func == .max_by) args[1] else numericNullArg(args[1]),
             }
             const default_name = if (func == .max_by)
                 try self.arena.dupe(u8, "max_by(expr)")
@@ -3574,6 +3574,8 @@ pub const Parser = struct {
             // its bytes elsewhere (`MAX(0x41)` is 'A'), as in MySQL.
             else => |e| arg_expr = if (exec_expr.hexLiteralBytes(e)) |bytes|
                 if (exec_aggregate.takesNumbers(func)) .{ .lit = exec_expr.hexLiteralNumber(bytes) } else e
+            else if (exec_aggregate.takesNumbers(func))
+                numericNullArg(e)
             else
                 e,
         }
@@ -3598,6 +3600,12 @@ pub const Parser = struct {
             .arg_expr = arg_expr,
             .params = params,
         } };
+    }
+
+    /// A bare NULL where an aggregate takes only numbers is a numeric NULL,
+    /// so `SUM(NULL)` is NULL, as in MySQL and StarRocks, not a text input.
+    fn numericNullArg(e: ir.Expr) ir.Expr {
+        return if (e == .null_lit and e.null_lit == .string) .{ .null_lit = .bigint } else e;
     }
 
     /// GROUP_CONCAT from its canonical `(value, separator [, order key])`

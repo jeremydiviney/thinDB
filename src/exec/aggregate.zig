@@ -3491,6 +3491,15 @@ pub fn takesNumbers(func: AggFunc) bool {
     };
 }
 
+/// COUNT_IF, BOOL_AND or BOOL_OR over a non-boolean input, which each read
+/// as its truth, `CAST(x AS BOOLEAN)`, as WHERE reads a condition.
+pub fn readsInputTruth(func: AggFunc, in: Type) bool {
+    return in != .boolean and switch (func) {
+        .count_if, .bool_and, .bool_or => true,
+        else => false,
+    };
+}
+
 /// An aggregate that takes only numbers, over a DATE or DATETIME input. MySQL
 /// reads the input as the number it spells there (`SUM(d)` sums YYYYMMDD);
 /// thinDB rejects it in the other dialects.

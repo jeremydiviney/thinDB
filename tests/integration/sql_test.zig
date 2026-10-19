@@ -4314,6 +4314,41 @@ test "sql: count_if under a GROUP BY" {
     try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v1 ORDER BY v1", &.{ "3", "1" });
     try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v4 ORDER BY v4", &.{ "0", "1", "0", "2", "1" });
     try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v1, v2 ORDER BY v1, v2", &.{ "0", "1", "2", "0", "1" });
+
+    // A non-boolean input counts where its truth holds, as WHERE reads it.
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v4) FROM ci GROUP BY v1 ORDER BY v1", &.{ "4", "2" });
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v4 + 1) FROM ci", &.{"6"});
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v4 - 1) FROM ci", &.{"4"});
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v2) FROM ci", &.{"0"});
+    try helpers.expectTexts(allocator, db, "SELECT count_if(NULL) FROM ci", &.{"0"});
+    try helpers.expectTexts(allocator, db, "SELECT count_if('') FROM ci", &.{"0"});
+    try helpers.expectTexts(allocator, db, "SELECT count_if(0.5) FROM ci", &.{"8"});
+    try helpers.expectTexts(allocator, db, "SELECT bool_and(v4) FROM ci", &.{"1"});
+    try helpers.expectTexts(allocator, db, "SELECT bool_and(v4 - 1) FROM ci", &.{"0"});
+    try helpers.expectTexts(allocator, db, "SELECT bool_or(v4 - 1) FROM ci GROUP BY v1 ORDER BY v1", &.{ "1", "1" });
+}
+
+test "sql: a bare NULL is a numeric NULL to the aggregates that take numbers" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE n (id BIGINT PRIMARY KEY, v INT)");
+    try helpers.exec(allocator, db, "INSERT INTO n VALUES (1, 4), (2, 6)");
+    inline for (.{
+        "SELECT SUM(NULL)",
+        "SELECT AVG(NULL)",
+        "SELECT VAR_SAMP(NULL)",
+        "SELECT STDDEV(NULL)",
+        "SELECT BIT_AND(NULL)",
+        "SELECT COVAR_SAMP(NULL, NULL)",
+        "SELECT CORR(NULL, v) FROM n",
+        "SELECT SUM(NULL) FROM n",
+        "SELECT AVG(DISTINCT NULL) FROM n",
+    }) |sql| try helpers.expectTexts(allocator, db, sql, &.{null});
+    try helpers.expectTexts(allocator, db, "SELECT COUNT(NULL) FROM n", &.{"0"});
 }
 
 test "sql: slash is true division; DIV is integer division" {
