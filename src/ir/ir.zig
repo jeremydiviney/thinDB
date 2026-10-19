@@ -549,6 +549,7 @@ pub const WindowFunc = enum(u8) {
     covar_pop = 20,
     covar_samp = 21,
     corr = 22,
+    session_number = 23,
 };
 
 /// Lookup table: window-function name → enum, or null when the name
@@ -572,6 +573,7 @@ pub fn windowFuncForName(name: []const u8) ?WindowFunc {
         .{ .name = "ntile", .func = .ntile },
         .{ .name = "cume_dist", .func = .cume_dist },
         .{ .name = "percent_rank", .func = .percent_rank },
+        .{ .name = "session_number", .func = .session_number },
     };
     for (table) |e| {
         if (std.ascii.eqlIgnoreCase(name, e.name)) return e.func;
@@ -604,6 +606,7 @@ pub fn windowFuncName(f: WindowFunc) []const u8 {
         .covar_pop => "covar_pop",
         .covar_samp => "covar_samp",
         .corr => "corr",
+        .session_number => "session_number",
     };
 }
 
@@ -2899,7 +2902,7 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         cursor.* += 4;
         const func_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (func_byte > @intFromEnum(WindowFunc.corr)) return Error.IrCorrupt;
+        if (func_byte > @intFromEnum(WindowFunc.session_number)) return Error.IrCorrupt;
         const func: WindowFunc = @enumFromInt(func_byte);
         const ignore_nulls = bytes[cursor.*] != 0;
         cursor.* += 1;

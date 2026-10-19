@@ -206,6 +206,9 @@ pub const Window = struct {
         nth_offset: i64 = 1,
         /// COVAR_POP/COVAR_SAMP/CORR's second argument column.
         second_col: usize = std.math.maxInt(usize),
+        /// `SESSION_NUMBER(x, delta)`'s delta, null when x or delta is a
+        /// NULL literal, which makes every row NULL.
+        session_delta: ?i64 = null,
     };
 
     const DefaultKind = enum { none, literal, col_ref };
@@ -1812,6 +1815,7 @@ pub const Window = struct {
             .ntile => try fillNtile(plan, perm, p_start, p_end, cell.column),
             .percent_rank => try fillPercentRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
+            .session_number => try fillSessionNumber(plan, self.accumulated, perm, p_start, p_end, cell.column),
             .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
         }
     }
@@ -2419,6 +2423,13 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
             if (plan.ntile_buckets < 1) return Error.WindowUnsupported;
         },
         .cume_dist, .percent_rank => {},
+        .session_number => {
+            if (c.args[0] != .null_lit and c.args[1] != .null_lit) {
+                plan.value_col = try exprColIdx(c.args[0], schema);
+                if (!schema[plan.value_col].type.isInteger()) return Error.AggregateUnsupportedType;
+                plan.session_delta = try exprIntLiteral(c.args[1]);
+            }
+        },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => {
             plan.value_col = try statisticColIdx(c.args[0], schema);
             if (c.args.len == 2) plan.second_col = try statisticColIdx(c.args[1], schema);
@@ -2462,7 +2473,7 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
             }
         },
         .avg, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => Type{ .double = {} },
-        .ntile => .bigint,
+        .ntile, .session_number => .bigint,
         .percent_rank, .cume_dist => Type{ .double = {} },
         // String input is supported here — the operator writes into a
         // separate `string_outputs` scratch (see Window.string_outputs).
@@ -2480,6 +2491,7 @@ fn outputNullable(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Colum
         },
         .sum, .avg, .min, .max, .first_value, .last_value, .nth_value => true,
         .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => true,
+        .session_number => plan.session_delta == null,
     };
 }
 
@@ -2916,6 +2928,39 @@ fn nthNonNullInRange(view: ColumnView, perm: []const u32, lo: usize, hi: usize, 
         }
     }
     return null;
+}
+
+/// SESSION_NUMBER(x, delta) numbers the sessions of an ordered partition
+/// from 1: a row starts the next session when its x exceeds the last
+/// non-NULL x before it by more than delta. A NULL x stays in the session.
+fn fillSessionNumber(
+    plan: Window.CallPlan,
+    cols: []const ColumnStore,
+    perm: []const u32,
+    p_start: usize,
+    p_end: usize,
+    out: *ColumnStore,
+) !void {
+    const delta = plan.session_delta orelse {
+        for (perm[p_start..p_end]) |r| setNull(out, r);
+        return;
+    };
+    const view = cols[plan.value_col].view();
+    var session: i64 = 1;
+    var last: ?i128 = null;
+    for (perm[p_start..p_end]) |r| {
+        if (isValid(view, r)) {
+            const x: i128 = switch (view.data) {
+                inline .tinyint, .smallint, .int, .bigint, .largeint => |values| values[r],
+                else => return Error.WindowUnsupported,
+            };
+            if (last) |l| {
+                if (@as(i256, x) - l > delta) session += 1;
+            }
+            last = x;
+        }
+        try writeBigint(out, r, session);
+    }
 }
 
 /// NTILE(n) — distribute the ordered partition into `n` buckets that

@@ -1343,6 +1343,12 @@ does, so over a whole partition it gives that partition's GROUP BY value, and
 a frame with too few non-NULL values, or pairs for the two-argument ones,
 gives NULL.
 
+StarRocks' `SESSION_NUMBER(x, delta)` numbers the sessions of each ordered
+partition from 1, ignoring the frame: a row starts the next session when its
+integer x exceeds the last non-NULL x before it by more than delta, a constant
+integer. A NULL x stays in the session, and a NULL argument makes every row
+NULL.
+
 Entry expressions may replace SQL-visible input names while retaining their
 original inputs under distinct physical slots. Projection expansion uses the
 same rules as ordinary SQL. Cached runs reconstruct the same entry recipe
