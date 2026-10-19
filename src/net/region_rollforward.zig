@@ -1359,6 +1359,11 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
                         hu(h, 4);
                         hu(h, k);
                     },
+                    .mann_whitney => |m| {
+                        hu(h, 5);
+                        hu(h, @intFromEnum(m.alternative));
+                        hu(h, @intFromBool(m.continuity_correction));
+                    },
                 }
             }
             try hashOp(h, g.upstream, entry);

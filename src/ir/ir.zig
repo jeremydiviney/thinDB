@@ -110,6 +110,7 @@ fn sameAggParams(a: AggParams, b: AggParams) bool {
         .percentile => |fraction| fraction == b.percentile,
         .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
         .top_k => |k| k == b.top_k,
+        .mann_whitney => |m| std.meta.eql(m, b.mann_whitney),
     };
 }
 
@@ -2013,6 +2014,11 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
                 try out.append(allocator, 4);
                 try appendU32(allocator, out, k);
             },
+            .mann_whitney => |m| {
+                try out.append(allocator, 5);
+                try out.append(allocator, @intFromEnum(m.alternative));
+                try out.append(allocator, @intFromBool(m.continuity_correction));
+            },
         }
     }
     try encodeOp(allocator, out, g.upstream.*);
@@ -2570,7 +2576,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 const as = try readString(bytes, cursor);
                 // AggParams tag: 0=none, 1=percentile (f64 payload),
                 // 2=concat separator (string payload), 3=the same, DISTINCT,
-                // 4=top_k (u32 payload).
+                // 4=top_k (u32 payload), 5=mann_whitney (alternative and
+                // continuity-correction bytes).
                 // Older encoders omit it; we treat absence as .none for
                 // back-compat with pre-params IR.
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
@@ -2590,6 +2597,13 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                         const k = readU32(bytes[cursor.* .. cursor.* + 4]);
                         cursor.* += 4;
                         break :blk2 .{ .top_k = k };
+                    },
+                    5 => blk2: {
+                        if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+                        const alternative = std.enums.fromInt(exec_aggregate.MannWhitneyParams.Alternative, bytes[cursor.*]) orelse return Error.IrCorrupt;
+                        const correction = bytes[cursor.* + 1] != 0;
+                        cursor.* += 2;
+                        break :blk2 .{ .mann_whitney = .{ .alternative = alternative, .continuity_correction = correction } };
                     },
                     else => return Error.IrCorrupt,
                 };

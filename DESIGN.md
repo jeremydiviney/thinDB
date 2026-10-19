@@ -578,6 +578,26 @@ order rows arrive in. k and the counter count are integer literals of at
 least 1, else `SqlInvalidProjection`. Exact counts keep one entry per
 distinct value in each group, as `COUNT(DISTINCT)` does.
 
+`MANN_WHITNEY_U_TEST(x, index[, alternative[, continuity_correction]])` is
+StarRocks' Mann–Whitney U test of the x values whose index is false against
+those whose index is true. x is numeric and the index boolean or an integer,
+nonzero being true, else `AggregateUnsupportedType`. A row where either is
+NULL is skipped, and so is a NaN, which has no rank. `alternative` is a
+literal 'two-sided' (the default), 'less' or 'greater', in any case, 'less'
+holding that the false-index values run below the true-index ones;
+`continuity_correction` is an integer literal, nonzero (the default) to
+move U half a unit toward its mean. Either otherwise is
+`SqlInvalidProjection`. The answer is the JSON `[U, p]`. U is the
+false-index sample's statistic: how many pairs of a false-index and a
+true-index value have the first greater, a tie counting half. p comes from
+the normal approximation with ties corrected for. `util/stats.zig` takes
+erfc in 128-bit precision and rounds it as double-precision erfc is
+composed, so p is StarRocks' to the last digit. Where every value is the
+same the answer is StarRocks' `{"Error": "All numbers in both samples are
+identical."}`, and where only one sample has values it is
+`{"Error": "Both samples must have numbers."}`, in thinDB's words. No rows
+give NULL. Each group keeps its values, as `PERCENTILE_CONT` does.
+
 `COUNT_IF(x)`, `BOOL_AND(x)` and `BOOL_OR(x)` read a non-boolean x as its
 truth, `CAST(x AS BOOLEAN)`, as WHERE reads a condition. So `COUNT_IF(n)`
 counts the rows where n is non-zero, and text counts where it reads as true
