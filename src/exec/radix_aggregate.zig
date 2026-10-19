@@ -86,6 +86,9 @@ pub const CompactAgg = struct {
     /// Original aggregate function — disambiguates the four Welford finalizes
     /// (var/stddev × pop/samp). Unused for the other kinds.
     func: AggFunc,
+    /// 10^scale of a DECIMAL input (`agg.avgScaleDiv`), 1 otherwise: AVG and
+    /// the Welford kinds fold raw mantissas and divide it out at finalize.
+    scale_div: f64 = 1.0,
 };
 
 /// The compact per-group state layout for a set of aggregates. `words` is the
@@ -152,7 +155,7 @@ pub fn planCompact(
             allocator.free(out);
             return null;
         };
-        dst.* = .{ .kind = kind, .off = w, .col_idx = idx, .func = a.func };
+        dst.* = .{ .kind = kind, .off = w, .col_idx = idx, .func = a.func, .scale_div = agg.avgScaleDiv(if (idx) |i| up_schema[i].type else null) };
         w += kind.words();
     }
     return .{ .aggs = out, .words = w };
@@ -429,27 +432,11 @@ pub fn finalize(layout: CompactLayout, state: []const u64, g: usize, ai: usize) 
         .avg => blk: {
             const sum: f64 = @bitCast(state[slot]);
             const cnt = state[slot + 1];
-            break :blk .{ .float = if (cnt == 0) null else sum / @as(f64, @floatFromInt(cnt)) };
+            break :blk .{ .float = if (cnt == 0) null else sum / @as(f64, @floatFromInt(cnt)) / ca.scale_div };
         },
         .min_int, .max_int => .{ .signed = if (state[slot + 1] == 0) null else @as(i64, @bitCast(state[slot])) },
         .min_float, .max_float => .{ .float = if (state[slot + 1] == 0) null else @as(f64, @bitCast(state[slot])) },
-        .welford => blk: {
-            const m2: f64 = @bitCast(state[slot + 1]);
-            const cnt = state[slot + 2];
-            // Sample variants need ≥2 inputs (n−1 divisor); zero inputs → NULL.
-            const defined = switch (ca.func) {
-                .var_pop, .stddev_pop => cnt >= 1,
-                else => cnt >= 2,
-            };
-            if (!defined) break :blk .{ .float = null };
-            const variance: f64 = switch (ca.func) {
-                .var_pop, .stddev_pop => m2 / @as(f64, @floatFromInt(cnt)),
-                .var_samp, .stddev_samp => m2 / @as(f64, @floatFromInt(cnt - 1)),
-                else => unreachable,
-            };
-            const out: f64 = if (ca.func == .stddev_pop or ca.func == .stddev_samp) @sqrt(variance) else variance;
-            break :blk .{ .float = out };
-        },
+        .welford => .{ .float = agg.welfordResult(ca.func, state[slot + 2], @bitCast(state[slot + 1]), ca.scale_div) },
     };
 }
 
@@ -2522,6 +2509,34 @@ test "compact core: MIN / MAX (int) + STDDEV_POP over grouped batches" {
     try std.testing.expectEqual(@as(i64, 30), finalize(layout, state, 0, 1).signed.?);
     const expected_sd = @sqrt((25.0 + 225.0 + 100.0) / 3.0);
     try std.testing.expectApproxEqAbs(expected_sd, finalize(layout, state, 0, 2).float.?, 1e-9);
+}
+
+test "compact core: AVG and VAR_POP over a DECIMAL read its scale (issue #711)" {
+    const ta = std.testing.allocator;
+    const aggs = [_]AggSpec{
+        .{ .func = .avg, .col = "v", .as = "a" },
+        .{ .func = .var_pop, .col = "v", .as = "vp" },
+    };
+    const schema = [_]types.Column{.{ .name = "v", .type = .{ .decimal64 = .{ .p = 10, .s = 2 } } }};
+    const agg_col_idx = [_]?usize{ 0, 0 };
+
+    const layout = (try planCompact(ta, &aggs, &agg_col_idx, &schema)).?;
+    defer layout.deinit(ta);
+    const state = try ta.alloc(u64, layout.words);
+    defer ta.free(state);
+    @memset(state, 0);
+
+    const vvals = [_]i64{ 150, 325, 75 }; // 1.50, 3.25, 0.75
+    const gids = [_]u32{ 0, 0, 0 };
+    const batch = Batch{
+        .schema = &schema,
+        .values = &.{.{ .data = .{ .decimal64 = &vvals } }},
+        .row_count = 3,
+    };
+    scatter(layout, state, &gids, batch);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5 / 3.0), finalize(layout, state, 0, 0).float.?, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 79.0 / 72.0), finalize(layout, state, 0, 1).float.?, 1e-12);
 }
 
 test "planCompact declines variable-state and string/large MIN/MAX" {

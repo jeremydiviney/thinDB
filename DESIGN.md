@@ -523,6 +523,9 @@ distinct values and have the same types as `SUM(x)` and `AVG(x)`.
 `STDDEV` and `VARIANCE` are the sample ones. The parser picks the function
 once (`AggNames`), so every aggregate path computes the same one. A
 population statistic over one value is 0; a sample one is NULL below two.
+Over a DECIMAL, every lane folds the raw mantissas, as AVG does, and
+`aggregate.welfordResult` divides the variance by 10^(2·scale) where they
+all finish.
 
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
 and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry

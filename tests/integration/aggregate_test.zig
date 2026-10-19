@@ -161,6 +161,26 @@ test "aggregate: percentile_cont — median + p25 + p75 of 1..10" {
     try std.testing.expectApproxEqAbs(@as(f64, 7.75), b.values[2].data.double[0], 1e-9);
 }
 
+test "aggregate: VAR and STDDEV over a DECIMAL read its scale, grouped or not (issue #711)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE vd (id BIGINT PRIMARY KEY, g BIGINT, d DECIMAL(10,2), w DECIMAL(38,2))");
+    try helpers.exec(allocator, db, "INSERT INTO vd VALUES (1, 1, 1.50, 1.50), (2, 0, 2.50, 2.50), (3, 1, 3.25, 3.25), (4, 0, NULL, NULL), (5, 1, 0.75, 0.75)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("vd", .{})).flush();
+        // 1.50, 3.25 and 0.75: mean 11/6, squared deviations 79/24.
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(VAR_POP(d), 9) FROM vd WHERE g = 1", &.{"1.097222222"});
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(VAR_SAMP(d), 9) FROM vd GROUP BY g ORDER BY g", &.{ null, "1.645833333" });
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(STDDEV_POP(d), 9) FROM vd GROUP BY g ORDER BY g", &.{ "0", "1.047483757" });
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(STDDEV_SAMP(w), 9) FROM vd GROUP BY g ORDER BY g", &.{ null, "1.28290036" });
+        try helpers.expectTexts(allocator, db, "SELECT ROUND(VAR_POP(d), 9) FROM vd GROUP BY g ORDER BY 1 DESC LIMIT 1", &.{"1.097222222"});
+    }
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
