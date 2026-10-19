@@ -1931,12 +1931,12 @@ const UrlParts = struct {
     /// What follows the `?`, short of any `#` fragment.
     query: ?[]const u8,
 
+    /// A URL, or a relative reference such as `/doc?k=1` (RFC 3986 §4.1).
+    /// Empty text is neither.
     fn parse(url: []const u8) ?UrlParts {
+        if (url.len == 0) return null;
         for (url) |c| if (c <= ' ' or c == 0x7f) return null;
-        const colon = std.mem.indexOfScalar(u8, url, ':') orelse return null;
-        if (colon == 0 or !std.ascii.isAlphabetic(url[0])) return null;
-        for (url[1..colon]) |c| if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return null;
-        const rest = url[colon + 1 ..];
+        const rest = url[afterScheme(url) orelse return null ..];
         const before_fragment = rest[0 .. std.mem.indexOfScalar(u8, rest, '#') orelse rest.len];
         const query_at = std.mem.indexOfScalar(u8, before_fragment, '?');
         const before_query = before_fragment[0 .. query_at orelse before_fragment.len];
@@ -1944,6 +1944,17 @@ const UrlParts = struct {
             .host = if (std.mem.startsWith(u8, before_query, "//")) hostOf(before_query[2..]) else null,
             .query = if (query_at) |q| before_fragment[q + 1 ..] else null,
         };
+    }
+
+    /// Where `url` goes on past its `scheme:`, 0 for a relative reference,
+    /// whose first segment holds no ':'. Null when what stands before the
+    /// first ':' is no scheme.
+    fn afterScheme(url: []const u8) ?usize {
+        const colon = std.mem.indexOfAny(u8, url, ":/?#") orelse return 0;
+        if (url[colon] != ':') return 0;
+        if (colon == 0 or !std.ascii.isAlphabetic(url[0])) return null;
+        for (url[1..colon]) |c| if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return null;
+        return colon + 1;
     }
 
     fn hostOf(after_slashes: []const u8) []const u8 {

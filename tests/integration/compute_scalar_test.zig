@@ -976,12 +976,13 @@ test "URL functions read a URL's host and query parameters, and encode text as a
     try helpers.exec(allocator, db,
         \\INSERT INTO u VALUES (1, 'https://a.com/doc?k1=10&k2=3&k1=100', 'k1'), (2, 'https://u:p@b.org:8030/?x&k2=%41+b#k2=no', 'k2'),
         \\  (3, 'https://c.net/doc?k1=10', 'k3'), (4, 'https://d.io/doc?k 1=2', 'k 1'), (5, 'mailto:me?x=1', 'x'), (6, '', 'k1'),
-        \\  (7, NULL, 'k1'), (8, 'https://e.com/?k1', 'k1'), (9, 'http://[::1]:80/', NULL)
+        \\  (7, NULL, 'k1'), (8, 'https://e.com/?k1', 'k1'), (9, 'http://[::1]:80/', NULL), (10, '/123?k=1&v=2', 'v'),
+        \\  (11, '//f.com/a?v=3', 'v'), (12, 'a/b:c?v=4', 'v'), (13, '1a:b?v=5', 'v')
     );
     for (0..2) |pass| {
         if (pass == 1) try (try db.openTable("u", .{})).flush();
-        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_HOST(url) FROM u ORDER BY id", &.{ "a.com", "b.org", "c.net", null, null, null, null, "e.com", "[::1]" });
-        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_PARAMETER(url, k) FROM u ORDER BY id", &.{ "10", "A b", null, null, "1", null, null, "", null });
+        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_HOST(url) FROM u ORDER BY id", &.{ "a.com", "b.org", "c.net", null, null, null, null, "e.com", "[::1]", null, "f.com", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT URL_EXTRACT_PARAMETER(url, k) FROM u ORDER BY id", &.{ "10", "A b", null, null, "1", null, null, "", null, "2", "3", "4", null });
         try helpers.expectTexts(allocator, db, "SELECT URL_DECODE(URL_ENCODE(url)) = url FROM u WHERE id <= 6 ORDER BY id", &.{ "1", "1", "1", "1", "1", "1" });
     }
     try helpers.expectText(allocator, db, "SELECT URL_ENCODE('a b/c~é*-._')", "a+b%2Fc%7E%C3%A9*-._");
