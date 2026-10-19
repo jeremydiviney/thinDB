@@ -1116,6 +1116,21 @@ pub const Parser = struct {
         };
     }
 
+    /// `windowFuncForName`, for a call whose arguments start with DISTINCT
+    /// when `distinct`.
+    pub fn windowFuncForCall(self: *const Parser, name: []const u8, distinct: bool) ?ir.WindowFunc {
+        const func = self.windowFuncForName(name) orelse return null;
+        if (!distinct) return func;
+        return switch (func) {
+            .count => .count_distinct,
+            .sum => .sum_distinct,
+            .avg => .avg_distinct,
+            // The least and greatest distinct values are the least and greatest values.
+            .min, .max => func,
+            else => null,
+        };
+    }
+
     pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
         if (aggForName(name, self.lex.dialect)) |func| return func;
         if (self.udf_registry) |registry| {
@@ -2441,7 +2456,7 @@ pub const Parser = struct {
                 if (filter != null) return ParseError.SqlInvalidProjection;
                 try self.advance();
                 const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                const wfunc = self.windowFuncForName(first) orelse
+                const wfunc = self.windowFuncForCall(first, saw_distinct) orelse
                     return ParseError.SqlInvalidProjection;
                 parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch
                     return ParseError.SqlInvalidProjection;
@@ -4311,10 +4326,10 @@ pub const Parser = struct {
                     const filter = try self.parseAggFilter();
                     const ignore_nulls = try parse_window.parseIgnoreNulls(self);
                     if (self.cur.tag == .kw_over) {
-                        if (saw_distinct or filter != null) return ParseError.SqlInvalidProjection;
+                        if (filter != null) return ParseError.SqlInvalidProjection;
                         try self.advance();
                         const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                        const wfunc = self.windowFuncForName(name) orelse
+                        const wfunc = self.windowFuncForCall(name, saw_distinct) orelse
                             return ParseError.SqlInvalidProjection;
                         parse_window.validateWindowCall(wfunc, nested_args, ignore_nulls) catch
                             return ParseError.SqlInvalidProjection;
@@ -9209,7 +9224,7 @@ fn normalizeWindowCallArgs(
 
 fn windowArgNeedsPrecompute(func: ir.WindowFunc, arg_idx: usize, arg: ir.Expr) bool {
     return switch (func) {
-        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => switch (arg) {
+        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct => switch (arg) {
             .col_ref => false,
             else => true,
         },

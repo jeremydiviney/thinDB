@@ -1050,3 +1050,46 @@ test "window: SESSION_NUMBER starts a session where x jumps by more than delta" 
     try std.testing.expectError(error.WindowUnsupported, helpers.exec(allocator, db, "SELECT SESSION_NUMBER(ts, g) OVER (ORDER BY k) FROM sn"));
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT SESSION_NUMBER(ts) OVER (ORDER BY k) FROM sn"));
 }
+
+test "window: COUNT, SUM and AVG of DISTINCT values over every frame shape" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE dw (k BIGINT PRIMARY KEY, g BIGINT, v INT, d DECIMAL(6,2), f DOUBLE, s VARCHAR(5))");
+    try helpers.exec(allocator, db, "INSERT INTO dw VALUES (1, 1, 5, 1.50, 0.0, 'a'), (2, 1, 5, 1.50, -0.0, 'a'), (3, 1, 7, 2.25, NULL, 'b'), (4, 2, 1, NULL, 2.5, NULL), (5, 2, 1, 3.00, 2.5, 'c'), (6, 2, NULL, 3.00, 1.0, 'c'), (7, 2, 4, 1.00, 1.0, 'd')");
+    const expectTexts = helpers.expectTexts;
+
+    // A whole partition, beside the plain aggregate that counts repeats.
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "2", "2", "2", "2", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT COUNT(v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "3", "3", "3", "3", "3", "3", "3" });
+    try expectTexts(allocator, db, "SELECT SUM(DISTINCT v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "12", "12", "12", "5", "5", "5", "5" });
+    try expectTexts(allocator, db, "SELECT AVG(DISTINCT v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "6", "6", "6", "2.5", "2.5", "2.5", "2.5" });
+    // Running frames, by rows and by peers.
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v) OVER (PARTITION BY g ORDER BY k) FROM dw ORDER BY k", &.{ "1", "1", "2", "1", "1", "1", "2" });
+    try expectTexts(allocator, db, "SELECT SUM(DISTINCT v) OVER (PARTITION BY g ORDER BY k) FROM dw ORDER BY k", &.{ "5", "5", "12", "1", "1", "1", "5" });
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM dw ORDER BY k", &.{ "2", "2", "2", "4", "4", "4", "4" });
+    // Sliding frames, and frames past the partition's end.
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM dw ORDER BY k", &.{ "1", "2", "2", "1", "1", "2", "1" });
+    try expectTexts(allocator, db, "SELECT SUM(DISTINCT v) OVER (ORDER BY k ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM dw ORDER BY k", &.{ "5", "5", "12", "13", "8", "1", "5" });
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v) OVER (ORDER BY k ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING) FROM dw ORDER BY k", &.{ "1", "1", "1", "1", "0", "0", "0" });
+    // DECIMAL sums keep their scale; -0 and 0 are one value; text counts.
+    try expectTexts(allocator, db, "SELECT CAST(SUM(DISTINCT d) OVER (PARTITION BY g) AS VARCHAR(10)) FROM dw ORDER BY k", &.{ "3.75", "3.75", "3.75", "4.00", "4.00", "4.00", "4.00" });
+    try expectTexts(allocator, db, "SELECT AVG(DISTINCT d) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "1.875", "1.875", "1.875", "2", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT f) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "1", "1", "1", "2", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT SUM(DISTINCT f) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "0", "0", "0", "3.5", "3.5", "3.5", "3.5" });
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT s) OVER () FROM dw ORDER BY k", &.{ "4", "4", "4", "4", "4", "4", "4" });
+    // MIN and MAX ignore DISTINCT; an expression, and one in an expression.
+    try expectTexts(allocator, db, "SELECT MIN(DISTINCT v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "5", "5", "5", "1", "1", "1", "1" });
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v + 1) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "2", "2", "2", "2", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT 10 + COUNT(DISTINCT v) OVER (PARTITION BY g) FROM dw ORDER BY k", &.{ "12", "12", "12", "12", "12", "12", "12" });
+    try expectTexts(allocator, db, "SELECT CASE WHEN COUNT(DISTINCT v) OVER (ORDER BY k) > 2 THEN 'many' ELSE 'few' END FROM dw ORDER BY k", &.{ "few", "few", "few", "many", "many", "many", "many" });
+
+    try std.testing.expectError(error.WindowUnsupported, helpers.exec(allocator, db, "SELECT SUM(DISTINCT s) OVER () FROM dw"));
+    try std.testing.expectError(error.WindowUnsupported, helpers.exec(allocator, db, "SELECT AVG(DISTINCT s) OVER () FROM dw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COUNT(DISTINCT *) OVER () FROM dw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT VAR_SAMP(DISTINCT v) OVER () FROM dw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COUNT(DISTINCT v, g) OVER () FROM dw"));
+}

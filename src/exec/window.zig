@@ -46,6 +46,7 @@ const BlockArena = @import("../util/block_arena.zig").BlockArena;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
+const nested = @import("nested.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
@@ -1816,7 +1817,7 @@ pub const Window = struct {
             .percent_rank => try fillPercentRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .session_number => try fillSessionNumber(plan, self.accumulated, perm, p_start, p_end, cell.column),
-            .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
+            .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
         }
     }
 
@@ -1952,7 +1953,7 @@ pub const Window = struct {
             const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (lo_i > hi_i) {
                 switch (plan.func) {
-                    .count => try writeBigint(cell.column, orig, 0),
+                    .count, .count_distinct => try writeBigint(cell.column, orig, 0),
                     else => setNullCell(cell, orig),
                 }
                 continue;
@@ -2001,6 +2002,14 @@ pub const Window = struct {
                 var acc = self.statisticAcc(plan);
                 for (perm[p_start..p_end]) |r| {
                     acc.add(r);
+                    try acc.write(cell.column, r);
+                }
+            },
+            .count_distinct, .sum_distinct, .avg_distinct => {
+                var acc = self.distinctAcc(plan);
+                defer acc.deinit();
+                for (perm[p_start..p_end]) |r| {
+                    try acc.add(r);
                     try acc.write(cell.column, r);
                 }
             },
@@ -2202,6 +2211,12 @@ pub const Window = struct {
                 for (perm[lo .. hi + 1]) |r| acc.add(r);
                 try acc.write(cell.column, out_idx);
             },
+            .count_distinct, .sum_distinct, .avg_distinct => {
+                var acc = self.distinctAcc(plan);
+                defer acc.deinit();
+                for (perm[lo .. hi + 1]) |r| try acc.add(r);
+                try acc.write(cell.column, out_idx);
+            },
             else => return Error.WindowUnsupported,
         }
     }
@@ -2214,6 +2229,15 @@ pub const Window = struct {
             .x_scale_div = aggregate.avgScaleDiv(self.input_schema[plan.value_col].type),
             .y = if (two_sided) self.accumulated[plan.second_col].view() else null,
             .y_scale_div = if (two_sided) aggregate.avgScaleDiv(self.input_schema[plan.second_col].type) else 1.0,
+        };
+    }
+
+    fn distinctAcc(self: *const Window, plan: CallPlan) DistinctAcc {
+        return .{
+            .func = plan.func,
+            .x = self.accumulated[plan.value_col].view(),
+            .x_scale_div = aggregate.avgScaleDiv(self.input_schema[plan.value_col].type),
+            .arena = std.heap.ArenaAllocator.init(self.allocator),
         };
     }
 
@@ -2434,7 +2458,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
             plan.value_col = try statisticColIdx(c.args[0], schema);
             if (c.args.len == 2) plan.second_col = try statisticColIdx(c.args[1], schema);
         },
-        .sum, .avg, .count, .min, .max => {
+        .sum, .avg, .count, .min, .max, .count_distinct, .sum_distinct, .avg_distinct => {
             switch (c.args[0]) {
                 .col_ref => |name| {
                     if (std.mem.eql(u8, name, "*")) {
@@ -2459,8 +2483,8 @@ pub fn output_column(c: ir.WindowCall, schema: []const Column) !Column {
 fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !Type {
     return switch (c.func) {
         .row_number, .rank, .dense_rank => .bigint,
-        .count => .bigint,
-        .sum => blk: {
+        .count, .count_distinct => .bigint,
+        .sum, .sum_distinct => blk: {
             const t = schema[plan.value_col].type;
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), matching
             // the aggregate operator.
@@ -2472,6 +2496,7 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
                 else => return Error.WindowUnsupported,
             }
         },
+        .avg_distinct => if (isSummable(schema[plan.value_col].type)) Type{ .double = {} } else Error.WindowUnsupported,
         .avg, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => Type{ .double = {} },
         .ntile, .session_number => .bigint,
         .percent_rank, .cume_dist => Type{ .double = {} },
@@ -2483,14 +2508,14 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
 
 fn outputNullable(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) bool {
     return switch (c.func) {
-        .row_number, .rank, .dense_rank, .count, .ntile, .percent_rank, .cume_dist => false,
+        .row_number, .rank, .dense_rank, .count, .count_distinct, .ntile, .percent_rank, .cume_dist => false,
         .lag, .lead => schema[plan.value_col].nullable or switch (plan.default_kind) {
             .none => true,
             .literal => false,
             .col_ref => schema[plan.default_col].nullable,
         },
         .sum, .avg, .min, .max, .first_value, .last_value, .nth_value => true,
-        .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => true,
+        .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .sum_distinct, .avg_distinct => true,
         .session_number => plan.session_delta == null,
     };
 }
@@ -2548,6 +2573,64 @@ const StatisticAcc = struct {
         if (value) |v| try writeDouble(out, row, v) else setNull(out, row);
     }
 };
+
+/// COUNT, SUM or AVG of the distinct non-NULL values added. Values are told
+/// apart by their stored bytes, so -0 and 0, and every NaN, are one value,
+/// as they are to GROUP BY.
+const DistinctAcc = struct {
+    func: ir.WindowFunc,
+    x: ColumnView,
+    x_scale_div: f64,
+    arena: std.heap.ArenaAllocator,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    count: i64 = 0,
+    int_sum: i128 = 0,
+    float_sum: f64 = 0,
+
+    fn deinit(self: *DistinctAcc) void {
+        self.arena.deinit();
+    }
+
+    fn add(self: *DistinctAcc, row: u32) !void {
+        if (!isValid(self.x, row)) return;
+        var buf: [16]u8 = undefined;
+        const key = nested.elementBytes(self.x, row, &buf);
+        const allocator = self.arena.allocator();
+        const entry = try self.seen.getOrPut(allocator, key);
+        if (entry.found_existing) return;
+        entry.key_ptr.* = try allocator.dupe(u8, key);
+        self.count += 1;
+        switch (self.x.data) {
+            inline .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => |values| self.int_sum += values[row],
+            inline .float, .double => |values| self.float_sum += values[row],
+            else => {},
+        }
+    }
+
+    fn write(self: *const DistinctAcc, out: *ColumnStore, row: u32) !void {
+        if (self.func == .count_distinct) return writeBigint(out, row, self.count);
+        if (self.count == 0) return setNull(out, row);
+        if (self.func == .avg_distinct) {
+            const sum: f64 = switch (self.x.data) {
+                .float, .double => self.float_sum,
+                else => @as(f64, @floatFromInt(self.int_sum)) / self.x_scale_div,
+            };
+            return writeDouble(out, row, sum / @as(f64, @floatFromInt(self.count)));
+        }
+        switch (out.data) {
+            // An exact sum truncated to BIGINT is the wrapped sum, as SUM's.
+            .bigint => try writeBigint(out, row, @truncate(self.int_sum)),
+            .largeint => try writeLargeint(out, row, self.int_sum),
+            .decimal128 => try writeDecimal128(out, row, self.int_sum),
+            .double => try writeDouble(out, row, self.float_sum),
+            else => return Error.WindowUnsupported,
+        }
+    }
+};
+
+fn isSummable(t: Type) bool {
+    return t.isInteger() or t.isDecimal() or t == .float or t == .double;
+}
 
 fn exprColIdx(e: ir.Expr, schema: []const Column) !usize {
     return switch (e) {
