@@ -299,6 +299,12 @@ test "VALUES and TABLE: row constructors and a whole table stand wherever a quer
         .{ "SELECT n * 100 + m FROM (VALUES ROW(1, 2), ROW(3, 4)) AS v(n, m) ORDER BY 1", &[_]i64{ 102, 304 } },
         .{ "SELECT a FROM (VALUES (5), (6)) AS v(a) ORDER BY a", &[_]i64{ 5, 6 } },
         .{ "SELECT CAST(SUM(column_0) * 10 AS BIGINT) FROM (VALUES ROW(1), ROW(2.5), ROW(NULL)) v", &[_]i64{35} },
+        // A column's type doesn't depend on where its NULL rows stand.
+        .{ "SELECT SUM(column_0) FROM (VALUES (1), (NULL), (NULL)) v", &[_]i64{1} },
+        .{ "SELECT SUM(column_0) FROM (VALUES (NULL), (NULL), (NULL), (NULL), (2)) v", &[_]i64{2} },
+        .{ "SELECT SUM(column_0 + column_1) FROM (VALUES (1, 10), (NULL, NULL), (NULL, NULL), (NULL, 20)) v", &[_]i64{11} },
+        .{ "WITH w AS (SELECT column_0 AS c FROM (VALUES (3), (NULL), (NULL)) t) SELECT SUM(c) FROM w", &[_]i64{3} },
+        .{ "SELECT SUM(x) FROM (SELECT 1 AS x UNION ALL (SELECT NULL AS x UNION ALL SELECT NULL AS x)) u", &[_]i64{1} },
         .{ "SELECT id FROM a UNION ALL VALUES ROW(9) ORDER BY 1", &[_]i64{ 1, 2, 3, 9 } },
         .{ "VALUES ROW(7) UNION ALL SELECT id FROM b ORDER BY 1", &[_]i64{ 2, 4, 7 } },
         .{ "(VALUES ROW(8)) UNION (TABLE b) ORDER BY 1 DESC", &[_]i64{ 8, 4, 2 } },

@@ -576,6 +576,15 @@ order rows arrive in. k and the counter count are integer literals of at
 least 1, else `SqlInvalidProjection`. Exact counts keep one entry per
 distinct value in each group, as `COUNT(DISTINCT)` does.
 
+`COUNT_IF(x)`, `BOOL_AND(x)` and `BOOL_OR(x)` read a non-boolean x as its
+truth, `CAST(x AS BOOLEAN)`, as WHERE reads a condition. So `COUNT_IF(n)`
+counts the rows where n is non-zero, and text counts where it reads as true
+(`aggregate.readsInputTruth`). A bare NULL is a numeric NULL to an aggregate
+that takes only numbers, so `SUM(NULL)` and `COVAR_SAMP(NULL, NULL)` are
+NULL, as in MySQL and StarRocks. A UNION arm column that is a bare NULL on
+every row takes the other arm's type, through the nested unions a VALUES list
+builds, so `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
+
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
 and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:

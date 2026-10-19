@@ -2272,21 +2272,42 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
 /// `other`, the other arm's: a bare NULL does, and so does `[]` beside an
 /// array or `map{}` beside a map.
 fn outputIsTypeless(op: *const ir.Op, name: []const u8, other: types.Type) bool {
-    const e = outputLiteral(op, name) orelse return false;
-    return e == .null_lit or scalar_fn.isEmptyNestedLiteral(e, other);
+    return switch (outputSource(op, name) orelse return false) {
+        .expr => |e| e == .null_lit or scalar_fn.isEmptyNestedLiteral(e, other),
+        .set_union => outputIsNull(op, name),
+    };
+}
+
+/// Whether `name` is a bare NULL on every row of `op`'s output, through
+/// the nested unions a VALUES list of more than two rows builds, so
+/// `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
+fn outputIsNull(op: *const ir.Op, name: []const u8) bool {
+    return switch (outputSource(op, name) orelse return false) {
+        .expr => |e| e == .null_lit,
+        .set_union => |s| outputIsNull(s.left, s.col) and outputIsNull(s.right, s.col),
+    };
 }
 
 /// `name = NULL`, `name = []` or `name = map{}` typed as `ty`, replacing
 /// the arm's output slot in place.
 fn typedDerived(arena: std.mem.Allocator, op: *const ir.Op, col_name: []const u8, ty: types.Type) !ir.Derived {
     const name = try arena.dupe(u8, col_name);
-    if (outputLiteral(op, col_name).? == .null_lit) return .{ .name = name, .expr = .{ .null_lit = ty } };
+    const source = outputSource(op, col_name).?;
+    if (source == .set_union or source.expr == .null_lit) return .{ .name = name, .expr = .{ .null_lit = ty } };
     return .{ .name = name, .expr = try scalar_fn.emptyNestedAs(arena, ty) };
 }
 
-/// The expression `name` in `op`'s output derives from on every row, followed
-/// through the row-preserving and renaming nodes an arm's SELECT builds.
-fn outputLiteral(op: *const ir.Op, name: []const u8) ?ir.Expr {
+const OutputSource = union(enum) {
+    expr: ir.Expr,
+    /// A union's column, which its right arm names as its left does when
+    /// one VALUES list builds both.
+    set_union: struct { left: *const ir.Op, right: *const ir.Op, col: []const u8 },
+};
+
+/// What `name` in `op`'s output derives from on every row, followed
+/// through the row-preserving and renaming nodes an arm's SELECT builds:
+/// an expression, or a union whose arms each hold it.
+fn outputSource(op: *const ir.Op, name: []const u8) ?OutputSource {
     var cur = op;
     var col = name;
     while (true) switch (cur.*) {
@@ -2294,7 +2315,7 @@ fn outputLiteral(op: *const ir.Op, name: []const u8) ?ir.Expr {
             var i = c.derived.len;
             while (i > 0) {
                 i -= 1;
-                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return c.derived[i].expr;
+                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return .{ .expr = c.derived[i].expr };
             }
             cur = c.upstream;
         },
@@ -2316,6 +2337,7 @@ fn outputLiteral(op: *const ir.Op, name: []const u8) ?ir.Expr {
             if (m.recursion != null) return null;
             cur = m.upstream;
         },
+        .set_union => |u| return .{ .set_union = .{ .left = u.left, .right = u.right, .col = col } },
         else => return null,
     };
 }

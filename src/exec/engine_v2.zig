@@ -851,7 +851,9 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
 /// double, decimal or text value as MySQL's bit operators read an operand
 /// (`aggregate_op.readsOperandBits`): those read a column of that number
 /// that this layers onto `q`. `aggs` itself when none does. The other
-/// dialects reject a temporal input.
+/// dialects reject a temporal input. In every dialect, COUNT_IF, BOOL_AND
+/// and BOOL_OR read a non-boolean input's truth
+/// (`aggregate_op.readsInputTruth`).
 pub fn mysqlAggInputs(input: CompileInput, q: *exec.Query, aggs: []const exec.AggSpec) ![]const exec.AggSpec {
     const schema = q.outputSchema();
     var derived: std.ArrayListUnmanaged(ir.Derived) = .empty;
@@ -865,6 +867,8 @@ pub fn mysqlAggInputs(input: CompileInput, q: *exec.Query, aggs: []const exec.Ag
             try exec.expr_mod.call(input.node_arena, "to_bigint", &.{.{ .col_ref = col }})
         else if (exec.aggregate_op.readsOperandBits(a.func, in))
             try exec.expr_mod.call(input.node_arena, exec.scalar_fn.bitOperatorFn(.bitor, .mysql), &.{ .{ .col_ref = col }, .{ .lit = .{ .bigint = 0 } } })
+        else if (exec.aggregate_op.readsInputTruth(a.func, in))
+            try exec.expr_mod.call(input.node_arena, "to_boolean", &.{.{ .col_ref = col }})
         else
             continue;
         if (out.len == 0) out = try input.node_arena.dupe(exec.AggSpec, aggs);
