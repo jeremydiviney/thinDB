@@ -319,6 +319,11 @@ dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
 `PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
 read `||` as concatenation.
 
+Some clause words aren't reserved in MySQL: `TEMP`, `TEMPORARY`, `MATERIALIZED`,
+`TABLES` and `COPY`, and the window words `CURRENT`, `UNBOUNDED`, `PRECEDING`,
+`FOLLOWING` and `RESPECT`. They are keywords only where they open their clause,
+so they can name a table, a column, an alias or a CTE without quotes.
+
 Explicitly **out of scope for v1**: `JSON`, `BITMAP`, `HLL`, `PERCENTILE`, `TIMESTAMPTZ`.
 
 MySQL DDL type names without a type of their own map onto the table above:

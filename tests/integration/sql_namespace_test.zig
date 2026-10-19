@@ -99,6 +99,32 @@ test "sql namespace: backtick-quoted identifier survives lex + resolves" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 1, 2, 3 }, ids);
 }
 
+test "sql namespace: clause words MySQL doesn't reserve name tables, columns, aliases and CTEs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE temp (id BIGINT PRIMARY KEY, current INT, copy INT, materialized INT, tables INT, temporary INT, unbounded INT, preceding INT, following INT, respect INT)");
+    try helpers.exec(allocator, db, "INSERT INTO temp VALUES (1, 10, 1, 1, 1, 1, 1, 1, 1, 1), (2, 20, 2, 2, 2, 2, 2, 2, 2, 2), (3, 30, 3, 3, 3, 3, 3, 3, 3, 3)");
+    try helpers.expectTexts(allocator, db, "SHOW TABLES", &.{"temp"});
+    try helpers.expectTexts(allocator, db, "SELECT current + copy + materialized + tables + temporary + unbounded + preceding + following + respect FROM temp ORDER BY id", &.{ "18", "36", "54" });
+    try helpers.expectTexts(allocator, db, "SELECT t.current AS copy FROM temp AS t ORDER BY copy DESC", &.{ "30", "20", "10" });
+    try helpers.expectTexts(allocator, db, "SELECT current FROM (SELECT current FROM temp WHERE id > 1) current ORDER BY current", &.{ "20", "30" });
+    try helpers.expectTexts(allocator, db, "WITH temp AS (SELECT id * 2 AS current FROM temp) SELECT current FROM temp ORDER BY current", &.{ "2", "4", "6" });
+    try helpers.expectTexts(allocator, db, "WITH materialized AS MATERIALIZED (SELECT id FROM temp) SELECT COUNT(*) FROM materialized", &.{"3"});
+    try helpers.expectTexts(allocator, db, "SELECT SUM(current) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS following FROM temp ORDER BY id", &.{ "10", "30", "60" });
+    try helpers.expectTexts(allocator, db, "SELECT LAG(current) RESPECT NULLS OVER (ORDER BY id) AS unbounded FROM temp ORDER BY id", &.{ null, "10", "20" });
+    try helpers.exec(allocator, db, "CREATE VIEW respect AS SELECT id FROM temp WHERE id < 3");
+    var q = try helpers.runSqlCtx(allocator, db, "SELECT COUNT(*) FROM respect");
+    defer q.deinit();
+    const counts = try helpers.collectIntCells(allocator, &q);
+    defer allocator.free(counts);
+    try std.testing.expectEqualSlices(?i64, &.{2}, counts);
+}
+
 test "sql namespace: a doubled backtick names a column with a backtick (#561)" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

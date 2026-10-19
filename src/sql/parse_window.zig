@@ -171,7 +171,7 @@ pub fn parseIgnoreNulls(p: anytype) !bool {
         try p.advance();
         return true;
     }
-    if (p.cur.tag == .kw_respect) {
+    if (p.atBareWord("respect")) {
         try p.advance();
         if (!isNullsWord(p.cur)) return PE.SqlExpectedKeyword;
         try p.advance();
@@ -298,19 +298,19 @@ pub fn parseFrameClause(p: anytype) !ir.Frame {
 ///   CURRENT ROW
 pub fn parseFrameBound(p: anytype) !ir.FrameBound {
     const PE = @TypeOf(p.*).Err;
-    if (p.cur.tag == .kw_unbounded) {
+    if (p.atBareWord("unbounded")) {
         try p.advance();
-        if (p.cur.tag == .kw_preceding) {
+        if (p.atBareWord("preceding")) {
             try p.advance();
             return .unbounded_preceding;
         }
-        if (p.cur.tag == .kw_following) {
+        if (p.atBareWord("following")) {
             try p.advance();
             return .unbounded_following;
         }
         return PE.SqlExpectedKeyword;
     }
-    if (p.cur.tag == .kw_current) {
+    if (p.atBareWord("current")) {
         try p.advance();
         if (p.cur.tag != .kw_row) return PE.SqlExpectedKeyword;
         try p.advance();
@@ -320,11 +320,11 @@ pub fn parseFrameBound(p: anytype) !ir.FrameBound {
         const n = p.cur.value.integer;
         if (n < 0) return PE.SqlExpectedValue;
         try p.advance();
-        if (p.cur.tag == .kw_preceding) {
+        if (p.atBareWord("preceding")) {
             try p.advance();
             return ir.FrameBound{ .preceding = @intCast(n) };
         }
-        if (p.cur.tag == .kw_following) {
+        if (p.atBareWord("following")) {
             try p.advance();
             return ir.FrameBound{ .following = @intCast(n) };
         }
