@@ -124,6 +124,8 @@ pub const Error = error{
     SeriesNonIntegerArgument,
     /// `map_from_arrays` given key and value arrays of different lengths.
     MapArrayLengthMismatch,
+    /// `array_map` given arrays of different lengths on one row.
+    ArrayLengthMismatch,
     /// Compute/projection operator: duplicate derived/final output name.
     ComputeNameCollision,
     /// Compute operator: an expression shape not yet supported in v1

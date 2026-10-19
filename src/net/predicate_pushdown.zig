@@ -1156,6 +1156,11 @@ fn collectExprRefs(arena: Allocator, e: ir.Expr, out: *std.ArrayListUnmanaged([]
             }
             if (c.else_branch) |eb| return collectExprRefs(arena, eb.*, out);
         },
+        .lambda => |l| {
+            var body: std.ArrayListUnmanaged([]const u8) = .empty;
+            if (!try collectExprRefs(arena, l.body.*, &body)) return false;
+            for (body.items) |name| if (!l.hasParam(name)) try out.append(arena, name);
+        },
         .scalar_subquery, .exists_subquery, .var_ref => return false,
     }
     return true;

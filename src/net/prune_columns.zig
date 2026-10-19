@@ -752,6 +752,8 @@ fn collectExpr(arena: Allocator, e: ir.Expr, out: *NameSet) bool {
             }
             if (cs.else_branch) |eb| return collectExpr(arena, eb.*, out);
         },
+        // Its parameters' names only ever keep more.
+        .lambda => |l| return collectExpr(arena, l.body.*, out),
         .scalar_subquery, .exists_subquery, .var_ref => return false,
     }
     return true;

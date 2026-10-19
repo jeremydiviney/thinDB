@@ -2712,6 +2712,7 @@ pub const Parser = struct {
     pub fn makeScalarCallExpr(self: *Parser, typed_name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
         const name = scalar_fn.canonicalName(typed_name);
         if (std.ascii.eqlIgnoreCase(name, "found_rows")) return ParseError.SqlFoundRowsUnsupported;
+        if (try self.lambdaCall(name, args)) |call| return call;
         if (args.len == 1 and fspTemporalFn(name)) {
             // The precision picks how many fraction digits the clock keeps.
             const fsp = literalInteger(args[0]) orelse return ParseError.SqlExpectedValue;
@@ -3037,7 +3038,7 @@ pub const Parser = struct {
             defer self.case_scope.reaches_every_row = reaches_every_row;
             while (true) {
                 if (!exec_compute.callReadsArgOnEveryRow(name, args.items.len)) self.case_scope.reaches_every_row = false;
-                const a = try self.parseValueExpr();
+                const a = if (try self.lambdaAhead()) try self.parseLambda() else try self.parseValueExpr();
                 try args.append(self.arena, a);
                 if (self.cur.tag != .comma) break;
                 try self.advance();
@@ -3055,6 +3056,98 @@ pub const Parser = struct {
         // text NULL, so CHARSET or COLLATION of a bare one takes a number's.
         if (bare_null and args.items.len == 1 and args.items[0] == .null_lit) args.items[0] = .{ .null_lit = .bigint };
         return try args.toOwnedSlice(self.arena);
+    }
+
+    /// Whether a lambda starts at `cur`: `x -> body` or `(x, y) -> body`. Text
+    /// after the arrow makes it a JSON path instead (`j -> '$.a'`).
+    fn lambdaAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        if (self.cur.tag == .identifier) {
+            if ((try look.next()).tag != .arrow) return false;
+            return (try look.next()).tag != .string;
+        }
+        if (self.cur.tag != .lparen) return false;
+        while (true) {
+            if ((try look.next()).tag != .identifier) return false;
+            const sep = try look.next();
+            if (sep.tag == .rparen) break;
+            if (sep.tag != .comma) return false;
+        }
+        return (try look.next()).tag == .arrow;
+    }
+
+    fn parseLambda(self: *Parser) ParseError!ir.Expr {
+        var params: std.ArrayList([]const u8) = .empty;
+        if (self.cur.tag == .lparen) {
+            try self.advance();
+            while (true) {
+                try params.append(self.arena, try self.expectIdent());
+                if (self.cur.tag != .comma) break;
+                try self.advance();
+            }
+            try self.expect(.rparen);
+        } else {
+            try params.append(self.arena, try self.expectIdent());
+        }
+        for (params.items, 0..) |p, i| {
+            for (params.items[0..i]) |q| if (types.columnNameEql(p, q)) return ParseError.SqlExpectedIdent;
+        }
+        try self.expect(.arrow);
+        // A computed operand of a comparison in the body stays with the
+        // body's own CASE: a hidden column of the statement's, or one it
+        // already anchors, would read the parameters' names outside it.
+        const case_scope = self.case_scope;
+        const derived_scope = self.predicate_derived_scope;
+        defer {
+            self.case_scope = case_scope;
+            self.predicate_derived_scope = derived_scope;
+        }
+        self.case_scope.reaches_every_row = false;
+        self.predicate_derived_scope = self.predicate_derived.items.len;
+        const body = try self.arena.create(ir.Expr);
+        body.* = try self.parseValueExpr();
+        return .{ .lambda = .{ .params = try params.toOwnedSlice(self.arena), .body = body } };
+    }
+
+    /// A call of StarRocks' that takes a lambda, as `array_map` of the lambda
+    /// under the function that reads its values, or null for any other call.
+    /// The lambda comes first or last (`any_match(a, x -> x > 1)`).
+    fn lambdaCall(self: *Parser, name: []const u8, given: []const ir.Expr) ParseError!?ir.Expr {
+        if (given.len < 2) return null;
+        const last = given.len - 1;
+        const args = if (given[0] != .lambda and given[last] == .lambda) moved: {
+            const out = try self.arena.alloc(ir.Expr, given.len);
+            out[0] = given[last];
+            @memcpy(out[1..], given[0..last]);
+            break :moved out;
+        } else given;
+        if (args[0] != .lambda) return null;
+        for (args[1..]) |a| if (a == .lambda) return ParseError.SqlExpectedValue;
+        const first = args[1];
+        if (std.ascii.eqlIgnoreCase(name, "array_map") or std.ascii.eqlIgnoreCase(name, "transform")) return try self.callOf("array_map", args);
+        if (std.ascii.eqlIgnoreCase(name, "array_filter") or std.ascii.eqlIgnoreCase(name, "array_sortby")) {
+            return try self.callOf(name, &.{ first, try self.callOf("array_map", args) });
+        }
+        if (std.ascii.eqlIgnoreCase(name, "any_match") or std.ascii.eqlIgnoreCase(name, "all_match")) {
+            return try self.callOf(name, &.{try self.callOf("array_map", args)});
+        }
+        const map_fns = [_][]const u8{ "map_filter", "transform_values", "transform_keys" };
+        for (map_fns) |f| {
+            if (!std.ascii.eqlIgnoreCase(name, f)) continue;
+            // The lambda takes each entry's key and value.
+            if (args.len != 2) return ParseError.SqlExpectedValue;
+            const keys = try self.callOf("map_keys", &.{first});
+            const values = try self.callOf("map_values", &.{first});
+            const mapped = try self.callOf("array_map", &.{ args[0], keys, values });
+            if (std.ascii.eqlIgnoreCase(f, "map_filter")) return try self.callOf(f, &.{ first, mapped });
+            if (std.ascii.eqlIgnoreCase(f, "transform_values")) return try self.callOf(scalar_fn.MAP_FROM_ARRAYS_FN, &.{ keys, mapped });
+            return try self.callOf(scalar_fn.MAP_FROM_ARRAYS_FN, &.{ mapped, values });
+        }
+        return null;
+    }
+
+    fn callOf(self: *Parser, name: []const u8, args: []const ir.Expr) ParseError!ir.Expr {
+        return .{ .call = .{ .fn_name = name, .args = try self.arena.dupe(ir.Expr, args) } };
     }
 
     /// CHARSET and COLLATION name their argument's type.
@@ -4123,6 +4216,12 @@ pub const Parser = struct {
                 buf[0] = '@';
                 @memcpy(buf[1..], name);
                 return buf;
+            },
+            .lambda => |l| {
+                const params = try std.mem.join(self.arena, ", ", l.params);
+                const body = try self.exprDefaultName(l.body.*);
+                if (l.params.len == 1) return try std.mem.concat(self.arena, u8, &.{ params, " -> ", body });
+                return try std.mem.concat(self.arena, u8, &.{ "(", params, ") -> ", body });
             },
         }
     }
@@ -5711,6 +5810,11 @@ pub const Parser = struct {
                 }
                 if (cs.else_branch) |eb| try self.checkResidualExpr(eb.*, scope, derived);
             },
+            .lambda => {
+                var names: std.ArrayListUnmanaged([]const u8) = .empty;
+                try exec_compute.collectColumnRefs(self.arena, &names, e);
+                for (names.items) |name| try self.checkResidualColumn(name, scope, derived);
+            },
         }
     }
 
@@ -6286,7 +6390,7 @@ pub const Parser = struct {
                 }
                 break :blk side;
             },
-            .case, .scalar_subquery, .exists_subquery => ParseError.SqlOnNonEquiUnsupported,
+            .case, .scalar_subquery, .exists_subquery, .lambda => ParseError.SqlOnNonEquiUnsupported,
         };
     }
 
@@ -7813,6 +7917,7 @@ pub const Parser = struct {
                 if (cs.else_branch) |eb| if (!self.exprShareable(eb.*)) break :blk false;
                 break :blk true;
             },
+            .lambda => |l| self.exprShareable(l.body.*),
             .scalar_subquery, .exists_subquery => false,
         };
     }
@@ -8090,6 +8195,10 @@ fn groupedOutputNameAvailable(name: []const u8, group_cols: []const []const u8, 
 }
 
 fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_cols: []const []const u8) bool {
+    return exprAvailableAfterGroupIn(e, group_cols, extra_cols, null);
+}
+
+fn exprAvailableAfterGroupIn(e: ir.Expr, group_cols: []const []const u8, extra_cols: []const []const u8, lambdas: ?*const exec_expr.LambdaScope) bool {
     return switch (e) {
         .lit => true,
         .null_lit => true,
@@ -8097,26 +8206,30 @@ fn exprAvailableAfterGroup(e: ir.Expr, group_cols: []const []const u8, extra_col
         // pre-compile pass runs once. A correlated subquery still resolves
         // against the grouped output, so it may name only grouped columns.
         .var_ref, .scalar_subquery, .exists_subquery => true,
-        .col_ref => |name| groupedOutputNameAvailable(name, group_cols, extra_cols),
+        .col_ref => |name| exec_expr.LambdaScope.binds(lambdas, name) or groupedOutputNameAvailable(name, group_cols, extra_cols),
         .call => |c| blk: {
             if (isNondeterministicFn(c.fn_name)) break :blk false;
             for (c.args) |arg| {
-                if (!exprAvailableAfterGroup(arg, group_cols, extra_cols)) break :blk false;
+                if (!exprAvailableAfterGroupIn(arg, group_cols, extra_cols, lambdas)) break :blk false;
             }
             break :blk true;
         },
         .case => |c| blk: {
             for (c.operands) |o| {
-                if (!exprAvailableAfterGroup(o.expr, group_cols, extra_cols)) break :blk false;
+                if (!exprAvailableAfterGroupIn(o.expr, group_cols, extra_cols, lambdas)) break :blk false;
             }
             for (c.branches) |branch| {
                 if (!predicateAvailableAfterGroup(branch.cond, group_cols, extra_cols, c.operands)) break :blk false;
-                if (!exprAvailableAfterGroup(branch.then, group_cols, extra_cols)) break :blk false;
+                if (!exprAvailableAfterGroupIn(branch.then, group_cols, extra_cols, lambdas)) break :blk false;
             }
             if (c.else_branch) |else_branch| {
-                if (!exprAvailableAfterGroup(else_branch.*, group_cols, extra_cols)) break :blk false;
+                if (!exprAvailableAfterGroupIn(else_branch.*, group_cols, extra_cols, lambdas)) break :blk false;
             }
             break :blk true;
+        },
+        .lambda => |l| {
+            const inner: exec_expr.LambdaScope = .{ .lambda = l, .outer = lambdas };
+            return exprAvailableAfterGroupIn(l.body.*, group_cols, extra_cols, &inner);
         },
     };
 }
@@ -8163,6 +8276,9 @@ fn predicateAvailableAfterGroup(p: PredicateExpr, group_cols: []const []const u8
 fn exprReferencesAnyColumn(e: ir.Expr, cols: []const []const u8) bool {
     return switch (e) {
         .col_ref => |name| nameInList(name, cols),
+        .lambda => |l| for (cols) |c| {
+            if (!l.hasParam(c) and exprReferencesAnyColumn(l.body.*, &.{c})) break true;
+        } else false,
         .call => |c| blk: {
             for (c.args) |arg| {
                 if (exprReferencesAnyColumn(arg, cols)) break :blk true;

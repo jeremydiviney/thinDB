@@ -44,6 +44,7 @@ const simd = @import("../util/simd.zig");
 const udf_mod = @import("../udf.zig");
 
 const cast = @import("cast.zig");
+const nested = @import("nested.zig");
 const CastKernel = cast.CastKernel;
 
 const exec = @import("exec.zig");
@@ -86,6 +87,12 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
                 try collectColumnRefs(allocator, out, b.then);
             }
             if (cs.else_branch) |eb| try collectColumnRefs(allocator, out, eb.*);
+        },
+        .lambda => |l| {
+            var body_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer body_refs.deinit(allocator);
+            try collectColumnRefs(allocator, &body_refs, l.body.*);
+            for (body_refs.items) |nm| if (!l.hasParam(nm)) try appendUniqueName(allocator, out, nm);
         },
         else => {},
     }
@@ -163,7 +170,26 @@ const CallPlan = struct {
     output_owned: bool,
     output_type: Type,
     arg_reach: ArgReach = .all,
+    /// Set for `array_map` over a lambda, which evaluates that instead of
+    /// a kernel; `args` are then its arrays.
+    lambda: ?*LambdaPlan = null,
 };
+
+/// A lambda's body evaluates as a Compute over a batch of the arrays'
+/// elements, one row per element: the parameters first, then the outer
+/// columns the body reads, each repeated for its row's elements.
+const LambdaPlan = struct {
+    /// The `up_schema` index of each outer column the body reads, in
+    /// `stub.schema` order after the parameters.
+    captured: []const usize,
+    stub: SchemaStub,
+    body: Query,
+    /// Where the body's value sits in its Compute's output.
+    result_slot: usize,
+    result_type: Type,
+};
+
+const LAMBDA_RESULT = "__lambda_result";
 
 /// Fused `col <op> const` (or `const <op> col`) for +/-/* — evaluated in one
 /// SIMD pass that widens the source column straight to the output type, so we
@@ -1070,7 +1096,9 @@ pub const Compute = struct {
 
         // 2. Run the kernel. Decimal (typed) kernels take precedence and get
         // the arg/out Types so they can align scales.
-        if (plan.func.typed_kernel) |tk| {
+        if (plan.lambda) |lp| {
+            try self.evalLambda(lp, arg_views, in_values, plan.output, n);
+        } else if (plan.func.typed_kernel) |tk| {
             try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, plan.output, n);
         } else if (plan.func.kernel) |k| {
             try k(self.allocator, arg_views, plan.output, n);
@@ -1093,6 +1121,92 @@ pub const Compute = struct {
                 .kernel_managed => {}, // kernel already wrote the bitmap
             }
         }
+    }
+
+    /// `array_map` over a batch: the body runs once over every element of
+    /// the rows' arrays, and its values fold back into one array per row. A
+    /// row any array is NULL on is NULL; the others must agree on length.
+    fn evalLambda(
+        self: *Compute,
+        lp: *LambdaPlan,
+        arrays: []const ColumnView,
+        in_values: []const ColumnView,
+        out: *ColumnStore,
+        n: usize,
+    ) anyerror!void {
+        const allocator = self.allocator;
+        for (arrays) |v| if (v.data != .nested) return out.appendNulls(allocator, n);
+        const schema = lp.stub.schema;
+        const flats = try allocator.alloc(nested.Flat, arrays.len);
+        var flattened: usize = 0;
+        defer {
+            for (flats[0..flattened]) |*f| f.deinit(allocator);
+            allocator.free(flats);
+        }
+        for (flats, arrays, schema[0..arrays.len]) |*f, v, param| {
+            f.* = try nested.flatten(allocator, param.type, v, n);
+            flattened += 1;
+        }
+
+        const validity = try allocator.alloc(u8, (n + 7) / 8);
+        defer allocator.free(validity);
+        @memset(validity, 0);
+        const offsets = try allocator.alloc(u32, n + 1);
+        defer allocator.free(offsets);
+        offsets[0] = 0;
+        var elements: u32 = 0;
+        for (0..n) |r| {
+            const valid = for (arrays) |v| {
+                if (!v.isValid(r)) break false;
+            } else true;
+            if (valid) {
+                const len = flats[0].offsets.items[r + 1] - flats[0].offsets.items[r];
+                for (flats[1..]) |f| {
+                    if (f.offsets.items[r + 1] - f.offsets.items[r] != len) return Error.ArrayLengthMismatch;
+                }
+                elements += len;
+                storage.column.setValidBit(validity, r, true);
+            }
+            offsets[r + 1] = elements;
+        }
+        if (elements == 0) {
+            var none = try ColumnStore.init(allocator, lp.result_type, true);
+            defer none.deinit(allocator);
+            return nested.encodeColumn(allocator, out, nested.ElemClass.of(lp.result_type), none.view(), offsets, validity, n);
+        }
+
+        const row_of = try allocator.alloc(u32, elements);
+        defer allocator.free(row_of);
+        for (0..n) |r| @memset(row_of[offsets[r]..offsets[r + 1]], @intCast(r));
+        const values = try allocator.alloc(ColumnView, schema.len);
+        defer allocator.free(values);
+        var gathered: std.ArrayList(ColumnStore) = .empty;
+        defer {
+            for (gathered.items) |*s| s.deinit(allocator);
+            gathered.deinit(allocator);
+        }
+        var picks: std.ArrayList(u32) = .empty;
+        defer picks.deinit(allocator);
+        for (flats, values[0..arrays.len]) |*f, *v| {
+            if (std.mem.eql(u32, f.offsets.items, offsets)) {
+                v.* = f.elements.view();
+                continue;
+            }
+            // Its elements on rows another array is NULL on drop out.
+            picks.clearRetainingCapacity();
+            for (0..n) |r| {
+                if (offsets[r] == offsets[r + 1]) continue;
+                for (f.offsets.items[r]..f.offsets.items[r + 1]) |k| try picks.append(allocator, @intCast(k));
+            }
+            v.* = try gatheredView(allocator, &gathered, f.elements.view(), picks.items);
+        }
+        for (lp.captured, values[arrays.len..]) |idx, *v| {
+            v.* = try gatheredView(allocator, &gathered, in_values[idx], row_of);
+        }
+
+        const body = exec.queryAs(Compute, lp.body).?;
+        const result = try body.evalBatch(.{ .schema = schema, .values = values, .row_count = elements });
+        try nested.encodeColumn(allocator, out, nested.ElemClass.of(lp.result_type), result.values[lp.result_slot], offsets, validity, n);
     }
 
     /// Evaluate a CASE expression over a single batch. Strategy:
@@ -1592,6 +1706,7 @@ pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
             if (c.else_branch) |e2| return mayVary(e2.*, registry);
             return false;
         },
+        .lambda => |l| return mayVary(l.body.*, registry),
         .col_ref, .lit, .null_lit => return false,
         .scalar_subquery, .exists_subquery, .var_ref => return true,
     }
@@ -1857,8 +1972,9 @@ fn resolveDerived(
             };
         },
         // Subqueries and var_refs must be resolved (rewritten to `.lit`)
-        // by the pre-compile pass before this resolver runs.
-        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+        // by the pre-compile pass before this resolver runs. A lambda is
+        // only ever a call's argument.
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => return Error.ComputeUnsupportedExpr,
     }
 }
 
@@ -2140,7 +2256,7 @@ fn buildBranchSrc(
             const sub = try buildCasePlan(runtime_allocator, aa, e.case, up_schema, udf_registry);
             break :blk BranchSrc{ .case = sub };
         },
-        .scalar_subquery, .exists_subquery, .var_ref => return Error.ComputeUnsupportedExpr,
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => return Error.ComputeUnsupportedExpr,
     };
 }
 
@@ -2217,54 +2333,17 @@ fn buildCallPlan(
         else => return Error.ComputeUnsupportedExpr,
     };
     if (try hexNumbersRead(aa, udf_registry, c)) |rewritten| return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
+    if (c.args.len > 0 and c.args[0] == .lambda and std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(c.fn_name), "array_map")) {
+        return buildLambdaPlan(runtime_allocator, aa, c, up_schema, udf_registry);
+    }
 
     const arg_plans = try aa.alloc(ArgPlan, c.args.len);
     const arg_types = try aa.alloc(Type, c.args.len);
     var built: usize = 0;
     errdefer for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
-    for (c.args, 0..) |arg, i| {
-        switch (arg) {
-            .col_ref => |name| {
-                const idx = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
-                arg_plans[i] = .{ .col = idx };
-                arg_types[i] = up_schema[idx].type;
-            },
-            .lit => |v| {
-                const slot = try aa.create(LitSlot);
-                slot.* = .{
-                    .value = v,
-                    .ty = try literalType(v),
-                    .buf = try ColumnStore.init(runtime_allocator, try literalType(v), false),
-                };
-                arg_plans[i] = .{ .lit = slot };
-                arg_types[i] = try literalType(v);
-            },
-            .null_lit => |ty| {
-                const slot = try aa.create(NullSlot);
-                slot.* = .{
-                    .ty = ty,
-                    .buf = try ColumnStore.init(runtime_allocator, ty, true),
-                };
-                arg_plans[i] = .{ .null_lit = slot };
-                arg_types[i] = ty;
-            },
-            .call => if (try decimalLitSlot(runtime_allocator, aa, arg)) |slot| {
-                arg_plans[i] = .{ .lit = slot };
-                arg_types[i] = slot.ty;
-            } else {
-                const sub = try buildCallPlan(runtime_allocator, aa, arg, up_schema, udf_registry);
-                arg_plans[i] = .{ .call = sub };
-                arg_types[i] = sub.output_type;
-            },
-            .case => {
-                const sub = try buildCasePlan(runtime_allocator, aa, arg.case, up_schema, udf_registry);
-                arg_plans[i] = .{ .case = sub };
-                arg_types[i] = sub.output_type;
-            },
-            .scalar_subquery, .exists_subquery, .var_ref => {
-                return Error.ComputeUnsupportedExpr;
-            },
-        }
+    for (c.args, arg_plans, arg_types) |arg, *ap, *at| {
+        ap.* = try buildArgPlan(runtime_allocator, aa, arg, up_schema, udf_registry);
+        at.* = argPlanType(ap.*, up_schema);
         built += 1;
     }
     if (try nullifConstantPlaced(aa, c, arg_plans, arg_types)) |rewritten| {
@@ -2394,6 +2473,134 @@ fn buildCallPlan(
         .arg_reach = argReach(func),
     };
     return plan;
+}
+
+/// `array_map(lambda, a1, ..., an)`: one array per parameter, and the body
+/// planned as a Compute over their elements (`LambdaPlan`). An argument
+/// that is a bare NULL gives a NULL row; its parameter takes the element
+/// type of another array.
+fn buildLambdaPlan(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    c: Expr.Call,
+    up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+) PlanError!*CallPlan {
+    const lambda = c.args[0].lambda;
+    const arrays = c.args[1..];
+    if (arrays.len == 0 or lambda.params.len != arrays.len) return Error.ComputeNoSuchOverload;
+    const arg_plans = try aa.alloc(ArgPlan, arrays.len);
+    const arg_types = try aa.alloc(Type, arrays.len);
+    var built: usize = 0;
+    errdefer for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
+    var some_element: ?Type = null;
+    for (arrays, arg_plans, arg_types) |a, *ap, *at| {
+        ap.* = try buildArgPlan(runtime_allocator, aa, a, up_schema, udf_registry);
+        built += 1;
+        at.* = argPlanType(ap.*, up_schema);
+        if (at.arrayElement()) |e| {
+            if (some_element == null) some_element = e;
+        } else if (ap.* != .null_lit) return Error.ComputeNoSuchOverload;
+    }
+
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    try collectColumnRefs(aa, &refs, c.args[0]);
+    const schema = try aa.alloc(Column, arrays.len + refs.items.len);
+    for (lambda.params, arg_types, schema[0..arrays.len]) |param, at, *col| {
+        col.* = .{ .name = param, .type = at.arrayElement() orelse some_element orelse .boolean, .nullable = true };
+    }
+    const captured = try aa.alloc(usize, refs.items.len);
+    for (refs.items, captured, schema[arrays.len..]) |name, *idx, *col| {
+        idx.* = columnIndex(up_schema, name) orelse return Error.ColumnNotFound;
+        col.* = .{ .name = name, .type = up_schema[idx.*].type, .nullable = true };
+    }
+
+    const lp = try aa.create(LambdaPlan);
+    lp.* = .{ .captured = captured, .stub = .{ .schema = schema }, .body = undefined, .result_slot = undefined, .result_type = undefined };
+    const derived = [_]Derived{.{ .name = LAMBDA_RESULT, .expr = lambda.body.* }};
+    lp.body = try Compute.createWithRegistry(runtime_allocator, makeQuery(runtime_allocator, &lp.stub), &derived, udf_registry);
+    errdefer {
+        var body = lp.body;
+        body.deinit();
+    }
+    const body = exec.queryAs(Compute, lp.body).?;
+    lp.result_slot = body.derived_output_indices[0];
+    lp.result_type = body.output_schema[lp.result_slot].type;
+
+    const output_type = try types.arrayOf(lp.result_type);
+    const output_buf = try runtime_allocator.create(ColumnStore);
+    errdefer runtime_allocator.destroy(output_buf);
+    output_buf.* = try ColumnStore.init(runtime_allocator, output_type, true);
+    errdefer output_buf.deinit(runtime_allocator);
+    const plan = try aa.create(CallPlan);
+    plan.* = .{
+        .func = .{ .name = c.fn_name, .arg_types = arg_types, .return_type = output_type, .null_strategy = .kernel_managed },
+        .args = arg_plans,
+        .arg_runtime_types = arg_types,
+        .arg_casts = null,
+        .cast_buffers = null,
+        .arg_views = try aa.alloc(ColumnView, arg_plans.len),
+        .output = output_buf,
+        .output_owned = true,
+        .output_type = output_type,
+        .lambda = lp,
+    };
+    return plan;
+}
+
+/// The rows `picks` names of `view`, kept alive in `gathered`.
+fn gatheredView(allocator: Allocator, gathered: *std.ArrayList(ColumnStore), view: ColumnView, picks: []const u32) !ColumnView {
+    var s = try ColumnStore.initLike(allocator, view, true);
+    errdefer s.deinit(allocator);
+    if (!try transform.appendGatheredColumn(allocator, view, picks, &s)) return Error.ComputeUnsupportedExpr;
+    try gathered.append(allocator, s);
+    return gathered.items[gathered.items.len - 1].view();
+}
+
+fn buildArgPlan(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    arg: Expr,
+    up_schema: []const Column,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+) PlanError!ArgPlan {
+    return switch (arg) {
+        .col_ref => |name| .{ .col = columnIndex(up_schema, name) orelse return Error.ColumnNotFound },
+        .lit => |v| blk: {
+            const slot = try aa.create(LitSlot);
+            slot.* = .{
+                .value = v,
+                .ty = try literalType(v),
+                .buf = try ColumnStore.init(runtime_allocator, try literalType(v), false),
+            };
+            break :blk .{ .lit = slot };
+        },
+        .null_lit => |ty| blk: {
+            const slot = try aa.create(NullSlot);
+            slot.* = .{
+                .ty = ty,
+                .buf = try ColumnStore.init(runtime_allocator, ty, true),
+            };
+            break :blk .{ .null_lit = slot };
+        },
+        .call => if (try decimalLitSlot(runtime_allocator, aa, arg)) |slot|
+            .{ .lit = slot }
+        else
+            .{ .call = try buildCallPlan(runtime_allocator, aa, arg, up_schema, udf_registry) },
+        .case => .{ .case = try buildCasePlan(runtime_allocator, aa, arg.case, up_schema, udf_registry) },
+        // A lambda is an argument only of the calls `buildLambdaPlan` takes.
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => Error.ComputeUnsupportedExpr,
+    };
+}
+
+fn argPlanType(ap: ArgPlan, up_schema: []const Column) Type {
+    return switch (ap) {
+        .col => |idx| up_schema[idx].type,
+        .lit => |slot| slot.ty,
+        .null_lit => |slot| slot.ty,
+        .call => |plan| plan.output_type,
+        .case => |plan| plan.output_type,
+    };
 }
 
 /// The call with each hex literal it reads as a number replaced by that
@@ -2860,6 +3067,10 @@ fn litTemporalValue(ap: ArgPlan, target: types.TypeTag) ?types.Value {
 /// the arena and is freed there.
 fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
     for (plan.args) |arg| freeArgPlan(runtime_allocator, arg);
+    if (plan.lambda) |lp| {
+        var body = lp.body;
+        body.deinit();
+    }
     if (plan.cast_buffers) |buffers| freeCastBuffers(runtime_allocator, buffers);
     if (plan.output_owned) {
         plan.output.deinit(runtime_allocator);

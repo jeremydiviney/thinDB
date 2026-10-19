@@ -2376,7 +2376,7 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                         plan.default_kind = .literal;
                         plan.default_literal = try coerceDefaultLit(v, schema[plan.value_col].type);
                     },
-                    .case, .scalar_subquery, .exists_subquery, .var_ref => return Error.WindowUnsupported,
+                    .case, .scalar_subquery, .exists_subquery, .var_ref, .lambda => return Error.WindowUnsupported,
                 }
             }
         },

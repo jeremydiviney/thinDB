@@ -90,6 +90,13 @@ Arrays follow StarRocks:
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
 - `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
 
+Lambdas follow StarRocks:
+- `x -> body` and `(x, y) -> body` are lambdas, written only as a function's argument, first or last. `array_map(lambda, a1, ..., an)`, or `transform`, takes one array per parameter and gives the body's value at each place of the arrays. A row whose arrays include a NULL is NULL. The others must be equally long on each row, or the statement fails with `ArrayLengthMismatch`.
+- The body is any scalar expression. It reads the row's columns, session variables and outer lambdas' parameters, and a parameter hides a column of its name. It runs as a Compute over the batch's elements, one row per element, beside the outer columns it reads.
+- The other lambda functions read `array_map`'s values: `array_filter(f, a, ...)` is `array_filter(a, array_map(f, a, ...))`, and so are `array_sortby`, `any_match` and `all_match` (over `array_map(f, a, ...)` alone). `map_filter`, `transform_values` and `transform_keys` take a lambda of key and value.
+- Each also takes the values themselves. `array_filter(a, flags)` and `map_filter(m, flags)` keep the places whose flag is true, so none past the flags' end and none for NULL flags. `any_match(flags)` and `all_match(flags)` are NULL where a NULL flag could change the answer. `array_sortby(a, keys, ...)` sorts by one key array after another, NULLs first and ties in order, passing over a NULL key array.
+- Not covered yet: `array_sort` with a comparator, `map_apply`, and session variables holding an array or map.
+
 Maps follow StarRocks too:
 - `map{k: v, ...}` and `map(k, v, ...)` are literals. Their keys meet at one common type and their values at another, as array elements do. `m[k]` and `ELEMENT_AT(m, k)` give the value `k` maps to, or NULL; a NULL key matches a NULL key.
 - A map holds each key once. A repeated key keeps its last value, at its last position, in a literal, `map_from_arrays`, `map_concat` and a CAST whose keys meet. Otherwise entries keep the order given. Maps compare by their keys array, then their values array, so the same entries in another order make another map.
@@ -1767,7 +1774,7 @@ MemoryBudgetExceeded, QueryCancelled, WindowUnsupported,
 RecursiveCteDepthExceeded,
 TableFnExecutionMismatch, TableFnInputMismatch, TableFnOutputMismatch,
 SeriesStepZero, SeriesNonIntegerArgument,
-MapArrayLengthMismatch,
+MapArrayLengthMismatch, ArrayLengthMismatch,
 ```
 
 Plus standard Zig errors (`OutOfMemory`, IO errors via `std.Io`, etc.) propagated unchanged.
@@ -1791,6 +1798,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `SeriesStepZero` means a `generate_series` step was 0, which would repeat its start forever; PostgreSQL, DuckDB and StarRocks refuse it too. `SeriesNonIntegerArgument` means a `generate_series` argument wasn't an integer (§6.2). The MySQL wire reports both as 1210 (`HY000`), as it does `IncorrectArgumentsToSleep`; the PostgreSQL wire as `22023`, PostgreSQL's code for a zero step.
 
 `MapArrayLengthMismatch` means `map_from_arrays` was given key and value arrays of different lengths, which pair no entries; StarRocks refuses them too. The wires report it as they report `SeriesStepZero`.
+
+`ArrayLengthMismatch` means a function that pairs arrays element by element, a lambda's arrays or `array_sortby`'s keys, was given arrays of different lengths on one row; StarRocks refuses them too. The wires report it as they report `MapArrayLengthMismatch`.
 
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 

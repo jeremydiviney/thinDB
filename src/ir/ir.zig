@@ -2085,7 +2085,7 @@ fn freeDecodedResidual(res: JoinResidual, allocator: Allocator) void {
     freeDecodedPredicate(res.predicate, allocator);
 }
 
-const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3, null_lit = 4 };
+const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3, null_lit = 4, lambda = 5 };
 
 /// Wire-encode an Expr tree (col_ref / lit / call / case). Recursive
 /// — mirrors the recursive Predicate encoding above.
@@ -2130,6 +2130,15 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
                 try out.appendSlice(allocator, o.name);
                 try encodeExpr(allocator, out, o.expr);
             }
+        },
+        .lambda => |l| {
+            try out.append(allocator, @intFromEnum(ExprTag.lambda));
+            try appendU32(allocator, out, @intCast(l.params.len));
+            for (l.params) |p| {
+                try appendU32(allocator, out, @intCast(p.len));
+                try out.appendSlice(allocator, p);
+            }
+            try encodeExpr(allocator, out, l.body.*);
         },
     }
 }
@@ -3274,7 +3283,7 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(ExprTag.null_lit)) return Error.IrCorrupt;
+    if (tag_byte > @intFromEnum(ExprTag.lambda)) return Error.IrCorrupt;
     const tag: ExprTag = @enumFromInt(tag_byte);
     return switch (tag) {
         .col_ref => Expr{ .col_ref = try readString(bytes, cursor) },
@@ -3317,6 +3326,18 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
             for (operands) |*o| o.* = .{ .name = try readString(bytes, cursor), .expr = try decodeExpr(allocator, bytes, cursor) };
             break :blk Expr{ .case = .{ .branches = branches, .else_branch = else_ptr, .operands = operands } };
         },
+        .lambda => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            const params = try allocator.alloc([]const u8, n);
+            errdefer allocator.free(params);
+            for (params) |*p| p.* = try readString(bytes, cursor);
+            const body = try allocator.create(Expr);
+            errdefer allocator.destroy(body);
+            body.* = try decodeExpr(allocator, bytes, cursor);
+            break :blk Expr{ .lambda = .{ .params = params, .body = body } };
+        },
     };
 }
 
@@ -3339,6 +3360,11 @@ pub fn freeDecodedExpr(e: Expr, allocator: Allocator) void {
             }
             for (cs.operands) |o| freeDecodedExpr(o.expr, allocator);
             allocator.free(cs.operands);
+        },
+        .lambda => |l| {
+            freeDecodedExpr(l.body.*, allocator);
+            allocator.destroy(@constCast(l.body));
+            allocator.free(l.params);
         },
     }
 }
@@ -4010,6 +4036,29 @@ test "ir: a CASE's condition operands round-trip" {
 
     try std.testing.expect(decoded == .compute);
     try std.testing.expect(exec_expr.eql(case_expr, decoded.compute.derived[0].expr));
+}
+
+test "ir: a lambda argument round-trips" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "t" } } };
+    const sum = [_]Expr{ .{ .col_ref = "x" }, .{ .col_ref = "k" } };
+    const body: Expr = .{ .call = .{ .fn_name = "add", .args = &sum } };
+    const params = [_][]const u8{ "x", "y" };
+    const args = [_]Expr{ .{ .lambda = .{ .params = &params, .body = &body } }, .{ .col_ref = "a" }, .{ .col_ref = "b" } };
+    const call: Expr = .{ .call = .{ .fn_name = "array_map", .args = &args } };
+    const derived = [_]Derived{.{ .name = "m", .expr = call }};
+    const root: Op = .{ .compute = .{ .derived = &derived, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expect(decoded == .compute);
+    try std.testing.expect(exec_expr.eql(call, decoded.compute.derived[0].expr));
 }
 
 test "ir: join round-trips with on + range + extra_predicate + skew" {
