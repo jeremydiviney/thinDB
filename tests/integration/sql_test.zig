@@ -4221,6 +4221,23 @@ test "sql: expanded scalar function spellings execute" {
     try std.testing.expectEqual(@as(usize, 64), b.values[18].data.string.rowBytes(0).len);
 }
 
+test "sql: null_or_empty is true for NULL and the empty string, and never NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE noe (id BIGINT PRIMARY KEY, s TEXT)");
+    try helpers.exec(allocator, db, "INSERT INTO noe VALUES (1, NULL), (2, ''), (3, ' '), (4, 'a')");
+    try helpers.expectTexts(allocator, db, "SELECT null_or_empty(s) FROM noe ORDER BY id", &.{ "1", "1", "0", "0" });
+    try helpers.expectTexts(allocator, db, "SELECT id FROM noe WHERE NOT null_or_empty(s) ORDER BY id", &.{ "3", "4" });
+    try helpers.expectText(allocator, db, "SELECT null_or_empty(NULL)", "1");
+    try helpers.expectText(allocator, db, "SELECT null_or_empty('')", "1");
+    try helpers.expectText(allocator, db, "SELECT null_or_empty('x')", "0");
+}
+
 test "sql: date_diff reaches a month-end anniversary whatever the earlier value's time" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -4275,7 +4292,10 @@ test "sql: unit-first date functions and aggregate aliases execute" {
         \\  std(x) AS st,
         \\  variance(x) AS varv,
         \\  first(tag) AS first_tag,
-        \\  last(tag) AS last_tag
+        \\  last(tag) AS last_tag,
+        \\  ndv(tag) AS ndv,
+        \\  approx_count_distinct_hll_sketch(tag) AS hll,
+        \\  bitmap_union_int(x) AS bui
         \\FROM agg_new
     );
     defer q.deinit();
@@ -4293,6 +4313,9 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     try std.testing.expectApproxEqAbs(@as(f64, 19.0 / 16.0), b.values[10].data.double[0], 1e-9);
     try std.testing.expectEqualStrings("a", b.values[11].data.string.rowBytes(0));
     try std.testing.expectEqualStrings("c", b.values[12].data.string.rowBytes(0));
+    try std.testing.expectEqual(@as(i64, 3), b.values[13].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[14].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 3), b.values[15].data.bigint[0]);
 }
 
 // The grouped, batched accumulator keeps COUNT_IF in a narrow count cell.
