@@ -1201,3 +1201,11 @@ test "numbers read as a date as StarRocks casts a column (issue #399)" {
     try ExpectRead.date(null, doubleToDate(1e20));
     try ExpectRead.date(null, doubleToDate(std.math.nan(f64)));
 }
+
+/// Iceberg's `bucket[N]` partition transform of a value's single-value
+/// bytes: Murmur3 (x86, 32-bit, seed 0) with the sign bit cleared, mod N.
+pub fn icebergBucket(bytes: []const u8, buckets: i128) error{InvalidIcebergTransformWidth}!i32 {
+    if (buckets < 1) return error.InvalidIcebergTransformWidth;
+    const hash = std.hash.Murmur3_32.hashWithSeed(bytes, 0) & 0x7fff_ffff;
+    return @intCast(@mod(@as(i128, hash), buckets));
+}

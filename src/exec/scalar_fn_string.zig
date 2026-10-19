@@ -854,6 +854,55 @@ pub fn murmurHash3_32Kernel(allocator: Allocator, args: []const ColumnView, out:
     }
 }
 
+/// `__iceberg_transform_bucket(x, n)`: an INT or BIGINT hashes as an
+/// 8-byte little-endian long, a DATE as its days and a DATETIME as its
+/// microseconds since 1970, and a string as its bytes, as Iceberg
+/// serializes them.
+pub fn icebergBucketKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const bucket_counts = args[1].data.bigint;
+    const base = out.data.rowCount();
+    var long_bytes: [8]u8 = undefined;
+    for (0..row_count) |i| {
+        const valid = allValid(args, i);
+        const bytes: []const u8 = switch (args[0].data) {
+            inline .int, .bigint, .date, .datetime => |values| blk: {
+                std.mem.writeInt(i64, &long_bytes, values[i], .little);
+                break :blk &long_bytes;
+            },
+            else => stringViewOf(args[0]).rowBytes(i),
+        };
+        try out.data.int.append(allocator, if (valid) try common.icebergBucket(bytes, bucket_counts[i]) else 0);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// `__iceberg_transform_truncate(x, w)`: Iceberg's `truncate[W]`. An
+/// integer drops to the multiple of w at or below it, and a string keeps
+/// its first w characters.
+pub fn icebergTruncateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const widths = args[1].data.bigint;
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        const valid = allValid(args, i);
+        if (valid and widths[i] < 1) return error.InvalidIcebergTransformWidth;
+        switch (args[0].data) {
+            .int => |values| try out.data.int.append(allocator, if (valid) try icebergTruncateInteger(values[i], widths[i]) else 0),
+            .bigint => |values| try out.data.bigint.append(allocator, if (valid) try icebergTruncateInteger(values[i], widths[i]) else 0),
+            else => {
+                const s = stringViewOf(args[0]).rowBytes(i);
+                const chars: usize = if (valid) @intCast(@min(widths[i], s.len)) else 0;
+                try stringStoreOf(out).appendValue(allocator, s[0..charOffset(s, chars)]);
+            },
+        }
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+fn icebergTruncateInteger(value: anytype, width: i64) !@TypeOf(value) {
+    const wide: i128 = value;
+    return std.math.cast(@TypeOf(value), wide - @mod(wide, width)) orelse error.ArithmeticOverflow;
+}
+
 pub fn xxHash3_64Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
     var i: usize = 0;

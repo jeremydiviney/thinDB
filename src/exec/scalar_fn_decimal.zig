@@ -648,6 +648,42 @@ pub fn hexKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, 
     }
 }
 
+/// `__iceberg_transform_bucket(d, n)`: Iceberg hashes a DECIMAL as its
+/// unscaled value's shortest big-endian two's complement, the bytes Java's
+/// `BigInteger.toByteArray` writes.
+pub fn icebergBucketKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    var bytes: [16]u8 = undefined;
+    for (0..n) |row| {
+        const m = mantissaAt(args[0], row);
+        std.mem.writeInt(i128, &bytes, m, .big);
+        var len: usize = 1;
+        while (len < bytes.len and !fitsSignedBytes(m, len)) len += 1;
+        const valid = args[0].isValid(row) and args[1].isValid(row);
+        try out.data.int.append(allocator, if (valid) try common.icebergBucket(bytes[bytes.len - len ..], nAt(args[1], row)) else 0);
+    }
+}
+
+fn fitsSignedBytes(m: i128, len: usize) bool {
+    const bound = @as(i128, 1) << @intCast(len * 8 - 1);
+    return m >= -bound and m < bound;
+}
+
+/// `__iceberg_transform_truncate(d, w)`: the unscaled value dropped to the
+/// multiple of w at or below it, at d's scale, as Iceberg truncates a
+/// DECIMAL.
+pub fn icebergTruncateKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
+    _ = arg_types;
+    for (0..n) |row| {
+        const valid = args[0].isValid(row) and args[1].isValid(row);
+        const width = nAt(args[1], row);
+        if (valid and width < 1) return error.InvalidIcebergTransformWidth;
+        const m = mantissaAt(args[0], row);
+        try appendDec(allocator, out, out_type, if (valid) m - @mod(m, width) else 0, valid);
+    }
+}
+
 /// A DECIMAL where MySQL reads it as an integer (`HEX(2.5)`, BENCHMARK's
 /// count): rounded half away from zero, clamped to the BIGINT range.
 pub fn integerArgAt(v: ColumnView, t: Type, row: usize) i64 {
