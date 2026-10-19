@@ -1388,6 +1388,16 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "json_length", .arg_types = &.{.json}, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthKernel },
     .{ .name = "json_contains", .arg_types = &.{ .json, .json }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonContainsKernel },
     .{ .name = "json_keys", .arg_types = &.{.json}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonKeysKernel },
+    .{ .name = "json_length", .arg_types = &.{ .json, .string }, .return_type = .int, .null_strategy = .kernel_managed, .kernel = json.jsonLengthPathKernel },
+    .{ .name = "json_remove", .arg_types = &.{ .json, .string }, .return_type = .json, .variadic_min_args = 2, .variadic_fixed = 1, .null_strategy = .kernel_managed, .kernel = json.jsonRemoveKernel },
+    // StarRocks' JSON functions.
+    .{ .name = "parse_json", .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
+    .{ .name = "get_json_string", .arg_types = &.{ .json, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = json.getJsonStringKernel },
+    .{ .name = "get_json_int", .arg_types = &.{ .json, .string }, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = json.getJsonIntKernel },
+    .{ .name = "get_json_double", .arg_types = &.{ .json, .string }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = json.getJsonDoubleKernel },
+    .{ .name = "get_json_bool", .arg_types = &.{ .json, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.getJsonBoolKernel },
+    .{ .name = "json_query", .arg_types = &.{ .json, .string }, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonQueryKernel },
+    .{ .name = "json_exists", .arg_types = &.{ .json, .string }, .return_type = .boolean, .null_strategy = .kernel_managed, .kernel = json.jsonExistsKernel },
     .{ .name = "to_json", .arg_types = &.{.json}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.toJsonKernel },
     .{ .name = JSON_AGG_ARRAY_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggArrayKernel },
     .{ .name = JSON_AGG_OBJECT_FN, .arg_types = &.{.string}, .return_type = .json, .null_strategy = .kernel_managed, .kernel = json.jsonAggObjectKernel },
@@ -1892,6 +1902,7 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "power", .name = "pow" },
     .{ .alias = "ceiling", .name = "ceil" },
     .{ .alias = "char", .name = "chr" },
+    .{ .alias = "get_json_object", .name = "get_json_string" },
 };
 
 pub fn canonicalName(name: []const u8) []const u8 {

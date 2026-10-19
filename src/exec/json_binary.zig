@@ -593,6 +593,54 @@ pub fn navigate(root: []const u8, steps: []const Step) ?[]const u8 {
     return cur;
 }
 
+/// `v` without the value `steps` lead to, or null when they lead nowhere.
+/// `steps` is not empty. Caller owns the slice.
+pub fn removed(aa: Allocator, v: []const u8, steps: []const Step) Allocator.Error!?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(aa);
+    if (!try appendRemoved(aa, &out, v, steps)) return null;
+    return try out.toOwnedSlice(aa);
+}
+
+fn appendRemoved(aa: Allocator, out: *std.ArrayList(u8), v: []const u8, steps: []const Step) Allocator.Error!bool {
+    var child_out: std.ArrayList(u8) = .empty;
+    defer child_out.deinit(aa);
+    switch (steps[0]) {
+        .member => |key| {
+            const child = member(v, key) orelse return false;
+            if (steps.len > 1 and !try appendRemoved(aa, &child_out, child, steps[1..])) return false;
+            var members: std.ArrayList(Member) = .empty;
+            defer members.deinit(aa);
+            var i: u32 = 0;
+            while (i < readU32(v, 5)) : (i += 1) {
+                const k = memberKey(v, i);
+                if (!std.mem.eql(u8, k, key)) {
+                    try members.append(aa, .{ .key = k, .val = memberValue(v, i) });
+                } else if (steps.len > 1) {
+                    try members.append(aa, .{ .key = k, .val = child_out.items });
+                }
+            }
+            try appendObject(aa, out, members.items);
+        },
+        .index => |idx| {
+            const child = element(v, idx) orelse return false;
+            if (steps.len > 1 and !try appendRemoved(aa, &child_out, child, steps[1..])) return false;
+            var elems: std.ArrayList(u8) = .empty;
+            defer elems.deinit(aa);
+            var offsets: std.ArrayList(u32) = .empty;
+            defer offsets.deinit(aa);
+            var i: u32 = 0;
+            while (i < readU32(v, 5)) : (i += 1) {
+                if (i == idx and steps.len == 1) continue;
+                try offsets.append(aa, @intCast(elems.items.len));
+                try elems.appendSlice(aa, if (i == idx) child_out.items else elementValue(v, i));
+            }
+            try appendArray(aa, out, elems.items, offsets.items);
+        },
+    }
+    return true;
+}
+
 pub fn arrayLen(v: []const u8) ?usize {
     return switch (tagOf(v)) {
         .array, .object => readU32(v, 5),
@@ -628,10 +676,13 @@ pub fn isValid(aa: Allocator, bytes: []const u8) bool {
 // Containment (JSON_CONTAINS) over JSONB
 // ---------------------------------------------------------------------------
 
-/// MySQL JSON_CONTAINS: is `cand` structurally contained in `target`?
+/// MySQL JSON_CONTAINS: is `cand` structurally contained in `target`? An
+/// array holds whatever one of its elements holds, and scalars compare as
+/// JSON values, so `1` is contained in `1.0`.
 pub fn contains(target: []const u8, cand: []const u8) bool {
     switch (tagOf(cand)) {
         .object => {
+            if (tagOf(target) == .array) return arrayContains(target, cand);
             if (tagOf(target) != .object) return false;
             const count = readU32(cand, 5);
             var i: u32 = 0;
@@ -659,7 +710,7 @@ pub fn contains(target: []const u8, cand: []const u8) bool {
         },
         else => {
             if (tagOf(target) == .array) return arrayContains(target, cand);
-            return std.mem.eql(u8, target, cand);
+            return compare(target, cand) == .eq;
         },
     }
 }
@@ -1189,4 +1240,56 @@ test "compare orders JSON values as MySQL 8.4 does" {
     try std.testing.expectEqual(std.math.Order.eq, compareOperands(operand(x), textOperand("x")));
     try std.testing.expectEqual(std.math.Order.lt, compareOperands(textOperand("\"x\""), operand(x)));
     try std.testing.expectEqual(std.math.Order.eq, compareOperands(operand(x), textOperand(x)));
+}
+
+test "contains follows MySQL's JSON_CONTAINS rules" {
+    const aa = std.testing.allocator;
+    const cases = .{
+        .{ "[1, 2, 3]", "2", true },
+        .{ "[1, 2, 3]", "[3, 1]", true },
+        .{ "[1, 2, 3]", "[1, 4]", false },
+        .{ "[{\"a\": 1}, {\"b\": 2}]", "{\"a\": 1}", true },
+        .{ "[{\"a\": 1}, {\"b\": 2}]", "{\"a\": 1, \"b\": 2}", false },
+        .{ "[[1, 2], [3]]", "[1]", true },
+        .{ "{\"a\": {\"b\": 1, \"c\": 2}}", "{\"a\": {\"c\": 2}}", true },
+        .{ "{\"a\": [1, 2]}", "{\"a\": 2}", true },
+        .{ "{\"a\": 1}", "[{\"a\": 1}]", false },
+        .{ "1.0", "1", true },
+        .{ "\"1\"", "1", false },
+    };
+    inline for (cases) |c| {
+        const target = try encodeFromText(aa, c[0]);
+        defer aa.free(target);
+        const cand = try encodeFromText(aa, c[1]);
+        defer aa.free(cand);
+        try std.testing.expectEqual(c[2], contains(target, cand));
+    }
+}
+
+test "removed drops the value a path leads to at any depth" {
+    const aa = std.testing.allocator;
+    const cases = .{
+        .{ "{\"a\": 1, \"b\": 2}", &[_]Step{.{ .member = "a" }}, "{\"b\": 2}" },
+        .{ "{\"a\": {\"x\": 1, \"y\": 2}}", &[_]Step{ .{ .member = "a" }, .{ .member = "x" } }, "{\"a\": {\"y\": 2}}" },
+        .{ "[0, [1, 2, 3], 4]", &[_]Step{ .{ .index = 1 }, .{ .index = 0 } }, "[0, [2, 3], 4]" },
+        .{ "{\"arr\": [0, 1, 2]}", &[_]Step{ .{ .member = "arr" }, .{ .index = 2 } }, "{\"arr\": [0, 1]}" },
+        .{ "{\"a\": {}}", &[_]Step{.{ .member = "a" }}, "{}" },
+        .{ "{\"a\": 1}", &[_]Step{.{ .member = "b" }}, null },
+        .{ "{\"a\": [1]}", &[_]Step{ .{ .member = "a" }, .{ .index = 1 } }, null },
+        .{ "[1]", &[_]Step{.{ .member = "a" }}, null },
+    };
+    inline for (cases) |c| {
+        const doc = try encodeFromText(aa, c[0]);
+        defer aa.free(doc);
+        const got = try removed(aa, doc, c[1]);
+        defer if (got) |g| aa.free(g);
+        if (@TypeOf(c[2]) == @TypeOf(null)) {
+            try std.testing.expect(got == null);
+        } else {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(aa);
+            try toText(aa, &text, got.?);
+            try std.testing.expectEqualStrings(c[2], text.items);
+        }
+    }
 }
