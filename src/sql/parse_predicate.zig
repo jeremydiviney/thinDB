@@ -212,6 +212,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (p.cur.tag == .kw_null) {
         try p.advance();
         const null_lhs: ir.Expr = .{ .null_lit = .string };
+        if (try isArithAhead(p)) return try parseExprOps(p, null_lhs);
         if (p.cur.tag == .kw_is) return try parseIsOps(p, null_lhs);
         if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, null_lhs)).?;
         if (!isComparisonToken(p.cur.tag)) return .unknown;
@@ -247,8 +248,8 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // Desugars to a json_extract/json_value call and routes through the
     // generic expression-comparison path.
     if (p.cur.tag == .arrow or p.cur.tag == .arrow2) {
-        const lhs = try p.consumeJsonArrows(.{ .col_ref = col_dup });
-        if (try parseComparisonTail(p, lhs)) |pred| return pred;
+        const lhs = try p.continueBinaryFrom(try p.consumeJsonArrows(.{ .col_ref = col_dup }));
+        if (try parseExprTail(p, lhs)) |pred| return pred;
         return try makeExprComparisonPredicate(p, lhs, .eq, .{ .lit = .{ .boolean = true } });
     }
 
@@ -420,21 +421,24 @@ fn hexRangeOrList(p: anytype, hex: ir.Expr) @TypeOf(p.*).Err!?PredicateExpr {
 /// operand, or arithmetic led by a literal) on a predicate's left side.
 fn parseExprOps(p: anytype, expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const lhs = try p.continueBinaryFrom(expr);
+    if (try parseExprTail(p, lhs)) |pred| return pred;
+    // A bare expression is its truth (`WHERE fn(x)`, `WHERE 1 + x`), as a
+    // bare column is.
+    if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs));
+    return try truthPredicate(p, lhs);
+}
+
+/// The predicate an operator after the expression `lhs` makes: a
+/// comparison, IS, BETWEEN, LIKE, REGEXP or IN. Null when none follows.
+fn parseExprTail(p: anytype, lhs: ir.Expr) @TypeOf(p.*).Err!?PredicateExpr {
     if (try parseComparisonTail(p, lhs)) |pred| return pred;
-    switch (p.cur.tag) {
+    return switch (p.cur.tag) {
         // `ABS(x) BETWEEN ...`, `fn(x) IN (...)`, `fn(x) IS NULL`: anchor the
         // call to a hidden computed column and reuse the operator tail. A
         // parenthesized bare column (`(s) IN (...)`) stays that column.
-        .kw_is, .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => {
-            return try parseColOps(p, try anchorColumn(p, lhs));
-        },
-        // A bare expression is its truth (`WHERE fn(x)`, `WHERE 1 + x`), as
-        // a bare column is.
-        else => {
-            if (try soundsLikeAhead(p)) return try parseColOps(p, try p.materializePredicateExpr(lhs));
-            return try truthPredicate(p, lhs);
-        },
-    }
+        .kw_is, .kw_not, .kw_between, .kw_like, .kw_regexp, .kw_in => try parseColOps(p, try anchorColumn(p, lhs)),
+        else => null,
+    };
 }
 
 fn isArithToken(tag: anytype) bool {

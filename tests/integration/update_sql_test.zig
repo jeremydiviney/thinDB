@@ -713,3 +713,21 @@ test "ON UPDATE timestamps replay from the WAL as they were stored (#251)" {
     defer allocator.free(after);
     try std.testing.expectEqualSlices(i64, before, after);
 }
+
+test "UPDATE: a column assigned twice keeps the last value, as in MySQL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    try exec(allocator, db, "UPDATE t SET qty = 100, label = 'x', qty = 200 WHERE id = 1");
+    try helpers.expectTexts(allocator, db, "SELECT qty FROM t WHERE id = 1", &.{"200"});
+    try helpers.expectTexts(allocator, db, "SELECT label FROM t WHERE id = 1", &.{"x"});
+
+    try exec(allocator, db, "CREATE TABLE bonus (id BIGINT PRIMARY KEY, amount INT)");
+    try exec(allocator, db, "INSERT INTO bonus VALUES (2, 5)");
+    try exec(allocator, db, "UPDATE t JOIN bonus ON t.id = bonus.id SET t.qty = bonus.amount, t.qty = bonus.amount + 1");
+    try helpers.expectTexts(allocator, db, "SELECT qty FROM t ORDER BY id", &.{ "200", "6", "30", "40" });
+}

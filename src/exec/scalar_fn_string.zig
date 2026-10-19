@@ -682,10 +682,19 @@ pub fn md5sumKernel(allocator: Allocator, args: []const ColumnView, out: *Column
     }
 }
 
+/// Seed StarRocks and Doris start `murmur_hash3_32` from, so checksums
+/// written against either engine match.
+const MURMUR3_32_SEED: u32 = 104729;
+
+/// `murmur_hash3_32(s1, s2, ...)`: each argument is hashed with the previous
+/// hash as its seed, and the result is a signed INT.
 pub fn murmurHash3_32Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const sv = stringViewOf(args[0]);
     var i: usize = 0;
-    while (i < row_count) : (i += 1) try out.data.bigint.append(allocator, @intCast(std.hash.Murmur3_32.hash(sv.rowBytes(i))));
+    while (i < row_count) : (i += 1) {
+        var hash: u32 = MURMUR3_32_SEED;
+        for (args) |arg| hash = std.hash.Murmur3_32.hashWithSeed(stringViewOf(arg).rowBytes(i), hash);
+        try out.data.int.append(allocator, @bitCast(hash));
+    }
 }
 
 pub fn xxHash3_64Kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {

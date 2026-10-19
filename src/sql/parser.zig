@@ -294,8 +294,15 @@ fn keywordScalarName(tag: TokenTag) ?[]const u8 {
         .kw_database => "database",
         .kw_schema => "schema",
         .kw_row => "row",
+        .kw_like => "like",
         else => null,
     };
+}
+
+/// Whether a keyword can begin an operand. LIKE opens a call only where an
+/// operand must start; after a name it is the operator (`SELECT mod LIKE 'a%'`).
+fn keywordBeginsOperand(tag: TokenTag) bool {
+    return tag != .kw_like and keywordScalarName(tag) != null;
 }
 
 /// MySQL's SELECT modifiers that steer execution or the query cache only.
@@ -2153,7 +2160,7 @@ pub const Parser = struct {
     fn selectItemFollows(self: *Parser) ParseError!bool {
         var look = self.lex.*;
         const tok = try look.next();
-        if (keywordScalarName(tok.tag) != null) return true;
+        if (keywordBeginsOperand(tok.tag)) return true;
         return switch (tok.tag) {
             .identifier, .integer, .big_integer, .floating, .string, .star, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .system_variable, .kw_null, .kw_true, .kw_false, .kw_case, .kw_not, .kw_exists, .kw_distinct, .kw_all => true,
             else => false,
@@ -2865,7 +2872,7 @@ pub const Parser = struct {
         const next = try look.next();
         return switch (next.tag) {
             .identifier, .integer, .big_integer, .floating, .string, .lparen, .minus, .plus, .tilde, .bang, .at_identifier, .system_variable, .kw_null, .kw_true, .kw_false, .kw_case => true,
-            else => keywordScalarName(next.tag) != null,
+            else => keywordBeginsOperand(next.tag),
         };
     }
 
@@ -6653,7 +6660,9 @@ pub const Parser = struct {
             if (self.cur.tag != .eq) return ParseError.SqlExpectedToken;
             try self.advance();
             const val = try self.parseScalar();
-            try assigns.append(self.arena, .{ .col = col_name, .value = val });
+            if (ir.assignmentIndex(assigns.items, null, col_name)) |prior| {
+                assigns.items[prior].value = val;
+            } else try assigns.append(self.arena, .{ .col = col_name, .value = val });
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
@@ -6950,9 +6959,14 @@ pub const Parser = struct {
                 all_qualified = false;
             }
             try self.expect(.eq);
-            try values.append(self.arena, try self.skipDmlValue());
-            const value_name = try std.fmt.allocPrint(self.arena, "__set_{d}", .{assigns.items.len});
-            try assigns.append(self.arena, .{ .col = col, .value = .{ .col_ref = value_name }, .target = target });
+            const value = try self.skipDmlValue();
+            if (ir.assignmentIndex(assigns.items, target, col)) |prior| {
+                values.items[prior] = value;
+            } else {
+                try values.append(self.arena, value);
+                const value_name = try std.fmt.allocPrint(self.arena, "__set_{d}", .{assigns.items.len});
+                try assigns.append(self.arena, .{ .col = col, .value = .{ .col_ref = value_name }, .target = target });
+            }
             if (self.cur.tag != .comma) break;
             try self.advance();
         }

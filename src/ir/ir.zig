@@ -775,6 +775,18 @@ pub const Assignment = struct {
     target: ?[]const u8 = null,
 };
 
+/// Index of the assignment in `assigns` to `col` of the same target, which a
+/// later one replaces: MySQL and StarRocks keep the last value a SET gives a
+/// column.
+pub fn assignmentIndex(assigns: []const Assignment, target: ?[]const u8, col: []const u8) ?usize {
+    for (assigns, 0..) |a, i| {
+        if (!types.columnNameEql(a.col, col)) continue;
+        const same_target = if (a.target != null and target != null) std.ascii.eqlIgnoreCase(a.target.?, target.?) else a.target == null and target == null;
+        if (same_target) return i;
+    }
+    return null;
+}
+
 /// `UPDATE t SET col = expr [, ...] [WHERE ...]` — modeled as
 /// DELETE-old + INSERT-new under the table mutex. The
 /// assignment exprs can reference the original row's columns

@@ -1782,7 +1782,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "sha2", .arg_types = &.{ .string, .int }, .return_type = .string, .kernel = string.sha2Kernel },
     .{ .name = "sha256", .arg_types = &.{.string}, .return_type = .string, .kernel = string.sha256Kernel },
     .{ .name = "crc32", .arg_types = &.{.string}, .return_type = .bigint, .kernel = string.crc32Kernel },
-    .{ .name = "murmur_hash3_32", .arg_types = &.{.string}, .return_type = .bigint, .kernel = string.murmurHash3_32Kernel },
+    .{ .name = "murmur_hash3_32", .arg_types = &.{.string}, .return_type = .int, .variadic_min_args = 1, .kernel = string.murmurHash3_32Kernel },
     .{ .name = "xx_hash3_64", .arg_types = &.{.string}, .return_type = .bigint, .kernel = string.xxHash3_64Kernel },
     .{ .name = "xx_hash3_128", .arg_types = &.{.string}, .return_type = .string, .kernel = string.xxHash3_128Kernel },
     // --- encoding ---

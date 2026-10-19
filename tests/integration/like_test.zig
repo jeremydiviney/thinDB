@@ -209,3 +209,17 @@ test "LIKE: a pattern expression matches per row" {
     }
     try helpers.expectRunError(allocator, db, "SELECT id FROM pt WHERE s LIKE pat ESCAPE '!'", error.SqlExpectedValue);
 }
+
+test "LIKE: like(s, pattern) is the operator's function form" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SELECT like('abc', 'a%')", "1");
+    try helpers.expectText(allocator, db, "SELECT like('abc', 'b%')", "0");
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM (SELECT 'abc' AS s) t WHERE like(s, '%c')", "1");
+    // After a name, LIKE is still the operator.
+    try helpers.expectText(allocator, db, "SELECT mod LIKE 'a%' FROM (SELECT 'abc' AS mod) t", "1");
+}

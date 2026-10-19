@@ -1257,7 +1257,10 @@ fn parseOnDuplicate(
         }
         if (p.cur.tag != .eq) return PE.SqlExpectedToken;
         try p.advance();
-        try assignments.append(p.arena, .{ .col = col, .value = try p.parseValueExpr() });
+        const value = try p.parseValueExpr();
+        if (ir.assignmentIndex(assignments.items, null, col)) |prior| {
+            assignments.items[prior].value = value;
+        } else try assignments.append(p.arena, .{ .col = col, .value = value });
         if (p.cur.tag != .comma) break;
         try p.advance();
     }

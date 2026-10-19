@@ -251,3 +251,15 @@ test "INSERT SET, VALUE and ROW spellings" {
     try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 11, 20, 30, 40, 50, 60 });
     try expectRunError(allocator, db, "INSERT INTO dim (id) SET id = 9", error.SqlExpectedKeyword);
 }
+
+test "ON DUPLICATE KEY UPDATE: a column assigned twice keeps the last value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openDim(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try exec(allocator, db, "INSERT INTO dim (id, a, b) VALUES (1, 0, 0) ON DUPLICATE KEY UPDATE a = 3, b = 4, a = 5");
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 5, 20 });
+    try expectInts(allocator, db, "SELECT b FROM dim ORDER BY id", &.{ 4, 200 });
+}
