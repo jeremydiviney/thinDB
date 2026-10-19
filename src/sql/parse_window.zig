@@ -97,7 +97,7 @@ pub fn validateWindowCall(
             if (args.len != 1) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
         },
-        .covar_pop, .covar_samp, .corr => {
+        .covar_pop, .covar_samp, .corr, .session_number => {
             if (args.len != 2) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
         },

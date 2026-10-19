@@ -1019,3 +1019,34 @@ test "window: a call over an expression needs no alias" {
     defer allocator.free(sums);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 63, 63, 63, 302, 302 }, sums);
 }
+
+test "window: SESSION_NUMBER starts a session where x jumps by more than delta" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sn (k BIGINT PRIMARY KEY, g BIGINT, ts BIGINT, x TINYINT, s VARCHAR(5))");
+    try helpers.exec(allocator, db, "INSERT INTO sn VALUES (1, 1, 10, 1, 'a'), (2, 1, 12, 2, 'b'), (3, 1, 20, NULL, 'c'), (4, 1, 21, 9, 'd'), (5, 2, 5, 3, 'e'), (6, 2, 100, 3, 'f'), (7, 2, NULL, 4, 'g'), (8, 2, 101, 4, 'h')");
+    const expectTexts = helpers.expectTexts;
+
+    // A gap of exactly delta stays in the session, and a NULL x stays in it
+    // without moving the last x.
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, 2) OVER (PARTITION BY g ORDER BY k) FROM sn ORDER BY k", &.{ "1", "1", "2", "2", "1", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, 0) OVER (ORDER BY k) FROM sn ORDER BY k", &.{ "1", "2", "3", "4", "4", "5", "5", "6" });
+    // The gap is signed: a fall never starts a session, unless delta is negative.
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(x, 1) OVER (PARTITION BY g ORDER BY k DESC) FROM sn ORDER BY k", &.{ "1", "1", "1", "1", "1", "1", "1", "1" });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, -1) OVER (ORDER BY ts) FROM sn ORDER BY k", &.{ "2", "3", "4", "5", "1", "6", "1", "7" });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, 9223372036854775807) OVER (ORDER BY k) FROM sn ORDER BY k", &.{ "1", "1", "1", "1", "1", "1", "1", "1" });
+    // Over an expression, ignoring a frame, and NULL for a NULL argument.
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts + 1, 5) OVER (PARTITION BY g ORDER BY k) FROM sn ORDER BY k", &.{ "1", "1", "2", "2", "1", "2", "2", "2" });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, 2) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM sn ORDER BY k", &.{ "1", "1", "2", "2", "2", "3", "3", "3" });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(NULL, NULL) OVER (ORDER BY k) FROM sn WHERE k < 3 ORDER BY k", &.{ null, null });
+    try expectTexts(allocator, db, "SELECT SESSION_NUMBER(ts, NULL) OVER (ORDER BY k) FROM sn WHERE k < 3 ORDER BY k", &.{ null, null });
+    try expectTexts(allocator, db, "SELECT SUM(n) FROM (SELECT SESSION_NUMBER(ts, 2) OVER (PARTITION BY g ORDER BY k) AS n FROM sn) x", &.{"13"});
+
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT SESSION_NUMBER(s, 2) OVER (ORDER BY k) FROM sn"));
+    try std.testing.expectError(error.WindowUnsupported, helpers.exec(allocator, db, "SELECT SESSION_NUMBER(ts, g) OVER (ORDER BY k) FROM sn"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT SESSION_NUMBER(ts) OVER (ORDER BY k) FROM sn"));
+}

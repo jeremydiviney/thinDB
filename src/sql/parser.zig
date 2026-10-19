@@ -9221,6 +9221,10 @@ fn windowArgNeedsPrecompute(func: ir.WindowFunc, arg_idx: usize, arg: ir.Expr) b
             .col_ref => false,
             else => true,
         },
+        .session_number => arg_idx == 0 and switch (arg) {
+            .col_ref, .null_lit => false,
+            else => true,
+        },
         else => false,
     };
 }
