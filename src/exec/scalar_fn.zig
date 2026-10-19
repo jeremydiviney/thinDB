@@ -1849,6 +1849,13 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "insert", .arg_types = &.{ .string, .int, .int, .string }, .return_type = .string, .kernel = string.insertKernel },
     .{ .name = "quote", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.quoteKernel },
     .{ .name = "soundex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.soundexKernel },
+    .{ .name = "ngram_search", .arg_types = &.{ .string, .string, .int }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = string.NgramSearch(false).kernel },
+    .{ .name = "ngram_search_case_insensitive", .arg_types = &.{ .string, .string, .int }, .return_type = .double, .null_strategy = .kernel_managed, .kernel = string.NgramSearch(true).kernel },
+    // --- URLs ---
+    .{ .name = "url_encode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlEncodeKernel },
+    .{ .name = "url_decode", .arg_types = &.{.string}, .return_type = .string, .kernel = string.urlDecodeKernel },
+    .{ .name = "url_extract_host", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.urlExtractHostKernel },
+    .{ .name = "url_extract_parameter", .arg_types = &.{ .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.urlExtractParameterKernel },
     // --- network addresses ---
     .{ .name = "inet_aton", .arg_types = &.{.string}, .return_type = .bigint, .null_strategy = .kernel_managed, .kernel = inet.inetAtonKernel },
     .{ .name = "inet_ntoa", .arg_types = &.{.bigint}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = inet.inetNtoaKernel },

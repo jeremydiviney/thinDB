@@ -1688,6 +1688,246 @@ fn appendSoundex(allocator: Allocator, code: *std.ArrayList(u8), s: []const u8) 
     while (chars < 4) : (chars += 1) try code.append(allocator, '0');
 }
 
+// ---------------------------------------------------------------------------
+// URLs
+// ---------------------------------------------------------------------------
+
+/// The parts of a URL the URL functions read, or null when `url` is none: it
+/// needs a scheme, and RFC 3986 allows no space or control character in it.
+const UrlParts = struct {
+    /// Null when the URL has no `//` authority.
+    host: ?[]const u8,
+    /// What follows the `?`, short of any `#` fragment.
+    query: ?[]const u8,
+
+    fn parse(url: []const u8) ?UrlParts {
+        for (url) |c| if (c <= ' ' or c == 0x7f) return null;
+        const colon = std.mem.indexOfScalar(u8, url, ':') orelse return null;
+        if (colon == 0 or !std.ascii.isAlphabetic(url[0])) return null;
+        for (url[1..colon]) |c| if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return null;
+        const rest = url[colon + 1 ..];
+        const before_fragment = rest[0 .. std.mem.indexOfScalar(u8, rest, '#') orelse rest.len];
+        const query_at = std.mem.indexOfScalar(u8, before_fragment, '?');
+        const before_query = before_fragment[0 .. query_at orelse before_fragment.len];
+        return .{
+            .host = if (std.mem.startsWith(u8, before_query, "//")) hostOf(before_query[2..]) else null,
+            .query = if (query_at) |q| before_fragment[q + 1 ..] else null,
+        };
+    }
+
+    fn hostOf(after_slashes: []const u8) []const u8 {
+        const authority = after_slashes[0 .. std.mem.indexOfScalar(u8, after_slashes, '/') orelse after_slashes.len];
+        const host_port = authority[if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0..];
+        if (std.mem.startsWith(u8, host_port, "[")) {
+            const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return host_port;
+            return host_port[0 .. close + 1];
+        }
+        return host_port[0 .. std.mem.indexOfScalar(u8, host_port, ':') orelse host_port.len];
+    }
+};
+
+/// URL_EXTRACT_HOST(url): the host of `url`'s authority, without user or
+/// port; NULL when `url` is no URL or has no authority.
+pub fn urlExtractHostKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const urls = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        const parts = if (args[0].isValid(i)) UrlParts.parse(urls.rowBytes(i)) else null;
+        const host = if (parts) |u| u.host else null;
+        try ss.appendValue(allocator, host orelse "");
+        try out.appendValidBit(allocator, base + i, host != null);
+    }
+}
+
+/// URL_EXTRACT_PARAMETER(url, name): the value of the first parameter of
+/// `url`'s query called `name`, names and values read as a form encodes them
+/// (`appendFormDecoded`); '' for a parameter with no `=`, NULL when there is
+/// no such parameter or `url` is no URL.
+pub fn urlExtractParameterKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const urls = stringViewOf(args[0]);
+    const names = stringViewOf(args[1]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var name_buf: std.ArrayList(u8) = .empty;
+    defer name_buf.deinit(allocator);
+    var value_buf: std.ArrayList(u8) = .empty;
+    defer value_buf.deinit(allocator);
+    for (0..row_count) |i| {
+        const value = if (allValid(args, i)) try queryParameter(allocator, urls.rowBytes(i), names.rowBytes(i), &name_buf, &value_buf) else null;
+        try ss.appendValue(allocator, value orelse "");
+        try out.appendValidBit(allocator, base + i, value != null);
+    }
+}
+
+fn queryParameter(allocator: Allocator, url: []const u8, name: []const u8, name_buf: *std.ArrayList(u8), value_buf: *std.ArrayList(u8)) !?[]const u8 {
+    const query = (UrlParts.parse(url) orelse return null).query orelse return null;
+    var params = std.mem.splitScalar(u8, query, '&');
+    while (params.next()) |param| {
+        if (param.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, param, '=');
+        name_buf.clearRetainingCapacity();
+        try appendFormDecoded(allocator, name_buf, param[0 .. eq orelse param.len]);
+        if (!std.mem.eql(u8, name_buf.items, name)) continue;
+        value_buf.clearRetainingCapacity();
+        if (eq) |e| try appendFormDecoded(allocator, value_buf, param[e + 1 ..]);
+        return value_buf.items;
+    }
+    return null;
+}
+
+/// URL_ENCODE(s): `s` in the application/x-www-form-urlencoded format:
+/// letters, digits and `*-._` as they are, a space as `+`, and every other
+/// byte as `%XX`.
+pub fn urlEncodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        for (sv.rowBytes(i)) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '*' or c == '-' or c == '.' or c == '_') {
+                try buf.append(allocator, c);
+            } else if (c == ' ') {
+                try buf.append(allocator, '+');
+            } else {
+                try buf.appendSlice(allocator, &.{ '%', "0123456789ABCDEF"[c >> 4], "0123456789ABCDEF"[c & 0x0F] });
+            }
+        }
+        try ss.appendValue(allocator, buf.items);
+    }
+}
+
+/// URL_DECODE(s): `s` read back from the application/x-www-form-urlencoded
+/// format (`appendFormDecoded`).
+pub fn urlDecodeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        try appendFormDecoded(allocator, &buf, sv.rowBytes(i));
+        try ss.appendValue(allocator, buf.items);
+    }
+}
+
+/// `text` with each `%XX` escape read as its byte and `+` as a space, as a
+/// form encodes them. A `%` without two hex digits after it stays a `%`.
+fn appendFormDecoded(allocator: Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const escaped: ?u8 = if (text[i] == '%' and i + 2 < text.len) hexByte(text[i + 1], text[i + 2]) else null;
+        if (escaped) |b| {
+            try out.append(allocator, b);
+            i += 2;
+        } else {
+            try out.append(allocator, if (text[i] == '+') ' ' else text[i]);
+        }
+    }
+}
+
+fn hexByte(hi: u8, lo: u8) ?u8 {
+    return (decodeHexNibble(hi) orelse return null) << 4 | (decodeHexNibble(lo) orelse return null);
+}
+
+// ---------------------------------------------------------------------------
+// N-gram similarity
+// ---------------------------------------------------------------------------
+
+/// NGRAM_SEARCH(haystack, needle, n) and its case-insensitive twin: how much
+/// of the needle the haystack holds, as the share of the needle's `n`-byte
+/// grams the haystack has too, each haystack gram standing for at most one
+/// of them. 1 when it has them all; 0 when the needle has none (it's shorter
+/// than `n`). Computed in single precision as in StarRocks, so the values
+/// match it to the digit. Case folding is ASCII only.
+pub fn NgramSearch(comptime fold_case: bool) type {
+    return struct {
+        pub fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            const haystacks = stringViewOf(args[0]);
+            const needles = stringViewOf(args[1]);
+            const base = out.data.rowCount();
+            var needle: NgramNeedle = .{};
+            defer needle.deinit(allocator);
+            var folded: std.ArrayList(u8) = .empty;
+            defer folded.deinit(allocator);
+            for (0..row_count) |i| {
+                const valid = allValid(args, i);
+                var similarity: f32 = 0;
+                if (valid) {
+                    const n = args[2].data.int[i];
+                    if (n <= 0) return error.InvalidNgramLength;
+                    try needle.set(allocator, needles.rowBytes(i), @intCast(n), fold_case);
+                    var haystack = haystacks.rowBytes(i);
+                    if (fold_case) {
+                        folded.clearRetainingCapacity();
+                        try folded.appendSlice(allocator, haystack);
+                        foldBytes(folded.items, true);
+                        haystack = folded.items;
+                    }
+                    similarity = try needle.similarity(allocator, haystack);
+                }
+                try out.data.double.append(allocator, similarity);
+                try out.appendValidBit(allocator, base + i, valid);
+            }
+        }
+    };
+}
+
+/// A needle's distinct grams and how often each occurs, kept between rows so
+/// a constant needle is cut into grams once per batch.
+const NgramNeedle = struct {
+    text: std.ArrayList(u8) = .empty,
+    n: usize = 0,
+    /// Gram → its place in `counts`; the keys point into `text`.
+    ids: std.StringHashMapUnmanaged(u32) = .empty,
+    counts: std.ArrayList(u32) = .empty,
+    left: std.ArrayList(u32) = .empty,
+    grams: usize = 0,
+
+    fn deinit(self: *NgramNeedle, allocator: Allocator) void {
+        self.text.deinit(allocator);
+        self.ids.deinit(allocator);
+        self.counts.deinit(allocator);
+        self.left.deinit(allocator);
+    }
+
+    fn set(self: *NgramNeedle, allocator: Allocator, raw: []const u8, n: usize, fold_case: bool) !void {
+        if (self.n == n and self.text.items.len == raw.len and (if (fold_case) std.ascii.eqlIgnoreCase(self.text.items, raw) else std.mem.eql(u8, self.text.items, raw))) return;
+        self.ids.clearRetainingCapacity();
+        self.counts.clearRetainingCapacity();
+        self.text.clearRetainingCapacity();
+        try self.text.appendSlice(allocator, raw);
+        if (fold_case) foldBytes(self.text.items, true);
+        self.n = n;
+        self.grams = if (raw.len >= n) raw.len - n + 1 else 0;
+        for (0..self.grams) |at| {
+            const entry = try self.ids.getOrPut(allocator, self.text.items[at..][0..n]);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = @intCast(self.counts.items.len);
+                try self.counts.append(allocator, 0);
+            }
+            self.counts.items[entry.value_ptr.*] += 1;
+        }
+    }
+
+    fn similarity(self: *NgramNeedle, allocator: Allocator, haystack: []const u8) !f32 {
+        if (self.grams == 0 or haystack.len < self.n) return 0;
+        self.left.clearRetainingCapacity();
+        try self.left.appendSlice(allocator, self.counts.items);
+        var found: usize = 0;
+        for (0..haystack.len - self.n + 1) |at| {
+            const id = self.ids.get(haystack[at..][0..self.n]) orelse continue;
+            if (self.left.items[id] == 0) continue;
+            self.left.items[id] -= 1;
+            found += 1;
+        }
+        const missed: f32 = @floatFromInt(self.grams - found);
+        return 1 - missed / @as(f32, @floatFromInt(self.grams));
+    }
+};
+
 test "foldBytes vectorized case-fold matches scalar across boundaries and non-alpha" {
     const testing = std.testing;
     // Length 67 spans multiple vector chunks plus a non-zero scalar tail; mixes

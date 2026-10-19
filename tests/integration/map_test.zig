@@ -188,3 +188,22 @@ test "MAP: text and empty maps beside typed maps" {
         \\SELECT map_concat(c1, map()) FROM t0
     , "{}");
 }
+
+test "MAP: STR_TO_MAP cuts text into entries and each entry into a key and a value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE sm (id BIGINT PRIMARY KEY, s VARCHAR(40), d VARCHAR(4))");
+    try exec(allocator, db, "INSERT INTO sm VALUES (1, 'a:1,b:2', ','), (2, 'a:1;a:2;c', ';'), (3, '7', ','), (4, '', ','), (5, NULL, ','), (6, 'x:1', NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("sm", .{})).flush();
+        try expectTexts(allocator, db, "SELECT STR_TO_MAP(s, d, ':') FROM sm ORDER BY id", &.{ "{\"a\":\"1\",\"b\":\"2\"}", "{\"a\":\"2\",\"c\":null}", "{\"7\":null}", "{\"\":null}", null, null });
+        try expectTexts(allocator, db, "SELECT CAST(CARDINALITY(STR_TO_MAP(s)) AS CHAR) FROM sm ORDER BY id", &.{ "2", "1", "1", "1", null, "1" });
+    }
+    try expectText(allocator, db, "SELECT STR_TO_MAP('k=v&x=y=z', '&', '=')", "{\"k\":\"v\",\"x\":\"y=z\"}");
+    try expectText(allocator, db, "SELECT STR_TO_MAP('ab', '', ':')", "{\"a\":null,\"b\":null}");
+    try expectText(allocator, db, "SELECT STR_TO_MAP('a:1', ',', '')", "{\"a:1\":null}");
+    try expectText(allocator, db, "SELECT STR_TO_MAP('a:1,b:2')['b']", "2");
+}

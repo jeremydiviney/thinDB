@@ -18,6 +18,7 @@ const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
 
 const scalar_fn = @import("scalar_fn.zig");
+const common = @import("scalar_fn_common.zig");
 const ResolvedOverload = scalar_fn.ResolvedOverload;
 const cast = @import("cast.zig");
 const array = @import("scalar_fn_array.zig");
@@ -29,7 +30,7 @@ const Error = @import("exec.zig").Error;
 
 /// Names that resolve here, for `scalar_fn.nameResolvable`.
 const NAMES = [_][]const u8{
-    scalar_fn.MAP_FROM_ARRAYS_FN, "map_size", "map_keys", "map_values", "map_concat", "distinct_map_keys", "map_filter",
+    scalar_fn.MAP_FROM_ARRAYS_FN, "map_size", "map_keys", "map_values", "map_concat", "distinct_map_keys", "map_filter", "str_to_map",
 };
 
 pub fn isMapFnName(name: []const u8) bool {
@@ -59,6 +60,11 @@ pub fn resolveMap(aa: Allocator, name: []const u8, arg_types: []const Type) Allo
         if (t.mapTypes() == null) return null;
         for (arg_types) |a| if (!try castable(aa, a, t)) return null;
         return overload(aa, name, arg_types, t, concatKernel);
+    }
+    if (eql(name, "str_to_map")) {
+        if (arg_types.len == 0 or arg_types.len > 3) return null;
+        for (arg_types) |a| if (!a.isString()) return null;
+        return overload(aa, name, arg_types, try types.mapOf(.string, .string), strToMapKernel);
     }
     if (arg_types.len == 0) return null;
     const m = arg_types[0].mapTypes() orelse return null;
@@ -138,6 +144,13 @@ const MapBuilder = struct {
     fn appendEntries(self: *MapBuilder, allocator: Allocator, keys: ColumnView, key_start: usize, values: ColumnView, value_start: usize, count: usize) !void {
         try store.appendViewRange(allocator, &self.keys, keys, key_start, key_start + count);
         try store.appendViewRange(allocator, &self.values, values, value_start, value_start + count);
+    }
+
+    fn appendText(self: *MapBuilder, allocator: Allocator, key: []const u8, value: ?[]const u8) !void {
+        try common.stringStoreOf(&self.keys).appendValue(allocator, key);
+        try self.keys.appendValidBit(allocator, self.keys.rowCount() - 1, true);
+        try common.stringStoreOf(&self.values).appendValue(allocator, value orelse "");
+        try self.values.appendValidBit(allocator, self.values.rowCount() - 1, value != null);
     }
 
     fn endRow(self: *MapBuilder, allocator: Allocator, valid: bool) !void {
@@ -328,6 +341,46 @@ fn concatKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, a
         try b.endRow(allocator, any);
     }
     try b.finish(allocator, out);
+}
+
+/// STR_TO_MAP(text[, entry_delimiter[, key_delimiter]]): `text` cut into
+/// entries at `entry_delimiter` (`,` by default; an empty one cuts between
+/// characters, as SPLIT does), and each entry at its first `key_delimiter`
+/// (`:` by default) into a key and its value. An entry with no key
+/// delimiter is a key mapped to NULL, and a key given twice keeps its last
+/// value. NULL when any argument is.
+fn strToMapKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
+    var b = try MapBuilder.init(allocator, out_type.mapTypes().?);
+    defer b.deinit(allocator);
+    for (0..rows) |r| {
+        var valid = true;
+        for (args) |a| valid = valid and a.isValid(r);
+        if (valid) {
+            const text = common.stringViewOf(args[0]).rowBytes(r);
+            const entry_delimiter = if (args.len > 1) common.stringViewOf(args[1]).rowBytes(r) else ",";
+            const key_delimiter = if (args.len > 2) common.stringViewOf(args[2]).rowBytes(r) else ":";
+            if (entry_delimiter.len == 0) {
+                var i: usize = 0;
+                while (i < text.len) {
+                    const n = @min(std.unicode.utf8ByteSequenceLength(text[i]) catch 1, text.len - i);
+                    try appendMapEntry(allocator, &b, text[i..][0..n], key_delimiter);
+                    i += n;
+                }
+            } else {
+                var entries = std.mem.splitSequence(u8, text, entry_delimiter);
+                while (entries.next()) |entry| try appendMapEntry(allocator, &b, entry, key_delimiter);
+            }
+        }
+        try b.endRow(allocator, valid);
+    }
+    try b.finish(allocator, out);
+}
+
+fn appendMapEntry(allocator: Allocator, b: *MapBuilder, entry: []const u8, key_delimiter: []const u8) !void {
+    const at = if (key_delimiter.len == 0) null else std.mem.indexOf(u8, entry, key_delimiter);
+    if (at) |k| return b.appendText(allocator, entry[0..k], entry[k + key_delimiter.len ..]);
+    try b.appendText(allocator, entry, null);
 }
 
 test "map resolution: types" {
