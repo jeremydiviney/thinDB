@@ -189,6 +189,10 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "percentile_cont", .func = .percentile },
     .{ .name = "percentile", .func = .percentile },
     .{ .name = "median", .func = .percentile },
+    .{ .name = "percentile_disc", .func = .percentile_disc },
+    // StarRocks' low-cardinality PERCENTILE_DISC: the same answer.
+    .{ .name = "percentile_disc_lc", .func = .percentile_disc },
+    .{ .name = "percentile_approx", .func = .percentile_approx },
     .{ .name = "group_concat", .func = .group_concat },
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
@@ -240,8 +244,25 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .stddev_samp => "stddev_samp",
         .var_pop => "var_pop",
         .var_samp => "var_samp",
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .group_concat, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf, .max_by_key => null,
     };
+}
+
+/// The fraction a percentile names: a number literal, or one cast to a
+/// floating or decimal type (`CAST(0.5 AS DOUBLE)`).
+fn percentileFraction(e: ir.Expr) ?f64 {
+    if (exec_expr.literalValue(e)) |v| return switch (v) {
+        .double => |x| x,
+        .float => |x| x,
+        .int => |x| @floatFromInt(x),
+        .bigint => |x| @floatFromInt(x),
+        .largeint => |x| @floatFromInt(x),
+        else => null,
+    };
+    if (e != .call or e.call.args.len != 1) return null;
+    const name = e.call.fn_name;
+    if (!std.mem.eql(u8, name, "to_double") and !std.mem.eql(u8, name, "to_float") and !std.mem.startsWith(u8, name, "to_decimal:")) return null;
+    return percentileFraction(e.call.args[0]);
 }
 
 fn explainFormatFromName(name: []const u8) ir.ExplainFormat {
@@ -3475,20 +3496,17 @@ pub const Parser = struct {
 
         var params: ir.AggParams = .none;
         var value_args = args;
-        if (func == .percentile) {
+        if (func == .percentile or func == .percentile_disc or func == .percentile_approx) {
             if (std.ascii.eqlIgnoreCase(func_name, "median")) {
                 if (args.len != 1) return ParseError.SqlInvalidProjection;
                 params = .{ .percentile = 0.5 };
                 value_args = args[0..1];
             } else {
-                if (args.len != 2) return ParseError.SqlInvalidProjection;
-                params = .{ .percentile = switch (exec_expr.literalValue(args[1]) orelse return ParseError.SqlInvalidProjection) {
-                    .double => |x| x,
-                    .float => |x| x,
-                    .int => |x| @floatFromInt(x),
-                    .bigint => |x| @floatFromInt(x),
-                    else => return ParseError.SqlInvalidProjection,
-                } };
+                // PERCENTILE_APPROX's third argument is the t-digest's
+                // compression, which an exact answer has no use for.
+                const max_args: usize = if (func == .percentile_approx) 3 else 2;
+                if (args.len < 2 or args.len > max_args) return ParseError.SqlInvalidProjection;
+                params = .{ .percentile = percentileFraction(args[1]) orelse return ParseError.SqlInvalidProjection };
                 value_args = args[0..1];
             }
         }

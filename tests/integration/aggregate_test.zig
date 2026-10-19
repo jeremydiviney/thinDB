@@ -161,6 +161,40 @@ test "aggregate: percentile_cont — median + p25 + p75 of 1..10" {
     try std.testing.expectApproxEqAbs(@as(f64, 7.75), b.values[2].data.double[0], 1e-9);
 }
 
+test "aggregate: PERCENTILE_CONT keeps DECIMAL, BIGINT, DATE and DATETIME exact; PERCENTILE_DISC and PERCENTILE_APPROX" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE pt (id BIGINT PRIMARY KEY, g INT, d DECIMAL(10,2), b BIGINT, dt DATETIME, dd DATE, f DOUBLE)");
+    try helpers.exec(allocator, db, "INSERT INTO pt VALUES " ++
+        "(1, 1, 1.50, 9007199254740993, '2020-01-01 00:00:01', '2020-01-01', 1.5), " ++
+        "(2, 1, 2.50, 9007199254740995, '2021-01-01 00:00:01', '2021-01-01', 2.5), " ++
+        "(3, 1, 3.25, 1, '2022-01-01 00:00:01', '2022-01-01', 0.5), " ++
+        "(4, 2, 7.00, -5, '1999-12-31 23:59:59', '1999-12-31', NULL), (5, 2, NULL, NULL, NULL, NULL, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("pt", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PERCENTILE_CONT(d, 0.5) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "2.5", "7" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(MEDIAN(dt) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "2021-01-01 00:00:01", "1999-12-31 23:59:59" });
+        // A leap year apart, the quarter point lands mid-year, as in DuckDB.
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PERCENTILE_CONT(dt, 0.25) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "2020-07-02 00:00:01", "1999-12-31 23:59:59" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PERCENTILE_CONT(dd, 0.25) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "2020-07-02", "1999-12-31" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PERCENTILE_DISC(b, 0.5) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "9007199254740993", "-5" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(PERCENTILE_DISC_LC(d, 0.34) AS CHAR) FROM pt GROUP BY g ORDER BY g", &.{ "2.50", "7.00" });
+        try helpers.expectTexts(allocator, db, "SELECT PERCENTILE_DISC(f, 0) FROM pt GROUP BY g ORDER BY g", &.{ "0.5", null });
+        try helpers.expectTexts(allocator, db, "SELECT PERCENTILE_APPROX(f, 0.9, 2048) FROM pt GROUP BY g ORDER BY g", &.{ "2.5", null });
+        try helpers.expectTexts(allocator, db, "SELECT PERCENTILE_CONT(f, CAST(0.5 AS DOUBLE)) FROM pt GROUP BY g ORDER BY g", &.{ "1.5", null });
+    }
+    // 0.07 × 100 is 7.000000000000001 in f64; DISC still takes the 7th value.
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_DISC(x, 0.07) FROM generate_series(0, 99) AS t(x)", "6");
+    // StarRocks' answers on 1, 4, ..., 49999: p×n − ½ lands on 25000 and 45000.4.
+    try helpers.expectText(allocator, db, "SELECT CAST(PERCENTILE_APPROX(x, 0.5) AS CHAR) FROM generate_series(1, 50000, 3) AS t(x)", "25000");
+    try helpers.expectText(allocator, db, "SELECT CAST(CAST(PERCENTILE_APPROX(x, 0.9) AS INT) AS CHAR) FROM generate_series(1, 50000, 3) AS t(x)", "45000");
+    try std.testing.expectError(error.AggregateInvalidParam, helpers.exec(allocator, db, "SELECT PERCENTILE_DISC(d, 1.5) FROM pt"));
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
