@@ -290,6 +290,28 @@ test "ARRAY: ARRAY_AGG keeps NULLs and follows ORDER BY" {
     try expectText(allocator, db, "SELECT array_sort(array_agg(v)) FROM g", "[null,10,10,20,30]");
 }
 
+test "ARRAY: ARRAY_UNIQUE_AGG is the distinct elements of a group's arrays" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE ua (id BIGINT PRIMARY KEY, k INT, i ARRAY<BIGINT>, s ARRAY<VARCHAR(10)>, d ARRAY<DECIMAL(26, 2)>, ai ARRAY<ARRAY<BIGINT>>)");
+    try exec(allocator, db,
+        \\INSERT INTO ua VALUES (1, 1, [1], ['a', 'a'], [1.3], [[1]]), (2, 2, [2], ['1'], [100.0], [[2]]), (3, 1, [1], ['a'], [1.3], [[1]]),
+        \\  (4, 2, [3, NULL, 2], NULL, NULL, [[2], [3]]), (5, 3, NULL, NULL, NULL, NULL)
+    );
+
+    try expectTexts(allocator, db, "SELECT array_unique_agg(i ORDER BY id) FROM ua GROUP BY k ORDER BY k", &.{ "[1]", "[2,3,null]", null });
+    try expectTexts(allocator, db, "SELECT array_unique_agg(s) FROM ua GROUP BY k ORDER BY k", &.{ "[\"a\"]", "[\"1\"]", null });
+    try expectTexts(allocator, db, "SELECT array_unique_agg(d) FROM ua GROUP BY k ORDER BY k", &.{ "[1.30]", "[100.00]", null });
+    try expectTexts(allocator, db, "SELECT array_unique_agg(ai ORDER BY id) FROM ua GROUP BY k ORDER BY k", &.{ "[[1]]", "[[2],[3]]", null });
+    try expectText(allocator, db, "SELECT array_sort(array_unique_agg(i)) FROM ua", "[null,1,2,3]");
+    try expectTexts(allocator, db, "SELECT array_max(array_unique_agg(i)) FROM ua GROUP BY k ORDER BY k", &.{ "1", "3", null });
+    try expectText(allocator, db, "SELECT array_unique_agg(i) FROM ua WHERE id > 100", null);
+}
+
 test "ARRAY: subscripts and array functions inside predicates" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
