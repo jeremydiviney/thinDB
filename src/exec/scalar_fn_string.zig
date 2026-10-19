@@ -13,6 +13,7 @@ const stringStoreOf = common.stringStoreOf;
 const Type = @import("../types.zig").Type;
 
 const regex = @import("../util/regex.zig");
+const aes = @import("../util/aes.zig");
 const predicate = @import("predicate.zig");
 
 // ---------------------------------------------------------------------------
@@ -723,6 +724,120 @@ pub fn md5sumKernel(allocator: Allocator, args: []const ColumnView, out: *Column
         try ss.appendValue(allocator, &hex_str);
     }
 }
+
+/// AES_ENCRYPT(text, key[, iv[, mode[, aad]]]), as StarRocks reads it:
+/// `mode` is `AES_<bits>_<chaining>`, AES_128_ECB by default, and `aad`
+/// is GCM's alone (`aesRow`).
+pub fn aesEncryptKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try aesKernel(allocator, args, out, row_count, .encrypt);
+}
+
+/// AES_DECRYPT(bytes, key[, iv[, mode[, aad]]]): what AES_ENCRYPT encrypted
+/// under the same arguments; NULL for bytes it can't have written.
+pub fn aesDecryptKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    try aesKernel(allocator, args, out, row_count, .decrypt);
+}
+
+const AesDirection = enum { encrypt, decrypt };
+
+fn aesKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, comptime direction: AesDirection) !void {
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var keys: AesKeyCache = .{};
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        const valid = try aesRow(allocator, args, i, direction, &keys, &buf);
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// The IV StarRocks uses where the IV is empty.
+const AES_DEFAULT_IV = "STARROCKS_16BYTE";
+
+/// One row's AES_ENCRYPT or AES_DECRYPT into `buf`; false where it is NULL.
+/// A NULL argument makes it NULL, except an IV that ECB has no use for.
+/// The IV is zero-padded or cut to 16 bytes, and GCM's nonce is its first
+/// 12. A mode that isn't one, or an `aad` beside a mode other than GCM,
+/// raises `InvalidEncryptionMode`.
+fn aesRow(allocator: Allocator, args: []const ColumnView, row: usize, comptime direction: AesDirection, keys: *AesKeyCache, buf: *std.ArrayList(u8)) !bool {
+    const mode: AesMode = if (args.len >= 4) mode: {
+        if (!args[3].isValid(row)) return false;
+        break :mode AesMode.parse(stringViewOf(args[3]).rowBytes(row)) orelse return error.InvalidEncryptionMode;
+    } else .{ .key_len = 16, .chaining = .ecb };
+    if (args.len == 5 and mode.chaining != .gcm) return error.InvalidEncryptionMode;
+    if (!args[0].isValid(row) or !args[1].isValid(row)) return false;
+    if (args.len == 5 and !args[4].isValid(row)) return false;
+    const iv_text: []const u8 = if (args.len < 3 or mode.chaining == .ecb)
+        ""
+    else if (args[2].isValid(row))
+        stringViewOf(args[2]).rowBytes(row)
+    else
+        return false;
+    var iv: [aes.BLOCK_LEN]u8 = @splat(0);
+    const iv_source = if (iv_text.len == 0) AES_DEFAULT_IV else iv_text;
+    const iv_len = @min(iv_source.len, aes.BLOCK_LEN);
+    @memcpy(iv[0..iv_len], iv_source[0..iv_len]);
+    const cipher = keys.get(mode.key_len, stringViewOf(args[1]).rowBytes(row));
+    const input = stringViewOf(args[0]).rowBytes(row);
+    const aad = if (args.len == 5) stringViewOf(args[4]).rowBytes(row) else "";
+    switch (direction) {
+        .encrypt => {
+            try aes.encrypt(allocator, cipher, mode.chaining, input, iv, aad, buf);
+            return true;
+        },
+        .decrypt => return aes.decrypt(allocator, cipher, mode.chaining, input, iv, aad, buf),
+    }
+}
+
+const AesMode = struct {
+    key_len: usize,
+    chaining: aes.Chaining,
+
+    const CHAININGS = [_]struct { []const u8, aes.Chaining }{
+        .{ "ECB", .ecb },   .{ "CBC", .cbc },   .{ "CFB", .cfb128 },
+        .{ "CFB1", .cfb1 }, .{ "CFB8", .cfb8 }, .{ "CFB128", .cfb128 },
+        .{ "OFB", .ofb },   .{ "CTR", .ctr },   .{ "GCM", .gcm },
+    };
+
+    /// `AES_<128|192|256>_<chaining>` in any case, CFB being CFB128.
+    fn parse(text: []const u8) ?AesMode {
+        if (text.len < 9 or !std.ascii.eqlIgnoreCase(text[0..4], "AES_") or text[7] != '_') return null;
+        const key_len: usize = if (std.mem.eql(u8, text[4..7], "128"))
+            16
+        else if (std.mem.eql(u8, text[4..7], "192"))
+            24
+        else if (std.mem.eql(u8, text[4..7], "256"))
+            32
+        else
+            return null;
+        const chaining = for (CHAININGS) |entry| {
+            if (std.ascii.eqlIgnoreCase(text[8..], entry[0])) break entry[1];
+        } else return null;
+        return .{ .key_len = key_len, .chaining = chaining };
+    }
+};
+
+/// The cipher for the last key seen, since a column of keys mostly
+/// repeats one.
+const AesKeyCache = struct {
+    key_len: usize = 0,
+    folded: [32]u8 = undefined,
+    cipher: aes.Cipher = undefined,
+
+    /// The cipher for `key` folded into `key_len` bytes by XOR, as MySQL
+    /// folds a key of any length.
+    fn get(cache: *AesKeyCache, key_len: usize, key: []const u8) *const aes.Cipher {
+        var folded: [32]u8 = @splat(0);
+        for (key, 0..) |b, i| folded[i % key_len] ^= b;
+        if (cache.key_len != key_len or !std.mem.eql(u8, cache.folded[0..key_len], folded[0..key_len])) {
+            cache.* = .{ .key_len = key_len, .folded = folded, .cipher = aes.Cipher.init(folded[0..key_len]) };
+        }
+        return &cache.cipher;
+    }
+};
 
 /// Seed StarRocks and Doris start `murmur_hash3_32` from, so checksums
 /// written against either engine match.
