@@ -527,6 +527,20 @@ Over a DECIMAL, every lane folds the raw mantissas, as AVG does, and
 `aggregate.welfordResult` divides the variance by 10^(2·scale) where they
 all finish.
 
+`PERCENTILE_CONT(x, p)` (and `MEDIAN(x)`, its p = 0.5) interpolates at index
+p×(n−1) of the sorted values, as PostgreSQL and DuckDB do.
+`PERCENTILE_DISC(x, p)`, and StarRocks' `PERCENTILE_DISC_LC`, is the first
+value whose cumulative share reaches p, at index ⌈p×n⌉ − 1, in the input
+type. `PERCENTILE_APPROX(x, p[, compression])` is computed exactly, at index
+p×n − ½ clamped to the values. That is where a t-digest over the values
+places it, so it gives StarRocks' answer; the compression is ignored. p is
+a literal in [0, 1], plain or cast to a floating or decimal type, else
+`AggregateInvalidParam`. An integer-family input keeps its exact integers,
+so a DECIMAL is read at its scale and a BIGINT past 2^53 sorts exactly. CONT
+and APPROX return a DATE or DATETIME as that type, rounded to the day or the
+microsecond, and anything else as a DOUBLE. A product p×n within float error
+of an integer is read as that integer, so 0.07 of 100 values is the 7th.
+
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
 and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:
@@ -821,7 +835,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`), `COUNT_DISTINCT`, `PERCENTILE_CONT`, `GROUP_CONCAT` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |

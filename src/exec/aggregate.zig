@@ -123,7 +123,8 @@ pub const AggFunc = enum {
     /// Exact distinct count. Hash set of dup'd value bytes; output bigint.
     count_distinct,
     /// Exact continuous percentile. params.percentile in [0, 1].
-    /// O(N) memory; sorts at finalize. Output double.
+    /// O(N) memory; sorts at finalize. Output DOUBLE, or the input type for
+    /// a DATE or DATETIME.
     percentile,
     /// Concatenate string values, `params.concat.separator` between them.
     /// `arg2_col`, when set, is a per-row key the values sort by, compared
@@ -139,6 +140,12 @@ pub const AggFunc = enum {
     unsigned_bit_and,
     unsigned_bit_or,
     unsigned_bit_xor,
+    /// PERCENTILE_DISC: the first value, in order, whose cumulative share
+    /// reaches params.percentile. Output is the input type.
+    percentile_disc,
+    /// PERCENTILE_APPROX, computed exactly at the place StarRocks' t-digest
+    /// estimates (`percentilePlace`). Output as `percentile`.
+    percentile_approx,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -149,7 +156,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .group_concat, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf => return false,
     };
     return true;
 }
@@ -319,8 +326,14 @@ pub const AccState = union(enum) {
     /// `distinct_int64` but a 4-byte slot, halving the set's footprint and the
     /// bytes touched per probe. Selected by `initialState` for ≤32-bit inputs.
     distinct_int32: group_table.DistinctU32Set,
-    /// Exact percentile: keep every observed value (as f64), sort + interpolate at finalize.
+    /// Exact percentile: keep every observed value, sort + interpolate at
+    /// finalize. A float input keeps f64s; an integer-family one keeps its
+    /// exact integers, so a DECIMAL, a BIGINT past 2^53 or a DATETIME compares
+    /// and interpolates exactly and PERCENTILE_DISC returns the value itself.
+    /// Selected by `percentileState`.
     percentile_values: std.ArrayListUnmanaged(f64),
+    percentile_ints: std.ArrayListUnmanaged(i64),
+    percentile_wide: std.ArrayListUnmanaged(i128),
     /// group_concat buffer, lazily boxed (the `ConcatAcc` is 32 bytes — too
     /// wide to sit inline without inflating every other group's state — so it
     /// lives behind a pointer, null until the first value is appended).
@@ -3276,10 +3289,17 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
                 .{ .distinct_int = .empty };
             break :blk .{ .distinct = .{} };
         },
-        .percentile => .{ .percentile_values = .empty },
+        .percentile, .percentile_disc, .percentile_approx => percentileState(in),
         .group_concat => .{ .concat = null },
         .udf => unreachable,
     };
+}
+
+fn percentileState(in: ?Type) AccState {
+    const t = in orelse return .{ .percentile_values = .empty };
+    if (t.isFloat()) return .{ .percentile_values = .empty };
+    const bits = intKeyBits(t) orelse return .{ .percentile_values = .empty };
+    return if (bits <= 64) .{ .percentile_ints = .empty } else .{ .percentile_wide = .empty };
 }
 
 /// Pure GROUP BY output schema: the group-key columns (carried from the input
@@ -3403,7 +3423,12 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         },
         .min, .max => in orelse return Error.AggregateNoSpecs,
         .sum_distinct => aggOutputType(.sum, in),
-        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .percentile => .double,
+        .avg, .avg_distinct, .stddev_pop, .stddev_samp, .var_pop, .var_samp => .double,
+        .percentile, .percentile_approx => blk: {
+            const t = in orelse return Error.AggregateColumnRequired;
+            break :blk if (t == .date or t == .datetime) t else .double;
+        },
+        .percentile_disc => in orelse return Error.AggregateColumnRequired,
         .bool_and, .bool_or => .boolean,
         .any_value, .first, .last, .max_by => in orelse return Error.AggregateColumnRequired,
         // The output is the KEY column's type, unknowable from `in` —
@@ -3477,7 +3502,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
             // Any column type works (we hash the encoded bytes).
             _ = in orelse return Error.AggregateColumnRequired;
         },
-        .percentile => {
+        .percentile, .percentile_disc, .percentile_approx => {
             const t = in orelse return Error.AggregateColumnRequired;
             if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double or t == .date or t == .datetime)) {
                 return Error.AggregateUnsupportedType;
@@ -3903,7 +3928,7 @@ pub fn updateState(
         .count_distinct => {
             try distinctUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
         },
-        .percentile => {
+        .percentile, .percentile_disc, .percentile_approx => {
             try percentileUpdate(aa, s, batch.values[col_idx.?], row_start, row_end);
         },
         .group_concat => {
@@ -4066,22 +4091,99 @@ fn distinctIntKey(view: ColumnView, row: u32) u128 {
     };
 }
 
-/// PERCENTILE_CONT(p): collect every valid value as f64, sort at
-/// finalize, linear-interpolate at p×(n-1). Memory O(N).
+/// PERCENTILE_CONT / DISC / APPROX: collect every valid value, in the list
+/// `percentileState` picked for the input type. Memory O(N).
 fn percentileUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
     switch (view.data) {
-        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .date, .datetime, .decimal64, .decimal128 => |slice| {
+        inline .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
-                if (!view.isValid(r)) continue;
-                try s.percentile_values.append(aa, @as(f64, @floatFromInt(v)));
+                if (view.isValid(r)) try s.percentile_ints.append(aa, v);
+            }
+        },
+        inline .largeint, .decimal128 => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (view.isValid(r)) try s.percentile_wide.append(aa, v);
             }
         },
         inline .float, .double => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
-                if (!view.isValid(r)) continue;
-                try s.percentile_values.append(aa, @as(f64, v));
+                if (view.isValid(r)) try s.percentile_values.append(aa, v);
             }
         },
+        else => unreachable,
+    }
+}
+
+/// Where fraction `p` of `n` sorted values falls, as a fractional index.
+/// CONT takes `p×(n−1)`, as PostgreSQL and DuckDB do. APPROX takes Hazen's
+/// `p×n − ½`, where a t-digest over singleton centroids puts it, so it
+/// gives StarRocks' answer. DISC takes `⌈p×n⌉ − 1`, the first value whose
+/// cumulative share reaches `p`.
+fn percentilePlace(func: AggFunc, p: f64, n: usize) f64 {
+    const count: f64 = @floatFromInt(n);
+    return switch (func) {
+        .percentile_disc => @max(@ceil(nearInteger(p * count)) - 1, 0),
+        .percentile_approx => std.math.clamp(nearInteger(p * count) - 0.5, 0, count - 1),
+        else => nearInteger(p * (count - 1)),
+    };
+}
+
+/// `x` as the integer it is within float error of: 0.07 × 100 is
+/// 7.000000000000001 in f64, which DISC must read as 7.
+fn nearInteger(x: f64) f64 {
+    const r = @round(x);
+    return if (@abs(x - r) <= @abs(x) * 4 * std.math.floatEps(f64)) r else x;
+}
+
+/// Append `func`'s percentile at `p` of `values` to `col`, or false when
+/// there are none. Sorts `values` in place: the arena owns the list and
+/// nothing else reads it. DISC appends a value as it is. CONT and APPROX
+/// interpolate, a DATE or DATETIME to its own type, rounded, and anything
+/// else to a DOUBLE, a DECIMAL scaled to its value.
+fn appendPercentile(comptime T: type, allocator: Allocator, col: *ColumnStore, func: AggFunc, p: f64, values: []T, in_type: ?Type, out_type: Type) !bool {
+    if (values.len == 0) return false;
+    std.mem.sortUnstable(T, values, {}, std.sort.asc(T));
+    const place = percentilePlace(func, p, values.len);
+    const lo = values[@intFromFloat(@floor(place))];
+    const hi = values[@intFromFloat(@ceil(place))];
+    if (func == .percentile_disc) {
+        try appendPercentileValue(T, allocator, col, out_type, lo);
+        return true;
+    }
+    const frac = place - @floor(place);
+    if (T == f64) {
+        try col.data.double.append(allocator, lo + (hi - lo) * frac);
+    } else {
+        // An i64 span is exact in i128, so a DATETIME far from 1970 still
+        // interpolates to the microsecond.
+        const span: f64 = if (T == i64) @floatFromInt(@as(i128, hi) - lo) else @as(f64, @floatFromInt(hi)) - @as(f64, @floatFromInt(lo));
+        const step = span * frac;
+        switch (out_type) {
+            .date => try col.data.date.append(allocator, @intCast(lo + @as(T, @intFromFloat(@round(step))))),
+            .datetime => try col.data.datetime.append(allocator, @intCast(lo + @as(T, @intFromFloat(@round(step))))),
+            else => try col.data.double.append(allocator, (@as(f64, @floatFromInt(lo)) + step) / avgScaleDiv(in_type)),
+        }
+    }
+    return true;
+}
+
+fn appendPercentileValue(comptime T: type, allocator: Allocator, col: *ColumnStore, out_type: Type, v: T) !void {
+    if (T == f64) {
+        switch (out_type) {
+            .float => try col.data.float.append(allocator, @floatCast(v)),
+            else => try col.data.double.append(allocator, v),
+        }
+    } else switch (out_type) {
+        .boolean => try col.data.boolean.append(allocator, @intCast(v)),
+        .tinyint => try col.data.tinyint.append(allocator, @intCast(v)),
+        .smallint => try col.data.smallint.append(allocator, @intCast(v)),
+        .int => try col.data.int.append(allocator, @intCast(v)),
+        .date => try col.data.date.append(allocator, @intCast(v)),
+        .bigint => try col.data.bigint.append(allocator, @intCast(v)),
+        .datetime => try col.data.datetime.append(allocator, @intCast(v)),
+        .decimal64 => try col.data.decimal64.append(allocator, @intCast(v)),
+        .largeint => try col.data.largeint.append(allocator, v),
+        .decimal128 => try col.data.decimal128.append(allocator, v),
         else => unreachable,
     }
 }
@@ -4432,28 +4534,20 @@ pub fn appendAccToColumn(
             };
             try col.data.bigint.append(allocator, @intCast(n));
         },
-        .percentile => {
+        .percentile, .percentile_disc, .percentile_approx => {
             const p: f64 = switch (spec.params) {
                 .percentile => |pv| pv,
                 else => 0.5,
             };
-            const vals = state.percentile_values.items;
-            if (vals.len == 0) {
+            const appended = switch (state) {
+                .percentile_values => |list| try appendPercentile(f64, allocator, col, func, p, list.items, in_type, out_type),
+                .percentile_ints => |list| try appendPercentile(i64, allocator, col, func, p, list.items, in_type, out_type),
+                .percentile_wide => |list| try appendPercentile(i128, allocator, col, func, p, list.items, in_type, out_type),
+                else => unreachable,
+            };
+            if (!appended) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
-            } else {
-                // Sort in place — arena owns the backing slice; nothing
-                // outside this aggregate observes the buffer.
-                std.mem.sortUnstable(f64, @constCast(vals), {}, std.sort.asc(f64));
-                const n: f64 = @floatFromInt(vals.len);
-                // Linear interpolation (PostgreSQL percentile_cont rule):
-                //   idx = p * (n - 1); blend floor and ceil.
-                const idx = p * (n - 1);
-                const lo: usize = @intFromFloat(@floor(idx));
-                const hi: usize = @intFromFloat(@ceil(idx));
-                const frac = idx - @floor(idx);
-                const v = if (lo == hi) vals[lo] else vals[lo] + (vals[hi] - vals[lo]) * frac;
-                try col.data.double.append(allocator, v);
             }
         },
         .group_concat => {
