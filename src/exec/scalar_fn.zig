@@ -1169,7 +1169,11 @@ const ArgConversion = struct { cost: u64, target: ?Type = null };
 /// the integer MySQL reads it as (`INTEGER_ARG_FN`), but only where no
 /// overload takes every argument without dropping a fraction: that costs
 /// more than any other conversion of the whole call, so `INTERVAL(2.5, 1,
-/// 2.5, 3)` still compares doubles.
+/// 2.5, 3)` still compares doubles. A decimal with scale 0 and more digits
+/// than a BIGINT holds is the LARGEINT StarRocks types an integer literal
+/// past BIGINT as, where MySQL's DECIMAL typing here makes it a decimal: it
+/// meets a LARGEINT parameter as its own value (`BITAND(x,
+/// 18446744073709551615)`).
 fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
     if (declared.isString()) {
         if (bindsAsIs(given, declared)) return .{ .cost = 0 };
@@ -1181,8 +1185,11 @@ fn argConversion(aa: Allocator, given: Type, declared: Type) !?ArgConversion {
         return null;
     }
     if (declared.isFloat() and given.isDecimal()) return .{ .cost = CONVERT_COST, .target = .double };
-    if (declared.isInteger() and (given.isFloat() or given.isDecimal()))
-        return .{ .cost = FRACTION_DROP_COST + (argCastCost(.bigint, declared, true) orelse return null), .target = .bigint };
+    if (declared.isInteger() and (given.isFloat() or given.isDecimal())) {
+        const integer: Type = if (isWideWholeDecimal(given)) .largeint else .bigint;
+        const target: Type = if (declared == .largeint) integer else .bigint;
+        return .{ .cost = FRACTION_DROP_COST + (argCastCost(integer, declared, true) orelse return null), .target = target };
+    }
     return .{ .cost = argCastCost(given, declared, true) orelse return null };
 }
 
@@ -1243,7 +1250,13 @@ pub const INTEGER_ARG_FN = "__integer_arg";
 /// `convertedArgs` converts it to; null unless a double or decimal meets an
 /// integer.
 pub fn integerArgFn(given: Type, target: Type) ?[]const u8 {
+    if (target == .largeint and isWideWholeDecimal(given)) return null;
     return if (target.isInteger() and (given.isFloat() or given.isDecimal())) INTEGER_ARG_FN else null;
+}
+
+fn isWideWholeDecimal(ty: Type) bool {
+    const spec = ty.decimalSpec() orelse return false;
+    return spec.s == 0 and spec.p > 18;
 }
 
 /// Whether `name` reads an argument `convertedArgs` converts as CAST reads
@@ -1523,12 +1536,18 @@ pub const builtins = [_]ScalarFn{
     .{ .name = bitOperatorFn(.bitnot, .mysql), .arg_types = &.{.largeint}, .return_type = .largeint, .kernel = math.unsignedBitNotKernel(i128) },
     .{ .name = bitOperatorFn(.bitnot, .mysql), .arg_types = &.{.bigint}, .return_type = .largeint, .kernel = math.unsignedBitNotKernel(i64) },
     // StarRocks' bit functions, which the operators lower to outside MySQL.
-    .{ .name = "bitand", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"and") },
-    .{ .name = "bitor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"or") },
-    .{ .name = "bitxor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.xor) },
-    .{ .name = "bit_shift_left", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_left) },
-    .{ .name = "bit_shift_right", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_right) },
-    .{ .name = "bitnot", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bitNotKernel },
+    .{ .name = "bitand", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.bitwiseKernel(.@"and", i128) },
+    .{ .name = "bitand", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"and", i64) },
+    .{ .name = "bitor", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.bitwiseKernel(.@"or", i128) },
+    .{ .name = "bitor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.@"or", i64) },
+    .{ .name = "bitxor", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.bitwiseKernel(.xor, i128) },
+    .{ .name = "bitxor", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.xor, i64) },
+    .{ .name = "bit_shift_left", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.bitwiseKernel(.shift_left, i128) },
+    .{ .name = "bit_shift_left", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_left, i64) },
+    .{ .name = "bit_shift_right", .arg_types = &.{ .largeint, .largeint }, .return_type = .largeint, .kernel = math.bitwiseKernel(.shift_right, i128) },
+    .{ .name = "bit_shift_right", .arg_types = &.{ .bigint, .bigint }, .return_type = .bigint, .kernel = math.bitwiseKernel(.shift_right, i64) },
+    .{ .name = "bitnot", .arg_types = &.{.largeint}, .return_type = .largeint, .kernel = math.bitNotKernel(i128) },
+    .{ .name = "bitnot", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = math.bitNotKernel(i64) },
     // A number reaches BIN and CONV as its text, as MySQL reads it there
     // (`readsNumberAsText`).
     .{ .name = "bin", .arg_types = &.{.string}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = math.binKernel },
@@ -1832,8 +1851,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "sha256", .arg_types = &.{.string}, .return_type = .string, .kernel = string.sha256Kernel },
     .{ .name = "crc32", .arg_types = &.{.string}, .return_type = .bigint, .kernel = string.crc32Kernel },
     .{ .name = "murmur_hash3_32", .arg_types = &.{.string}, .return_type = .int, .variadic_min_args = 1, .kernel = string.murmurHash3_32Kernel },
-    .{ .name = "xx_hash3_64", .arg_types = &.{.string}, .return_type = .bigint, .kernel = string.xxHash3_64Kernel },
-    .{ .name = "xx_hash3_128", .arg_types = &.{.string}, .return_type = .string, .kernel = string.xxHash3_128Kernel },
+    .{ .name = "xx_hash3_64", .arg_types = &.{.string}, .return_type = .bigint, .variadic_min_args = 1, .kernel = string.xxHash3_64Kernel },
+    .{ .name = "xx_hash3_128", .arg_types = &.{.string}, .return_type = .largeint, .variadic_min_args = 1, .kernel = string.xxHash3_128Kernel },
     // --- encoding ---
     .{ .name = "hex", .arg_types = &.{.string}, .return_type = .string, .kernel = string.hexEncodeKernel },
     .{ .name = "hex", .arg_types = &.{.bigint}, .return_type = .string, .kernel = string.hexBigintKernel },

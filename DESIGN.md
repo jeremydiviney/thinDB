@@ -443,6 +443,8 @@ Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s`
 
 `AES_ENCRYPT(text, key[, iv[, mode[, aad]]])` and `AES_DECRYPT(bytes, key[, iv[, mode[, aad]]])` take StarRocks' arguments, of which the first two are MySQL's. `mode` is `AES_<128|192|256>_<ECB|CBC|CFB|CFB1|CFB8|CFB128|OFB|CTR|GCM>` in any case, AES_128_ECB by default, CFB being CFB128. The key folds into the mode's key length by XOR, as MySQL folds it. The IV is zero-padded or cut to 16 bytes, an empty IV is StarRocks' default `STARROCKS_16BYTE`, and ECB ignores it, so a NULL IV doesn't make ECB NULL. ECB and CBC pad with PKCS#7. GCM uses the IV's first 12 bytes as its nonce, takes `aad` as its additional data, and writes the nonce, the ciphertext and the 16-byte tag. Decryption reads its nonce from those bytes. Any other NULL argument gives NULL, and so does decrypting bytes the mode can't have written, such as broken padding or a tag that doesn't match. A mode that isn't one, or an `aad` beside a mode other than GCM, raises `InvalidEncryptionMode`. std carries AES for 128- and 256-bit keys only, so `util/aes.zig` expands the keys of all three sizes for std's rounds.
 
+`XX_HASH3_64(s, ...)` and `XX_HASH3_128(s, ...)` are StarRocks' XXH3 hashes, by the xxHash spec (`util/xxh3.zig`). `XX_HASH3_64` hashes each argument with the previous hash as its seed, the first with seed 0, and is a signed BIGINT. `XX_HASH3_128` hashes the arguments run together, so `XX_HASH3_128('hello', 'world')` is `XX_HASH3_128('helloworld')`, and is a signed LARGEINT whose high 64 bits are the hash's high half. A NULL argument makes either NULL.
+
 Regular expressions (`util/regex.zig`) are RE2's linear-time subset, POSIX bracket classes such as `[[:lower:]]` included. Every `REGEXP_*` function reads each row's own pattern. `REGEXP_COUNT(s, p)` counts the matches, each search resuming where the last match ended, or one character on after an empty match. `REGEXP_EXTRACT(s, p, group)` is a capture group of the first match, where group 0 is the whole match. It gives '' when nothing matches or the group took no part in the match. `REGEXP_EXTRACT_ALL(s, p, group)` is the array of that group across every match. Both give '' or an empty array for a group the pattern doesn't have, as StarRocks does. Unlike StarRocks, which gives NULL for a malformed pattern read from a column, thinDB fails the query with `RegexInvalidPattern`, as MySQL does.
 
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
@@ -462,8 +464,11 @@ integer it starts with. The result is BIGINT UNSIGNED, held in a LARGEINT, so
 `~1` is 18446744073709551614, `-1 >> 1` is 9223372036854775807 (zeros shift
 in), and a shift count outside 0..63 gives 0. The other dialects lower the
 operators to StarRocks' `bitand`, `bitor`, `bitxor`, `bitnot`,
-`bit_shift_left` and `bit_shift_right`, which keep BIGINT's two's complement,
-as StarRocks, DuckDB and PG do: `~1` is -2 and `>>` keeps the sign. The choice
+`bit_shift_left` and `bit_shift_right`, which keep the two's complement of a
+BIGINT, or of a LARGEINT when an operand is one, as StarRocks, DuckDB and PG
+do: `~1` is -2 and `>>` keeps the sign. An integer literal past BIGINT is a
+LARGEINT to them, as StarRocks types it, so
+`BITAND(x, 18446744073709551615)` keeps a LARGEINT's low 64 bits. The choice
 is made once, in `scalar_fn.bitOperatorFn`. The aggregates BIT_AND/OR/XOR
 follow MySQL the same way in the MySQL dialect: each value reads as BIGINT
 UNSIGNED, as an operator's operand does, and the result is one, held in a
