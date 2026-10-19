@@ -966,6 +966,51 @@ test "compute: TO_BINARY, FROM_BINARY, FORMAT_BYTES, BAR and POSITIVE follow Sta
     try helpers.expectTexts(allocator, db, "SELECT id FROM b WHERE POSITIVE(n) > 1000 ORDER BY id", &.{ "2", "3", "4", "7" });
 }
 
+test "AES_ENCRYPT and AES_DECRYPT in every StarRocks mode, with MySQL's key folding" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const key = "'F3229A0B371ED2D9441B830D21A390C3'";
+    const cases = .{
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ "))", "uv/Lhzm74syo8JlfWarwKA==" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", NULL, 'aes_128_ecb'))", "uv/Lhzm74syo8JlfWarwKA==" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", '', 'AES_192_ECB'))", "xaf+kW/d5YPRSYFGnFkOfQ==" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", '', 'AES_128_CBC'))", "ne2YHEKECQSni3/kRI/nBg==" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefg', 'AES_256_CBC'))", "4w0ceQx2FqG8GGTivC0QPg==" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefg', 'AES_192_CFB1'))", "MltCAryodTud" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefg', 'AES_256_CFB8'))", "p8NH5PX2mufr" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", '', 'AES_128_CFB'))", "3wGmUeFO4/Ex" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefg', 'AES_192_OFB'))", "Ma7ozVBB4lGP" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefg', 'AES_256_CTR'))", "p6+axkiBSNf2" },
+        .{ "TO_BASE64(AES_ENCRYPT('starrocks', " ++ key ++ ", 'abcdefghijklmnop', 'AES_192_GCM', 'abcdefg'))", "YWJjZGVmZ2hpamtsIpxL5blh0/zHNXw5nG/tL68lc1BJZ/fCPA==" },
+        .{ "AES_DECRYPT(FROM_BASE64('uv/Lhzm74syo8JlfWarwKA=='), " ++ key ++ ")", "starrocks" },
+        .{ "AES_DECRYPT(FROM_BASE64('h5rRJ9HmkeqM'), " ++ key ++ ", 'abcdefg', 'AES_256_CFB1')", "starrocks" },
+        .{ "AES_DECRYPT(FROM_BASE64('YWJjZGVmZ2hpamts2bRovmWbg/Y5qmz8Lt1L2oebY6lOV92Ozw=='), " ++ key ++ ", 'abcdefghijklmnop', 'AES_256_GCM', 'abcdefg')", "starrocks" },
+        .{ "AES_ENCRYPT('starrocks', " ++ key ++ ", NULL, 'AES_128_CBC')", null },
+        .{ "AES_ENCRYPT(NULL, " ++ key ++ ")", null },
+        .{ "AES_DECRYPT(FROM_BASE64('YWJjZGVmZ2hpamts2bRovmWbg/Y5qmz8Lt1L2oebY6lOV92Ozw=='), " ++ key ++ ", '', 'AES_256_GCM', 'other')", null },
+        .{ "AES_DECRYPT('not a ciphertext', " ++ key ++ ")", null },
+        .{ "AES_DECRYPT(AES_ENCRYPT('x', 'k1'), 'k2')", null },
+        .{ "AES_DECRYPT(AES_ENCRYPT('folded key', 'a key longer than sixteen bytes'), 'a key longer than sixteen bytes')", "folded key" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
+    try std.testing.expectError(error.InvalidEncryptionMode, helpers.exec(allocator, db, "SELECT AES_ENCRYPT('a', 'k', '', 'AES_512_ECB')"));
+    try std.testing.expectError(error.InvalidEncryptionMode, helpers.exec(allocator, db, "SELECT AES_DECRYPT('a', 'k', '', 'AES_128_CBC', 'aad')"));
+
+    try helpers.exec(allocator, db, "CREATE TABLE secret (id BIGINT PRIMARY KEY, msg VARCHAR(40), k VARCHAR(40), mode VARCHAR(16))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO secret VALUES (1, 'one', 'key one', 'AES_128_CBC'), (2, '', 'key two', 'AES_256_GCM'),
+        \\  (3, 'a message of more than two blocks', 'k', 'AES_192_CTR'), (4, NULL, 'k', 'AES_128_OFB'), (5, 'five', NULL, 'AES_128_CFB8')
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("secret", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT AES_DECRYPT(AES_ENCRYPT(msg, k, 'iv', mode), k, 'iv', mode) FROM secret ORDER BY id", &.{ "one", "", "a message of more than two blocks", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT OCTET_LENGTH(AES_ENCRYPT(msg, k, 'iv', mode)) FROM secret ORDER BY id", &.{ "16", "28", "33", null, null });
+    }
+}
+
 test "URL functions read a URL's host and query parameters, and encode text as a form does" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
