@@ -2893,6 +2893,38 @@ test "join: COUNT(*) over a nested-loop join that outputs no columns counts ever
     }
 }
 
+test "join: a nested-loop join with an empty right reads its left only when the left is preserved" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const helpers = @import("sql_helpers.zig");
+    try helpers.exec(allocator, db, "CREATE TABLE base (k BIGINT PRIMARY KEY)");
+    try helpers.exec(allocator, db, "INSERT INTO base VALUES (10), (20), (30)");
+    // Reading `a` runs an invalid JSON path, so a join that reads it fails.
+    const failing = "(SELECT k AS x, JSON_EXTRACT(CONCAT('[', k, ']'), '$x') AS j FROM base) a";
+    const empty = "(SELECT k FROM base WHERE k < 0) e";
+    {
+        var q = try helpers.runSql(allocator, db, "SELECT x FROM " ++ failing ++ " WHERE j IS NULL");
+        defer q.deinit();
+        try std.testing.expectError(error.JsonPathInvalid, q.next());
+    }
+    const cases = .{
+        .{ "SELECT a.x FROM " ++ failing ++ " CROSS JOIN " ++ empty ++ " WHERE a.j IS NULL", &[_]i64{} },
+        .{ "SELECT a.x FROM " ++ failing ++ " JOIN " ++ empty ++ " ON a.x > e.k WHERE a.j IS NULL", &[_]i64{} },
+        .{ "SELECT a.x FROM " ++ failing ++ " RIGHT JOIN " ++ empty ++ " ON a.x > e.k WHERE a.j IS NULL", &[_]i64{} },
+        .{ "SELECT COUNT(*) FROM base LEFT JOIN " ++ empty ++ " ON base.k > e.k", &[_]i64{3} },
+        .{ "SELECT COUNT(*) FROM base FULL JOIN " ++ empty ++ " ON base.k > e.k", &[_]i64{3} },
+    };
+    inline for (cases) |case| {
+        const got = try helpers.collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, case[1], got);
+    }
+}
+
 /// Every row as its cells joined by `|` (NULL spelled out), rows joined by
 /// newlines, after a header of the output column names.
 fn crossRowsText(allocator: std.mem.Allocator, db: anytype, sql: []const u8) ![]u8 {

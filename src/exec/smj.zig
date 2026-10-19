@@ -439,7 +439,7 @@ pub const SortMergeJoin = struct {
                 for (batch.values, 0..) |v, i| {
                     try transform.appendAllColumn(self.allocator, v, &self.left_materialized[i]);
                 }
-                self.left_rows += @intCast(batch.row_count);
+                self.left_rows = try exec.memory.addHeldRows(self.left_rows, batch.row_count);
             }
         }
         // Drain right (skip if pre-filled).
@@ -449,7 +449,7 @@ pub const SortMergeJoin = struct {
                 for (batch.values, 0..) |v, i| {
                     try transform.appendAllColumn(self.allocator, v, &self.right_materialized[i]);
                 }
-                self.right_rows += @intCast(batch.row_count);
+                self.right_rows = try exec.memory.addHeldRows(self.right_rows, batch.row_count);
             }
         }
 
