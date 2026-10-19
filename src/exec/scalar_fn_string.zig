@@ -1505,28 +1505,32 @@ fn resultLen(len: anytype) ?usize {
     return if (n <= MAX_STRING_RESULT) n else null;
 }
 
-/// LPAD / RPAD(s, len, pad): `s` cut or padded to `len` characters, the
-/// pad repeating as needed. An empty pad leaves a short `s` as it is.
+/// LPAD / RPAD(s, len[, pad]): `s` cut or padded to `len` characters, the
+/// pad repeating as needed, spaces when it's left out. An empty pad leaves a
+/// short `s` as it is.
 fn padKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, side: enum { left, right }) !void {
     const sv = stringViewOf(args[0]);
     const lens = args[1].data.int;
-    const pad_sv = stringViewOf(args[2]);
+    const pad_sv = if (args.len == 3) stringViewOf(args[2]) else null;
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     for (0..row_count) |i| {
         buf.clearRetainingCapacity();
-        const valid = allValid(args, i) and try padRow(allocator, &buf, sv.rowBytes(i), lens[i], pad_sv.rowBytes(i), side == .left);
+        const pad = if (pad_sv) |pads| pads.rowBytes(i) else " ";
+        const valid = allValid(args, i) and try padRow(allocator, &buf, sv.rowBytes(i), lens[i], pad, side == .left);
         try ss.appendValue(allocator, buf.items);
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
-/// `src` padded or cut to `target` characters into `buf`, or false when the
-/// result would be past `MAX_STRING_RESULT`.
+/// `src` padded or cut to `target` characters into `buf`, or false when
+/// `target` is negative, as in MySQL and StarRocks, or the result would be
+/// past `MAX_STRING_RESULT`.
 fn padRow(allocator: Allocator, buf: *std.ArrayList(u8), src: []const u8, target_in: i32, pad: []const u8, left: bool) !bool {
-    const target: usize = @intCast(@max(target_in, 0));
+    if (target_in < 0) return false;
+    const target: usize = @intCast(target_in);
     const src_chars = charCount(src);
     if (src_chars >= target or pad.len == 0) {
         try buf.appendSlice(allocator, charSlice(src, 0, @min(src_chars, target)));
@@ -1605,6 +1609,43 @@ pub fn instrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     for (0..row_count) |i| {
         try out.data.int.append(allocator, findChars(hay_sv.rowBytes(i), needle_sv.rowBytes(i), 0));
     }
+}
+
+/// STRPOS(haystack, needle, instance), as Trino: the character position of
+/// the instance-th occurrence of `needle`, overlapping ones counted, from
+/// the end for a negative instance; 0 when there are fewer, or the instance
+/// is 0. An empty needle is at 1, as in StarRocks.
+pub fn strposInstanceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const hay_sv = stringViewOf(args[0]);
+    const needle_sv = stringViewOf(args[1]);
+    const instances = args[2].data.int;
+    for (0..row_count) |i| {
+        const hay = hay_sv.rowBytes(i);
+        const found: i32 = if (nthOccurrence(hay, needle_sv.rowBytes(i), instances[i])) |at| @intCast(charCount(hay[0..at]) + 1) else 0;
+        try out.data.int.append(allocator, found);
+    }
+}
+
+/// The byte offset of the `instance`-th occurrence of `needle` in `hay`,
+/// overlapping ones counted, from the end when `instance` is negative.
+fn nthOccurrence(hay: []const u8, needle: []const u8, instance: i32) ?usize {
+    if (instance == 0) return null;
+    if (needle.len == 0) return 0;
+    var left = @abs(instance);
+    if (instance > 0) {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, hay, from, needle)) |at| : (from = at + 1) {
+            left -= 1;
+            if (left == 0) return at;
+        }
+    } else {
+        var end = hay.len;
+        while (std.mem.lastIndexOf(u8, hay[0..end], needle)) |at| : (end = at + needle.len - 1) {
+            left -= 1;
+            if (left == 0) return at;
+        }
+    }
+    return null;
 }
 
 /// LOCATE(needle, haystack, pos): the search starts at character `pos`; a

@@ -402,6 +402,10 @@ fn resolveDecimal(aa: Allocator, name: []const u8, arg_types: []const Type) !?Re
             return try buildDecFn(aa, name, arg_types, .string, dec.hexKernel, .propagates);
         if (std.ascii.eqlIgnoreCase(name, INTEGER_ARG_FN))
             return try buildDecFn(aa, name, arg_types, .bigint, dec.integerArgKernel, .kernel_managed);
+        if (std.ascii.eqlIgnoreCase(name, "greatest"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.greatestKernel, .propagates);
+        if (std.ascii.eqlIgnoreCase(name, "least"))
+            return try buildDecFn(aa, name, arg_types, arg_types[0], dec.leastKernel, .propagates);
         return null;
     }
 
@@ -1477,20 +1481,20 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "least", .arg_types = &.{ .string, .string }, .return_type = .string, .kernel = string.leastStringKernel },
     .{ .name = "least", .arg_types = &.{ .date, .date }, .return_type = .date, .kernel = math.leastDateKernel },
     .{ .name = "least", .arg_types = &.{ .datetime, .datetime }, .return_type = .datetime, .kernel = math.leastDatetimeKernel },
-    .{ .name = "greatest", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.greatestIntKernel },
-    .{ .name = "greatest", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.greatestBigintKernel },
-    .{ .name = "greatest", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 3, .kernel = math.greatestLargeintKernel },
-    .{ .name = "greatest", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.greatestDoubleKernel },
-    .{ .name = "greatest", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.greatestStringKernel },
-    .{ .name = "greatest", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.greatestDateKernel },
-    .{ .name = "greatest", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 3, .kernel = math.greatestDatetimeKernel },
-    .{ .name = "least", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 3, .kernel = math.leastIntKernel },
-    .{ .name = "least", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 3, .kernel = math.leastBigintKernel },
-    .{ .name = "least", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 3, .kernel = math.leastLargeintKernel },
-    .{ .name = "least", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 3, .kernel = math.leastDoubleKernel },
-    .{ .name = "least", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 3, .kernel = string.leastStringKernel },
-    .{ .name = "least", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 3, .kernel = math.leastDateKernel },
-    .{ .name = "least", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 3, .kernel = math.leastDatetimeKernel },
+    .{ .name = "greatest", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 1, .kernel = math.greatestIntKernel },
+    .{ .name = "greatest", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 1, .kernel = math.greatestBigintKernel },
+    .{ .name = "greatest", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 1, .kernel = math.greatestLargeintKernel },
+    .{ .name = "greatest", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 1, .kernel = math.greatestDoubleKernel },
+    .{ .name = "greatest", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 1, .kernel = string.greatestStringKernel },
+    .{ .name = "greatest", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 1, .kernel = math.greatestDateKernel },
+    .{ .name = "greatest", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 1, .kernel = math.greatestDatetimeKernel },
+    .{ .name = "least", .arg_types = &.{.int}, .return_type = .int, .variadic_min_args = 1, .kernel = math.leastIntKernel },
+    .{ .name = "least", .arg_types = &.{.bigint}, .return_type = .bigint, .variadic_min_args = 1, .kernel = math.leastBigintKernel },
+    .{ .name = "least", .arg_types = &.{.largeint}, .return_type = .largeint, .variadic_min_args = 1, .kernel = math.leastLargeintKernel },
+    .{ .name = "least", .arg_types = &.{.double}, .return_type = .double, .variadic_min_args = 1, .kernel = math.leastDoubleKernel },
+    .{ .name = "least", .arg_types = &.{.string}, .return_type = .string, .variadic_min_args = 1, .kernel = string.leastStringKernel },
+    .{ .name = "least", .arg_types = &.{.date}, .return_type = .date, .variadic_min_args = 1, .kernel = math.leastDateKernel },
+    .{ .name = "least", .arg_types = &.{.datetime}, .return_type = .datetime, .variadic_min_args = 1, .kernel = math.leastDatetimeKernel },
     // --- math (expanded) ---
     .{ .name = "sin", .arg_types = &.{.double}, .return_type = .double, .kernel = math.sinKernel },
     .{ .name = "cos", .arg_types = &.{.double}, .return_type = .double, .kernel = math.cosKernel },
@@ -1663,6 +1667,8 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "quarter", .arg_types = &.{.datetime}, .return_type = .int, .kernel = date.quarterFromDatetimeKernel },
     .{ .name = "last_day", .arg_types = &.{.date}, .return_type = .date, .kernel = date.lastDayFromDateKernel },
     .{ .name = "last_day", .arg_types = &.{.datetime}, .return_type = .date, .kernel = date.lastDayFromDatetimeKernel },
+    .{ .name = "last_day", .arg_types = &.{ .datetime, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.lastDayOfUnitKernel(.datetime) },
+    .{ .name = "last_day", .arg_types = &.{ .date, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.lastDayOfUnitKernel(.date) },
     .{ .name = "date_format", .arg_types = &.{ .datetime, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.dateFormatDatetimeKernel },
     .{ .name = "date_format", .arg_types = &.{ .date, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.dateFormatDateKernel },
     .{ .name = "str_to_date", .arg_types = &.{ .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = datefmt.strToDateKernel },
@@ -1839,6 +1845,8 @@ pub const builtins = [_]ScalarFn{
     // --- string (expanded set; matches DuckDB / MySQL / StarRocks parity) ---
     .{ .name = "lpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.lpadKernel },
     .{ .name = "rpad", .arg_types = &.{ .string, .int, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.rpadKernel },
+    .{ .name = "lpad", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.lpadKernel },
+    .{ .name = "rpad", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.rpadKernel },
     .{ .name = "repeat", .arg_types = &.{ .string, .int }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.repeatKernel },
     .{ .name = "space", .arg_types = &.{.int}, .return_type = .string, .null_strategy = .kernel_managed, .kernel = string.spaceKernel },
     .{ .name = "ascii", .arg_types = &.{.string}, .return_type = .int, .kernel = string.asciiKernel },
@@ -1848,6 +1856,7 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "locate", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.positionKernel },
     .{ .name = "locate", .arg_types = &.{ .string, .string, .int }, .return_type = .int, .kernel = string.locateFromKernel },
     .{ .name = "strpos", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.instrKernel },
+    .{ .name = "strpos", .arg_types = &.{ .string, .string, .int }, .return_type = .int, .kernel = string.strposInstanceKernel },
     .{ .name = "instr", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.instrKernel },
     .{ .name = "starts_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.startsWithKernel },
     .{ .name = "ends_with", .arg_types = &.{ .string, .string }, .return_type = .boolean, .kernel = string.endsWithKernel },
