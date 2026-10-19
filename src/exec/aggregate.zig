@@ -1707,6 +1707,7 @@ pub const Aggregate = struct {
         for (self.aggs, 0..) |a, ai| {
             switch (a.func) {
                 .count => self.scatterCount(self.agg_cols[ai].count, gids, self.agg_col_indices[ai], batch),
+                .count_if => self.scatterCountIf(self.agg_cols[ai].count, gids, batch.values[self.agg_col_indices[ai].?]),
                 .sum => self.scatterSum(ai, gids, batch.values[self.agg_col_indices[ai].?]),
                 .min => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, true),
                 .max => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, false),
@@ -1762,6 +1763,15 @@ pub const Aggregate = struct {
             }
         } else {
             for (gids) |g| counts[g] += 1;
+        }
+    }
+
+    /// COUNT_IF scatter over its BOOLEAN argument: rows that are true.
+    inline fn scatterCountIf(self: *Aggregate, counts: []u64, gids: []const u32, view: ColumnView) void {
+        _ = self;
+        const flags = view.data.boolean;
+        for (gids, 0..) |g, r| {
+            if (view.isValid(r) and flags[r] != 0) counts[g] += 1;
         }
     }
 

@@ -4236,6 +4236,27 @@ test "sql: unit-first date functions and aggregate aliases execute" {
     try std.testing.expectEqualStrings("c", b.values[12].data.string.rowBytes(0));
 }
 
+// The grouped, batched accumulator keeps COUNT_IF in a narrow count cell.
+test "sql: count_if under a GROUP BY" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ci (id BIGINT PRIMARY KEY, v1 VARCHAR(10), v2 VARCHAR(10), v4 INT, flag BOOLEAN)");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO ci VALUES
+        \\ (1, 'a', 'a', 1, true), (2, 'a', 'b', NULL, NULL), (3, 'a', NULL, 1, false), (4, 'a', 'b', 3, true),
+        \\ (5, 'a', 'b', 7, true), (6, 'c', NULL, NULL, false), (7, 'c', NULL, 2, NULL), (8, 'c', 'a', 3, true)
+    );
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v2 IS NOT NULL) FROM ci GROUP BY v1 ORDER BY v1", &.{ "4", "1" });
+    try helpers.expectTexts(allocator, db, "SELECT count_if(v4 + v4 IS NOT NULL) FROM ci GROUP BY v1 ORDER BY v1", &.{ "4", "2" });
+    try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v1 ORDER BY v1", &.{ "3", "1" });
+    try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v4 ORDER BY v4", &.{ "0", "1", "0", "2", "1" });
+    try helpers.expectTexts(allocator, db, "SELECT count_if(flag) FROM ci GROUP BY v1, v2 ORDER BY v1, v2", &.{ "0", "1", "2", "0", "1" });
+}
+
 test "sql: slash is true division; DIV is integer division" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
