@@ -677,9 +677,22 @@ const AvgAcc = struct {
 };
 
 /// AVG denominator factor for the input's decimal scale (1.0 for non-decimal).
-fn avgScaleDiv(in: ?Type) f64 {
+pub fn avgScaleDiv(in: ?Type) f64 {
     if (in) |t| if (t.decimalSpec()) |sp| return std.math.pow(f64, 10.0, @floatFromInt(sp.s));
     return 1.0;
+}
+
+/// VAR_POP / VAR_SAMP / STDDEV_POP / STDDEV_SAMP of `count` values whose
+/// squared deviations sum to `m2`, or null when it is undefined: no values,
+/// or one for a sample statistic. Every lane folds a DECIMAL's raw mantissas,
+/// so `scale_div` (`avgScaleDiv`) brings the variance back to the values'
+/// scale here, in the one place they all finish.
+pub fn welfordResult(func: AggFunc, count: u64, m2: f64, scale_div: f64) ?f64 {
+    const population = func == .var_pop or func == .stddev_pop;
+    if (count < @as(u64, if (population) 1 else 2)) return null;
+    const n: f64 = @floatFromInt(count);
+    const variance = (if (population) m2 / n else m2 / (n - 1)) / (scale_div * scale_div);
+    return if (func == .stddev_pop or func == .stddev_samp) @sqrt(variance) else variance;
 }
 
 const BoolAcc = struct {
@@ -4588,21 +4601,11 @@ pub fn appendAccToColumn(
         },
         .var_pop, .var_samp, .stddev_pop, .stddev_samp => {
             const w = state.welford;
-            // Sample variants additionally need ≥2 inputs (n−1 divisor).
-            const defined = switch (func) {
-                .var_pop, .stddev_pop => w.count >= 1,
-                else => w.count >= 2,
-            };
-            if (!defined) {
+            if (welfordResult(func, w.count, w.m2, avgScaleDiv(in_type))) |out| {
+                try col.data.double.append(allocator, out);
+            } else {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
-            } else {
-                const variance: f64 = switch (func) {
-                    .var_pop, .stddev_pop => w.m2 / @as(f64, @floatFromInt(w.count)),
-                    else => w.m2 / @as(f64, @floatFromInt(w.count - 1)),
-                };
-                const out: f64 = if (func == .stddev_pop or func == .stddev_samp) @sqrt(variance) else variance;
-                try col.data.double.append(allocator, out);
             }
         },
         .count_distinct => {

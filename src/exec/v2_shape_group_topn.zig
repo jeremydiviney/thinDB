@@ -934,14 +934,9 @@ fn welfordDefined(row: SiloCore.TopRow, agg_plan: AggregatePlan) bool {
 }
 
 fn welfordValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
-    if (!welfordDefined(row, agg_plan)) return 0.0;
-    const n: f64 = @floatFromInt(@as(i64, @intCast(rowStateValueNarrow(row, agg_plan.state_index))));
-    const m2 = rowStateFloat(row, agg_plan.state_index + 2);
-    const variance: f64 = switch (agg_plan.func) {
-        .var_pop, .stddev_pop => m2 / n,
-        else => m2 / (n - 1.0),
-    };
-    return if (agg_plan.func == .stddev_pop or agg_plan.func == .stddev_samp) @sqrt(variance) else variance;
+    const count: u64 = @intCast(rowStateValueNarrow(row, agg_plan.state_index));
+    const scale_div = std.math.pow(f64, 10.0, @floatFromInt(agg_plan.input_scale));
+    return aggregate.welfordResult(agg_plan.func, count, rowStateFloat(row, agg_plan.state_index + 2), scale_div) orelse 0.0;
 }
 
 fn avgValue(row: SiloCore.TopRow, agg_plan: AggregatePlan) f64 {
@@ -1735,6 +1730,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     .input_type = physicalTypeFor(input_type),
                     .state_index = next_numeric_state_index,
                     .output_type = output_type,
+                    .input_scale = if (input_type.decimalSpec()) |sp| sp.s else 0,
                     .input_nullable = input_nullable,
                 };
                 next_numeric_state_index += 3;
