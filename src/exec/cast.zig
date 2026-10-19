@@ -419,6 +419,29 @@ pub fn commonMember(a: Type, b: Type) ?Type {
     return commonType(a, b);
 }
 
+/// The type two nested values of different types compare in: `commonType`'s,
+/// when the two nest alike. Text never reads as a nested member here, as a
+/// NULL does in a constructor (`commonMember`), so a VARCHAR field beside an
+/// ARRAY field is a type mismatch, as in StarRocks.
+pub fn nestedComparedType(a: Type, b: Type) ?Type {
+    if (!sameNesting(a, b)) return null;
+    return commonType(a, b);
+}
+
+fn sameNesting(a: Type, b: Type) bool {
+    if (!a.isNested() or !b.isNested()) return !a.isNested() and !b.isNested();
+    if (a.arrayElement()) |ae| return sameNesting(ae, b.arrayElement() orelse return false);
+    if (a.mapTypes()) |am| {
+        const bm = b.mapTypes() orelse return false;
+        return sameNesting(am.key, bm.key) and sameNesting(am.value, bm.value);
+    }
+    const af = a.structFields().?;
+    const bf = b.structFields() orelse return false;
+    if (af.len != bf.len) return false;
+    for (af, bf) |x, y| if (!sameNesting(x.type, y.type)) return false;
+    return true;
+}
+
 /// A number and a DATE or DATETIME meet as in StarRocks, which reads the
 /// date as its YYYYMMDD number, an INT, and the datetime as its
 /// YYYYMMDDhhmmss number, a BIGINT (`CAST(d AS BIGINT)`). An integer or

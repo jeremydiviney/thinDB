@@ -139,6 +139,31 @@ test "STRUCT: comparison, ordering, grouping and conditionals" {
     try expectTexts(allocator, db, "SELECT IF(id > 2, s, NULL) FROM sc ORDER BY id", &.{ null, null, null, "{\"a\":2,\"b\":null}" });
 }
 
+test "STRUCT: two struct columns of different types compare and join at their common type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE st (id INT PRIMARY KEY, s1 STRUCT<a INT, b VARCHAR(10)>, s2 STRUCT<x BIGINT, y STRING>, s3 STRUCT<a INT>, s4 STRUCT<a INT, b ARRAY<INT>>)");
+    try exec(allocator, db,
+        \\INSERT INTO st VALUES
+        \\ (1, row(1, 'x'), row(1, 'x'), row(1), row(1, [1])),
+        \\ (2, row(2, 'y'), row(3, 'y'), row(2), row(2, [2])),
+        \\ (3, NULL, row(1, NULL), NULL, row(3, NULL))
+    );
+
+    try expectTexts(allocator, db, "SELECT s1 = s2 FROM st ORDER BY id", &.{ "1", "0", null });
+    try expectTexts(allocator, db, "SELECT s1 < s2 FROM st ORDER BY id", &.{ "0", "1", null });
+    try expectTexts(allocator, db, "SELECT u.id FROM st t JOIN st u ON t.s1 = u.s2 ORDER BY t.id, u.id", &.{"1"});
+    // A NULL literal's field reads as the other side's array.
+    try expectTexts(allocator, db, "SELECT s4 <=> row(3, NULL) FROM st ORDER BY id", &.{ "0", "0", "1" });
+    try helpers.expectRunError(allocator, db, "SELECT id FROM st WHERE s1 = s3", error.PredicateTypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT id FROM st WHERE s1 = s4", error.PredicateTypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT t.id FROM st t JOIN st u ON t.s1 = u.s4", error.JoinKeyTypeMismatch);
+}
+
 test "STRUCT: nested paths through joins, unions and derived tables" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

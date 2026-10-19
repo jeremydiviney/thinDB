@@ -146,6 +146,21 @@ test "MAP: ordering by a subscript, grouping and equality" {
     try expectTexts(allocator, db, "SELECT COUNT(*) FROM g GROUP BY v ORDER BY v", &.{ "1", "1", "2", "1" });
 }
 
+test "MAP: two map columns of different types compare and join at their common type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE mc (id BIGINT PRIMARY KEY, i MAP<INT, STRING>, d MAP<DECIMAL(16, 3), VARCHAR(30)>)");
+    try exec(allocator, db, "INSERT INTO mc VALUES (1, map{1: 'a'}, map{1.000: 'a'}), (2, map{2: 'b'}, map{2.5: 'b'}), (3, NULL, NULL)");
+
+    try expectTexts(allocator, db, "SELECT id FROM mc WHERE d = i ORDER BY id", &.{"1"});
+    try expectTexts(allocator, db, "SELECT i <> d FROM mc ORDER BY id", &.{ "0", "1", null });
+    try expectTexts(allocator, db, "SELECT b.id FROM mc a LEFT JOIN mc b ON b.d = a.i ORDER BY a.id", &.{ "1", null, null });
+}
+
 test "MAP: MAP_AGG skips NULL keys and keeps NULL values" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

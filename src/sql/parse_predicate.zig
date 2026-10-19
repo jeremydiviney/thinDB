@@ -567,7 +567,9 @@ fn anchorColumn(p: anytype, e: ir.Expr) @TypeOf(p.*).Err![]const u8 {
 }
 
 /// `a <=> b` (IS NOT DISTINCT FROM): equal, or both NULL. It is never
-/// UNKNOWN, so its negation keeps the rows where only one side is NULL.
+/// UNKNOWN, so its negation keeps the rows where only one side is NULL. A
+/// nested constructor compares as `nestedComparison` has it, so its NULL
+/// members take the other side's types.
 fn nullSafeEqual(p: anytype, lhs_expr: ir.Expr, rhs_expr: ir.Expr) @TypeOf(p.*).Err!PredicateExpr {
     const operands = try hexResolved(p, lhs_expr, rhs_expr);
     const lhs = leafOperand(operands[0]);
@@ -594,7 +596,10 @@ fn nullSafeEqual(p: anytype, lhs_expr: ir.Expr, rhs_expr: ir.Expr) @TypeOf(p.*).
     const equal = try p.arena.alloc(PredicateExpr, 3);
     equal[0] = .{ .is_not_null = a };
     equal[1] = .{ .is_not_null = b };
-    equal[2] = .{ .leaf_col_col = .{ .left = a, .op = .eq, .right = b } };
+    equal[2] = if (isNestedExpr(operands[0]) or isNestedExpr(operands[1]))
+        try nestedComparison(p, .{ .col_ref = a }, .eq, .{ .col_ref = b })
+    else
+        .{ .leaf_col_col = .{ .left = a, .op = .eq, .right = b } };
     const kids = try p.arena.alloc(PredicateExpr, 2);
     kids[0] = .{ .@"and" = both_null };
     kids[1] = .{ .@"and" = equal };
