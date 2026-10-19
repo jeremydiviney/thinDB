@@ -124,6 +124,30 @@ test "REGEXP and RLIKE match anywhere in the string" {
     }
 }
 
+test "REGEXP functions read each row's own pattern, replacement and match type" {
+    // They read row 0's and applied it to the whole batch, so a pattern
+    // column matched every row against its first pattern.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE rp (id BIGINT PRIMARY KEY, s VARCHAR(16), p VARCHAR(16), r VARCHAR(8), m VARCHAR(4))");
+    try exec(allocator, db,
+        \\INSERT INTO rp VALUES (1, 'abc', 'b', '-', 'c'), (2, 'xyz', 'y', '+', 'c'), (3, 'xyz', 'q', '-', 'c'),
+        \\  (4, 'XYZ', 'y', '*', 'i'), (5, 'abc', NULL, '-', 'c'), (6, 'aBc', 'b', NULL, NULL), (7, 'abcb', 'b', '=', 'c')
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("rp", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_LIKE(s, p, m) AS CHAR) FROM rp ORDER BY id", &.{ "1", "1", "0", "1", null, null, "1" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_LIKE(s, p) AS CHAR) FROM rp ORDER BY id", &.{ "1", "1", "0", "0", null, "0", "1" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, p, r) FROM rp ORDER BY id", &.{ "a-c", "x+z", "xyz", "XYZ", null, null, "a=c=" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_INSTR(s, p) AS CHAR) FROM rp ORDER BY id", &.{ "2", "2", "0", "0", null, "0", "2" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_SUBSTR(s, p, 1, 1, m) FROM rp ORDER BY id", &.{ "b", "y", null, "Y", null, null, "b" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(id AS CHAR) FROM rp WHERE s REGEXP p ORDER BY id", &.{ "1", "2", "7" });
+    }
+}
+
 test "LIKE: backslash escapes by default, ESCAPE names another character" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

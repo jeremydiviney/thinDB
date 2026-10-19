@@ -23,23 +23,22 @@ const predicate = @import("predicate.zig");
 
 /// REGEXP_REPLACE(haystack, pattern, replacement[, pos[, occurrence[,
 /// match_type]]]): the matches from character `pos` on, or only the
-/// `occurrence`-th of them when it's positive, replaced. The pattern,
-/// replacement and match type are read from row 0 and the regex compiled
-/// once per batch — i.e. they must be constant across the batch (the usual
-/// case: SQL literals). The replacement may use `\N` capture backrefs.
+/// `occurrence`-th of them when it's positive, replaced. Each row may give
+/// its own pattern, replacement and match type (`RegexCall`). The
+/// replacement may use `\N` capture backrefs.
 /// Backed by the linear-time engine in util/regex.zig; unsupported regex
 /// features (lookaround, in-pattern backrefs) or malformed patterns
 /// surface as RegexInvalidPattern.
 pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = try RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null) orelse
-        return appendNullStrings(allocator, out, row_count);
-    defer call.deinit(allocator);
-    const replacement = stringViewOf(args[2]).rowBytes(0);
+    var call = RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null);
+    defer call.deinit();
+    const replacements = stringViewOf(args[2]);
     const sv = stringViewOf(args[0]);
     for (0..row_count) |i| {
-        if (!allValid(args, i)) {
+        const re = try call.at(i);
+        if (re == null or !allValid(args, i)) {
             try stringStoreOf(out).appendValue(allocator, "");
             try out.appendValidBit(allocator, base + i, false);
             continue;
@@ -53,47 +52,86 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
         } else 0;
         // `replaced` is borrowed from the scratch's reused output buffer;
         // appendValue copies it into the column store, so no free per row.
-        const replaced = try call.re.replaceScratch(s, replacement, &call.scratch, start, occurrence);
+        const replaced = try re.?.replaceScratch(s, replacements.rowBytes(i), &call.scratch, start, occurrence);
         try stringStoreOf(out).appendValue(allocator, replaced);
         try out.appendValidBit(allocator, base + i, true);
     }
 }
 
-/// The compiled pattern of a REGEXP_* call and the matcher state its rows
+/// The patterns of a REGEXP_* call's rows and the matcher state they
 /// share: the visited array, thread lists, capture arena, and slot buffers
 /// all persist between rows, so applying one pattern to a whole batch
-/// allocates ~nothing per row. The pattern and match type come from row 0.
+/// allocates ~nothing per row. Each row may give its own pattern and match
+/// type. The last pair compiled is kept, so a constant pattern compiles
+/// once per batch, and a column of them once per change.
 const RegexCall = struct {
-    re: regex.Regex,
+    allocator: Allocator,
+    patterns: ColumnView,
+    match_types: ?ColumnView,
+    compiled: ?Compiled = null,
     scratch: regex.Scratch,
-    slots: []?usize,
 
-    /// Null when the pattern or match type is NULL, which makes every row
-    /// NULL.
-    fn init(allocator: Allocator, pattern: ColumnView, match_type: ?ColumnView) !?RegexCall {
-        if (!pattern.isValid(0)) return null;
-        var options: regex.Options = .{};
-        if (match_type) |m| {
-            if (!m.isValid(0)) return null;
-            options = try regexMatchOptions(stringViewOf(m).rowBytes(0));
-        }
-        var re = try regex.Regex.compileWith(allocator, stringViewOf(pattern).rowBytes(0), options);
-        errdefer re.deinit();
-        const slots = try allocator.alloc(?usize, re.n_slots);
-        return .{ .re = re, .scratch = regex.Scratch.init(allocator), .slots = slots };
+    const Compiled = struct {
+        re: regex.Regex,
+        slots: []?usize,
+        pattern: []u8,
+        match_type: []u8,
+    };
+
+    fn init(allocator: Allocator, patterns: ColumnView, match_types: ?ColumnView) RegexCall {
+        return .{ .allocator = allocator, .patterns = patterns, .match_types = match_types, .scratch = regex.Scratch.init(allocator) };
     }
 
-    fn deinit(self: *RegexCall, allocator: Allocator) void {
-        allocator.free(self.slots);
+    fn deinit(self: *RegexCall) void {
+        self.release();
         self.scratch.deinit();
-        self.re.deinit();
     }
 
-    /// Byte bounds of the `occurrence`-th match at or after byte `start`.
+    fn release(self: *RegexCall) void {
+        const c = &(self.compiled orelse return);
+        c.re.deinit();
+        self.allocator.free(c.slots);
+        self.allocator.free(c.pattern);
+        self.allocator.free(c.match_type);
+        self.compiled = null;
+    }
+
+    /// The regex `row` names, or null when its pattern or match type is
+    /// NULL. Compiled even when the row's other arguments are NULL, so a
+    /// malformed pattern fails the call as it does in MySQL.
+    fn at(self: *RegexCall, row: usize) !?*regex.Regex {
+        if (!self.patterns.isValid(row)) return null;
+        const pattern = stringViewOf(self.patterns).rowBytes(row);
+        var match_type: []const u8 = "";
+        if (self.match_types) |m| {
+            if (!m.isValid(row)) return null;
+            match_type = stringViewOf(m).rowBytes(row);
+        }
+        if (self.compiled) |*c| {
+            if (std.mem.eql(u8, c.pattern, pattern) and std.mem.eql(u8, c.match_type, match_type)) return &c.re;
+        }
+        self.release();
+        // The scratch keys its lazy DFA by the program's address, which a
+        // new compile may reuse, so a new pattern starts a new scratch.
+        self.scratch.deinit();
+        self.scratch = regex.Scratch.init(self.allocator);
+        var re = try regex.Regex.compileWith(self.allocator, pattern, try regexMatchOptions(match_type));
+        errdefer re.deinit();
+        const slots = try self.allocator.alloc(?usize, re.n_slots);
+        errdefer self.allocator.free(slots);
+        const pattern_copy = try self.allocator.dupe(u8, pattern);
+        errdefer self.allocator.free(pattern_copy);
+        self.compiled = .{ .re = re, .slots = slots, .pattern = pattern_copy, .match_type = try self.allocator.dupe(u8, match_type) };
+        return &self.compiled.?.re;
+    }
+
+    /// Byte bounds of the `occurrence`-th match at or after byte `start`
+    /// of the pattern `at` last gave.
     fn nth(self: *RegexCall, s: []const u8, start: usize, occurrence: usize) !?[2]usize {
-        @memset(self.slots, null);
-        if (!try self.re.findNth(&self.scratch, s, start, occurrence, self.slots)) return null;
-        return .{ self.slots[0].?, self.slots[1].? };
+        const c = &self.compiled.?;
+        @memset(c.slots, null);
+        if (!try c.re.findNth(&self.scratch, s, start, occurrence, c.slots)) return null;
+        return .{ c.slots[0].?, c.slots[1].? };
     }
 };
 
@@ -125,14 +163,6 @@ fn allValid(args: []const ColumnView, row: usize) bool {
 fn regexStart(s: []const u8, pos: i64, past_end: usize) !usize {
     if (pos < 1 or @as(u64, @intCast(pos)) > charCount(s) + past_end) return error.RegexIndexOutOfBounds;
     return charOffset(s, @intCast(pos - 1));
-}
-
-fn appendNullStrings(allocator: Allocator, out: *ColumnStore, row_count: usize) !void {
-    const base = out.data.rowCount();
-    for (0..row_count) |i| {
-        try stringStoreOf(out).appendValue(allocator, "");
-        try out.appendValidBit(allocator, base + i, false);
-    }
 }
 
 pub fn orderKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
@@ -1084,16 +1114,13 @@ pub fn likeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = try RegexCall.init(allocator, args[1], if (args.len > 2) args[2] else null) orelse {
-        try out.data.boolean.appendNTimes(allocator, 0, row_count);
-        for (0..row_count) |i| try out.appendValidBit(allocator, base + i, false);
-        return;
-    };
-    defer call.deinit(allocator);
+    var call = RegexCall.init(allocator, args[1], if (args.len > 2) args[2] else null);
+    defer call.deinit();
     const sv = stringViewOf(args[0]);
     for (0..row_count) |i| {
-        const valid = allValid(args, i);
-        const ok = valid and try call.re.matchesWith(&call.scratch, sv.rowBytes(i), 0);
+        const re = try call.at(i);
+        const valid = re != null and allValid(args, i);
+        const ok = valid and try re.?.matchesWith(&call.scratch, sv.rowBytes(i), 0);
         try out.data.boolean.append(allocator, @intFromBool(ok));
         try out.appendValidBit(allocator, base + i, valid);
     }
@@ -1106,15 +1133,11 @@ pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 pub fn regexpInstrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = try RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null) orelse {
-        try out.data.bigint.appendNTimes(allocator, 0, row_count);
-        for (0..row_count) |i| try out.appendValidBit(allocator, base + i, false);
-        return;
-    };
-    defer call.deinit(allocator);
+    var call = RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null);
+    defer call.deinit();
     const sv = stringViewOf(args[0]);
     for (0..row_count) |i| {
-        const valid = allValid(args, i);
+        const valid = try call.at(i) != null and allValid(args, i);
         try out.data.bigint.append(allocator, if (valid) try regexpInstrRow(&call, args, sv.rowBytes(i), i) else 0);
         try out.appendValidBit(allocator, base + i, valid);
     }
@@ -1141,13 +1164,12 @@ pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *
     if (row_count == 0) return;
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
-    var call = try RegexCall.init(allocator, args[1], if (args.len > 4) args[4] else null) orelse
-        return appendNullStrings(allocator, out, row_count);
-    defer call.deinit(allocator);
+    var call = RegexCall.init(allocator, args[1], if (args.len > 4) args[4] else null);
+    defer call.deinit();
     const sv = stringViewOf(args[0]);
     for (0..row_count) |i| {
         const src = sv.rowBytes(i);
-        const bounds: ?[2]usize = if (allValid(args, i)) blk: {
+        const bounds: ?[2]usize = if (try call.at(i) != null and allValid(args, i)) blk: {
             const start = if (args.len > 2) try regexStart(src, args[2].data.bigint[i], 1) else 0;
             const occurrence: usize = if (args.len > 3) @intCast(@max(args[3].data.bigint[i], 1)) else 1;
             break :blk try call.nth(src, start, occurrence);
