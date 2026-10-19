@@ -29,15 +29,16 @@ const Error = @import("exec.zig").Error;
 
 /// Names that resolve here, for `scalar_fn.nameResolvable`.
 const NAMES = [_][]const u8{
-    scalar_fn.ARRAY_VALUE_FN, "split",              "array_generate",   "array_repeat",
-    "array_length",           "cardinality",        "array_distinct",   "array_sort",
-    "array_reverse",          "array_min",          "array_max",        "array_sum",
-    "array_avg",              "array_flatten",      "array_difference", "element_at",
-    "array_slice",            "array_join",         "array_contains",   "array_position",
-    "array_remove",           "array_append",       "array_concat",     "arrays_overlap",
-    "array_contains_all",     "array_contains_seq", "array_intersect",  scalar_fn.ARRAY_ORDER_FN,
-    "array_filter",           "any_match",          "all_match",        "array_sortby",
-    "array_map",              "regexp_extract_all",
+    scalar_fn.ARRAY_VALUE_FN, "split",              "array_generate",    "array_repeat",
+    "array_length",           "cardinality",        "array_distinct",    "array_sort",
+    "array_reverse",          "array_min",          "array_max",         "array_sum",
+    "array_avg",              "array_flatten",      "array_difference",  "element_at",
+    "array_slice",            "array_join",         "array_contains",    "array_position",
+    "array_remove",           "array_append",       "array_concat",      "arrays_overlap",
+    "array_contains_all",     "array_contains_seq", "array_intersect",   scalar_fn.ARRAY_ORDER_FN,
+    "array_filter",           "any_match",          "all_match",         "array_sortby",
+    "array_map",              "regexp_extract_all", "cosine_similarity", "cosine_similarity_norm",
+    "l2_distance",
 };
 
 pub fn isArrayFnName(name: []const u8) bool {
@@ -126,6 +127,20 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
             return overload(aa, name, arg_types, .boolean, if (eql(name, "any_match")) anyMatchKernel else allMatchKernel);
         }
         return null;
+    }
+    if (eql(name, "cosine_similarity") or eql(name, "cosine_similarity_norm") or eql(name, "l2_distance")) {
+        if (arg_types.len != 2) return null;
+        for (arg_types) |t| {
+            const e = t.arrayElement() orelse return null;
+            if (!(e.isInteger() or e.isDecimal() or e.isFloat() or e == .boolean)) return null;
+        }
+        const kernel = if (eql(name, "l2_distance"))
+            VectorKernel(.l2_distance)
+        else if (eql(name, "cosine_similarity"))
+            VectorKernel(.cosine_similarity)
+        else
+            VectorKernel(.inner_product);
+        return overload(aa, name, arg_types, .double, kernel);
     }
     if (eql(name, "array_filter")) {
         if (arg_types.len != 2) return null;
@@ -985,6 +1000,65 @@ fn sumKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args
         },
         else => return Error.ComputeNoSuchOverload,
     }
+}
+
+const VectorMeasure = enum { cosine_similarity, inner_product, l2_distance };
+
+/// COSINE_SIMILARITY(a, b), COSINE_SIMILARITY_NORM(a, b) (the inner product,
+/// for vectors already of length 1) and L2_DISTANCE(a, b) (the squared
+/// distance), as StarRocks defines them, over equal-length numeric arrays in
+/// double precision. A NULL array or element gives NULL, as does a cosine
+/// with a zero vector; arrays of different lengths are `ArrayLengthMismatch`.
+fn VectorKernel(comptime measure: VectorMeasure) TypedKernel {
+    return struct {
+        fn kernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+            _ = out_type;
+            var a = try FlatAs.init(allocator, arg_types[0], args[0], .double, rows);
+            defer a.deinit(allocator);
+            var b = try FlatAs.init(allocator, arg_types[1], args[1], .double, rows);
+            defer b.deinit(allocator);
+            const av = a.elements.view;
+            const bv = b.elements.view;
+            for (0..rows) |r| {
+                if (!args[0].isValid(r) or !args[1].isValid(r)) {
+                    try out.appendNulls(allocator, 1);
+                    continue;
+                }
+                const as = a.start(r);
+                const bs = b.start(r);
+                const n = a.end(r) - as;
+                if (b.end(r) - bs != n) return Error.ArrayLengthMismatch;
+                var dot: f64 = 0;
+                var a_norm: f64 = 0;
+                var b_norm: f64 = 0;
+                var any_null = false;
+                for (0..n) |i| {
+                    if (!av.isValid(as + i) or !bv.isValid(bs + i)) {
+                        any_null = true;
+                        break;
+                    }
+                    const x = av.data.double[as + i];
+                    const y = bv.data.double[bs + i];
+                    switch (measure) {
+                        .l2_distance => dot += (x - y) * (x - y),
+                        .inner_product => dot += x * y,
+                        .cosine_similarity => {
+                            dot += x * y;
+                            a_norm += x * x;
+                            b_norm += y * y;
+                        },
+                    }
+                }
+                const zero_vector = measure == .cosine_similarity and (a_norm == 0 or b_norm == 0);
+                if (any_null or zero_vector) {
+                    try out.appendNulls(allocator, 1);
+                    continue;
+                }
+                const value = if (measure == .cosine_similarity) dot / (@sqrt(a_norm) * @sqrt(b_norm)) else dot;
+                try appendValue(allocator, out, "double", value);
+            }
+        }
+    }.kernel;
 }
 
 /// ARRAY_AVG: the mean of the elements that aren't NULL, a DECIMAL's

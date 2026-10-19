@@ -117,6 +117,28 @@ test "ARRAY: functions" {
     try expectText(allocator, db, "SELECT array_sort(array_intersect([1, 2, 2, 3], [2, 3, 4]))", "[2,3]");
 }
 
+test "ARRAY: cosine_similarity, cosine_similarity_norm and l2_distance" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE v (id BIGINT PRIMARY KEY, data ARRAY<FLOAT>, i ARRAY<INT>)");
+    try exec(allocator, db, "INSERT INTO v VALUES (1, [0.1, 0.2, 0.3], [1, 2]), (2, [0.2, 0.1, 0.3], [0, 0]), (3, [0.3, 0.2, 0.1], [3, NULL]), (4, NULL, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("v", .{})).flush();
+        // StarRocks' answers.
+        try expectTexts(allocator, db, "SELECT ROUND(cosine_similarity(ARRAY<FLOAT>[0.1, 0.2, 0.3], data), 3) FROM v ORDER BY id", &.{ "1", "0.929", "0.714", null });
+        try expectTexts(allocator, db, "SELECT ROUND(l2_distance(ARRAY<FLOAT>[0.1, 0.2, 0.3], data), 3) FROM v ORDER BY id", &.{ "0", "0.02", "0.08", null });
+        try expectTexts(allocator, db, "SELECT ROUND(cosine_similarity_norm(data, data), 3) FROM v ORDER BY id", &.{ "0.14", "0.14", "0.14", null });
+        try expectTexts(allocator, db, "SELECT cosine_similarity(i, [3, 4]) FROM v ORDER BY id", &.{ "0.9838699100999074", null, null, null });
+        try expectTexts(allocator, db, "SELECT l2_distance(i, [3, 4]) FROM v ORDER BY id", &.{ "8", "25", null, null });
+    }
+    try expectText(allocator, db, "SELECT l2_distance([], [])", "0");
+    try std.testing.expectError(error.ArrayLengthMismatch, exec(allocator, db, "SELECT cosine_similarity([1, 2], [1, 2, 3])"));
+}
+
 test "ARRAY: IF, IFNULL, COALESCE and CASE choose whole arrays" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
