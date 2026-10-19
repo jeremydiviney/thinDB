@@ -2950,6 +2950,33 @@ test "sql: JOIN keyword alone defaults to INNER" {
     try std.testing.expectEqual(@as(usize, 2), rows);
 }
 
+test "sql: StarRocks join hints parse and change nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try seedOrdersItems(db);
+
+    const cases = .{
+        .{ .sql = "SELECT oid FROM orders JOIN [BROADCAST] items ON orders.item_id = items.iid ORDER BY oid", .expected = &[_]i64{ 1, 2 } },
+        .{ .sql = "SELECT oid FROM orders INNER JOIN [shuffle] items ON orders.item_id = items.iid ORDER BY oid", .expected = &[_]i64{ 1, 2 } },
+        .{ .sql = "SELECT oid FROM orders LEFT JOIN [bucket] items ON orders.item_id = items.iid ORDER BY oid", .expected = &[_]i64{ 1, 2, 3 } },
+        .{ .sql = "SELECT oid FROM orders LEFT OUTER JOIN [Colocate] items ON orders.item_id = items.iid ORDER BY oid", .expected = &[_]i64{ 1, 2, 3 } },
+        .{ .sql = "SELECT COUNT(*) FROM orders CROSS JOIN [unreorder] items", .expected = &[_]i64{9} },
+        .{ .sql = "SELECT oid FROM orders LEFT JOIN [skew|orders.item_id(100, 'x', -2.5, NULL)] items ON orders.item_id = items.iid ORDER BY oid", .expected = &[_]i64{ 1, 2, 3 } },
+    };
+    inline for (cases) |c| {
+        const got = try helpers.collectBigints(allocator, db, c.sql);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, c.expected, got);
+    }
+
+    try helpers.expectRunError(allocator, db, "SELECT oid FROM orders JOIN [fastest] items ON orders.item_id = items.iid", error.SqlExpectedIdent);
+    try helpers.expectRunError(allocator, db, "SELECT oid FROM orders JOIN [skew orders.item_id(1)] items ON orders.item_id = items.iid", error.SqlExpectedToken);
+    try helpers.expectRunError(allocator, db, "SELECT oid FROM orders JOIN [skew|orders.item_id(1) items", error.SqlExpectedToken);
+}
+
 test "sql: LEFT OUTER JOIN preserves unmatched left rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

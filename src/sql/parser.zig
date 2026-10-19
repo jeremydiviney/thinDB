@@ -6110,7 +6110,35 @@ pub const Parser = struct {
         }
         if (self.cur.tag != .kw_join) return ParseError.SqlExpectedKeyword;
         try self.advance();
+        try self.skipJoinHint();
         return jtype;
+    }
+
+    /// StarRocks' join hint after JOIN: `[BROADCAST]`, `[SHUFFLE]`,
+    /// `[BUCKET]`, `[COLOCATE]`, `[UNREORDER]` or `[SKEW|t.c(v, ...)]`.
+    /// Each picks how StarRocks distributes or orders the join, and thinDB
+    /// runs a join as it's written, so a hint changes nothing and only
+    /// parses.
+    fn skipJoinHint(self: *Parser) ParseError!void {
+        if (self.cur.tag != .lbracket) return;
+        try self.advance();
+        if (self.cur.tag != .identifier or self.cur.quoted) return ParseError.SqlExpectedIdent;
+        const hints = [_][]const u8{ "broadcast", "shuffle", "bucket", "colocate", "unreorder" };
+        const known = for (hints) |h| {
+            if (std.ascii.eqlIgnoreCase(self.cur.text, h)) break true;
+        } else false;
+        if (known) {
+            try self.advance();
+            return self.expect(.rbracket);
+        }
+        if (!std.ascii.eqlIgnoreCase(self.cur.text, "skew")) return ParseError.SqlExpectedIdent;
+        try self.advance();
+        try self.expect(.pipe);
+        while (self.cur.tag != .rbracket) {
+            if (self.cur.tag == .eof) return ParseError.SqlExpectedToken;
+            try self.advance();
+        }
+        try self.advance();
     }
 
     /// An ON clause of keys, ranges and one-sided conditions lowers to join
