@@ -151,6 +151,10 @@ pub const AggFunc = enum {
     covar_pop,
     covar_samp,
     corr,
+    /// APPROX_TOP_K: the `params.top_k` most frequent values of `col`, NULL
+    /// among them, counted exactly (`appendTopK`). Output
+    /// ARRAY<STRUCT<item, count BIGINT>> (`topKType`).
+    approx_top_k,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -161,7 +165,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .udf => return false,
     };
     return true;
 }
@@ -173,6 +177,8 @@ pub const AggParams = union(enum) {
     none,
     percentile: f64,
     concat: ConcatParams,
+    /// APPROX_TOP_K's k, at least 1.
+    top_k: u32,
 };
 
 pub const ConcatParams = struct {
@@ -345,6 +351,8 @@ pub const AccState = union(enum) {
     /// wide to sit inline without inflating every other group's state — so it
     /// lives behind a pointer, null until the first value is appended).
     concat: ?*ConcatAcc,
+    /// APPROX_TOP_K's counts, boxed like `concat`.
+    top_k: ?*TopKAcc,
 };
 
 fn boolUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
@@ -793,6 +801,13 @@ const CoMomentAcc = struct {
     c: f64 = 0.0,
     m2_x: f64 = 0.0,
     m2_y: f64 = 0.0,
+};
+
+/// Each value's count, keyed by the value as an array stores it as an
+/// element (`nested.elementBytes`); NULLs count apart.
+const TopKAcc = struct {
+    counts: std.StringHashMapUnmanaged(u64) = .empty,
+    nulls: u64 = 0,
 };
 
 const ConcatAcc = struct {
@@ -3310,6 +3325,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         },
         .percentile, .percentile_disc, .percentile_approx => percentileState(in),
         .group_concat => .{ .concat = null },
+        .approx_top_k => .{ .top_k = null },
         .udf => unreachable,
     };
 }
@@ -3457,8 +3473,13 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => .largeint,
         // Arrays concatenate into one array (ARRAY_AGG).
         .group_concat => if (in != null and in.?.isNested()) in.? else .string,
+        .approx_top_k => topKType(in orelse return Error.AggregateColumnRequired),
         .udf => Error.AggregateUnsupportedType,
     };
+}
+
+fn topKType(item: Type) !Type {
+    return types.arrayOf(try types.structOf(&.{ .{ .name = "item", .type = item }, .{ .name = "count", .type = .bigint } }));
 }
 
 /// Whether an aggregate takes only numbers, so MySQL reads its input as a
@@ -3543,6 +3564,13 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
             if (arg2_in) |k| if (!k.isString()) return Error.AggregateUnsupportedType;
             switch (params) {
                 .concat => {},
+                else => return Error.AggregateInvalidParam,
+            }
+        },
+        .approx_top_k => {
+            _ = in orelse return Error.AggregateColumnRequired;
+            switch (params) {
+                .top_k => |k| if (k == 0) return Error.AggregateInvalidParam,
                 else => return Error.AggregateInvalidParam,
             }
         },
@@ -3973,6 +4001,7 @@ pub fn updateState(
                 null;
             try groupConcatUpdate(aa, s, batch.values[col_idx.?], order_key, row_start, row_end, params);
         },
+        .approx_top_k => try topKUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
         .udf => return Error.AggregateUnsupportedType,
     }
 }
@@ -4291,6 +4320,75 @@ fn groupConcatUpdate(aa: Allocator, s: *AccState, view: ColumnView, order_key: ?
             c.nonempty = true;
         }
     }
+}
+
+fn topKUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    const acc = s.top_k orelse blk: {
+        const box = try aa.create(TopKAcc);
+        box.* = .{};
+        s.top_k = box;
+        break :blk box;
+    };
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) {
+            acc.nulls += 1;
+            continue;
+        }
+        var buf: [16]u8 = undefined;
+        const gop = try acc.counts.getOrPut(aa, nested.elementBytes(view, r, &buf));
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try aa.dupe(u8, gop.key_ptr.*);
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* += 1;
+    }
+}
+
+/// The `k` most frequent values, most frequent first. Among equal counts
+/// NULL comes first, then the values in order, so the answer is the same
+/// however rows arrive.
+fn appendTopK(allocator: Allocator, col: *ColumnStore, acc: *const TopKAcc, k: u32, item_type: Type) !void {
+    const Entry = struct { item: ?[]const u8, count: u64 };
+    const entries = try allocator.alloc(Entry, acc.counts.count() + @intFromBool(acc.nulls > 0));
+    defer allocator.free(entries);
+    var it = acc.counts.iterator();
+    var n: usize = 0;
+    while (it.next()) |kv| : (n += 1) entries[n] = .{ .item = kv.key_ptr.*, .count = kv.value_ptr.* };
+    if (acc.nulls > 0) entries[n] = .{ .item = null, .count = acc.nulls };
+    const class = nested.ElemClass.of(item_type);
+    std.mem.sortUnstable(Entry, entries, class, struct {
+        fn less(c: nested.ElemClass, a: Entry, b: Entry) bool {
+            if (a.count != b.count) return a.count > b.count;
+            const a_item = a.item orelse return b.item != null;
+            const b_item = b.item orelse return false;
+            return nested.elementOrder(c, a_item, b_item) == .lt;
+        }
+    }.less);
+    const top = entries[0..@min(entries.len, k)];
+    var cells: std.ArrayList(u8) = .empty;
+    defer cells.deinit(allocator);
+    const ends = try allocator.alloc(usize, top.len);
+    defer allocator.free(ends);
+    const classes = [_]nested.ElemClass{ class, .i64 };
+    for (top, ends) |e, *end| {
+        var count_bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &count_bytes, @intCast(e.count), .little);
+        const fields = [_]?[]const u8{ e.item, &count_bytes };
+        try nested.appendRawStruct(allocator, &cells, &classes, &fields);
+        end.* = cells.items.len;
+    }
+    const elements = try allocator.alloc([]const u8, top.len);
+    defer allocator.free(elements);
+    var start: usize = 0;
+    for (elements, ends) |*element, end| {
+        element.* = cells.items[start..end];
+        start = end;
+    }
+    var value: std.ArrayList(u8) = .empty;
+    defer value.deinit(allocator);
+    try nested.appendRawArray(allocator, &value, .nested, elements);
+    try col.data.nested.appendValue(allocator, value.items);
 }
 
 /// A collected GROUP_CONCAT of arrays: one array of all their elements; of
@@ -4652,6 +4750,14 @@ pub fn appendAccToColumn(
                     }
                     try col.data.string.appendValue(allocator, joined.items);
                 }
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
+        },
+        .approx_top_k => {
+            if (state.top_k) |acc| {
+                try appendTopK(allocator, col, acc, spec.params.top_k, in_type orelse return Error.AggregateColumnRequired);
             } else {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
