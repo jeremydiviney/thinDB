@@ -202,6 +202,16 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr, lowered:
             if (s.rest_cols.len > 0) return try resolveRowIn(ctx, pred, s);
             const drained = try runInSubquery(ctx, s.source);
             pred.* = .{ .in_set = .{ .col = s.col, .values = drained.values, .negate = s.negate, .value_type = drained.ty } };
+            // With no rows there is nothing to compare, so even a NULL is NOT
+            // IN the set; only a NULL the subquery returned makes it UNKNOWN.
+            // The empty IN set keeps its type check, and the mask-level NOT
+            // reads its UNKNOWN for a NULL as FALSE, passing every row.
+            if (drained.no_rows and s.negate) {
+                const in_empty = try (try ctx.subqueryArena()).create(PredicateExpr);
+                in_empty.* = pred.*;
+                in_empty.in_set.negate = false;
+                pred.* = .{ .not = in_empty };
+            }
         },
         .@"and" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c), lowered),
         .@"or" => |children| for (children) |*c| try resolveSubqueriesInPredicate(ctx, @constCast(c), lowered),
@@ -461,6 +471,8 @@ fn runExistsSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !bool {
 const DrainedSet = struct {
     values: []const Value,
     ty: types.Type,
+    /// The subquery returned no rows, NULL or otherwise.
+    no_rows: bool,
 };
 
 fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet {
@@ -484,8 +496,10 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet 
     const acct = try ctx.queryAccountant();
     const per_value = @sizeOf(Value) + 32;
 
+    var no_rows = true;
     while (try q.next()) |batch| {
         if (batch.row_count == 0) continue;
+        no_rows = false;
         const view = batch.values[0];
         var i: usize = 0;
         while (i < batch.row_count) : (i += 1) {
@@ -494,7 +508,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet 
             try out.append(aa, try extractKeyValueAt(aa, view, schema[0].type, i));
         }
     }
-    return .{ .values = try out.toOwnedSlice(aa), .ty = schema[0].type };
+    return .{ .values = try out.toOwnedSlice(aa), .ty = schema[0].type, .no_rows = no_rows };
 }
 
 /// `(a, b) IN (SELECT x, y ...)`, uncorrelated: the inner's rows become one

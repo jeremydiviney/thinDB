@@ -1084,3 +1084,19 @@ test "MAX_BY skips NULL keys, and the greatest key's row wins even when its valu
         }
     }
 }
+
+test "NULL in arithmetic ahead of a comparison makes it UNKNOWN" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SELECT NULL + 1 > 0", null);
+    try helpers.expectText(allocator, db, "SELECT 1 + NULL > 0", null);
+    try helpers.expectText(allocator, db, "SELECT NULL - 1 IS NULL", "1");
+    try exec(allocator, db, "CREATE TABLE n (v INT)");
+    try exec(allocator, db, "INSERT INTO n VALUES (1), (NULL)");
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM n WHERE NULL * 2 = 0", "0");
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM n WHERE NOT (NULL + v > 0)", "0");
+}

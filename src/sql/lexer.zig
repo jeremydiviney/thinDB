@@ -244,12 +244,23 @@ pub const Lexer = struct {
     /// Body of the last `/*+ ... */` optimizer-hint comment skipped and not
     /// yet taken by the parser.
     hint: ?[]const u8 = null,
+    /// Whether the last token returned can end an operand.
+    after_operand: bool = false,
 
     pub fn init(arena: Allocator, src: []const u8) Lexer {
         return .{ .arena = arena, .src = src };
     }
 
     pub fn next(self: *Lexer) LexError!Token {
+        var tok = try self.nextToken();
+        // END closes a CASE only after an operand. Anywhere else it is a name:
+        // MySQL and StarRocks leave it non-reserved, so a column can be `end`.
+        if (tok.tag == .kw_end and !self.after_operand) tok.tag = .identifier;
+        self.after_operand = endsOperand(tok.tag);
+        return tok;
+    }
+
+    fn nextToken(self: *Lexer) LexError!Token {
         try self.skipWhitespaceAndComments();
         if (self.pos >= self.src.len) return Token{ .tag = .eof, .text = "" };
 
@@ -936,6 +947,13 @@ fn charsetOf(name: []const u8) ?Charset {
     for (wide) |n| if (std.ascii.eqlIgnoreCase(name, n)) return .wide;
     for (ascii_compatible) |n| if (std.ascii.eqlIgnoreCase(name, n)) return .ascii_compatible;
     return null;
+}
+
+fn endsOperand(tag: TokenTag) bool {
+    return switch (tag) {
+        .integer, .big_integer, .floating, .string, .identifier, .kw_null, .kw_true, .kw_false, .kw_end, .at_identifier, .system_variable, .rparen, .rbracket, .rbrace, .question, .dollar_param => true,
+        else => false,
+    };
 }
 
 fn keywordFor(s: []const u8) ?TokenTag {
@@ -1694,4 +1712,12 @@ test "lexer: charset introducers read the literal that follows as a string" {
         lx.dialect = .mysql;
         try std.testing.expectError(LexError.LexCharsetUnsupported, lx.next());
     }
+}
+
+test "lexer: END is a keyword only after an operand" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lx = Lexer.init(arena.allocator(), "CASE WHEN end THEN (1) END, end");
+    const want = [_]TokenTag{ .kw_case, .kw_when, .identifier, .kw_then, .lparen, .integer, .rparen, .kw_end, .comma, .identifier, .eof };
+    for (want) |tag| try std.testing.expectEqual(tag, (try lx.next()).tag);
 }

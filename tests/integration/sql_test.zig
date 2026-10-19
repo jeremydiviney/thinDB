@@ -5077,3 +5077,34 @@ test "sql: rows drained from a filtered parallel scan outlive its chunks' scratc
         }
     }
 }
+
+test "sql: murmur_hash3_32 matches StarRocks: seed 104729, a signed result, each argument seeding the next" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.expectText(allocator, db, "SELECT murmur_hash3_32('hello')", "1321743225");
+    try helpers.expectText(allocator, db, "SELECT murmur_hash3_32('hello', 'world')", "984713481");
+    try helpers.expectText(allocator, db, "SELECT murmur_hash3_32('1')", "-1848669458");
+    try helpers.expectText(allocator, db, "SELECT murmur_hash3_32(1)", "-1848669458");
+    try helpers.expectText(allocator, db, "SELECT murmur_hash3_32('hello', NULL)", null);
+}
+
+test "sql: END names a column wherever it can't close a CASE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try helpers.exec(allocator, db, "CREATE TABLE spans (start INT, end INT)");
+    try helpers.exec(allocator, db, "INSERT INTO spans (start, end) VALUES (1, 3), (5, 2)");
+    try helpers.expectTexts(allocator, db, "SELECT end FROM spans ORDER BY end", &.{ "2", "3" });
+    try helpers.expectTexts(allocator, db, "SELECT CASE WHEN end > 2 THEN end ELSE s.end + 10 END FROM spans s ORDER BY start", &.{ "3", "12" });
+    try helpers.expectTexts(allocator, db, "SELECT CASE WHEN start > 1 THEN end END FROM spans ORDER BY start", &.{ null, "2" });
+    try helpers.expectTexts(allocator, db, "SELECT x.end FROM (SELECT end FROM spans) x ORDER BY 1", &.{ "2", "3" });
+    try helpers.exec(allocator, db, "UPDATE spans SET end = end + 10 WHERE start = 1");
+    try helpers.expectTexts(allocator, db, "SELECT start FROM spans WHERE end > 10", &.{"1"});
+}

@@ -250,3 +250,19 @@ test "JSON: comparison, ORDER BY, MIN and MAX follow MySQL's JSON rules, over th
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
 }
+
+test "JSON: an extraction takes IS NULL, IN and arithmetic like any operand" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE docs (id INT, c1 JSON)");
+    try exec(allocator, db, "INSERT INTO docs VALUES (1, '{\"a\":1}'), (2, '{\"b\":2}')");
+    try helpers.expectTexts(allocator, db, "SELECT c1->'$.a' IS NULL FROM docs ORDER BY id", &.{ "0", "1" });
+    try helpers.expectTexts(allocator, db, "SELECT c1->'$.a' IS NOT NULL FROM docs ORDER BY id", &.{ "1", "0" });
+    try helpers.expectTexts(allocator, db, "SELECT id FROM docs WHERE c1->'$.a' IS NULL", &.{"2"});
+    try helpers.expectTexts(allocator, db, "SELECT id FROM docs WHERE c1->'$.a' IN (1)", &.{"1"});
+    try helpers.expectTexts(allocator, db, "SELECT id FROM docs WHERE c1->'$.b' + 1 > 2", &.{"2"});
+}

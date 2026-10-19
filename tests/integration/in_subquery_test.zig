@@ -177,3 +177,20 @@ test "IN (subquery): multi-column inner rejected" {
         try std.testing.expectEqual(thindb.net.Error.BadRequest, err);
     }
 }
+
+test "NOT IN (subquery): an empty inner keeps a NULL row; a NULL from the inner leaves it out" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE outer_vals (a INT)");
+    try exec(allocator, db, "INSERT INTO outer_vals VALUES (1), (NULL)");
+    try exec(allocator, db, "CREATE TABLE inner_vals (b INT)");
+    try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE a NOT IN (SELECT b FROM inner_vals) ORDER BY a", &.{ null, "1" });
+    try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE NOT (a IN (SELECT b FROM inner_vals)) ORDER BY a", &.{ null, "1" });
+    try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE a IN (SELECT b FROM inner_vals)", &.{});
+    try exec(allocator, db, "INSERT INTO inner_vals VALUES (NULL)");
+    try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE a NOT IN (SELECT b FROM inner_vals) ORDER BY a", &.{"1"});
+}
