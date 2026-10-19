@@ -184,7 +184,10 @@ const Pass = struct {
                     try names.appendSlice(a, s.partition_by);
                     for (s.order_by) |o| try names.append(a, o.col);
                 }
-                for (w.calls) |call| for (call.args) |arg| try exec.compute_op.collectColumnRefs(a, names, arg);
+                for (w.calls) |call| {
+                    try derived.append(a, call.output_name);
+                    for (call.args) |arg| try exec.compute_op.collectColumnRefs(a, names, arg);
+                }
             },
             else => {},
         }

@@ -45,6 +45,7 @@ const transform = @import("../engine/transform.zig");
 const BlockArena = @import("../util/block_arena.zig").BlockArena;
 
 const exec = @import("exec.zig");
+const aggregate = @import("aggregate.zig");
 const Query = exec.Query;
 const Batch = exec.Batch;
 const Error = exec.Error;
@@ -203,6 +204,8 @@ pub const Window = struct {
         ntile_buckets: i64 = 1,
         /// `NTH_VALUE(expr, n)` 1-based offset within the frame.
         nth_offset: i64 = 1,
+        /// COVAR_POP/COVAR_SAMP/CORR's second argument column.
+        second_col: usize = std.math.maxInt(usize),
     };
 
     const DefaultKind = enum { none, literal, col_ref };
@@ -1809,7 +1812,7 @@ pub const Window = struct {
             .ntile => try fillNtile(plan, perm, p_start, p_end, cell.column),
             .percent_rank => try fillPercentRank(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
-            .sum, .avg, .count, .min, .max => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
+            .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
         }
     }
 
@@ -1990,6 +1993,13 @@ pub const Window = struct {
             .sum => try self.prefixSum(plan, perm, p_start, p_end, cell.column),
             .avg => try self.prefixAvg(plan, perm, p_start, p_end, cell.column),
             .min, .max => try self.prefixMinMax(plan, perm, p_start, p_end, cell, plan.func == .min),
+            .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => {
+                var acc = self.statisticAcc(plan);
+                for (perm[p_start..p_end]) |r| {
+                    acc.add(r);
+                    try acc.write(cell.column, r);
+                }
+            },
             else => unreachable,
         }
     }
@@ -2183,8 +2193,24 @@ pub const Window = struct {
             .avg => try self.frameAvg(plan, perm, lo, hi, cell.column, out_idx),
             .min => try self.frameMinMax(plan, perm, lo, hi, cell, out_idx, true),
             .max => try self.frameMinMax(plan, perm, lo, hi, cell, out_idx, false),
+            .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => {
+                var acc = self.statisticAcc(plan);
+                for (perm[lo .. hi + 1]) |r| acc.add(r);
+                try acc.write(cell.column, out_idx);
+            },
             else => return Error.WindowUnsupported,
         }
+    }
+
+    fn statisticAcc(self: *const Window, plan: CallPlan) StatisticAcc {
+        const two_sided = plan.second_col != std.math.maxInt(usize);
+        return .{
+            .func = statisticAggFunc(plan.func),
+            .x = self.accumulated[plan.value_col].view(),
+            .x_scale_div = aggregate.avgScaleDiv(self.input_schema[plan.value_col].type),
+            .y = if (two_sided) self.accumulated[plan.second_col].view() else null,
+            .y_scale_div = if (two_sided) aggregate.avgScaleDiv(self.input_schema[plan.second_col].type) else 1.0,
+        };
     }
 
     fn frameSum(
@@ -2393,6 +2419,10 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
             if (plan.ntile_buckets < 1) return Error.WindowUnsupported;
         },
         .cume_dist, .percent_rank => {},
+        .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => {
+            plan.value_col = try statisticColIdx(c.args[0], schema);
+            if (c.args.len == 2) plan.second_col = try statisticColIdx(c.args[1], schema);
+        },
         .sum, .avg, .count, .min, .max => {
             switch (c.args[0]) {
                 .col_ref => |name| {
@@ -2431,7 +2461,7 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
                 else => return Error.WindowUnsupported,
             }
         },
-        .avg => Type{ .double = {} },
+        .avg, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => Type{ .double = {} },
         .ntile => .bigint,
         .percent_rank, .cume_dist => Type{ .double = {} },
         // String input is supported here — the operator writes into a
@@ -2449,8 +2479,63 @@ fn outputNullable(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Colum
             .col_ref => schema[plan.default_col].nullable,
         },
         .sum, .avg, .min, .max, .first_value, .last_value, .nth_value => true,
+        .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => true,
     };
 }
+
+/// A statistic's argument: a numeric column, as its aggregate takes.
+fn statisticColIdx(e: ir.Expr, schema: []const Column) !usize {
+    const idx = try exprColIdx(e, schema);
+    const t = schema[idx].type;
+    if (!(t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double)) return Error.AggregateUnsupportedType;
+    return idx;
+}
+
+fn statisticAggFunc(f: ir.WindowFunc) aggregate.AggFunc {
+    return switch (f) {
+        .var_pop => .var_pop,
+        .var_samp => .var_samp,
+        .stddev_pop => .stddev_pop,
+        .stddev_samp => .stddev_samp,
+        .covar_pop => .covar_pop,
+        .covar_samp => .covar_samp,
+        .corr => .corr,
+        else => unreachable,
+    };
+}
+
+/// A frame's VAR_*/STDDEV_* or COVAR_*/CORR, folded as the aggregate
+/// operator folds it, so a window over a whole partition gives the
+/// partition's GROUP BY value. A pair counts only when both sides are
+/// non-NULL.
+const StatisticAcc = struct {
+    func: aggregate.AggFunc,
+    x: ColumnView,
+    x_scale_div: f64,
+    y: ?ColumnView,
+    y_scale_div: f64,
+    welford: aggregate.WelfordAcc = .{},
+    comoment: aggregate.CoMomentAcc = .{},
+
+    fn add(self: *StatisticAcc, row: u32) void {
+        if (!isValid(self.x, row)) return;
+        const x = aggregate.numericAsF64(self.x, row);
+        if (self.y) |y| {
+            if (!isValid(y, row)) return;
+            aggregate.coMomentStep(&self.comoment, x / self.x_scale_div, aggregate.numericAsF64(y, row) / self.y_scale_div);
+        } else {
+            aggregate.welfordStep(&self.welford, x);
+        }
+    }
+
+    fn write(self: StatisticAcc, out: *ColumnStore, row: u32) !void {
+        const value = if (self.y == null)
+            aggregate.welfordResult(self.func, self.welford.count, self.welford.m2, self.x_scale_div)
+        else
+            aggregate.coMomentResult(self.func, self.comoment);
+        if (value) |v| try writeDouble(out, row, v) else setNull(out, row);
+    }
+};
 
 fn exprColIdx(e: ir.Expr, schema: []const Column) !usize {
     return switch (e) {

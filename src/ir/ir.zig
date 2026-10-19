@@ -541,6 +541,14 @@ pub const WindowFunc = enum(u8) {
     ntile = 13,
     cume_dist = 14,
     percent_rank = 15,
+    // Statistics, named as their aggregates are (`Parser.windowFuncForName`).
+    var_pop = 16,
+    var_samp = 17,
+    stddev_pop = 18,
+    stddev_samp = 19,
+    covar_pop = 20,
+    covar_samp = 21,
+    corr = 22,
 };
 
 /// Lookup table: window-function name → enum, or null when the name
@@ -589,6 +597,13 @@ pub fn windowFuncName(f: WindowFunc) []const u8 {
         .ntile => "ntile",
         .cume_dist => "cume_dist",
         .percent_rank => "percent_rank",
+        .var_pop => "var_pop",
+        .var_samp => "var_samp",
+        .stddev_pop => "stddev_pop",
+        .stddev_samp => "stddev_samp",
+        .covar_pop => "covar_pop",
+        .covar_samp => "covar_samp",
+        .corr => "corr",
     };
 }
 
@@ -2884,7 +2899,7 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         cursor.* += 4;
         const func_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (func_byte > @intFromEnum(WindowFunc.percent_rank)) return Error.IrCorrupt;
+        if (func_byte > @intFromEnum(WindowFunc.corr)) return Error.IrCorrupt;
         const func: WindowFunc = @enumFromInt(func_byte);
         const ignore_nulls = bytes[cursor.*] != 0;
         cursor.* += 1;
