@@ -565,6 +565,13 @@ pub const Catalog = struct {
             .decimal64, .decimal128 => |d| try list.print(allocator, "DECIMAL({d},{d})", .{ d.p, d.s }),
             .uuid => try list.appendSlice(allocator, "UUID"),
             .json => try list.appendSlice(allocator, "JSON"),
+            .nested => |n| switch (n.*) {
+                .array => |element| {
+                    try list.appendSlice(allocator, "ARRAY<");
+                    try appendSqlTypeName(list, allocator, element);
+                    try list.append(allocator, '>');
+                },
+            },
         }
     }
 

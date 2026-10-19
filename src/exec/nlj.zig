@@ -843,7 +843,7 @@ fn columnIndex(schema: []const Column, name: []const u8) ?usize {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char, .json => true,
+        .varchar, .string, .char, .json, .nested => true,
         else => false,
     };
 }

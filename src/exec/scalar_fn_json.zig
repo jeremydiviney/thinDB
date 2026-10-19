@@ -21,6 +21,7 @@ const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 
 const jb = @import("json_binary.zig");
+const nested = @import("nested.zig");
 const Step = jb.Step;
 
 // ---------------------------------------------------------------------------
@@ -357,6 +358,14 @@ fn appendSqlValue(aa: Allocator, out: *std.ArrayList(u8), t: Type, arg: ColumnVi
     var buf: [64]u8 = undefined;
     switch (arg.data) {
         .varchar, .string, .char, .json => |sv| try jb.appendString(aa, out, sv.rowBytes(row)),
+        .nested => |sv| {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(aa);
+            try nested.appendText(aa, &text, t, sv.rowBytes(row), .starrocks);
+            const value = try jb.encodeFromText(aa, text.items);
+            defer aa.free(value);
+            try out.appendSlice(aa, value);
+        },
         .boolean => |s| try jb.appendBool(aa, out, s[row] != 0),
         inline .tinyint, .smallint, .int, .bigint => |s| try jb.appendInt(aa, out, s[row]),
         .largeint => |s| {

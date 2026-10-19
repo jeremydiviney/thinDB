@@ -2238,6 +2238,13 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
         .char => |n| std.fmt.allocPrint(allocator, "char({d})", .{n}),
         .string => allocator.dupe(u8, "text"),
         .json => allocator.dupe(u8, "json"),
+        .nested => |n| switch (n.*) {
+            .array => |element| {
+                const inner = try allocMysqlColumnType(allocator, element);
+                defer allocator.free(inner);
+                return std.fmt.allocPrint(allocator, "array<{s}>", .{inner});
+            },
+        },
     };
 }
 
@@ -2284,6 +2291,7 @@ fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
         .char => allocator.dupe(u8, "char"),
         .json => allocator.dupe(u8, "json"),
         .string => allocator.dupe(u8, "text"),
+        .nested => |n| allocator.dupe(u8, @tagName(std.meta.activeTag(n.*))),
     };
 }
 

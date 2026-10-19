@@ -1450,7 +1450,7 @@ fn partitionOf(part_starts: []const usize, total: usize, j: usize) usize {
 
 fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
     return switch (view.data) {
-        .varchar, .string, .char, .json => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(row),
         // Key base columns and their casts agree in type family with the
         // output column.
         else => unreachable,
@@ -1470,7 +1470,7 @@ fn gatherAcrossPartitions(
     const dst_start = out.data.rowCount();
     const rows_total = part_starts[part_starts.len - 1] + srcs[srcs.len - 1].rowCount();
     switch (out.data) {
-        .varchar, .string, .char, .json => |*ss| {
+        .varchar, .string, .char, .json, .nested => |*ss| {
             var total: usize = 0;
             for (idx) |j| {
                 const w = partitionOf(part_starts, rows_total, j);
@@ -1511,6 +1511,7 @@ fn appendStringAggregate(allocator: Allocator, col: *ColumnStore, out_type: Type
         .string => try col.data.string.appendValue(allocator, bytes),
         .char => try col.data.char.appendValue(allocator, bytes),
         .json => try col.data.json.appendValue(allocator, bytes),
+        .nested => try col.data.nested.appendValue(allocator, bytes),
         else => return error.TypeMismatch,
     }
 }
@@ -1865,7 +1866,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
 
 fn isStringKeyType(t: Type) bool {
     return switch (t) {
-        .varchar, .string, .char, .json => true,
+        .varchar, .string, .char, .json, .nested => true,
         else => false,
     };
 }

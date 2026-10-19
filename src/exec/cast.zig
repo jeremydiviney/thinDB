@@ -358,6 +358,7 @@ pub fn narrowIntegerArg(v: types.Value, to: Type) ?types.Value {
 /// says, and anything meets text as text. Null when the two never share a
 /// result (a UUID and a number).
 pub fn commonType(a: Type, b: Type) ?Type {
+    if (a.isNested() or b.isNested()) return commonNested(a, b);
     if (sameRepresentation(a, b)) return if (a.isString()) commonText(a, b) else a;
     if (numberMeetsTemporal(a, b) orelse numberMeetsTemporal(b, a)) |t| return t;
     if (a.isDecimal() or b.isDecimal()) {
@@ -374,6 +375,17 @@ pub fn commonType(a: Type, b: Type) ?Type {
     }
     if (a.isString() or b.isString()) return .string;
     return null;
+}
+
+/// Two arrays meet at the array of their elements' common type; an array
+/// meets nothing else. A failure to intern that array type reads as no
+/// common type, which the caller reports as a type mismatch.
+fn commonNested(a: Type, b: Type) ?Type {
+    if (std.meta.eql(a, b)) return a;
+    const a_element = a.arrayElement() orelse return null;
+    const b_element = b.arrayElement() orelse return null;
+    const element = commonType(a_element, b_element) orelse return null;
+    return types.arrayOf(element) catch null;
 }
 
 /// A number and a DATE or DATETIME meet as in StarRocks, which reads the
@@ -429,7 +441,7 @@ pub fn commonTypeOf(ts: []const Type) ?Type {
 /// mantissa means a different number at another scale.
 pub fn sameRepresentation(a: Type, b: Type) bool {
     if (a.isString() and b.isString()) return true;
-    if (a.isDecimal() or b.isDecimal()) return std.meta.eql(a, b);
+    if (a.isDecimal() or b.isDecimal() or a.isNested() or b.isNested()) return std.meta.eql(a, b);
     return @as(TypeTag, a) == @as(TypeTag, b);
 }
 
@@ -596,7 +608,7 @@ fn assignTextRows(allocator: Allocator, src: ColumnView, from: Type, rows: usize
 
 fn assignRows(comptime T: type, src: ColumnView, from: Type, dst: anytype) AssignError!void {
     switch (src.data) {
-        .varchar, .string, .char, .json => |s| for (dst, 0..) |*d, i| {
+        .varchar, .string, .char, .json, .nested => |s| for (dst, 0..) |*d, i| {
             d.* = if (src.isValid(i)) slotOf(try assignText(T, s.rowBytes(i))) else 0;
         },
         .boolean => |values| for (dst, values[0..dst.len], 0..) |*d, v, i| {
@@ -641,13 +653,16 @@ pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
 /// tag alone, so a payload at another scale would be stored misread. Text
 /// parses into a DATE or DATETIME target, and a DATETIME lands in a DATE
 /// column as its day, as MySQL and StarRocks store it: a DATE stepped by
-/// days is a DATETIME at midnight. Other targets widen along the
+/// days is a DATETIME at midnight. An array takes an array of other elements
+/// or text, converted element by element. Other targets widen along the
 /// implicit-cast ladder short of its lossy steps; the memtable admits or
 /// rejects the rest. A row the cast turns NULL is a failed write
 /// (`assignmentDroppedValue`). Allocates in `arena`.
 pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Type) !?Expr {
     if (std.meta.eql(from, to) or assignsByRule(from, to)) return null;
-    const widens = if (to.isDecimal())
+    const widens = if (to.isNested())
+        from.isNested() or (from.isString() and from != .json)
+    else if (to.isDecimal())
         from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or (from.isString() and from != .json)
     else if (to == .date or to == .datetime)
         from.isString() or from == .date or from == .datetime
@@ -672,6 +687,7 @@ pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Ty
 pub const OrderKept = enum { none, merging, strict };
 
 pub fn preservesOrder(from: Type, to: Type) OrderKept {
+    if (from.isNested() or to.isNested()) return if (std.meta.eql(from, to)) .strict else .none;
     if (from == .json or to == .json or from == .uuid or to == .uuid) {
         return if (@as(TypeTag, from) == @as(TypeTag, to)) .strict else .none;
     }

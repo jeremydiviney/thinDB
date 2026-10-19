@@ -1987,7 +1987,7 @@ fn walk_join_leaf_path(c: *ProjScan, allocator: Allocator, op: *const ir.Op, lea
 /// coded 32-bit field) so the gate's fit pre-check matches `planIntKey` exactly.
 fn codedKeyBits(t: types.Type) ?u16 {
     return switch (t) {
-        .varchar, .string, .char, .json => 32,
+        .varchar, .string, .char, .json, .nested => 32,
         .boolean, .tinyint => 8,
         .smallint => 16,
         .int, .date => 32,
@@ -3044,7 +3044,7 @@ const StagedInsertRows = struct {
 
     fn storeCapacityBytes(c: *const engine.ColumnStore) usize {
         return switch (c.data) {
-            .varchar, .string, .char, .json => |s| s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity,
+            .varchar, .string, .char, .json, .nested => |s| s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity,
             inline else => |list| list.capacity * @sizeOf(std.meta.Child(@TypeOf(list.items))),
         };
     }
@@ -4039,7 +4039,7 @@ pub const InsertColumnBuilder = struct {
                 .smallint => 2,
                 .tinyint, .boolean => 1,
                 .largeint, .decimal128, .uuid => 16,
-                .varchar, .string, .char, .json => 0,
+                .varchar, .string, .char, .json, .nested => 0,
             };
             fixed_slabs[i] = if (per_row == 0)
                 &[_]u8{}
@@ -4072,7 +4072,7 @@ pub const InsertColumnBuilder = struct {
         const bitmap_len = (row_count + 7) / 8;
         for (table_schema.columns, 0..) |c, i| {
             if (c.nullable) try nulls[i].appendNTimes(allocator, 0, bitmap_len);
-            if (c.type.isString()) try string_offsets[i].append(allocator, 0);
+            if (c.type.isVarlen()) try string_offsets[i].append(allocator, 0);
         }
         return .{
             .allocator = allocator,
@@ -4125,7 +4125,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.fixed_cursor[col_idx] / 2,
             .tinyint, .boolean => self.fixed_cursor[col_idx],
             .largeint, .decimal128, .uuid => self.fixed_cursor[col_idx] / 16,
-            .varchar, .string, .char, .json => self.string_offsets[col_idx].items.len - 1,
+            .varchar, .string, .char, .json, .nested => self.string_offsets[col_idx].items.len - 1,
         };
     }
 
@@ -4136,7 +4136,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.writeFixedZero(col_idx, 2),
             .tinyint, .boolean => self.writeFixedZero(col_idx, 1),
             .largeint, .decimal128, .uuid => self.writeFixedZero(col_idx, 16),
-            .varchar, .string, .char, .json => {
+            .varchar, .string, .char, .json, .nested => {
                 const cur = self.string_offsets[col_idx].items[self.string_offsets[col_idx].items.len - 1];
                 try self.string_offsets[col_idx].append(self.allocator, cur);
             },
@@ -4170,10 +4170,16 @@ pub const InsertColumnBuilder = struct {
             .decimal64 => |spec| self.writeFixedInt(col_idx, i64, try coerceToDecimal64(v, spec)),
             .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
             .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
-            .varchar, .string, .char, .json => {
+            .varchar, .string, .char, .json, .nested => {
                 const sb = &self.string_bytes[col_idx];
                 if (col.type == .json) {
                     try sb.appendSlice(self.allocator, try coerceToJsonText(v));
+                } else if (col.type == .nested) {
+                    if (v != .text) return Error.TypeMismatch;
+                    exec.nested.parseText(self.allocator, col.type, v.text, sb) catch |err| return switch (err) {
+                        error.InvalidArrayText => Error.TypeMismatch,
+                        error.OutOfMemory => error.OutOfMemory,
+                    };
                 } else {
                     try exec_cast.appendAssignedText(self.allocator, sb, v);
                 }
@@ -4224,6 +4230,10 @@ pub const InsertColumnBuilder = struct {
                     .bytes = self.string_bytes[i].items,
                 } },
                 .json => .{ .json = .{
+                    .offsets = self.string_offsets[i].items,
+                    .bytes = self.string_bytes[i].items,
+                } },
+                .nested => .{ .nested = .{
                     .offsets = self.string_offsets[i].items,
                     .bytes = self.string_bytes[i].items,
                 } },

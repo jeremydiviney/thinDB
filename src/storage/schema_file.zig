@@ -10,7 +10,10 @@
 //!     name_len u32, name bytes
 //!     type_tag u8
 //!     nullable u8     (added v2; 0 = NOT NULL, 1 = nullable)
-//!     type_extra u32  (varchar N or 0)
+//!     type_extra u32  (varchar N, decimal p << 8 | s, a nested type's
+//!                      text length, or 0)
+//!     type_text        (nested types only: the canonical type text,
+//!                      types.appendTypeText, type_extra bytes long)
 //!     default_value  (v3: 1 presence byte + optional payload; the byte's
 //!                     bit 2 is ON UPDATE CURRENT_TIMESTAMP, see encodeDefault)
 //!     auto_increment u8 (v4: 0 = none, 1 = AUTO_INCREMENT)
@@ -134,7 +137,16 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator,
             .decimal128 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
             else => 0,
         };
-        try appendU32(scratch, &buf, extra);
+        if (c.type == .nested) {
+            // A nested type came after v5 without a version bump: a release
+            // older than it rejects tag 18 (SchemaCorrupt) instead of
+            // misreading the column.
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(scratch);
+            try types.appendTypeText(scratch, &text, c.type);
+            try appendU32(scratch, &buf, @intCast(text.items.len));
+            try buf.appendSlice(scratch, text.items);
+        } else try appendU32(scratch, &buf, extra);
         try encodeDefault(scratch, &buf, c);
         // v4: AUTO_INCREMENT flag.
         try buf.append(scratch, @intFromBool(c.auto_increment));
@@ -189,7 +201,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > 17) return Error.SchemaCorrupt;
+        if (tag_byte < 1 or tag_byte > @intFromEnum(TypeTag.nested)) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
         const nullable = bytes[cursor] != 0;
         cursor += 1;
@@ -215,6 +227,15 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .uuid => .uuid,
             .json => .json,
+            .nested => blk: {
+                if (cursor + extra > bytes.len) return Error.SchemaCorrupt;
+                const text = bytes[cursor .. cursor + extra];
+                cursor += extra;
+                break :blk types.parseTypeText(text) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidTypeText => return Error.SchemaCorrupt,
+                };
+            },
         };
         const dflt = try decodeDefault(aa, bytes, &cursor);
         if (cursor + 1 > bytes.len) return Error.SchemaCorrupt;
@@ -286,6 +307,7 @@ pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
             .char => |n| if (n != bc.type.char) return false,
             .decimal64 => |spec| if (spec.p != bc.type.decimal64.p or spec.s != bc.type.decimal64.s) return false,
             .decimal128 => |spec| if (spec.p != bc.type.decimal128.p or spec.s != bc.type.decimal128.s) return false,
+            .nested => |n| if (n != bc.type.nested) return false,
             else => {},
         }
     }

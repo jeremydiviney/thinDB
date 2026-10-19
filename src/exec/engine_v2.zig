@@ -687,7 +687,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     for (order_specs) |s| {
         if (!nameInList(plan.group_by.group_cols, s.col)) continue;
         const idx = types.findColumn(table.schema.columns, s.col) orelse continue;
-        if (table.schema.columns[idx].type.isString()) {
+        if (table.schema.columns[idx].type.isVarlen()) {
             post_sort = true;
             break;
         }

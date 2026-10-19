@@ -1170,7 +1170,7 @@ pub const Compute = struct {
         const srcs = srcs_buf[0..src_count];
 
         switch (plan.output.data) {
-            .varchar, .string, .char, .json => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
+            .varchar, .string, .char, .json, .nested => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
             inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
     }
@@ -2532,7 +2532,8 @@ fn convertedArg(aa: Allocator, e: Expr, given: Type, target: Type) !?Expr {
         return Expr{ .call = .{ .fn_name = reader, .args = try aa.dupe(Expr, &.{e}) } };
     };
     const lit_value: ?types.Value = if (e == .lit) e.lit else if (target.isFloat()) expr_mod.literalValue(e) else null;
-    if (lit_value) |lv| if (!target.isString()) {
+    // A decimal Value carries no scale, so a decimal target stays a CAST.
+    if (lit_value) |lv| if (!target.isString() and !target.isDecimal()) {
         var v = lv;
         if (predicate_mod.coerceValueRounded(&v, target)) |_| return Expr{ .lit = v } else |_| {}
     };
@@ -2581,10 +2582,13 @@ fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar
 /// it here keeps the call a non-null constant rather than a per-row parse.
 /// A NULL literal carries only a placeholder type, so a call no overload
 /// accepts as written retries with its NULL arguments retyped to each
-/// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`), then
-/// to the declared parameter types of each overload of the right arity
-/// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`): a strict function's answer for
-/// NULL input is NULL whichever overload runs.
+/// sibling argument's type in turn (`COALESCE(NULL, x)`, `x + NULL`), or a
+/// sibling array's element type (`ARRAY_APPEND(arr, NULL)`), then to the
+/// declared parameter types of each overload of the right arity
+/// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`), and last to an array or an
+/// index, which no declared parameter names (`ARRAY_LENGTH(NULL)`,
+/// `arr[NULL]`): a strict function's answer for NULL input is NULL whichever
+/// overload runs.
 fn resolveWithTypedNulls(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -2596,20 +2600,17 @@ fn resolveWithTypedNulls(
     var any_null = false;
     for (arg_plans) |ap| any_null = any_null or ap == .null_lit;
     if (!any_null) return null;
-    const tried = try aa.alloc(Type, arg_types.len);
+    const tried = try aa.alloc(Type, 2 * arg_types.len);
     var tried_len: usize = 0;
-    candidates: for (arg_plans, arg_types) |ap, candidate| {
-        if (ap == .null_lit) continue;
-        for (tried[0..tried_len]) |t| if (std.meta.eql(t, candidate)) continue :candidates;
-        tried[tried_len] = candidate;
-        tried_len += 1;
-        const retyped = try aa.dupe(Type, arg_types);
-        for (arg_plans, retyped) |p, *t| {
-            if (p == .null_lit) t.* = candidate;
+    for ([_]bool{ false, true }) |elements| {
+        candidates: for (arg_plans, arg_types) |ap, sibling| {
+            if (ap == .null_lit) continue;
+            const candidate = if (elements) sibling.arrayElement() orelse continue else sibling;
+            for (tried[0..tried_len]) |t| if (std.meta.eql(t, candidate)) continue :candidates;
+            tried[tried_len] = candidate;
+            tried_len += 1;
+            if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
         }
-        const r = try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped) orelse continue;
-        try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
-        return r;
     }
     for (scalar_fn.overloadsOf(fn_name)) |f| {
         if (!scalar_fn.scalarArityMatches(f, arg_types.len)) continue;
@@ -2621,7 +2622,28 @@ fn resolveWithTypedNulls(
         try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
         return r;
     }
+    if (scalar_fn.isArrayFnName(fn_name)) for ([_]Type{ try types.arrayOf(.boolean), .bigint }) |candidate| {
+        if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
+    };
     return null;
+}
+
+fn resolveNullsAs(
+    runtime_allocator: Allocator,
+    aa: Allocator,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    fn_name: []const u8,
+    arg_plans: []ArgPlan,
+    arg_types: []Type,
+    candidate: Type,
+) !?scalar_fn.ResolvedOverload {
+    const retyped = try aa.dupe(Type, arg_types);
+    for (arg_plans, retyped) |p, *t| {
+        if (p == .null_lit) t.* = candidate;
+    }
+    const r = try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped) orelse return null;
+    try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
+    return r;
 }
 
 fn commitNullTypes(runtime_allocator: Allocator, arg_plans: []ArgPlan, arg_types: []Type, retyped: []const Type) !void {
@@ -3269,7 +3291,7 @@ fn setCaseValidity(allocator: Allocator, out: *ColumnStore, srcs: []const CaseSr
 
 fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
     return switch (view.data) {
-        .varchar, .string, .char, .json => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(row),
         // CASE branches unify to one type family at plan time.
         else => unreachable,
     };

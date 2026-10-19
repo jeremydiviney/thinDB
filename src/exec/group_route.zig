@@ -493,7 +493,7 @@ pub fn planNeeds(
 
 fn valueWidth(st: exec.PipelineStats, schema: []const types.Column, idx: usize) u64 {
     const t = schema[idx].type;
-    if (!t.isString()) return exec.memory.estimateColumnBytes(t);
+    if (!t.isVarlen()) return exec.memory.estimateColumnBytes(t);
     if (idx < st.column_stats.len) if (st.column_stats[idx].avg_width) |w| return w;
     return GUESSED_STRING_WIDTH;
 }
@@ -524,7 +524,7 @@ fn keepsValue(func: ir.AggFunc) bool {
 }
 
 fn columnRowBytes(st: exec.PipelineStats, schema: []const types.Column, idx: usize) u64 {
-    const offset: u64 = if (schema[idx].type.isString()) @sizeOf(u32) else 0;
+    const offset: u64 = if (schema[idx].type.isVarlen()) @sizeOf(u32) else 0;
     const validity: u64 = @intFromBool(schema[idx].nullable);
     return valueWidth(st, schema, idx) + offset + validity;
 }
@@ -570,11 +570,11 @@ fn withSampledWidths(
     }
     var unmeasured = false;
     for (schema, widths) |col, w| {
-        if (col.type.isString() and !w.complete()) unmeasured = true;
+        if (col.type.isVarlen() and !w.complete()) unmeasured = true;
     }
     if (unmeasured) try upstream.sampleWidths(widths);
     for (schema, out, widths) |col, *o, w| {
-        if (!col.type.isString()) continue;
+        if (!col.type.isVarlen()) continue;
         o.avg_width = o.avg_width orelse w.row;
         o.distinct_width = o.distinct_width orelse w.distinct;
     }
@@ -877,7 +877,7 @@ fn groupState(
         const idx = types.findColumn(schema, gc) orelse return null;
         group += valueWidth(st, schema, idx) + columnRowBytes(st, schema, idx);
         const validity: u64 = @intFromBool(schema[idx].nullable);
-        if (!schema[idx].type.isString()) {
+        if (!schema[idx].type.isVarlen()) {
             const width = exec.memory.estimateColumnBytes(schema[idx].type);
             payload += width;
             out_fixed += width + validity;
@@ -906,7 +906,7 @@ fn groupState(
         slot += exec.aggregate_op.aggStateWidth(a.func, in_t, key_t);
         switch (a.func) {
             .min, .max, .any_value, .first, .last, .max_by => {
-                const string_value = if (in_t) |t| t.isString() else false;
+                const string_value = if (in_t) |t| t.isVarlen() else false;
                 if (string_value) {
                     group += valueWidth(st, schema, in_idx.?) + columnRowBytes(st, schema, in_idx.?);
                     const kept = keptValueWidth(st, schema, in_idx.?);
@@ -917,7 +917,7 @@ fn groupState(
                     group += 16;
                     out_fixed += 16;
                 }
-                const string_key = if (key_t) |t| t.isString() else false;
+                const string_key = if (key_t) |t| t.isVarlen() else false;
                 if (string_key) {
                     group += valueWidth(st, schema, key_idx.?);
                     payload += keptValueWidth(st, schema, key_idx.?);
@@ -963,7 +963,7 @@ fn groupState(
 fn traceInput(st: exec.PipelineStats, priced: exec.PipelineStats, schema: []const types.Column) void {
     std.debug.print("[gbroute]   input={d} MiB ({d} B/row):", .{ (st.upper_rows *| rowBytes(priced, schema)) >> 20, rowBytes(priced, schema) });
     for (schema, 0..) |col, i| {
-        if (!col.type.isString()) continue;
+        if (!col.type.isVarlen()) continue;
         const measured = i < st.column_stats.len and st.column_stats[i].avg_width != null;
         const how = if (measured) "measured" else if (priced.column_stats[i].avg_width != null) "sampled" else "guessed";
         std.debug.print(" {s}={d} B {s}", .{ col.name, valueWidth(priced, schema, i), how });
@@ -1064,7 +1064,7 @@ pub const RealizedInput = struct {
         const Sampler = storage.column.DistinctWidthSampler;
         const step = Sampler.stride(self.rows, Sampler.ROWS_PER_BUFFER);
         for (schema, widths, 0..) |col, *w, i| {
-            if (!col.type.isString() or !w.wantsDistinct()) continue;
+            if (!col.type.isVarlen() or !w.wantsDistinct()) continue;
             var sampler: Sampler = .{};
             defer sampler.deinit(self.allocator);
             var next_row: usize = 0;
@@ -1126,7 +1126,7 @@ pub const RealizedInput = struct {
         const bounds = source.stats().column_stats;
         for (col_stats, schema, 0..) |*stat, col, i| {
             stat.* = if (i < bounds.len) bounds[i] else .{};
-            if (!col.type.isString()) continue;
+            if (!col.type.isVarlen()) continue;
             var payload: u64 = 0;
             for (owned.chunks) |c| payload += exec.stringPayloadBytes(c.stores[i].view());
             stat.avg_width = exec.avgWidth(payload, rows);
@@ -1262,7 +1262,7 @@ pub fn routeRadixGroupBy(
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return null;
         switch (schema[idx].type) {
-            .varchar, .string, .char, .json => return null,
+            .varchar, .string, .char, .json, .nested => return null,
             else => {},
         }
     }
@@ -2114,7 +2114,7 @@ fn testLines(a: Allocator, q: *Query) ![][]u8 {
                     continue;
                 }
                 switch (v.data) {
-                    .varchar, .string, .char, .json => |sv| try line.print(a, "{s}|", .{sv.rowBytes(row)}),
+                    .varchar, .string, .char, .json, .nested => |sv| try line.print(a, "{s}|", .{sv.rowBytes(row)}),
                     .bigint => |values| try line.print(a, "{d}|", .{values[row]}),
                     else => return error.UnexpectedColumnType,
                 }

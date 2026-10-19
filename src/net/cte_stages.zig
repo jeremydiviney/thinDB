@@ -2229,13 +2229,12 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
     const trace_jf = getenv("THINDB_TRACE_JOINFUSE") != null;
     for (ls, rs) |lc, rc| {
         if (!cast.sameRepresentation(lc.type, rc.type)) {
-            // A bare NULL has no type of its own; it takes the other arm's.
-            const l_null = outputIsNullLiteral(u.left, lc.name);
-            if (l_null != outputIsNullLiteral(u.right, rc.name)) {
-                if (l_null) {
-                    try l_derived.append(input.node_arena, try nullDerived(input.node_arena, lc.name, rc.type));
+            const l_typeless = outputIsTypeless(u.left, lc.name, rc.type);
+            if (l_typeless != outputIsTypeless(u.right, rc.name, lc.type)) {
+                if (l_typeless) {
+                    try l_derived.append(input.node_arena, try typedDerived(input.node_arena, u.left, lc.name, rc.type));
                 } else {
-                    try r_derived.append(input.node_arena, try nullDerived(input.node_arena, rc.name, lc.type));
+                    try r_derived.append(input.node_arena, try typedDerived(input.node_arena, u.right, rc.name, lc.type));
                 }
                 continue;
             }
@@ -2261,9 +2260,25 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
     }
 }
 
-/// Whether `name` in `op`'s output is a NULL literal on every row, followed
+/// Whether `name` in `op`'s output has no type of its own, so it takes
+/// `other`, the other arm's: a bare NULL does, and so does `[]` beside an
+/// array.
+fn outputIsTypeless(op: *const ir.Op, name: []const u8, other: types.Type) bool {
+    const e = outputLiteral(op, name) orelse return false;
+    return e == .null_lit or (other.isNested() and scalar_fn.isEmptyArrayLiteral(e));
+}
+
+/// `name = NULL` or `name = []` typed as `ty`, replacing the arm's output
+/// slot in place.
+fn typedDerived(arena: std.mem.Allocator, op: *const ir.Op, col_name: []const u8, ty: types.Type) !ir.Derived {
+    const name = try arena.dupe(u8, col_name);
+    if (outputLiteral(op, col_name).? == .null_lit) return .{ .name = name, .expr = .{ .null_lit = ty } };
+    return .{ .name = name, .expr = try scalar_fn.emptyArrayAs(arena, ty) };
+}
+
+/// The expression `name` in `op`'s output derives from on every row, followed
 /// through the row-preserving and renaming nodes an arm's SELECT builds.
-fn outputIsNullLiteral(op: *const ir.Op, name: []const u8) bool {
+fn outputLiteral(op: *const ir.Op, name: []const u8) ?ir.Expr {
     var cur = op;
     var col = name;
     while (true) switch (cur.*) {
@@ -2271,12 +2286,12 @@ fn outputIsNullLiteral(op: *const ir.Op, name: []const u8) bool {
             var i = c.derived.len;
             while (i > 0) {
                 i -= 1;
-                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return c.derived[i].expr == .null_lit;
+                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return c.derived[i].expr;
             }
             cur = c.upstream;
         },
         .select => |p| {
-            col = projectedSource(p, col) orelse return false;
+            col = projectedSource(p, col) orelse return null;
             cur = p.upstream;
         },
         .alias => |a| {
@@ -2290,10 +2305,10 @@ fn outputIsNullLiteral(op: *const ir.Op, name: []const u8) bool {
         .order_by => |o| cur = o.upstream,
         .limit => |l| cur = l.upstream,
         .materialize => |m| {
-            if (m.recursion != null) return false;
+            if (m.recursion != null) return null;
             cur = m.upstream;
         },
-        else => return false,
+        else => return null,
     };
 }
 
@@ -2303,11 +2318,6 @@ fn projectedSource(p: ir.Op.Project, name: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(out, types.unqualifiedName(name))) return src;
     }
     return null;
-}
-
-/// `name = NULL` typed as `ty`, replacing the arm's output slot in place.
-fn nullDerived(arena: std.mem.Allocator, col_name: []const u8, ty: types.Type) !ir.Derived {
-    return .{ .name = try arena.dupe(u8, col_name), .expr = .{ .null_lit = ty } };
 }
 
 /// `name = to_T(name)` — replaces the arm's own output slot in place (a

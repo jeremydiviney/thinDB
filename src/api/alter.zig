@@ -303,7 +303,7 @@ fn valueTagMatchesType(v: Value, t: Type) bool {
         .decimal64 => vt == .decimal64,
         .decimal128 => vt == .decimal128,
         .uuid => vt == .uuid,
-        .varchar, .string, .char, .json => vt == .text,
+        .varchar, .string, .char, .json, .nested => vt == .text,
     };
 }
 
@@ -541,6 +541,7 @@ fn fillDefault(
         .string => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
         .char => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
         .json => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
+        .nested => |*ss| while (i < n) : (i += 1) try ss.appendValue(allocator, val.text),
     }
     if (schema_col.nullable) {
         var j: u32 = 0;

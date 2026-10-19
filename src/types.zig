@@ -44,7 +44,151 @@ pub const TypeTag = enum(u8) {
     /// metadata reports it as JSON. Phase 1 keeps the text representation;
     /// a binary JSONB form and columnar shredding are later phases.
     json = 17,
+    /// ARRAY. The payload's `Nested` gives the element type. Physically each
+    /// value is one variable-length cell holding its elements in the
+    /// self-contained encoding of `exec/nested.zig`, so storage, the WAL and
+    /// row movement treat it as bytes, the way they treat a string.
+    nested = 18,
 };
+
+/// The shape of a nested type. Interned (`internNested`): the process keeps
+/// one instance per distinct shape, so a `Type` stays a plain value that is
+/// copied freely and compares by pointer.
+pub const Nested = union(enum) {
+    /// Element type. Elements are always nullable.
+    array: Type,
+};
+
+/// Process-wide on purpose, like the time zone cache: a shape is immutable
+/// and means the same in every database, and interning it keeps `Type`
+/// copyable with no owner to outlive. Grows by one entry per distinct shape
+/// a statement spells, and is never freed.
+const NestedPool = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    by_key: std.StringHashMapUnmanaged(*const Nested) = .empty,
+
+    fn acquire(pool: *NestedPool) void {
+        while (!pool.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+};
+
+var nested_pool: NestedPool = .{};
+const nested_allocator = std.heap.smp_allocator;
+
+/// The interned instance of `shape`. Its element types are interned already,
+/// so two shapes are equal exactly when their shallow bytes are.
+pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
+    var key_buf: [10]u8 = undefined;
+    const key = nestedKey(shape, &key_buf);
+    nested_pool.acquire();
+    defer nested_pool.lock.unlock();
+    if (nested_pool.by_key.get(key)) |known| return known;
+    const owned_key = try nested_allocator.dupe(u8, key);
+    errdefer nested_allocator.free(owned_key);
+    const instance = try nested_allocator.create(Nested);
+    errdefer nested_allocator.destroy(instance);
+    instance.* = shape;
+    try nested_pool.by_key.put(nested_allocator, owned_key, instance);
+    return instance;
+}
+
+fn nestedKey(shape: Nested, buf: *[10]u8) []const u8 {
+    buf[0] = @intFromEnum(std.meta.activeTag(shape));
+    switch (shape) {
+        .array => |element| {
+            @memset(buf[1..], 0);
+            buf[1] = @intFromEnum(std.meta.activeTag(element));
+            const payload: u64 = switch (element) {
+                .varchar, .char => |n| n,
+                .decimal64, .decimal128 => |spec| (@as(u64, spec.p) << 8) | spec.s,
+                .nested => |n| @intFromPtr(n),
+                else => 0,
+            };
+            std.mem.writeInt(u64, buf[2..10], payload, .little);
+            return buf[0..10];
+        },
+    }
+}
+
+/// `ARRAY<element>`.
+pub fn arrayOf(element: Type) error{OutOfMemory}!Type {
+    return .{ .nested = try internNested(.{ .array = element }) };
+}
+
+/// The canonical text of `t` (`int`, `varchar(20)`, `decimal(10,2)`,
+/// `array<array<int>>`), which `parseTypeText` reads back. Where a type
+/// leaves the process (schema files, the IR wire, CAST's function name) it
+/// travels as this text, since a nested shape is a pointer.
+pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: Type) std.mem.Allocator.Error!void {
+    var buf: [32]u8 = undefined;
+    switch (t) {
+        .varchar => |n| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "varchar({d})", .{n}) catch unreachable),
+        .char => |n| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "char({d})", .{n}) catch unreachable),
+        .decimal64, .decimal128 => |spec| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "decimal({d},{d})", .{ spec.p, spec.s }) catch unreachable),
+        .nested => |n| switch (n.*) {
+            .array => |element| {
+                try out.appendSlice(allocator, "array<");
+                try appendTypeText(allocator, out, element);
+                try out.append(allocator, '>');
+            },
+        },
+        else => try out.appendSlice(allocator, @tagName(t)),
+    }
+}
+
+pub const TypeTextError = error{InvalidTypeText} || std.mem.Allocator.Error;
+
+/// Read the canonical text `appendTypeText` writes; the whole text must be
+/// one type.
+pub fn parseTypeText(text: []const u8) TypeTextError!Type {
+    var pos: usize = 0;
+    const t = try parseTypeTextAt(text, &pos);
+    if (pos != text.len) return error.InvalidTypeText;
+    return t;
+}
+
+fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
+    const start = pos.*;
+    while (pos.* < text.len and (std.ascii.isAlphanumeric(text[pos.*]) or text[pos.*] == '_')) pos.* += 1;
+    const name = text[start..pos.*];
+    if (std.mem.eql(u8, name, "array")) {
+        try expectTypeChar(text, pos, '<');
+        const element = try parseTypeTextAt(text, pos);
+        try expectTypeChar(text, pos, '>');
+        return arrayOf(element);
+    }
+    if (std.mem.eql(u8, name, "varchar") or std.mem.eql(u8, name, "char")) {
+        try expectTypeChar(text, pos, '(');
+        const n = try typeTextInt(u32, text, pos);
+        try expectTypeChar(text, pos, ')');
+        return if (name[0] == 'v') .{ .varchar = n } else .{ .char = n };
+    }
+    if (std.mem.eql(u8, name, "decimal")) {
+        try expectTypeChar(text, pos, '(');
+        const p = try typeTextInt(u8, text, pos);
+        try expectTypeChar(text, pos, ',');
+        const s = try typeTextInt(u8, text, pos);
+        try expectTypeChar(text, pos, ')');
+        if (p == 0 or p > 38 or s > p) return error.InvalidTypeText;
+        const spec: DecimalSpec = .{ .p = p, .s = s };
+        return if (p <= 18) .{ .decimal64 = spec } else .{ .decimal128 = spec };
+    }
+    inline for (@typeInfo(Type).@"union".fields) |f| {
+        if (f.type == void and std.mem.eql(u8, name, f.name)) return @unionInit(Type, f.name, {});
+    }
+    return error.InvalidTypeText;
+}
+
+fn expectTypeChar(text: []const u8, pos: *usize, c: u8) TypeTextError!void {
+    if (pos.* >= text.len or text[pos.*] != c) return error.InvalidTypeText;
+    pos.* += 1;
+}
+
+fn typeTextInt(comptime T: type, text: []const u8, pos: *usize) TypeTextError!T {
+    const start = pos.*;
+    while (pos.* < text.len and std.ascii.isDigit(text[pos.*])) pos.* += 1;
+    return std.fmt.parseInt(T, text[start..pos.*], 10) catch error.InvalidTypeText;
+}
 
 /// Precision/scale carried by both decimal type variants.
 pub const DecimalSpec = struct {
@@ -87,6 +231,7 @@ pub const Type = union(TypeTag) {
     decimal128: DecimalSpec,
     uuid,
     json,
+    nested: *const Nested,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -103,7 +248,28 @@ pub const Type = union(TypeTag) {
             .decimal64 => @sizeOf(i64),
             .decimal128 => @sizeOf(i128),
             .uuid => @sizeOf(u128),
-            .varchar, .string, .char, .json => null,
+            .varchar, .string, .char, .json, .nested => null,
+        };
+    }
+
+    /// Stored as one variable-length cell per row: the string family, JSON
+    /// and the nested types. Storage, row movement and the WAL key off
+    /// this; `isString` is the narrower logical question.
+    pub fn isVarlen(self: Type) bool {
+        return self.isString() or self == .nested;
+    }
+
+    pub fn isNested(self: Type) bool {
+        return self == .nested;
+    }
+
+    /// The element type of an ARRAY, or null for any other type.
+    pub fn arrayElement(self: Type) ?Type {
+        return switch (self) {
+            .nested => |n| switch (n.*) {
+                .array => |element| element,
+            },
+            else => null,
         };
     }
 
@@ -174,7 +340,7 @@ pub const Type = union(TypeTag) {
             .decimal64 => T == i64 or T == comptime_int,
             .decimal128 => T == i128 or T == comptime_int,
             .uuid => T == Uuid or T == u128 or T == comptime_int,
-            .varchar, .string, .char, .json => isStringLikeType(T),
+            .varchar, .string, .char, .json, .nested => isStringLikeType(T),
         };
     }
 };
@@ -290,7 +456,7 @@ pub const ValueTag = enum(u8) {
             .int => .int,
             .bigint => .bigint,
             .boolean => .boolean,
-            .varchar, .string, .char, .json => .text,
+            .varchar, .string, .char, .json, .nested => .text,
             .float => .float,
             .double => .double,
             .date => .date,

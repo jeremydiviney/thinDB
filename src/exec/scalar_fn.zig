@@ -51,6 +51,8 @@ const time = @import("scalar_fn_time.zig");
 const cond = @import("scalar_fn_cond.zig");
 const dec = @import("scalar_fn_decimal.zig");
 const json = @import("scalar_fn_json.zig");
+const array = @import("scalar_fn_array.zig");
+pub const isArrayFnName = array.isArrayFnName;
 const inet = @import("scalar_fn_inet.zig");
 const common = @import("scalar_fn_common.zig");
 
@@ -130,6 +132,7 @@ pub fn resolveWithRegistry(
 ) !?ResolvedOverload {
     if (try resolvePgBoolText(aa, name_in, arg_types)) |ov| return ov;
     const name = if (std.mem.eql(u8, name_in, PG_TEXT_FN)) "to_string" else name_in;
+    if (try array.resolveArray(aa, name, arg_types)) |ov| return ov;
     // Decimal-involving calls resolve to scale-aware typed kernels (the static
     // builtins table can't express a dynamic output scale). Checked first so a
     // decimal operand never falls into an int/double overload that ignores scale.
@@ -684,6 +687,7 @@ fn resolveJson(aa: Allocator, name: []const u8, arg_types: []const Type) !?Resol
 pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) bool {
     if (std.mem.startsWith(u8, name, "to_decimal")) return true;
     if (std.mem.startsWith(u8, name, CAST_TIME_PREFIX)) return true;
+    if (array.isArrayFnName(name)) return true;
     if (std.ascii.eqlIgnoreCase(name, "json_array") or std.ascii.eqlIgnoreCase(name, "json_object")) return true;
     if (std.mem.eql(u8, name, JSON_AGG_ELEMENT_FN) or std.mem.eql(u8, name, JSON_AGG_MEMBER_FN)) return true;
     if (std.mem.eql(u8, name, SINGLE_ROW_FN)) return true;
@@ -782,9 +786,44 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
         .datetime => "to_datetime",
         .varchar, .char, .string => "to_string",
         .json => "to_json",
+        .nested => return try nestedCastFnName(arena, ty),
         .decimal64, .decimal128, .uuid => return null,
     };
     return try arena.dupe(u8, name);
+}
+
+/// CAST to a nested type names its target type by text, as a DECIMAL
+/// target rides in `to_decimal:p:s`.
+pub const NESTED_CAST_PREFIX = "to_nested:";
+
+/// The function an array literal lowers to: `[a, b]`, `ARRAY[a, b]`.
+pub const ARRAY_VALUE_FN = "array_value";
+
+/// `[]`, which has no element type of its own: beside an array of known
+/// type it takes that type (`emptyArrayAs`).
+pub fn isEmptyArrayLiteral(e: Expr) bool {
+    return e == .call and e.call.args.len == 0 and std.ascii.eqlIgnoreCase(e.call.fn_name, ARRAY_VALUE_FN);
+}
+
+/// An empty array of `ty`: the CAST of its text, which reads as any array.
+pub fn emptyArrayAs(arena: Allocator, ty: Type) Allocator.Error!Expr {
+    const args = try arena.alloc(Expr, 1);
+    args[0] = .{ .lit = .{ .text = "[]" } };
+    return .{ .call = .{ .fn_name = try nestedCastFnName(arena, ty), .args = args } };
+}
+
+/// The function a subscript lowers to: `arr[i]`.
+pub const ELEMENT_AT_FN = "element_at";
+
+/// The order of two arrays as -1, 0 or 1, which a comparison of arrays
+/// tests against 0: `a < [1, 2]` is `array_order(a, [1, 2]) < 0`.
+pub const ARRAY_ORDER_FN = "array_order";
+
+fn nestedCastFnName(arena: Allocator, ty: Type) Allocator.Error![]const u8 {
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, NESTED_CAST_PREFIX);
+    try types.appendTypeText(arena, &text, ty);
+    return text.items;
 }
 
 /// How a join reads one key as a type where CAST would read it otherwise
@@ -995,7 +1034,7 @@ fn bindsAsIs(given: Type, declared: Type) bool {
 /// those arguments take one type by `cast.commonType` when no overload
 /// matches them as given. Null for any other function.
 pub fn resultValueArgsStart(name: []const u8) ?usize {
-    inline for (.{ "greatest", "least", "coalesce", "ifnull", "nullif" }) |n| {
+    inline for (.{ "greatest", "least", "coalesce", "ifnull", "nullif", ARRAY_VALUE_FN }) |n| {
         if (std.ascii.eqlIgnoreCase(name, n)) return 0;
     }
     if (std.ascii.eqlIgnoreCase(name, "if")) return 1;

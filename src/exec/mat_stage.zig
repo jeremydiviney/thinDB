@@ -243,7 +243,7 @@ pub const MaterializedResult = struct {
     /// TVF input borrow re-tags borrowed store views the same way.
     pub fn presentAsSchemaType(v: ColumnView, t: types.Type) ColumnView {
         const sv = switch (v.data) {
-            .varchar, .string, .char, .json => |x| x,
+            .varchar, .string, .char, .json, .nested => |x| x,
             else => return v,
         };
         return switch (t) {
@@ -303,7 +303,7 @@ pub const MaterializedResult = struct {
         }
         for (self.schema, 0..) |sc, i| {
             const bytes_cap: usize = switch (sc.type) {
-                .varchar, .string, .char, .json => blk: {
+                .varchar, .string, .char, .json, .nested => blk: {
                     const p = prev orelse break :blk 0;
                     if (p.rows == 0) break :blk 0;
                     const bpr = (colStrBytes(&p.cols[i]) + p.rows - 1) / p.rows;
@@ -323,7 +323,7 @@ pub const MaterializedResult = struct {
     fn measureWidths(self: *const MaterializedResult, stats: []exec.ColStat) void {
         if (stats.len != self.schema.len) return;
         for (self.schema, stats, 0..) |sc, *stat, i| {
-            if (!sc.type.isString()) continue;
+            if (!sc.type.isVarlen()) continue;
             var payload: u64 = 0;
             for (self.chunks.items) |c| {
                 if (c.rows == 0) continue;
@@ -341,7 +341,7 @@ pub const MaterializedResult = struct {
         const Sampler = storage.column.DistinctWidthSampler;
         const step = Sampler.stride(self.total_rows, Sampler.ROWS_PER_BUFFER);
         for (self.schema, widths, 0..) |sc, *w, i| {
-            if (!sc.type.isString() or !w.wantsDistinct()) continue;
+            if (!sc.type.isVarlen() or !w.wantsDistinct()) continue;
             var sampler: Sampler = .{};
             defer sampler.deinit(allocator);
             var next_row: usize = 0;
@@ -382,7 +382,7 @@ pub const MaterializedResult = struct {
     /// Bytes held by a string-family column store; 0 for fixed-width.
     fn colStrBytes(col: *const engine.ColumnStore) usize {
         return switch (col.data) {
-            .varchar, .string, .char, .json => |ss| ss.bytes.items.len,
+            .varchar, .string, .char, .json, .nested => |ss| ss.bytes.items.len,
             else => 0,
         };
     }
@@ -820,7 +820,7 @@ fn fillContiguous(scratch: Allocator, store_alloc: Allocator, stores: []engine.C
     for (parts) |p| {
         total += p.rows;
         for (p.views, 0..) |v, ci| switch (v.data) {
-            .varchar, .string, .char, .json => |sv| str_bytes[ci] += sv.offsets[p.rows] - sv.offsets[0],
+            .varchar, .string, .char, .json, .nested => |sv| str_bytes[ci] += sv.offsets[p.rows] - sv.offsets[0],
             else => {},
         };
     }

@@ -1544,6 +1544,8 @@ const TypeWireTag = enum(u8) {
     decimal128 = 14,
     uuid = 15,
     json = 16,
+    /// Followed by u32 length + the canonical type text.
+    nested = 17,
 };
 
 fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
@@ -1579,6 +1581,13 @@ fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) Enco
         },
         .uuid => try out.append(allocator, @intFromEnum(TypeWireTag.uuid)),
         .json => try out.append(allocator, @intFromEnum(TypeWireTag.json)),
+        .nested => {
+            try out.append(allocator, @intFromEnum(TypeWireTag.nested));
+            const len_at = out.items.len;
+            try appendU32(allocator, out, 0);
+            try types.appendTypeText(allocator, out, t);
+            std.mem.writeInt(u32, out.items[len_at..][0..4], @intCast(out.items.len - len_at - 4), .little);
+        },
     }
 }
 
@@ -1586,7 +1595,7 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(TypeWireTag.json)) return Error.IrCorrupt;
+    if (t > @intFromEnum(TypeWireTag.nested)) return Error.IrCorrupt;
     const tag: TypeWireTag = @enumFromInt(t);
     return switch (tag) {
         .int => .int,
@@ -1613,6 +1622,18 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
             break :blk types.Type{ .char = n };
         },
         .json => .json,
+        .nested => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const n = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            if (cursor.* + n > bytes.len) return Error.IrCorrupt;
+            const text = bytes[cursor.* .. cursor.* + n];
+            cursor.* += n;
+            break :blk types.parseTypeText(text) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidTypeText => return Error.IrCorrupt,
+            };
+        },
         .decimal64 => blk: {
             if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
             const p = bytes[cursor.*];

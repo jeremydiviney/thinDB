@@ -54,6 +54,7 @@ pub fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .decimal128 => |s| cmpVal(i128, s[row], pred.val.decimal128, pred.op),
         .uuid => |s| cmpVal(u128, s[row], pred.val.uuid, pred.op),
         .json => |sv| cmpJson(sv.rowBytes(row), pred.val.text, pred.op),
+        .nested => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
     };
 }
 
