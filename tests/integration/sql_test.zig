@@ -2186,6 +2186,33 @@ test "sql: GROUP BY multiple distinct arithmetic expressions" {
     try std.testing.expectEqual(@as(usize, 3), rows);
 }
 
+test "sql: GROUP BY an expression the SELECT list doesn't show groups on a hidden key (issue #709)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE gh (id BIGINT PRIMARY KEY, d DECIMAL(10,2), dt DATETIME, s VARCHAR(10))");
+    try helpers.exec(allocator, db,
+        \\INSERT INTO gh VALUES (1, 1.50, '2020-01-01 00:00:01', 'a'), (2, 2.50, '2021-03-01 00:00:01', 'B'),
+        \\  (3, 3.25, '2021-06-01 00:00:01', 'b'), (4, NULL, NULL, NULL)
+    );
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("gh", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT CAST(SUM(d) AS CHAR) FROM gh GROUP BY id % 2 ORDER BY 1", &.{ "2.50", "4.75" });
+        try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FROM gh GROUP BY YEAR(dt) ORDER BY YEAR(dt)", &.{ "1", "1", "2" });
+        // SELECT, HAVING and ORDER BY read a hidden key where they repeat it.
+        try helpers.expectTexts(allocator, db, "SELECT YEAR(dt) + 1 FROM gh GROUP BY YEAR(dt) ORDER BY 1", &.{ null, "2021", "2022" });
+        try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FROM gh GROUP BY LOWER(s) HAVING LOWER(s) = 'b'", &.{"2"});
+        try helpers.expectTexts(allocator, db, "SELECT CASE WHEN YEAR(dt) > 2020 THEN 'new' ELSE 'old' END FROM gh GROUP BY YEAR(dt) ORDER BY 1", &.{ "new", "old", "old" });
+        try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FROM gh GROUP BY YEAR(dt), id % 2", &.{ "1", "1", "1", "1" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(SUM(d) AS CHAR) FROM gh GROUP BY ROLLUP(YEAR(dt)) ORDER BY GROUPING(YEAR(dt)), 1", &.{ null, "1.50", "5.75", "7.25" });
+    }
+    // A column only the key reads is still not grouped.
+    try std.testing.expectError(error.SqlMixedAggAndPlainProjection, helpers.exec(allocator, db, "SELECT LOWER(s), COUNT(*) FROM gh GROUP BY UPPER(s)"));
+}
+
 test "sql: GROUP BY an aliased plain column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
