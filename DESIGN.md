@@ -523,6 +523,9 @@ distinct values and have the same types as `SUM(x)` and `AVG(x)`.
 `STDDEV` and `VARIANCE` are the sample ones. The parser picks the function
 once (`AggNames`), so every aggregate path computes the same one. A
 population statistic over one value is 0; a sample one is NULL below two.
+`COVAR_POP(x, y)`, `COVAR_SAMP(x, y)` and `CORR(x, y)` read the pairs where
+neither side is NULL, by the same rule; CORR is also NULL where either side is
+constant, as in StarRocks and PostgreSQL, where DuckDB gives NaN.
 
 `PERCENTILE_CONT(x, p)` (and `MEDIAN(x)`, its p = 0.5) interpolates at index
 p×(n−1) of the sorted values, as PostgreSQL and DuckDB do.
@@ -832,7 +835,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |
