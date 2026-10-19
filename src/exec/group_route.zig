@@ -933,7 +933,7 @@ fn groupState(
                 } else rows;
                 sets +|= pairs *| ((valueWidth(st, schema, i) + 16) * 4 / 3 * SET_GROWTH);
             },
-            .group_concat, .percentile, .percentile_disc, .percentile_approx => {
+            .group_concat, .percentile, .percentile_disc, .percentile_approx, .percentile_approx_weighted => {
                 group += 16;
                 out_fixed += 16;
                 var width: u64 = if (in_idx) |i| valueWidth(st, schema, i) else 0;

@@ -577,6 +577,23 @@ and APPROX return a DATE or DATETIME as that type, rounded to the day or the
 microsecond, and anything else as a DOUBLE. A product p×n within float error
 of an integer is read as that integer, so 0.07 of 100 values is the 7th.
 
+`PERCENTILE_APPROX_WEIGHTED(x, w, p[, compression])` counts each x w times,
+w truncated to an integer as StarRocks casts it to BIGINT. A row whose
+weight is NULL or below 1, or whose x is NULL or NaN, is left out. Each
+value is a centroid of its weight, centered on its share of the total, and
+the answer lies at p of the total weight: linear between adjacent centers,
+and the first or last value beyond them. That is where StarRocks' t-digest
+places it while it keeps every value, so with every weight 1 it is
+PERCENTILE_APPROX's answer. Equal values sort by weight, so the answer
+doesn't depend on row order. x and w are numeric, x is read as a DOUBLE,
+and the answer is a DOUBLE, NULL where no row counts. p and the ignored
+compression are as for PERCENTILE_APPROX. StarRocks differs in four ways:
+- It rounds the values and the answer through FLOAT.
+- It answers NaN where every weight is 0.
+- It counts a negative weight in the total but places no centroid for it.
+- Once its t-digest merges centroids, over some thousands of values at the
+  default compression, its answers drift from these slightly.
+
 `APPROX_TOP_K(x[, k[, counters]])` gives the k (default 5) most frequent
 values of x as an `ARRAY<STRUCT<item, count BIGINT>>`, most frequent first,
 with NULL counted as a value. The counts are exact, so the third argument,
@@ -909,7 +926,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT`, `APPROX_TOP_K` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`/`APPROX_WEIGHTED`, `GROUP_CONCAT`, `APPROX_TOP_K` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |

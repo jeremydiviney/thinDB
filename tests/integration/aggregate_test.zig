@@ -313,6 +313,49 @@ test "aggregate: MANN_WHITNEY_U_TEST ranks the false-index sample against the tr
     try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT MANN_WHITNEY_U_TEST(s, t) FROM mw"));
 }
 
+test "aggregate: PERCENTILE_APPROX_WEIGHTED interpolates between weighted centroids, as StarRocks' t-digest does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE pw (id BIGINT PRIMARY KEY, g BIGINT, k INT, w BIGINT, m DECIMAL(6,2), f DOUBLE, s VARCHAR(8), d DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO pw VALUES (1, 1, 2, 1, 1.25, 1.5, 'a', '2021-01-01'), (2, 1, 3, 2, 2.50, 2.0, 'b', '2021-01-02'), " ++
+        "(3, 1, 4, 3, NULL, 3.0, 'c', '2021-01-03'), (4, 2, 7, 5, 3.75, -1.0, 'd', NULL), (5, 2, 8, 0, 1.00, 0.0, 'e', NULL), " ++
+        "(6, 2, NULL, 4, NULL, NULL, NULL, NULL), (7, 3, 9, NULL, NULL, NULL, NULL, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("pw", .{})).flush();
+        // Centers 2@0.5, 3@2, 4@4.5 and 7@8.5 of total weight 11; the zero
+        // weight and the NULLs are left out.
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0.5) FROM pw", "4.75");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0.5, 100) FROM pw", "4.75");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0) FROM pw", "2");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 1) FROM pw", "7");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k + 1, w * 2, 0.5) FROM pw", "5.75");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(m, w, 0.5) FROM pw", "3.2142857142857144");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, f, 0.5) FROM pw", "3.4");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, 1, 0.25) FROM pw", "3");
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX(k, 0.25) FROM pw", "3");
+        try helpers.expectTexts(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0.5) FROM pw GROUP BY g ORDER BY g", &.{ "3.4", "7", null });
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0.5) FROM pw WHERE id = 5", null);
+        try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 0.5) FROM pw WHERE id > 100", null);
+    }
+    // StarRocks' answers, which it rounds through FLOAT: 3.4000000953674316,
+    // 3.3333332538604736 and 3.5999999046325684.
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, v, 0.5) FROM (VALUES (2, 1), (3, 2), (4, 3)) AS t(k, v)", "3.4");
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, v, 0.5) FROM (VALUES (3, 1), (3, 1), (4, 2)) AS t(k, v)", "3.3333333333333335");
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, v, 0.5) FROM (VALUES (2, 0), (3, 2), (4, 3)) AS t(k, v)", "3.6");
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(x, 1, 0.9) FROM TABLE(generate_series(1, 100)) AS numbers(x)", "90.5");
+    try helpers.expectText(allocator, db, "SELECT PERCENTILE_APPROX(x, 0.9) FROM TABLE(generate_series(1, 100)) AS numbers(x)", "90.5");
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(s, w, 0.5) FROM pw"));
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(d, w, 0.5) FROM pw"));
+    try std.testing.expectError(error.AggregateUnsupportedType, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, s, 0.5) FROM pw"));
+    try std.testing.expectError(error.AggregateInvalidParam, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, 1.5) FROM pw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w, id) FROM pw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT PERCENTILE_APPROX_WEIGHTED(k, w) FROM pw"));
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
