@@ -251,6 +251,29 @@ test "sql ddl: ALTER TABLE ADD COLUMN backfills nullable NULL and default values
     }
 }
 
+test "sql ddl: ALTER TABLE ADD [COLUMN] (def, ...) adds each column at the end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INT NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, 20)");
+    try exec(allocator, db, "ALTER TABLE t ADD COLUMN (v6 INTEGER DEFAULT '100')");
+    try exec(allocator, db, "ALTER TABLE t ADD (a INT, b TEXT NOT NULL DEFAULT 'x'), ADD c INT");
+    const t = try db.openTable("t", .{});
+    const names = [_][]const u8{ "id", "qty", "v6", "a", "b", "c" };
+    try std.testing.expectEqual(names.len, t.schema.columns.len);
+    for (names, t.schema.columns) |name, column| try std.testing.expectEqualStrings(name, column.name);
+    try helpers.expectTexts(allocator, db, "SELECT CONCAT(v6, '|', COALESCE(a, -1), '|', b, '|', COALESCE(c, -1)) FROM t ORDER BY id", &.{ "100|-1|x|-1", "100|-1|x|-1" });
+
+    try expectRunError(allocator, db, "ALTER TABLE t ADD (z INT AFTER id)", error.SqlExpectedToken);
+    try expectRunError(allocator, db, "ALTER TABLE t ADD (k INT PRIMARY KEY)", error.SqlInvalidProjection);
+    try expectRunError(allocator, db, "ALTER TABLE t ADD ()", error.SqlExpectedIdent);
+}
+
 test "sql ddl: ALTER TABLE drops, renames and changes columns and renames the table, as MySQL spells them" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

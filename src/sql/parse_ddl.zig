@@ -185,7 +185,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             const table = try p.parseTableRef();
             var actions: std.ArrayList(ir.AlterAction) = .empty;
             while (true) {
-                if (try parseAlterAction(p)) |action| try actions.append(p.arena, action);
+                try parseAlterAction(p, &actions);
                 if (p.cur.tag != .comma) break;
                 try p.advance();
             }
@@ -203,27 +203,36 @@ pub fn parseDdl(p: anytype) !*ir.Op {
     }
 }
 
-/// One `ALTER TABLE` action, in MySQL's spellings:
-///   ADD [COLUMN] def | DROP [COLUMN] name | RENAME COLUMN a TO b
-///   | CHANGE [COLUMN] old def | MODIFY [COLUMN] def | RENAME [TO | AS] t2
-/// Null for an action that changes nothing thinDB keeps: an index or
+/// One `ALTER TABLE` action, in MySQL's spellings, appended to `actions`:
+///   ADD [COLUMN] def | ADD [COLUMN] (def, ...) | DROP [COLUMN] name
+///   | RENAME COLUMN a TO b | CHANGE [COLUMN] old def | MODIFY [COLUMN] def
+///   | RENAME [TO | AS] t2
+/// Nothing for an action that changes nothing thinDB keeps: an index or
 /// constraint added, dropped or renamed (see parseTableConstraint), a table
 /// option, `ENABLE` / `DISABLE KEYS`, `FORCE`.
-fn parseAlterAction(p: anytype) !?ir.AlterAction {
+fn parseAlterAction(p: anytype, actions: *std.ArrayList(ir.AlterAction)) !void {
     const PE = @TypeOf(p.*).Err;
-    if (try skipTableOption(p)) return null;
+    if (try skipTableOption(p)) return;
     switch (p.cur.tag) {
         .kw_add => {
             try p.advance();
-            if (try parseTableConstraint(p)) |c| return switch (c) {
-                .primary_key => PE.SqlInvalidProjection,
-                .ignored => null,
+            if (try parseTableConstraint(p)) |c| switch (c) {
+                .primary_key => return PE.SqlInvalidProjection,
+                .ignored => return,
             };
             if (p.cur.tag == .kw_column) try p.advance();
-            const col = try parseColumnDef(p);
-            if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
+            if (p.cur.tag == .lparen) {
+                try p.advance();
+                while (true) {
+                    try actions.append(p.arena, .{ .add_column = try parseAddedColumn(p) });
+                    if (p.cur.tag != .comma) break;
+                    try p.advance();
+                }
+                return p.expect(.rparen);
+            }
+            const def = try parseAddedColumn(p);
             try rejectColumnPosition(p);
-            return .{ .add_column = col.def };
+            return try actions.append(p.arena, .{ .add_column = def });
         },
         .kw_drop => {
             try p.advance();
@@ -231,16 +240,16 @@ fn parseAlterAction(p: anytype) !?ir.AlterAction {
                 try p.advance();
                 try p.expect(.kw_key);
                 _ = try p.dupedIdent();
-                return null;
+                return;
             }
             if (p.cur.tag == .kw_key or isBareWord(p, "index") or isBareWord(p, "check") or isBareWord(p, "constraint")) {
                 try p.advance();
                 _ = try p.dupedIdent();
-                return null;
+                return;
             }
             if (p.cur.tag == .kw_primary) return PE.SqlInvalidProjection;
             if (p.cur.tag == .kw_column) try p.advance();
-            return .{ .drop_column = try p.dupedIdent() };
+            return try actions.append(p.arena, .{ .drop_column = try p.dupedIdent() });
         },
         .kw_rename => {
             try p.advance();
@@ -249,16 +258,16 @@ fn parseAlterAction(p: anytype) !?ir.AlterAction {
                 _ = try p.dupedIdent();
                 try p.expect(.kw_to);
                 _ = try p.dupedIdent();
-                return null;
+                return;
             }
             if (p.cur.tag == .kw_column) {
                 try p.advance();
                 const from = try p.dupedIdent();
                 try p.expect(.kw_to);
-                return .{ .rename_column = .{ .from = from, .to = try p.dupedIdent() } };
+                return try actions.append(p.arena, .{ .rename_column = .{ .from = from, .to = try p.dupedIdent() } });
             }
             if (p.cur.tag == .kw_to or p.cur.tag == .kw_as) try p.advance();
-            return .{ .rename_table = try p.parseTableRef() };
+            return try actions.append(p.arena, .{ .rename_table = try p.parseTableRef() });
         },
         // `ALTER INDEX name VISIBLE | INVISIBLE`.
         .kw_alter => {
@@ -268,7 +277,7 @@ fn parseAlterAction(p: anytype) !?ir.AlterAction {
             _ = try p.dupedIdent();
             if (!isBareWord(p, "visible") and !isBareWord(p, "invisible")) return PE.SqlExpectedKeyword;
             try p.advance();
-            return null;
+            return;
         },
         else => {},
     }
@@ -276,11 +285,11 @@ fn parseAlterAction(p: anytype) !?ir.AlterAction {
         try p.advance();
         if (!isBareWord(p, "keys")) return PE.SqlExpectedKeyword;
         try p.advance();
-        return null;
+        return;
     }
     if (isBareWord(p, "force")) {
         try p.advance();
-        return null;
+        return;
     }
     const change = isIdentText(p, "change");
     if (!change and !isIdentText(p, "modify")) return PE.SqlExpectedKeyword;
@@ -290,7 +299,15 @@ fn parseAlterAction(p: anytype) !?ir.AlterAction {
     const col = try parseColumnDef(p);
     if (col.is_pk) return PE.SqlInvalidProjection;
     try rejectColumnPosition(p);
-    return .{ .change_column = .{ .from = from orelse col.def.name, .column = col.def } };
+    return try actions.append(p.arena, .{ .change_column = .{ .from = from orelse col.def.name, .column = col.def } });
+}
+
+/// A column ALTER TABLE ... ADD can add: no key, no AUTO_INCREMENT.
+fn parseAddedColumn(p: anytype) !ir.ColumnDef {
+    const PE = @TypeOf(p.*).Err;
+    const col = try parseColumnDef(p);
+    if (col.is_pk or col.def.auto_increment) return PE.SqlInvalidProjection;
+    return col.def;
 }
 
 fn rejectColumnPosition(p: anytype) !void {
