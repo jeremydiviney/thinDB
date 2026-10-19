@@ -1229,3 +1229,68 @@ test "StarRocks' extra overloads: LAST_DAY by unit, STRPOS by instance, two-argu
         try helpers.expectTexts(allocator, db, "SELECT COUNT(*) FROM ov WHERE ts > 1700000000", &.{"3"});
     }
 }
+
+test "Iceberg's bucket and truncate transforms match the Iceberg spec and StarRocks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        // The Iceberg spec's hashes (appendix B), sign bit cleared: a
+        // bucket count of 2^31 - 1 leaves them as they are.
+        .{ "__ICEBERG_TRANSFORM_BUCKET(34, 2147483647)", "2017239379" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST(34 AS BIGINT), 2147483647)", "2017239379" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(14.20, 2147483647)", "1646729059" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(DATE '2017-11-16', 2147483647)", "1494153226" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST('2017-11-16 22:31:08' AS DATETIME), 2147483647)", "99539207" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST('2017-11-16 22:31:08.000001' AS DATETIME(6)), 2147483647)", "940286838" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET('iceberg', 2147483647)", "1210000089" },
+        // StarRocks' answers.
+        .{ "__ICEBERG_TRANSFORM_BUCKET(34, 16)", "3" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(10.65, 8)", "4" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(14.20, 1000)", "59" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET('iceberg', 1000)", "89" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(-1, 7)", "5" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET('', 5)", "0" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET('中文', 100)", "3" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(DATE '2017-11-16', 1000)", "226" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST('2017-11-16 22:31:08' AS DATETIME), 1000)", "207" },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST(NULL AS INT), 7)", null },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(34, NULL)", null },
+        .{ "__ICEBERG_TRANSFORM_BUCKET(CAST(0 AS DECIMAL(10,2)), 2147483647)", "1364076727" },
+        .{ "CAST(__ICEBERG_TRANSFORM_TRUNCATE(10.65, 50) AS CHAR)", "10.50" },
+        .{ "CAST(__ICEBERG_TRANSFORM_TRUNCATE(-10.65, 50) AS CHAR)", "-11.00" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE(1, 10)", "0" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE(-1, 10)", "-10" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE(CAST(-14 AS BIGINT), 10)", "-20" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE('iceberg', 3)", "ice" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE('中文abc', 2)", "中文" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE('ab', 5)", "ab" },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE(CAST(NULL AS INT), 3)", null },
+        .{ "__ICEBERG_TRANSFORM_TRUNCATE('ab', NULL)", null },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
+    inline for (.{ "__ICEBERG_TRANSFORM_BUCKET(34, 0)", "__ICEBERG_TRANSFORM_BUCKET('a', -3)", "__ICEBERG_TRANSFORM_BUCKET(1.5, 0)", "__ICEBERG_TRANSFORM_TRUNCATE(5, 0)", "__ICEBERG_TRANSFORM_TRUNCATE('abc', -1)", "__ICEBERG_TRANSFORM_TRUNCATE(1.5, 0)" }) |call| {
+        try std.testing.expectError(error.InvalidIcebergTransformWidth, helpers.exec(allocator, db, "SELECT " ++ call));
+    }
+    try std.testing.expectError(error.ArithmeticOverflow, helpers.exec(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(CAST(-2147483648 AS INT), 10)"));
+    try std.testing.expectError(error.ArithmeticOverflow, helpers.exec(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(CAST(-99.99 AS DECIMAL(4,2)), 50)"));
+
+    try helpers.exec(allocator, db, "CREATE TABLE ice (id BIGINT PRIMARY KEY, i INT, b BIGINT, m DECIMAL(6,2), s VARCHAR(10), d DATE, w INT)");
+    try helpers.exec(allocator, db, "INSERT INTO ice VALUES (1, 34, 34, 14.20, 'iceberg', '2017-11-16', 16), (2, -1, -14, 10.65, '中文abc', '1970-01-01', 7), " ++
+        "(3, NULL, NULL, NULL, NULL, NULL, 3), (4, 5, 5, 1.00, 'x', '2000-02-29', NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("ice", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_BUCKET(i, 2147483647) FROM ice ORDER BY id", &.{ "2017239379", "1651860712", null, "1740791543" });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_BUCKET(b, w) FROM ice ORDER BY id", &.{ "3", "1", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_BUCKET(m, 1000) FROM ice ORDER BY id", &.{ "59", "20", null, "59" });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_BUCKET(s, 1000) FROM ice ORDER BY id", &.{ "89", "0", null, "643" });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_BUCKET(d, 1000) FROM ice ORDER BY id", &.{ "226", "676", null, "141" });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(i, w) FROM ice ORDER BY id", &.{ "32", "-7", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(b, 10) FROM ice ORDER BY id", &.{ "30", "-20", null, "0" });
+        try helpers.expectTexts(allocator, db, "SELECT CAST(__ICEBERG_TRANSFORM_TRUNCATE(m, w) AS CHAR) FROM ice ORDER BY id", &.{ "14.08", "10.64", null, null });
+        try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(s, w) FROM ice ORDER BY id", &.{ "iceberg", "中文abc", null, null });
+    }
+}

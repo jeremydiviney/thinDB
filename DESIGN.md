@@ -441,6 +441,12 @@ StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the ho
 
 Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s` as `hex` (the default), `encode64` (padded base64) or `utf8` (the bytes as they are), named in any case. Text that isn't hex or base64 gives '', and empty base64 NULL, as in StarRocks. `FROM_BINARY(b[, format])` writes bytes in the same formats, hex in capitals. `FORMAT_BYTES(n)` writes a byte count in the largest binary unit it reaches, `B` through `EB`, with two decimals past `B` (`1.50 KB`); a negative count is NULL. `BAR(size, min, max, width)` draws `width` `▓` characters scaled by where `size` falls in `[min, max]`, in whole characters. `POSITIVE(x)` is `+x`. `NULL_OR_EMPTY(s)` is whether `s` is NULL or '', and is never NULL. `EQUIWIDTH_BUCKET(value, min, max, buckets)` is StarRocks' bucket of an integer `value` among buckets of one whole width laid from `min`, counting from 0: (value − min) / width rounded down, the width being (max − min) / buckets rounded down, or 1 where that is 0, so values near `max` can land in bucket `buckets` or later. StarRocks reads the four as unsigned, so there a negative min below a non-negative max fails and a negative bucket count is a vast one; thinDB reads them as signed.
 
+`__ICEBERG_TRANSFORM_BUCKET(x, n)` and `__ICEBERG_TRANSFORM_TRUNCATE(x, w)` are Iceberg's `bucket[N]` and `truncate[W]` partition transforms, as StarRocks exposes them for its Iceberg sinks, by the Iceberg spec.
+- **BUCKET:** Murmur3 (x86, 32-bit, seed 0) of x's single-value bytes, sign bit cleared, mod n, as an INT. An INT or BIGINT hashes as an 8-byte little-endian long, a DATE as its days and a DATETIME as its microseconds since 1970, a DECIMAL as its unscaled value's shortest big-endian two's complement, and a string as its bytes.
+- **TRUNCATE:** an INT, BIGINT or DECIMAL drops to the multiple of w at or below it, a DECIMAL's unscaled value and in its own type: `TRUNCATE(-1, 10)` is -10, `TRUNCATE(10.65, 50)` 10.50. A string keeps its first w characters.
+- **Errors:** an n or w below 1 raises `InvalidIcebergTransformWidth`, and a result past x's type `ArithmeticOverflow`.
+- **Types:** StarRocks takes only INT, BIGINT, DECIMAL, string, DATE and DATETIME (BUCKET) or INT, BIGINT, DECIMAL and string (TRUNCATE). thinDB also takes the narrower integers, which widen to INT with the same answer.
+
 `AES_ENCRYPT(text, key[, iv[, mode[, aad]]])` and `AES_DECRYPT(bytes, key[, iv[, mode[, aad]]])` take StarRocks' arguments, of which the first two are MySQL's. `mode` is `AES_<128|192|256>_<ECB|CBC|CFB|CFB1|CFB8|CFB128|OFB|CTR|GCM>` in any case, AES_128_ECB by default, CFB being CFB128. The key folds into the mode's key length by XOR, as MySQL folds it. The IV is zero-padded or cut to 16 bytes, an empty IV is StarRocks' default `STARROCKS_16BYTE`, and ECB ignores it, so a NULL IV doesn't make ECB NULL. ECB and CBC pad with PKCS#7. GCM uses the IV's first 12 bytes as its nonce, takes `aad` as its additional data, and writes the nonce, the ciphertext and the 16-byte tag. Decryption reads its nonce from those bytes. Any other NULL argument gives NULL, and so does decrypting bytes the mode can't have written, such as broken padding or a tag that doesn't match. A mode that isn't one, or an `aad` beside a mode other than GCM, raises `InvalidEncryptionMode`. std carries AES for 128- and 256-bit keys only, so `util/aes.zig` expands the keys of all three sizes for std's rounds.
 
 `XX_HASH3_64(s, ...)` and `XX_HASH3_128(s, ...)` are StarRocks' XXH3 hashes, by the xxHash spec (`util/xxh3.zig`). `XX_HASH3_64` hashes each argument with the previous hash as its seed, the first with seed 0, and is a signed BIGINT. `XX_HASH3_128` hashes the arguments run together, so `XX_HASH3_128('hello', 'world')` is `XX_HASH3_128('helloworld')`, and is a signed LARGEINT whose high 64 bits are the hash's high half. A NULL argument makes either NULL.
@@ -581,6 +587,23 @@ so a DECIMAL is read at its scale and a BIGINT past 2^53 sorts exactly. CONT
 and APPROX return a DATE or DATETIME as that type, rounded to the day or the
 microsecond, and anything else as a DOUBLE. A product p×n within float error
 of an integer is read as that integer, so 0.07 of 100 values is the 7th.
+
+`PERCENTILE_APPROX_WEIGHTED(x, w, p[, compression])` counts each x w times,
+w truncated to an integer as StarRocks casts it to BIGINT. A row whose
+weight is NULL or below 1, or whose x is NULL or NaN, is left out. Each
+value is a centroid of its weight, centered on its share of the total, and
+the answer lies at p of the total weight: linear between adjacent centers,
+and the first or last value beyond them. That is where StarRocks' t-digest
+places it while it keeps every value, so with every weight 1 it is
+PERCENTILE_APPROX's answer. Equal values sort by weight, so the answer
+doesn't depend on row order. x and w are numeric, x is read as a DOUBLE,
+and the answer is a DOUBLE, NULL where no row counts. p and the ignored
+compression are as for PERCENTILE_APPROX. StarRocks differs in four ways:
+- It rounds the values and the answer through FLOAT.
+- It answers NaN where every weight is 0.
+- It counts a negative weight in the total but places no centroid for it.
+- Once its t-digest merges centroids, over some thousands of values at the
+  default compression, its answers drift from these slightly.
 
 `APPROX_TOP_K(x[, k[, counters]])` gives the k (default 5) most frequent
 values of x as an `ARRAY<STRUCT<item, count BIGINT>>`, most frequent first,
@@ -914,7 +937,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT`, `APPROX_TOP_K` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`/`APPROX_WEIGHTED`, `GROUP_CONCAT`, `APPROX_TOP_K` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |
@@ -1990,6 +2013,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `InvalidBarArguments` means `BAR` was given a size outside `[min, max]`, a min not below its max, or a negative width, which StarRocks also refuses.
 
 `InvalidEquiwidthBucketArguments` means `EQUIWIDTH_BUCKET` was given a value outside `[min, max]`, a min not below its max, or a bucket count below 1. StarRocks fails the query too.
+
+`InvalidIcebergTransformWidth` means `__ICEBERG_TRANSFORM_BUCKET` was given a bucket count below 1, or `__ICEBERG_TRANSFORM_TRUNCATE` a width below 1, which Iceberg's transforms don't define.
 
 `InvalidEncryptionMode` means `AES_ENCRYPT` or `AES_DECRYPT` was given a mode other than `AES_<128|192|256>_<ECB|CBC|CFB|CFB1|CFB8|CFB128|OFB|CTR|GCM>`, or additional data beside a mode other than GCM. StarRocks fails the query too.
 
