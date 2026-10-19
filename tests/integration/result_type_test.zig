@@ -252,3 +252,40 @@ test "result type: a LARGEINT meets a decimal with a fraction as DOUBLE, and one
         .{ .sql = "SELECT CAST(v AS CHAR) FROM lv ORDER BY id", .expected = &.{ big, "99999999999999999999999999999999999999", "2" } },
     });
 }
+
+test "result type: TYPEOF names a value's type as StarRocks does, and TIMESTAMP(x) is x as a DATETIME" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try setup(allocator, db);
+
+    try expectCasesBeforeAndAfterFlush(allocator, db, &.{
+        .{ .sql = "SELECT TYPEOF(id) FROM rt WHERE id = 1", .expected = &.{"bigint"} },
+        .{ .sql = "SELECT TYPEOF(i) FROM rt ORDER BY id", .expected = &.{ "int", "int", "int" } },
+        .{ .sql = "SELECT TYPEOF(a) FROM rt WHERE id = 1", .expected = &.{"decimal64(10, 2)"} },
+        .{ .sql = "SELECT TYPEOF(CAST(a AS DECIMAL(19, 2))) FROM rt WHERE id = 1", .expected = &.{"decimal128(19, 2)"} },
+        .{ .sql = "SELECT TYPEOF(CAST(a AS DECIMAL(9, 2))) FROM rt WHERE id = 1", .expected = &.{"decimal32(9, 2)"} },
+        .{ .sql = "SELECT TYPEOF(s) FROM rt WHERE id = 1", .expected = &.{"varchar"} },
+        .{ .sql = "SELECT TYPEOF(d) FROM rt WHERE id = 1", .expected = &.{"date"} },
+        .{ .sql = "SELECT TYPEOF(ts) FROM rt WHERE id = 1", .expected = &.{"datetime"} },
+        .{ .sql = "SELECT TYPEOF(x) FROM rt WHERE id = 1", .expected = &.{"double"} },
+        .{ .sql = "SELECT TYPEOF(CAST(1 AS TINYINT))", .expected = &.{"tinyint"} },
+        .{ .sql = "SELECT TYPEOF(CAST(1 AS LARGEINT))", .expected = &.{"largeint"} },
+        .{ .sql = "SELECT TYPEOF(CAST(1 AS FLOAT) > 0)", .expected = &.{"boolean"} },
+        .{ .sql = "SELECT TYPEOF(PARSE_JSON('{\"a\": 1}'))", .expected = &.{"json"} },
+        .{ .sql = "SELECT TYPEOF(MAP{1: 'apple'})", .expected = &.{"map<int,varchar>"} },
+        .{ .sql = "SELECT TYPEOF(CAST(NULL AS ARRAY<STRUCT<x INT, y ARRAY<DATE>>>))", .expected = &.{"array<struct<x int, y array<date>>>"} },
+        .{ .sql = "SELECT TYPEOF(GREATEST(d, ts)) FROM rt WHERE id = 1", .expected = &.{"datetime"} },
+        .{ .sql = "SELECT TYPEOF(GREATEST(CAST(100 AS INT), CAST(200 AS BIGINT)))", .expected = &.{"bigint"} },
+        // The type of a NULL row is still its column's type.
+        .{ .sql = "SELECT TYPEOF(d) FROM rt WHERE id = 3", .expected = &.{"date"} },
+        .{ .sql = "SELECT CAST(TIMESTAMP('2026-01-11 08:30:00') AS CHAR)", .expected = &.{"2026-01-11 08:30:00"} },
+        .{ .sql = "SELECT CAST(TIMESTAMP('2026-01-11') AS CHAR)", .expected = &.{"2026-01-11 00:00:00"} },
+        .{ .sql = "SELECT CAST(TIMESTAMP(d) AS CHAR) FROM rt ORDER BY id", .expected = &.{ "2024-03-05 00:00:00", "2024-03-06 00:00:00", NULL } },
+        .{ .sql = "SELECT CAST(TIMESTAMP('not a date') AS CHAR)", .expected = &.{NULL} },
+        .{ .sql = "SELECT CAST(DATE(GREATEST(DATE('2026-01-14'), TIMESTAMP('2026-01-11 00:00:00'))) AS CHAR)", .expected = &.{"2026-01-14"} },
+        .{ .sql = "SELECT CAST(COALESCE(NULL, DATE('2026-01-11'), TIMESTAMP('2026-01-14 00:00:00')) AS CHAR)", .expected = &.{"2026-01-11 00:00:00"} },
+    });
+}
