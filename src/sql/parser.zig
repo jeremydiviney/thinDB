@@ -1288,7 +1288,6 @@ pub const Parser = struct {
             },
             .kw_insert => return try parse_ddl.parseInsert(self),
             .kw_replace => return try parse_ddl.parseReplace(self),
-            .kw_copy => return try parse_ddl.parseCopy(self),
             .kw_set => return try self.parseSetVar(),
             .kw_delete => return try self.parseDelete(),
             .kw_update => return try self.parseUpdate(),
@@ -1298,6 +1297,7 @@ pub const Parser = struct {
                 if (std.ascii.eqlIgnoreCase(self.cur.text, "refresh")) {
                     return try parse_ddl.parseRefresh(self);
                 }
+                if (self.atBareWord("copy")) return try parse_ddl.parseCopy(self);
                 if (try parse_ddl.parseAdmin(self)) |op| return op;
             },
             else => {},
@@ -1986,7 +1986,13 @@ pub const Parser = struct {
     /// MySQL's `DUAL`: the one-row source of a FROM-less SELECT. A
     /// backquoted `dual` still names a table.
     fn atDual(self: *const Parser) bool {
-        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, "dual") and !self.cur.quoted;
+        return self.atBareWord("dual");
+    }
+
+    /// The unquoted word `word`, for a clause word that isn't a keyword
+    /// token (`lexer.keywordFor`).
+    pub fn atBareWord(self: *const Parser, comptime word: []const u8) bool {
+        return self.cur.tag == .identifier and std.ascii.eqlIgnoreCase(self.cur.text, word) and !self.cur.quoted;
     }
 
     /// Optional LIMIT / OFFSET applies last. A bare OFFSET (no limit, e.g.
@@ -5760,12 +5766,12 @@ pub const Parser = struct {
             //   NOT MATERIALIZED    → never
             //   (no hint)           → auto (refcount-driven post-pass)
             var hint: MaterializeHint = .auto;
-            if (self.cur.tag == .kw_materialized) {
+            if (self.atBareWord("materialized")) {
                 hint = .force;
                 try self.advance();
             } else if (self.cur.tag == .kw_not) {
                 try self.advance();
-                if (self.cur.tag != .kw_materialized) return ParseError.SqlExpectedKeyword;
+                if (!self.atBareWord("materialized")) return ParseError.SqlExpectedKeyword;
                 try self.advance();
                 hint = .never;
             }

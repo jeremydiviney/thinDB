@@ -64,8 +64,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 return try parseCreateFunctionBody(p, or_replace);
             }
             // CREATE [OR REPLACE] [MATERIALIZED] VIEW name AS <select>.
-            // `materialized` is a reserved keyword; `view` is contextual.
-            if (p.cur.tag == .kw_materialized) {
+            if (isBareWord(p, "materialized")) {
                 try p.advance();
                 if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
                 try p.advance();
@@ -80,7 +79,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                 return try parseCreateIndex(p);
             }
             var is_temp = false;
-            if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
+            if (isBareWord(p, "temp") or isBareWord(p, "temporary")) {
                 is_temp = true;
                 try p.advance();
             }
@@ -127,7 +126,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
             // DROP [MATERIALIZED] VIEW [IF EXISTS] name.
             {
                 var materialized = false;
-                if (p.cur.tag == .kw_materialized) {
+                if (isBareWord(p, "materialized")) {
                     materialized = true;
                     try p.advance();
                 }
@@ -149,7 +148,7 @@ pub fn parseDdl(p: anytype) !*ir.Op {
                     } } });
                 }
             }
-            if (p.cur.tag == .kw_temp or p.cur.tag == .kw_temporary) {
+            if (isBareWord(p, "temp") or isBareWord(p, "temporary")) {
                 try p.advance();
             }
             if (p.cur.tag == .kw_table) {
@@ -679,7 +678,7 @@ pub fn parseCreateViewBody(p: anytype, or_replace: bool, materialized: bool) !*i
 pub fn parseRefresh(p: anytype) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     try p.advance(); // consume "refresh"
-    if (p.cur.tag != .kw_materialized) return PE.SqlExpectedKeyword;
+    if (!isBareWord(p, "materialized")) return PE.SqlExpectedKeyword;
     try p.advance();
     if (!isIdentText(p, "view")) return PE.SqlExpectedKeyword;
     try p.advance();
@@ -1933,7 +1932,7 @@ pub fn parseAdmin(p: anytype) !?*ir.Op {
     }
     if (asciiEqlAny(word, &.{ "lock", "unlock" })) {
         try p.advance();
-        if (p.cur.tag != .kw_table and p.cur.tag != .kw_tables and !isBareWord(p, "instance")) return PE.SqlExpectedKeyword;
+        if (p.cur.tag != .kw_table and !isBareWord(p, "tables") and !isBareWord(p, "instance")) return PE.SqlExpectedKeyword;
         try skipToStatementEnd(p);
         return try p.allocOp(.{ .admin = .ignored });
     }
@@ -1966,7 +1965,7 @@ pub fn parseAdmin(p: anytype) !?*ir.Op {
         return null;
     try p.advance();
     if (kind != .check and (isBareWord(p, "no_write_to_binlog") or isBareWord(p, "local"))) try p.advance();
-    if (p.cur.tag != .kw_table and p.cur.tag != .kw_tables) return PE.SqlExpectedKeyword;
+    if (p.cur.tag != .kw_table and !isBareWord(p, "tables")) return PE.SqlExpectedKeyword;
     try p.advance();
     var tables: std.ArrayList(ir.TableRef) = .empty;
     while (true) {
@@ -2025,6 +2024,22 @@ fn skipCompletionOptions(p: anytype) !bool {
 pub fn parseShow(p: anytype) !*ir.Op {
     const PE = @TypeOf(p.*).Err;
     try p.advance(); // consume SHOW
+    if (isBareWord(p, "tables")) {
+        try p.advance();
+        var ref: ir.TableRef = .{ .name = "" };
+        if (p.cur.tag == .kw_from) {
+            try p.advance();
+            const first = try p.dupedIdentLower();
+            if (p.cur.tag == .dot) {
+                try p.advance();
+                const second = try p.dupedIdentLower();
+                ref = .{ .database = first, .schema = second, .name = "" };
+            } else {
+                ref = .{ .schema = first, .name = "" };
+            }
+        }
+        return try p.allocOp(.{ .show = .{ .tables = ref } });
+    }
     switch (p.cur.tag) {
         .kw_databases => {
             try p.advance();
@@ -2038,22 +2053,6 @@ pub fn parseShow(p: anytype) !*ir.Op {
                 db = try p.dupedIdentLower();
             }
             return try p.allocOp(.{ .show = .{ .schemas = db } });
-        },
-        .kw_tables => {
-            try p.advance();
-            var ref: ir.TableRef = .{ .name = "" };
-            if (p.cur.tag == .kw_from) {
-                try p.advance();
-                const first = try p.dupedIdentLower();
-                if (p.cur.tag == .dot) {
-                    try p.advance();
-                    const second = try p.dupedIdentLower();
-                    ref = .{ .database = first, .schema = second, .name = "" };
-                } else {
-                    ref = .{ .schema = first, .name = "" };
-                }
-            }
-            return try p.allocOp(.{ .show = .{ .tables = ref } });
         },
         .kw_create => {
             try p.advance();

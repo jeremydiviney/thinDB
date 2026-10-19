@@ -51,7 +51,6 @@ pub const TokenTag = enum {
     kw_on,
     kw_having,
     kw_with,
-    kw_materialized,
     kw_alter,
     kw_rename,
     kw_truncate,
@@ -67,7 +66,6 @@ pub const TokenTag = enum {
     kw_use,
     kw_show,
     kw_explain,
-    kw_tables,
     kw_table,
     kw_primary,
     kw_key,
@@ -77,9 +75,6 @@ pub const TokenTag = enum {
     kw_values,
     kw_insert,
     kw_replace,
-    kw_copy,
-    kw_temp,
-    kw_temporary,
     // Window-function keywords.
     kw_over,
     kw_partition,
@@ -88,13 +83,8 @@ pub const TokenTag = enum {
     kw_range,
     kw_groups,
     kw_between,
-    kw_preceding,
-    kw_following,
-    kw_unbounded,
-    kw_current,
     kw_row,
     kw_ignore,
-    kw_respect,
     kw_qualify,
     kw_default,
     /// MySQL-style `AUTO_INCREMENT` column attribute. Lexed as a single
@@ -958,6 +948,10 @@ fn endsOperand(tag: TokenTag) bool {
 
 fn keywordFor(s: []const u8) ?TokenTag {
     // Tiny set; linear scan is fine. ASCII-case-insensitive compare.
+    // A word MySQL doesn't reserve and that only opens a clause (TEMP,
+    // MATERIALIZED, TABLES, CURRENT ROW, UNBOUNDED PRECEDING, RESPECT
+    // NULLS, ...) stays an identifier the parser matches by its text, so
+    // it can still name a table, a column or a CTE.
     const kws = [_]struct { name: []const u8, tag: TokenTag }{
         .{ .name = "select", .tag = .kw_select },
         .{ .name = "from", .tag = .kw_from },
@@ -989,7 +983,6 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "on", .tag = .kw_on },
         .{ .name = "having", .tag = .kw_having },
         .{ .name = "with", .tag = .kw_with },
-        .{ .name = "materialized", .tag = .kw_materialized },
         .{ .name = "alter", .tag = .kw_alter },
         .{ .name = "rename", .tag = .kw_rename },
         .{ .name = "truncate", .tag = .kw_truncate },
@@ -1005,7 +998,6 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "use", .tag = .kw_use },
         .{ .name = "show", .tag = .kw_show },
         .{ .name = "explain", .tag = .kw_explain },
-        .{ .name = "tables", .tag = .kw_tables },
         .{ .name = "table", .tag = .kw_table },
         .{ .name = "primary", .tag = .kw_primary },
         .{ .name = "key", .tag = .kw_key },
@@ -1015,9 +1007,6 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "values", .tag = .kw_values },
         .{ .name = "insert", .tag = .kw_insert },
         .{ .name = "replace", .tag = .kw_replace },
-        .{ .name = "copy", .tag = .kw_copy },
-        .{ .name = "temp", .tag = .kw_temp },
-        .{ .name = "temporary", .tag = .kw_temporary },
         .{ .name = "over", .tag = .kw_over },
         .{ .name = "partition", .tag = .kw_partition },
         .{ .name = "window", .tag = .kw_window },
@@ -1025,13 +1014,8 @@ fn keywordFor(s: []const u8) ?TokenTag {
         .{ .name = "range", .tag = .kw_range },
         .{ .name = "groups", .tag = .kw_groups },
         .{ .name = "between", .tag = .kw_between },
-        .{ .name = "preceding", .tag = .kw_preceding },
-        .{ .name = "following", .tag = .kw_following },
-        .{ .name = "unbounded", .tag = .kw_unbounded },
-        .{ .name = "current", .tag = .kw_current },
         .{ .name = "row", .tag = .kw_row },
         .{ .name = "ignore", .tag = .kw_ignore },
-        .{ .name = "respect", .tag = .kw_respect },
         .{ .name = "qualify", .tag = .kw_qualify },
         .{ .name = "default", .tag = .kw_default },
         .{ .name = "auto_increment", .tag = .kw_auto_increment },
