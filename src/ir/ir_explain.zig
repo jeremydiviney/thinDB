@@ -623,6 +623,15 @@ fn explainExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) anyerror!
             try out.append(allocator, '@');
             try out.appendSlice(allocator, name);
         },
+        .lambda => |l| {
+            try out.append(allocator, '(');
+            for (l.params, 0..) |param, i| {
+                if (i > 0) try out.appendSlice(allocator, ", ");
+                try out.appendSlice(allocator, param);
+            }
+            try out.appendSlice(allocator, ") -> ");
+            try explainExpr(allocator, out, l.body.*);
+        },
     }
 }
 

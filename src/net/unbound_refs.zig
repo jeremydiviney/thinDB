@@ -132,6 +132,9 @@ const Finder = struct {
     exposed: std.AutoHashMapUnmanaged(*const ir.Op, ?*const NameSet) = .empty,
     exposed_columns: std.AutoHashMapUnmanaged(*const ir.Op, ?[]const Exposed) = .empty,
     visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty,
+    /// The lambdas whose bodies are being checked: their parameters are no
+    /// columns.
+    lambdas: ?*const expr_mod.LambdaScope = null,
 
     fn walk(self: *Finder, op: *const ir.Op) Allocator.Error!?Unbound {
         if ((try self.visited.getOrPut(self.arena, op)).found_existing) return null;
@@ -213,7 +216,7 @@ const Finder = struct {
 
     fn checkExpr(self: *Finder, e: Expr, scope: Scope) Allocator.Error!?Unbound {
         switch (e) {
-            .col_ref => |c| if (scope.rejects(c)) |u| return u,
+            .col_ref => |c| if (!expr_mod.LambdaScope.binds(self.lambdas, c)) if (scope.rejects(c)) |u| return u,
             .call => |c| {
                 if (self.mode == .unbound and !scalar_fn.nameResolvable(self.udfs, c.fn_name)) return .{ .function = c.fn_name };
                 for (c.args) |arg| if (try self.checkExpr(arg, scope)) |u| return u;
@@ -224,10 +227,17 @@ const Finder = struct {
                 for (cs.branches) |b| {
                     refs.clearRetainingCapacity();
                     try expr_mod.collectCaseConditionRefs(self.arena, &refs, cs, b.cond);
-                    for (refs.items) |c| if (scope.rejects(c)) |u| return u;
+                    for (refs.items) |c| if (!expr_mod.LambdaScope.binds(self.lambdas, c)) if (scope.rejects(c)) |u| return u;
                     if (try self.checkExpr(b.then, scope)) |u| return u;
                 }
                 if (cs.else_branch) |eb| return self.checkExpr(eb.*, scope);
+            },
+            .lambda => |l| {
+                const enclosing = self.lambdas;
+                const inner: expr_mod.LambdaScope = .{ .lambda = l, .outer = enclosing };
+                self.lambdas = &inner;
+                defer self.lambdas = enclosing;
+                return self.checkExpr(l.body.*, scope);
             },
             .lit, .null_lit, .scalar_subquery, .exists_subquery, .var_ref => {},
         }

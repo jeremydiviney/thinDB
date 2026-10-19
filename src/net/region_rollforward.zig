@@ -1232,7 +1232,7 @@ fn hash_fusion_expr(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, 
             if (case.else_branch) |other| try hash_fusion_expr(registry, h, other.*);
         },
         .col_ref, .lit, .null_lit => {},
-        .scalar_subquery, .exists_subquery, .var_ref => return Unhashable,
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => return Unhashable,
     }
 }
 
@@ -1524,7 +1524,7 @@ fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
                 try hashExpr(h, eb.*);
             } else hu(h, 0);
         },
-        .scalar_subquery, .exists_subquery, .var_ref => return Unhashable,
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => return Unhashable,
     }
 }
 

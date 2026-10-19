@@ -1009,6 +1009,12 @@ fn collectExprCols(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const
             }
             if (cs.else_branch) |eb| try collectExprCols(allocator, needed, table, eb.*);
         },
+        .lambda => {
+            var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer refs.deinit(allocator);
+            try compute.collectColumnRefs(allocator, &refs, e);
+            for (refs.items) |nm| _ = try addNeeded(allocator, needed, table, nm);
+        },
         else => {},
     }
 }

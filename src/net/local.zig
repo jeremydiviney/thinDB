@@ -1702,6 +1702,15 @@ fn projWalkExpr(c: *ProjScan, allocator: Allocator, e: ir.Expr) void {
             }
             if (cs.else_branch) |eb| projWalkExpr(c, allocator, eb.*);
         },
+        .lambda => {
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer names.deinit(allocator);
+            exec.compute_op.collectColumnRefs(allocator, &names, e) catch {
+                c.bail = true;
+                return;
+            };
+            for (names.items) |nm| c.add(allocator, nm);
+        },
         .scalar_subquery, .exists_subquery, .var_ref => c.bail = true,
     }
 }
@@ -3989,6 +3998,7 @@ fn collectExprNames(aa: Allocator, out: *std.ArrayListUnmanaged([]const u8), e: 
             }
             if (c.else_branch) |eb| try collectExprNames(aa, out, eb.*);
         },
+        .lambda => try exec.compute_op.collectColumnRefs(aa, out, e),
         .lit, .null_lit => {},
         .scalar_subquery, .exists_subquery, .var_ref => return Error.UnsupportedOp,
     }

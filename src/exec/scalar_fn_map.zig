@@ -29,7 +29,7 @@ const Error = @import("exec.zig").Error;
 
 /// Names that resolve here, for `scalar_fn.nameResolvable`.
 const NAMES = [_][]const u8{
-    scalar_fn.MAP_FROM_ARRAYS_FN, "map_size", "map_keys", "map_values", "map_concat", "distinct_map_keys",
+    scalar_fn.MAP_FROM_ARRAYS_FN, "map_size", "map_keys", "map_values", "map_concat", "distinct_map_keys", "map_filter",
 };
 
 pub fn isMapFnName(name: []const u8) bool {
@@ -69,6 +69,11 @@ pub fn resolveMap(aa: Allocator, name: []const u8, arg_types: []const Type) Allo
         // Maps hold no repeated keys, so there are none to drop.
         if (eql(name, "distinct_map_keys")) return overload(aa, name, arg_types, arg_types[0], identityKernel);
         return null;
+    }
+    if (eql(name, "map_filter") and arg_types.len == 2) {
+        const keep = arg_types[1].arrayElement() orelse return null;
+        if (!try castable(aa, keep, .boolean)) return null;
+        return overload(aa, name, arg_types, arg_types[0], filterKernel);
     }
     if (eql(name, scalar_fn.ELEMENT_AT_FN) and arg_types.len == 2) {
         const c = array.comparedType(m.key, arg_types[1]) orelse return null;
@@ -269,6 +274,31 @@ fn elementAtKernel(allocator: Allocator, arg_types: []const Type, out_type: Type
         const found = if (args[0].isValid(r)) array.findIn(fm.keys.view, fm.start(r), fm.end(r), key.view, r) else null;
         if (found) |i| try store.appendViewRange(allocator, out, fm.values.view, i, i + 1) else try out.appendNulls(allocator, 1);
     }
+}
+
+/// MAP_FILTER(m, keep): the entries whose place in `keep` holds true; none
+/// past `keep`'s end, and none when `keep` is NULL.
+fn filterKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    const m = out_type.mapTypes().?;
+    var fm = try FlatMapAs.init(allocator, arg_types[0], args[0], m, rows);
+    defer fm.deinit(allocator);
+    const keep_element = arg_types[1].arrayElement().?;
+    var keep = try nested.flatten(allocator, keep_element, args[1], rows);
+    defer keep.deinit(allocator);
+    var flags = try AsType.init(allocator, keep.elements.view(), keep_element, .boolean, keep.elements.rowCount());
+    defer flags.deinit(allocator);
+    var b = try MapBuilder.init(allocator, m);
+    defer b.deinit(allocator);
+    for (0..rows) |r| {
+        const ks = keep.offsets.items[r];
+        const n = @min(fm.end(r) - fm.start(r), keep.offsets.items[r + 1] - ks);
+        for (0..n) |i| {
+            if (!flags.view.isValid(ks + i) or flags.view.data.boolean[ks + i] == 0) continue;
+            try b.appendEntries(allocator, fm.keys.view, fm.start(r) + i, fm.values.view, fm.start(r) + i, 1);
+        }
+        try b.endRow(allocator, args[0].isValid(r));
+    }
+    try b.finish(allocator, out);
 }
 
 /// MAP_CONCAT: every map's entries, a key in several taking its value from

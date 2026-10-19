@@ -61,6 +61,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "SeriesStepZero")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "SeriesNonIntegerArgument")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "MapArrayLengthMismatch")) return .wrong_arguments;
+    if (std.mem.eql(u8, err_name, "ArrayLengthMismatch")) return .wrong_arguments;
     if (std.mem.eql(u8, err_name, "MemoryBudgetExceeded")) return .memory_budget_exceeded;
     if (std.mem.eql(u8, err_name, "OutOfMemory")) return .out_of_memory;
     for (NOT_SUPPORTED) |name| if (std.mem.eql(u8, err_name, name)) return .not_supported;
@@ -118,6 +119,7 @@ test "classify recognizes known errors" {
         .{ "SeriesStepZero", Category.wrong_arguments },
         .{ "SeriesNonIntegerArgument", Category.wrong_arguments },
         .{ "MapArrayLengthMismatch", Category.wrong_arguments },
+        .{ "ArrayLengthMismatch", Category.wrong_arguments },
         .{ "SqlOnColumnAmbiguous", Category.ambiguous_column },
         .{ "MemoryBudgetExceeded", Category.memory_budget_exceeded },
         .{ "OutOfMemory", Category.out_of_memory },

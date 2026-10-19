@@ -3773,21 +3773,31 @@ pub fn derivedFusable(d: Derived, scan_cols: []const Column) bool {
 }
 
 fn exprFusable(e: Expr, scan_cols: []const Column) bool {
+    return exprFusableIn(e, scan_cols, null);
+}
+
+const LambdaScope = expr_mod.LambdaScope;
+
+fn exprFusableIn(e: Expr, scan_cols: []const Column, scope: ?*const LambdaScope) bool {
     return switch (e) {
-        .col_ref => |name| types.findColumn(scan_cols, name) != null,
+        .col_ref => |name| LambdaScope.binds(scope, name) or types.findColumn(scan_cols, name) != null,
         .lit => true,
         .null_lit => true,
         .call => |c| {
             for (c.args) |a| {
-                if (!exprFusable(a, scan_cols)) return false;
+                if (!exprFusableIn(a, scan_cols, scope)) return false;
             }
             return true;
+        },
+        .lambda => |l| {
+            const inner: LambdaScope = .{ .lambda = l, .outer = scope };
+            return exprFusableIn(l.body.*, scan_cols, &inner);
         },
         // CASE is fusable when row-local (branch conds, THENs, and ELSE all
         // reference upstream columns only). Whether fusing it actually WINS
         // depends on the source — see the table-source gate in
         // `ParallelScan.tryFuseCompute`.
-        .case => |c| caseFusable(c, scan_cols),
+        .case => |c| scope == null and caseFusable(c, scan_cols),
         .scalar_subquery, .exists_subquery, .var_ref => false,
     };
 }

@@ -57,6 +57,22 @@ pub const Expr = union(enum) {
     /// vars map and rewrites this into a `.lit`. Operators never
     /// see this variant.
     var_ref: []const u8,
+    /// `x -> body` or `(x, y) -> body`, an argument of a function that
+    /// applies it to each element (`array_map`). The body reads the
+    /// parameters as columns, and any other column of the call's input.
+    lambda: Lambda,
+
+    pub const Lambda = struct {
+        params: []const []const u8,
+        body: *const Expr,
+
+        /// Whether `name` is a parameter, or a field path over one (`x.a`).
+        pub fn hasParam(self: Lambda, name: []const u8) bool {
+            const root = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+            for (self.params) |p| if (types.columnNameEql(p, root)) return true;
+            return false;
+        }
+    };
 
     pub const Call = struct {
         fn_name: []const u8,
@@ -92,6 +108,19 @@ pub const Expr = union(enum) {
         name: []const u8,
         expr: Expr,
     };
+};
+
+/// The lambdas around an expression being walked, innermost first: a name
+/// one of them takes as a parameter is no column.
+pub const LambdaScope = struct {
+    lambda: Expr.Lambda,
+    outer: ?*const LambdaScope,
+
+    pub fn binds(scope: ?*const LambdaScope, name: []const u8) bool {
+        var at = scope;
+        while (at) |s| : (at = s.outer) if (s.lambda.hasParam(name)) return true;
+        return false;
+    }
 };
 
 pub fn operandListed(operands: []const Expr.Operand, name: []const u8) bool {
@@ -188,6 +217,16 @@ pub fn deepCloneRenamed(out_arena: Allocator, e: Expr, renames: []const predicat
         .scalar_subquery => |p| .{ .scalar_subquery = p },
         .exists_subquery => |p| .{ .exists_subquery = p },
         .var_ref => |name| .{ .var_ref = try out_arena.dupe(u8, name) },
+        .lambda => |l| blk: {
+            const params = try out_arena.alloc([]const u8, l.params.len);
+            for (params, l.params) |*d, p| d.* = try out_arena.dupe(u8, p);
+            // A parameter hides the column it shares a name with.
+            var kept: std.ArrayList(predicate_mod.ColRename) = .empty;
+            for (renames) |r| if (!l.hasParam(r.from)) try kept.append(out_arena, r);
+            const body = try out_arena.create(Expr);
+            body.* = try deepCloneRenamed(out_arena, l.body.*, kept.items);
+            break :blk .{ .lambda = .{ .params = params, .body = body } };
+        },
     };
 }
 
@@ -222,6 +261,12 @@ pub fn eql(a: Expr, b: Expr) bool {
         },
         .scalar_subquery, .exists_subquery => false,
         .var_ref => |name| std.mem.eql(u8, name, b.var_ref),
+        .lambda => |l| blk: {
+            const o = b.lambda;
+            if (l.params.len != o.params.len) break :blk false;
+            for (l.params, o.params) |x, y| if (!types.columnNameEql(x, y)) break :blk false;
+            break :blk eql(l.body.*, o.body.*);
+        },
     };
 }
 

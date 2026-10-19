@@ -319,6 +319,9 @@ fn systemVariableValue(c: exec.expr_mod.Expr.Call, current_schema: []const u8) e
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScalars) anyerror!void {
     switch (e.*) {
         .col_ref, .lit, .null_lit => {},
+        // A subquery in a lambda's body that reads the enclosing row isn't
+        // lowered: the body runs over elements, not rows.
+        .lambda => |l| try resolveSubqueriesInExpr(ctx, @constCast(l.body), null),
         .var_ref => |name| {
             // A variable set to SQL NULL resolves to a NULL literal; the type
             // is unknown at this point (MySQL user vars are dynamically typed),
@@ -937,6 +940,9 @@ const RefSides = struct {
     /// The operands of the CASE whose condition is being read: names the
     /// CASE makes up, not columns.
     case_operands: []const exec.expr_mod.Expr.Operand = &.{},
+    /// The lambdas whose bodies are being read: their parameters are no
+    /// columns.
+    lambdas: ?*const exec.expr_mod.LambdaScope = null,
     inner: bool = false,
     outer: bool = false,
     /// A nested subquery was read, whose own names aren't counted here.
@@ -944,6 +950,7 @@ const RefSides = struct {
 
     fn readName(self: *RefSides, ref: []const u8) void {
         if (ref.len == 0 or exec.expr_mod.operandListed(self.case_operands, ref)) return;
+        if (exec.expr_mod.LambdaScope.binds(self.lambdas, ref)) return;
         if (self.qualified_only and types.splitQualifiedName(ref) == null) return;
         if (self.scope.binds(ref)) self.inner = true else self.outer = true;
     }
@@ -999,6 +1006,13 @@ const RefSides = struct {
                 self.case_operands = enclosing;
                 for (cs.branches) |br| self.readExpr(br.then);
                 if (cs.else_branch) |eb| self.readExpr(eb.*);
+            },
+            .lambda => |l| {
+                const enclosing = self.lambdas;
+                const scope: exec.expr_mod.LambdaScope = .{ .lambda = l, .outer = enclosing };
+                self.lambdas = &scope;
+                defer self.lambdas = enclosing;
+                self.readExpr(l.body.*);
             },
             .scalar_subquery, .exists_subquery => self.nested = true,
             .lit, .null_lit, .var_ref => {},
@@ -2508,6 +2522,7 @@ fn exprReadsName(e: ir.Expr, name: []const u8) bool {
             for (cs.branches) |br| if (exec.predicate.touchesColumn(br.cond, name) or exprReadsName(br.then, name)) return true;
             return if (cs.else_branch) |eb| exprReadsName(eb.*, name) else false;
         },
+        .lambda => |l| !l.hasParam(name) and exprReadsName(l.body.*, name),
     };
 }
 
@@ -2811,6 +2826,7 @@ fn deterministic(ctx: *CompileCtx, e: ir.Expr) bool {
             if (cs.else_branch) |eb| return deterministic(ctx, eb.*);
             return true;
         },
+        .lambda => |l| deterministic(ctx, l.body.*),
         .scalar_subquery, .exists_subquery => false,
     };
 }
@@ -2966,6 +2982,7 @@ const FreeNames = struct {
         switch (e) {
             .col_ref => |ref| return .{ .col_ref = try self.readName(ref) },
             .lit, .null_lit, .var_ref => return e,
+            .lambda => return error.NotLiftable,
             .call => |c| {
                 var copy = c;
                 const args = try na.alloc(ir.Expr, c.args.len);
@@ -4030,6 +4047,7 @@ fn exprReadsSubquery(e: ir.Expr) bool {
             if (cs.else_branch) |eb| return exprReadsSubquery(eb.*);
             return false;
         },
+        .lambda => |l| exprReadsSubquery(l.body.*),
     };
 }
 
@@ -4065,7 +4083,9 @@ const OuterAggregates = struct {
     fn expr(self: *OuterAggregates, e: ir.Expr) Allocator.Error!?ir.Expr {
         const na = self.ctx.nodeArena();
         switch (e) {
-            .col_ref, .lit, .null_lit, .var_ref => return null,
+            // A lambda's body runs over elements, which no enclosing
+            // aggregate reads.
+            .col_ref, .lit, .null_lit, .var_ref, .lambda => return null,
             .scalar_subquery => |source| return .{ .scalar_subquery = (try self.subquery(source)) orelse return null },
             .exists_subquery => |source| return .{ .exists_subquery = (try self.subquery(source)) orelse return null },
             .call => |c| {

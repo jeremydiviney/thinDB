@@ -35,6 +35,8 @@ const NAMES = [_][]const u8{
     "array_slice",            "array_join",         "array_contains",   "array_position",
     "array_remove",           "array_append",       "array_concat",     "arrays_overlap",
     "array_contains_all",     "array_contains_seq", "array_intersect",  scalar_fn.ARRAY_ORDER_FN,
+    "array_filter",           "any_match",          "all_match",        "array_sortby",
+    "array_map",
 };
 
 pub fn isArrayFnName(name: []const u8) bool {
@@ -114,7 +116,21 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
             return overload(aa, name, arg_types, element, flattenKernel);
         }
         if (eql(name, "array_concat") or eql(name, "array_intersect")) return overload(aa, name, arg_types, array, if (eql(name, "array_concat")) concatKernel else intersectKernel);
+        if (eql(name, "any_match") or eql(name, "all_match")) {
+            if (!try castable(aa, element, .boolean)) return null;
+            return overload(aa, name, arg_types, .boolean, if (eql(name, "any_match")) anyMatchKernel else allMatchKernel);
+        }
         return null;
+    }
+    if (eql(name, "array_filter")) {
+        if (arg_types.len != 2) return null;
+        const keep = arg_types[1].arrayElement() orelse return null;
+        if (!try castable(aa, keep, .boolean)) return null;
+        return overload(aa, name, arg_types, array, filterKernel);
+    }
+    if (eql(name, "array_sortby")) {
+        for (arg_types[1..]) |t| if (t.arrayElement() == null) return null;
+        return overload(aa, name, arg_types, array, sortByKernel);
     }
     if (eql(name, scalar_fn.ELEMENT_AT_FN)) {
         if (arg_types.len != 2 or !arg_types[1].isInteger()) return null;
@@ -756,6 +772,122 @@ fn sortKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, arg
         }.lessThan);
         for (order.items) |i| try b.appendOne(allocator, v, i);
         try b.endRow(allocator, args[0].isValid(r));
+    }
+    try b.finish(allocator, out);
+}
+
+/// ARRAY_FILTER(arr, keep): the elements whose place in `keep` holds true;
+/// none past `keep`'s end, and none when `keep` is NULL.
+fn filterKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = out_type;
+    const element = arg_types[0].arrayElement().?;
+    var fa = try FlatAs.init(allocator, arg_types[0], args[0], element, rows);
+    defer fa.deinit(allocator);
+    var keep = try FlatAs.init(allocator, arg_types[1], args[1], .boolean, rows);
+    defer keep.deinit(allocator);
+    var b = try ArrayBuilder.init(allocator, element);
+    defer b.deinit(allocator);
+    const flags = keep.elements.view;
+    for (0..rows) |r| {
+        const n = @min(fa.end(r) - fa.start(r), keep.end(r) - keep.start(r));
+        for (0..n) |i| {
+            const k = keep.start(r) + i;
+            if (flags.isValid(k) and flags.data.boolean[k] != 0) try b.appendOne(allocator, fa.elements.view, fa.start(r) + i);
+        }
+        try b.endRow(allocator, args[0].isValid(r));
+    }
+    try b.finish(allocator, out);
+}
+
+fn anyMatchKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    try matchKernel(allocator, arg_types, out_type, args, out, rows, true);
+}
+
+fn allMatchKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    try matchKernel(allocator, arg_types, out_type, args, out, rows, false);
+}
+
+/// ANY_MATCH (`decides` true): whether an element is true. ALL_MATCH
+/// (`decides` false): whether none is false. An element that decides
+/// neither way, a NULL, makes the answer NULL when no other decides it.
+fn matchKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize, comptime decides: bool) !void {
+    _ = out_type;
+    var fa = try FlatAs.init(allocator, arg_types[0], args[0], .boolean, rows);
+    defer fa.deinit(allocator);
+    const v = fa.elements.view;
+    for (0..rows) |r| {
+        if (!args[0].isValid(r)) {
+            try out.appendNulls(allocator, 1);
+            continue;
+        }
+        var saw_null = false;
+        const decided = for (fa.start(r)..fa.end(r)) |i| {
+            if (!v.isValid(i)) {
+                saw_null = true;
+            } else if ((v.data.boolean[i] != 0) == decides) break true;
+        } else false;
+        if (!decided and saw_null) {
+            try out.appendNulls(allocator, 1);
+            continue;
+        }
+        try appendValue(allocator, out, "boolean", @intFromBool(decided == decides));
+    }
+}
+
+/// ARRAY_SORTBY(arr, keys...): `arr` in the order of its elements' keys,
+/// compared one key array after another, NULLs first; ties keep their
+/// order. A NULL key array is passed over; the others must be as long as
+/// `arr`.
+fn sortByKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = out_type;
+    const element = arg_types[0].arrayElement().?;
+    var fa = try FlatAs.init(allocator, arg_types[0], args[0], element, rows);
+    defer fa.deinit(allocator);
+    const keys = try allocator.alloc(FlatAs, args.len - 1);
+    var built: usize = 0;
+    defer {
+        for (keys[0..built]) |*k| k.deinit(allocator);
+        allocator.free(keys);
+    }
+    for (keys, arg_types[1..], args[1..]) |*k, t, a| {
+        k.* = try FlatAs.init(allocator, t, a, t.arrayElement().?, rows);
+        built += 1;
+    }
+    const SortKey = struct { view: ColumnView, start: usize };
+    const row_keys = try allocator.alloc(SortKey, keys.len);
+    defer allocator.free(row_keys);
+    var b = try ArrayBuilder.init(allocator, element);
+    defer b.deinit(allocator);
+    var order: std.ArrayList(usize) = .empty;
+    defer order.deinit(allocator);
+    for (0..rows) |r| {
+        if (!args[0].isValid(r)) {
+            try b.endRow(allocator, false);
+            continue;
+        }
+        const s = fa.start(r);
+        const n = fa.end(r) - s;
+        var used: usize = 0;
+        for (keys, args[1..]) |*k, a| {
+            if (!a.isValid(r)) continue;
+            if (k.end(r) - k.start(r) != n) return Error.ArrayLengthMismatch;
+            row_keys[used] = .{ .view = k.elements.view, .start = k.start(r) };
+            used += 1;
+        }
+        order.clearRetainingCapacity();
+        for (0..n) |i| try order.append(allocator, i);
+        std.sort.block(usize, order.items, row_keys[0..used], struct {
+            fn lessThan(ks: []const SortKey, x: usize, y: usize) bool {
+                for (ks) |k| switch (cellOrder(k.view, k.start + x, k.start + y)) {
+                    .lt => return true,
+                    .gt => return false,
+                    .eq => {},
+                };
+                return false;
+            }
+        }.lessThan);
+        for (order.items) |i| try b.appendOne(allocator, fa.elements.view, s + i);
+        try b.endRow(allocator, true);
     }
     try b.finish(allocator, out);
 }

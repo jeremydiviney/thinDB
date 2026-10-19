@@ -887,6 +887,8 @@ fn nestedComparison(p: anytype, lhs: ir.Expr, op: PredicateOp, rhs: ir.Expr) @Ty
 fn exprHasColumnRef(expr: ir.Expr) bool {
     return switch (expr) {
         .col_ref => true,
+        // Its parameters' names count too, which only ever says yes more.
+        .lambda => |l| exprHasColumnRef(l.body.*),
         .call => |c| blk: {
             for (c.args) |arg| {
                 if (exprHasColumnRef(arg)) break :blk true;
