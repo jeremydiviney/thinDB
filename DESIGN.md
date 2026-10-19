@@ -1343,6 +1343,10 @@ does, so over a whole partition it gives that partition's GROUP BY value, and
 a frame with too few non-NULL values, or pairs for the two-argument ones,
 gives NULL.
 
+`COUNT`, `SUM` and `AVG` take DISTINCT over a window too, and fold each
+frame's distinct non-NULL values, told apart as GROUP BY tells them (-0 is
+0). `MIN(DISTINCT x)` and `MAX(DISTINCT x)` are `MIN(x)` and `MAX(x)`.
+
 StarRocks' `SESSION_NUMBER(x, delta)` numbers the sessions of each ordered
 partition from 1, ignoring the frame: a row starts the next session when its
 integer x exceeds the last non-NULL x before it by more than delta, a constant

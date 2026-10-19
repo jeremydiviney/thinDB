@@ -271,10 +271,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         // list); WHERE/HAVING contexts keep rejecting OVER. Checked before
         // the aggregate arm so `SUM(x) OVER (...)` hoists as a window.
         if (p.cur.tag == .kw_over and p.aggregateExprRefsEnabled()) {
-            if (saw_distinct or filter != null) return PE.SqlInvalidProjection;
+            if (filter != null) return PE.SqlInvalidProjection;
             try p.advance();
             const spec_kind = try parse_window.parseWindowSpecOrRef(p);
-            const wfunc = p.windowFuncForName(col_dup) orelse return PE.SqlInvalidProjection;
+            const wfunc = p.windowFuncForCall(col_dup, saw_distinct) orelse return PE.SqlInvalidProjection;
             parse_window.validateWindowCall(wfunc, args, false) catch return PE.SqlInvalidProjection;
             const hidden = try p.materializeWindowExpr(.{
                 .func = wfunc,

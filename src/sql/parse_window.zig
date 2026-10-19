@@ -46,7 +46,7 @@ pub const SpecKind = union(enum) {
 /// windows.
 pub fn isAggregateAlsoFunc(f: ir.WindowFunc) bool {
     return switch (f) {
-        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => true,
+        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct => true,
         else => false,
     };
 }
@@ -100,6 +100,11 @@ pub fn validateWindowCall(
         .covar_pop, .covar_samp, .corr, .session_number => {
             if (args.len != 2) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
+        },
+        .count_distinct, .sum_distinct, .avg_distinct => {
+            if (args.len != 1) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
+            if (args[0] == .col_ref and std.mem.eql(u8, args[0].col_ref, "*")) return error.InvalidShape;
         },
     }
 }

@@ -550,6 +550,11 @@ pub const WindowFunc = enum(u8) {
     covar_samp = 21,
     corr = 22,
     session_number = 23,
+    // `COUNT/SUM/AVG(DISTINCT x) OVER`, as the aggregates have their own
+    // DISTINCT functions (`Parser.windowFuncForCall`).
+    count_distinct = 24,
+    sum_distinct = 25,
+    avg_distinct = 26,
 };
 
 /// Lookup table: window-function name → enum, or null when the name
@@ -607,6 +612,9 @@ pub fn windowFuncName(f: WindowFunc) []const u8 {
         .covar_samp => "covar_samp",
         .corr => "corr",
         .session_number => "session_number",
+        .count_distinct => "count_distinct",
+        .sum_distinct => "sum_distinct",
+        .avg_distinct => "avg_distinct",
     };
 }
 
@@ -2902,7 +2910,7 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         cursor.* += 4;
         const func_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (func_byte > @intFromEnum(WindowFunc.session_number)) return Error.IrCorrupt;
+        if (func_byte > @intFromEnum(WindowFunc.avg_distinct)) return Error.IrCorrupt;
         const func: WindowFunc = @enumFromInt(func_byte);
         const ignore_nulls = bytes[cursor.*] != 0;
         cursor.* += 1;
