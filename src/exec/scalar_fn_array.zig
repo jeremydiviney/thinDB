@@ -1465,6 +1465,20 @@ fn orderKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, ar
     }
 }
 
+/// Each row's order of two nested columns once both read as the type they
+/// compare in (`cast.nestedComparedType`), as `ARRAY_ORDER` orders them. A
+/// row where either is NULL gets `.eq`, for the caller to mask out.
+pub fn orderColumns(allocator: Allocator, a: ColumnView, a_type: Type, b: ColumnView, b_type: Type, orders: []std.math.Order) !void {
+    const t = cast.nestedComparedType(a_type, b_type) orelse return Error.PredicateTypeMismatch;
+    var av = try AsType.init(allocator, a, a_type, t, orders.len);
+    defer av.deinit(allocator);
+    var bv = try AsType.init(allocator, b, b_type, t, orders.len);
+    defer bv.deinit(allocator);
+    for (orders, 0..) |*o, r| {
+        o.* = if (av.view.isValid(r) and bv.view.isValid(r)) nested.order(cellBytes(av.view, r), cellBytes(bv.view, r)) else .eq;
+    }
+}
+
 test "array resolution: types and NULL placeholders" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -23,6 +23,7 @@ const Error = exec.Error;
 const scalar_fn_common = @import("scalar_fn_common.zig");
 const json_binary = @import("json_binary.zig");
 const nested = @import("nested.zig");
+const scalar_fn_array = @import("scalar_fn_array.zig");
 const cast = @import("cast.zig");
 const scalar_fn_time = @import("scalar_fn_time.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
@@ -672,7 +673,9 @@ pub fn validateExpr(expr: *PredicateExpr, schema: []const Column) !void {
         .leaf_col_col => |lc| {
             const li = types.findColumn(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = types.findColumn(schema, lc.right) orelse return Error.ColumnNotFound;
-            if (!typesComparable(schema[li].type, schema[ri].type) and !temporalBesideNumber(schema[li].type, schema[ri].type)) return Error.PredicateTypeMismatch;
+            const lt = schema[li].type;
+            const rt = schema[ri].type;
+            if (!typesComparable(lt, rt) and !temporalBesideNumber(lt, rt) and !nestedAcrossTypes(lt, rt)) return Error.PredicateTypeMismatch;
         },
         .is_null, .is_not_null => |col_name| {
             _ = types.findColumn(schema, col_name) orelse return Error.ColumnNotFound;
@@ -1455,7 +1458,7 @@ pub fn evaluatePredicate(
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
-            evaluateColColMask(batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
+            try evaluateColCol(allocator, batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
         },
         .is_null => |col_name| {
             const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
@@ -1554,7 +1557,7 @@ pub fn evaluateExprGuided(
         .leaf_col_col => |lc| {
             const li = findCol(schema, lc.left) orelse return Error.ColumnNotFound;
             const ri = findCol(schema, lc.right) orelse return Error.ColumnNotFound;
-            evaluateColColMask(batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
+            try evaluateColCol(allocator, batch.values[li], schema[li].type, batch.values[ri], schema[ri].type, lc.op, batch.row_count, out);
         },
         .is_null => |col_name| {
             const col_idx = findCol(schema, col_name) orelse return Error.ColumnNotFound;
@@ -2439,7 +2442,7 @@ pub fn comparisonKind(ty: types.Type) ComparisonKind {
 /// them (`placeTemporalNumber`, `temporalBesideNumber`); a join key, a
 /// subquery's column or a correlated key never pairs the two.
 pub fn typesComparable(a: types.Type, b: types.Type) bool {
-    if (a.isNested() or b.isNested()) return std.meta.eql(a, b);
+    if (a.isNested() or b.isNested()) return cast.sameRepresentation(a, b);
     const ka = comparisonKind(a);
     const kb = comparisonKind(b);
     if (ka == kb) return true;
@@ -2628,6 +2631,24 @@ fn sameRepresentation(a: types.Type, b: types.Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     if (a.decimalSpec()) |da| if (b.decimalSpec()) |db| return da.s == db.s;
     return true;
+}
+
+/// Two nested columns of different types that meet at a common type, which
+/// they compare in (`evaluateColCol`).
+fn nestedAcrossTypes(a: types.Type, b: types.Type) bool {
+    return a.isNested() and b.isNested() and !cast.sameRepresentation(a, b) and cast.nestedComparedType(a, b) != null;
+}
+
+/// `evaluateColColMask`, and nested columns of different types, which
+/// convert to their common type a batch at a time.
+fn evaluateColCol(allocator: std.mem.Allocator, left: ColumnView, left_type: types.Type, right: ColumnView, right_type: types.Type, op: PredicateOp, n: usize, mask: []bool) !void {
+    if (!nestedAcrossTypes(left_type, right_type)) return evaluateColColMask(left, left_type, right, right_type, op, n, mask);
+    const orders = try allocator.alloc(std.math.Order, n);
+    defer allocator.free(orders);
+    try scalar_fn_array.orderColumns(allocator, left, left_type, right, right_type, orders);
+    for (orders, mask[0..n]) |o, *m| m.* = orderMatches(o, op);
+    clearNullRows(left.nulls, mask[0..n]);
+    clearNullRows(right.nulls, mask[0..n]);
 }
 
 /// Per-row col-vs-col comparison under the comparison rule. NULL on either

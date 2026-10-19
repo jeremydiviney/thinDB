@@ -274,9 +274,7 @@ pub const NestedLoopJoin = struct {
         for (spec.on, 0..) |pair, i| {
             left_keys[i] = columnIndex(left_schema, pair.left) orelse return Error.ColumnNotFound;
             right_keys[i] = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
-            const lt: TypeTag = left_schema[left_keys[i]].type;
-            const rt: TypeTag = right_schema[right_keys[i]].type;
-            if (lt != rt and !(isStringTag(lt) and isStringTag(rt))) {
+            if (!join_mod.keyTypesMatch(left_schema[left_keys[i]].type, right_schema[right_keys[i]].type)) {
                 return Error.JoinKeyTypeMismatch;
             }
         }

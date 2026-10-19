@@ -205,6 +205,34 @@ test "ARRAY: comparisons meet at the common array type" {
     try expectTexts(allocator, db, "SELECT d FROM t WHERE id = 5", &.{"[0.50]"});
 }
 
+test "ARRAY: two array columns of different types compare and join at their common type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE c (id BIGINT PRIMARY KEY, s10 ARRAY<VARCHAR(10)>, s20 ARRAY<VARCHAR(20)>, f ARRAY<FLOAT>, i ARRAY<INT>, n ARRAY<ARRAY<INT>>)");
+    try exec(allocator, db,
+        \\INSERT INTO c VALUES
+        \\ (1, ['a', 'b'], ['a', 'b'], [1.5], [1], [[1]]),
+        \\ (2, ['aa', NULL], ['ssss', NULL], [2.0], [2], [[2]]),
+        \\ (3, NULL, NULL, NULL, NULL, NULL)
+    );
+
+    try expectTexts(allocator, db, "SELECT id FROM c WHERE s10 = s20 ORDER BY id", &.{"1"});
+    try expectTexts(allocator, db, "SELECT s10 < s20 FROM c ORDER BY id", &.{ "0", "1", null });
+    try expectTexts(allocator, db, "SELECT f = i FROM c ORDER BY id", &.{ "0", "1", null });
+    try expectTexts(allocator, db, "SELECT id FROM c WHERE f >= i ORDER BY id", &.{ "1", "2" });
+    try expectTexts(allocator, db, "SELECT id FROM c WHERE f <> i ORDER BY id", &.{"1"});
+    try expectTexts(allocator, db, "SELECT b.id FROM c a LEFT JOIN c b ON a.f = b.i ORDER BY a.id", &.{ null, "2", null });
+    try expectTexts(allocator, db, "SELECT b.id FROM c a JOIN c b ON a.i = b.f ORDER BY a.id", &.{"2"});
+    try helpers.expectRunError(allocator, db, "SELECT id FROM c WHERE i = n", error.PredicateTypeMismatch);
+    // Text never reads as an array between columns, as a NULL literal does.
+    try helpers.expectRunError(allocator, db, "SELECT id FROM c WHERE s10 = n", error.PredicateTypeMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT a.id FROM c a JOIN c b ON a.s10 = b.n", error.JoinKeyTypeMismatch);
+}
+
 test "ARRAY: an empty, all-NULL or BOOLEAN array meets a nested sibling, as in StarRocks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

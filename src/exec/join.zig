@@ -558,6 +558,10 @@ fn textMeetsValue(value: Type, value_kind: predicate.ComparisonKind, use: KeyUse
 /// values already compare. Decimals meet at the common decimal type, since
 /// mantissas at different scales never match.
 fn commonJoinKeyType(left: Type, right: Type) ?Type {
+    if (left.isNested() or right.isNested()) {
+        if (cast.sameRepresentation(left, right)) return null;
+        return cast.nestedComparedType(left, right);
+    }
     if (left.isDecimal() or right.isDecimal()) {
         if (std.meta.eql(left, right)) return null;
         if (left.isFloat() or right.isFloat()) return .double;
@@ -610,7 +614,7 @@ pub fn mergingEqualityKeyReading(aa: Allocator, name: []const u8, key_type: Type
 /// conversions `normalizeJoinKeyTypes` lays over them, the keys share a type.
 pub fn equalityKeyTypesJoin(left: Type, right: Type) bool {
     const plan = joinKeyConversions(left, right, .equality);
-    return keyTagsMatch(typeTag(convertedKeyType(left, plan.left)), typeTag(convertedKeyType(right, plan.right)));
+    return keyTypesMatch(convertedKeyType(left, plan.left), convertedKeyType(right, plan.right));
 }
 
 /// The type `keyConversionExpr`'s function returns for a key of type `t`.
@@ -626,6 +630,14 @@ fn convertedKeyType(t: Type, conversion: ?KeyConversion) Type {
             else => r.target,
         },
     };
+}
+
+/// Whether a join compares keys of these types by their stored values: one
+/// tag, or two texts. Nested keys must be stored alike, as their encoded
+/// bytes are what the join compares.
+pub fn keyTypesMatch(left: Type, right: Type) bool {
+    if (left.isNested() or right.isNested()) return cast.sameRepresentation(left, right);
+    return keyTagsMatch(typeTag(left), typeTag(right));
 }
 
 fn keyTagsMatch(left: TypeTag, right: TypeTag) bool {
@@ -1696,9 +1708,7 @@ pub const Join = struct {
             right_keys[i] = columnIndex(right_schema, pair.right) orelse return Error.ColumnNotFound;
             left_key_names[i] = try aa.dupe(u8, left_schema[left_keys[i]].name);
             right_key_names[i] = try aa.dupe(u8, right_schema[right_keys[i]].name);
-            // Types must match by tag (varchar/string/char are
-            // compatible string-family; otherwise must match exactly).
-            if (!keyTagsMatch(left_schema[left_keys[i]].type, right_schema[right_keys[i]].type)) {
+            if (!keyTypesMatch(left_schema[left_keys[i]].type, right_schema[right_keys[i]].type)) {
                 return Error.JoinKeyTypeMismatch;
             }
         }
@@ -3785,6 +3795,7 @@ fn sameValueType(a: Type, b: Type) bool {
     const at = typeTag(a);
     const bt = typeTag(b);
     if (at == .json or bt == .json) return false;
+    if (a.isNested() or b.isNested()) return cast.sameRepresentation(a, b);
     return std.meta.eql(a, b) or (isStringTag(at) and isStringTag(bt));
 }
 
