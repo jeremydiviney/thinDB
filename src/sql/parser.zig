@@ -1407,6 +1407,9 @@ pub const Parser = struct {
         // this is empty and the scalar-only path below runs unchanged.
         var group_cols: []const []const u8 = &.{};
         var grouping_key: []bool = &.{};
+        // GROUP BY expressions no SELECT item computes, each computed before
+        // the GroupBy under its own key column (`resolveGroupBy`).
+        var group_hidden: []const ir.Derived = &.{};
         // Per-projection flag: a deterministic scalar expression over grouped
         // output columns (e.g. `k + 1` under `GROUP BY k`) that isn't itself a
         // grouping key — computed once per group ABOVE the aggregate.
@@ -1442,12 +1445,13 @@ pub const Parser = struct {
             const res = try self.resolveGroupBy(proj, group_exprs, from_op);
             group_cols = res.cols;
             grouping_key = res.gk;
+            group_hidden = res.hidden;
             const keys: GroupKeys = .{ .exprs = group_exprs, .cols = group_cols };
-            proj = try self.rewriteGroupingInProj(proj, keys, &grouping_calls);
-            having_derived = try self.rewriteGroupingInDerived(having_derived, keys, &grouping_calls);
-            order_anchors = try self.rewriteGroupingInDerived(order_anchors, keys, &grouping_calls);
-            order_keys = try self.rewriteGroupingInDerived(order_keys, keys, &grouping_calls);
-            const pred_derived = try self.rewriteGroupingInDerived(projection_predicate_derived, keys, &grouping_calls);
+            proj = try self.readHiddenKeysInProj(try self.rewriteGroupingInProj(proj, keys, &grouping_calls), grouping_key, group_hidden);
+            having_derived = try self.readHiddenKeysInDerived(try self.rewriteGroupingInDerived(having_derived, keys, &grouping_calls), group_hidden);
+            order_anchors = try self.readHiddenKeysInDerived(try self.rewriteGroupingInDerived(order_anchors, keys, &grouping_calls), group_hidden);
+            order_keys = try self.readHiddenKeysInDerived(try self.rewriteGroupingInDerived(order_keys, keys, &grouping_calls), group_hidden);
+            const pred_derived = try self.readHiddenKeysInDerived(try self.rewriteGroupingInDerived(projection_predicate_derived, keys, &grouping_calls), group_hidden);
             if (grouping_calls.items.len > 0) {
                 grouping_names = try groupingColumnNames(self.arena, grouping_calls.items.len);
                 after_group_extra = try std.mem.concat(self.arena, []const u8, &.{ hidden_agg_cols, grouping_names });
@@ -1550,6 +1554,7 @@ pub const Parser = struct {
                 },
                 else => {},
             };
+            try derived_buf.appendSlice(self.arena, group_hidden);
             var synth_counter: usize = 0;
             var agg_cols: std.ArrayList(?[]const u8) = .empty;
             defer agg_cols.deinit(self.arena);
@@ -7918,7 +7923,7 @@ pub const Parser = struct {
         return .{ .case = .{ .branches = branches, .else_branch = null } };
     }
 
-    const GroupByResolution = struct { cols: []const []const u8, gk: []bool };
+    const GroupByResolution = struct { cols: []const []const u8, gk: []bool, hidden: []const ir.Derived };
 
     /// Resolve GROUP BY items against the projection. Each item binds to
     /// a projected column (by ordinal, by name/alias, or by structural
@@ -7927,11 +7932,15 @@ pub const Parser = struct {
     /// is grouped directly. A bare name FROM exposes means that column even
     /// when a SELECT alias spells it too (`SELECT n % 2 AS n ... GROUP BY
     /// n` groups on `n`), as in MySQL, StarRocks, PostgreSQL and DuckDB.
+    /// Any other expression groups on a hidden `__group_key_<n>` column the
+    /// pre-aggregate Compute adds (`hidden`), which the SELECT list doesn't
+    /// show.
     fn resolveGroupBy(self: *Parser, proj: []const ProjItem, group_exprs: []const ir.Expr, from: ?*const ir.Op) ParseError!GroupByResolution {
         const gk = try self.arena.alloc(bool, proj.len);
         @memset(gk, false);
         var cols: std.ArrayList([]const u8) = .empty;
         defer cols.deinit(self.arena);
+        var hidden: std.ArrayList(ir.Derived) = .empty;
         var from_columns: ?[]const []const u8 = null;
         for (group_exprs) |ge| {
             if (ordinalOf(ge)) |k| {
@@ -7957,10 +7966,63 @@ pub const Parser = struct {
             }
             switch (ge) {
                 .col_ref => |c| try cols.append(self.arena, try self.arena.dupe(u8, c)),
-                else => return ParseError.SqlInvalidProjection,
+                else => {
+                    const name = try std.fmt.allocPrint(self.arena, "__group_key_{d}", .{hidden.items.len});
+                    try cols.append(self.arena, name);
+                    try hidden.append(self.arena, .{ .name = name, .expr = ge });
+                },
             }
         }
-        return .{ .cols = try cols.toOwnedSlice(self.arena), .gk = gk };
+        return .{ .cols = try cols.toOwnedSlice(self.arena), .gk = gk, .hidden = try hidden.toOwnedSlice(self.arena) };
+    }
+
+    /// `e` with every part a hidden GROUP BY key computes read from that
+    /// key's column, so `YEAR(d) + 1` under `GROUP BY YEAR(d)` reads the
+    /// grouped value rather than `d`, which the GroupBy doesn't keep.
+    fn readHiddenKeys(self: *Parser, e: ir.Expr, hidden: []const ir.Derived) ParseError!ir.Expr {
+        for (hidden) |h| if (exprEqual(e, h.expr)) return .{ .col_ref = h.name };
+        switch (e) {
+            .call => |c| {
+                const args = try self.arena.alloc(ir.Expr, c.args.len);
+                for (c.args, args) |arg, *dst| dst.* = try self.readHiddenKeys(arg, hidden);
+                var call = c;
+                call.args = args;
+                return .{ .call = call };
+            },
+            .case => |c| {
+                const branches = try self.arena.alloc(ir.Expr.Branch, c.branches.len);
+                for (c.branches, branches) |b, *dst| dst.* = .{ .cond = b.cond, .then = try self.readHiddenKeys(b.then, hidden) };
+                var else_branch: ?*const ir.Expr = null;
+                if (c.else_branch) |eb| {
+                    const rewritten = try self.arena.create(ir.Expr);
+                    rewritten.* = try self.readHiddenKeys(eb.*, hidden);
+                    else_branch = rewritten;
+                }
+                const operands = try self.arena.alloc(ir.Expr.Operand, c.operands.len);
+                for (c.operands, operands) |o, *dst| dst.* = .{ .name = o.name, .expr = try self.readHiddenKeys(o.expr, hidden) };
+                return .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands } };
+            },
+            else => return e,
+        }
+    }
+
+    fn readHiddenKeysInProj(self: *Parser, proj: []const ProjItem, grouping_key: []const bool, hidden: []const ir.Derived) ParseError![]const ProjItem {
+        if (hidden.len == 0) return proj;
+        const items = try self.arena.dupe(ProjItem, proj);
+        for (items, grouping_key) |*p, key| switch (p.kind) {
+            .expr => |e| if (!key) {
+                p.kind = .{ .expr = try self.readHiddenKeys(e, hidden) };
+            },
+            else => {},
+        };
+        return items;
+    }
+
+    fn readHiddenKeysInDerived(self: *Parser, derived: []const ir.Derived, hidden: []const ir.Derived) ParseError![]const ir.Derived {
+        if (hidden.len == 0) return derived;
+        const items = try self.arena.dupe(ir.Derived, derived);
+        for (items) |*d| d.expr = try self.readHiddenKeys(d.expr, hidden);
+        return items;
     }
 
     fn markGroupKey(

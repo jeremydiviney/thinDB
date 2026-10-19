@@ -914,6 +914,14 @@ MySQL, StarRocks, PostgreSQL and DuckDB bind it: `SELECT n % 2 AS n ... GROUP BY
 n` makes one group per `n`. It reaches an alias only when FROM has no such
 column. `SELECT n, t.n FROM t` names the repeat `n_1`, as `SELECT n, n` does.
 
+A GROUP BY expression no SELECT item computes groups on a hidden key column
+that the pre-aggregate Compute adds and the final Project drops. `SELECT
+COUNT(*) FROM t GROUP BY YEAR(d)` makes one row per year, as in MySQL,
+StarRocks, PostgreSQL and DuckDB. Where a SELECT item, HAVING or ORDER BY
+repeats the expression, in whole or as a part (`YEAR(d) + 1`), it reads the
+key. A column only the key reads stays ungrouped, so `SELECT d ... GROUP BY
+YEAR(d)` fails with `SqlMixedAggAndPlainProjection`.
+
 `ORDER BY ALL`, from DuckDB, sorts by every SELECT item from left to right, as
 `ORDER BY 1, 2, ...` would, a `*` counting each column it expands to. One
 `ASC` or `DESC` and one NULLS placement after it apply to every key. It stands
