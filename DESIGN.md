@@ -96,6 +96,7 @@ Arrays follow StarRocks:
 - Text casts to an array from StarRocks' `[1, "a", null]` or PostgreSQL's `{1,a,NULL}`. An element that doesn't read as the element type is NULL. Text that isn't an array is NULL in a CAST and fails an INSERT.
 - The MySQL wire prints StarRocks' text; the PostgreSQL wire prints PostgreSQL's array literal.
 - `ARRAY_AGG(x [ORDER BY k])` keeps NULLs. It is a GROUP_CONCAT of `[x]`, and GROUP_CONCAT over arrays concatenates them.
+- `cosine_similarity(a, b)`, `cosine_similarity_norm(a, b)` (the inner product, for vectors already of length 1) and `l2_distance(a, b)` (the squared distance) take two numeric arrays of one length, else `ArrayLengthMismatch`. They compute in double precision and return a DOUBLE, where StarRocks returns a FLOAT. A NULL element gives NULL, as does a cosine with a zero vector.
 
 Lambdas follow StarRocks:
 - `x -> body` and `(x, y) -> body` are lambdas, written only as a function's argument, first or last. `array_map(lambda, a1, ..., an)`, or `transform`, takes one array per parameter and gives the body's value at each place of the arrays. A row whose arrays include a NULL is NULL. The others must be equally long on each row, or the statement fails with `ArrayLengthMismatch`.
@@ -407,6 +408,8 @@ A DATE or DATETIME in a numeric context is its YYYYMMDD or YYYYMMDDhhmmss number
 A number, boolean, DATE or DATETIME is its text where a string is expected: in a string function, one-argument `CONCAT`, `LIKE` (`12 LIKE '1%'`), a cast to text, or a text column. A boolean is `1` or `0` there, as in MySQL and StarRocks; only PostgreSQL's cast to text spells it `true` or `false`. `REPEAT`, `LPAD`, `RPAD` and `SPACE` return NULL rather than build a result longer than 16 MiB, the `max_allowed_packet` thinDB reports, as MySQL does. The MySQL wire splits a row longer than one packet across packets, so a long result never drops the connection.
 
 StarRocks' URL and n-gram functions follow it. `URL_EXTRACT_HOST(url)` is the host of the URL's authority, without user or port. `URL_EXTRACT_PARAMETER(url, name)` is the value of the query's first parameter called `name`: '' for a parameter without `=`, NULL for none. Both are NULL for text that isn't a URL: one needs a scheme, and may hold no space or control character, as RFC 3986 says. `URL_ENCODE` writes text in the application/x-www-form-urlencoded format, keeping letters, digits and `*-._`, and turning a space into `+`. `URL_DECODE` and the parameter reader undo that, keeping a `%` that isn't followed by two hex digits. `NGRAM_SEARCH(haystack, needle, n)` is the share of the needle's `n`-byte grams that the haystack also holds, each haystack gram counting for at most one. It is computed in single precision, as StarRocks computes it, so the values match to the digit. `NGRAM_SEARCH_CASE_INSENSITIVE` folds ASCII case first. Unlike StarRocks, the needle and `n` may differ per row.
+
+Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s` as `hex` (the default), `encode64` (padded base64) or `utf8` (the bytes as they are), named in any case. Text that isn't hex or base64 gives '', and empty base64 NULL, as in StarRocks. `FROM_BINARY(b[, format])` writes bytes in the same formats, hex in capitals. `FORMAT_BYTES(n)` writes a byte count in the largest binary unit it reaches, `B` through `EB`, with two decimals past `B` (`1.50 KB`); a negative count is NULL. `BAR(size, min, max, width)` draws `width` `▓` characters scaled by where `size` falls in `[min, max]`, in whole characters. `POSITIVE(x)` is `+x`.
 
 Regular expressions (`util/regex.zig`) are RE2's linear-time subset, POSIX bracket classes such as `[[:lower:]]` included. Every `REGEXP_*` function reads each row's own pattern. `REGEXP_COUNT(s, p)` counts the matches, each search resuming where the last match ended, or one character on after an empty match. `REGEXP_EXTRACT(s, p, group)` is a capture group of the first match, where group 0 is the whole match. It gives '' when nothing matches or the group took no part in the match. `REGEXP_EXTRACT_ALL(s, p, group)` is the array of that group across every match. Both give '' or an empty array for a group the pattern doesn't have, as StarRocks does. Unlike StarRocks, which gives NULL for a malformed pattern read from a column, thinDB fails the query with `RegexInvalidPattern`, as MySQL does.
 
@@ -1910,6 +1913,10 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `InvalidWeekdayName` means `NEXT_DAY` or `PREVIOUS_DAY` was given a weekday name that is none of the seven's two-letter, three-letter or full English names. StarRocks fails the query too.
 
 `InvalidNgramLength` means `NGRAM_SEARCH` or `NGRAM_SEARCH_CASE_INSENSITIVE` was given a gram length of 0 or less. StarRocks fails the query too.
+
+`InvalidBinaryFormat` means `TO_BINARY` or `FROM_BINARY` was given a format other than `hex`, `encode64` or `utf8`. StarRocks fails the query too.
+
+`InvalidBarArguments` means `BAR` was given a size outside `[min, max]`, a min not below its max, or a negative width, which StarRocks also refuses.
 
 `SubqueryMultipleRows` means a scalar subquery returned more than one row where one value was needed. A correlated scalar subquery raises it only for an outer row whose correlation key matched several inner rows; a key that matched none reads NULL.
 

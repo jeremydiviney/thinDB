@@ -1773,6 +1773,153 @@ fn appendSoundex(allocator: Allocator, code: *std.ArrayList(u8), s: []const u8) 
 }
 
 // ---------------------------------------------------------------------------
+// Byte formats
+// ---------------------------------------------------------------------------
+
+/// The text formats TO_BINARY reads and FROM_BINARY writes, named in any case.
+const BinaryFormat = enum { hex, encode64, utf8 };
+
+/// Row `row`'s format: the second argument, hex when there is none. Any
+/// other name is `InvalidBinaryFormat`, as StarRocks fails it.
+fn binaryFormat(args: []const ColumnView, row: usize) !BinaryFormat {
+    if (args.len < 2) return .hex;
+    const name = stringViewOf(args[1]).rowBytes(row);
+    for (std.enums.values(BinaryFormat)) |f| {
+        if (std.ascii.eqlIgnoreCase(name, @tagName(f))) return f;
+    }
+    return error.InvalidBinaryFormat;
+}
+
+/// TO_BINARY(s[, format]): the bytes `s` spells in `format`. Text that
+/// isn't hex or padded base64 gives '', and empty base64 NULL, as in StarRocks.
+pub fn toBinaryKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        var valid = allValid(args, i);
+        if (valid) {
+            const src = sv.rowBytes(i);
+            switch (try binaryFormat(args, i)) {
+                .utf8 => try buf.appendSlice(allocator, src),
+                .hex => try decodeHexInto(allocator, &buf, src),
+                .encode64 => if (src.len == 0) {
+                    valid = false;
+                } else try decodeBase64Into(allocator, &buf, src),
+            }
+        }
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// FROM_BINARY(b[, format]): `b` written in `format`, hex in capitals.
+pub fn fromBinaryKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sv = stringViewOf(args[0]);
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        const valid = allValid(args, i);
+        if (valid) {
+            const src = sv.rowBytes(i);
+            switch (try binaryFormat(args, i)) {
+                .utf8 => try buf.appendSlice(allocator, src),
+                .hex => for (src) |b| try buf.print(allocator, "{X:0>2}", .{b}),
+                .encode64 => {
+                    const enc = std.base64.standard.Encoder;
+                    try buf.resize(allocator, enc.calcSize(src.len));
+                    _ = enc.encode(buf.items, src);
+                },
+            }
+        }
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+/// The bytes hex text spells into `buf`, left empty when it isn't hex.
+fn decodeHexInto(allocator: Allocator, buf: *std.ArrayList(u8), src: []const u8) !void {
+    if (src.len % 2 != 0) return;
+    try buf.resize(allocator, src.len / 2);
+    for (buf.items, 0..) |*b, j| {
+        const hi = decodeHexNibble(src[j * 2]) orelse return buf.clearRetainingCapacity();
+        const lo = decodeHexNibble(src[j * 2 + 1]) orelse return buf.clearRetainingCapacity();
+        b.* = (hi << 4) | lo;
+    }
+}
+
+/// The bytes padded base64 spells into `buf`, left empty when it isn't that.
+fn decodeBase64Into(allocator: Allocator, buf: *std.ArrayList(u8), src: []const u8) !void {
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(src) catch return;
+    try buf.resize(allocator, n);
+    dec.decode(buf.items, src) catch buf.clearRetainingCapacity();
+}
+
+/// FORMAT_BYTES(n): `n` bytes in the largest binary unit it reaches, with two
+/// decimals past B (`1.50 KB`); NULL for a negative count, as in StarRocks.
+pub fn formatBytesKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const counts = args[0].data.bigint;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        const valid = args[0].isValid(i) and counts[i] >= 0;
+        if (valid) try appendFormattedBytes(allocator, &buf, counts[i]);
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+fn appendFormattedBytes(allocator: Allocator, buf: *std.ArrayList(u8), n: i64) !void {
+    if (n < 1024) return buf.print(allocator, "{d} B", .{n});
+    const units = [_][]const u8{ "KB", "MB", "GB", "TB", "PB", "EB" };
+    var unit: usize = 0;
+    var size: i64 = 1024;
+    while (unit + 1 < units.len and @divTrunc(n, 1024) >= size) : (unit += 1) size *= 1024;
+    const scaled = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(size));
+    try buf.print(allocator, "{d:.2} {s}", .{ scaled, units[unit] });
+}
+
+/// BAR(size, min, max, width): `width` ▓ characters scaled by where `size`
+/// falls between `min` and `max`, in whole characters. A size outside
+/// [min, max], a min not below max or a negative width is
+/// `InvalidBarArguments`; StarRocks requires the same.
+pub fn barKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const sizes = args[0].data.double;
+    const mins = args[1].data.double;
+    const maxes = args[2].data.double;
+    const widths = args[3].data.bigint;
+    const ss = stringStoreOf(out);
+    const base = out.data.rowCount();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    for (0..row_count) |i| {
+        buf.clearRetainingCapacity();
+        const valid = allValid(args, i);
+        if (valid) {
+            const size = sizes[i];
+            const lo = mins[i];
+            const hi = maxes[i];
+            if (!(lo < hi and size >= lo and size <= hi and widths[i] >= 0)) return error.InvalidBarArguments;
+            const width: f64 = @floatFromInt(widths[i]);
+            const chars: usize = @intFromFloat(@floor((size - lo) * width / (hi - lo)));
+            for (0..chars) |_| try buf.appendSlice(allocator, "▓");
+        }
+        try ss.appendValue(allocator, buf.items);
+        try out.appendValidBit(allocator, base + i, valid);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // URLs
 // ---------------------------------------------------------------------------
 

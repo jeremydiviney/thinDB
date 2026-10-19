@@ -2806,6 +2806,8 @@ pub const Parser = struct {
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, name), .args = try self.arena.dupe(ir.Expr, args) } };
         }
         if (std.ascii.eqlIgnoreCase(name, "isnull") and args.len == 1) return try self.isNullValue(args[0]);
+        // StarRocks' POSITIVE(x) is unary plus.
+        if (std.ascii.eqlIgnoreCase(name, "positive") and args.len == 1) return args[0];
         if (std.ascii.eqlIgnoreCase(name, "map")) {
             // StarRocks' `map(k1, v1, k2, v2, ...)`.
             if (args.len % 2 != 0) return ParseError.SqlExpectedValue;
