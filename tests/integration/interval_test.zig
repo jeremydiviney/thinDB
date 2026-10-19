@@ -466,8 +466,8 @@ test "DATE_DIFF(unit, a, b) is a - b in whole units, and MONTHS_DIFF(a, b) too, 
     inline for (cases) |c| try expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
 
     // A unit may differ by row, and a NULL unit makes its row NULL. A bare
-    // name first is a unit word, as in `DATE_DIFF(day, a, b)`, so the column
-    // goes through LOWER.
+    // unit word first is the unit, as in `DATE_DIFF(day, a, b)`, and any
+    // other name a column.
     try exec(allocator, db, "CREATE TABLE dd (id BIGINT PRIMARY KEY, u VARCHAR(20), a DATETIME, b DATE)");
     try exec(allocator, db,
         \\INSERT INTO dd VALUES (1, 'day', '2026-01-02 01:00:00', '2026-01-01'), (2, 'month', '2024-02-29 00:00:00', '2024-01-31'),
@@ -475,6 +475,9 @@ test "DATE_DIFF(unit, a, b) is a - b in whole units, and MONTHS_DIFF(a, b) too, 
         \\  (5, 'millisecond', '2026-01-01 00:00:00.5', '2026-01-01'), (6, 'month', NULL, '2026-01-01')
     );
     try expectTexts(allocator, db, "SELECT CAST(DATE_DIFF(LOWER(u), a, b) AS CHAR) FROM dd ORDER BY id", &.{ "1", "1", null, "-4", "500", null });
+    try expectTexts(allocator, db, "SELECT CAST(DATE_DIFF(u, a, b) AS CHAR) FROM dd ORDER BY id", &.{ "1", "1", null, "-4", "500", null });
+    try expectTexts(allocator, db, "SELECT CAST(DATE_DIFF(dd.u, a, '2025-12-31') AS CHAR) FROM dd ORDER BY id", &.{ "2", "-22", null, "0", "86400500", null });
+    try expectTexts(allocator, db, "SELECT CAST(DATE_DIFF(u, NULL, b) AS CHAR) FROM dd ORDER BY id", &.{ null, null, null, null, null, null });
     try expectTexts(allocator, db, "SELECT CAST(MONTHS_DIFF(a, b) AS CHAR) FROM dd ORDER BY id", &.{ "0", "0", "0", "-1", "0", null });
 }
 

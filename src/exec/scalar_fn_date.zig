@@ -797,6 +797,11 @@ fn parseDiffUnit(text: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
     return parseFineUnit(if (std.ascii.startsWithIgnoreCase(text, "sql_tsi_")) text["sql_tsi_".len..] else text);
 }
 
+pub fn isDiffUnit(text: []const u8) bool {
+    _ = parseDiffUnit(text) catch return false;
+    return true;
+}
+
 /// A `DateUnit`, or millisecond or microsecond.
 fn parseFineUnit(unit: []const u8) error{ComputeUnsupportedExpr}!DiffUnit {
     if (std.ascii.eqlIgnoreCase(unit, "microsecond") or std.ascii.eqlIgnoreCase(unit, "microseconds")) return .microsecond;
