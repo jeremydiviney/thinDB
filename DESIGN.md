@@ -542,6 +542,15 @@ and APPROX return a DATE or DATETIME as that type, rounded to the day or the
 microsecond, and anything else as a DOUBLE. A product p×n within float error
 of an integer is read as that integer, so 0.07 of 100 values is the 7th.
 
+`APPROX_TOP_K(x[, k[, counters]])` gives the k (default 5) most frequent
+values of x as an `ARRAY<STRUCT<item, count BIGINT>>`, most frequent first,
+with NULL counted as a value. The counts are exact, so the third argument,
+which sizes StarRocks' table of counters, is ignored. Among equal counts NULL
+comes first, then the values in order, so the answer doesn't depend on the
+order rows arrive in. k and the counter count are integer literals of at
+least 1, else `SqlInvalidProjection`. Exact counts keep one entry per
+distinct value in each group, as `COUNT(DISTINCT)` does.
+
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
 and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:
@@ -836,7 +845,7 @@ pub fn deinit(self: *Self) void
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
 | `Compute` | Derived columns via scalar functions (with implicit coercion) |
-| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT` |
+| `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`, `GROUP_CONCAT`, `APPROX_TOP_K` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |
 | `Join` (hash) | Build smaller side, probe with the larger; compound keys via order-preserving byte encoding |

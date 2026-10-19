@@ -246,6 +246,42 @@ test "aggregate: COVAR_POP, COVAR_SAMP and CORR read the pairs with no NULL, gro
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COVAR_POP(x) FROM cv"));
 }
 
+test "aggregate: APPROX_TOP_K counts each value, NULL included, most frequent first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE tk (id BIGINT PRIMARY KEY, g BIGINT, x INT, s VARCHAR(8), d DATE, m DECIMAL(6,2), b BOOLEAN, f DOUBLE)");
+    try helpers.exec(allocator, db, "INSERT INTO tk VALUES " ++
+        "(1, 1, 3, 'b', '2021-01-02', 1.50, true, 0.5), (2, 1, 3, 'b', '2021-01-02', 1.50, true, 0.5), " ++
+        "(3, 1, 1, 'a', '2021-01-01', 2.25, false, 1.25), (4, 2, NULL, NULL, NULL, NULL, NULL, NULL), " ++
+        "(5, 2, NULL, NULL, NULL, NULL, NULL, NULL), (6, 2, 2, 'c', '2021-01-03', 2.25, true, 1.25), " ++
+        "(7, 3, NULL, NULL, NULL, NULL, NULL, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("tk", .{})).flush();
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(x) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":3,\"count\":2},{\"item\":1,\"count\":1},{\"item\":2,\"count\":1}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(x, 2) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":3,\"count\":2}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(s, 3, 100) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":\"b\",\"count\":2},{\"item\":\"a\",\"count\":1}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(d, 2) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":\"2021-01-02\",\"count\":2}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(m) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":1.50,\"count\":2},{\"item\":2.25,\"count\":2}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(b) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":1,\"count\":3},{\"item\":0,\"count\":1}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(f, 1) FROM tk", "[{\"item\":null,\"count\":3}]");
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(x % 2) FROM tk", "[{\"item\":null,\"count\":3},{\"item\":1,\"count\":3},{\"item\":0,\"count\":1}]");
+        try helpers.expectTexts(allocator, db, "SELECT APPROX_TOP_K(x) FROM tk GROUP BY g ORDER BY g", &.{
+            "[{\"item\":3,\"count\":2},{\"item\":1,\"count\":1}]",
+            "[{\"item\":null,\"count\":2},{\"item\":2,\"count\":1}]",
+            "[{\"item\":null,\"count\":1}]",
+        });
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(x) FROM tk WHERE id > 100", null);
+        try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(x)[2].count FROM tk", "2");
+    }
+    try helpers.expectText(allocator, db, "SELECT APPROX_TOP_K(1)", "[{\"item\":1,\"count\":1}]");
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT APPROX_TOP_K(x, 0) FROM tk"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT APPROX_TOP_K(x, id) FROM tk"));
+}
+
 test "aggregate: group_concat with separator preserves insertion order" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

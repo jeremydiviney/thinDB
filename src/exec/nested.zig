@@ -485,7 +485,7 @@ fn classOfView(v: ColumnView) ElemClass {
 }
 
 /// Row `row` of `v` as an array stores it as an element.
-fn elementBytes(v: ColumnView, row: usize, buf: *[16]u8) []const u8 {
+pub fn elementBytes(v: ColumnView, row: usize, buf: *[16]u8) []const u8 {
     const w = classOfView(v).width() orelse return varBytes(v, row);
     writeFixed(buf[0..w], v, row);
     return buf[0..w];
@@ -705,6 +705,51 @@ pub fn appendStruct(allocator: Allocator, out: *std.ArrayList(u8), fields: []con
     }
 }
 
+/// Append one struct whose fields are stored bytes already, field i of
+/// class `classes[i]`; a null field is NULL.
+pub fn appendRawStruct(allocator: Allocator, out: *std.ArrayList(u8), classes: []const ElemClass, fields: []const ?[]const u8) !void {
+    try out.append(allocator, STRUCT_TAG);
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(fields.len), .little);
+    try out.appendSlice(allocator, &count_buf);
+    const vb_at = out.items.len;
+    try out.appendNTimes(allocator, 0, validityBytes(fields.len));
+    for (classes) |c| try out.append(allocator, @intFromEnum(c));
+    const offsets_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4 * (fields.len + 1));
+    const data_at = out.items.len;
+    for (fields, 0..) |f, i| {
+        if (f) |bytes| {
+            out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
+            try out.appendSlice(allocator, bytes);
+        }
+        std.mem.writeInt(u32, out.items[offsets_at + 4 * (i + 1) ..][0..4], @intCast(out.items.len - data_at), .little);
+    }
+}
+
+/// Append one array of `class` whose elements, none NULL, are stored
+/// bytes already.
+pub fn appendRawArray(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, elements: []const []const u8) !void {
+    try out.append(allocator, @intFromEnum(class));
+    var count_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buf, @intCast(elements.len), .little);
+    try out.appendSlice(allocator, &count_buf);
+    const vb_at = out.items.len;
+    try out.appendNTimes(allocator, 0, validityBytes(elements.len));
+    for (0..elements.len) |i| out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
+    if (class.width() != null) {
+        for (elements) |e| try out.appendSlice(allocator, e);
+        return;
+    }
+    const offsets_at = out.items.len;
+    try out.appendNTimes(allocator, 0, 4 * (elements.len + 1));
+    const data_at = out.items.len;
+    for (elements, 1..) |e, i| {
+        try out.appendSlice(allocator, e);
+        std.mem.writeInt(u32, out.items[offsets_at + 4 * i ..][0..4], @intCast(out.items.len - data_at), .little);
+    }
+}
+
 /// Build a STRUCT column of `rows` rows from one flat view per field
 /// (`appendStruct`); a row whose `row_validity` bit is clear is NULL.
 pub fn encodeStructColumn(
@@ -809,7 +854,7 @@ pub fn order(a_bytes: []const u8, b_bytes: []const u8) std.math.Order {
     return std.math.order(a.count, b.count);
 }
 
-fn elementOrder(class: ElemClass, x: []const u8, y: []const u8) std.math.Order {
+pub fn elementOrder(class: ElemClass, x: []const u8, y: []const u8) std.math.Order {
     return switch (class) {
         .i8 => std.math.order(@as(i8, @bitCast(x[0])), @as(i8, @bitCast(y[0]))),
         .boolean => std.math.order(x[0], y[0]),
