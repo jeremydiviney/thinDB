@@ -37,6 +37,7 @@ pub fn appendNullTo(allocator: Allocator, dst: *ColumnStore) !void {
         .char => |*s| try s.appendValue(allocator, ""),
         .json => |*s| try s.appendValue(allocator, ""),
         .nested => |*s| try s.appendValue(allocator, ""),
+        .bitmap => |*s| try s.appendValue(allocator, ""),
     }
     try dst.appendValidBit(allocator, dst.data.rowCount() - 1, false);
 }
@@ -67,6 +68,7 @@ pub inline fn appendOneFromView(
         .char => |sv| try dst.data.char.appendValue(allocator, sv.rowBytes(row)),
         .json => |sv| try dst.data.json.appendValue(allocator, sv.rowBytes(row)),
         .nested => |sv| try dst.data.nested.appendValue(allocator, sv.rowBytes(row)),
+        .bitmap => |sv| try dst.data.bitmap.appendValue(allocator, sv.rowBytes(row)),
     }
     if (dst.nulls != null) {
         try dst.appendValidBit(allocator, dst.data.rowCount() - 1, valid);

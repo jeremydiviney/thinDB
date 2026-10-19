@@ -49,6 +49,11 @@ pub const TypeTag = enum(u8) {
     /// self-contained encoding of `exec/nested.zig`, so storage, the WAL and
     /// row movement treat it as bytes, the way they treat a string.
     nested = 18,
+    /// A set of unsigned 64-bit integers (`exec/bitmap.zig`). Physically each
+    /// value is one variable-length cell in StarRocks' serialized form, so
+    /// storage, the WAL and row movement treat it as bytes, as they treat a
+    /// nested value.
+    bitmap = 19,
 };
 
 /// The shape of a nested type. Interned (`internNested`): the process keeps
@@ -397,6 +402,7 @@ pub const Type = union(TypeTag) {
     uuid,
     json,
     nested: *const Nested,
+    bitmap,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -413,15 +419,15 @@ pub const Type = union(TypeTag) {
             .decimal64 => @sizeOf(i64),
             .decimal128 => @sizeOf(i128),
             .uuid => @sizeOf(u128),
-            .varchar, .string, .char, .json, .nested => null,
+            .varchar, .string, .char, .json, .nested, .bitmap => null,
         };
     }
 
-    /// Stored as one variable-length cell per row: the string family, JSON
-    /// and the nested types. Storage, row movement and the WAL key off
+    /// Stored as one variable-length cell per row: the string family, JSON,
+    /// the nested types and BITMAP. Storage, row movement and the WAL key off
     /// this; `isString` is the narrower logical question.
     pub fn isVarlen(self: Type) bool {
-        return self.isString() or self == .nested;
+        return self.isString() or self == .nested or self == .bitmap;
     }
 
     pub fn isNested(self: Type) bool {
@@ -528,7 +534,7 @@ pub const Type = union(TypeTag) {
             .decimal64 => T == i64 or T == comptime_int,
             .decimal128 => T == i128 or T == comptime_int,
             .uuid => T == Uuid or T == u128 or T == comptime_int,
-            .varchar, .string, .char, .json, .nested => isStringLikeType(T),
+            .varchar, .string, .char, .json, .nested, .bitmap => isStringLikeType(T),
         };
     }
 };
@@ -644,7 +650,7 @@ pub const ValueTag = enum(u8) {
             .int => .int,
             .bigint => .bigint,
             .boolean => .boolean,
-            .varchar, .string, .char, .json, .nested => .text,
+            .varchar, .string, .char, .json, .nested, .bitmap => .text,
             .float => .float,
             .double => .double,
             .date => .date,

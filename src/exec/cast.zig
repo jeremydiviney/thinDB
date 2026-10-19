@@ -680,7 +680,7 @@ fn assignTextRows(allocator: Allocator, src: ColumnView, from: Type, rows: usize
 
 fn assignRows(comptime T: type, src: ColumnView, from: Type, dst: anytype) AssignError!void {
     switch (src.data) {
-        .varchar, .string, .char, .json, .nested => |s| for (dst, 0..) |*d, i| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| for (dst, 0..) |*d, i| {
             d.* = if (src.isValid(i)) slotOf(try assignText(T, s.rowBytes(i))) else 0;
         },
         .boolean => |values| for (dst, values[0..dst.len], 0..) |*d, v, i| {

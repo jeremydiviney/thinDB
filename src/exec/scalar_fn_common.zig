@@ -32,6 +32,7 @@ pub inline fn stringViewOf(v: ColumnView) storage.StringView {
         .char => |sv| sv,
         .json => |sv| sv,
         .nested => |sv| sv,
+        .bitmap => |sv| sv,
         else => unreachable, // resolve() already gated on type
     };
 }
@@ -43,6 +44,7 @@ pub inline fn stringStoreOf(out: *ColumnStore) *store.StringStore {
         .char => |*ss| ss,
         .json => |*ss| ss,
         .nested => |*ss| ss,
+        .bitmap => |*ss| ss,
         else => unreachable,
     };
 }

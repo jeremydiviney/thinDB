@@ -764,7 +764,7 @@ fn mixKey(x: u64) u64 {
 /// widths agree.
 fn hashKeyBlock(view: ColumnView, start: usize, tuples: []u64, sketch: *KeySketch) void {
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| for (tuples, start..) |*t, r| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| for (tuples, start..) |*t, r| {
             const h = if (view.isValid(r)) std.hash.Wyhash.hash(0, sv.rowBytes(r)) else NULL_KEY_HASH;
             sketch.add(h);
             t.* = mixKey(t.* ^ h);
@@ -790,7 +790,7 @@ fn hashKeyBlock(view: ColumnView, start: usize, tuples: []u64, sketch: *KeySketc
 /// String payload bytes a view holds (0 for fixed-width data).
 pub fn stringPayloadBytes(view: storage.ColumnView) u64 {
     return switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.offsets[sv.offsets.len - 1] - sv.offsets[0],
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.offsets[sv.offsets.len - 1] - sv.offsets[0],
         else => 0,
     };
 }
@@ -1780,6 +1780,7 @@ pub const Expr = expr_mod.Expr;
 pub const scalar_fn = @import("scalar_fn.zig");
 pub const ScalarFn = scalar_fn.ScalarFn;
 pub const nested = @import("nested.zig");
+pub const bitmap = @import("bitmap.zig");
 
 pub const compute_op = @import("compute.zig");
 pub const Compute = compute_op.Compute;
@@ -1821,6 +1822,7 @@ test {
     _ = @import("scalar_fn_map.zig");
     _ = @import("scalar_fn_struct.zig");
     _ = nested;
+    _ = bitmap;
     _ = @import("scalar_fn_date.zig");
     _ = @import("time_zone.zig");
     _ = @import("scalar_fn_time.zig");

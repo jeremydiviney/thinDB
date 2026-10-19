@@ -732,6 +732,7 @@ fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
         .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .json => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .nested => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
+        .bitmap => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
     };
 }
 
@@ -761,6 +762,7 @@ fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usi
         .char => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
         .json => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
         .nested => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
+        .bitmap => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
     };
 }
 

@@ -1262,7 +1262,7 @@ pub fn routeRadixGroupBy(
     for (group_cols) |gc| {
         const idx = types.findColumn(schema, gc) orelse return null;
         switch (schema[idx].type) {
-            .varchar, .string, .char, .json, .nested => return null,
+            .varchar, .string, .char, .json, .nested, .bitmap => return null,
             else => {},
         }
     }
@@ -2114,7 +2114,7 @@ fn testLines(a: Allocator, q: *Query) ![][]u8 {
                     continue;
                 }
                 switch (v.data) {
-                    .varchar, .string, .char, .json, .nested => |sv| try line.print(a, "{s}|", .{sv.rowBytes(row)}),
+                    .varchar, .string, .char, .json, .nested, .bitmap => |sv| try line.print(a, "{s}|", .{sv.rowBytes(row)}),
                     .bigint => |values| try line.print(a, "{d}|", .{values[row]}),
                     else => return error.UnexpectedColumnType,
                 }

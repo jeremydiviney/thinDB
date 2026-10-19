@@ -699,7 +699,7 @@ fn descCols(arena: Allocator, descs: []const ColDesc) ![]types.Column {
             .type = switch (tag) {
                 .varchar => .{ .varchar = 0 },
                 .char => .{ .char = 0 },
-                .decimal64, .decimal128, .nested => return Error.FunctionInvalidDefinition,
+                .decimal64, .decimal128, .nested, .bitmap => return Error.FunctionInvalidDefinition,
                 inline else => |t| @unionInit(types.Type, @tagName(t), {}),
             },
             .nullable = d.nullable,

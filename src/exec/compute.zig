@@ -1285,7 +1285,7 @@ pub const Compute = struct {
         const srcs = srcs_buf[0..src_count];
 
         switch (plan.output.data) {
-            .varchar, .string, .char, .json, .nested => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
+            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try assembleCaseStrings(self.allocator, ss, plan.output, srcs, winners),
             inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
         try ensureNarrow(plan.output);
@@ -2878,8 +2878,9 @@ fn literalDivisorNonzero(aa: Allocator, runtime_allocator: Allocator, rr: scalar
 /// declared parameter types of each overload of the right arity
 /// (`ABS(NULL)`, `DATE_FORMAT(NULL, '%Y')`), and last to an array, a map or
 /// an index, which no declared parameter names (`ARRAY_LENGTH(NULL)`,
-/// `MAP_SIZE(NULL)`, `arr[NULL]`): a strict function's answer for NULL input
-/// is NULL whichever overload runs.
+/// `MAP_SIZE(NULL)`, `arr[NULL]`), or for a BITMAP function to a bitmap, a
+/// member or an array of members (`BITMAP_TO_STRING(NULL)`): a strict
+/// function's answer for NULL input is NULL whichever overload runs.
 fn resolveWithTypedNulls(
     runtime_allocator: Allocator,
     aa: Allocator,
@@ -2928,6 +2929,11 @@ fn resolveWithTypedNulls(
         if (try scalar_fn.resolveWithRegistry(aa, udf_registry, fn_name, retyped)) |r| {
             try commitNullTypes(runtime_allocator, arg_plans, arg_types, retyped);
             return r;
+        }
+    }
+    if (scalar_fn.isBitmapFnName(fn_name)) {
+        for ([_]Type{ .bitmap, .bigint, try types.arrayOf(.bigint) }) |candidate| {
+            if (try resolveNullsAs(runtime_allocator, aa, udf_registry, fn_name, arg_plans, arg_types, candidate)) |r| return r;
         }
     }
     return null;
@@ -3604,7 +3610,7 @@ fn setCaseValidity(allocator: Allocator, out: *ColumnStore, srcs: []const CaseSr
 
 fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
     return switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.rowBytes(row),
         // CASE branches unify to one type family at plan time.
         else => unreachable,
     };

@@ -79,7 +79,7 @@ pub const ElemClass = enum(u8) {
             .float => .f32,
             .double => .f64,
             .boolean => .boolean,
-            .varchar, .string, .char, .json => .bytes,
+            .varchar, .string, .char, .json, .bitmap => .bytes,
             .nested => .nested,
         };
     }
@@ -479,7 +479,7 @@ fn classOfView(v: ColumnView) ElemClass {
         .float => .f32,
         .double => .f64,
         .boolean => .boolean,
-        .varchar, .string, .char, .json => .bytes,
+        .varchar, .string, .char, .json, .bitmap => .bytes,
         .nested => .nested,
     };
 }
@@ -493,7 +493,7 @@ pub fn elementBytes(v: ColumnView, row: usize, buf: *[16]u8) []const u8 {
 
 fn varBytes(v: ColumnView, row: usize) []const u8 {
     return switch (v.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -503,7 +503,7 @@ fn writeFixed(dst: []u8, v: ColumnView, row: usize) void {
         .boolean => |s| dst[0] = @intFromBool(s[row] != 0),
         .float => |s| std.mem.writeInt(u32, dst[0..4], types.canonicalFloatBits(s[row]), .little),
         .double => |s| std.mem.writeInt(u64, dst[0..8], types.canonicalFloatBits(s[row]), .little),
-        .varchar, .string, .char, .json, .nested => unreachable,
+        .varchar, .string, .char, .json, .nested, .bitmap => unreachable,
         inline else => |s| {
             const T = std.meta.Elem(@TypeOf(s));
             std.mem.writeInt(T, dst[0..@sizeOf(T)], s[row], .little);
@@ -797,7 +797,7 @@ pub fn appendStructField(allocator: Allocator, out: *ColumnStore, structs: Colum
 pub fn appendRaw(allocator: Allocator, out: *ColumnStore, raw: []const u8) !void {
     const at = out.rowCount();
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| try ss.appendValue(allocator, raw),
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(allocator, raw),
         .boolean => |*l| try l.append(allocator, raw[0]),
         .float => |*l| try l.append(allocator, @bitCast(std.mem.readInt(u32, raw[0..4], .little))),
         .double => |*l| try l.append(allocator, @bitCast(std.mem.readInt(u64, raw[0..8], .little))),
@@ -949,6 +949,8 @@ fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
             if (style == .starrocks) try appendSingleQuoted(allocator, out, text.items) else try appendQuoted(allocator, out, text.items, style);
         },
         .varchar, .string, .char => try appendQuoted(allocator, out, raw, style),
+        // StarRocks shows a bitmap as NULL.
+        .bitmap => try out.appendSlice(allocator, if (style == .starrocks) "null" else "NULL"),
         .boolean => try out.appendSlice(allocator, if (style == .postgres) (if (raw[0] != 0) "t" else "f") else (if (raw[0] != 0) "1" else "0")),
         .date => try appendQuoted(allocator, out, try common.formatDate(&buf, std.mem.readInt(i32, raw[0..4], .little)), style),
         .datetime => try appendQuoted(allocator, out, try common.formatDateTime(&buf, std.mem.readInt(i64, raw[0..8], .little)), style),
@@ -1267,6 +1269,7 @@ fn appendElementJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
     var buf: [64]u8 = undefined;
     switch (t) {
         .nested => try appendJson(allocator, out, t, raw),
+        .bitmap => return error.NotJson,
         .json => {
             const doc = json_binary.normalize(allocator, raw) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1442,6 +1445,7 @@ fn appendTextElement(allocator: Allocator, out: *ColumnStore, t: Type, text: []c
             try ss.appendValue(allocator, enc);
         },
         .nested => return false,
+        .bitmap => return false,
         .boolean => |*l| try l.append(allocator, @intFromBool(common.textBoolean(text) orelse return false)),
         .float => |*l| try l.append(allocator, @floatCast(common.textDouble(text) orelse return false)),
         .double => |*l| try l.append(allocator, common.textDouble(text) orelse return false),

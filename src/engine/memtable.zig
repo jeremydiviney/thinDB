@@ -19,6 +19,7 @@ pub const DataStore = store.DataStore;
 const transform = @import("transform.zig");
 const json_binary = @import("../exec/json_binary.zig");
 const nested = @import("../exec/nested.zig");
+const bitmap = @import("../exec/bitmap.zig");
 pub const appendAllColumn = transform.appendAllColumn;
 pub const appendByIndices = transform.appendByIndices;
 pub const appendOneRow = transform.appendOneRow;
@@ -532,7 +533,7 @@ pub const Memtable = struct {
                 .uuid => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
                 else => return Error.TypeMismatch,
             },
-            .varchar, .string, .char, .json, .nested => |sv| {
+            .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
                 // Honor the wire's null bitmap if present. appendString
                 // always writes valid=true, so for null rows we have to
                 // route through appendNullToColumn instead.
@@ -569,7 +570,7 @@ pub const Memtable = struct {
 
     fn isStringTag(t: types.TypeTag) bool {
         return switch (t) {
-            .varchar, .string, .char, .json, .nested => true,
+            .varchar, .string, .char, .json, .nested, .bitmap => true,
             else => false,
         };
     }
@@ -820,6 +821,17 @@ pub const Memtable = struct {
                 if (!nested.isWellFormed(value, self.schema.columns[col_idx].type)) return Error.TypeMismatch;
                 try ss.appendValue(self.allocator, value);
             },
+            // Stored in the one layout each set has, so equal bitmaps have
+            // equal bytes for GROUP BY and DISTINCT.
+            .bitmap => |*ss| {
+                var canonical: std.ArrayList(u8) = .empty;
+                defer canonical.deinit(self.allocator);
+                bitmap.canonicalize(self.allocator, value, &canonical) catch |err| switch (err) {
+                    error.BitmapInvalid => return Error.TypeMismatch,
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                try ss.appendValue(self.allocator, canonical.items);
+            },
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -871,6 +883,7 @@ pub fn columnsByteSize(columns: []const ColumnStore) usize {
             .char => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             .json => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             .nested => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
+            .bitmap => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             .decimal64 => |l| l.items.len * @sizeOf(i64),
             .decimal128 => |l| l.items.len * @sizeOf(i128),
             .uuid => |l| l.items.len * @sizeOf(u128),

@@ -86,6 +86,7 @@ fn mysqlTypeOf(t: types.Type, protocol: Protocol) struct { type_byte: u8, decima
         .json => .{ .type_byte = MYSQL_TYPE_JSON, .decimals = 0, .len = 4294967295, .charset = CHARSET_UTF8MB4 },
         // MySQL has no array type; the value goes as its text, as StarRocks sends it.
         .nested => .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = 65535, .charset = CHARSET_UTF8MB4 },
+        .bitmap => .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = 65535, .charset = CHARSET_UTF8MB4 },
     };
 }
 
@@ -172,6 +173,8 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
         .string, .varchar, .char => |sv| try scratch.appendSlice(allocator, sv.rowBytes(row)),
         .json => |sv| try appendJsonText(allocator, scratch, sv.rowBytes(row)),
         .nested => |sv| try nested.appendText(allocator, scratch, schema_col.type, sv.rowBytes(row), .starrocks),
+        // StarRocks shows a bitmap as NULL; bitmap_to_string spells it.
+        .bitmap => return null,
     }
     return scratch.items;
 }

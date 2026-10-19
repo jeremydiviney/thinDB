@@ -74,7 +74,7 @@ fn keyValueAt(v: ColumnView, row: usize) ?types.Value {
         .double => |s| .{ .double = s[row] },
         .decimal64 => |s| .{ .decimal64 = s[row] },
         .largeint => |s| .{ .largeint = s[row] },
-        .varchar, .string, .char, .json, .nested => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| .{ .text = s.bytes[s.offsets[row]..s.offsets[row + 1]] },
         else => null,
     };
 }
@@ -626,7 +626,7 @@ fn convertedKeyType(t: Type, conversion: ?KeyConversion) Type {
             else => target,
         },
         .read => |r| switch (r.target) {
-            .float, .double, .varchar, .char, .string, .json, .nested, .uuid => t,
+            .float, .double, .varchar, .char, .string, .json, .nested, .bitmap, .uuid => t,
             else => r.target,
         },
     };
@@ -686,7 +686,7 @@ const FastKeyKind = enum { int, string, compound, null_safe };
 fn fastKindOfType(t: TypeTag) ?FastKeyKind {
     return switch (t) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-        .varchar, .string, .char, .json, .nested => .string,
+        .varchar, .string, .char, .json, .nested, .bitmap => .string,
         else => null,
     };
 }
@@ -701,7 +701,7 @@ pub const MAX_FAST_KEYS: usize = 8;
 fn fastCellDigest(view: ColumnView, row: u32) u64 {
     return switch (view.data) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => fastIntKey(view, row),
-        .varchar, .string, .char, .json, .nested => std.hash.Wyhash.hash(0, stringRowBytes(view, row)),
+        .varchar, .string, .char, .json, .nested, .bitmap => std.hash.Wyhash.hash(0, stringRowBytes(view, row)),
         else => unreachable,
     };
 }
@@ -914,7 +914,7 @@ fn probeDigests(comptime kind: FastKeyKind, key_view: ColumnView, probe_views: [
         .boolean => |col| for (out, col[start..][0..out.len]) |*d, x| {
             d.* = fastMix(d.* ^ x);
         },
-        .varchar, .string, .char, .json, .nested => |sv| for (out, start..) |*d, row| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| for (out, start..) |*d, row| {
             d.* = fastMix(d.* ^ std.hash.Wyhash.hash(0, sv.rowBytes(@intCast(row))));
         },
         else => unreachable,
@@ -1182,7 +1182,7 @@ pub fn buildFastTable(aa: Allocator, scratch: Allocator, key_views: []const Colu
     const key_view = key_views[0];
     const kind: FastKeyKind = if (null_safe_keys != 0) .null_safe else if (key_views.len > 1) .compound else switch (key_view.data) {
         .int, .bigint, .date, .datetime, .tinyint, .smallint, .boolean => .int,
-        .varchar, .string, .char, .json, .nested => .string,
+        .varchar, .string, .char, .json, .nested, .bitmap => .string,
         else => return null,
     };
     if (kind == .null_safe) for (key_views) |v| {
@@ -1391,7 +1391,7 @@ fn fastIntKey(view: ColumnView, row: u32) u64 {
 
 fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
     return switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.rowBytes(row),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -3855,7 +3855,7 @@ fn keySource(q: Query, col: []const u8) ?KeySource {
 
 fn isStringTag(t: TypeTag) bool {
     return switch (t) {
-        .varchar, .string, .char, .json, .nested => true,
+        .varchar, .string, .char, .json, .nested, .bitmap => true,
         else => false,
     };
 }
@@ -3910,7 +3910,7 @@ fn appendKeyCell(allocator: Allocator, out: *std.ArrayList(u8), view: ColumnView
         .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
         .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
         .uuid => |s| try appendInt(allocator, out, u128, s[row]),
-        .varchar, .string, .char, .json, .nested => |sv| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             const bytes = sv.rowBytes(row);
             try appendBits(allocator, out, u32, @intCast(bytes.len));
             try out.appendSlice(allocator, bytes);
@@ -3957,6 +3957,7 @@ pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32,
         .char => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.char.rowBytes(rrow), op),
         .json => |sv| return orderOp(json_binary.compare(sv.rowBytes(lrow), right.data.json.rowBytes(rrow)), op),
         .nested => |sv| return orderOp(nested.order(sv.rowBytes(lrow), right.data.nested.rowBytes(rrow)), op),
+        .bitmap => |sv| return orderOp(std.mem.order(u8, sv.rowBytes(lrow), right.data.bitmap.rowBytes(rrow)), op),
     }
 }
 

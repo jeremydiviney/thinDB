@@ -172,7 +172,7 @@ fn isFloatType(t: Type) bool {
 
 fn isStringType(t: Type) bool {
     return switch (t) {
-        .varchar, .string, .char, .json, .nested => true,
+        .varchar, .string, .char, .json, .nested, .bitmap => true,
         else => false,
     };
 }
@@ -799,7 +799,7 @@ fn packKeysForPart(comptime assign: bool, w: *Worker, batch: Batch, part_i: usiz
         } else {
             const memo = memoFor(&w.state.key_memos[part_i], w.dicts[part_i].?);
             const sv = switch (batch.values[ci].data) {
-                .varchar, .string, .char, .json, .nested => |s| s,
+                .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
                 else => return error.UnsupportedQueryShape,
             };
             for (keys, 0..) |*k, r| {
@@ -1184,7 +1184,7 @@ fn foldDistinctCoded(
     const codes: []const u32 = if (sidecar) |cc| cc.codes[0..n] else blk: {
         const memo = memoFor(&w.state.distinct_memos[agg_i], w.distinct_dicts[agg_i].?);
         const sv = switch (view.data) {
-            .varchar, .string, .char, .json, .nested => |s| s,
+            .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
             else => return error.UnsupportedQueryShape,
         };
         try w.state.codes_scratch.resize(w.scratch_allocator, n);
@@ -1211,7 +1211,7 @@ fn foldDistinctStrKernel(
     ssets: []DistinctStrSet,
 ) !void {
     const sv = switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |s| s,
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
         else => return error.UnsupportedQueryShape,
     };
     const parts_n = ssets.len;
@@ -2042,7 +2042,7 @@ fn appendInt(allocator: Allocator, col: *ColumnStore, out_type: Type, value: i12
 
 fn appendString(allocator: Allocator, col: *ColumnStore, s: []const u8) !void {
     switch (col.data) {
-        .varchar, .string, .char, .json, .nested => |*ss| try ss.appendValue(allocator, s),
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(allocator, s),
         else => return error.TypeMismatch,
     }
 }

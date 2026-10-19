@@ -648,6 +648,7 @@ fn decodeRawColumn(
         .char => return .{ .data = .{ .char = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
         .json => return .{ .data = .{ .json = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
         .nested => return .{ .data = .{ .nested = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
+        .bitmap => return .{ .data = .{ .bitmap = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
         .decimal64 => return .{ .data = .{ .decimal64 = try decodeFixed(i64, allocator, values, row_count) }, .nulls = nulls },
         .decimal128 => return .{ .data = .{ .decimal128 = try decodeFixed(i128, allocator, values, row_count) }, .nulls = nulls },
         .uuid => return .{ .data = .{ .uuid = try decodeFixed(u128, allocator, values, row_count) }, .nulls = nulls },
@@ -1097,6 +1098,7 @@ pub fn viewRawColumn(
         .char => return stringView(values, row_count, nulls, .char),
         .json => return stringView(values, row_count, nulls, .json),
         .nested => return stringView(values, row_count, nulls, .nested),
+        .bitmap => return stringView(values, row_count, nulls, .bitmap),
     }
 }
 
@@ -1278,6 +1280,7 @@ pub fn decodeDictColumn(
         .char => .{ .data = .{ .char = sc }, .nulls = nulls },
         .json => .{ .data = .{ .json = sc }, .nulls = nulls },
         .nested => .{ .data = .{ .nested = sc }, .nulls = nulls },
+        .bitmap => .{ .data = .{ .bitmap = sc }, .nulls = nulls },
         else => unreachable,
     };
 }
@@ -1411,6 +1414,7 @@ pub fn expandFsstPooled(
         .char => .{ .data = .{ .char = sc }, .nulls = fv.nulls },
         .json => .{ .data = .{ .json = sc }, .nulls = fv.nulls },
         .nested => .{ .data = .{ .nested = sc }, .nulls = fv.nulls },
+        .bitmap => .{ .data = .{ .bitmap = sc }, .nulls = fv.nulls },
         else => format.Error.CorruptColumnBlockHeader,
     };
 }
@@ -1463,6 +1467,7 @@ pub fn decodeFsstColumn(
         .char => .{ .data = .{ .char = sc }, .nulls = nulls },
         .json => .{ .data = .{ .json = sc }, .nulls = nulls },
         .nested => .{ .data = .{ .nested = sc }, .nulls = nulls },
+        .bitmap => .{ .data = .{ .bitmap = sc }, .nulls = nulls },
         else => unreachable,
     };
 }

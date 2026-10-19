@@ -459,6 +459,7 @@ fn serializeGroupKey(
             .char => |sv| try appendKeyString(allocator, out, sv.rowBytes(row)),
             .json => |sv| try appendKeyString(allocator, out, sv.rowBytes(row)),
             .nested => |sv| try appendKeyString(allocator, out, sv.rowBytes(row)),
+            .bitmap => |sv| try appendKeyString(allocator, out, sv.rowBytes(row)),
             .decimal64 => |s| try storage.format.appendI64(allocator, out, s[row]),
             .decimal128 => |s| {
                 var b: [16]u8 = undefined;
@@ -504,6 +505,7 @@ fn appendCellFromView(allocator: Allocator, dst: *ColumnStore, src: ColumnView, 
         .char => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),
         .json => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),
         .nested => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),
+        .bitmap => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),
     }
     try dst.appendValidBit(allocator, dst.rowCount() - 1, true);
 }
@@ -515,6 +517,7 @@ fn stringBytes(src: ColumnView, row: usize) []const u8 {
         .char => |sv| sv.rowBytes(row),
         .json => |sv| sv.rowBytes(row),
         .nested => |sv| sv.rowBytes(row),
+        .bitmap => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }

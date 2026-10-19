@@ -575,6 +575,7 @@ fn encodeColumnData(
         .char => |sv| try writeStringColumn(allocator, out, sv, row_count),
         .json => |sv| try writeStringColumn(allocator, out, sv, row_count),
         .nested => |sv| try writeStringColumn(allocator, out, sv, row_count),
+        .bitmap => |sv| try writeStringColumn(allocator, out, sv, row_count),
     }
     _ = t;
 }
@@ -737,6 +738,7 @@ pub const OwnedColumnBuffers = struct {
             .char => .{ .char = .{ .offsets = self.offsets.?, .bytes = self.data } },
             .json => .{ .json = .{ .offsets = self.offsets.?, .bytes = self.data } },
             .nested => .{ .nested = .{ .offsets = self.offsets.?, .bytes = self.data } },
+            .bitmap => .{ .bitmap = .{ .offsets = self.offsets.?, .bytes = self.data } },
         };
     }
 };
@@ -749,7 +751,7 @@ fn decodeColumnData(
     row_count: u32,
 ) !OwnedColumnBuffers {
     switch (t) {
-        .varchar, .string, .char, .json, .nested => {
+        .varchar, .string, .char, .json, .nested, .bitmap => {
             // offsets section
             const offsets_len = try readU32(bytes, cursor);
             if (cursor.* + offsets_len > bytes.len) return Error.WireCorrupt;
@@ -787,7 +789,7 @@ fn allocAlignedDup(allocator: Allocator, src: []const u8) ![]align(16) u8 {
 
 pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
     // The native wire doesn't carry a nested shape yet.
-    if (tag >= @intFromEnum(TypeTag.nested)) return Error.WireUnknownType;
+    if (tag == @intFromEnum(TypeTag.nested) or tag > @intFromEnum(TypeTag.bitmap)) return Error.WireUnknownType;
     const tt: TypeTag = @enumFromInt(tag);
     return switch (tt) {
         .int => .int,
@@ -814,6 +816,7 @@ pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
         .uuid => .uuid,
         .json => .json,
         .nested => Error.WireUnknownType,
+        .bitmap => .bitmap,
     };
 }
 

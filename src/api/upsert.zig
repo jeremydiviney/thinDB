@@ -503,7 +503,7 @@ pub fn viewValueAt(aa: Allocator, view: storage.ColumnView, row: u32) !?types.Va
         .int => |s| .{ .int = s[row] },
         .bigint => |s| .{ .bigint = s[row] },
         .boolean => |s| .{ .boolean = s[row] != 0 },
-        .varchar, .string, .char, .json, .nested => |sv| .{ .text = try aa.dupe(u8, sv.rowBytes(row)) },
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| .{ .text = try aa.dupe(u8, sv.rowBytes(row)) },
         .float => |s| .{ .float = s[row] },
         .double => |s| .{ .double = s[row] },
         .date => |s| .{ .date = s[row] },

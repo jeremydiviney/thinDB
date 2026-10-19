@@ -1586,6 +1586,8 @@ pub fn parseColumnDef(p: anytype) !ColDefResult {
         }
     }
     if (default_null and !nullable) return PE.SqlInvalidDefault;
+    // No literal spells a bitmap.
+    if (ty == .bitmap and (default_value != null or default_now or on_update_now or auto_increment)) return PE.SqlInvalidDefault;
     return .{
         .def = .{
             .name = name,
@@ -1703,6 +1705,7 @@ pub fn parseColumnType(p: anytype) @TypeOf(p.*).Err!types.Type {
     // PostgreSQL's `INT[]`, `TEXT[][]`. A declared bound (`INT[3]`) doesn't
     // limit the length, as in PostgreSQL.
     while (p.cur.tag == .lbracket) {
+        if (t == .bitmap) return @TypeOf(p.*).Err.SqlExpectedKeyword;
         try p.advance();
         if (p.cur.tag == .integer) try p.advance();
         try p.expect(.rbracket);
@@ -1711,10 +1714,18 @@ pub fn parseColumnType(p: anytype) @TypeOf(p.*).Err!types.Type {
     return t;
 }
 
+/// The type of an array's elements, a map's keys or values, or a struct's
+/// fields: any column type but BITMAP, which StarRocks nests in none.
+fn memberType(p: anytype) @TypeOf(p.*).Err!types.Type {
+    const t = try parseColumnType(p);
+    if (t == .bitmap) return @TypeOf(p.*).Err.SqlExpectedKeyword;
+    return t;
+}
+
 /// StarRocks' and DuckDB's `ARRAY<T>`, cursor past `ARRAY`.
 pub fn arrayType(p: anytype) !types.Type {
     try p.expect(.lt);
-    const element = try parseColumnType(p);
+    const element = try memberType(p);
     try closeTypeArguments(p);
     return types.arrayOf(element);
 }
@@ -1722,9 +1733,9 @@ pub fn arrayType(p: anytype) !types.Type {
 /// StarRocks' `MAP<K, V>`, cursor past `MAP`.
 pub fn mapType(p: anytype) !types.Type {
     try p.expect(.lt);
-    const key = try parseColumnType(p);
+    const key = try memberType(p);
     try p.expect(.comma);
-    const value = try parseColumnType(p);
+    const value = try memberType(p);
     try closeTypeArguments(p);
     return types.mapOf(key, value);
 }
@@ -1741,7 +1752,7 @@ pub fn structType(p: anytype) !types.Type {
         const name = p.cur.text;
         if (types.structFieldIndex(fields.items, name) != null) return PE.SqlExpectedIdent;
         try p.advance();
-        try fields.append(p.arena, .{ .name = name, .type = try parseColumnType(p) });
+        try fields.append(p.arena, .{ .name = name, .type = try memberType(p) });
         if (p.cur.tag != .comma) break;
         try p.advance();
     }
@@ -1872,6 +1883,7 @@ fn parseBaseColumnType(p: anytype) !types.Type {
     }
     if (asciiEqlAny(name, &.{"uuid"})) return .uuid;
     if (asciiEqlAny(name, &.{ "json", "jsonb" })) return .json;
+    if (asciiEqlAny(name, &.{"bitmap"})) return .bitmap;
     if (asciiEqlAny(name, &.{"array"})) return arrayType(p);
     if (asciiEqlAny(name, &.{"map"})) return mapType(p);
     if (asciiEqlAny(name, &.{"struct"})) return structType(p);

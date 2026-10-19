@@ -201,7 +201,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > @intFromEnum(TypeTag.nested)) return Error.SchemaCorrupt;
+        if (tag_byte < 1 or tag_byte > @intFromEnum(TypeTag.bitmap)) return Error.SchemaCorrupt;
         const tag: TypeTag = @enumFromInt(tag_byte);
         const nullable = bytes[cursor] != 0;
         cursor += 1;
@@ -227,6 +227,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .uuid => .uuid,
             .json => .json,
+            .bitmap => .bitmap,
             .nested => blk: {
                 if (cursor + extra > bytes.len) return Error.SchemaCorrupt;
                 const text = bytes[cursor .. cursor + extra];

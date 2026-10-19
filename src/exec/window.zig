@@ -646,7 +646,7 @@ pub const Window = struct {
                     for (g.perm, 0..) |r, out_row| {
                         const bytes = scratch[r] orelse "";
                         switch (st.data) {
-                            .varchar, .string, .char, .json, .nested => |*ss| try ss.appendValue(aa, bytes),
+                            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(aa, bytes),
                             else => return Error.WindowUnsupported,
                         }
                         try st.appendValidBit(aa, @intCast(out_row), scratch[r] != null);
@@ -2671,7 +2671,7 @@ fn borrowed_store(view: ColumnView) ColumnStore {
     return .{
         .nulls = if (view.nulls) |bits| .{ .items = @constCast(bits), .capacity = 0 } else null,
         .data = switch (view.data) {
-            inline .varchar, .string, .char, .json, .nested => |strings, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{
+            inline .varchar, .string, .char, .json, .nested, .bitmap => |strings, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{
                 .offsets = .{ .items = @constCast(strings.offsets), .capacity = 0 },
                 .bytes = .{ .items = @constCast(strings.bytes), .capacity = 0 },
             }),
@@ -2699,7 +2699,7 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
         .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
         .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
         .uuid => |*l| try l.appendNTimes(allocator, 0, n),
-        .varchar, .string, .char, .json, .nested => return Error.WindowUnsupported,
+        .varchar, .string, .char, .json, .nested, .bitmap => return Error.WindowUnsupported,
     }
     _ = t;
     if (out.nulls) |*nb| {
@@ -2712,7 +2712,7 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
 /// of every row, in any order, lands in its destination.
 fn stringBytes(view: ColumnView) usize {
     return switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| sv.offsets[sv.rowCount()] - sv.offsets[0],
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.offsets[sv.rowCount()] - sv.offsets[0],
         else => 0,
     };
 }
@@ -2738,6 +2738,7 @@ fn appendStringScratchRange(
             .char => |*ss| try ss.appendValue(allocator, bytes),
             .json => |*ss| try ss.appendValue(allocator, bytes),
             .nested => |*ss| try ss.appendValue(allocator, bytes),
+            .bitmap => |*ss| try ss.appendValue(allocator, bytes),
             else => return Error.WindowUnsupported,
         }
         try out.appendValidBit(allocator, row, scratch[i] != null);
@@ -2760,6 +2761,7 @@ fn appendStringScratchIndices(
             .char => |*ss| try ss.appendValue(allocator, bytes),
             .json => |*ss| try ss.appendValue(allocator, bytes),
             .nested => |*ss| try ss.appendValue(allocator, bytes),
+            .bitmap => |*ss| try ss.appendValue(allocator, bytes),
             else => return Error.WindowUnsupported,
         }
         try out.appendValidBit(allocator, row, scratch[idx] != null);
@@ -2768,7 +2770,7 @@ fn appendStringScratchIndices(
 
 fn isStringType(t: Type) bool {
     return switch (t) {
-        .string, .varchar, .char, .json, .nested => true,
+        .string, .varchar, .char, .json, .nested, .bitmap => true,
         else => false,
     };
 }
@@ -2781,7 +2783,7 @@ fn isStringType(t: Type) bool {
 /// columns grow internally and are left alone.
 fn reserveAggressive(allocator: Allocator, out: *ColumnStore, add_rows: usize) !void {
     switch (out.data) {
-        .varchar, .string, .char, .json, .nested => {},
+        .varchar, .string, .char, .json, .nested, .bitmap => {},
         inline else => |*l| {
             const need = l.items.len + add_rows;
             if (need > l.capacity) try l.ensureTotalCapacity(allocator, @max(need, l.capacity * 4));
@@ -2824,7 +2826,7 @@ fn copyCellTo(src: ColumnStore, src_row: u32, cell: OutCell, out_row: u32) !void
     }
     if (cell.string_scratch) |s| {
         s[out_row] = switch (src.data) {
-            .string, .varchar, .char, .json, .nested => |ss| ss.view().rowBytes(src_row),
+            .string, .varchar, .char, .json, .nested, .bitmap => |ss| ss.view().rowBytes(src_row),
             else => return Error.WindowUnsupported,
         };
         return;
@@ -3347,6 +3349,7 @@ pub fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
         // comparator decides.
         .json => 0,
         .nested => 0,
+        .bitmap => 0,
     };
     return if (desc) ~norm else norm;
 }
@@ -3398,7 +3401,7 @@ fn digestCell(h: *std.hash.Wyhash, col: ColumnStore, row: u32) void {
         .uuid => |l| h.update(std.mem.asBytes(&l.items[row])),
         .float => |l| hashInt(h, @as(i64, @bitCast(floatNorm(@as(f64, l.items[row]))))),
         .double => |l| hashInt(h, @as(i64, @bitCast(floatNorm(l.items[row])))),
-        .varchar, .string, .char, .json, .nested => |s| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |s| {
             const bytes = s.rowBytesWide(row);
             var len: u64 = bytes.len;
             h.update(std.mem.asBytes(&len));
@@ -3575,7 +3578,7 @@ fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !vo
             .uuid => |*o| o.items[out_row] = l.items[src_row],
             else => return Error.WindowUnsupported,
         },
-        .varchar, .string, .char, .json, .nested => return Error.WindowUnsupported,
+        .varchar, .string, .char, .json, .nested, .bitmap => return Error.WindowUnsupported,
     }
     setValid(out, out_row);
 }

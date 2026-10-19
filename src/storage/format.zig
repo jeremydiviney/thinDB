@@ -310,7 +310,7 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
         .largeint, .decimal128, .uuid => true,
-        .varchar, .string, .char, .json, .nested => true,
+        .varchar, .string, .char, .json, .nested, .bitmap => true,
         .float, .double => true,
     };
 }
@@ -321,7 +321,7 @@ pub fn typeHasStats(t: @import("../types.zig").Type) bool {
 /// they do: min/max stats, Bloom hashes and encoded-block kernels built on
 /// those bytes can't answer either comparison.
 pub fn bytesFollowComparison(t: @import("../types.zig").Type) bool {
-    return t != .json and t != .nested;
+    return t != .json and t != .nested and t != .bitmap;
 }
 
 /// How a column type uses the `Stats.sum` slot — drives both the writer's
@@ -333,7 +333,7 @@ pub fn sumKindOf(t: @import("../types.zig").Type) SumKind {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => .int,
         .float, .double => .float,
-        .varchar, .string, .char, .json, .nested => .string_min,
+        .varchar, .string, .char, .json, .nested, .bitmap => .string_min,
         .largeint, .decimal128, .uuid => .none,
     };
 }

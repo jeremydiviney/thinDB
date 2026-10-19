@@ -1630,6 +1630,7 @@ const TypeWireTag = enum(u8) {
     json = 16,
     /// Followed by u32 length + the canonical type text.
     nested = 17,
+    bitmap = 18,
 };
 
 fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
@@ -1665,6 +1666,7 @@ fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) Enco
         },
         .uuid => try out.append(allocator, @intFromEnum(TypeWireTag.uuid)),
         .json => try out.append(allocator, @intFromEnum(TypeWireTag.json)),
+        .bitmap => try out.append(allocator, @intFromEnum(TypeWireTag.bitmap)),
         .nested => {
             try out.append(allocator, @intFromEnum(TypeWireTag.nested));
             const len_at = out.items.len;
@@ -1679,7 +1681,7 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(TypeWireTag.nested)) return Error.IrCorrupt;
+    if (t > @intFromEnum(TypeWireTag.bitmap)) return Error.IrCorrupt;
     const tag: TypeWireTag = @enumFromInt(t);
     return switch (tag) {
         .int => .int,
@@ -1706,6 +1708,7 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
             break :blk types.Type{ .char = n };
         },
         .json => .json,
+        .bitmap => .bitmap,
         .nested => blk: {
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
             const n = readU32(bytes[cursor.* .. cursor.* + 4]);

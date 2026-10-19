@@ -990,7 +990,7 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
         .double => .{ .exact = .{ .double = scalarF64(lit) orelse return .incomparable } },
         .date => placeOnDays(lit),
         .datetime => .{ .exact = .{ .datetime = lit.micros } },
-        .varchar, .string, .char, .json, .nested => .{ .exact = .{ .text = lit.text } },
+        .varchar, .string, .char, .json, .nested, .bitmap => .{ .exact = .{ .text = lit.text } },
         .boolean, .uuid => .incomparable,
     };
 }
@@ -2001,7 +2001,7 @@ fn cellKeyOrder(view: ColumnView, idx: usize, ref: Value) ?std.math.Order {
         },
         .boolean => |col| if (ref == .boolean) std.math.order(@intFromBool(col[idx] != 0), @intFromBool(ref.boolean)) else null,
         .varchar, .string, .char => |sv| if (ref == .text) std.mem.order(u8, sv.rowBytes(idx), ref.text) else null,
-        .float, .double, .json, .nested => null,
+        .float, .double, .json, .nested, .bitmap => null,
     };
 }
 
@@ -2025,6 +2025,7 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
         .uuid => |s| ref == .uuid and s[idx] == ref.uuid,
         .json => |sv| jsonOrder(sv.rowBytes(idx), valueJsonOperand(ref)) == .eq,
         .nested => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
+        .bitmap => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
         .varchar, .string, .char => |sv| switch (ref) {
             .text => |t| std.mem.eql(u8, sv.rowBytes(idx), t),
             else => textOrder(sv.rowBytes(idx), valueScalar(ref, 0)) == .eq,
@@ -2206,7 +2207,7 @@ pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values:
             inline .varchar, .string, .char => |sv| if (values.len > IN_SET_LINEAR_MAX) return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
             // Float `==` (NaN, -0.0) and two-valued booleans stay on the scan,
             // as does JSON, whose equal values needn't share bytes.
-            .float, .double, .boolean, .json, .nested => {},
+            .float, .double, .boolean, .json, .nested, .bitmap => {},
         }
     }
     // Outer per-column-type dispatch keeps the inner loop type-mono.
@@ -2429,7 +2430,7 @@ pub fn comparisonKind(ty: types.Type) ComparisonKind {
     return switch (ty) {
         .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => .number,
         .date, .datetime => .temporal,
-        .varchar, .string, .char, .json, .nested => .text,
+        .varchar, .string, .char, .json, .nested, .bitmap => .text,
         .uuid => .uuid,
     };
 }
@@ -2442,6 +2443,7 @@ pub fn comparisonKind(ty: types.Type) ComparisonKind {
 /// them (`placeTemporalNumber`, `temporalBesideNumber`); a join key, a
 /// subquery's column or a correlated key never pairs the two.
 pub fn typesComparable(a: types.Type, b: types.Type) bool {
+    if (a == .bitmap or b == .bitmap) return false;
     if (a.isNested() or b.isNested()) return cast.sameRepresentation(a, b);
     const ka = comparisonKind(a);
     const kb = comparisonKind(b);
@@ -2466,7 +2468,7 @@ fn cellScalar(view: ColumnView, ty: types.Type, i: usize) Scalar {
         .date => |s| .{ .micros = @as(i64, s[i]) * std.time.us_per_day },
         .datetime => |s| .{ .micros = s[i] },
         .uuid => |s| .{ .uuid = s[i] },
-        .varchar, .string, .char, .json, .nested => |sv| .{ .text = sv.rowBytes(i) },
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| .{ .text = sv.rowBytes(i) },
     };
 }
 
@@ -2495,6 +2497,7 @@ fn cellJsonOperand(view: ColumnView, ty: types.Type, i: usize) ?json_binary.Oper
     return switch (view.data) {
         .json => |sv| json_binary.textOperand(sv.rowBytes(i)),
         .nested => null,
+        .bitmap => null,
         .varchar, .string, .char => |sv| .{ .string = sv.rowBytes(i) },
         .boolean => |s| .{ .boolean = s[i] != 0 },
         .float => |s| .{ .number = .{ .double = s[i] } },
@@ -2744,7 +2747,7 @@ fn sameRepresentationMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             const r = right.data.uuid;
             for (0..n) |i| mask[i] = cmp(u128, l[i], r[i], op);
         },
-        .varchar, .string, .char, .json => |l| {
+        .varchar, .string, .char, .json, .bitmap => |l| {
             const r = scalar_fn_common.stringViewOf(right);
             for (0..n) |i| mask[i] = cmpStr(l.rowBytes(i), r.rowBytes(i), op);
         },
@@ -2775,7 +2778,7 @@ pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: [
     // Compile the pattern once per batch, then match each row against the plan.
     const plan = compileLike(pattern);
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested => |sv| {
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             if (active) |act| {
                 for (0..n) |i| mask[i] = act[i] and view.isValid(i) and plan.match(sv.rowBytes(i));
             } else {
@@ -2799,6 +2802,7 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
             for (0..n) |i| mask[i] = orderMatches(json_binary.compareOperands(json_binary.textOperand(sv.rowBytes(i)), want), op);
         },
         .nested => return Error.PredicateTypeMismatch,
+        .bitmap => return Error.PredicateTypeMismatch,
         .varchar, .char => |sv| {
             if (p.val.text.len == 0 and (op == .eq or op == .neq)) {
                 emptyStringMask(sv, op == .eq, n, mask[0..n]);
@@ -2929,7 +2933,7 @@ pub fn typeHasRange(t: types.Type) bool {
         .int, .bigint, .smallint, .tinyint, .largeint => true,
         .boolean, .date, .datetime => true,
         .decimal64, .decimal128 => true,
-        .varchar, .string, .char, .json, .nested, .uuid, .float, .double => false,
+        .varchar, .string, .char, .json, .nested, .bitmap, .uuid, .float, .double => false,
     };
 }
 

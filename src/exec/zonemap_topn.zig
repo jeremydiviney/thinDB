@@ -953,7 +953,7 @@ fn keyValueI128(col: ColumnStore, r: u32) i128 {
         .decimal128 => |l| l.items[r],
         .largeint => |l| l.items[r],
         .uuid => |l| storage.format.encodeUnsignedU128(l.items[r]),
-        .string, .varchar, .char, .json, .nested => |s| storage.format.encodeStringPrefix(s.view().rowBytes(r)),
+        .string, .varchar, .char, .json, .nested, .bitmap => |s| storage.format.encodeStringPrefix(s.view().rowBytes(r)),
         .float => |l| storage.format.encodeFloatOrder(@as(f64, l.items[r])),
         .double => |l| storage.format.encodeFloatOrder(l.items[r]),
     };

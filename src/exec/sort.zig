@@ -120,10 +120,10 @@ fn sortStringPermCompare(allocator: Allocator, perm: []u32, view: anytype, desc:
 /// `appendByIndices`.
 fn emitColumn(allocator: Allocator, src: ColumnStore, idxs: []const u32, out: *ColumnStore) !void {
     switch (src.data) {
-        inline .varchar, .string, .char, .json, .nested => |s| {
+        inline .varchar, .string, .char, .json, .nested, .bitmap => |s| {
             if (s.isWide()) {
                 switch (out.data) {
-                    inline .varchar, .string, .char, .json, .nested => |*dst| {
+                    inline .varchar, .string, .char, .json, .nested, .bitmap => |*dst| {
                         for (idxs) |idx| try dst.appendValue(allocator, s.rowBytesWide(idx));
                     },
                     else => unreachable,
@@ -177,7 +177,7 @@ fn sortSingleKey(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool
 
 fn sortSingleKeyValid(allocator: Allocator, perm: []u32, col: ColumnStore, desc: bool) error{QueryCancelled}!void {
     switch (col.data) {
-        inline .varchar, .string, .char, .json, .nested => |s, tag| {
+        inline .varchar, .string, .char, .json, .nested, .bitmap => |s, tag| {
             // A column past 4 GiB carries u64 offsets (StringStore.wide_offsets);
             // the u32-offset radix can't index it, so fall back to the generic
             // comparison sort over the wide view (correct, just slower). Rare.

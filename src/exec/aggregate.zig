@@ -28,6 +28,8 @@ const predicate = @import("predicate.zig");
 const json_binary = @import("json_binary.zig");
 const stats = @import("../util/stats.zig");
 const nested = @import("nested.zig");
+const bitmap_set = @import("bitmap.zig");
+const bitmap_fns = @import("scalar_fn_bitmap.zig");
 const Predicate = predicate.Predicate;
 
 pub fn prune_group_input(upstream: *Query, schema: []const Column, group_indices: []const usize, offer: exec.PruneOffer) !void {
@@ -164,6 +166,17 @@ pub const AggFunc = enum {
     /// `col` values, each counted `arg2_col` times
     /// (`appendWeightedPercentile`). Output DOUBLE.
     percentile_approx_weighted,
+    /// BITMAP_AGG: the set of the `col` values that are bitmap members
+    /// (`scalar_fn_bitmap.memberAt`). BITMAP_UNION: the union of the `col`
+    /// bitmaps. Both give NULL over no such value. Output BITMAP.
+    bitmap_agg,
+    bitmap_union,
+    /// BITMAP_UNION_COUNT: the number of members BITMAP_UNION's set holds; 0
+    /// over no bitmap. Output BIGINT.
+    bitmap_union_count,
+    /// BITMAP_INTERSECT: the members every `col` bitmap holds; NULL over no
+    /// bitmap. Output BITMAP.
+    bitmap_intersect,
 };
 
 /// True when every aggregate keeps BOUNDED per-group state — so the bare-LIMIT
@@ -174,7 +187,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .bitmap_agg, .bitmap_union, .bitmap_union_count, .bitmap_intersect, .udf => return false,
     };
     return true;
 }
@@ -376,6 +389,11 @@ pub const AccState = union(enum) {
     top_k: ?*TopKAcc,
     /// MANN_WHITNEY_U_TEST's samples, boxed like `concat`.
     mann_whitney: ?*MannWhitneyAcc,
+    /// BITMAP_AGG, BITMAP_UNION and BITMAP_UNION_COUNT's set, boxed like
+    /// `concat`.
+    bitmap_union: ?*bitmap_set.Builder,
+    /// BITMAP_INTERSECT's set so far, boxed like `concat`.
+    bitmap_intersect: ?*bitmap_set.Bitmap,
 };
 
 fn boolUpdate(s: *AccState, func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
@@ -410,7 +428,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
         .decimal64 => |v| .{ .decimal64 = v[row] },
         .decimal128 => |v| .{ .decimal128 = v[row] },
         .uuid => |v| .{ .uuid = v[row] },
-        .varchar, .string, .char, .json, .nested => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
+        .varchar, .string, .char, .json, .nested, .bitmap => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
     };
 }
 
@@ -418,7 +436,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
 /// the bank block of the value it replaces, `old` (null when there is none).
 fn replaceValueFromRow(bank: *StringBank, aa: Allocator, old: ?types.Value, view: ColumnView, row: u32) !types.Value {
     return switch (view.data) {
-        .varchar, .string, .char, .json, .nested => .{ .text = try bank.replace(aa, if (old) |v| v.text else "", stringRowBytes(view, @intCast(row))) },
+        .varchar, .string, .char, .json, .nested, .bitmap => .{ .text = try bank.replace(aa, if (old) |v| v.text else "", stringRowBytes(view, @intCast(row))) },
         else => valueFromRow(aa, view, row),
     };
 }
@@ -459,6 +477,7 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
         .json => |sv| json_binary.compare(sv.rowBytes(row), val.text),
         .nested => |sv| nested.order(sv.rowBytes(row), val.text),
+        .bitmap => |sv| std.mem.order(u8, sv.rowBytes(row), val.text),
     };
 }
 
@@ -559,6 +578,7 @@ fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, 
         .char => try col.data.char.appendValue(allocator, value.text),
         .json => try col.data.json.appendValue(allocator, value.text),
         .nested => try col.data.nested.appendValue(allocator, value.text),
+        .bitmap => try col.data.bitmap.appendValue(allocator, value.text),
     }
 }
 
@@ -1261,7 +1281,7 @@ pub const Aggregate = struct {
             .single_str_key = group_col_indices.len == 1 and
                 !up_schema[group_col_indices[0]].nullable and
                 switch (up_schema[group_col_indices[0]].type) {
-                    .string, .varchar, .char, .json, .nested => true,
+                    .string, .varchar, .char, .json, .nested, .bitmap => true,
                     else => false,
                 },
             .top_k = resolved_top_k,
@@ -1992,7 +2012,7 @@ pub const Aggregate = struct {
                     try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, {});
                 } else switch (value_view.data) {
                     inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
-                    inline .varchar, .string, .char, .json, .nested => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    inline .varchar, .string, .char, .json, .nested, .bitmap => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
                     else => unreachable,
                 }
             },
@@ -2004,7 +2024,7 @@ pub const Aggregate = struct {
     fn scatterAnyValueNarrow(self: *Aggregate, col: []ValueNarrow, gids: []const u32, view: ColumnView, aa: Allocator) !void {
         switch (view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
-            inline .varchar, .string, .char, .json, .nested => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
+            inline .varchar, .string, .char, .json, .nested, .bitmap => |vs| try anyValueNarrowRows(&self.str_bank, aa, col, gids, view, vs),
             else => unreachable,
         }
     }
@@ -2060,7 +2080,7 @@ pub const Aggregate = struct {
                     }
                 }
             },
-            inline .varchar, .string, .char, .json, .nested => |sv, tag| {
+            inline .varchar, .string, .char, .json, .nested, .bitmap => |sv, tag| {
                 const col = self.agg_cols[ai].other;
                 for (gids, 0..) |g, r| {
                     if (has_nulls and !view.isValid(r)) continue;
@@ -2565,7 +2585,7 @@ pub const Aggregate = struct {
 
         const str_view: ?storage.StringView = if (coded_cc == null and self.single_str_key)
             switch (batch.values[self.group_col_indices[0]].data) {
-                .string, .varchar, .char, .json, .nested => |sv| sv,
+                .string, .varchar, .char, .json, .nested, .bitmap => |sv| sv,
                 else => unreachable,
             }
         else
@@ -2712,7 +2732,7 @@ pub const Aggregate = struct {
             // code back to its string via the query dictionary.
             const code = std.mem.readInt(u32, self.gkeys.items[gid][0..4], native_endian);
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char, .json, .nested => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
+                .string, .varchar, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(self.allocator, ck.dict.decode(code)),
                 else => unreachable,
             }
         } else if (self.int_layout) |layout| {
@@ -2720,7 +2740,7 @@ pub const Aggregate = struct {
         } else if (self.single_str_key) {
             // Raw string bytes — no compound framing to decode.
             switch (self.output_columns[0].data) {
-                .string, .varchar, .char, .json, .nested => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
+                .string, .varchar, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(self.allocator, self.gkeys.items[gid]),
                 else => unreachable,
             }
         } else {
@@ -3358,6 +3378,8 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .approx_top_k => .{ .top_k = null },
         .mann_whitney_u_test => .{ .mann_whitney = null },
         .percentile_approx_weighted => .{ .weighted_values = .empty },
+        .bitmap_agg, .bitmap_union, .bitmap_union_count => .{ .bitmap_union = null },
+        .bitmap_intersect => .{ .bitmap_intersect = null },
         .udf => unreachable,
     };
 }
@@ -3507,6 +3529,8 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         .group_concat => if (in != null and in.?.isNested()) in.? else .string,
         .approx_top_k => topKType(in orelse return Error.AggregateColumnRequired),
         .mann_whitney_u_test => .json,
+        .bitmap_agg, .bitmap_union, .bitmap_intersect => .bitmap,
+        .bitmap_union_count => .bigint,
         .udf => Error.AggregateUnsupportedType,
     };
 }
@@ -3632,6 +3656,14 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
                 .percentile => |p| if (p < 0.0 or p > 1.0) return Error.AggregateInvalidParam,
                 else => return Error.AggregateInvalidParam,
             }
+        },
+        .bitmap_agg => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (!bitmap_fns.isMemberType(t)) return Error.AggregateUnsupportedType;
+        },
+        .bitmap_union, .bitmap_union_count, .bitmap_intersect => {
+            const t = in orelse return Error.AggregateColumnRequired;
+            if (t != .bitmap) return Error.AggregateUnsupportedType;
         },
         .udf => return Error.AggregateUnsupportedType,
     }
@@ -3816,7 +3848,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMinLarge(s, simd.minOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMinFloat(s, simd.minOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMinFloat(s, simd.minOf(f64, sl[lo..hi])),
-                .varchar, .string, .char, .json, .nested => {},
+                .varchar, .string, .char, .json, .nested, .bitmap => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3865,7 +3897,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.min_float == null or v < s.min_float.?) s.min_float = v;
                 },
-                inline .varchar, .string, .char, .json, .nested => |sv, tag| {
+                inline .varchar, .string, .char, .json, .nested, .bitmap => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -3893,7 +3925,7 @@ pub fn updateState(
                 .largeint, .decimal128 => |sl| return foldMaxLarge(s, simd.maxOf(i128, sl[lo..hi])),
                 .float => |sl| return foldMaxFloat(s, simd.maxOf(f32, sl[lo..hi])),
                 .double => |sl| return foldMaxFloat(s, simd.maxOf(f64, sl[lo..hi])),
-                .varchar, .string, .char, .json, .nested => {},
+                .varchar, .string, .char, .json, .nested, .bitmap => {},
                 else => unreachable,
             };
             switch (view.data) {
@@ -3942,7 +3974,7 @@ pub fn updateState(
                     if (!view.isValid(r)) continue;
                     if (s.max_float == null or v > s.max_float.?) s.max_float = v;
                 },
-                inline .varchar, .string, .char, .json, .nested => |sv, tag| {
+                inline .varchar, .string, .char, .json, .nested, .bitmap => |sv, tag| {
                     var r: u32 = row_start;
                     while (r < row_end) : (r += 1) {
                         if (!view.isValid(r)) continue;
@@ -4061,6 +4093,9 @@ pub fn updateState(
             try groupConcatUpdate(aa, s, batch.values[col_idx.?], order_key, row_start, row_end, params);
         },
         .approx_top_k => try topKUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
+        .bitmap_agg => try bitmapAggUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
+        .bitmap_union, .bitmap_union_count => try bitmapUnionUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
+        .bitmap_intersect => try bitmapIntersectUpdate(aa, s, batch.values[col_idx.?], row_start, row_end),
         .mann_whitney_u_test => {
             const index_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
             const index_idx = types.findColumn(batch.schema, index_name) orelse return Error.ColumnNotFound;
@@ -4195,7 +4230,7 @@ fn distinctUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32,
             // string-family columns have an empty form — the other types
             // reaching this path are float/double, where `sv` stays null.
             const sv: ?storage.StringView = switch (view.data) {
-                .string, .varchar, .char, .json, .nested => |strv| strv,
+                .string, .varchar, .char, .json, .nested, .bitmap => |strv| strv,
                 else => null,
             };
             var scratch: std.ArrayList(u8) = .empty;
@@ -4418,6 +4453,57 @@ fn topKUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row
     }
 }
 
+fn bitmapBuilder(aa: Allocator, s: *AccState) !*bitmap_set.Builder {
+    if (s.bitmap_union) |b| return b;
+    const box = try aa.create(bitmap_set.Builder);
+    box.* = .{};
+    s.bitmap_union = box;
+    return box;
+}
+
+/// A value that is no member (NULL, negative, too large, text that spells
+/// none) is skipped, as in StarRocks.
+fn bitmapAggUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        const v = bitmap_fns.memberAt(view, r) orelse continue;
+        try (try bitmapBuilder(aa, s)).add(aa, v);
+    }
+}
+
+fn bitmapUnionUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        const b = try bitmapBuilder(aa, s);
+        b.addSerialized(aa, view.data.bitmap.rowBytes(r)) catch |err| switch (err) {
+            error.BitmapInvalid => return Error.TypeMismatch,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+    }
+}
+
+fn bitmapIntersectUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
+    var r: u32 = row_start;
+    while (r < row_end) : (r += 1) {
+        if (!view.isValid(r)) continue;
+        var next = bitmap_set.Bitmap.deserialize(aa, view.data.bitmap.rowBytes(r)) catch |err| switch (err) {
+            error.BitmapInvalid => return Error.TypeMismatch,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (s.bitmap_intersect) |acc| {
+            const both = try bitmap_set.Bitmap.combine(aa, .@"and", acc, &next);
+            next.deinit(aa);
+            acc.deinit(aa);
+            acc.* = both;
+        } else {
+            const box = try aa.create(bitmap_set.Bitmap);
+            box.* = next;
+            s.bitmap_intersect = box;
+        }
+    }
+}
+
 /// A NaN has no rank, so it is skipped like a NULL.
 fn mannWhitneyUpdate(aa: Allocator, s: *AccState, values: ColumnView, scale_div: f64, index: ColumnView, row_start: u32, row_end: u32) !void {
     const acc = s.mann_whitney orelse blk: {
@@ -4628,6 +4714,7 @@ fn stringRowBytes(view: ColumnView, row: u32) []const u8 {
         .char => |sv| sv.rowBytes(row),
         .json => |sv| sv.rowBytes(row),
         .nested => |sv| sv.rowBytes(row),
+        .bitmap => |sv| sv.rowBytes(row),
         else => unreachable,
     };
 }
@@ -4671,7 +4758,7 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
             storage.format.writeF64(&b, types.canonicalFloat(s[row]));
             try out.appendSlice(aa, &b);
         },
-        .string, .varchar, .char, .json, .nested => |sv| {
+        .string, .varchar, .char, .json, .nested, .bitmap => |sv| {
             const bytes = sv.rowBytes(row);
             try storage.format.appendU32(aa, out, @intCast(bytes.len));
             try out.appendSlice(aa, bytes);
@@ -4796,6 +4883,7 @@ pub fn appendAccToColumn(
                     .char => try col.data.char.appendValue(allocator, v),
                     .json => try col.data.json.appendValue(allocator, v),
                     .nested => try col.data.nested.appendValue(allocator, v),
+                    .bitmap => try col.data.bitmap.appendValue(allocator, v),
                     else => unreachable,
                 } else {
                     try col.data.appendNullPlaceholder(allocator);
@@ -4956,6 +5044,33 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             }
+        },
+        .bitmap_agg, .bitmap_union, .bitmap_intersect => {
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(allocator);
+            if (spec.func == .bitmap_intersect) {
+                if (state.bitmap_intersect) |acc| try acc.serialize(allocator, &bytes);
+            } else if (state.bitmap_union) |b| {
+                var set = try b.merged(allocator);
+                defer set.deinit(allocator);
+                try set.serialize(allocator, &bytes);
+            }
+            // Every bitmap, the empty one too, serializes to some bytes.
+            if (bytes.items.len > 0) {
+                try col.data.bitmap.appendValue(allocator, bytes.items);
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            }
+        },
+        .bitmap_union_count => {
+            var n: u64 = 0;
+            if (state.bitmap_union) |b| {
+                var bm = try b.merged(allocator);
+                defer bm.deinit(allocator);
+                n = bm.cardinality();
+            }
+            try col.data.bigint.append(allocator, std.math.cast(i64, n) orelse return Error.ValueOutOfRange);
         },
         .mann_whitney_u_test => {
             const acc = state.mann_whitney;
@@ -5386,7 +5501,7 @@ pub fn appendIntGroupKey(
             const code = unpackField(u32, key, f);
             const bytes = layout.coded_dicts[i].?.decode(code);
             switch (out_cols[i].data) {
-                .varchar, .string, .char, .json, .nested => |*ss| try ss.appendValue(allocator, bytes),
+                .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendValue(allocator, bytes),
                 else => unreachable,
             }
             continue;
@@ -5470,7 +5585,7 @@ pub fn buildCompoundGroupKey(
                 try storage.format.appendU32(allocator, out, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
             },
-            .json, .nested => |sv| {
+            .json, .nested, .bitmap => |sv| {
                 const bytes = sv.rowBytes(row);
                 try storage.format.appendU32(allocator, out, @intCast(bytes.len));
                 try out.appendSlice(allocator, bytes);
@@ -5519,7 +5634,7 @@ pub fn buildCompoundGroupKeys(
         const view = batch.values[ci];
         const nullable = batch.schema[ci].nullable;
         switch (view.data) {
-            .varchar, .string, .char, .json, .nested => |sv| for (sp, 0..) |*s, r| {
+            .varchar, .string, .char, .json, .nested, .bitmap => |sv| for (sp, 0..) |*s, r| {
                 if (nullable and !view.isValid(r)) continue;
                 s[1] += 4 + (sv.offsets[r + 1] - sv.offsets[r]);
             },
@@ -5560,7 +5675,7 @@ fn fixedKeyWidth(data: storage.column.ValueView) ?u32 {
         .int, .date, .float => 4,
         .bigint, .datetime, .decimal64, .double => 8,
         .largeint, .decimal128, .uuid => 16,
-        .varchar, .string, .char, .json, .nested => null,
+        .varchar, .string, .char, .json, .nested, .bitmap => null,
     };
 }
 
@@ -5575,7 +5690,7 @@ fn writeKeyColumn(comptime nullable: bool, out: []u8, spans: [][2]u32, view: sto
         .uuid => |s| writeFixedKeys(u128, nullable, out, spans, view, s),
         .float => |s| writeFixedKeys(f32, nullable, out, spans, view, s),
         .double => |s| writeFixedKeys(f64, nullable, out, spans, view, s),
-        .varchar, .string, .char, .json, .nested => |sv| writeStringKeys(nullable, out, spans, view, sv),
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| writeStringKeys(nullable, out, spans, view, sv),
     }
 }
 
@@ -5672,7 +5787,7 @@ fn appendGroupKey(
                 try out_cols[i].data.boolean.append(allocator, key_bytes[cursor]);
                 cursor += 1;
             },
-            .varchar, .string, .char, .json, .nested => {
+            .varchar, .string, .char, .json, .nested, .bitmap => {
                 const len = storage.format.readU32(key_bytes[cursor .. cursor + 4]);
                 cursor += 4;
                 const bytes = key_bytes[cursor .. cursor + len];
@@ -5683,6 +5798,7 @@ fn appendGroupKey(
                     .char => |*x| x,
                     .json => |*x| x,
                     .nested => |*x| x,
+                    .bitmap => |*x| x,
                     else => unreachable,
                 };
                 try ss.appendValue(allocator, bytes);

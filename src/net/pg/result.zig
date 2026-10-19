@@ -70,6 +70,7 @@ fn pgTypeOf(t: Type) TypeInfo {
         .uuid => .{ .oid = OID_UUID, .type_size = 16 },
         .varchar, .string, .char => .{ .oid = OID_TEXT, .type_size = -1 },
         .json => .{ .oid = OID_JSON, .type_size = -1 },
+        .bitmap => .{ .oid = OID_TEXT, .type_size = -1 },
         .nested => |n| switch (n.*) {
             // PostgreSQL gives an array of arrays its element's array type.
             .array => |element| .{ .oid = if (element.arrayElement() != null) pgTypeOf(element).oid else pgArrayOid(pgTypeOf(element).oid), .type_size = -1 },
@@ -185,6 +186,7 @@ fn formatCell(
             }
         },
         .nested => |sv| try nested.appendText(allocator, scratch, schema_col.type, sv.rowBytes(row), .postgres),
+        .bitmap => return null,
     }
     return scratch.items;
 }
