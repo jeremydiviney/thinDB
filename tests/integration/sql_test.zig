@@ -4351,6 +4351,27 @@ test "sql: count_if under a GROUP BY" {
     try helpers.expectTexts(allocator, db, "SELECT bool_or(v4 - 1) FROM ci GROUP BY v1 ORDER BY v1", &.{ "1", "1" });
 }
 
+test "sql: COUNT(), BOOLOR_AGG, BOOLAND_AGG and MULTI_DISTINCT_COUNT/SUM, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sa (k BIGINT PRIMARY KEY, g INT, v DOUBLE, b BOOLEAN)");
+    try helpers.exec(allocator, db, "INSERT INTO sa VALUES (1, 1, 1.5, true), (2, 1, 2.5, false), (3, 1, NULL, NULL), (4, 2, 10, false), (5, 2, 11, false), (6, 2, 14, NULL)");
+
+    try helpers.expectTexts(allocator, db, "SELECT count() FROM sa", &.{"6"});
+    try helpers.expectTexts(allocator, db, "SELECT count() + 1 FROM sa WHERE k > 4", &.{"3"});
+    try helpers.expectTexts(allocator, db, "SELECT g FROM sa GROUP BY g HAVING count() > 2 ORDER BY g", &.{ "1", "2" });
+    try helpers.expectTexts(allocator, db, "SELECT boolor_agg(b) FROM sa GROUP BY g ORDER BY g", &.{ "1", "0" });
+    try helpers.expectTexts(allocator, db, "SELECT booland_agg(b) FROM sa GROUP BY g ORDER BY g", &.{ "0", "0" });
+    try helpers.expectTexts(allocator, db, "SELECT multi_distinct_count(g) FROM sa", &.{"2"});
+    try helpers.expectTexts(allocator, db, "SELECT multi_distinct_sum(g) FROM sa", &.{"3"});
+    try helpers.expectTexts(allocator, db, "SELECT multi_distinct_count(v) FROM sa GROUP BY g ORDER BY g", &.{ "2", "3" });
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT count(DISTINCT) FROM sa"));
+}
+
 test "sql: a bare NULL is a numeric NULL to the aggregates that take numbers" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
