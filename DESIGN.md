@@ -498,6 +498,18 @@ and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:
 by the key's least value ascending, its greatest descending.
 
+`agg(...) FILTER (WHERE cond)` aggregates only the rows where `cond` is true, as
+in PostgreSQL and DuckDB. The parser wraps the input the aggregate reads in
+`CASE WHEN cond THEN input END`, and every aggregate skips a NULL input:
+COUNT(*) counts a 1 the filter keeps, MAX_BY wraps its key, and ARRAY_AGG and
+MAP_AGG wrap the entry they concatenate. So a row the filter drops adds nothing,
+and an aggregate the filter leaves empty is NULL (0 for a count). StarRocks
+wraps the argument instead, so its `ARRAY_AGG(x) FILTER (WHERE false)` over one
+row is `[NULL]`. FILTER works in the SELECT list, HAVING, ORDER BY and
+expressions over aggregates, and on JSON_ARRAYAGG and JSON_OBJECTAGG. A window
+call and an aggregate UDF refuse it (`SqlInvalidProjection`). The condition is
+part of the argument, so a filtered call never repeats an unfiltered one.
+
 A statement computes each distinct aggregate call once. The SELECT list, HAVING,
 ORDER BY, window specs and post-aggregate expressions can all repeat a call:
 `SELECT k, MIN(s), COUNT(*) ... HAVING MIN(s) <> '' AND COUNT(*) > 1` runs two

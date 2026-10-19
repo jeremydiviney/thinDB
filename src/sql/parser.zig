@@ -604,6 +604,13 @@ const AggExprRef = struct {
     agg: ParsedAgg,
 };
 
+/// An aggregate's `FILTER (WHERE cond)`, with the operands its condition
+/// computes.
+pub const AggFilter = struct {
+    cond: PredicateExpr,
+    operands: []const ir.Expr.Operand,
+};
+
 /// A statement's aggregate calls: the SELECT list's first, then the hidden
 /// ones HAVING, ORDER BY and expressions hoisted. A call equal to an earlier
 /// one reads that one's output, as each would otherwise keep the same state
@@ -2316,6 +2323,7 @@ pub const Parser = struct {
             // follows.
             var saw_distinct = false;
             const args = try self.parseCallArgList(first, &saw_distinct);
+            const filter = try self.parseAggFilter();
             // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
             const ignore_nulls = try parse_window.parseIgnoreNulls(self);
 
@@ -2324,6 +2332,7 @@ pub const Parser = struct {
             // window flavors; ROW_NUMBER / LAG / FIRST_VALUE / etc.
             // require OVER and reject everywhere else.
             if (self.cur.tag == .kw_over) {
+                if (filter != null) return ParseError.SqlInvalidProjection;
                 try self.advance();
                 const spec_kind = try parse_window.parseWindowSpecOrRef(self);
                 const wfunc = ir.windowFuncForName(first) orelse
@@ -2384,17 +2393,22 @@ pub const Parser = struct {
                 // aggregate output exactly like the nested form, then keeps
                 // parsing the expression.
                 if (self.cur.tag == .lbracket or try self.binaryOpAhead()) {
-                    const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct);
+                    const agg_name = try self.materializeAggregateExpr(first, func, args, saw_distinct, filter);
                     const expr = try self.continueBinaryFrom(try self.parsePostfix(ir.Expr{ .col_ref = agg_name }));
                     return try self.namedExprItem(item_start, expr);
                 }
-                const parsed = try self.parsedAggFromArgs(first, func, args, saw_distinct);
+                var parsed = try self.parsedAggFromArgs(first, func, args, saw_distinct);
+                if (filter) |f| parsed.agg = try self.filteredAgg(parsed.agg, f);
                 return try self.namedProjItem(item_start, parsed.default_name, .{ .agg = parsed.agg });
             }
 
             // DISTINCT is only valid inside an aggregate; a scalar/window
             // call with DISTINCT is a syntax error.
             if (saw_distinct) return ParseError.SqlInvalidProjection;
+            if (filter) |f| {
+                const json_agg = try self.parsePostfix(try self.filteredJsonAggregate(first, args, f));
+                return try self.namedExprItem(item_start, try self.continueBinaryFrom(json_agg));
+            }
 
             // Scalar function call. If a binary operator follows, the
             // whole thing is a binary expression with the call as the
@@ -2817,7 +2831,7 @@ pub const Parser = struct {
             inner[0] = .{ .call = .{ .fn_name = try self.arena.dupe(u8, "str_to_date"), .args = try self.arena.dupe(ir.Expr, args) } };
             return ir.Expr{ .call = .{ .fn_name = try self.arena.dupe(u8, "to_date"), .args = inner } };
         }
-        if (jsonAggregateFor(name)) |agg| return try self.jsonAggregateCall(name, agg, args);
+        if (jsonAggregateFor(name)) |agg| return try self.jsonAggregateCall(name, agg, args, null);
         return ir.Expr{ .call = .{
             .fn_name = try self.arena.dupe(u8, name),
             .args = try self.normalizeScalarCallArgs(name, args),
@@ -2845,13 +2859,13 @@ pub const Parser = struct {
     /// separator, of each row's packed JSONB, which the wrapper turns into
     /// the group's document. An empty group concatenates to NULL, as MySQL
     /// returns.
-    fn jsonAggregateCall(self: *Parser, name: []const u8, agg: JsonAggregate, args: []const ir.Expr) ParseError!ir.Expr {
+    fn jsonAggregateCall(self: *Parser, name: []const u8, agg: JsonAggregate, args: []const ir.Expr, filter: ?AggFilter) ParseError!ir.Expr {
         if (args.len != agg.arity) return ParseError.SqlInvalidProjection;
         for (args) |a| if (a == .col_ref and std.mem.eql(u8, a.col_ref, "*")) return ParseError.SqlInvalidProjection;
         const concat_args = try self.arena.alloc(ir.Expr, 2);
         concat_args[0] = .{ .call = .{ .fn_name = agg.packer, .args = try self.arena.dupe(ir.Expr, args) } };
         concat_args[1] = .{ .lit = .{ .text = "" } };
-        const hidden = try self.materializeAggregateExpr(name, .group_concat, concat_args, false);
+        const hidden = try self.materializeAggregateExpr(name, .group_concat, concat_args, false, filter);
         const wrapper_args = try self.arena.alloc(ir.Expr, 1);
         wrapper_args[0] = .{ .col_ref = hidden };
         return .{ .call = .{ .fn_name = agg.wrapper, .args = wrapper_args } };
@@ -3571,13 +3585,67 @@ pub const Parser = struct {
         func: ir.AggFunc,
         args: []const ir.Expr,
         saw_distinct: bool,
+        filter: ?AggFilter,
     ) ParseError![]const u8 {
         if (!self.aggregate_expr_refs_enabled) return ParseError.SqlInvalidProjection;
-        const parsed = try self.parsedAggFromArgs(func_name, func, args, saw_distinct);
+        var parsed = try self.parsedAggFromArgs(func_name, func, args, saw_distinct);
+        if (filter) |f| parsed.agg = try self.filteredAgg(parsed.agg, f);
         const name = std.fmt.allocPrint(self.arena, "__agg_expr_{d}", .{self.aggregate_expr_counter}) catch return ParseError.OutOfMemory;
         self.aggregate_expr_counter += 1;
         try self.aggregate_expr_refs.append(self.arena, .{ .name = name, .agg = parsed.agg });
         return name;
+    }
+
+    /// `FILTER (WHERE cond)` after an aggregate call's `)`. FILTER is a word
+    /// only when `( WHERE` follows, so `COUNT(*) filter` still names the
+    /// count `filter`.
+    pub fn parseAggFilter(self: *Parser) ParseError!?AggFilter {
+        if (self.cur.tag != .identifier or self.cur.quoted or !std.ascii.eqlIgnoreCase(self.cur.text, "filter")) return null;
+        var look = self.lex.*;
+        if ((try look.next()).tag != .lparen) return null;
+        if ((try look.next()).tag != .kw_where) return null;
+        try self.advance();
+        try self.expect(.lparen);
+        try self.expect(.kw_where);
+        const outer = self.openCase();
+        errdefer self.abandonCase(outer);
+        const cond = try self.parseBoolExpr();
+        try self.expect(.rparen);
+        return .{ .cond = cond, .operands = try self.closeCase(outer) };
+    }
+
+    /// `agg` over only the rows `filter` holds for. Its input reads NULL on
+    /// the other rows, and every aggregate but a UDF skips a NULL input:
+    /// MAX_BY by its key, COUNT(*) counting a 1 the filter keeps. The CASE
+    /// wraps the input the aggregate reads, so ARRAY_AGG skips a row rather
+    /// than collecting `[NULL]`.
+    fn filteredAgg(self: *Parser, agg: ParsedAgg, filter: AggFilter) ParseError!ParsedAgg {
+        var out = agg;
+        switch (agg.func) {
+            .udf => return ParseError.SqlInvalidProjection,
+            .max_by, .max_by_key => {
+                out.arg2_expr = try self.filterCase(filter, aggArgExpr(agg.arg2_col, agg.arg2_expr) orelse return ParseError.SqlInvalidProjection);
+                out.arg2_col = null;
+            },
+            else => {
+                out.arg_expr = try self.filterCase(filter, aggArgExpr(agg.col, agg.arg_expr) orelse .{ .lit = .{ .bigint = 1 } });
+                out.col = null;
+            },
+        }
+        return out;
+    }
+
+    fn filterCase(self: *Parser, filter: AggFilter, value: ir.Expr) ParseError!ir.Expr {
+        const branches = try self.arena.alloc(ir.Expr.Branch, 1);
+        branches[0] = .{ .cond = filter.cond, .then = value };
+        return .{ .case = .{ .branches = branches, .else_branch = null, .operands = filter.operands } };
+    }
+
+    /// A FILTER after a call that names no aggregate: only JSON_ARRAYAGG and
+    /// JSON_OBJECTAGG, aggregates parsed as calls, take one.
+    pub fn filteredJsonAggregate(self: *Parser, name: []const u8, args: []const ir.Expr, filter: AggFilter) ParseError!ir.Expr {
+        const agg = jsonAggregateFor(scalar_fn.canonicalName(name)) orelse return ParseError.SqlInvalidProjection;
+        return try self.jsonAggregateCall(name, agg, args, filter);
     }
 
     pub fn materializeWindowExpr(self: *Parser, call: ParsedWindowCall) ParseError![]const u8 {
@@ -4063,9 +4131,10 @@ pub const Parser = struct {
                     if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);
                     var saw_distinct = false;
                     const nested_args = try self.parseCallArgList(name, &saw_distinct);
+                    const filter = try self.parseAggFilter();
                     const ignore_nulls = try parse_window.parseIgnoreNulls(self);
                     if (self.cur.tag == .kw_over) {
-                        if (saw_distinct) return ParseError.SqlInvalidProjection;
+                        if (saw_distinct or filter != null) return ParseError.SqlInvalidProjection;
                         try self.advance();
                         const spec_kind = try parse_window.parseWindowSpecOrRef(self);
                         const wfunc = ir.windowFuncForName(name) orelse
@@ -4082,11 +4151,12 @@ pub const Parser = struct {
                     }
                     if (ignore_nulls) return ParseError.SqlInvalidProjection;
                     if (self.aggregateFuncForName(name)) |func| {
-                        const agg_name = try self.materializeAggregateExpr(name, func, nested_args, saw_distinct);
+                        const agg_name = try self.materializeAggregateExpr(name, func, nested_args, saw_distinct, filter);
                         return ir.Expr{ .col_ref = agg_name };
                     }
                     if (ir.windowFuncForName(name)) |_| return ParseError.SqlInvalidProjection;
                     if (saw_distinct) return ParseError.SqlInvalidProjection;
+                    if (filter) |f| return try self.filteredJsonAggregate(name, nested_args, f);
                     return try self.makeScalarCallExpr(name, nested_args);
                 }
                 // Bare CURRENT_TIMESTAMP / CURRENT_DATE → nullary call.
@@ -7355,22 +7425,25 @@ pub const Parser = struct {
         if (self.cur.tag != .lparen) return try self.arena.dupe(u8, orderNameSource(proj, first));
         var distinct = false;
         const args = try self.parseCallArgList(first, &distinct);
+        const filter = try self.parseAggFilter();
         // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
         // to the aggregate's canonical output column name (the
         // sort runs after the aggregate). Aliased aggregates are
         // referenced by alias via the plain-ident path.
         if (self.aggregateFuncForName(first)) |func| {
             if (self.aggregate_expr_refs_enabled) {
-                if (!distinct) {
+                if (!distinct and filter == null) {
                     if (self.aggSortName(first, args, false)) |canonical| {
                         if (try self.aggAliasFor(proj, canonical)) |alias| return alias;
                     } else |_| {}
                 }
-                return try self.materializeAggregateExpr(first, func, args, distinct);
+                return try self.materializeAggregateExpr(first, func, args, distinct, filter);
             }
+            if (filter != null) return ParseError.SqlInvalidProjection;
             return try self.aggSortName(first, args, distinct);
         }
         if (distinct) return ParseError.SqlInvalidProjection;
+        if (filter) |f| return try self.orderExprKey(proj, try self.filteredJsonAggregate(first, args, f), keys);
         return try self.orderExprKey(proj, try self.makeScalarCallExpr(first, args), keys);
     }
 

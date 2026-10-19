@@ -265,12 +265,13 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         var saw_distinct = false;
         const args = try p.parseCallArgList(col_dup, &saw_distinct);
+        const filter = try p.parseAggFilter();
         // Window call in a predicate position — only where the projection's
         // hoisting channels are live (CASE WHEN conditions inside the select
         // list); WHERE/HAVING contexts keep rejecting OVER. Checked before
         // the aggregate arm so `SUM(x) OVER (...)` hoists as a window.
         if (p.cur.tag == .kw_over and p.aggregateExprRefsEnabled()) {
-            if (saw_distinct) return PE.SqlInvalidProjection;
+            if (saw_distinct or filter != null) return PE.SqlInvalidProjection;
             try p.advance();
             const spec_kind = try parse_window.parseWindowSpecOrRef(p);
             const wfunc = ir.windowFuncForName(col_dup) orelse return PE.SqlInvalidProjection;
@@ -291,13 +292,15 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
         }
         if (p.aggregateFuncForName(col_dup)) |func| {
             if (p.aggregateExprRefsEnabled()) {
-                col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct);
+                col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct, filter);
             } else {
-                if (saw_distinct) return PE.SqlInvalidProjection;
+                if (saw_distinct or filter != null) return PE.SqlInvalidProjection;
                 col_dup = try p.aggSortName(col_dup, args, false);
             }
         } else if (saw_distinct) {
             return PE.SqlInvalidProjection;
+        } else if (filter) |f| {
+            return try parseExprOps(p, try p.parsePostfix(try p.filteredJsonAggregate(col_dup, args, f)));
         } else if (std.ascii.eqlIgnoreCase(col_dup, "day") and args.len == 1 and args[0] == .col_ref and isComparisonToken(p.cur.tag) and p.cur.tag != .null_safe_eq) {
             return try makeDayComparison(p, args[0].col_ref);
         } else {
