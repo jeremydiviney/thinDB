@@ -139,7 +139,7 @@ JSON follows MySQL, with StarRocks' JSON functions beside MySQL's:
 
 User variables follow MySQL:
 - `SET @a = expr, @b = expr, ...` takes any expression that reads no column: functions of literals, other variables and scalar subqueries. Each assignment is evaluated once the ones before it took effect, so `SET @a = 1, @b = @a + 1` gives @b 2. A session option such as `thindb_max_dop` may sit among them. A SET that fails changes no variable.
-- A variable keeps its value's type. One of DECIMAL type is kept as a DOUBLE. A variable never set reads as NULL.
+- A variable keeps its value's type, a scalar subquery's JSON, array, map or struct included. One of DECIMAL type is kept as a DOUBLE. A variable never set reads as NULL.
 - A variable holds an array, map or struct too, read wherever a constant of its type is (`array_contains(@arr, x)`, `@m[k]`, `@s.f`, an INSERT's VALUES). A predicate that compares a column with one directly (`a = @arr`) is `UnsupportedOp`, as such a predicate pushes a literal down and a nested value isn't one.
 
 Dates run from 0000-01-01 to 9999-12-31 in the proleptic Gregorian
