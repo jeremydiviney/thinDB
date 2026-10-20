@@ -733,7 +733,8 @@ pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
 /// parses into a DATE or DATETIME target, and a DATETIME lands in a DATE
 /// column as its day, as MySQL and StarRocks store it: a DATE stepped by
 /// days is a DATETIME at midnight. An array takes an array of other elements
-/// or text, converted element by element. Other targets widen along the
+/// or text, converted element by element. A number lands in a JSON column as
+/// the JSON number its text spells. Other targets widen along the
 /// implicit-cast ladder short of its lossy steps; the memtable admits or
 /// rejects the rest. A row the cast turns NULL is a failed write
 /// (`assignmentDroppedValue`). Allocates in `arena`.
@@ -745,6 +746,8 @@ pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Ty
         from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or (from.isString() and from != .json)
     else if (to == .date or to == .datetime)
         from.isString() or from == .date or from == .datetime
+    else if (to == .json)
+        from.isInteger() or from.isFloat() or from.isDecimal()
     else if (castCost(@as(TypeTag, from), @as(TypeTag, to))) |cost|
         cost > 0 and cost < LOSSY_CAST_COST
     else
