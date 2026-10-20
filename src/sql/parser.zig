@@ -3491,13 +3491,17 @@ pub const Parser = struct {
                     try self.parsePredicateValue()
                 else
                     try self.parseCallArg();
-                if (self.cur.tag == .kw_desc) {
-                    try self.advance();
-                    const desc_args = try self.arena.alloc(ir.Expr, 1);
-                    desc_args[0] = key;
-                    key = .{ .call = .{ .fn_name = scalar_fn.ORDER_KEY_DESC_FN, .args = desc_args } };
-                } else if (self.cur.tag == .kw_asc) {
-                    try self.advance();
+                const placement = try self.parseSortPlacement();
+                // NULLs sort first ascending and last descending; the other
+                // placement takes the order key that puts them at the other end.
+                const nulls_moved = if (placement.nulls_first) |first| first == placement.desc else false;
+                const wrap: ?[]const u8 = if (placement.desc)
+                    (if (nulls_moved) scalar_fn.ORDER_KEY_DESC_NULLS_FIRST_FN else scalar_fn.ORDER_KEY_DESC_FN)
+                else if (nulls_moved) scalar_fn.ORDER_KEY_NULLS_LAST_FN else null;
+                if (wrap) |fn_name| {
+                    const wrapped = try self.arena.alloc(ir.Expr, 1);
+                    wrapped[0] = key;
+                    key = .{ .call = .{ .fn_name = fn_name, .args = wrapped } };
                 }
                 try keys.append(self.arena, key);
                 if (self.cur.tag != .comma) break;
@@ -3536,7 +3540,7 @@ pub const Parser = struct {
         const next = try look.next();
         const whole_key = switch (next.tag) {
             .comma, .kw_asc, .kw_desc, .rparen => true,
-            .identifier => !next.quoted and std.ascii.eqlIgnoreCase(next.text, "separator"),
+            .identifier => !next.quoted and (std.ascii.eqlIgnoreCase(next.text, "separator") or std.ascii.eqlIgnoreCase(next.text, "nulls")),
             else => false,
         };
         if (!whole_key) return null;

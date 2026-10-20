@@ -290,6 +290,36 @@ test "ARRAY: ARRAY_AGG keeps NULLs and follows ORDER BY" {
     try expectText(allocator, db, "SELECT array_sort(array_agg(v)) FROM g", "[null,10,10,20,30]");
 }
 
+test "ARRAY: ARRAY_AGG and GROUP_CONCAT ORDER BY take NULLS FIRST / NULLS LAST" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE g (id BIGINT PRIMARY KEY, k INT, v INT, s VARCHAR(10))");
+    try exec(allocator, db, "INSERT INTO g VALUES (1, 1, 10, 'x'), (2, 1, NULL, 'y'), (3, 2, 30, 'x'), (4, 2, 20, NULL), (5, 1, 10, 'x')");
+
+    const cases = .{
+        .{ "SELECT array_agg(v ORDER BY v NULLS LAST, id) FROM g", "[10,10,20,30,null]" },
+        .{ "SELECT array_agg(v ORDER BY v ASC NULLS FIRST, id) FROM g", "[null,10,10,20,30]" },
+        .{ "SELECT array_agg(v ORDER BY v DESC NULLS FIRST, id) FROM g", "[null,30,20,10,10]" },
+        .{ "SELECT array_agg(v ORDER BY v DESC NULLS LAST, id) FROM g", "[30,20,10,10,null]" },
+        .{ "SELECT array_agg(s ORDER BY s NULLS LAST, id DESC) FROM g", "[\"x\",\"x\",\"x\",\"y\",null]" },
+        .{ "SELECT array_agg(DISTINCT v ORDER BY v NULLS LAST) FROM g", "[10,20,30,null]" },
+        .{ "SELECT group_concat(id ORDER BY s DESC NULLS FIRST, id) FROM g", "4,2,1,3,5" },
+    };
+    inline for (cases) |c| try expectText(allocator, db, c[0], c[1]);
+    try expectTexts(allocator, db, "SELECT array_agg(v ORDER BY v DESC NULLS FIRST) FROM g GROUP BY k ORDER BY k", &.{ "[null,10,10]", "[30,20]" });
+
+    // MySQL's ORDER BY <n> names the n-th argument ahead of NULLS too.
+    var q = try helpers.runSqlMysql(allocator, db, "SELECT array_agg(v ORDER BY 1 DESC NULLS FIRST) FROM g");
+    defer q.deinit();
+    const got = try helpers.columnText(allocator, &q);
+    defer helpers.freeStrings(allocator, got);
+    try std.testing.expectEqualStrings("[null,30,20,10,10]", got[0].?);
+}
+
 test "ARRAY: ARRAY_UNIQUE_AGG is the distinct elements of a group's arrays" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

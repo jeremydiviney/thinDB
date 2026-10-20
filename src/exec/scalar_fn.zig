@@ -732,7 +732,7 @@ pub fn nameResolvable(registry: ?*const udf_mod.UdfRegistry, name: []const u8) b
     inline for (.{ "charset", "collation", "typeof", "benchmark" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     if (std.mem.eql(u8, name, ROW_KEY_FN)) return true;
     if (keyFnParts(name) != null) return true;
-    if (std.mem.eql(u8, name, ORDER_KEY_FN) or std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return true;
+    if (orderKeyKernelFor(name) != null) return true;
     if (std.mem.eql(u8, name, expr_mod.HEX_LITERAL_AS_FN) or std.mem.eql(u8, name, PG_TEXT_FN)) return true;
     if (intArithOp(name) != null) return true;
     if (std.ascii.eqlIgnoreCase(name, "format")) return true;
@@ -965,19 +965,25 @@ fn resolveKeyFn(aa: Allocator, name: []const u8, arg_types: []const Type) !?Reso
 
 /// Internal: a byte string per row that, compared as bytes, sorts like its
 /// arguments ascending with NULLs first (`string.orderKeyKernel`). The DESC
-/// twin sorts them descending with NULLs last. GROUP_CONCAT's ORDER BY packs
-/// its keys into one of these.
+/// twin sorts them descending with NULLs last, and the other two put the
+/// NULLs at the other end. GROUP_CONCAT's ORDER BY packs its keys into one
+/// of these.
 pub const ORDER_KEY_FN = "__order_key";
 pub const ORDER_KEY_DESC_FN = "__order_key_desc";
+pub const ORDER_KEY_NULLS_LAST_FN = "__order_key_nulls_last";
+pub const ORDER_KEY_DESC_NULLS_FIRST_FN = "__order_key_desc_nulls_first";
+
+fn orderKeyKernelFor(name: []const u8) ?TypedKernel {
+    if (std.mem.eql(u8, name, ORDER_KEY_FN)) return string.orderKeyKernel;
+    if (std.mem.eql(u8, name, ORDER_KEY_DESC_FN)) return string.orderKeyDescKernel;
+    if (std.mem.eql(u8, name, ORDER_KEY_NULLS_LAST_FN)) return string.orderKeyNullsLastKernel;
+    if (std.mem.eql(u8, name, ORDER_KEY_DESC_NULLS_FIRST_FN)) return string.orderKeyDescNullsFirstKernel;
+    return null;
+}
 
 fn resolveOrderKey(aa: Allocator, name: []const u8, arg_types: []const Type) !?ResolvedOverload {
     if (arg_types.len == 0) return null;
-    const kernel: TypedKernel = if (std.mem.eql(u8, name, ORDER_KEY_FN))
-        string.orderKeyKernel
-    else if (std.mem.eql(u8, name, ORDER_KEY_DESC_FN))
-        string.orderKeyDescKernel
-    else
-        return null;
+    const kernel = orderKeyKernelFor(name) orelse return null;
     return try buildDecFn(aa, name, arg_types, .string, kernel, .kernel_managed);
 }
 
