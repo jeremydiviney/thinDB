@@ -206,11 +206,20 @@ pub fn parseDdl(p: anytype) !*ir.Op {
 ///   ADD [COLUMN] def | ADD [COLUMN] (def, ...) | DROP [COLUMN] name
 ///   | RENAME COLUMN a TO b | CHANGE [COLUMN] old def | MODIFY [COLUMN] def
 ///   | RENAME [TO | AS] t2
+///   | AUTO_INCREMENT [=] n
 /// Nothing for an action that changes nothing thinDB keeps: an index or
 /// constraint added, dropped or renamed (see parseTableConstraint), a table
 /// option, `ENABLE` / `DISABLE KEYS`, `FORCE`.
 fn parseAlterAction(p: anytype, actions: *std.ArrayList(ir.AlterAction)) !void {
     const PE = @TypeOf(p.*).Err;
+    if (p.cur.tag == .kw_auto_increment) {
+        try p.advance();
+        if (p.cur.tag == .eq) try p.advance();
+        if (p.cur.tag != .integer) return PE.SqlExpectedValue;
+        const n = std.fmt.parseInt(u64, p.cur.text, 10) catch return PE.SqlExpectedValue;
+        try p.advance();
+        return actions.append(p.arena, .{ .auto_increment = n });
+    }
     if (try skipTableOption(p)) return;
     switch (p.cur.tag) {
         .kw_add => {
@@ -470,8 +479,7 @@ fn skipColumnConstraint(p: anytype) !void {
 /// A MySQL table option as an ALTER TABLE action: storage engine, character
 /// set, comment, row format, and the online-DDL `ALGORITHM` / `LOCK`
 /// clauses. None has a single-node columnar meaning; each is accepted and
-/// dropped. `AUTO_INCREMENT = n` is dropped too: new ids continue past the
-/// table's largest, so they stay unique.
+/// dropped.
 fn skipTableOption(p: anytype) !bool {
     const PE = @TypeOf(p.*).Err;
     if (isBareWord(p, "convert")) {
@@ -497,7 +505,7 @@ fn skipTableOption(p: anytype) !bool {
         try p.advance();
     } else if (had_default) {
         return PE.SqlExpectedKeyword;
-    } else if (p.cur.tag == .kw_auto_increment or isTableOptionWord(p)) {
+    } else if (isTableOptionWord(p)) {
         try p.advance();
     } else return false;
     if (p.cur.tag == .eq) try p.advance();

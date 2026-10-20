@@ -494,6 +494,7 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
                         try out.appendSlice(allocator, @tagName(ch.column.column_type));
                     },
                     .rename_table => |ref| try writeTableRef(allocator, out, ref),
+                    .auto_increment => |n| try out.print(allocator, "{d}", .{n}),
                 }
             }
             try out.append(allocator, '\n');

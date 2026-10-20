@@ -327,6 +327,8 @@ pub const AlterAction = union(enum) {
     /// `CHANGE old def` / `MODIFY def` (then `from` is `column.name`).
     change_column: ChangeColumn,
     rename_table: TableRef,
+    /// `AUTO_INCREMENT = n`: the next generated id is at least `n`.
+    auto_increment: u64,
 
     pub const RenameColumn = struct { from: []const u8, to: []const u8 };
     pub const ChangeColumn = struct { from: []const u8, column: ColumnDef };
@@ -1565,6 +1567,7 @@ fn encodeAlterAction(allocator: Allocator, out: *std.ArrayList(u8), action: Alte
             try encodeColumnDef(allocator, out, ch.column);
         },
         .rename_table => |ref| try encodeTableRef(allocator, out, ref),
+        .auto_increment => |n| try appendU64(allocator, out, n),
     }
 }
 
@@ -3074,6 +3077,12 @@ fn decodeAlterAction(bytes: []const u8, cursor: *usize) DecodeError!AlterAction 
         .rename_column => .{ .rename_column = .{ .from = try readString(bytes, cursor), .to = try readString(bytes, cursor) } },
         .change_column => .{ .change_column = .{ .from = try readString(bytes, cursor), .column = try decodeColumnDef(bytes, cursor) } },
         .rename_table => .{ .rename_table = try decodeTableRef(bytes, cursor) },
+        .auto_increment => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+            const n = readU64(bytes[cursor.*..]);
+            cursor.* += 8;
+            break :blk .{ .auto_increment = n };
+        },
     };
 }
 
@@ -3930,6 +3939,7 @@ test "ir: ddl rename alter drop and truncate round-trip" {
         .{ .rename_table = .{ .schema = "s", .name = "t2" } },
         .{ .add_column = stamped },
         .{ .change_column = .{ .from = "at", .column = fixed_stamped } },
+        .{ .auto_increment = 300 },
     };
     const dropped = [_]TableRef{ .{ .name = "a" }, .{ .database = "d", .name = "b" } };
     const cases = [_]Op{
@@ -3959,6 +3969,7 @@ test "ir: ddl rename alter drop and truncate round-trip" {
                 try std.testing.expectEqualStrings("b", at.actions[2].rename_column.to);
                 try std.testing.expectEqualStrings("c", at.actions[3].change_column.from);
                 try std.testing.expectEqualStrings("t2", at.actions[4].rename_table.name);
+                try std.testing.expectEqual(@as(u64, 300), at.actions[7].auto_increment);
                 try std.testing.expect(!at.actions[0].add_column.on_update_now);
                 const got_stamped = at.actions[5].add_column;
                 try std.testing.expect(got_stamped.default_now and got_stamped.on_update_now and got_stamped.default_value == null);

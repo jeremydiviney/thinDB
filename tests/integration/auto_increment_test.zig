@@ -212,3 +212,57 @@ test "AUTO_INCREMENT: INT column width is respected" {
     try std.testing.expectEqual(@as(i32, 1), batch.values[0].data.int[0]);
     try std.testing.expectEqual(@as(i32, 2), batch.values[0].data.int[1]);
 }
+
+test "AUTO_INCREMENT: an explicit value moves the ids later rows of its statement take" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (label) VALUES ('a'), ('b')");
+    try exec(allocator, db, "INSERT INTO t (id, label) VALUES (5, 'c'), (NULL, 'd'), (3, 'e'), (DEFAULT, 'f')");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 5, 6, 7 }, ids);
+}
+
+test "AUTO_INCREMENT: ALTER TABLE AUTO_INCREMENT = n raises the counter across reopen" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)");
+        try exec(allocator, db, "INSERT INTO t (label) VALUES ('a')");
+        const t = try db.openTable("t", .{});
+        try t.flush();
+        try exec(allocator, db, "ALTER TABLE t AUTO_INCREMENT = 300");
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "INSERT INTO t (label) VALUES ('b')");
+    // A counter already past the new value stays where it is.
+    try exec(allocator, db, "ALTER TABLE t AUTO_INCREMENT 10");
+    try exec(allocator, db, "INSERT INTO t (label) VALUES ('c')");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 300, 301 }, ids);
+
+    try exec(allocator, db, "CREATE TABLE plain (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "ALTER TABLE plain AUTO_INCREMENT = 5");
+    try expectRunError(allocator, db, "ALTER TABLE t AUTO_INCREMENT = 'x'", error.SqlExpectedValue);
+    try expectRunError(allocator, db, "ALTER TABLE ghost AUTO_INCREMENT = 5", thindb.net.Error.TableNotFound);
+}
