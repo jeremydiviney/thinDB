@@ -312,6 +312,40 @@ test "sql ddl: ALTER TABLE drops, renames and changes columns and renames the ta
     try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 220 }, got);
 }
 
+test "sql ddl: ALTER TABLE DROP COLUMN of a sort key sorts the table on the rest of it, and refuses a PRIMARY KEY's" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE e (a BIGINT NOT NULL, b BIGINT NOT NULL, c VARCHAR(10)) ORDER BY (a, b)");
+    try exec(allocator, db, "INSERT INTO e VALUES (1, 30, 'x'), (2, 10, 'y'), (3, 20, NULL), (4, 5, 'w')");
+    try (try db.openTable("e", .{})).flush();
+    try exec(allocator, db, "DELETE FROM e WHERE a = 4");
+    try exec(allocator, db, "ALTER TABLE e DROP COLUMN a");
+    const e = try db.openTable("e", .{});
+    try std.testing.expectEqual(@as(usize, 1), e.schema.order_key.len);
+    try std.testing.expectEqualStrings("b", e.schema.order_key[0]);
+    {
+        // One segment, so the scan reads it in its new order.
+        const got = try collectBigints(allocator, db, "SELECT b FROM e");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{ 10, 20, 30 }, got);
+    }
+    {
+        const got = try collectBigints(allocator, db, "SELECT b FROM e WHERE c IS NULL");
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &[_]i64{20}, got);
+    }
+
+    try exec(allocator, db, "CREATE TABLE p (id BIGINT PRIMARY KEY, v INT)");
+    try expectRunError(allocator, db, "ALTER TABLE p DROP COLUMN id", thindb.Error.UniqueKeyColumnDrop);
+    try exec(allocator, db, "CREATE TABLE q (k1 BIGINT, k2 BIGINT, v INT, PRIMARY KEY (k1, k2))");
+    try expectRunError(allocator, db, "ALTER TABLE q DROP COLUMN k2", thindb.Error.UniqueKeyColumnDrop);
+}
+
 test "sql ddl: DROP TABLE drops a list, and a missing table drops none of it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
