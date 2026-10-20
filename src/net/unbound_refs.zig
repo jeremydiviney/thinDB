@@ -21,6 +21,13 @@
 //! ColumnNotFound, and the report names it. Its column lists follow how
 //! compile qualifies names, so a miss leaves the error unnamed and a false
 //! report only misnames an error the statement raised regardless.
+//!
+//! `findUnknownQualifier` serves the binder: `types.findColumn` reads a
+//! qualified name its input has no column for as the bare name, so a block
+//! over one table would answer `other.c` with its own `c`. A qualifier that
+//! names nothing anywhere in the statement can only be a mistake, and the
+//! caller refuses it. Its name set is a superset too, so a reported
+//! qualifier really is unknown.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -83,6 +90,21 @@ pub fn findAmbiguous(
     return finder.walk(root);
 }
 
+/// The first column reference `q.c` whose `q` nothing in the statement is
+/// called: no table, schema, database or alias, no CTE, table function or
+/// UNNEST, and no column or output a struct path could start from. Null
+/// when there is none, or when some relation's names can't be listed.
+pub fn findUnknownQualifier(
+    arena: Allocator,
+    catalog: ?*api.Catalog,
+    session: api.Session,
+    root: *const ir.Op,
+) Allocator.Error!?Unbound {
+    var finder: Finder = .{ .arena = arena, .catalog = catalog, .session = session, .udfs = null, .mode = .qualifier };
+    if (!try finder.survey(root)) return null;
+    return finder.walk(root);
+}
+
 /// Lower-cased bare names of the columns an operator can expose.
 const NameSet = std.StringHashMapUnmanaged(void);
 
@@ -105,20 +127,42 @@ fn splitColumn(name: []const u8) Exposed {
     return .{ .qualifier = split.qualifier, .bare = split.bare };
 }
 
-const Mode = enum { unbound, ambiguous };
+const Mode = enum { unbound, ambiguous, qualifier };
 
 /// What a reference is checked against: the bare names an operator can
-/// expose, or its qualified columns.
+/// expose, its qualified columns, or every name in the statement.
 const Scope = union(Mode) {
     unbound: *const NameSet,
     ambiguous: []const Exposed,
+    qualifier: *const Known,
 
     fn rejects(self: Scope, name: []const u8) ?Unbound {
         if (isStar(name)) return null;
         return switch (self) {
             .unbound => |set| if (has(set, name)) null else .{ .column = name },
             .ambiguous => |columns| if (isAmbiguous(columns, name)) .{ .ambiguous_column = name } else null,
+            .qualifier => |known| if (known.refuses(name)) .{ .column = name } else null,
         };
+    }
+};
+
+/// The names a statement gives its relations, columns and outputs.
+const Known = struct {
+    /// Lower-cased: every relation's names and every column's and
+    /// output's last part.
+    names: NameSet = .empty,
+    /// Lower-cased whole output names, which may read like `q.c`.
+    outputs: NameSet = .empty,
+
+    /// Whether `name` is `q.c` with a `q` nothing is called. A longer
+    /// name is a struct path `struct_paths` judged, and a generated column
+    /// (`a.__d0`) or an output named by its text is no reference.
+    fn refuses(self: *const Known, name: []const u8) bool {
+        const split = types.splitQualifiedName(name) orelse return false;
+        if (!types.isPlainIdentifier(split.qualifier) or !types.isPlainIdentifier(split.bare)) return false;
+        if (std.mem.startsWith(u8, split.bare, "__")) return false;
+        if (hasFolded(&self.outputs, name)) return false;
+        return !hasFolded(&self.names, split.qualifier);
     }
 };
 
@@ -135,6 +179,80 @@ const Finder = struct {
     /// The lambdas whose bodies are being checked: their parameters are no
     /// columns.
     lambdas: ?*const expr_mod.LambdaScope = null,
+    known: Known = .{},
+    surveyed: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty,
+
+    /// Gathers `known` from `op` and everything under it; false when a
+    /// relation's columns can't be listed.
+    fn survey(self: *Finder, op: *const ir.Op) Allocator.Error!bool {
+        if ((try self.surveyed.getOrPut(self.arena, op)).found_existing) return true;
+        const known = &self.known.names;
+        switch (op.*) {
+            .scan => |s| {
+                try self.addTableNames(s.table);
+                if (s.alias) |a| try self.add(known, a);
+                if (pgcat.match(s.table, self.session.dialect) == null) if (self.catalog) |cat| {
+                    if (local.resolveTable(cat, self.session, s.table)) |table| {
+                        for (table.schema.columns) |col| try self.add(known, col.name);
+                    } else |_| {}
+                };
+            },
+            .file_scan => return false,
+            .alias => |a| try self.add(known, a.alias),
+            .materialize => |m| if (m.name) |n| try self.add(known, n),
+            .table_fn => |t| {
+                try self.add(known, t.name);
+                if (t.alias) |a| try self.add(known, a);
+            },
+            .expand => |e| {
+                try self.add(known, e.name());
+                for (e.columns) |c| try self.add(known, c);
+            },
+            .select => |p| if (p.outputs) |outs| for (outs) |o| if (o) |n| try self.addOutput(n),
+            .compute => |c| for (c.derived) |d| try self.addOutput(d.name),
+            .window => |w| for (w.calls) |call| try self.addOutput(call.output_name),
+            .group_by => |g| for (g.aggs) |a| try self.addOutput(a.as),
+            .delete_op => |d| try self.addTableNames(d.table),
+            .update_op => |u| try self.addTableNames(u.table),
+            else => {},
+        }
+        return switch (op.*) {
+            .limit => |l| self.survey(l.upstream),
+            .select, .exclude => |p| self.survey(p.upstream),
+            .filter => |f| self.survey(f.upstream),
+            .order_by => |o| self.survey(o.upstream),
+            .group_by => |g| self.survey(g.upstream),
+            .compute => |c| self.survey(c.upstream),
+            .materialize => |m| self.survey(m.upstream),
+            .window => |w| self.survey(w.upstream),
+            .alias => |a| self.survey(a.upstream),
+            .expand => |e| self.survey(e.upstream),
+            .join => |j| try self.survey(j.left) and try self.survey(j.right),
+            .set_union => |u| try self.survey(u.left) and try self.survey(u.right),
+            .create_table_as => |c| self.survey(c.source),
+            .insert_select => |i| self.survey(i.source),
+            .delete_op => |d| if (d.source) |s| self.survey(s) else true,
+            .update_op => |u| if (u.source) |s| self.survey(s) else true,
+            .explain => |e| self.survey(e.inner),
+            .batch => |b| self.surveyAll(b.statements),
+            .table_fn => |t| self.surveyAll(t.inputs),
+            else => true,
+        };
+    }
+
+    fn surveyAll(self: *Finder, ops: []const *ir.Op) Allocator.Error!bool {
+        for (ops) |op| if (!try self.survey(op)) return false;
+        return true;
+    }
+
+    fn addTableNames(self: *Finder, table: ir.TableRef) Allocator.Error!void {
+        for ([_]?[]const u8{ table.name, table.schema, table.database }) |name| if (name) |n| try self.add(&self.known.names, n);
+    }
+
+    fn addOutput(self: *Finder, name: []const u8) Allocator.Error!void {
+        try self.add(&self.known.names, name);
+        try self.known.outputs.put(self.arena, try std.ascii.allocLowerString(self.arena, name), {});
+    }
 
     fn walk(self: *Finder, op: *const ir.Op) Allocator.Error!?Unbound {
         if ((try self.visited.getOrPut(self.arena, op)).found_existing) return null;
@@ -255,6 +373,7 @@ const Finder = struct {
         return switch (self.mode) {
             .unbound => .{ .unbound = try self.names(op) orelse return null },
             .ambiguous => .{ .ambiguous = try self.columns(op) orelse return null },
+            .qualifier => .{ .qualifier = &self.known },
         };
     }
 
@@ -475,13 +594,16 @@ fn isAmbiguous(columns: []const Exposed, name: []const u8) bool {
 }
 
 fn has(set: *const NameSet, name: []const u8) bool {
-    const seg = lastSegment(name);
+    return hasFolded(set, lastSegment(name));
+}
+
+fn hasFolded(set: *const NameSet, name: []const u8) bool {
     var buf: [256]u8 = undefined;
     // Too long to fold on the stack: compare case-insensitively instead.
-    if (seg.len > buf.len) {
+    if (name.len > buf.len) {
         var it = set.keyIterator();
-        while (it.next()) |k| if (std.ascii.eqlIgnoreCase(k.*, seg)) return true;
+        while (it.next()) |k| if (std.ascii.eqlIgnoreCase(k.*, name)) return true;
         return false;
     }
-    return set.contains(std.ascii.lowerString(buf[0..seg.len], seg));
+    return set.contains(std.ascii.lowerString(buf[0..name.len], name));
 }

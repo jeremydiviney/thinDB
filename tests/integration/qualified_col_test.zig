@@ -506,6 +506,53 @@ test "a schema- or database-qualified column resolves by its table name" {
     try helpers.expectRunError(allocator, db, "SELECT a.main.t.id FROM t", error.ColumnNotFound);
 }
 
+test "a qualifier that names nothing in the statement is refused" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupOrders(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE st (pk INT, s STRUCT<a INT, b STRING>)");
+    try exec(allocator, db, "INSERT INTO st VALUES (1, row(10, 'x')), (2, row(20, 'y'))");
+
+    // `o` is a table, but not one this statement reads.
+    const refused = [_][]const u8{
+        "SELECT x.qty FROM t",
+        "SELECT o.qty FROM t",
+        "SELECT qty FROM t WHERE x.id = 1",
+        "SELECT id FROM t ORDER BY x.id",
+        "SELECT SUM(x.qty) FROM t",
+        "SELECT x.id, COUNT(*) FROM t GROUP BY x.id",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY x.qty) FROM t",
+        "WITH c AS (SELECT id FROM t) SELECT x.id FROM c",
+        "SELECT t.id FROM t JOIN o ON t.id = o.tid ORDER BY x.oid",
+        "SELECT pk FROM st ORDER BY t.pk",
+    };
+    for (refused) |sql| {
+        errdefer std.debug.print("query: {s}\n", .{sql});
+        try std.testing.expectError(error.ColumnNotFound, helpers.runSql(allocator, db, sql));
+    }
+
+    const answered = .{
+        .{ "SELECT t.id FROM t ORDER BY t.id", &[_]i64{ 1, 2, 3 } },
+        .{ "WITH c AS (SELECT id FROM t) SELECT c.id FROM c ORDER BY c.id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT d.id FROM (SELECT id FROM t) d ORDER BY d.id", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT (SELECT COUNT(*) FROM o WHERE o.tid = t.id) FROM t ORDER BY t.id", &[_]i64{ 2, 0, 1 } },
+        .{ "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM o WHERE o.tid = t.id) ORDER BY id", &[_]i64{ 1, 3 } },
+        .{ "SELECT array_sum(array_map(x -> x + t.qty, [t.id])) FROM t ORDER BY t.id", &[_]i64{ 11, 22, 33 } },
+        .{ "SELECT s.a FROM st ORDER BY pk", &[_]i64{ 10, 20 } },
+        .{ "SELECT st.s.a FROM st ORDER BY st.pk", &[_]i64{ 10, 20 } },
+    };
+    inline for (answered) |case| {
+        const got = try collectBigints(allocator, db, case[0]);
+        defer allocator.free(got);
+        std.testing.expectEqualSlices(i64, case[1], got) catch |err| {
+            std.debug.print("query: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
 fn setupShadowed(allocator: std.mem.Allocator, io: anytype, dir: anytype) !*thindb.Database {
     const db = try thindb.Database.open(allocator, io, dir, .{});
     errdefer db.close();

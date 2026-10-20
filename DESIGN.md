@@ -1042,6 +1042,13 @@ output. A name that both inputs have is an error (`SqlOnColumnAmbiguous`, MySQL
 1052). If an input's columns can't be listed (a file scan, or a parse without
 the catalog), unqualified names on that join don't resolve.
 
+A qualified column whose qualifier names nothing in the statement is an error
+(`ColumnNotFound`, MySQL's `Unknown column 'x.c'`). That means no table,
+schema, database, alias, CTE, table function or UNNEST, and no column or output
+a struct path could start from. A single-table block reads any other qualifier
+as its own table's: `SELECT t.c FROM t AS a` reads `a.c`, where MySQL refuses
+a name the block's FROM hides.
+
 `JOIN ... USING (c, ...)` is an equi join on each named column. The parser
 merges each `c` into one bare output column holding the left value, the right
 value under RIGHT JOIN, or their COALESCE under FULL JOIN. `left.c` and
