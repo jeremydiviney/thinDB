@@ -105,8 +105,8 @@ pub const ParseError = error{
     SqlRowValueWidthMismatch,
     /// `DEFAULT NULL` on a NOT NULL or PRIMARY KEY column (MySQL 1067).
     SqlInvalidDefault,
-    /// `ALTER TABLE ... ADD COLUMN c ... FIRST | AFTER x`: new columns are
-    /// appended.
+    /// `ALTER TABLE ... CHANGE | MODIFY COLUMN c ... FIRST | AFTER x`: a
+    /// changed column keeps its place.
     SqlColumnPositionUnsupported,
     /// A CREATE TABLE PROPERTIES key that is neither a thinDB option nor a
     /// StarRocks key thinDB knows to ignore.
@@ -364,6 +364,12 @@ fn fspTemporalFn(name: []const u8) bool {
     return false;
 }
 
+fn sliceCount(e: ir.Expr) ParseError!ir.Expr {
+    const n = literalInteger(e) orelse return ParseError.SqlExpectedValue;
+    if (n <= 0) return ParseError.SqlExpectedValue;
+    return .{ .lit = .{ .bigint = n } };
+}
+
 fn literalInteger(e: ir.Expr) ?i64 {
     if (e != .lit) return null;
     return switch (e.lit) {
@@ -511,6 +517,10 @@ const EXTRACT_COMPOUND_FNS = [_][]const u8{
 };
 
 const DateAddSubKind = enum { add, sub };
+
+fn isSliceFn(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "time_slice") or std.ascii.eqlIgnoreCase(name, "date_slice");
+}
 
 fn dateAddSubName(name: []const u8) ?DateAddSubKind {
     if (std.ascii.eqlIgnoreCase(name, "date_add") or std.ascii.eqlIgnoreCase(name, "adddate")) return .add;
@@ -2679,6 +2689,7 @@ pub const Parser = struct {
 
     pub fn scalarCallHasOwnSyntax(_: *const Parser, name: []const u8) bool {
         return dateAddSubName(name) != null or
+            isSliceFn(name) or
             std.ascii.eqlIgnoreCase(name, "cast") or
             std.ascii.eqlIgnoreCase(name, "convert") or
             std.ascii.eqlIgnoreCase(name, "extract") or
@@ -2689,6 +2700,7 @@ pub const Parser = struct {
 
     pub fn parseScalarCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
         if (dateAddSubName(name)) |_| return try self.parseDateAddSubCallAfterName(name);
+        if (isSliceFn(name)) return try self.parseSliceCall(name);
         if (std.ascii.eqlIgnoreCase(name, "cast")) return try self.parseCastCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "convert")) return try self.parseConvertCallAfterName();
         if (std.ascii.eqlIgnoreCase(name, "extract")) return try self.parseExtractCall();
@@ -3242,6 +3254,40 @@ pub const Parser = struct {
             },
         }
         return try self.makeBinary("sub", ir.Expr{ .lit = .{ .int = 0 } }, expr);
+    }
+
+    /// `TIME_SLICE(dt, INTERVAL n unit [, FLOOR | CEIL])` or StarRocks'
+    /// internal spelling `time_slice(dt, n, 'unit', 'floor')`, and the same
+    /// for DATE_SLICE. The count is a positive integer literal, as StarRocks
+    /// requires.
+    fn parseSliceCall(self: *Parser, name: []const u8) ParseError!ir.Expr {
+        try self.expect(.lparen);
+        const args = try self.arena.alloc(ir.Expr, 4);
+        args[0] = try self.parseCallArg();
+        try self.expect(.comma);
+        if (self.cur.tag == .kw_interval) {
+            try self.advance();
+            args[1] = try sliceCount(try self.parseScalar());
+            if (self.cur.tag != .identifier or intervalUnit(self.cur.text) == null) return ParseError.SqlExpectedKeyword;
+            args[2] = .{ .lit = .{ .text = try self.arena.dupe(u8, self.cur.text) } };
+            try self.advance();
+            args[3] = .{ .lit = .{ .text = "floor" } };
+            if (self.cur.tag == .comma) {
+                try self.advance();
+                if (self.cur.tag != .identifier or !(std.ascii.eqlIgnoreCase(self.cur.text, "floor") or std.ascii.eqlIgnoreCase(self.cur.text, "ceil")))
+                    return ParseError.SqlExpectedKeyword;
+                args[3] = .{ .lit = .{ .text = try self.arena.dupe(u8, self.cur.text) } };
+                try self.advance();
+            }
+        } else {
+            args[1] = try sliceCount(try self.parseCallArg());
+            try self.expect(.comma);
+            args[2] = try self.parseCallArg();
+            try self.expect(.comma);
+            args[3] = try self.parseCallArg();
+        }
+        try self.expect(.rparen);
+        return try self.makeScalarCallExpr(name, args);
     }
 
     fn parseDateAddSubCallAfterName(self: *Parser, name: []const u8) ParseError!ir.Expr {
