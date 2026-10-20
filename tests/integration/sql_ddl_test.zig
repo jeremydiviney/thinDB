@@ -156,7 +156,7 @@ test "sql ddl: parser recognizes rename, alter add column, and truncate" {
         const root = try thindb.sql.parse(arena.allocator(), "ALTER TABLE t ADD COLUMN note TEXT");
         try std.testing.expect(root.* == .ddl);
         try std.testing.expect(root.ddl == .alter_table);
-        try std.testing.expectEqualStrings("note", root.ddl.alter_table.actions[0].add_column.name);
+        try std.testing.expectEqualStrings("note", root.ddl.alter_table.actions[0].add_column.column.name);
     }
     {
         const root = try thindb.sql.parse(arena.allocator(), "TRUNCATE TABLE t");
@@ -302,7 +302,7 @@ test "sql ddl: ALTER TABLE drops, renames and changes columns and renames the ta
     try expectRunError(allocator, db, "ALTER TABLE t MODIFY amount INT NOT NULL", thindb.net.Error.UnsupportedOp);
     try expectRunError(allocator, db, "ALTER TABLE t CHANGE amount total BIGINT", thindb.net.Error.UnsupportedOp);
     try expectRunError(allocator, db, "ALTER TABLE t CHANGE ghost total BIGINT NOT NULL", thindb.net.Error.ColumnNotFound);
-    try expectRunError(allocator, db, "ALTER TABLE t ADD COLUMN z INT AFTER id", error.SqlColumnPositionUnsupported);
+    try expectRunError(allocator, db, "ALTER TABLE t MODIFY COLUMN amount BIGINT NOT NULL AFTER id", error.SqlColumnPositionUnsupported);
 
     try exec(allocator, db, "ALTER TABLE t RENAME TO t2");
     try expectRunError(allocator, db, "SELECT id FROM t", thindb.net.Error.TableNotFound);
@@ -310,6 +310,50 @@ test "sql ddl: ALTER TABLE drops, renames and changes columns and renames the ta
     const got = try collectBigints(allocator, db, "SELECT id * 100 + total FROM t3 ORDER BY id");
     defer allocator.free(got);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 110, 220 }, got);
+}
+
+test "sql ddl: ALTER TABLE ADD COLUMN FIRST / AFTER places the column, and it stays there across a reopen" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const order = [_][]const u8{ "z", "id", "a", "m", "b", "n" };
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE p (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b VARCHAR(10))");
+        try exec(allocator, db, "INSERT INTO p VALUES (1, 10, 'x')");
+        try (try db.openTable("p", .{})).flush();
+        try exec(allocator, db, "INSERT INTO p VALUES (2, 20, 'y')");
+
+        try exec(allocator, db, "ALTER TABLE p ADD COLUMN z INT DEFAULT 7 FIRST, ADD COLUMN m VARCHAR(5) AFTER a, ADD n INT AFTER `b`");
+        try exec(allocator, db, "INSERT INTO p VALUES (5, 3, 30, 'mm', 'zz', 9)");
+        {
+            var q = try runSql(allocator, db, "SELECT * FROM p");
+            defer q.deinit();
+            const schema = q.outputSchema();
+            try std.testing.expectEqual(order.len, schema.len);
+            for (order, schema) |want, col| try std.testing.expectEqualStrings(want, col.name);
+        }
+        {
+            var q = try runSql(allocator, db, "SELECT z, id, a, n FROM p ORDER BY id");
+            defer q.deinit();
+            const cells = try helpers.collectIntCells(allocator, &q);
+            defer allocator.free(cells);
+            try std.testing.expectEqualSlices(?i64, &[_]?i64{ 7, 1, 10, null, 7, 2, 20, null, 5, 3, 30, 9 }, cells);
+        }
+        try helpers.expectTexts(allocator, db, "SELECT CONCAT(COALESCE(m, '-'), b) FROM p ORDER BY id", &.{ "-x", "-y", "mmzz" });
+
+        try expectRunError(allocator, db, "ALTER TABLE p ADD COLUMN q INT AFTER ghost", thindb.net.Error.ColumnNotFound);
+        try expectRunError(allocator, db, "ALTER TABLE p ADD COLUMN q INT AFTER", error.SqlExpectedIdent);
+    }
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    var q = try runSql(allocator, db, "SELECT * FROM p WHERE id = 5");
+    defer q.deinit();
+    const schema = q.outputSchema();
+    try std.testing.expectEqual(order.len, schema.len);
+    for (order, schema) |want, col| try std.testing.expectEqualStrings(want, col.name);
 }
 
 test "sql ddl: ALTER TABLE DROP COLUMN of a sort key sorts the table on the rest of it, and refuses a PRIMARY KEY's" {

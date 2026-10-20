@@ -321,7 +321,7 @@ pub const AlterTable = struct {
 };
 
 pub const AlterAction = union(enum) {
-    add_column: ColumnDef,
+    add_column: AddColumn,
     drop_column: []const u8,
     rename_column: RenameColumn,
     /// `CHANGE old def` / `MODIFY def` (then `from` is `column.name`).
@@ -330,6 +330,7 @@ pub const AlterAction = union(enum) {
     /// `AUTO_INCREMENT = n`: the next generated id is at least `n`.
     auto_increment: u64,
 
+    pub const AddColumn = struct { column: ColumnDef, position: types.ColumnPosition = .last };
     pub const RenameColumn = struct { from: []const u8, to: []const u8 };
     pub const ChangeColumn = struct { from: []const u8, column: ColumnDef };
 };
@@ -1626,7 +1627,11 @@ fn encodeCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) EncodeEr
 fn encodeAlterAction(allocator: Allocator, out: *std.ArrayList(u8), action: AlterAction) EncodeError!void {
     try out.append(allocator, @intFromEnum(@as(std.meta.Tag(AlterAction), action)));
     switch (action) {
-        .add_column => |c| try encodeColumnDef(allocator, out, c),
+        .add_column => |add| {
+            try encodeColumnDef(allocator, out, add.column);
+            try out.append(allocator, @intFromEnum(@as(std.meta.Tag(types.ColumnPosition), add.position)));
+            if (add.position == .after) try encodeString(allocator, out, add.position.after);
+        },
         .drop_column => |name| try encodeString(allocator, out, name),
         .rename_column => |r| {
             try encodeString(allocator, out, r.from);
@@ -3161,7 +3166,19 @@ fn decodeAlterAction(bytes: []const u8, cursor: *usize) DecodeError!AlterAction 
     cursor.* += 1;
     if (t >= @typeInfo(AlterAction).@"union".fields.len) return Error.IrCorrupt;
     return switch (@as(std.meta.Tag(AlterAction), @enumFromInt(t))) {
-        .add_column => .{ .add_column = try decodeColumnDef(bytes, cursor) },
+        .add_column => blk: {
+            const column = try decodeColumnDef(bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const pos = bytes[cursor.*];
+            cursor.* += 1;
+            if (pos >= @typeInfo(types.ColumnPosition).@"union".fields.len) return Error.IrCorrupt;
+            const position: types.ColumnPosition = switch (@as(std.meta.Tag(types.ColumnPosition), @enumFromInt(pos))) {
+                .last => .last,
+                .first => .first,
+                .after => .{ .after = try readString(bytes, cursor) },
+            };
+            break :blk .{ .add_column = .{ .column = column, .position = position } };
+        },
         .drop_column => .{ .drop_column = try readString(bytes, cursor) },
         .rename_column => .{ .rename_column = .{ .from = try readString(bytes, cursor), .to = try readString(bytes, cursor) } },
         .change_column => .{ .change_column = .{ .from = try readString(bytes, cursor), .column = try decodeColumnDef(bytes, cursor) } },
@@ -4029,12 +4046,12 @@ test "ir: ddl rename alter drop and truncate round-trip" {
     const stamped: ColumnDef = .{ .name = "at", .column_type = .datetime, .nullable = true, .default_now = true, .on_update_now = true };
     const fixed_stamped: ColumnDef = .{ .name = "at", .column_type = .datetime, .nullable = true, .default_value = .{ .datetime = 5 }, .on_update_now = true };
     const actions = [_]AlterAction{
-        .{ .add_column = score },
+        .{ .add_column = .{ .column = score, .position = .{ .after = "id" } } },
         .{ .drop_column = "old" },
         .{ .rename_column = .{ .from = "a", .to = "b" } },
         .{ .change_column = .{ .from = "c", .column = score } },
         .{ .rename_table = .{ .schema = "s", .name = "t2" } },
-        .{ .add_column = stamped },
+        .{ .add_column = .{ .column = stamped, .position = .first } },
         .{ .change_column = .{ .from = "at", .column = fixed_stamped } },
         .{ .auto_increment = 300 },
     };
@@ -4067,8 +4084,10 @@ test "ir: ddl rename alter drop and truncate round-trip" {
                 try std.testing.expectEqualStrings("c", at.actions[3].change_column.from);
                 try std.testing.expectEqualStrings("t2", at.actions[4].rename_table.name);
                 try std.testing.expectEqual(@as(u64, 300), at.actions[7].auto_increment);
-                try std.testing.expect(!at.actions[0].add_column.on_update_now);
-                const got_stamped = at.actions[5].add_column;
+                try std.testing.expect(!at.actions[0].add_column.column.on_update_now);
+                try std.testing.expectEqualStrings("id", at.actions[0].add_column.position.after);
+                try std.testing.expect(at.actions[5].add_column.position == .first);
+                const got_stamped = at.actions[5].add_column.column;
                 try std.testing.expect(got_stamped.default_now and got_stamped.on_update_now and got_stamped.default_value == null);
                 const got_fixed = at.actions[6].change_column.column;
                 try std.testing.expect(!got_fixed.default_now and got_fixed.on_update_now);

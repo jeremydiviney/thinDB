@@ -353,6 +353,7 @@ pub fn decodeSchema(allocator: Allocator, bytes: []const u8, cursor: *usize) !Ta
 /// Encode one AlterOp. Layout:
 ///   [op_tag u8]                          0=add, 1=drop, 2=rename, 3=set_clauses
 ///   add:     [name_len u32][name][type_tag u8][nullable u8][type_extra u32][clauses u8][value?]
+///            [position u8][after_len u32][after]?    0=last, 1=first, 2=after (name follows)
 ///   drop:    [name_len u32][name]
 ///   rename:  [from_len u32][from][to_len u32][to]
 ///   set_clauses: [name_len u32][name][clauses u8][value?]
@@ -366,6 +367,8 @@ pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp)
             try out.append(allocator, @intFromBool(a.nullable));
             try appendU32(allocator, out, typeExtra(a.type));
             try encodeClauses(allocator, out, a.default, a.default_now, a.on_update_now);
+            try out.append(allocator, @intFromEnum(@as(std.meta.Tag(types.ColumnPosition), a.position)));
+            if (a.position == .after) try appendLenString(allocator, out, a.position.after);
         },
         .set_clauses => |sc| {
             try out.append(allocator, 3);
@@ -425,6 +428,15 @@ pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !A
             cursor.* += 4;
             const t = try typeFromTagAndExtra(tag_byte, extra);
             const clauses = try decodeClauses(allocator, bytes, cursor);
+            if (cursor.* + 1 > bytes.len) return Error.WireCorrupt;
+            const pos = bytes[cursor.*];
+            cursor.* += 1;
+            const position: types.ColumnPosition = switch (pos) {
+                0 => .last,
+                1 => .first,
+                2 => .{ .after = try allocator.dupe(u8, try readLenString(bytes, cursor)) },
+                else => return Error.WireCorrupt,
+            };
             break :blk AlterOp{ .add = .{
                 .name = try allocator.dupe(u8, name),
                 .type = t,
@@ -432,6 +444,7 @@ pub fn decodeAlterOp(allocator: Allocator, bytes: []const u8, cursor: *usize) !A
                 .default = clauses.default,
                 .default_now = clauses.default_now,
                 .on_update_now = clauses.on_update_now,
+                .position = position,
             } };
         },
         1 => blk: {
@@ -1005,24 +1018,28 @@ test "wire: batch encode -> decode round-trip preserves data" {
     try std.testing.expect(db2.values[3].isValid(2));
 }
 
-test "wire: ALTER ops carry DEFAULT and ON UPDATE CURRENT_TIMESTAMP" {
+test "wire: ALTER ops carry DEFAULT, ON UPDATE CURRENT_TIMESTAMP and an added column's position" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     const ops = [_]AlterOp{
-        .{ .add = .{ .name = "at", .type = .datetime, .nullable = false, .default = .{ .datetime = 7 }, .default_now = true, .on_update_now = true } },
+        .{ .add = .{ .name = "at", .type = .datetime, .nullable = false, .default = .{ .datetime = 7 }, .default_now = true, .on_update_now = true, .position = .first } },
         .{ .set_clauses = .{ .name = "at", .default = null, .default_now = false, .on_update_now = true } },
-        .{ .add = .{ .name = "n", .type = .int, .nullable = true, .default = .{ .int = 3 } } },
+        .{ .add = .{ .name = "n", .type = .int, .nullable = true, .default = .{ .int = 3 }, .position = .{ .after = "id" } } },
+        .{ .add = .{ .name = "m", .type = .int, .nullable = true } },
     };
     var buf: std.ArrayList(u8) = .empty;
     for (ops) |op| try encodeAlterOp(aa, &buf, op);
     var cursor: usize = 0;
     const add = (try decodeAlterOp(aa, buf.items, &cursor)).add;
     try std.testing.expect(add.default.?.eql(.{ .datetime = 7 }) and add.default_now and add.on_update_now);
+    try std.testing.expect(add.position == .first);
     const set = (try decodeAlterOp(aa, buf.items, &cursor)).set_clauses;
     try std.testing.expectEqualStrings("at", set.name);
     try std.testing.expect(set.default == null and !set.default_now and set.on_update_now);
     const plain = (try decodeAlterOp(aa, buf.items, &cursor)).add;
     try std.testing.expect(plain.default.?.eql(.{ .int = 3 }) and !plain.default_now and !plain.on_update_now);
+    try std.testing.expectEqualStrings("id", plain.position.after);
+    try std.testing.expect((try decodeAlterOp(aa, buf.items, &cursor)).add.position == .last);
     try std.testing.expectEqual(buf.items.len, cursor);
 }

@@ -93,6 +93,7 @@ pub const AlterOp = union(enum) {
         /// time existing rows take.
         default_now: bool = false,
         on_update_now: bool = false,
+        position: @import("../types.zig").ColumnPosition = .last,
     };
 
     pub const SetClauses = struct {

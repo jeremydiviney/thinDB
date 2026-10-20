@@ -750,6 +750,14 @@ pub const Value = union(ValueTag) {
     }
 };
 
+/// Where ALTER TABLE ... ADD COLUMN puts the new column: `FIRST`,
+/// `AFTER name`, or last when the statement names no position.
+pub const ColumnPosition = union(enum) {
+    last,
+    first,
+    after: []const u8,
+};
+
 pub const Column = struct {
     name: []const u8,
     type: Type,

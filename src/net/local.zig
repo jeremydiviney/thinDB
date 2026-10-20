@@ -2678,7 +2678,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             var rename_to: ?PersistentTableTarget = null;
             var auto_increment: ?u64 = null;
             for (at.actions) |action| switch (action) {
-                .add_column => |c| try ops.append(ctx.allocator, try addColumnOp(ctx, c)),
+                .add_column => |add| try ops.append(ctx.allocator, try addColumnOp(ctx, add.column, add.position)),
                 .drop_column => |name| try ops.append(ctx.allocator, .{ .drop = name }),
                 .rename_column => |r| try ops.append(ctx.allocator, .{ .rename = .{ .from = r.from, .to = r.to } }),
                 .change_column => |ch| {
@@ -3474,7 +3474,7 @@ fn dropTable(ctx: *CompileCtx, catalog: *Catalog, ref: ir.TableRef, if_exists: b
 
 /// An added column backfills existing rows with its default, or NULL. A
 /// DEFAULT CURRENT_TIMESTAMP gives them the ALTER's time, as MySQL does.
-fn addColumnOp(ctx: *CompileCtx, c: ir.ColumnDef) !AlterOp {
+fn addColumnOp(ctx: *CompileCtx, c: ir.ColumnDef, position: types.ColumnPosition) !AlterOp {
     if (c.auto_increment) return Error.UnsupportedOp;
     const clauses = try columnClauses(c);
     const backfill: ?Value = if (clauses.default_now) nowDatetime(ctx) else clauses.default_value;
@@ -3486,6 +3486,7 @@ fn addColumnOp(ctx: *CompileCtx, c: ir.ColumnDef) !AlterOp {
         .default = backfill,
         .default_now = clauses.default_now,
         .on_update_now = clauses.on_update_now,
+        .position = position,
     } };
 }
 

@@ -225,9 +225,14 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
             } else if (!add.nullable) {
                 return api.Error.UnsupportedAlterOp;
             }
+            const at: usize = switch (add.position) {
+                .last => cols.items.len,
+                .first => 0,
+                .after => |name| (findColumn(cols.items, name) orelse return api.Error.ColumnNotFound) + 1,
+            };
             const name_copy = try aa.dupe(u8, add.name);
             const default_owned = if (add.default) |v| try cloneValue(aa, v) else null;
-            try cols.append(aa, .{
+            try cols.insert(aa, at, .{
                 .name = name_copy,
                 .type = add.type,
                 .nullable = add.nullable,
@@ -235,7 +240,7 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
                 .default_now = add.default_now,
                 .on_update_now = add.on_update_now,
             });
-            try sources.append(aa, if (default_owned) |v| .{ .add_with_default = v } else .add_null);
+            try sources.insert(aa, at, if (default_owned) |v| .{ .add_with_default = v } else .add_null);
         },
         .set_clauses => |sc| {
             const idx = findColumn(cols.items, sc.name) orelse return api.Error.ColumnNotFound;
