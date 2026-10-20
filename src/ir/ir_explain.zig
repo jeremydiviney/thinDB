@@ -218,7 +218,7 @@ fn explainOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op, depth: usize
                 try out.appendSlice(allocator, if (i == 0) " [" else ", ");
                 try out.appendSlice(allocator, call.output_name);
                 try out.appendSlice(allocator, " = ");
-                try out.appendSlice(allocator, windowFuncName(call.func));
+                try out.appendSlice(allocator, if (call.agg) |agg| @tagName(agg.func) else windowFuncName(call.func));
                 try out.append(allocator, '(');
                 for (call.args, 0..) |a, ai| {
                     if (ai > 0) try out.appendSlice(allocator, ", ");

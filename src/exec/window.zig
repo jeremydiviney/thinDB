@@ -43,6 +43,7 @@ const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 const transform = @import("../engine/transform.zig");
 const BlockArena = @import("../util/block_arena.zig").BlockArena;
+const StringBank = @import("../util/string_bank.zig").StringBank;
 
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
@@ -210,6 +211,9 @@ pub const Window = struct {
         /// `SESSION_NUMBER(x, delta)`'s delta, null when x or delta is a
         /// NULL literal, which makes every row NULL.
         session_delta: ?i64 = null,
+        /// An `.aggregate` call's aggregate, reading `value_col` and, when
+        /// it takes one, `second_col` by their input names.
+        agg: ?aggregate.AggSpec = null,
     };
 
     const DefaultKind = enum { none, literal, col_ref };
@@ -579,8 +583,8 @@ pub const Window = struct {
         self.accumulated_rows = batch.row_count;
         try self.evaluate_accumulated();
         @memcpy(self.views[0..batch.values.len], batch.values);
-        for (self.output_columns, 0..) |*out, ci| {
-            if (isStringType(self.schema[self.input_schema.len + ci].type)) {
+        for (self.output_columns, self.call_plans, 0..) |*out, plan, ci| {
+            if (plan.func != .aggregate and isStringType(self.schema[self.input_schema.len + ci].type)) {
                 out.clear();
                 try appendStringScratchRange(self.allocator, self.string_outputs[ci], 0, batch.row_count, out);
             }
@@ -1125,7 +1129,8 @@ pub const Window = struct {
         // allocate `string_outputs[ci]` instead — strings are written
         // by row position into the scratch and materialized into a
         // StringStore at emit time.
-        for (self.output_columns, 0..) |*out, ci| {
+        for (self.output_columns, self.call_plans, 0..) |*out, plan, ci| {
+            if (plan.func == .aggregate) continue;
             const out_type = self.schema[self.input_schema.len + ci].type;
             if (isStringType(out_type)) {
                 if (self.string_outputs[ci].len < n) {
@@ -1167,7 +1172,7 @@ pub const Window = struct {
                 self.allocator.free(perm);
                 continue;
             }
-            if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1) {
+            if (si.partition_cols.len > 0 and n >= parallel_min_rows and self.dop > 1 and !self.groupRunsAggregate(spec_i)) {
                 try self.evaluateSpecParallel(si, spec_i, n);
                 continue;
             }
@@ -1199,6 +1204,16 @@ pub const Window = struct {
         }
 
         self.drained = true;
+    }
+
+    /// Whether a call of the specs sharing `spec_i`'s pass is an
+    /// `.aggregate` one, which writes its whole output column at once and so
+    /// runs serially.
+    fn groupRunsAggregate(self: *const Window, spec_i: usize) bool {
+        for (self.call_plans) |plan| {
+            if (plan.func == .aggregate and self.spec_group[plan.spec_idx] == spec_i) return true;
+        }
+        return false;
     }
 
     /// Below this many rows the parallel path's scatter + spawn overhead
@@ -1781,6 +1796,7 @@ pub const Window = struct {
         perm: []const u32,
         si: SpecIndices,
     ) !void {
+        if (plan.func == .aggregate) return self.evaluateAggregateCall(plan, out_idx, perm, si);
         const spec = self.specs[plan.spec_idx];
         const cell: OutCell = .{
             .column = &self.output_columns[out_idx],
@@ -1794,6 +1810,77 @@ pub const Window = struct {
             try self.evaluateOnePartition(plan, spec, si, perm, p_start, p_end, cell);
             p_start = p_end;
         }
+    }
+
+    /// An `.aggregate` call: the aggregate operator's accumulator folded over
+    /// each row's frame. The inputs are gathered in `perm` order, so a frame
+    /// is one run of them. A frame that keeps the last one's start and ends
+    /// no earlier folds on into the same state, a row whose frame is the last
+    /// one's shares its result, and any other frame starts a fresh state.
+    fn evaluateAggregateCall(self: *Window, plan: CallPlan, out_idx: usize, perm: []const u32, si: SpecIndices) !void {
+        const allocator = self.allocator;
+        const spec = self.specs[plan.spec_idx];
+        const agg = plan.agg orelse return Error.WindowUnsupported;
+        const sources = [2]usize{ plan.value_col, plan.second_col };
+        const n_inputs: usize = if (agg.arg2_col != null) 2 else 1;
+        var input_schema: [2]Column = undefined;
+        for (sources[0..n_inputs], input_schema[0..n_inputs]) |src, *col| col.* = self.input_schema[src];
+        const acc = self.upstream.accountant();
+        const gathered_bytes = perm.len * exec.memory.estimateRowBytes(input_schema[0..n_inputs]);
+        if (acc) |a| try a.reserve(.window, gathered_bytes);
+        defer if (acc) |a| a.release(.window, gathered_bytes);
+        var inputs: [2]ColumnStore = undefined;
+        var input_views: [2]ColumnView = undefined;
+        var made: usize = 0;
+        defer for (inputs[0..made]) |*c| c.deinit(allocator);
+        for (sources[0..n_inputs], 0..) |src, k| {
+            inputs[k] = try ColumnStore.init(allocator, input_schema[k].type, input_schema[k].nullable);
+            made += 1;
+            try transform.appendByIndices(allocator, self.accumulated[src].view(), perm, &inputs[k]);
+            input_views[k] = inputs[k].view();
+        }
+        const batch: Batch = .{ .schema = input_schema[0..n_inputs], .values = input_views[0..n_inputs], .row_count = perm.len };
+        const in_type = input_schema[0].type;
+        const out_col = self.schema[self.input_schema.len + out_idx];
+
+        var results = try ColumnStore.init(allocator, out_col.type, out_col.nullable);
+        defer results.deinit(allocator);
+        const result_of = try allocator.alloc(u32, perm.len);
+        defer allocator.free(result_of);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var bank: StringBank = .{};
+        var state = aggregate.initialState(agg.func, in_type);
+
+        var p_start: usize = 0;
+        while (p_start < perm.len) {
+            const p_end = partitionEnd(self.accumulated, si.partition_cols, perm, p_start);
+            var frame = FrameCursor.init(self, plan.spec_idx, perm, p_start, p_end);
+            // The rows `state` holds, which the last result finalized.
+            var folded: ?[2]usize = null;
+            for (p_start..p_end) |i| {
+                const fb = try frame.bounds(spec.frame, i);
+                const lo: usize = @intCast(std.math.clamp(@as(i128, fb.start), p_start, p_end));
+                const hi: usize = @intCast(std.math.clamp(@as(i128, fb.end_inclusive) + 1, lo, p_end));
+                if (folded == null or folded.?[0] != lo or folded.?[1] != hi) {
+                    const grows = folded != null and folded.?[0] == lo and folded.?[1] < hi;
+                    const start = if (grows) folded.?[1] else blk: {
+                        _ = arena.reset(.retain_capacity);
+                        bank.reset();
+                        state = aggregate.initialState(agg.func, in_type);
+                        break :blk lo;
+                    };
+                    if (hi > start) try aggregate.updateState(arena.allocator(), &bank, &state, agg, batch, 0, @intCast(start), @intCast(hi));
+                    try aggregate.appendAccToColumn(allocator, agg, state, &results, in_type, out_col.type, null);
+                    folded = .{ lo, hi };
+                }
+                result_of[perm[i]] = @intCast(results.data.rowCount() - 1);
+            }
+            p_start = p_end;
+        }
+        const out = &self.output_columns[out_idx];
+        out.clear();
+        try transform.appendByIndices(allocator, results.view(), result_of, out);
     }
 
     fn evaluateOnePartition(
@@ -1818,6 +1905,8 @@ pub const Window = struct {
             .cume_dist => try fillCumeDist(self.accumulated, si.order_cols, perm, p_start, p_end, cell.column),
             .session_number => try fillSessionNumber(plan, self.accumulated, perm, p_start, p_end, cell.column),
             .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct => try self.fillAggregate(plan, spec, perm, p_start, p_end, cell),
+            // `evaluateCall` runs these whole.
+            .aggregate => return Error.WindowUnsupported,
         }
     }
 
@@ -2471,6 +2560,24 @@ fn buildCallPlan(c: ir.WindowCall, schema: []const Column) !Window.CallPlan {
                 else => return Error.WindowUnsupported,
             }
         },
+        .aggregate => {
+            const agg = c.agg orelse return Error.WindowUnsupported;
+            switch (agg.func) {
+                .udf, .max_by_key, .min_by_key => return Error.WindowUnsupported,
+                else => {},
+            }
+            plan.value_col = try exprColIdx(c.args[0], schema);
+            if (c.args.len == 2) plan.second_col = try exprColIdx(c.args[1], schema);
+            const second: ?Column = if (c.args.len == 2) schema[plan.second_col] else null;
+            try aggregate.validateAggFn(agg.func, schema[plan.value_col].type, agg.params, if (second) |s| s.type else null);
+            plan.agg = .{
+                .func = agg.func,
+                .col = schema[plan.value_col].name,
+                .arg2_col = if (second) |s| s.name else null,
+                .as = c.output_name,
+                .params = agg.params,
+            };
+        },
     }
     return plan;
 }
@@ -2507,6 +2614,7 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
         // String input is supported here — the operator writes into a
         // separate `string_outputs` scratch (see Window.string_outputs).
         .min, .max, .lag, .lead, .first_value, .last_value, .nth_value => schema[plan.value_col].type,
+        .aggregate => aggregate.aggOutputTypeFor(plan.agg.?, schema[plan.value_col].type),
     };
 }
 
@@ -2521,6 +2629,7 @@ fn outputNullable(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Colum
         .sum, .avg, .min, .max, .first_value, .last_value, .nth_value => true,
         .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .sum_distinct, .avg_distinct => true,
         .session_number => plan.session_delta == null,
+        .aggregate => aggregate.aggOutputNullable(plan.agg.?.func),
     };
 }
 

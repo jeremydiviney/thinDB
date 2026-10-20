@@ -121,7 +121,8 @@ pub const magic: [4]u8 = .{ 't', 'D', 'B', 'Q' };
 /// v9: a CASE carries the operands its conditions compute.
 /// v10: a join key pair carries a null-safe byte.
 /// v11: a predicate leaf can test its column's truth (`as_boolean_leaf`).
-pub const version: u16 = 11;
+/// v12: a window call carries its aggregate, if it runs one.
+pub const version: u16 = 12;
 pub const header_size: usize = 8;
 
 /// Qualified table reference. Either segment may be null when the
@@ -521,6 +522,16 @@ pub const WindowCall = struct {
     /// Output column name — user's AS alias, or a parser-derived label
     /// from the call form (e.g. "rank()").
     output_name: []const u8,
+    /// The aggregate an `.aggregate` call runs; null for every other call.
+    agg: ?WindowAgg = null,
+};
+
+/// An aggregate run over each row's frame (`MAX_BY(v, k) OVER (...)`). Its
+/// inputs are the call's args: the value, then the second column MAX_BY,
+/// COVAR_POP and an ordered GROUP_CONCAT read (`AggSpec.arg2_col`).
+pub const WindowAgg = struct {
+    func: AggFunc,
+    params: AggParams = .none,
 };
 
 pub const WindowFunc = enum(u8) {
@@ -558,6 +569,8 @@ pub const WindowFunc = enum(u8) {
     count_distinct = 24,
     sum_distinct = 25,
     avg_distinct = 26,
+    /// Any other aggregate, named by `WindowCall.agg`.
+    aggregate = 27,
 };
 
 /// Lookup table: window-function name → enum, or null when the name
@@ -618,6 +631,7 @@ pub fn windowFuncName(f: WindowFunc) []const u8 {
         .count_distinct => "count_distinct",
         .sum_distinct => "sum_distinct",
         .avg_distinct => "avg_distinct",
+        .aggregate => "aggregate",
     };
 }
 
@@ -1589,6 +1603,13 @@ fn encodeWindow(allocator: Allocator, out: *std.ArrayList(u8), w: WindowOp) Enco
         try out.appendSlice(allocator, c.output_name);
         try appendU32(allocator, out, @intCast(c.args.len));
         for (c.args) |a| try encodeExpr(allocator, out, a);
+        if (c.agg) |agg| {
+            try out.append(allocator, 1);
+            try out.append(allocator, @intFromEnum(agg.func));
+            try encodeAggParams(allocator, out, agg.params);
+        } else {
+            try out.append(allocator, 0);
+        }
     }
     try encodeOp(allocator, out, w.upstream.*);
 }
@@ -2122,33 +2143,37 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
         }
         try appendU32(allocator, out, @intCast(a.as.len));
         try out.appendSlice(allocator, a.as);
-        // params tag (u8) + payload (matches decoder)
-        switch (a.params) {
-            .none => try out.append(allocator, 0),
-            .percentile => |p| {
-                try out.append(allocator, 1);
-                const bits: u64 = @bitCast(p);
-                var b: [8]u8 = undefined;
-                std.mem.writeInt(u64, &b, bits, .little);
-                try out.appendSlice(allocator, &b);
-            },
-            .concat => |c| {
-                try out.append(allocator, if (c.distinct) 3 else 2);
-                try appendU32(allocator, out, @intCast(c.separator.len));
-                try out.appendSlice(allocator, c.separator);
-            },
-            .top_k => |k| {
-                try out.append(allocator, 4);
-                try appendU32(allocator, out, k);
-            },
-            .mann_whitney => |m| {
-                try out.append(allocator, 5);
-                try out.append(allocator, @intFromEnum(m.alternative));
-                try out.append(allocator, @intFromBool(m.continuity_correction));
-            },
-        }
+        try encodeAggParams(allocator, out, a.params);
     }
     try encodeOp(allocator, out, g.upstream.*);
+}
+
+/// A params tag (u8) and its payload, as `decodeAggParams` reads them.
+fn encodeAggParams(allocator: Allocator, out: *std.ArrayList(u8), params: AggParams) EncodeError!void {
+    switch (params) {
+        .none => try out.append(allocator, 0),
+        .percentile => |p| {
+            try out.append(allocator, 1);
+            const bits: u64 = @bitCast(p);
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, bits, .little);
+            try out.appendSlice(allocator, &b);
+        },
+        .concat => |c| {
+            try out.append(allocator, if (c.distinct) 3 else 2);
+            try appendU32(allocator, out, @intCast(c.separator.len));
+            try out.appendSlice(allocator, c.separator);
+        },
+        .top_k => |k| {
+            try out.append(allocator, 4);
+            try appendU32(allocator, out, k);
+        },
+        .mann_whitney => |m| {
+            try out.append(allocator, 5);
+            try out.append(allocator, @intFromEnum(m.alternative));
+            try out.append(allocator, @intFromBool(m.continuity_correction));
+        },
+    }
 }
 
 fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) EncodeError!void {
@@ -2707,39 +2732,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 cursor.* += 1;
                 const arg2_col: ?[]const u8 = if (has_arg2_col != 0) try readString(bytes, cursor) else null;
                 const as = try readString(bytes, cursor);
-                // AggParams tag: 0=none, 1=percentile (f64 payload),
-                // 2=concat separator (string payload), 3=the same, DISTINCT,
-                // 4=top_k (u32 payload), 5=mann_whitney (alternative and
-                // continuity-correction bytes).
-                // Older encoders omit it; we treat absence as .none for
-                // back-compat with pre-params IR.
-                if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
-                const params_tag = bytes[cursor.*];
-                cursor.* += 1;
-                const params: exec_aggregate.AggParams = switch (params_tag) {
-                    0 => .none,
-                    1 => blk2: {
-                        if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
-                        const bits = std.mem.readInt(u64, bytes[cursor.*..][0..8], .little);
-                        cursor.* += 8;
-                        break :blk2 .{ .percentile = @as(f64, @bitCast(bits)) };
-                    },
-                    2, 3 => .{ .concat = .{ .separator = try readString(bytes, cursor), .distinct = params_tag == 3 } },
-                    4 => blk2: {
-                        if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
-                        const k = readU32(bytes[cursor.* .. cursor.* + 4]);
-                        cursor.* += 4;
-                        break :blk2 .{ .top_k = k };
-                    },
-                    5 => blk2: {
-                        if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
-                        const alternative = std.enums.fromInt(exec_aggregate.MannWhitneyParams.Alternative, bytes[cursor.*]) orelse return Error.IrCorrupt;
-                        const correction = bytes[cursor.* + 1] != 0;
-                        cursor.* += 2;
-                        break :blk2 .{ .mann_whitney = .{ .alternative = alternative, .continuity_correction = correction } };
-                    },
-                    else => return Error.IrCorrupt,
-                };
+                const params = try decodeAggParams(bytes, cursor);
                 a.* = .{ .func = func, .udf_name = udf_name, .udf_arg_cols = udf_arg_cols, .col = col, .arg2_col = arg2_col, .as = as, .params = params };
             }
 
@@ -2944,6 +2937,39 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     };
 }
 
+/// AggParams tag: 0=none, 1=percentile (f64 payload), 2=concat separator
+/// (string payload), 3=the same, DISTINCT, 4=top_k (u32 payload),
+/// 5=mann_whitney (alternative and continuity-correction bytes).
+fn decodeAggParams(bytes: []const u8, cursor: *usize) DecodeError!AggParams {
+    if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+    const params_tag = bytes[cursor.*];
+    cursor.* += 1;
+    return switch (params_tag) {
+        0 => .none,
+        1 => blk: {
+            if (cursor.* + 8 > bytes.len) return Error.IrCorrupt;
+            const bits = std.mem.readInt(u64, bytes[cursor.*..][0..8], .little);
+            cursor.* += 8;
+            break :blk .{ .percentile = @as(f64, @bitCast(bits)) };
+        },
+        2, 3 => .{ .concat = .{ .separator = try readString(bytes, cursor), .distinct = params_tag == 3 } },
+        4 => blk: {
+            if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
+            const k = readU32(bytes[cursor.* .. cursor.* + 4]);
+            cursor.* += 4;
+            break :blk .{ .top_k = k };
+        },
+        5 => blk: {
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const alternative = std.enums.fromInt(exec_aggregate.MannWhitneyParams.Alternative, bytes[cursor.*]) orelse return Error.IrCorrupt;
+            const correction = bytes[cursor.* + 1] != 0;
+            cursor.* += 2;
+            break :blk .{ .mann_whitney = .{ .alternative = alternative, .continuity_correction = correction } };
+        },
+        else => Error.IrCorrupt,
+    };
+}
+
 fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!Op {
     if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
     const n_specs = readU32(bytes[cursor.* .. cursor.* + 4]);
@@ -3010,7 +3036,7 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         cursor.* += 4;
         const func_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (func_byte > @intFromEnum(WindowFunc.avg_distinct)) return Error.IrCorrupt;
+        if (func_byte > @intFromEnum(WindowFunc.aggregate)) return Error.IrCorrupt;
         const func: WindowFunc = @enumFromInt(func_byte);
         const ignore_nulls = bytes[cursor.*] != 0;
         cursor.* += 1;
@@ -3026,12 +3052,24 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
             a.* = try decodeExpr(allocator, bytes, cursor);
             inited_args += 1;
         }
+        if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+        const has_agg = bytes[cursor.*] != 0;
+        cursor.* += 1;
+        if (has_agg != (func == .aggregate)) return Error.IrCorrupt;
+        const agg: ?WindowAgg = if (has_agg) blk: {
+            if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
+            const agg_byte = bytes[cursor.*];
+            cursor.* += 1;
+            if (agg_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
+            break :blk .{ .func = @enumFromInt(agg_byte), .params = try decodeAggParams(bytes, cursor) };
+        } else null;
         calls[j] = .{
             .spec_idx = spec_idx,
             .func = func,
             .args = args,
             .ignore_nulls = ignore_nulls,
             .output_name = output_name,
+            .agg = agg,
         };
         initialized_calls = j + 1;
     }
@@ -4398,6 +4436,38 @@ test "ir: a lambda argument round-trips" {
 
     try std.testing.expect(decoded == .compute);
     try std.testing.expect(exec_expr.eql(call, decoded.compute.derived[0].expr));
+}
+
+test "ir: a window call's aggregate round-trips" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "t" } } };
+    const partition = [_][]const u8{"g"};
+    const specs = [_]WindowSpec{.{ .partition_by = &partition, .order_by = &.{}, .frame = Frame.default_no_order }};
+    const concat_args = [_]Expr{ .{ .col_ref = "v" }, .{ .col_ref = "k" } };
+    const rank_args = [_]Expr{};
+    const calls = [_]WindowCall{
+        .{ .spec_idx = 0, .func = .aggregate, .args = &concat_args, .ignore_nulls = false, .output_name = "a", .agg = .{ .func = .group_concat, .params = .{ .concat = .{ .separator = "-", .distinct = true } } } },
+        .{ .spec_idx = 0, .func = .rank, .args = &rank_args, .ignore_nulls = false, .output_name = "r" },
+    };
+    const root: Op = .{ .window = .{ .specs = &specs, .calls = &calls, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expect(decoded == .window);
+    const got = decoded.window.calls;
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqual(WindowFunc.aggregate, got[0].func);
+    try std.testing.expectEqual(AggFunc.group_concat, got[0].agg.?.func);
+    try std.testing.expectEqualStrings("-", got[0].agg.?.params.concat.separator);
+    try std.testing.expect(got[0].agg.?.params.concat.distinct);
+    try std.testing.expectEqual(@as(usize, 2), got[0].args.len);
+    try std.testing.expectEqual(@as(?WindowAgg, null), got[1].agg);
 }
 
 test "ir: join round-trips with on + range + extra_predicate + skew" {
