@@ -518,7 +518,7 @@ fn keptValueWidth(st: exec.PipelineStats, schema: []const types.Column, idx: usi
 /// per group.
 fn keepsValue(func: ir.AggFunc) bool {
     return switch (func) {
-        .min, .max, .any_value, .first, .last, .max_by => true,
+        .min, .max, .any_value, .first, .last, .max_by, .min_by => true,
         else => false,
     };
 }
@@ -905,7 +905,7 @@ fn groupState(
         const key_t: ?types.Type = if (key_idx) |i| schema[i].type else null;
         slot += exec.aggregate_op.aggStateWidth(a.func, in_t, key_t);
         switch (a.func) {
-            .min, .max, .any_value, .first, .last, .max_by => {
+            .min, .max, .any_value, .first, .last, .max_by, .min_by => {
                 const string_value = if (in_t) |t| t.isVarlen() else false;
                 if (string_value) {
                     group += valueWidth(st, schema, in_idx.?) + columnRowBytes(st, schema, in_idx.?);

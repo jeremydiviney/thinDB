@@ -3475,11 +3475,11 @@ fn passColumn(a: exec.AggSpec, in_schema: []const Column, out: types.Type) ?Pass
         const name = a.col orelse return .one;
         return .{ .valid = types.findColumn(in_schema, name) orelse return null };
     }
-    const name = (if (a.func == .max_by_key) a.arg2_col else a.col) orelse return null;
+    const name = (if (a.func == .max_by_key or a.func == .min_by_key) a.arg2_col else a.col) orelse return null;
     const idx = types.findColumn(in_schema, name) orelse return null;
     const in = in_schema[idx].type;
     return switch (a.func) {
-        .min, .max, .any_value, .max_by, .max_by_key => if (std.meta.eql(in, out)) .{ .view = idx } else null,
+        .min, .max, .any_value, .max_by, .max_by_key, .min_by, .min_by_key => if (std.meta.eql(in, out)) .{ .view = idx } else null,
         .sum => switch (in) {
             .tinyint, .smallint, .int => if (out == .bigint) .{ .widen_int = idx } else null,
             .bigint, .largeint, .double => if (std.meta.eql(in, out)) .{ .view = idx } else null,
