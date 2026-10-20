@@ -158,12 +158,11 @@ pub fn frameBoundsEqual(a: ir.FrameBound, b: ir.FrameBound) bool {
 // previously lived on the Parser struct.
 // ---------------------------------------------------------------------------
 
-/// Consume an optional `IGNORE NULLS` / `RESPECT NULLS` modifier
-/// between a function's closing `)` and its `OVER` keyword. Returns
-/// `true` only for `IGNORE NULLS`. `RESPECT NULLS` is consumed and
-/// ignored — it's the SQL-standard default and the operator behaves
+/// Consume an optional `IGNORE NULLS` / `RESPECT NULLS` modifier.
+/// Returns null when there is none, else whether it is `IGNORE NULLS`.
+/// `RESPECT NULLS` is the SQL-standard default and the operator behaves
 /// the same either way.
-pub fn parseIgnoreNulls(p: anytype) !bool {
+pub fn parseNullTreatment(p: anytype) !?bool {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .kw_ignore) {
         try p.advance();
@@ -177,7 +176,17 @@ pub fn parseIgnoreNulls(p: anytype) !bool {
         try p.advance();
         return false;
     }
-    return false;
+    return null;
+}
+
+/// Whether a call ignores NULLs: its modifier is written either inside
+/// the parentheses (`inside`, from `parseCallArgList`) or between the
+/// closing `)` and `OVER`, but not both.
+pub fn callIgnoresNulls(p: anytype, inside: ?bool) !bool {
+    const PE = @TypeOf(p.*).Err;
+    const after = try parseNullTreatment(p);
+    if (inside != null and after != null) return PE.SqlInvalidProjection;
+    return (inside orelse after) orelse false;
 }
 
 /// NULLS is a word only after IGNORE / RESPECT or a sort key; elsewhere it is

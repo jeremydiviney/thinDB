@@ -559,6 +559,40 @@ test "window: FIRST_VALUE IGNORE NULLS finds first non-null in partition" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 30, 30, 30, 30 }, vals);
 }
 
+test "window: IGNORE NULLS / RESPECT NULLS inside the call parentheses" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, qty BIGINT)");
+    try helpers.exec(allocator, db, "INSERT INTO t VALUES (1, 10), (2, NULL), (3, NULL), (4, 40), (5, 50)");
+
+    const cases = .{
+        .{ "SELECT lag(qty IGNORE NULLS) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ null, "10", "10", "10", "40" } },
+        .{ "SELECT lag(qty, 1) IGNORE NULLS OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ null, "10", "10", "10", "40" } },
+        .{ "SELECT lag(qty IGNORE NULLS, 2) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ null, null, null, null, "10" } },
+        .{ "SELECT lag(qty IGNORE NULLS, 2, -1) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ "-1", "-1", "-1", "-1", "10" } },
+        .{ "SELECT lead(qty IGNORE NULLS, 1, -1) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ "40", "40", "40", "50", "-1" } },
+        .{ "SELECT lag(qty RESPECT NULLS, 1) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ null, "10", null, null, "40" } },
+        .{ "SELECT last_value(qty IGNORE NULLS) OVER (ORDER BY id) FROM t ORDER BY id", &[_]?[]const u8{ "10", "10", "10", "40", "50" } },
+        .{ "SELECT first_value(qty IGNORE NULLS) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id", &[_]?[]const u8{ "40", "40", "40", "50", null } },
+        .{ "SELECT coalesce(lag(qty IGNORE NULLS) OVER (ORDER BY id), 0) FROM t ORDER BY id", &[_]?[]const u8{ "0", "10", "10", "10", "40" } },
+        .{ "SELECT CASE WHEN lag(qty IGNORE NULLS) OVER (ORDER BY id) > 10 THEN 1 ELSE 0 END FROM t ORDER BY id", &[_]?[]const u8{ "0", "0", "0", "0", "1" } },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, c[0], c[1]);
+
+    const rejected = .{
+        "SELECT lag(qty IGNORE NULLS) IGNORE NULLS OVER (ORDER BY id) FROM t",
+        "SELECT lag(qty IGNORE NULLS, 1 IGNORE NULLS) OVER (ORDER BY id) FROM t",
+        "SELECT sum(qty IGNORE NULLS) OVER (ORDER BY id) FROM t",
+        "SELECT lag(qty IGNORE NULLS) FROM t",
+        "SELECT abs(qty IGNORE NULLS) FROM t",
+    };
+    inline for (rejected) |sql| try helpers.expectRunError(allocator, db, sql, error.SqlInvalidProjection);
+}
+
 test "window: NTILE(4) divides 10 rows into 4 buckets of 3,3,2,2" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
