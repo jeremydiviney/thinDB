@@ -223,16 +223,14 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     if (try p.prefixOperatorAhead() or p.cur.tag == .system_variable or p.cur.tag == .lbracket or try p.nestedLiteralAhead() or try literalLedAhead(p)) {
         return try parseScalarLhs(p);
     }
-    // `@var op X` — a session var on the LHS (constant guard, e.g.
-    // `@comparisonMonths > 1`). Symmetric to the literal-LHS form above: the
-    // var resolves to a literal pre-compile, so both sides materialize as
-    // constant columns. A bare `@var` is its truth (`truthPredicate`).
+    // A session var on the LHS (a constant guard, e.g.
+    // `@comparisonMonths > 1`, `@v IS NULL`). Like the literal-LHS form
+    // above: the var resolves to a literal pre-compile, so both sides
+    // materialize as constant columns. A bare `@var` is its truth.
     if (p.cur.tag == .at_identifier) {
         const var_name = try p.arena.dupe(u8, p.cur.text);
         try p.advance();
-        const lhs_expr = ir.Expr{ .var_ref = var_name };
-        if (try parseComparisonTail(p, lhs_expr)) |pred| return pred;
-        return try truthPredicate(p, lhs_expr);
+        return try parseExprOps(p, .{ .var_ref = var_name });
     }
     // A CASE expression or a keyword-named call (`IF(...)`) can only be a
     // scalar operand here.
