@@ -1547,6 +1547,15 @@ per outer row. Its names bind as SQL scopes them (§9.8), and the ones it
 reads from enclosing queries, one level out or more, are its correlation.
 Two strategies apply, the first that fits.
 
+An EXISTS or IN subquery's filter conjunct that reads only enclosing values
+(`WHERE o.flag`) ties the outer row to no inner row: where it isn't TRUE,
+the subquery has no rows. It is lifted out as a guard on the outer row,
+unless an aggregate without GROUP BY above it makes a row of none. EXISTS
+and IN hold where the guard holds and the rest of the subquery does; NOT
+EXISTS and NOT IN hold where the guard isn't TRUE or the rest does. The
+rest takes the strategies below, or runs once when nothing else correlates
+it, rather than pairing every enclosing value with every inner row.
+
 Keyed. When the subquery's WHERE ties its own columns to enclosing values
 only by equalities (`inner = outer`) and ranges (`inner < outer`), its inner
 block runs once without those terms and projects their inner sides. The

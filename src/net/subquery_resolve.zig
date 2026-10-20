@@ -1556,6 +1556,103 @@ fn rebuildBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, columns: []cons
     return try newOp(ctx, .{ .select = .{ .columns = columns, .upstream = cur } });
 }
 
+/// A subquery's filter conjuncts that read only the outer row, ANDed, and
+/// the subquery without them.
+const OuterGuard = struct {
+    guard: PredicateExpr,
+    rest: *ir.Op,
+};
+
+/// Where a conjunct over the outer row alone isn't TRUE, its filter passes
+/// none of the block's rows, so the block has none, unless an operator above
+/// makes a row of none, as an aggregate without GROUP BY does. Such a
+/// conjunct tests the outer row and ties it to no inner row: lifted onto the
+/// domain, it would pair every outer value with every inner row. Null when
+/// the block has none.
+fn outerGuard(ctx: *CompileCtx, top: *const ir.Op) !?OuterGuard {
+    const na = ctx.nodeArena();
+    const block = try splitBlock(ctx, top);
+    const above_global = for (block.chain, 0..) |op, i| {
+        if (op.* == .group_by and op.group_by.group_cols.len == 0) break i;
+    } else block.chain.len;
+    var scope = try ScopeBuilder.build(ctx, block, true);
+    var guards: std.ArrayList(PredicateExpr) = .empty;
+    const rest = try na.alloc(?PredicateExpr, block.chain.len);
+    @memset(rest, null);
+    var i = block.chain.len;
+    while (i > 0) {
+        i -= 1;
+        switch (block.chain[i].*) {
+            .select => |p| scope = try scope.above(na, p),
+            .filter => |f| if (i < above_global) {
+                var kept: std.ArrayList(PredicateExpr) = .empty;
+                const before = guards.items.len;
+                try splitOuterConjuncts(na, f.predicate, scope, &guards, &kept);
+                if (guards.items.len > before) rest[i] = if (kept.items.len == 0) .{ .always = true } else try conjunction(ctx, kept.items);
+            },
+            else => {},
+        }
+    }
+    if (guards.items.len == 0) return null;
+
+    var cur: *ir.Op = @constCast(block.from);
+    i = block.chain.len;
+    while (i > 0) {
+        i -= 1;
+        var copy = block.chain[i].*;
+        if (rest[i]) |kept| {
+            if (kept == .always) continue;
+            copy.filter.predicate = kept;
+        }
+        const op = try newOp(ctx, copy);
+        relink(op, cur);
+        cur = op;
+    }
+    return .{ .guard = try conjunction(ctx, guards.items), .rest = cur };
+}
+
+fn splitOuterConjuncts(na: Allocator, pred: PredicateExpr, scope: Scope, guards: *std.ArrayList(PredicateExpr), kept: *std.ArrayList(PredicateExpr)) Allocator.Error!void {
+    if (pred == .@"and") {
+        for (pred.@"and") |child| try splitOuterConjuncts(na, child, scope, guards, kept);
+        return;
+    }
+    var sides: RefSides = .{ .scope = scope };
+    sides.readPredicate(pred);
+    try (if (sides.outer and !sides.inner and !sides.nested) guards else kept).append(na, pred);
+}
+
+/// `pred` as the guard ANDed with its subquery without the guard: an outer
+/// row the guard fails sees no rows, so IN and EXISTS fail there, and NOT IN
+/// and NOT EXISTS hold, for a NULL compared value too. The mask-level NOT
+/// reads an UNKNOWN guard as FALSE, so the negated forms hold wherever the
+/// guard isn't TRUE.
+fn resolveGuarded(ctx: *CompileCtx, pred: *PredicateExpr, guarded: OuterGuard, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !void {
+    const aa = try ctx.subqueryArena();
+    const rest = try aa.create(PredicateExpr);
+    rest.* = if (in_subquery) |s| blk: {
+        var copy = s;
+        copy.source = guarded.rest;
+        break :blk .{ .in_subquery = copy };
+    } else .{ .exists_subquery = guarded.rest };
+    if (negate and in_subquery == null) {
+        const exists = try aa.create(PredicateExpr);
+        exists.* = rest.*;
+        rest.* = .{ .not = exists };
+    }
+    try resolveSubqueriesInPredicate(ctx, rest, lowered);
+    const parts = try aa.alloc(PredicateExpr, 2);
+    parts[1] = rest.*;
+    if (negate) {
+        const guard = try aa.create(PredicateExpr);
+        guard.* = guarded.guard;
+        parts[0] = .{ .not = guard };
+        pred.* = .{ .@"or" = parts };
+    } else {
+        parts[0] = guarded.guard;
+        pred.* = .{ .@"and" = parts };
+    }
+}
+
 /// Decorrelate an EXISTS (`in_subquery` null) or IN subquery that reads the
 /// outer row. One whose WHERE ties its rows to the outer row by equalities
 /// and ranges is keyed on its own columns (`planKeyedBlock`), as is each
@@ -1566,6 +1663,10 @@ fn rebuildBlock(ctx: *CompileCtx, block: *const CorrelatedBlock, columns: []cons
 /// subquery to the uncorrelated paths.
 fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const anyopaque, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) !bool {
     const top: *const ir.Op = @ptrCast(@alignCast(source));
+    if (try outerGuard(ctx, top)) |guarded| {
+        try resolveGuarded(ctx, pred, guarded, negate, in_subquery, lowered);
+        return true;
+    }
     const in_width: ?usize = if (in_subquery) |s| 1 + s.rest_cols.len else null;
     if (try analyzeBlockCorrelation(ctx, top, in_width)) |block| {
         if (try planKeyedBlock(ctx, &block, in_subquery, lowered)) |plan| {
