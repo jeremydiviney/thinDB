@@ -355,6 +355,35 @@ test "session var: a variable holds an array, map or struct" {
     try std.testing.expectError(error.UnsupportedOp, runSql(allocator, db, "SET @arr = [9]; SELECT id FROM uv WHERE a = @arr"));
 }
 
+test "session var: a large array variable is read once by a call, not copied to every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Copied to each of the 5,000 rows, a 100,000-element array is gigabytes,
+    // far past the budget.
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .query_memory_budget = 64 << 20 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE big (id INT, s VARCHAR(16))");
+    try exec(allocator, db, "INSERT INTO big SELECT generate_series, concat('v', generate_series) FROM TABLE(generate_series(1, 5000))");
+
+    const cases = .{
+        .{ .sql = "SET @arr = array_repeat('abcdefg', 100000); SELECT SUM(array_contains(@arr, 'abcdefg')) FROM big", .expected = 5000 },
+        .{ .sql = "SET @arr = array_repeat('abcdefg', 100000); SELECT SUM(array_contains(@arr, s)) FROM big", .expected = 0 },
+        .{ .sql = "SET @arr = array_append(array_repeat('abcdefg', 100000), 'v7'); SELECT SUM(array_position(@arr, s)) FROM big", .expected = 100001 },
+        .{ .sql = "SET @arr = array_generate(1, 100000); SELECT SUM(array_contains(@arr, id)) FROM big", .expected = 5000 },
+        .{ .sql = "SET @arr = array_generate(1, 100000); SELECT SUM(array_position(@arr, id * 10)) FROM big", .expected = 125025000 },
+        .{ .sql = "SET @arr = array_generate(1, 100000); SELECT SUM(array_length(@arr)) FROM big", .expected = 500000000 },
+        // A NULL value finds a NULL element, in its place.
+        .{ .sql = "SET @arr = array_append(array_generate(1, 1000), NULL); SELECT SUM(array_position(@arr, IF(id > 10, NULL, id))) FROM big", .expected = 4995045 },
+        .{ .sql = "SET @arr = array_map(x -> CAST(x AS DOUBLE) / 4, array_generate(1, 100000)); SELECT SUM(array_contains(@arr, CAST(id AS DOUBLE) / 4)) FROM big", .expected = 5000 },
+    };
+    inline for (cases) |c| {
+        const got = try collectBigints(allocator, db, c.sql);
+        defer allocator.free(got);
+        try std.testing.expectEqualSlices(i64, &.{c.expected}, got);
+    }
+}
+
 test "session var: a scalar subquery's array, map, struct or JSON keeps its type" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

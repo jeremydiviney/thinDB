@@ -969,7 +969,7 @@ pub fn deinit(self: *Self) void
 | `Scan` | Read row groups from a table; prunes via manifest stats; applies tombstones via bitset |
 | `Filter` | Evaluates predicate; produces a bitmap-selected batch |
 | `Project` | Selects / renames / excludes columns |
-| `Compute` | Derived columns via scalar functions (with implicit coercion). A constant argument is repeated on every row, so a batch value whose text passes 4 GiB is `MemoryBudgetExceeded` |
+| `Compute` | Derived columns via scalar functions (with implicit coercion). A call of an immutable built-in over only constants runs once, over one row, and its value repeats on every row. A function whose kernel reads a one-row argument for every row (`ScalarFn.broadcast_args`: ARRAY_CONTAINS, ARRAY_POSITION) takes a constant argument once instead, and looks each row's value up in a constant array by hash. A batch value whose text passes 4 GiB is `MemoryBudgetExceeded` |
 | `Aggregate` | Hash-group + standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) plus statistical (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `COVAR_POP`, `COVAR_SAMP`, `CORR`), `COUNT_DISTINCT`, `PERCENTILE_CONT`/`DISC`/`APPROX`/`APPROX_WEIGHTED`, `GROUP_CONCAT`, `APPROX_TOP_K` |
 | `Sort` | Materializes, sorts by key columns, streams sorted batches |
 | `Limit` | Stops after N rows |

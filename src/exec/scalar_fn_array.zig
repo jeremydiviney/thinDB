@@ -72,6 +72,14 @@ pub fn overload(aa: Allocator, name: []const u8, arg_types: []const Type, return
     };
 }
 
+/// `overload` of a kernel that reads an argument of one row on every row
+/// (`ScalarFn.broadcast_args`).
+fn broadcastOverload(aa: Allocator, name: []const u8, arg_types: []const Type, return_type: Type, kernel: TypedKernel) !?ResolvedOverload {
+    var r = (try overload(aa, name, arg_types, return_type, kernel)).?;
+    r.func.broadcast_args = true;
+    return r;
+}
+
 /// The overload of an array function, or null when `name` is none or its
 /// arguments don't fit it.
 pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Allocator.Error!?ResolvedOverload {
@@ -188,8 +196,8 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
         if (arg_types.len != 2) return null;
         const c = comparedType(element, arg_types[1]) orelse return null;
         if (!try castable(aa, element, c) or !try castable(aa, arg_types[1], c)) return null;
-        if (eql(name, "array_contains")) return overload(aa, name, arg_types, .boolean, containsKernel);
-        if (eql(name, "array_position")) return overload(aa, name, arg_types, .int, positionKernel);
+        if (eql(name, "array_contains")) return broadcastOverload(aa, name, arg_types, .boolean, containsKernel);
+        if (eql(name, "array_position")) return broadcastOverload(aa, name, arg_types, .int, positionKernel);
         if (eql(name, "array_remove")) return overload(aa, name, arg_types, array, removeKernel);
         if (eql(name, "array_append")) return overload(aa, name, arg_types, try types.arrayOf(c), appendKernel);
         return null;
@@ -489,6 +497,18 @@ fn cellBytes(v: ColumnView, i: usize) []const u8 {
     return switch (v.data) {
         .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv.rowBytes(i),
         inline else => |s| std.mem.asBytes(&s[i]),
+    };
+}
+
+/// A hash of row `i` of `v` that agrees with `cellsEqual`.
+fn cellHash(v: ColumnView, i: usize) u64 {
+    if (!v.isValid(i)) return 0;
+    return switch (v.data) {
+        inline .float, .double => |s| {
+            const bits = types.canonicalFloatBits(s[i]);
+            return std.hash.Wyhash.hash(0, std.mem.asBytes(&bits));
+        },
+        else => std.hash.Wyhash.hash(0, cellBytes(v, i)),
     };
 }
 
@@ -1388,26 +1408,95 @@ fn joinKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, arg
 // ---------------------------------------------------------------------------
 
 /// An array argument's elements and a value argument, both as the type they
-/// compare in (`comparedType`).
+/// compare in (`comparedType`). Either may be broadcast, one row for all
+/// (`ScalarFn.broadcast_args`); one array for all looks values up by hash.
 const ArrayAndValue = struct {
     fa: FlatAs,
     value: AsType,
+    one_array: bool,
+    one_value: bool,
+    index: ?ElementIndex,
 
     fn init(allocator: Allocator, arg_types: []const Type, args: []const ColumnView, rows: usize) !ArrayAndValue {
         const c = comparedType(arg_types[0].arrayElement().?, arg_types[1]) orelse return Error.ComputeNoSuchOverload;
-        var fa = try FlatAs.init(allocator, arg_types[0], args[0], c, rows);
+        const array_rows = scalar_fn.broadcastRows(args[0], rows);
+        var fa = try FlatAs.init(allocator, arg_types[0], args[0], c, array_rows);
         errdefer fa.deinit(allocator);
-        return .{ .fa = fa, .value = try AsType.init(allocator, args[1], arg_types[1], c, rows) };
+        const value_rows = scalar_fn.broadcastRows(args[1], rows);
+        var value = try AsType.init(allocator, args[1], arg_types[1], c, value_rows);
+        errdefer value.deinit(allocator);
+        const one_array = array_rows < rows;
+        const index = if (one_array) try ElementIndex.init(allocator, fa.elements.view, fa.start(0), fa.end(0)) else null;
+        return .{ .fa = fa, .value = value, .one_array = one_array, .one_value = value_rows < rows, .index = index };
     }
 
     fn deinit(self: *ArrayAndValue, allocator: Allocator) void {
+        if (self.index) |*ix| ix.deinit(allocator);
         self.value.deinit(allocator);
         self.fa.deinit(allocator);
     }
 
-    fn find(self: *const ArrayAndValue, row: usize) ?usize {
-        return findIn(self.fa.elements.view, self.fa.start(row), self.fa.end(row), self.value.view, row);
+    /// The row of the array argument that row `row` reads.
+    fn arrayRow(self: *const ArrayAndValue, row: usize) usize {
+        return if (self.one_array) 0 else row;
     }
+
+    fn find(self: *const ArrayAndValue, row: usize) ?usize {
+        const j = if (self.one_value) 0 else row;
+        if (self.index) |*ix| return ix.find(self.fa.elements.view, self.value.view, j);
+        const a = self.arrayRow(row);
+        return findIn(self.fa.elements.view, self.fa.start(a), self.fa.end(a), self.value.view, j);
+    }
+};
+
+/// One array's elements by value: the first of each, found by hash where a
+/// scan would read every element for every row that looks one up.
+const ElementIndex = struct {
+    first: std.HashMapUnmanaged(u32, void, ElementContext, std.hash_map.default_max_load_percentage),
+
+    fn init(allocator: Allocator, elements: ColumnView, start: usize, end: usize) !ElementIndex {
+        var ix: ElementIndex = .{ .first = .empty };
+        errdefer ix.first.deinit(allocator);
+        const ctx: ElementContext = .{ .elements = elements };
+        try ix.first.ensureTotalCapacityContext(allocator, @intCast(end - start), ctx);
+        for (start..end) |i| _ = ix.first.getOrPutAssumeCapacityContext(@intCast(i), ctx);
+        return ix;
+    }
+
+    fn deinit(self: *ElementIndex, allocator: Allocator) void {
+        self.first.deinit(allocator);
+    }
+
+    /// The first element equal to row `j` of `x`.
+    fn find(self: *const ElementIndex, elements: ColumnView, x: ColumnView, j: usize) ?usize {
+        const i = self.first.getKeyAdapted(j, ProbeContext{ .elements = elements, .probe = x }) orelse return null;
+        return i;
+    }
+
+    const ElementContext = struct {
+        elements: ColumnView,
+
+        pub fn hash(self: ElementContext, i: u32) u64 {
+            return cellHash(self.elements, i);
+        }
+
+        pub fn eql(self: ElementContext, a: u32, b: u32) bool {
+            return cellsEqual(self.elements, a, self.elements, b);
+        }
+    };
+
+    const ProbeContext = struct {
+        elements: ColumnView,
+        probe: ColumnView,
+
+        pub fn hash(self: ProbeContext, j: usize) u64 {
+            return cellHash(self.probe, j);
+        }
+
+        pub fn eql(self: ProbeContext, j: usize, i: u32) bool {
+            return cellsEqual(self.probe, j, self.elements, i);
+        }
+    };
 };
 
 fn containsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
@@ -1415,7 +1504,7 @@ fn containsKernel(allocator: Allocator, arg_types: []const Type, out_type: Type,
     var av = try ArrayAndValue.init(allocator, arg_types, args, rows);
     defer av.deinit(allocator);
     for (0..rows) |r| {
-        if (!args[0].isValid(r)) {
+        if (!args[0].isValid(av.arrayRow(r))) {
             try out.appendNulls(allocator, 1);
             continue;
         }
@@ -1430,11 +1519,11 @@ fn positionKernel(allocator: Allocator, arg_types: []const Type, out_type: Type,
     var av = try ArrayAndValue.init(allocator, arg_types, args, rows);
     defer av.deinit(allocator);
     for (0..rows) |r| {
-        if (!args[0].isValid(r)) {
+        if (!args[0].isValid(av.arrayRow(r))) {
             try out.appendNulls(allocator, 1);
             continue;
         }
-        const at: i32 = if (av.find(r)) |i| @intCast(i - av.fa.start(r) + 1) else 0;
+        const at: i32 = if (av.find(r)) |i| @intCast(i - av.fa.start(av.arrayRow(r)) + 1) else 0;
         try appendValue(allocator, out, "int", at);
     }
 }
