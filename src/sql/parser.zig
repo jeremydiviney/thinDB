@@ -5843,6 +5843,11 @@ pub const Parser = struct {
             } else null;
             if (rb) |r| self.recursive_parse = r;
             const body = try self.parseStatement();
+            // A recursive CTE's body reads the CTE itself, so it can't compile
+            // alone to tell a star's columns.
+            if (rb) |r| if (r.self_refs > 0 and column_names != null) {
+                for (self.select_output) |p| if (p.kind == .star) return ParseError.SqlColumnListOverStar;
+            };
             const renamed = if (column_names) |names| try self.renameOutputs(body, self.select_output, names) else body;
             const op = if (rb) |r| (if (r.self_refs > 0) try self.recursiveCte(r, body, renamed) else renamed) else renamed;
             try self.expect(.rparen);
@@ -7918,7 +7923,14 @@ pub const Parser = struct {
     /// the SELECT list the parser recorded for `body`; a set operation's
     /// columns are its first operand's.
     fn renameOutputs(self: *Parser, body: *ir.Op, output: []const ProjItem, names: []const []const u8) ParseError!*ir.Op {
-        for (output) |p| if (p.kind == .star) return ParseError.SqlColumnListOverStar;
+        // The rename reads the query as a derived table does, through its own
+        // boundary, so it projects over any query shape.
+        const boundary = try self.allocOp(.{ .materialize = .{ .upstream = body, .structural_cse = true } });
+        // A star's columns are known only once its FROM is, so the names
+        // apply by position then.
+        for (output) |p| if (p.kind == .star) {
+            return try self.allocOp(.{ .select = .{ .columns = &.{"*"}, .column_list = names, .upstream = boundary } });
+        };
         if (output.len != names.len) return ParseError.SqlColumnListCountMismatch;
         const columns = try self.arena.alloc([]const u8, names.len);
         const outputs = try self.arena.alloc(?[]const u8, names.len);
@@ -7926,9 +7938,6 @@ pub const Parser = struct {
             column.* = outputColumnName(p);
             out.* = name;
         }
-        // The rename reads the query as a derived table does, through its own
-        // boundary, so it projects over any query shape.
-        const boundary = try self.allocOp(.{ .materialize = .{ .upstream = body, .structural_cse = true } });
         return try self.allocOp(.{ .select = .{ .columns = columns, .outputs = outputs, .upstream = boundary } });
     }
 

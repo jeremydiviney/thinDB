@@ -1016,6 +1016,12 @@ pub const Op = union(OpTag) {
         /// records how many trailing derived columns to exclude from `*`
         /// and `alias.*` expansion.
         star_skip_trailing: u32 = 0,
+        /// A derived table's or CTE's column list over a SELECT with a star:
+        /// `columns` is that star, and these names its columns by position
+        /// once the relation's columns are known. The subquery pass makes it
+        /// an ordinary select of each column (`subquery_resolve`) before any
+        /// other pass reads it.
+        column_list: ?[]const []const u8 = null,
         upstream: *Op,
     };
 
@@ -1337,6 +1343,7 @@ fn freeProject(p: Op.Project, allocator: Allocator) void {
     allocator.free(p.columns);
     if (p.outputs) |outs| allocator.free(outs);
     if (p.replace_on_collision) |flags| allocator.free(flags);
+    if (p.column_list) |names| allocator.free(names);
     p.upstream.deinitDecoded(allocator);
     allocator.destroy(p.upstream);
 }
@@ -2153,6 +2160,7 @@ fn encodeProject(allocator: Allocator, out: *std.ArrayList(u8), p: Op.Project) E
     } else {
         try out.append(allocator, 0);
     }
+    try encodeOptNames(allocator, out, p.column_list);
     try encodeOp(allocator, out, p.upstream.*);
 }
 
@@ -3821,6 +3829,8 @@ fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) Decode
         replace_on_collision = flags;
     }
     errdefer if (replace_on_collision) |flags| allocator.free(flags);
+    const column_list = try decodeOptNames(allocator, bytes, cursor);
+    errdefer if (column_list) |names| allocator.free(names);
 
     const upstream = try allocator.create(Op);
     errdefer allocator.destroy(upstream);
@@ -3830,6 +3840,7 @@ fn decodeProject(allocator: Allocator, bytes: []const u8, cursor: *usize) Decode
         .outputs = outputs,
         .replace_on_collision = replace_on_collision,
         .star_skip_trailing = star_skip_trailing,
+        .column_list = column_list,
         .upstream = upstream,
     };
 }
@@ -4231,6 +4242,27 @@ test "ir: select round-trips with multiple columns" {
     try std.testing.expectEqualStrings("tag", decoded.select.columns[2]);
     try std.testing.expect(decoded.select.upstream.* == .scan);
     try std.testing.expectEqualStrings("orders", decoded.select.upstream.scan.table.name);
+    try std.testing.expect(decoded.select.column_list == null);
+}
+
+test "ir: a select's column list over a star round-trips" {
+    const allocator = std.testing.allocator;
+
+    var scan_storage: Op = .{ .scan = .{ .table = .{ .name = "orders" } } };
+    const names = [_][]const u8{ "a", "b" };
+    const root: Op = .{ .select = .{ .columns = &.{"*"}, .column_list = &names, .upstream = &scan_storage } };
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encode(allocator, &buf, root);
+
+    var decoded = try decode(allocator, buf.items);
+    defer decoded.deinitDecoded(allocator);
+
+    try std.testing.expectEqualStrings("*", decoded.select.columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), decoded.select.column_list.?.len);
+    try std.testing.expectEqualStrings("a", decoded.select.column_list.?[0]);
+    try std.testing.expectEqualStrings("b", decoded.select.column_list.?[1]);
 }
 
 test "ir: exclude round-trips and is distinguishable from select" {
