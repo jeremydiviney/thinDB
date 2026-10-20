@@ -1530,7 +1530,7 @@ pub fn evaluatePredicate(
         },
         .text_as_number_set => |s| {
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
-            evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
+            try evaluateTextAsNumberSetMask(allocator, batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out, null),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out, null),
@@ -1636,7 +1636,7 @@ pub fn evaluateExprGuided(
         },
         .text_as_number_set => |s| {
             const col_idx = findCol(schema, s.col) orelse return Error.ColumnNotFound;
-            evaluateTextAsNumberSetMask(batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
+            try evaluateTextAsNumberSetMask(allocator, batch.values[col_idx], schema[col_idx].type, s, batch.row_count, out);
         },
         .correlated_set => |s| try evaluateCorrelatedSetMask(s, schema, batch, out, active),
         .correlated_scalar => |s| try evaluateCorrelatedScalarMask(s, schema, batch, out, active),
@@ -2298,31 +2298,113 @@ fn evaluateTextAsNumberMask(view: ColumnView, col_type: types.Type, p: Predicate
     }
 }
 
-/// `.text_as_number_set`, element by element: `a IN (b, c)` is
-/// `a = b OR a = c`. IN holds when some value equals the row, NOT IN when
-/// every value is known to differ; text that isn't a number leaves each
-/// comparison with a number NULL, so it fails both.
-fn evaluateTextAsNumberSetMask(view: ColumnView, col_type: types.Type, s: InSet, n: usize, mask: []bool) void {
+/// `.text_as_number_set`: `a IN (b, c)` is `a = b OR a = c`. IN holds when
+/// some value equals the row, NOT IN when every value is known to differ;
+/// text that isn't a number leaves each comparison with a number NULL, so it
+/// fails both. Each row looks its text and its number up in the set
+/// (`TextNumberSet`) rather than meeting every value in turn.
+fn evaluateTextAsNumberSetMask(allocator: std.mem.Allocator, view: ColumnView, col_type: types.Type, s: InSet, n: usize, mask: []bool) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const set = try TextNumberSet.init(arena.allocator(), s);
     for (0..n) |i| {
         if (!view.isValid(i)) {
             mask[i] = false;
             continue;
         }
-        const cell = cellScalar(view, col_type, i);
-        const number: ?Scalar = if (cell == .text) textNumber(cell.text) else cell;
-        var found = false;
-        var unknown = false;
-        for (s.values) |v| {
-            const order = if (v == .text) scalarOrder(cell, valueScalar(v, 0)) else if (number) |x| scalarOrder(x, valueScalar(v, 0)) else null;
-            if (order == .eq) {
-                found = true;
-                break;
-            }
-            unknown = unknown or order == null;
-        }
-        mask[i] = if (s.negate) !found and !unknown else found;
+        const m = set.match(cellScalar(view, col_type, i).text);
+        mask[i] = if (s.negate) !m.found and !m.unknown else m.found;
     }
 }
+
+/// A `.text_as_number_set`'s values arranged for lookup: text to match
+/// bytewise, exact numbers sorted by value, and doubles. Each exact number
+/// is also kept as the double a comparison with a double reads it as, sorted
+/// apart, since that rounding needn't keep their order. A decimal subquery's
+/// digits that no double holds arrive as text (`value_type` a number) and
+/// count as numbers.
+const TextNumberSet = struct {
+    texts: std.StringHashMapUnmanaged(void),
+    exact: []const WideScaledInt,
+    exact_doubles: []const f64,
+    doubles: []const f64,
+    /// Some value compares as NULL with every number: a NaN.
+    always_unknown: bool,
+
+    const Match = struct { found: bool, unknown: bool };
+
+    fn init(aa: std.mem.Allocator, s: InSet) !TextNumberSet {
+        const numeric_text = if (s.value_type) |vt| comparisonKind(vt) == .number else false;
+        var texts: std.StringHashMapUnmanaged(void) = .empty;
+        var exact: std.ArrayList(WideScaledInt) = .empty;
+        var exact_doubles: std.ArrayList(f64) = .empty;
+        var doubles: std.ArrayList(f64) = .empty;
+        var always_unknown = false;
+        for (s.values) |v| {
+            if (v == .text and !numeric_text) {
+                try texts.put(aa, v.text, {});
+                continue;
+            }
+            const number = if (v == .text) textNumberWide(v.text) orelse continue else valueScalar(v, 0);
+            switch (number) {
+                .float => |f| if (std.math.isNan(f)) {
+                    always_unknown = true;
+                } else try doubles.append(aa, f),
+                .integer, .decimal, .wide => {
+                    try exact.append(aa, scalarWide(number).?);
+                    try exact_doubles.append(aa, scalarF64(number).?);
+                },
+                .micros, .text, .uuid => always_unknown = true,
+            }
+        }
+        std.sort.pdq(WideScaledInt, exact.items, {}, exactLessThan);
+        std.sort.pdq(f64, exact_doubles.items, {}, std.sort.asc(f64));
+        std.sort.pdq(f64, doubles.items, {}, std.sort.asc(f64));
+        return .{ .texts = texts, .exact = exact.items, .exact_doubles = exact_doubles.items, .doubles = doubles.items, .always_unknown = always_unknown };
+    }
+
+    fn exactLessThan(_: void, a: WideScaledInt, b: WideScaledInt) bool {
+        return scaledOrder(i256, a, b) == .lt;
+    }
+
+    fn match(self: TextNumberSet, text: []const u8) Match {
+        if (self.texts.contains(text)) return .{ .found = true, .unknown = false };
+        const any_number = self.exact.len + self.doubles.len > 0 or self.always_unknown;
+        const number = textNumber(text) orelse return .{ .found = false, .unknown = any_number };
+        const found = switch (number) {
+            .float => |x| if (std.math.isNan(x))
+                return .{ .found = false, .unknown = any_number }
+            else
+                sortedHolds(self.exact_doubles, x) or sortedHolds(self.doubles, x),
+            else => self.exactHolds(scalarWide(number).?) or sortedHolds(self.doubles, scalarF64(number).?),
+        };
+        return .{ .found = found, .unknown = !found and self.always_unknown };
+    }
+
+    fn exactHolds(self: TextNumberSet, x: WideScaledInt) bool {
+        var lo: usize = 0;
+        var hi = self.exact.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (scaledOrder(i256, self.exact[mid], x)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return true,
+            }
+        }
+        return false;
+    }
+
+    fn sortedHolds(sorted: []const f64, x: f64) bool {
+        var lo: usize = 0;
+        var hi = sorted.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (sorted[mid] < x) lo = mid + 1 else hi = mid;
+        }
+        return lo < sorted.len and sorted[lo] == x;
+    }
+};
 
 /// Same matching as the per-row scan: only values of the column's own tag
 /// can equal a cell.
@@ -3442,6 +3524,40 @@ test "an OR's equality arms and an AND's inequality arms fold per column beside 
                 try evaluateExprGuided(t.allocator, all_of, &schema, batch, got[0..rows], null);
                 try t.expectEqualSlices(bool, want_all[0..rows], got[0..rows]);
             }
+        }
+    }
+}
+
+test "TextNumberSet agrees with comparing every value in turn" {
+    var prng = std.Random.DefaultPrng.init(0x7e57);
+    const rand = prng.random();
+    const texts = [_][]const u8{ "1", "1.0", "01", "-2", "2.50", "2.5", " 3", "3e0", "abc", "", "1e400", "0", "-0", "0.1", "9007199254740993", "nan", "12345678901234567890123456789012345678901" };
+    const pool = [_]Value{
+        .{ .int = 1 },                    .{ .bigint = -2 },   .{ .largeint = 9007199254740993 },
+        .{ .double = 2.5 },               .{ .double = 0.1 },  .{ .double = std.math.nan(f64) },
+        .{ .double = 9007199254740992 },  .{ .text = "abc" },  .{ .text = "1.0" },
+        .{ .text = "" },                  .{ .double = -0.0 }, .{ .int = 3 },
+        .{ .double = std.math.inf(f64) },
+    };
+    for (0..300) |_| {
+        var values: [8]Value = undefined;
+        const len = rand.intRangeAtMost(usize, 0, values.len);
+        for (values[0..len]) |*v| v.* = pool[rand.intRangeLessThan(usize, 0, pool.len)];
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const set = try TextNumberSet.init(arena.allocator(), .{ .col = "c", .values = values[0..len], .negate = false });
+        for (texts) |text| {
+            const number = textNumber(text);
+            var want: TextNumberSet.Match = .{ .found = false, .unknown = false };
+            for (values[0..len]) |v| {
+                const order = if (v == .text) scalarOrder(.{ .text = text }, valueScalar(v, 0)) else if (number) |x| scalarOrder(x, valueScalar(v, 0)) else null;
+                if (order == .eq) {
+                    want = .{ .found = true, .unknown = false };
+                    break;
+                }
+                want.unknown = want.unknown or order == null;
+            }
+            try std.testing.expectEqual(want, set.match(text));
         }
     }
 }

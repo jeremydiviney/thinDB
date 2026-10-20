@@ -220,7 +220,7 @@ fn resolveSubqueriesInPredicate(ctx: *CompileCtx, pred: *PredicateExpr, lowered:
                 if (pred.* != .scalar_subquery) return;
             };
             pred.* = switch (try runScalarSubquery(ctx, sq.source)) {
-                .value => |tv| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = try comparableValue(try ctx.subqueryArena(), tv), .from_statement = true } },
+                .value => |tv| .{ .leaf = .{ .col = sq.col, .op = sq.op, .val = try predicateValue(try ctx.subqueryArena(), tv), .from_statement = true } },
                 .null_of => .unknown,
             };
         },
@@ -705,6 +705,17 @@ fn comparableValue(arena: Allocator, tv: TypedValue) !Value {
     return .{ .text = try text.toOwnedSlice(arena) };
 }
 
+/// The value as a comparison takes it. A decimal comes as the parser hands
+/// a decimal literal to one (`expr.exactLiteralValue`): its integer when
+/// whole, else the double that holds its digits, so a text column reads its
+/// rows as numbers against it, as against `c = 1.0`. Digits no double
+/// holds keep `comparableValue`'s text.
+fn predicateValue(arena: Allocator, tv: TypedValue) !Value {
+    const spec = tv.ty.decimalSpec() orelse return tv.val;
+    const digits = try comparableValue(arena, tv);
+    return exec.expr_mod.exactLiteralValue(try exec.expr_mod.decimalLiteralExpr(arena, digits.text, spec.p, spec.s)) orelse digits;
+}
+
 /// A user variable's value as an expression: an array, map or struct
 /// re-enters from its encoded bytes (`scalar_fn.NESTED_VALUE_PREFIX`), a
 /// JSON value from its text.
@@ -824,9 +835,9 @@ fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
 }
 
 /// A correlation key or IN value as a predicate literal: validation brings
-/// it to the outer column's type (see `comparableValue`).
+/// it to the outer column's type (see `predicateValue`).
 fn extractKeyValueAt(allocator: Allocator, view: storage.ColumnView, ty: types.Type, idx: usize) !Value {
-    return comparableValue(allocator, .{ .val = try extractScalarValueAt(allocator, view, idx), .ty = ty });
+    return predicateValue(allocator, .{ .val = try extractScalarValueAt(allocator, view, idx), .ty = ty });
 }
 
 fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usize) !Value {
