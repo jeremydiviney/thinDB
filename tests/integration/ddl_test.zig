@@ -316,7 +316,7 @@ test "alterTable: deletes, replaced rows and key filters survive the rewrite" {
     try expectLiveRows(allocator, try db.openTable("orders", .{}), &expected);
 }
 
-test "alterTable: rejects dropping a column in the order key" {
+test "alterTable: refuses dropping a column of a unique key, under any name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -325,11 +325,164 @@ test "alterTable: rejects dropping a column in the order key" {
 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
     defer db.close();
-    _ = try db.table("orders", schema_v1, opts_v1);
+    const t = try db.table("orders", schema_v1, opts_v1);
 
-    try std.testing.expectError(thindb.Error.UnsupportedAlterOp, db.alterTable("orders", &.{
-        .{ .drop = "id" }, // "id" is in opts_v1.order_key
+    try std.testing.expectError(thindb.Error.UniqueKeyColumnDrop, db.alterTable("orders", &.{
+        .{ .drop = "id" },
     }));
+    try std.testing.expectError(thindb.Error.UniqueKeyColumnDrop, db.alterTable("orders", &.{
+        .{ .rename = .{ .from = "id", .to = "order_id" } },
+        .{ .drop = "order_id" },
+    }));
+    try std.testing.expect(t.schema.columnIndex("id") != null);
+    try std.testing.expectEqual(@as(usize, 1), t.schema.order_key.len);
+}
+
+const keyed_schema = thindb.TableSchema{
+    .columns = &.{
+        .{ .name = "a", .type = .bigint },
+        .{ .name = "b", .type = .int },
+        .{ .name = "c", .type = .int, .nullable = true },
+    },
+    .order_key = &.{ "a", "b" },
+    .unique = false,
+};
+const keyed_opts = thindb.TableOptions{ .order_key = &.{ "a", "b" }, .row_group_size = 4 };
+
+const BcRow = struct { b: i32, c: ?i32 };
+
+/// The table's rows in scan order: each segment's rows in turn.
+fn expectScanRows(allocator: std.mem.Allocator, t: *thindb.Table, expected: []const BcRow) !void {
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var rows: std.ArrayList(BcRow) = .empty;
+    defer rows.deinit(allocator);
+    const b_idx = t.schema.columnIndex("b").?;
+    const c_idx = t.schema.columnIndex("c").?;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |i| try rows.append(allocator, .{
+            .b = batch.values[b_idx].data.int[i],
+            .c = if (batch.values[c_idx].isValid(i)) batch.values[c_idx].data.int[i] else null,
+        });
+    }
+    try std.testing.expectEqualSlices(BcRow, expected, rows.items);
+}
+
+test "alterTable: dropping a column of a non-unique key sorts each segment again on the rest of it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Each segment sorted on b, its deleted rows gone.
+    const expected = [_]BcRow{
+        .{ .b = 12, .c = 5 },
+        .{ .b = 15, .c = null },
+        .{ .b = 20, .c = 4 },
+        .{ .b = 30, .c = 1 },
+        .{ .b = 40, .c = null },
+        .{ .b = 5, .c = null },
+        .{ .b = 25, .c = 7 },
+    };
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("events", keyed_schema, keyed_opts);
+        try t.insert(&.{
+            .{ .a = @as(i64, 1), .b = @as(i32, 30), .c = @as(?i32, 1) },
+            .{ .a = @as(i64, 2), .b = @as(i32, 15), .c = @as(?i32, null) },
+            .{ .a = @as(i64, 3), .b = @as(i32, 10), .c = @as(?i32, 3) },
+            .{ .a = @as(i64, 4), .b = @as(i32, 20), .c = @as(?i32, 4) },
+            .{ .a = @as(i64, 5), .b = @as(i32, 12), .c = @as(?i32, 5) },
+            .{ .a = @as(i64, 6), .b = @as(i32, 40), .c = @as(?i32, null) },
+        });
+        try t.flush();
+        try t.insert(&.{
+            .{ .a = @as(i64, 7), .b = @as(i32, 25), .c = @as(?i32, 7) },
+            .{ .a = @as(i64, 8), .b = @as(i32, 5), .c = @as(?i32, null) },
+            .{ .a = @as(i64, 9), .b = @as(i32, 1), .c = @as(?i32, 9) },
+        });
+        try t.flush();
+        _ = try t.delete(.{ .col = "a", .op = .eq, .val = .{ .bigint = 3 } });
+        _ = try t.delete(.{ .col = "a", .op = .eq, .val = .{ .bigint = 9 } });
+
+        try db.alterTable("events", &.{.{ .drop = "a" }});
+        try std.testing.expectEqual(@as(usize, 1), t.schema.order_key.len);
+        try std.testing.expectEqualStrings("b", t.schema.order_key[0]);
+        try expectScanRows(allocator, t, &expected);
+        try std.testing.expectEqual(@as(usize, 2), t.manifest.segments.items.len);
+        for (t.manifest.segments.items) |entry| {
+            try std.testing.expectEqual(@as(usize, 0), try t.tombstoneCount(entry.segment_id));
+        }
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.openTable("events", .{});
+    try std.testing.expectEqualStrings("b", t.schema.order_key[0]);
+    try expectScanRows(allocator, t, &expected);
+}
+
+test "alterTable: dropping a non-unique key's only column orders the table by its first column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    var one_key = keyed_schema;
+    one_key.order_key = &.{"a"};
+    const t = try db.table("events", one_key, .{ .order_key = &.{"a"}, .row_group_size = 4 });
+    try t.insert(&.{
+        .{ .a = @as(i64, 1), .b = @as(i32, 3), .c = @as(?i32, null) },
+        .{ .a = @as(i64, 2), .b = @as(i32, 1), .c = @as(?i32, 2) },
+        .{ .a = @as(i64, 3), .b = @as(i32, 2), .c = @as(?i32, 3) },
+    });
+    try t.flush();
+    // Every row of a segment deleted: the segment goes.
+    try t.insert(&.{.{ .a = @as(i64, 4), .b = @as(i32, 0), .c = @as(?i32, 4) }});
+    try t.flush();
+    _ = try t.delete(.{ .col = "a", .op = .eq, .val = .{ .bigint = 4 } });
+
+    try db.alterTable("events", &.{
+        .{ .rename = .{ .from = "b", .to = "rank" } },
+        .{ .drop = "a" },
+    });
+    try std.testing.expectEqual(@as(usize, 1), t.schema.order_key.len);
+    try std.testing.expectEqualStrings("rank", t.schema.order_key[0]);
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+
+    var q = try thindb.scan(allocator, t);
+    defer q.deinit();
+    var ranks: std.ArrayList(i32) = .empty;
+    defer ranks.deinit(allocator);
+    while (try q.next()) |batch| try ranks.appendSlice(allocator, batch.values[0].data.int[0..batch.row_count]);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3 }, ranks.items);
+}
+
+test "alterTable: the table keeps its compression" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var schema = schema_v1;
+    schema.compression = .none;
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+        defer db.close();
+        const t = try db.table("orders", schema, opts_v1);
+        try db.alterTable("orders", &.{.{ .drop = "tag" }});
+        try std.testing.expectEqual(thindb.types.TableCompression.none, t.schema.compression);
+    }
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    const t = try db.openTable("orders", .{});
+    try std.testing.expectEqual(thindb.types.TableCompression.none, t.schema.compression);
 }
 
 test "ddl_lock: dropTable waits for an in-flight scan to release before proceeding" {

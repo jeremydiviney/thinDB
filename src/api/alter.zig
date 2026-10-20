@@ -153,7 +153,11 @@ pub const AlterPlan = struct {
     new_columns: []Column,
     new_order_key: [][]const u8,
     new_unique: bool,
+    compression: types.TableCompression,
     sources: []ColumnSource,
+    /// The order key lost a column, so every segment sorts again on the new
+    /// one rather than keeping its rows in order.
+    rekeyed: bool,
 
     pub fn deinit(self: *AlterPlan) void {
         self.arena.deinit();
@@ -165,14 +169,20 @@ pub const AlterPlan = struct {
             .columns = self.new_columns,
             .order_key = self.new_order_key,
             .unique = self.new_unique,
+            .compression = self.compression,
         };
     }
 };
 
 /// Apply ops to old schema, return the resolved plan. Validates as it goes:
 ///   - No duplicate column names.
-///   - No dropping a column that's part of the order key.
+///   - No dropping a column of a unique key: rows unique on the whole key
+///     need not be unique on what is left of it.
 ///   - `add` default tag matches the new column's type.
+///
+/// Dropping a column of a non-unique key orders the table by the key's
+/// other columns, or by its first column when none is left, as CREATE TABLE
+/// does with no key.
 pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const AlterOp) !AlterPlan {
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
     errdefer arena.deinit();
@@ -205,10 +215,6 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
         },
         .drop => |name| {
             const idx = findColumn(cols.items, name) orelse return api.Error.ColumnNotFound;
-            // Forbid dropping any column that's part of the order key.
-            for (old.order_key) |key| {
-                if (std.mem.eql(u8, key, name)) return api.Error.UnsupportedAlterOp;
-            }
             _ = cols.orderedRemove(idx);
             _ = sources.orderedRemove(idx);
         },
@@ -243,40 +249,43 @@ pub fn planAlter(parent_allocator: Allocator, old: TableSchema, ops: []const Alt
         },
     };
 
-    // Translate the order key: each entry must still refer to a still-extant
-    // column (we forbade dropping order-key cols), under whatever its name
-    // is NOW (rename may have changed it).
-    var new_ok = try aa.alloc([]const u8, old.order_key.len);
-    for (old.order_key, 0..) |old_key, i| {
+    // Translate the order key to the names its columns have NOW (rename may
+    // have changed them), leaving out the ones dropped.
+    var new_ok: std.ArrayList([]const u8) = .empty;
+    for (old.order_key) |old_key| {
         const old_idx = old.columnIndex(old_key) orelse return api.Error.ColumnNotFound;
-        var found: ?usize = null;
         for (sources.items, 0..) |s, j| switch (s) {
             .from_old => |oi| if (oi == old_idx) {
-                found = j;
+                try new_ok.append(aa, cols.items[j].name);
                 break;
             },
             else => {},
         };
-        const pos = found orelse return api.Error.ColumnNotFound;
-        new_ok[i] = cols.items[pos].name;
     }
+    const rekeyed = new_ok.items.len < old.order_key.len;
+    if (rekeyed and old.unique) return api.Error.UniqueKeyColumnDrop;
+    if (new_ok.items.len == 0 and cols.items.len > 0) try new_ok.append(aa, cols.items[0].name);
 
     const owned_cols = try cols.toOwnedSlice(aa);
     const owned_sources = try sources.toOwnedSlice(aa);
+    const owned_ok = try new_ok.toOwnedSlice(aa);
 
     const schema_view: TableSchema = .{
         .columns = owned_cols,
-        .order_key = new_ok,
+        .order_key = owned_ok,
         .unique = old.unique,
+        .compression = old.compression,
     };
     schema_view.validate() catch return api.Error.SchemaMismatch;
 
     return .{
         .arena = arena,
         .new_columns = owned_cols,
-        .new_order_key = new_ok,
+        .new_order_key = owned_ok,
         .new_unique = old.unique,
+        .compression = old.compression,
         .sources = owned_sources,
+        .rekeyed = rekeyed,
     };
 }
 
@@ -364,9 +373,9 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     else
         null;
     for (t.manifest.segments.items) |entry| {
-        const info = try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync);
+        const info = (try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync)) orelse continue;
         defer info.deinit(t.allocator);
-        try carrySidecars(t, shadow_segs, entry.segment_id, sync);
+        if (!plan.rekeyed) try carrySidecars(t, shadow_segs, entry.segment_id, sync);
         try new_manifest.appendSegment(
             try storage.manifest.entryFromSegmentInfo(t.allocator, info, new_lk_idx, new_schema.columns),
         );
@@ -427,7 +436,9 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
 
 /// Build a new segment in `shadow_segs` carrying `entry`'s rows but reshaped
 /// per `plan`. Decodes the old segment row group at a time, populating one
-/// big ColumnStore per new column.
+/// big ColumnStore per new column. A rekeyed plan writes only the rows the
+/// segment's tombstones leave, sorted on the new key, and null when none is
+/// left.
 fn rewriteSegment(
     t: *Table,
     plan: *const AlterPlan,
@@ -436,7 +447,7 @@ fn rewriteSegment(
     new_schema: TableSchema,
     new_fp: u64,
     sync: bool,
-) !storage.format.SegmentInfo {
+) !?storage.format.SegmentInfo {
     var name_buf: [32]u8 = undefined;
     const file_name = try Table.segmentFileName(&name_buf, entry.segment_id);
 
@@ -470,9 +481,20 @@ fn rewriteSegment(
         };
     }
 
-    const new_views = try t.allocator.alloc(ColumnView, new_stores.len);
+    var sorted: ?[]ColumnStore = null;
+    defer if (sorted) |stores| {
+        for (stores) |*c| c.deinit(t.allocator);
+        t.allocator.free(stores);
+    };
+    if (plan.rekeyed) {
+        sorted = try liveRowsSorted(t, entry.segment_id, new_stores, new_schema);
+        if (sorted.?[0].data.rowCount() == 0) return null;
+    }
+    const written = sorted orelse new_stores;
+
+    const new_views = try t.allocator.alloc(ColumnView, written.len);
     defer t.allocator.free(new_views);
-    for (new_stores, 0..) |c, i| new_views[i] = c.view();
+    for (written, 0..) |c, i| new_views[i] = c.view();
 
     return try storage.writeSegment(
         t.allocator,
@@ -491,6 +513,55 @@ fn rewriteSegment(
         sync,
         t.compact_threads,
     );
+}
+
+/// `stores`, a segment's rows, cut to the rows its tombstones leave and
+/// sorted on `new_schema`'s order key, as a flush sorts the memtable
+/// (`Memtable.buildSortedSnapshot`).
+fn liveRowsSorted(t: *Table, seg_id: u64, stores: []const ColumnStore, new_schema: TableSchema) ![]ColumnStore {
+    const keys = try t.allocator.alloc(usize, new_schema.order_key.len);
+    defer t.allocator.free(keys);
+    for (new_schema.order_key, keys) |name, *k| k.* = new_schema.columnIndex(name) orelse return api.Error.SchemaMismatch;
+
+    const tombs: []const u32 = (try storage.tombstone.read(t.allocator, t.io, t.segments_dir, seg_id)) orelse &.{};
+    defer t.allocator.free(tombs);
+    const n = if (stores.len > 0) stores[0].data.rowCount() else 0;
+    var perm: std.ArrayList(u32) = .empty;
+    defer perm.deinit(t.allocator);
+    try perm.ensureTotalCapacity(t.allocator, n);
+    var dead: usize = 0;
+    for (0..n) |row| {
+        while (dead < tombs.len and tombs[dead] < row) dead += 1;
+        if (dead < tombs.len and tombs[dead] == row) continue;
+        perm.appendAssumeCapacity(@intCast(row));
+    }
+
+    const Ctx = struct {
+        stores: []const ColumnStore,
+        keys: []const usize,
+
+        pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+            for (ctx.keys) |ci| {
+                const ord = engine.transform.compareInColumn(ctx.stores[ci], a, b);
+                if (ord == .lt) return true;
+                if (ord == .gt) return false;
+            }
+            return false;
+        }
+    };
+    std.sort.pdq(u32, perm.items, Ctx{ .stores = stores, .keys = keys }, Ctx.lessThan);
+
+    const out = try t.allocator.alloc(ColumnStore, stores.len);
+    var made: usize = 0;
+    errdefer {
+        for (out[0..made]) |*c| c.deinit(t.allocator);
+        t.allocator.free(out);
+    }
+    for (stores, out) |src, *dst| {
+        dst.* = try engine.transform.applyPermutation(t.allocator, src, perm.items);
+        made += 1;
+    }
+    return out;
 }
 
 /// A segment's deletes (`.tomb`) and key filter (`.bloom`) live in

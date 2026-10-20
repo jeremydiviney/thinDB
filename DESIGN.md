@@ -1919,7 +1919,17 @@ try db.dropTable("orders_v2");
 
 Each rename is followed by a directory sync. When a schema opens, it resolves any swap that a crash or a persistent refusal interrupted. Before the commit, it puts the original back. After the commit, it deletes what is left over. DROP TABLE and RENAME TABLE delete an original that a committed swap failed to delete, so the next open can't restore it under the old name. A replacing table build (REFRESH MATERIALIZED VIEW, §8.2) publishes with steps 2 to 4, its build in the shadow's place, and recovers the same way. Names starting `__alter_` or `__ctas_` (a table build, §8.2) are reserved: no table can be created or renamed under one, and none is listed or opened.
 
-Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
+Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over. The table keeps its compression.
+
+Dropping a column of the order key depends on whether the key is unique:
+- On a unique key (PRIMARY KEY) ALTER refuses with `UniqueKeyColumnDrop`, since rows unique on the whole key need not be unique on the rest of it.
+- On a non-unique key the table orders by the key's other columns, or by its first column when none is left, as CREATE TABLE with no key clause does.
+
+A non-unique key that loses a column changes the copy:
+- Each segment is rewritten with only the rows its tombstones leave, sorted on the new key as a flush sorts the memtable.
+- No `.tomb` is copied, and a non-unique table has no `.bloom`.
+- A segment with no row left is not written.
+- Compaction then merges the segments as it merges any others.
 
 SQL's `ALTER TABLE` takes MySQL's spellings of the actions. `ADD [COLUMN] (def, ...)` adds each listed column at the end and, as in MySQL, takes no `FIRST` or `AFTER`.
 
@@ -2028,12 +2038,14 @@ All fallible API calls return a Zig error union. The public error surface is spl
 ```
 SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
 TableNotFound, TableAlreadyExists, ColumnNotFound,
-ColumnAlreadyExists, UnsupportedAlterOp,
+ColumnAlreadyExists, UnsupportedAlterOp, UniqueKeyColumnDrop,
 FunctionAlreadyExists, FunctionInvalidDefinition,
 WalOrphaned, XaBranchTooLarge, XaInvalidXid,
 DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
 InvalidDatabaseName, NoDatabaseSelected,
 ```
+
+`UniqueKeyColumnDrop`: ALTER TABLE dropped a column of a unique order key (§9.2). It is refused even when the column was renamed earlier in the same ALTER.
 
 `WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
 
