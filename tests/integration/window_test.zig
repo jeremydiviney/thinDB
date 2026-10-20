@@ -593,6 +593,32 @@ test "window: IGNORE NULLS / RESPECT NULLS inside the call parentheses" {
     inline for (rejected) |sql| try helpers.expectRunError(allocator, db, sql, error.SqlInvalidProjection);
 }
 
+test "window: SUM / AVG / COUNT (DISTINCT) over a DECIMAL past 38 digits, and SUM / AVG over a BOOLEAN" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE w (id BIGINT PRIMARY KEY, g INT, b BOOLEAN, d DECIMAL(40, 2))");
+    try helpers.exec(allocator, db, "INSERT INTO w VALUES (1, 1, true, 1.50), (2, 1, false, 2.25), (3, 1, true, 1.50), (4, 1, NULL, NULL), (5, 2, true, 10.00), (6, 2, true, 3.00)");
+
+    const cases = .{
+        .{ "SELECT SUM(DISTINCT d) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1.50", "3.75", "3.75", "3.75", "10.00", "13.00" } },
+        .{ "SELECT SUM(DISTINCT d) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w ORDER BY id", &[_]?[]const u8{ "1.50", "3.75", "3.75", "1.50", "10.00", "13.00" } },
+        .{ "SELECT SUM(DISTINCT d) OVER (PARTITION BY g) FROM w ORDER BY id", &[_]?[]const u8{ "3.75", "3.75", "3.75", "3.75", "13.00", "13.00" } },
+        .{ "SELECT AVG(DISTINCT d) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1.5", "1.875", "1.875", "1.875", "10", "6.5" } },
+        .{ "SELECT COUNT(DISTINCT d) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1", "2", "2", "2", "1", "2" } },
+        .{ "SELECT SUM(b) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1", "1", "2", "2", "1", "2" } },
+        .{ "SELECT SUM(b) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w ORDER BY id", &[_]?[]const u8{ "1", "1", "1", "1", "1", "2" } },
+        .{ "SELECT AVG(b) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1", "0.5", "0.6666666666666666", "0.6666666666666666", "1", "1" } },
+        .{ "SELECT AVG(b) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w ORDER BY id", &[_]?[]const u8{ "1", "0.5", "0.5", "1", "1", "1" } },
+        .{ "SELECT SUM(DISTINCT b) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1", "1", "1", "1", "1", "1" } },
+        .{ "SELECT AVG(DISTINCT b) OVER (PARTITION BY g ORDER BY id) FROM w ORDER BY id", &[_]?[]const u8{ "1", "0.5", "0.5", "0.5", "1", "1" } },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, c[0], c[1]);
+}
+
 test "window: NTILE(4) divides 10 rows into 4 buckets of 3,3,2,2" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
