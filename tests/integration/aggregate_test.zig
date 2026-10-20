@@ -444,6 +444,42 @@ test "aggregate: GROUP_CONCAT takes any value type, ORDER BY, DISTINCT and SEPAR
     try helpers.expectRunError(allocator, db, "SELECT COUNT(n ORDER BY n) FROM gct", error.SqlExpectedToken);
 }
 
+test "aggregate: GROUP_CONCAT ORDER BY <n> names its n-th expression in MySQL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE s (id INT PRIMARY KEY, name VARCHAR(10), score INT)");
+    try helpers.exec(allocator, db, "INSERT INTO s VALUES (1, 'b', 2), (2, 'a', 3), (3, 'c', 1)");
+
+    const cases = .{
+        .{ "SELECT GROUP_CONCAT(name ORDER BY 1) FROM s", "a,b,c" },
+        .{ "SELECT GROUP_CONCAT(name, score ORDER BY 2) FROM s", "c1,b2,a3" },
+        .{ "SELECT GROUP_CONCAT(name, score ORDER BY 2 DESC SEPARATOR '|') FROM s", "a3|b2|c1" },
+        .{ "SELECT GROUP_CONCAT(DISTINCT name ORDER BY 1 DESC, id) FROM s", "c,b,a" },
+        .{ "SELECT GROUP_CONCAT(name ORDER BY 1 + 0, id) FROM s", "b,a,c" },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSqlMysql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        std.testing.expectEqualStrings(c[1], got[0].?) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    inline for (.{ "SELECT GROUP_CONCAT(name ORDER BY 2) FROM s", "SELECT GROUP_CONCAT(name, score ORDER BY 0) FROM s" }) |sql| {
+        try std.testing.expectError(error.SqlInvalidProjection, helpers.runSqlMysql(allocator, db, sql));
+    }
+    // Elsewhere the integer is a constant key, as in PostgreSQL.
+    const constant = try helpers.collectStrings(allocator, db, "SELECT GROUP_CONCAT(name ORDER BY 1, id) FROM s");
+    defer helpers.freeStrings(allocator, constant);
+    try std.testing.expectEqualStrings("b,a,c", constant[0].?);
+}
+
 fn expectStringsEqual(want: []const ?[]const u8, got: []const ?[]u8) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {
