@@ -1943,7 +1943,11 @@ A non-unique key that loses a column changes the copy:
 - A segment with no row left is not written.
 - Compaction then merges the segments as it merges any others.
 
-SQL's `ALTER TABLE` takes MySQL's spellings of the actions. `ADD [COLUMN] (def, ...)` adds each listed column at the end and, as in MySQL, takes no `FIRST` or `AFTER`.
+SQL's `ALTER TABLE` takes MySQL's spellings of the actions:
+- `ADD [COLUMN] def [FIRST | AFTER col]` puts the column first, right after `col`, or at the end.
+- The copy writes every column in its new place, so no column ever has to be appended. An `AFTER` that names no column fails with `ColumnNotFound`.
+- `ADD [COLUMN] (def, ...)` adds each listed column at the end and, as in MySQL, takes no `FIRST` or `AFTER`.
+- `CHANGE` and `MODIFY` refuse a position, since moving an existing column is not supported.
 
 `AUTO_INCREMENT [=] n` copies nothing:
 - It raises the table's id counter so the next generated id is at least `n`.

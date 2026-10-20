@@ -474,11 +474,19 @@ fn explainDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) !void {
                 try out.appendSlice(allocator, @tagName(action));
                 try out.append(allocator, ' ');
                 switch (action) {
-                    .add_column => |c| {
-                        try out.appendSlice(allocator, c.name);
+                    .add_column => |add| {
+                        try out.appendSlice(allocator, add.column.name);
                         try out.append(allocator, ' ');
-                        try out.appendSlice(allocator, @tagName(c.column_type));
-                        if (c.nullable) try out.appendSlice(allocator, " NULL");
+                        try out.appendSlice(allocator, @tagName(add.column.column_type));
+                        if (add.column.nullable) try out.appendSlice(allocator, " NULL");
+                        switch (add.position) {
+                            .last => {},
+                            .first => try out.appendSlice(allocator, " FIRST"),
+                            .after => |name| {
+                                try out.appendSlice(allocator, " AFTER ");
+                                try out.appendSlice(allocator, name);
+                            },
+                        }
                     },
                     .drop_column => |name| try out.appendSlice(allocator, name),
                     .rename_column => |r| {

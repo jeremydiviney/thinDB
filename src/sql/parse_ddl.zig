@@ -232,15 +232,14 @@ fn parseAlterAction(p: anytype, actions: *std.ArrayList(ir.AlterAction)) !void {
             if (p.cur.tag == .lparen) {
                 try p.advance();
                 while (true) {
-                    try actions.append(p.arena, .{ .add_column = try parseAddedColumn(p) });
+                    try actions.append(p.arena, .{ .add_column = .{ .column = try parseAddedColumn(p) } });
                     if (p.cur.tag != .comma) break;
                     try p.advance();
                 }
                 return p.expect(.rparen);
             }
             const def = try parseAddedColumn(p);
-            try rejectColumnPosition(p);
-            return try actions.append(p.arena, .{ .add_column = def });
+            return try actions.append(p.arena, .{ .add_column = .{ .column = def, .position = try parseColumnPosition(p) } });
         },
         .kw_drop => {
             try p.advance();
@@ -321,6 +320,19 @@ fn parseAddedColumn(p: anytype) !ir.ColumnDef {
 fn rejectColumnPosition(p: anytype) !void {
     const PE = @TypeOf(p.*).Err;
     if (isIdentText(p, "first") or isIdentText(p, "after")) return PE.SqlColumnPositionUnsupported;
+}
+
+/// An added column's optional `FIRST` or `AFTER name`.
+fn parseColumnPosition(p: anytype) !types.ColumnPosition {
+    if (isBareWord(p, "first")) {
+        try p.advance();
+        return .first;
+    }
+    if (isBareWord(p, "after")) {
+        try p.advance();
+        return .{ .after = try p.dupedIdent() };
+    }
+    return .last;
 }
 
 fn isIdentText(p: anytype, comptime text: []const u8) bool {
