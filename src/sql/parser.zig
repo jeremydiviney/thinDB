@@ -2483,10 +2483,10 @@ pub const Parser = struct {
             // decide between aggregate / scalar / window based on what
             // follows.
             var saw_distinct = false;
-            const args = try self.parseCallArgList(first, &saw_distinct);
+            var inner_nulls: ?bool = null;
+            const args = try self.parseCallArgList(first, &saw_distinct, &inner_nulls);
             const filter = try self.parseAggFilter();
-            // Optional [IGNORE | RESPECT] NULLS between `)` and `OVER`.
-            const ignore_nulls = try parse_window.parseIgnoreNulls(self);
+            const ignore_nulls = try parse_window.callIgnoresNulls(self, inner_nulls);
 
             // OVER (...) makes this a window call regardless of which
             // function name was used. SUM / AVG / etc. become aggregate-
@@ -2677,7 +2677,7 @@ pub const Parser = struct {
         if (std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(name), "substring")) return try self.parseSubstringCall(name);
         if (std.ascii.eqlIgnoreCase(name, "trim")) return try self.parseTrimCall();
         if (std.ascii.eqlIgnoreCase(name, "if")) return try self.parseIfCallAfterName();
-        const args = try self.parseCallArgList(name, null);
+        const args = try self.parseCallArgList(name, null, null);
         return try self.makeScalarCallExpr(name, args);
     }
 
@@ -3256,8 +3256,10 @@ pub const Parser = struct {
     /// Parse `( arg, arg, ... )` or `( * )`. A leading `DISTINCT` is
     /// consumed and reported via `distinct_out` (for aggregate calls like
     /// `COUNT(DISTINCT col)`). Passing `null` for `distinct_out` rejects
-    /// DISTINCT — it's only valid inside an aggregate.
-    pub fn parseCallArgList(self: *Parser, name: []const u8, distinct_out: ?*bool) ParseError![]const ir.Expr {
+    /// DISTINCT — it's only valid inside an aggregate. An `IGNORE NULLS` /
+    /// `RESPECT NULLS` after an argument (`LAG(x IGNORE NULLS, 1)`) is
+    /// reported via `null_treatment_out` the same way, for window calls.
+    pub fn parseCallArgList(self: *Parser, name: []const u8, distinct_out: ?*bool, null_treatment_out: ?*?bool) ParseError![]const ir.Expr {
         try self.expect(.lparen);
         const bare_null = namesArgType(name) and try self.bareNullAhead();
         var distinct = false;
@@ -3281,6 +3283,11 @@ pub const Parser = struct {
                 if (!exec_compute.callReadsArgOnEveryRow(name, args.items.len)) self.case_scope.reaches_every_row = false;
                 const a = if (try self.lambdaAhead()) try self.parseLambda() else try self.parseValueExpr();
                 try args.append(self.arena, a);
+                if (try parse_window.parseNullTreatment(self)) |ignores| {
+                    const out = null_treatment_out orelse return ParseError.SqlInvalidProjection;
+                    if (out.* != null) return ParseError.SqlInvalidProjection;
+                    out.* = ignores;
+                }
                 if (self.cur.tag != .comma) break;
                 try self.advance();
             }
@@ -4424,9 +4431,10 @@ pub const Parser = struct {
                 if (self.cur.tag == .lparen) {
                     if (self.scalarCallHasOwnSyntax(name)) return try self.parseScalarCallAfterName(name);
                     var saw_distinct = false;
-                    const nested_args = try self.parseCallArgList(name, &saw_distinct);
+                    var inner_nulls: ?bool = null;
+                    const nested_args = try self.parseCallArgList(name, &saw_distinct, &inner_nulls);
                     const filter = try self.parseAggFilter();
-                    const ignore_nulls = try parse_window.parseIgnoreNulls(self);
+                    const ignore_nulls = try parse_window.callIgnoresNulls(self, inner_nulls);
                     if (self.cur.tag == .kw_over) {
                         if (filter != null) return ParseError.SqlInvalidProjection;
                         try self.advance();
@@ -7808,7 +7816,7 @@ pub const Parser = struct {
         if (self.cur.tag == .dot) return try self.dupQualifiedColRef(first);
         if (self.cur.tag != .lparen) return try self.arena.dupe(u8, orderNameSource(proj, first));
         var distinct = false;
-        const args = try self.parseCallArgList(first, &distinct);
+        const args = try self.parseCallArgList(first, &distinct, null);
         const filter = try self.parseAggFilter();
         // `ORDER BY agg(arg)` (e.g. ORDER BY COUNT(*) DESC) binds
         // to the aggregate's canonical output column name (the

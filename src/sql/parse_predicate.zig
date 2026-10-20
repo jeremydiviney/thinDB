@@ -262,8 +262,10 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             return try parseExprOps(p, try p.parseScalarCallAfterName(col_dup));
         }
         var saw_distinct = false;
-        const args = try p.parseCallArgList(col_dup, &saw_distinct);
+        var inner_nulls: ?bool = null;
+        const args = try p.parseCallArgList(col_dup, &saw_distinct, &inner_nulls);
         const filter = try p.parseAggFilter();
+        const ignore_nulls = try parse_window.callIgnoresNulls(p, inner_nulls);
         // Window call in a predicate position — only where the projection's
         // hoisting channels are live (CASE WHEN conditions inside the select
         // list); WHERE/HAVING contexts keep rejecting OVER. Checked before
@@ -273,11 +275,11 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             try p.advance();
             const spec_kind = try parse_window.parseWindowSpecOrRef(p);
             const wfunc = p.windowFuncForCall(col_dup, saw_distinct) orelse return PE.SqlInvalidProjection;
-            parse_window.validateWindowCall(wfunc, args, false) catch return PE.SqlInvalidProjection;
+            parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch return PE.SqlInvalidProjection;
             const hidden = try p.materializeWindowExpr(.{
                 .func = wfunc,
                 .args = args,
-                .ignore_nulls = false,
+                .ignore_nulls = ignore_nulls,
                 .spec_kind = spec_kind,
             });
             const lhs = try p.continueBinaryFrom(.{ .col_ref = hidden });
@@ -288,6 +290,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             };
             return try parseColOps(p, anchored);
         }
+        if (ignore_nulls) return PE.SqlInvalidProjection;
         if (p.aggregateFuncForName(col_dup)) |func| {
             if (p.aggregateExprRefsEnabled()) {
                 col_dup = try p.materializeAggregateExpr(col_dup, func, args, saw_distinct, filter);
