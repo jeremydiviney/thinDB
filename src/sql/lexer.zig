@@ -137,6 +137,7 @@ pub const TokenTag = enum {
     percent, // %
     arrow, // -> (MySQL JSON extract: JSON_EXTRACT)
     arrow2, // ->> (MySQL JSON extract + unquote: JSON_UNQUOTE(JSON_EXTRACT))
+    fat_arrow, // => (a named argument: generate_series(start => 1, end => 5))
     pipe_pipe, // || (PG/ANSI string concat; MySQL logical OR)
     null_safe_eq, // <=> (MySQL null-safe equality)
     amp, // & (bitwise AND)
@@ -260,6 +261,10 @@ pub const Lexer = struct {
         // Single/double-character operators.
         switch (ch) {
             '=' => {
+                if (self.peekChar(1) == '>') {
+                    self.pos += 2;
+                    return Token{ .tag = .fat_arrow, .text = self.src[start..self.pos] };
+                }
                 self.pos += 1;
                 return Token{ .tag = .eq, .text = self.src[start..self.pos] };
             },
