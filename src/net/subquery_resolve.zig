@@ -561,29 +561,66 @@ fn resolveRowIn(ctx: *CompileCtx, pred: *PredicateExpr, s: exec.predicate.InSubq
     const outer_cols = try aa.alloc([]const u8, width);
     outer_cols[0] = try aa.dupe(u8, s.col);
     for (s.rest_cols, outer_cols[1..]) |c, *dst| dst.* = try aa.dupe(u8, c);
-    pred.* = try inTupleSet(aa, .{
+    const drained = try drainTuples(ctx, &q, width, null);
+    // With no rows even a NULL is NOT IN the subquery, as for one column:
+    // the mask-level NOT reads the IN's UNKNOWN for a NULL as FALSE.
+    const no_rows = drained.no_rows and s.negate;
+    const set = try inTupleSet(aa, .{
         .outer_cols = outer_cols,
-        .rows = try drainTuples(ctx, &q, width),
-        .negate = s.negate,
+        .rows = drained.rows,
+        .negate = s.negate and !no_rows,
         .inner_types = try columnTypes(aa, q.outputSchema()),
     }, width);
+    if (!no_rows) {
+        pred.* = set;
+        return;
+    }
+    const in_empty = try aa.create(PredicateExpr);
+    in_empty.* = set;
+    pred.* = .{ .not = in_empty };
 }
 
-/// The inner's rows as `width`-value tuples in key order
-/// (`exec.predicate.sortKeyed`); a tuple holding a NULL can never match, so
-/// it drops (the thinDB IN-set dialect).
-fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Value {
+/// The inner's rows drained for an IN: each row's first `width` values as a
+/// tuple, in key order (`exec.predicate.sortKeyed`).
+const DrainedTuples = struct {
+    /// A tuple holding a NULL can never match, so it drops (the thinDB
+    /// IN-set dialect).
+    rows: []const []const Value,
+    /// The inner had no rows, with NULLs or without.
+    no_rows: bool,
+    /// With `keys_from`: the distinct tuples of each row's values from there
+    /// on, in key order, a tuple holding a NULL dropping. These are the
+    /// correlation keys the inner has rows for, whatever IN compares.
+    keys: []const []const Value,
+};
+
+fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize, keys_from: ?usize) !DrainedTuples {
     const aa = try ctx.subqueryArena();
     const acct = try ctx.queryAccountant();
     const per_tuple = width * (@sizeOf(Value) + 32);
+    const schema = q.outputSchema();
     var rows: std.ArrayList([]const Value) = .empty;
+    var keys: std.ArrayList([]const Value) = .empty;
+    var no_rows = true;
     while (try q.next()) |batch| {
-        var i: usize = 0;
-        next_row: while (i < batch.row_count) : (i += 1) {
-            for (batch.values[0..width]) |view| if (!view.isValid(i)) continue :next_row;
+        if (batch.row_count > 0) no_rows = false;
+        for (0..batch.row_count) |i| {
+            if (keys_from) |from| keyed: {
+                for (batch.values[from..width]) |view| if (!view.isValid(i)) break :keyed;
+                if (acct) |a| try a.reserve(.subquery, (width - from) * (@sizeOf(Value) + 32));
+                const key = try aa.alloc(Value, width - from);
+                for (key, batch.values[from..width], schema[from..width]) |*v, view, column| {
+                    v.* = try extractKeyValueAt(aa, view, column.type, i);
+                }
+                try keys.append(aa, key);
+            }
+            const any_null = for (batch.values[0..width]) |view| {
+                if (!view.isValid(i)) break true;
+            } else false;
+            if (any_null) continue;
             if (acct) |a| try a.reserve(.subquery, per_tuple);
             const tuple = try aa.alloc(Value, width);
-            for (tuple, batch.values[0..width], q.outputSchema()[0..width]) |*v, view, column| {
+            for (tuple, batch.values[0..width], schema[0..width]) |*v, view, column| {
                 v.* = try extractKeyValueAt(aa, view, column.type, i);
             }
             try rows.append(aa, tuple);
@@ -591,7 +628,14 @@ fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize) ![]const []const Valu
     }
     const owned = try rows.toOwnedSlice(aa);
     exec.predicate.sortKeyed([]const Value, owned);
-    return owned;
+    exec.predicate.sortKeyed([]const Value, keys.items);
+    var distinct: usize = 0;
+    for (keys.items) |key| {
+        if (distinct > 0 and keysEqual(keys.items[distinct - 1], key)) continue;
+        keys.items[distinct] = key;
+        distinct += 1;
+    }
+    return .{ .rows = owned, .no_rows = no_rows, .keys = keys.items[0..distinct] };
 }
 
 /// A probe of a tuple set whose first `in_width` outer columns are an IN's
@@ -608,6 +652,22 @@ fn nullGuarded(aa: Allocator, in_cols: []const []const u8, negate: bool, probe: 
     for (in_cols, kids[0..in_cols.len]) |c, *kid| kid.* = .{ .is_not_null = c };
     kids[in_cols.len] = probe;
     return .{ .@"and" = kids };
+}
+
+/// A correlated NOT IN still passes a row with a NULL among its compared
+/// columns where the subquery has no rows for it, as an uncorrelated NOT IN
+/// with no rows passes every row. `guarded` keeps such rows out
+/// (`nullGuarded`), and `empty` holds where the subquery has no rows.
+fn passingNullProbes(aa: Allocator, in_cols: []const []const u8, guarded: PredicateExpr, empty: PredicateExpr) !PredicateExpr {
+    const nulls = try aa.alloc(PredicateExpr, in_cols.len);
+    for (in_cols, nulls) |c, *n| n.* = .{ .is_null = c };
+    const arm = try aa.alloc(PredicateExpr, 2);
+    arm[0] = if (nulls.len == 1) nulls[0] else .{ .@"or" = nulls };
+    arm[1] = empty;
+    const either = try aa.alloc(PredicateExpr, 2);
+    either[0] = guarded;
+    either[1] = .{ .@"and" = arm };
+    return .{ .@"or" = either };
 }
 
 /// The types of `columns`, in the subquery arena.
@@ -1695,12 +1755,30 @@ fn resolveCorrelatedBlock(ctx: *CompileCtx, pred: *PredicateExpr, source: *const
     if (try analyzeBlockCorrelation(ctx, top, in_width)) |block| {
         if (try planKeyedBlock(ctx, &block, in_subquery, lowered)) |plan| {
             pred.* = try runKeyedPlan(ctx, plan, negate, lowered);
+            // A keyed set answers NOT IN's NULL probes from its own rows.
+            if (plan.bounds != null) try passNullProbesByExists(ctx, pred, top, negate, in_subquery, lowered);
             return true;
         }
     }
-    if (try resolveDisjunctBlocks(ctx, pred, top, negate, in_subquery, lowered)) return true;
-    const l = lowered orelse return false;
-    return try resolveDomainBlock(ctx, pred, top, negate, in_subquery, l);
+    if (!try resolveDisjunctBlocks(ctx, pred, top, negate, in_subquery, lowered)) {
+        const l = lowered orelse return false;
+        if (!try resolveDomainBlock(ctx, pred, top, negate, in_subquery, l)) return false;
+    }
+    try passNullProbesByExists(ctx, pred, top, negate, in_subquery, lowered);
+    return true;
+}
+
+/// `passingNullProbes` for a NOT IN whose resolved probe can't tell where
+/// the subquery has no rows: the block's NOT EXISTS, resolved beside it,
+/// does.
+fn passNullProbesByExists(ctx: *CompileCtx, pred: *PredicateExpr, top: *const ir.Op, negate: bool, in_subquery: ?exec.predicate.InSubquery, lowered: ?*LoweredScalars) anyerror!void {
+    if (!negate) return;
+    const s = in_subquery orelse return;
+    var empty: PredicateExpr = undefined;
+    if (!try resolveCorrelatedBlock(ctx, &empty, top, true, null, lowered)) return;
+    const aa = try ctx.subqueryArena();
+    const in_cols = try std.mem.concat(aa, []const u8, &.{ &.{s.col}, s.rest_cols });
+    pred.* = try passingNullProbes(aa, in_cols, pred.*, empty);
 }
 
 /// A keyed block's subquery without its correlations, and the outer columns
@@ -1752,12 +1830,24 @@ fn runKeyedPlan(ctx: *CompileCtx, plan: KeyedPlan, negate: bool, lowered: ?*Lowe
     else blk: {
         var q = try local.compileSubplan(ctx, rewritten);
         defer q.deinit();
-        break :blk try inTupleSet(aa, .{
+        const width = plan.outer_keys.len;
+        const null_probes = negate and plan.n_in > 0;
+        const drained = try drainTuples(ctx, &q, width, if (null_probes) plan.n_in else null);
+        const inner_types = try columnTypes(aa, q.outputSchema()[0..width]);
+        const in_set = try inTupleSet(aa, .{
             .outer_cols = plan.outer_keys,
-            .rows = try drainTuples(ctx, &q, plan.outer_keys.len),
+            .rows = drained.rows,
             .negate = negate,
-            .inner_types = try columnTypes(aa, q.outputSchema()[0..plan.outer_keys.len]),
+            .inner_types = inner_types,
         }, plan.n_in);
+        if (!null_probes) break :blk in_set;
+        const empty: PredicateExpr = if (plan.n_in == width) .{ .always = drained.no_rows } else .{ .correlated_set = .{
+            .outer_cols = plan.outer_keys[plan.n_in..],
+            .rows = drained.keys,
+            .negate = true,
+            .inner_types = inner_types[plan.n_in..],
+        } };
+        break :blk try passingNullProbes(aa, plan.outer_keys[0..plan.n_in], in_set, empty);
     };
     if (lowered) |l| try l.computeOuterValues(ctx, &plan.block.info);
     return pred;
