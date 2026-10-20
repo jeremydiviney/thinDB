@@ -1616,3 +1616,66 @@ test "a DATE stepped by days, weeks, months, quarters or years is a DATETIME in 
     try exec(allocator, db, "INSERT INTO w VALUES (1, DATE '2000-01-01') ON DUPLICATE KEY UPDATE d = d + INTERVAL 1 WEEK");
     try expectTexts(allocator, db, "SELECT CAST(d AS CHAR) FROM w ORDER BY id", &.{ "2026-03-07", "2025-02-01", "2026-03-04" });
 }
+
+test "TIME_SLICE and DATE_SLICE floor or ceil to periods counted from 0001-01-01, as in StarRocks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, dt DATETIME, d DATE)");
+    try exec(allocator, db, "INSERT INTO t VALUES (1, '2023-10-31 23:59:59', '2023-10-31'), (2, NULL, NULL), (3, '2023-12-31 03:12:04', '2024-02-29')");
+
+    // StarRocks 4.0's answers. CEIL is the next period's start even on a
+    // boundary, and NULL past 9999-12-31.
+    const slices = .{
+        .{ "TIME_SLICE('2023-12-31 03:12:04', INTERVAL 2147483647 SECOND)", "1974-06-25 21:49:23" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 2147483647 year)", "0001-01-01 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 2147483647 week)", "0001-01-01 00:00:00" },
+        .{ "time_slice('9999-12-31 23:59:59', interval 5 year, ceil)", null },
+        .{ "time_slice('9999-12-31', interval 5 week, ceil)", null },
+        .{ "time_slice('9999-12-31 23:59:59', interval 5 second, CEIL)", null },
+        .{ "time_slice('2023-10-31 23:59:59', interval 17 millisecond)", "2023-10-31 23:59:58.984000" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 17 millisecond, ceil)", "2023-10-31 23:59:59.001000" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 1000 millisecond, ceil)", "2023-11-01 00:00:00" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 172800000 millisecond)", "2023-10-30 00:00:00" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 1000001 microsecond)", "2023-10-31 23:59:58.329764" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 1001 microsecond, ceil)", "2023-10-31 23:59:59.000024" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 5 hour)", "2023-10-31 23:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 7 minutes, floor)", "2023-12-31 03:07:00" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 3 day, ceil)", "2023-11-02 00:00:00" },
+        // 0001-01-01 is a Monday, so weeks start on Mondays.
+        .{ "time_slice('2023-10-31 23:59:59', interval 1 week)", "2023-10-30 00:00:00" },
+        .{ "time_slice('2023-10-31 23:59:59', interval 1 week, ceil)", "2023-11-06 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 1 month)", "2023-12-01 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 5 month, ceil)", "2024-05-01 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 2 quarter)", "2023-07-01 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', interval 10 year)", "2021-01-01 00:00:00" },
+        .{ "time_slice('2023-12-31 03:12:04', 1, 'month', 'floor')", "2023-12-01 00:00:00" },
+        .{ "time_slice(DATE '2024-02-29', interval 1 month)", "2024-02-01 00:00:00" },
+        .{ "date_slice('2023-12-31 03:12:04', interval 1 year)", "2023-01-01" },
+        .{ "date_slice(DATE '2024-02-29', interval 1 week)", "2024-02-26" },
+        .{ "date_slice(DATE '2024-02-29', interval 1 month, ceil)", "2024-03-01" },
+        .{ "date_slice(DATE '9999-12-31', interval 1 day, ceil)", null },
+    };
+    inline for (slices) |c| try expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
+
+    try expectTexts(allocator, db, "SELECT CAST(time_slice(dt, interval 1 hour) AS CHAR) FROM t ORDER BY id", &.{ "2023-10-31 23:00:00", null, "2023-12-31 03:00:00" });
+    try expectTexts(allocator, db, "SELECT CAST(time_slice(dt, 2, 'day', 'ceil') AS CHAR) FROM t ORDER BY id", &.{ "2023-11-01 00:00:00", null, "2024-01-02 00:00:00" });
+    try expectTexts(allocator, db, "SELECT CAST(date_slice(d, interval 1 quarter) AS CHAR) FROM t ORDER BY id", &.{ "2023-10-01", null, "2024-01-01" });
+    try expectTexts(allocator, db, "SELECT CAST(time_slice(dt, interval 1 year) AS CHAR) AS y, COUNT(*) FROM t WHERE dt IS NOT NULL GROUP BY y", &.{"2023-01-01 00:00:00"});
+    try expectTexts(allocator, db, "SELECT CAST(id AS CHAR) FROM t WHERE time_slice(dt, interval 1 month) = '2023-12-01 00:00:00'", &.{"3"});
+    inline for (.{ .{ "time_slice(d, interval 1 day)", thindb.types.TypeTag.datetime }, .{ "date_slice(dt, interval 1 day)", thindb.types.TypeTag.date } }) |c| {
+        var q = try runSql(allocator, db, "SELECT " ++ c[0] ++ " FROM t");
+        defer q.deinit();
+        try std.testing.expectEqual(c[1], std.meta.activeTag(q.outputSchema()[0].type));
+    }
+
+    // StarRocks wants a positive integer literal for the count.
+    inline for (.{ "interval 3.2 year", "interval -3 week", "interval 0 day", "interval id day", "interval '5' day" }) |interval| {
+        try helpers.expectRunError(allocator, db, "SELECT date_slice(dt, " ++ interval ++ ") FROM t", error.SqlExpectedValue);
+    }
+    try helpers.expectRunError(allocator, db, "SELECT time_slice(dt, interval 1 day, round) FROM t", error.SqlExpectedKeyword);
+    try std.testing.expectError(error.TimeSliceBeforeOrigin, exec(allocator, db, "SELECT time_slice('0000-01-01', interval 5 year)"));
+    try std.testing.expectError(error.ComputeUnsupportedExpr, exec(allocator, db, "SELECT date_slice(d, interval 1 hour) FROM t"));
+}

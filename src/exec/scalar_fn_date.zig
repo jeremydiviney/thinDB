@@ -579,6 +579,93 @@ pub fn dateTruncKernel(allocator: Allocator, args: []const ColumnView, out: *Col
     }
 }
 
+/// The first day StarRocks' TIME_SLICE counts its periods from.
+const SLICE_ORIGIN_DAYS = common.ymdToDays(1, 1, 1);
+
+const SliceBoundary = enum { floor, ceil };
+
+fn parseSliceBoundary(text: []const u8) error{ComputeUnsupportedExpr}!SliceBoundary {
+    if (std.ascii.eqlIgnoreCase(text, "floor")) return .floor;
+    if (std.ascii.eqlIgnoreCase(text, "ceil")) return .ceil;
+    return error.ComputeUnsupportedExpr;
+}
+
+/// StarRocks' TIME_SLICE(dt, INTERVAL n unit [, FLOOR | CEIL]), which the
+/// parser spells time_slice(dt, n, 'unit', 'floor' | 'ceil'). A DATE
+/// reaches it widened to midnight.
+pub fn timeSliceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    if (row_count == 0) return;
+    const span = unitSpan(try parseFineUnit(stringViewOf(args[2]).rowBytes(0)));
+    const boundary = try parseSliceBoundary(stringViewOf(args[3]).rowBytes(0));
+    const base = out.data.rowCount();
+    const values = args[0].data.datetime;
+    const ns = args[1].data.bigint;
+    for (0..row_count) |i| {
+        const slice = if (args[0].isValid(i) and args[1].isValid(i)) try timeSlice(values[i], ns[i], span, boundary) else null;
+        try out.data.datetime.append(allocator, slice orelse 0);
+        try out.appendValidBit(allocator, base + i, slice != null);
+    }
+}
+
+/// StarRocks' DATE_SLICE: TIME_SLICE by a day or a longer unit, as a DATE.
+/// A DATETIME reaches it as its day.
+pub fn dateSliceKernel(comptime temporal: Temporal) Kernel {
+    return struct {
+        fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+            if (row_count == 0) return;
+            const span = unitSpan(try parseFineUnit(stringViewOf(args[2]).rowBytes(0)));
+            switch (span) {
+                .micros => |unit| if (unit < std.time.us_per_day) return error.ComputeUnsupportedExpr,
+                .months => {},
+            }
+            const boundary = try parseSliceBoundary(stringViewOf(args[3]).rowBytes(0));
+            const base = out.data.rowCount();
+            const ns = args[1].data.bigint;
+            for (0..row_count) |i| {
+                const days: ?i32 = if (args[0].isValid(i) and args[1].isValid(i)) blk: {
+                    const day = switch (temporal) {
+                        .date => args[0].data.date[i],
+                        .datetime => daysFromDatetime(args[0].data.datetime[i]),
+                    };
+                    const slice = try timeSlice(@as(i64, day) * std.time.us_per_day, ns[i], span, boundary) orelse break :blk null;
+                    break :blk daysFromDatetime(slice);
+                } else null;
+                try out.data.date.append(allocator, days orelse 0);
+                try out.appendValidBit(allocator, base + i, days != null);
+            }
+        }
+    }.kernel;
+}
+
+/// The start of the period `n` spans wide that holds `micros`, periods
+/// counted from 0001-01-01, or of the period after it for CEIL, even when
+/// `micros` starts its own, as in StarRocks. Null when that passes
+/// 9999-12-31.
+fn timeSlice(micros: i64, n: i64, span: UnitSpan, boundary: SliceBoundary) error{ TimeSliceIntervalNotPositive, TimeSliceBeforeOrigin }!?i64 {
+    if (n <= 0) return error.TimeSliceIntervalNotPositive;
+    const origin_micros = @as(i64, SLICE_ORIGIN_DAYS) * std.time.us_per_day;
+    if (micros < origin_micros) return error.TimeSliceBeforeOrigin;
+    const after: i128 = @intFromBool(boundary == .ceil);
+    switch (span) {
+        .micros => |unit| {
+            const period = @as(i128, n) * unit;
+            const slice = origin_micros + (@divTrunc(micros - origin_micros, period) + after) * period;
+            if (slice > common.LAST_DATETIME_MICROS) return null;
+            return @as(i64, @intCast(slice));
+        },
+        .months => |unit| {
+            const ymd = daysToYmd(daysFromDatetime(micros));
+            const elapsed = (@as(i64, ymd.year) - 1) * 12 + ymd.month - 1;
+            const period = @as(i128, n) * unit;
+            const months = (@divTrunc(elapsed, period) + after) * period;
+            if (months >= 9999 * 12) return null;
+            const year: i32 = @intCast(1 + @divTrunc(months, 12));
+            const month: u32 = @intCast(@mod(months, 12) + 1);
+            return @as(i64, common.ymdToDays(year, month, 1)) * std.time.us_per_day;
+        },
+    }
+}
+
 /// A unit named by the constant string argument of `timestampadd`.
 /// `DiffUnit` adds StarRocks' millisecond and microsecond to it for
 /// `date_trunc`, `date_diff` and `timestampdiff`.
