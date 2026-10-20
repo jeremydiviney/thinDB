@@ -1,6 +1,6 @@
 //! IN / NOT IN against a subquery — pre-compile pass drains the inner,
-//! materializes the column into a Value slice, evaluator does linear
-//! scan per row.
+//! materializes the column into a Value slice, and the filter looks each
+//! row up in it.
 //!
 //! thinDB dialect: NULLs in the materialized set are dropped (both IN
 //! and NOT IN). This deliberately deviates from SQL-standard 3VL on
@@ -193,4 +193,44 @@ test "NOT IN (subquery): an empty inner keeps a NULL row; a NULL from the inner 
     try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE a IN (SELECT b FROM inner_vals)", &.{});
     try exec(allocator, db, "INSERT INTO inner_vals VALUES (NULL)");
     try helpers.expectTexts(allocator, db, "SELECT a FROM outer_vals WHERE a NOT IN (SELECT b FROM inner_vals) ORDER BY a", &.{"1"});
+}
+
+test "a subquery's numbers meet a text column's rows read as numbers, decimals included" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE tn (k BIGINT PRIMARY KEY, s VARCHAR(8) NULL)");
+    try exec(allocator, db, "INSERT INTO tn VALUES (1, '1'), (2, '2.0'), (3, '02'), (4, 'abc'), (5, '2.5'), (6, NULL), (7, '10')");
+    try exec(allocator, db, "CREATE TABLE nums (n INT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO nums VALUES (1), (2)");
+    try exec(allocator, db, "CREATE TABLE decs (k BIGINT PRIMARY KEY, d DECIMAL(4, 1) NOT NULL)");
+    try exec(allocator, db, "INSERT INTO decs VALUES (1, 1.0), (2, 2.5)");
+
+    // Each answer is the one the same comparison with literals gives
+    // (`s IN (1.0, 2.5)`, `s = 2.5`, ...).
+    const cases = .{
+        .{ "SELECT k FROM tn WHERE s IN (SELECT n FROM nums) ORDER BY k", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT k FROM tn WHERE s NOT IN (SELECT n FROM nums) ORDER BY k", &[_]i64{ 5, 7 } },
+        .{ "SELECT k FROM tn WHERE s IN (SELECT d FROM decs) ORDER BY k", &[_]i64{ 1, 5 } },
+        .{ "SELECT k FROM tn WHERE s IN (SELECT d * 2 FROM decs) ORDER BY k", &[_]i64{ 2, 3 } },
+        .{ "SELECT k FROM tn WHERE s = (SELECT d FROM decs WHERE k = 2) ORDER BY k", &[_]i64{5} },
+        .{ "SELECT k FROM tn WHERE s < (SELECT d FROM decs WHERE k = 2) ORDER BY k", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT k FROM tn WHERE s IN (SELECT d FROM decs WHERE decs.k = tn.k) ORDER BY k", &[_]i64{1} },
+        .{ "SELECT k FROM tn WHERE (s, k) IN (SELECT d, k FROM decs) ORDER BY k", &[_]i64{1} },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("tn", .{})).flush();
+        inline for (cases) |c| {
+            const ks = try collectBigints(allocator, db, c[0]);
+            defer allocator.free(ks);
+            std.testing.expectEqualSlices(i64, c[1], ks) catch |err| {
+                std.debug.print("pass {d}: {s}\n", .{ pass, c[0] });
+                return err;
+            };
+        }
+    }
 }
