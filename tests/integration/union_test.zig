@@ -350,3 +350,39 @@ test "VALUES and TABLE: row constructors and a whole table stand wherever a quer
 
     try helpers.expectRunError(allocator, db, "VALUES ROW(1), ROW(1, 2)", error.SqlRowValueWidthMismatch);
 }
+
+test "VALUES: an all-NULL column reads as a number, and nested NULL parts take the other rows' types" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const all_null = .{
+        .{ "SELECT SUM(c1) FROM (VALUES (NULL), (NULL)) t(c1)", null },
+        .{ "SELECT AVG(c1) FROM (VALUES (NULL), (NULL)) t(c1)", null },
+        .{ "SELECT STDDEV(c1) FROM (VALUES (NULL), (NULL), (NULL)) t(c1)", null },
+        .{ "SELECT COUNT(c1) FROM (VALUES (NULL), (NULL)) t(c1)", "0" },
+        .{ "WITH w1 AS (SELECT column_0 AS c1 FROM (VALUES (NULL), (NULL)) t) SELECT SUM(c1) FROM w1", null },
+        .{ "WITH w1 AS (SELECT column_0 AS c1 FROM (VALUES (NULL), (NULL)) t) SELECT MAX(c1) FROM w1", null },
+        .{ "SELECT CORR(a, b) FROM (VALUES (NULL, NULL), (NULL, NULL)) t(a, b)", null },
+    };
+    inline for (all_null) |c| try helpers.expectText(allocator, db, c[0], c[1]);
+
+    const nested = .{
+        .{
+            "SELECT column_1 FROM (VALUES (1, named_struct('name', NULL, 'age', NULL)), (2, named_struct('name', 'Alice', 'age', 25))) v ORDER BY column_0",
+            &[_]?[]const u8{ "{\"name\":null,\"age\":null}", "{\"name\":\"Alice\",\"age\":25}" },
+        },
+        .{
+            "SELECT column_1 FROM (VALUES (1, named_struct('name', 'Bob', 'age', 30)), (2, named_struct('name', NULL, 'age', NULL)), (3, named_struct('name', 'Alice', 'age', NULL))) v ORDER BY column_0",
+            &[_]?[]const u8{ "{\"name\":\"Bob\",\"age\":30}", "{\"name\":null,\"age\":null}", "{\"name\":\"Alice\",\"age\":null}" },
+        },
+        .{ "SELECT column_1 FROM (VALUES (1, [NULL]), (2, [25])) v ORDER BY column_0", &[_]?[]const u8{ "[null]", "[25]" } },
+        .{ "SELECT column_1 FROM (VALUES (1, [25]), (2, [NULL, NULL])) v ORDER BY column_0", &[_]?[]const u8{ "[25]", "[null,null]" } },
+        .{ "SELECT column_1 FROM (VALUES (1, map{'a': NULL}), (2, map{'b': 2})) v ORDER BY column_0", &[_]?[]const u8{ "{\"a\":null}", "{\"b\":2}" } },
+        .{ "SELECT column_1 FROM (VALUES (1, [named_struct('x', NULL)]), (2, [named_struct('x', 1.5)])) v ORDER BY column_0", &[_]?[]const u8{ "[{\"x\":null}]", "[{\"x\":1.5}]" } },
+    };
+    inline for (nested) |c| try helpers.expectTexts(allocator, db, c[0], c[1]);
+}

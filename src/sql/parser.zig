@@ -1698,7 +1698,7 @@ pub const Parser = struct {
             defer agg_arg2_cols.deinit(self.arena);
             const agg_calls = try self.statementAggCalls(proj, aggregate_expr_refs);
             for (agg_calls.aggs, agg_calls.repeats) |a, repeat| {
-                if (repeat == null) try self.appendAggInputs(a, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter);
+                if (repeat == null) try self.appendAggInputs(a, root, &derived_buf, &agg_cols, &agg_arg2_cols, &synth_counter);
             }
             if (derived_buf.items.len > 0) {
                 const derived_slice = try derived_buf.toOwnedSlice(self.arena);
@@ -3503,12 +3503,14 @@ pub const Parser = struct {
     fn appendAggInputs(
         self: *Parser,
         a: ParsedAgg,
+        from: *const ir.Op,
         derived_buf: *std.ArrayList(ir.Derived),
         agg_cols: *std.ArrayList(?[]const u8),
         agg_arg2_cols: *std.ArrayList(?[]const u8),
         synth_counter: *usize,
     ) ParseError!void {
-        if (a.arg_expr) |e| {
+        const numeric = readsNumericNull(a.func);
+        if (hoistedAggInput(from, numeric, a.col, a.arg_expr)) |e| {
             const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter.*}) catch return ParseError.OutOfMemory;
             synth_counter.* += 1;
             try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
@@ -3516,7 +3518,7 @@ pub const Parser = struct {
         } else {
             try agg_cols.append(self.arena, a.col);
         }
-        if (a.arg2_expr) |e| {
+        if (hoistedAggInput(from, numeric, a.arg2_col, a.arg2_expr)) |e| {
             const owned_name = std.fmt.allocPrint(self.arena, "__agg_arg_{d}", .{synth_counter.*}) catch return ParseError.OutOfMemory;
             synth_counter.* += 1;
             try derived_buf.append(self.arena, .{ .name = owned_name, .expr = e });
@@ -3764,6 +3766,25 @@ pub const Parser = struct {
             .arg_expr = arg_expr,
             .params = params,
         } };
+    }
+
+    /// The expression an aggregate input computes in the pre-aggregate
+    /// Compute: its own, or a numeric NULL for a column a bare NULL fills on
+    /// every row of `from` where the aggregate takes numbers, as
+    /// `numericNullArg` reads a literal one: `SUM(c)` over `VALUES (NULL),
+    /// (NULL)` is NULL, not a sum over text. Null to read the column as is.
+    fn hoistedAggInput(from: *const ir.Op, numeric: bool, col: ?[]const u8, expr: ?ir.Expr) ?ir.Expr {
+        if (expr) |e| return e;
+        const name = col orelse return null;
+        return if (numeric and ir.outputIsNull(from, name)) .{ .null_lit = .bigint } else null;
+    }
+
+    /// Whether `func` reads a bare NULL argument as a numeric NULL.
+    fn readsNumericNull(func: ir.AggFunc) bool {
+        return exec_aggregate.takesNumbers(func) or switch (func) {
+            .covar_pop, .covar_samp, .corr, .mann_whitney_u_test, .percentile_approx_weighted => true,
+            else => false,
+        };
     }
 
     /// A bare NULL where an aggregate takes only numbers is a numeric NULL,

@@ -1341,6 +1341,69 @@ fn freeProject(p: Op.Project, allocator: Allocator) void {
     allocator.destroy(p.upstream);
 }
 
+/// Whether `name` is a bare NULL on every row of `op`'s output, through
+/// the nested unions a VALUES list of more than two rows builds, so
+/// `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
+pub fn outputIsNull(op: *const Op, name: []const u8) bool {
+    return switch (outputSource(op, name) orelse return false) {
+        .expr => |e| e == .null_lit,
+        .set_union => |s| outputIsNull(s.left, s.col) and outputIsNull(s.right, s.col),
+    };
+}
+
+pub const OutputSource = union(enum) {
+    expr: Expr,
+    /// A union's column, which its right arm names as its left does when
+    /// one VALUES list builds both.
+    set_union: struct { left: *const Op, right: *const Op, col: []const u8 },
+};
+
+/// What `name` in `op`'s output derives from on every row, followed
+/// through the row-preserving and renaming nodes an arm's SELECT builds:
+/// an expression, or a union whose arms each hold it.
+pub fn outputSource(op: *const Op, name: []const u8) ?OutputSource {
+    var cur = op;
+    var col = name;
+    while (true) switch (cur.*) {
+        .compute => |c| {
+            var i = c.derived.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return .{ .expr = c.derived[i].expr };
+            }
+            cur = c.upstream;
+        },
+        .select => |p| {
+            col = projectedSource(p, col) orelse return null;
+            cur = p.upstream;
+        },
+        .alias => |a| {
+            if (types.splitQualifiedName(col)) |split| {
+                if (std.ascii.eqlIgnoreCase(split.qualifier, a.alias)) col = split.bare;
+            }
+            cur = a.upstream;
+        },
+        .exclude => |p| cur = p.upstream,
+        .filter => |f| cur = f.upstream,
+        .order_by => |o| cur = o.upstream,
+        .limit => |l| cur = l.upstream,
+        .materialize => |m| {
+            if (m.recursion != null) return null;
+            cur = m.upstream;
+        },
+        .set_union => |u| return .{ .set_union = .{ .left = u.left, .right = u.right, .col = col } },
+        else => return null,
+    };
+}
+
+fn projectedSource(p: Op.Project, name: []const u8) ?[]const u8 {
+    for (p.columns, 0..) |src, i| {
+        const out = if (p.outputs) |outs| outs[i] orelse types.unqualifiedName(src) else types.unqualifiedName(src);
+        if (std.ascii.eqlIgnoreCase(out, types.unqualifiedName(name))) return src;
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // Encode
 // ---------------------------------------------------------------------------
