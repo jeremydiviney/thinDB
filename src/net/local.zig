@@ -3012,6 +3012,10 @@ fn writeInsertRows(t: *ApiTable, rule: DuplicateRule, batch_schema: []const type
             return row_count;
         },
         .resolve => |action| return duplicateAffectedRows(try t.insertBatchOnDuplicate(batch_schema, views, row_count, action)),
+        .partial => |action| {
+            _ = try t.insertBatchOnDuplicate(batch_schema, views, row_count, action);
+            return row_count;
+        },
     }
 }
 
@@ -3670,6 +3674,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         switch (rule) {
             .replace => try t.insertBatchLocked(builder.schemaSlice(), builder.views(), row_count),
             .resolve => |action| affected = duplicateAffectedRows(try t.insertBatchOnDuplicateLocked(builder.schemaSlice(), builder.views(), row_count, action)),
+            .partial => |action| _ = try t.insertBatchOnDuplicateLocked(builder.schemaSlice(), builder.views(), row_count, action),
         }
     } else {
         for (rows) |row| {
@@ -3697,6 +3702,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         switch (rule) {
             .replace => try t.insertBatch(builder.schemaSlice(), builder.views(), row_count),
             .resolve => |action| affected = duplicateAffectedRows(try t.insertBatchOnDuplicate(builder.schemaSlice(), builder.views(), row_count, action)),
+            .partial => |action| _ = try t.insertBatchOnDuplicate(builder.schemaSlice(), builder.views(), row_count, action),
         }
     }
 
@@ -3921,18 +3927,22 @@ fn duplicateAffectedRows(counts: upsert_mod.DuplicateCounts) usize {
 }
 
 /// What a unique table does with an INSERT row whose key it already holds:
-/// plain INSERT replaces the stored row; IGNORE and a merging ON DUPLICATE
-/// KEY UPDATE hand the rows to `Table.insertBatchOnDuplicate`.
+/// plain INSERT and REPLACE replace the stored row; IGNORE, a merging ON
+/// DUPLICATE KEY UPDATE and a column list that leaves columns out hand the
+/// rows to `Table.insertBatchOnDuplicate`.
 const DuplicateRule = union(enum) {
     replace,
     resolve: upsert_mod.OnDuplicate,
+    /// A partial update, which counts one affected row per INSERT row as a
+    /// replace does, not MySQL's two per updated row.
+    partial: upsert_mod.OnDuplicate,
 };
 
-/// Reduce an INSERT's IGNORE / ON DUPLICATE KEY UPDATE to its rule. A table
-/// without a unique key never meets a duplicate. An update that sets every
-/// non-key column from the new row is a replace, the path bulk upserts take;
-/// one that changes nothing is IGNORE. `source_names` are an INSERT ...
-/// SELECT's output columns, which its assignments may name.
+/// Reduce an INSERT's IGNORE / ON DUPLICATE KEY UPDATE / column list to its
+/// rule. A table without a unique key never meets a duplicate. An update that
+/// sets every non-key column from the new row is a replace, the path bulk
+/// upserts take; one that changes nothing is IGNORE. `source_names` are an
+/// INSERT ... SELECT's output columns, which its assignments may name.
 fn duplicateRule(
     ctx: *CompileCtx,
     aa: Allocator,
@@ -3944,7 +3954,11 @@ fn duplicateRule(
     source_names: ?[]const []const u8,
 ) !DuplicateRule {
     if (!t.schema.unique) return .replace;
-    const od = on_duplicate orelse return if (mode == .ignore) .{ .resolve = .ignore } else .replace;
+    const od = on_duplicate orelse return switch (mode) {
+        .insert => try columnListRule(ctx, aa, t, insert_columns),
+        .replace => .replace,
+        .ignore => .{ .resolve = .ignore },
+    };
     const scope: DuplicateScope = .{
         .schema = t.schema,
         .table_name = op_table.name,
@@ -3994,6 +4008,33 @@ fn duplicateRule(
     for (od.assignments, named) |a, *name| name.* = a.col;
     try computed.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, named));
     return .{ .resolve = .{ .update = computed.items } };
+}
+
+/// A plain INSERT naming its columns updates a held key's row in those
+/// columns and keeps its others, as StarRocks updates a primary-key table
+/// (`enable_insert_partial_update`). The row takes ON UPDATE
+/// CURRENT_TIMESTAMP stamps as an UPDATE's would. A new key still fills the
+/// columns left out with their defaults, and a list naming every column is
+/// a replace. REPLACE resets the columns left out, as MySQL's does.
+fn columnListRule(ctx: *CompileCtx, aa: Allocator, t: *ApiTable, insert_columns: ?[]const []const u8) !DuplicateRule {
+    const listed = insert_columns orelse return .replace;
+    var assignments: std.ArrayList(update_mod.Assignment) = .empty;
+    var leaves_out = false;
+    for (t.schema.columns, 0..) |c, ci| {
+        const is_key = for (t.order_key_indices) |k| {
+            if (k == ci) break true;
+        } else false;
+        if (is_key) continue;
+        if (!nameListed(listed, c.name)) {
+            leaves_out = true;
+            continue;
+        }
+        try assignments.append(aa, .{ .col = c.name, .value = .{ .col_ref = try std.mem.concat(aa, u8, &.{ upsert_mod.incoming_prefix, c.name }) } });
+    }
+    if (!leaves_out) return .replace;
+    if (assignments.items.len == 0) return .{ .partial = .ignore };
+    try assignments.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, listed));
+    return .{ .partial = .{ .update = assignments.items } };
 }
 
 /// The names an ON DUPLICATE KEY UPDATE expression may use, resolved to

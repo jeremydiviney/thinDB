@@ -1,8 +1,8 @@
-//! `INSERT IGNORE` and `INSERT ... ON DUPLICATE KEY UPDATE` on unique and
-//! non-unique tables, plus the MySQL INSERT spellings that feed them
-//! (`SET`, `VALUE`, `ROW(...)`, a row alias). An update that sets every
-//! non-key column from the new row takes the plain upsert path the Flink
-//! JDBC sink relies on; any other update merges into the stored row.
+//! `INSERT IGNORE`, `INSERT ... ON DUPLICATE KEY UPDATE` and a column-list
+//! INSERT on unique and non-unique tables, plus the MySQL INSERT spellings
+//! that feed them (`SET`, `VALUE`, `ROW(...)`, a row alias). An update that
+//! sets every non-key column from the new row takes the plain upsert path the
+//! Flink JDBC sink relies on; any other update merges into the stored row.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -262,4 +262,77 @@ test "ON DUPLICATE KEY UPDATE: a column assigned twice keeps the last value" {
     try exec(allocator, db, "INSERT INTO dim (id, a, b) VALUES (1, 0, 0) ON DUPLICATE KEY UPDATE a = 3, b = 4, a = 5");
     try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 5, 20 });
     try expectInts(allocator, db, "SELECT b FROM dim ORDER BY id", &.{ 4, 200 });
+}
+
+test "a column-list INSERT updates the columns it names and keeps the others" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openDim(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try std.testing.expectEqual(@as(u64, 2), try affectedRows(allocator, db, "INSERT INTO dim (id, a) VALUES (1, 11), (3, 30)"));
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 11, 20, 30 });
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ 100, 200, -1 });
+
+    try (try db.openTable("dim", .{})).flush();
+    try exec(allocator, db, "INSERT INTO dim (a, id) VALUES (21, 2), (22, 2)");
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 11, 22, 30 });
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ 100, 200, -1 });
+
+    // A NOT NULL column without a default can't be left out, key held or not.
+    try expectRunError(allocator, db, "INSERT INTO dim (id, b) VALUES (1, 5)", error.ColumnNotFound);
+
+    try exec(allocator, db, "CREATE TABLE src (k INT NOT NULL, v INT NOT NULL, PRIMARY KEY (k))");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 1000), (4, 4000)");
+    try std.testing.expectEqual(@as(u64, 2), try affectedRows(allocator, db, "INSERT INTO dim (a, id) SELECT v, k FROM src"));
+    try expectInts(allocator, db, "SELECT id FROM dim ORDER BY id", &.{ 1, 2, 3, 4 });
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 1000, 22, 30, 4000 });
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ 100, 200, -1, -1 });
+
+    db.close();
+    db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 1000, 22, 30, 4000 });
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ 100, 200, -1, -1 });
+}
+
+test "REPLACE and an INSERT naming every column replace the whole row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try openDim(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try exec(allocator, db, "REPLACE INTO dim (id, a) VALUES (1, 5)");
+    try exec(allocator, db, "INSERT INTO dim (b, a, id) VALUES (8, 9, 2)");
+    try expectInts(allocator, db, "SELECT a FROM dim ORDER BY id", &.{ 5, 9 });
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ -1, 8 });
+    try exec(allocator, db, "INSERT INTO dim VALUES (1, 6, 7)");
+    try expectInts(allocator, db, "SELECT COALESCE(b, -1) FROM dim ORDER BY id", &.{ 7, 8 });
+}
+
+test "a column-list INSERT keeps the defaults a row was given and stamps ON UPDATE columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db,
+        \\CREATE TABLE acct (id INT NOT NULL, name VARCHAR(20), n INT DEFAULT 5,
+        \\  created DATETIME DEFAULT CURRENT_TIMESTAMP, touched DATETIME ON UPDATE CURRENT_TIMESTAMP,
+        \\  PRIMARY KEY (id))
+    );
+    try exec(allocator, db, "INSERT INTO acct (id, name) VALUES (1, 'a'), (2, 'b')");
+    try exec(allocator, db, "INSERT INTO acct (id, n) VALUES (1, 6), (2, 5)");
+    try expectInts(allocator, db, "SELECT n FROM acct ORDER BY id", &.{ 6, 5 });
+    try expectInts(allocator, db, "SELECT id FROM acct WHERE name = 'a'", &.{1});
+    try expectInts(allocator, db, "SELECT COUNT(*) FROM acct WHERE created = (SELECT created FROM acct WHERE id = 2)", &.{2});
+    // Row 2's n was already 5, so nothing changed and nothing stamps it.
+    try expectInts(allocator, db, "SELECT id FROM acct WHERE touched IS NOT NULL", &.{1});
+
+    try exec(allocator, db, "INSERT INTO acct (id) VALUES (2), (3)");
+    try expectInts(allocator, db, "SELECT n FROM acct ORDER BY id", &.{ 6, 5, 5 });
+    try expectInts(allocator, db, "SELECT id FROM acct WHERE name IS NULL", &.{3});
+    try expectInts(allocator, db, "SELECT id FROM acct WHERE touched IS NOT NULL", &.{1});
 }
