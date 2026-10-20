@@ -1383,6 +1383,17 @@ gives NULL.
 frame's distinct non-NULL values, told apart as GROUP BY tells them (-0 is
 0). `MIN(DISTINCT x)` and `MAX(DISTINCT x)` are `MIN(x)` and `MAX(x)`.
 
+Every other built-in aggregate takes OVER as well (`MAX_BY`, `ARRAY_AGG`
+with its DISTINCT and ORDER BY, `GROUP_CONCAT`, `BOOL_OR`,
+`APPROX_TOP_K`, ...). Such a call is an `.aggregate` window call that names
+its aggregate, and the operator folds each row's frame into the aggregate
+operator's own accumulator, so a whole partition gives its GROUP BY value. A
+frame that keeps the last row's start and ends no earlier folds on into the
+same state, a row whose frame is the last one's shares its result, and any
+other frame folds afresh. These calls write their output column whole, so a
+spec that runs one evaluates serially. A UDF aggregate, `ARRAY_UNIQUE_AGG`,
+FILTER and IGNORE NULLS stay refused under OVER.
+
 StarRocks' `SESSION_NUMBER(x, delta)` numbers the sessions of each ordered
 partition from 1, ignoring the frame: a row starts the next session when its
 integer x exceeds the last non-NULL x before it by more than delta, a constant
