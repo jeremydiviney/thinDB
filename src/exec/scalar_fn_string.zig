@@ -182,25 +182,42 @@ fn regexStart(s: []const u8, pos: i64, past_end: usize) !usize {
 pub fn orderKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
     _ = arg_types;
     _ = out_type;
-    try appendOrderKeys(allocator, args, out, row_count, false);
+    try appendOrderKeys(allocator, args, out, row_count, false, NULL_BELOW);
 }
 
 pub fn orderKeyDescKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
     _ = arg_types;
     _ = out_type;
-    try appendOrderKeys(allocator, args, out, row_count, true);
+    try appendOrderKeys(allocator, args, out, row_count, true, NULL_BELOW);
 }
 
+pub fn orderKeyNullsLastKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, false, NULL_ABOVE);
+}
+
+pub fn orderKeyDescNullsFirstKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    try appendOrderKeys(allocator, args, out, row_count, true, NULL_ABOVE);
+}
+
+/// A key part's first byte: a NULL's marker below or above the 1 that
+/// starts every value.
+const NULL_BELOW: u8 = 0;
+const NULL_ABOVE: u8 = 2;
+
 /// Inverting every byte of an ascending key reverses its byte order, and
-/// moves the NULL marker from first to last.
-fn appendOrderKeys(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, descending: bool) !void {
+/// moves the NULL marker to the other end.
+fn appendOrderKeys(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize, descending: bool, null_marker: u8) !void {
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(allocator);
     for (0..row_count) |row| {
         key.clearRetainingCapacity();
-        for (args) |arg| try appendOrderKeyPart(allocator, &key, arg, row);
+        for (args) |arg| try appendOrderKeyPart(allocator, &key, arg, row, null_marker);
         if (descending) for (key.items) |*b| {
             b.* = ~b.*;
         };
@@ -209,8 +226,8 @@ fn appendOrderKeys(allocator: Allocator, args: []const ColumnView, out: *ColumnS
     }
 }
 
-fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize) Allocator.Error!void {
-    if (!arg.isValid(row)) return key.append(allocator, 0);
+fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: ColumnView, row: usize, null_marker: u8) Allocator.Error!void {
+    if (!arg.isValid(row)) return key.append(allocator, null_marker);
     try key.append(allocator, 1);
     switch (arg.data) {
         // A zero byte escapes to 0x00 0xFF and 0x00 0x00 ends the text, so a
@@ -1174,7 +1191,7 @@ pub fn rowKeyKernel(allocator: Allocator, arg_types: []const Type, out_type: Typ
         key.clearRetainingCapacity();
         const complete = for (args) |arg| {
             if (!arg.isValid(row)) break false;
-            try appendOrderKeyPart(allocator, &key, arg, row);
+            try appendOrderKeyPart(allocator, &key, arg, row, NULL_BELOW);
         } else true;
         try ss.appendValue(allocator, if (complete) key.items else "");
         try out.appendValidBit(allocator, base + row, complete);
