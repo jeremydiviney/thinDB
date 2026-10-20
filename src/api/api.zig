@@ -16,6 +16,9 @@ pub const Error = error{
     ColumnNotFound,
     ColumnAlreadyExists,
     UnsupportedAlterOp,
+    /// ALTER dropped a column of a unique key: rows unique on the whole key
+    /// need not be unique on the rest of it.
+    UniqueKeyColumnDrop,
     DatabaseNotFound,
     DatabaseAlreadyExists,
     /// A database name that can't name a database directory: one of the
