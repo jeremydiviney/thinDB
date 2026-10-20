@@ -2052,7 +2052,7 @@ pub const Window = struct {
         const col = self.accumulated[plan.value_col];
         const view = col.view();
         switch (col.data) {
-            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+            inline .int, .bigint, .tinyint, .smallint, .largeint, .boolean => |l| {
                 const items = l.items;
                 var sum: i128 = 0;
                 var saw_any = false;
@@ -2114,7 +2114,7 @@ pub const Window = struct {
         var sum: f64 = 0;
         var n: i64 = 0;
         switch (col.data) {
-            inline .int, .bigint, .tinyint, .smallint, .largeint, .float, .double => |l| {
+            inline .int, .bigint, .tinyint, .smallint, .largeint, .boolean, .float, .double => |l| {
                 const items = l.items;
                 const is_float = @typeInfo(@TypeOf(items[0])) == .float;
                 var i: usize = p_start;
@@ -2256,7 +2256,7 @@ pub const Window = struct {
         // Bind the typed slice ONCE (inline switch), then index it in the row
         // loop — no per-element data-union dispatch.
         switch (col.data) {
-            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+            inline .int, .bigint, .tinyint, .smallint, .largeint, .boolean => |l| {
                 const items = l.items;
                 var sum: i128 = 0;
                 var k: usize = lo;
@@ -2320,7 +2320,7 @@ pub const Window = struct {
         var sum: f64 = 0;
         var n: i64 = 0;
         switch (col.data) {
-            inline .int, .bigint, .tinyint, .smallint, .largeint => |l| {
+            inline .int, .bigint, .tinyint, .smallint, .largeint, .boolean => |l| {
                 const items = l.items;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
@@ -2488,20 +2488,19 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
             const t = schema[plan.value_col].type;
             // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), or
             // DECIMAL(76, s) over a DECIMAL past 38 digits, matching the
-            // aggregate operator. A DISTINCT sum keeps an i128.
+            // aggregate operator.
             if (t.decimalSpec()) |spec| {
                 if (t != .decimal256) break :blk Type{ .decimal128 = .{ .p = types.max_decimal128_precision, .s = spec.s } };
-                if (c.func == .sum_distinct) return Error.WindowUnsupported;
                 break :blk Type{ .decimal256 = .{ .p = types.max_decimal_precision, .s = spec.s } };
             }
             switch (t) {
-                .int, .bigint, .tinyint, .smallint => break :blk Type{ .bigint = {} },
+                .int, .bigint, .tinyint, .smallint, .boolean => break :blk Type{ .bigint = {} },
                 .largeint => break :blk Type{ .largeint = {} },
                 .float, .double => break :blk Type{ .double = {} },
                 else => return Error.WindowUnsupported,
             }
         },
-        .avg_distinct => if (isSummable(schema[plan.value_col].type) and schema[plan.value_col].type != .decimal256) Type{ .double = {} } else Error.WindowUnsupported,
+        .avg_distinct => if (isSummable(schema[plan.value_col].type)) Type{ .double = {} } else Error.WindowUnsupported,
         .avg, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => Type{ .double = {} },
         .ntile, .session_number => .bigint,
         .percent_rank, .cume_dist => Type{ .double = {} },
@@ -2590,6 +2589,8 @@ const DistinctAcc = struct {
     seen: std.StringHashMapUnmanaged(void) = .empty,
     count: i64 = 0,
     int_sum: i128 = 0,
+    /// DECIMAL256 mantissas, each step checked as SUM's are.
+    wide_sum: i256 = 0,
     float_sum: f64 = 0,
 
     fn deinit(self: *DistinctAcc) void {
@@ -2606,7 +2607,8 @@ const DistinctAcc = struct {
         entry.key_ptr.* = try allocator.dupe(u8, key);
         self.count += 1;
         switch (self.x.data) {
-            inline .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => |values| self.int_sum += values[row],
+            inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => |values| self.int_sum += values[row],
+            .decimal256 => |values| self.wide_sum = try addDecimalSum(self.wide_sum, values[row]),
             inline .float, .double => |values| self.float_sum += values[row],
             else => {},
         }
@@ -2618,6 +2620,7 @@ const DistinctAcc = struct {
         if (self.func == .avg_distinct) {
             const sum: f64 = switch (self.x.data) {
                 .float, .double => self.float_sum,
+                .decimal256 => types.floatOfInt(self.wide_sum) / self.x_scale_div,
                 else => @as(f64, @floatFromInt(self.int_sum)) / self.x_scale_div,
             };
             return writeDouble(out, row, sum / @as(f64, @floatFromInt(self.count)));
@@ -2627,6 +2630,7 @@ const DistinctAcc = struct {
             .bigint => try writeBigint(out, row, @truncate(self.int_sum)),
             .largeint => try writeLargeint(out, row, self.int_sum),
             .decimal128 => try writeDecimal128(out, row, self.int_sum),
+            .decimal256 => try writeDecimalSum(out, row, self.wide_sum),
             .double => try writeDouble(out, row, self.float_sum),
             else => return Error.WindowUnsupported,
         }
@@ -2634,7 +2638,7 @@ const DistinctAcc = struct {
 };
 
 fn isSummable(t: Type) bool {
-    return t.isInteger() or t.isDecimal() or t == .float or t == .double;
+    return t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double;
 }
 
 fn exprColIdx(e: ir.Expr, schema: []const Column) !usize {
