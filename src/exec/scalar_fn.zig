@@ -1297,6 +1297,30 @@ fn isWideWholeDecimal(ty: Type) bool {
 /// FROM_UNIXTIME's count so, and the count of YEARS_ADD and the rest of its
 /// family: `1.5` is 1 and `-0.5` is 0, truncated toward zero, where MySQL's
 /// reading rounds; and `'1.5'` or `1e20` is NULL.
+/// The type FIELD() compares its arguments as, by MySQL's rule: text beside
+/// text compares as text, numbers beside numbers as numbers, and anything
+/// else as DOUBLE, where a date is its YYYYMMDD number. Integers and
+/// booleans alone compare as BIGINT, or as LARGEINT beside a LARGEINT or an
+/// integer literal past BIGINT (`isWideWholeDecimal`). Null when every
+/// argument is text, or one is of a type with no such reading.
+pub fn fieldCompareType(arg_types: []const Type) ?Type {
+    var all_text = true;
+    var all_integers = true;
+    var wide = false;
+    for (arg_types) |t| {
+        const text = t.isString() and t != .json;
+        const wide_integer = t == .largeint or isWideWholeDecimal(t);
+        const integer = t.isInteger() or t == .boolean or wide_integer;
+        if (!text and !integer and !t.isFloat() and !t.isDecimal() and !t.isTemporal()) return null;
+        all_text = all_text and text;
+        all_integers = all_integers and integer;
+        wide = wide or wide_integer;
+    }
+    if (all_text) return null;
+    if (all_integers) return if (wide) .largeint else .bigint;
+    return .double;
+}
+
 pub fn readsArgsAsCast(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "from_unixtime")) return true;
     for (unit_add_sub_builtins) |f| if (std.ascii.eqlIgnoreCase(name, f.name)) return true;
@@ -1917,7 +1941,10 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "split_part", .arg_types = &.{ .string, .string, .int }, .return_type = .string, .kernel = string.splitPartKernel },
     .{ .name = "substring_index", .arg_types = &.{ .string, .string, .int }, .return_type = .string, .kernel = string.substringIndexKernel },
     .{ .name = "strcmp", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.strcmpKernel },
-    .{ .name = "field", .arg_types = &.{.string}, .return_type = .int, .variadic_min_args = 2, .kernel = string.fieldKernel },
+    .{ .name = "field", .arg_types = &.{.string}, .return_type = .int, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.fieldKernel },
+    .{ .name = "field", .arg_types = &.{.bigint}, .return_type = .int, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.fieldBigintKernel },
+    .{ .name = "field", .arg_types = &.{.largeint}, .return_type = .int, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.fieldLargeintKernel },
+    .{ .name = "field", .arg_types = &.{.double}, .return_type = .int, .variadic_min_args = 2, .null_strategy = .kernel_managed, .kernel = string.fieldDoubleKernel },
     .{ .name = "find_in_set", .arg_types = &.{ .string, .string }, .return_type = .int, .kernel = string.findInSetKernel },
     .{ .name = "initcap", .arg_types = &.{.string}, .return_type = .string, .kernel = string.initcapKernel },
     .{ .name = "translate", .arg_types = &.{ .string, .string, .string }, .return_type = .string, .kernel = string.translateKernel },

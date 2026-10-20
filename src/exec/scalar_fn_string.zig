@@ -1433,6 +1433,7 @@ pub fn ordKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSto
 
 pub fn fieldKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const probe_sv = stringViewOf(args[0]);
+    const base = out.data.rowCount();
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
         var found: i32 = 0;
@@ -1446,6 +1447,37 @@ pub fn fieldKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
             }
         }
         try out.data.int.append(allocator, found);
+        try out.appendValidBit(allocator, base + i, true);
+    }
+}
+
+pub fn fieldBigintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return fieldNumbersKernel("bigint", allocator, args, out, row_count);
+}
+
+pub fn fieldLargeintKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return fieldNumbersKernel("largeint", allocator, args, out, row_count);
+}
+
+pub fn fieldDoubleKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    return fieldNumbersKernel("double", allocator, args, out, row_count);
+}
+
+fn fieldNumbersKernel(comptime slice: []const u8, allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
+    const base = out.data.rowCount();
+    for (0..row_count) |i| {
+        var found: i32 = 0;
+        if (args[0].isValid(i)) {
+            const probe = @field(args[0].data, slice)[i];
+            for (args[1..], 1..) |arg, pos| {
+                if (arg.isValid(i) and @field(arg.data, slice)[i] == probe) {
+                    found = @intCast(pos);
+                    break;
+                }
+            }
+        }
+        try out.data.int.append(allocator, found);
+        try out.appendValidBit(allocator, base + i, true);
     }
 }
 

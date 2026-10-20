@@ -2350,7 +2350,7 @@ fn buildCallPlan(
         at.* = argPlanType(ap.*, up_schema);
         built += 1;
     }
-    if (try nullifConstantPlaced(aa, c, arg_plans, arg_types)) |rewritten| {
+    if (try nullifConstantPlaced(aa, c, arg_plans, arg_types) orelse try fieldArgsConverted(aa, c, arg_plans, arg_types)) |rewritten| {
         for (arg_plans[0..built]) |ap| freeArgPlan(runtime_allocator, ap);
         built = 0;
         return buildCallPlan(runtime_allocator, aa, rewritten, up_schema, udf_registry);
@@ -2693,6 +2693,31 @@ fn nullifConstantPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan,
         return Expr{ .call = .{ .fn_name = c.fn_name, .args = args, .from_statement = c.from_statement } };
     }
     return null;
+}
+
+/// FIELD(x, a, b, ...) with every argument converted to the one type the
+/// call compares them as (`scalar_fn.fieldCompareType`). Text and dates
+/// convert as CAST reads them, so text that is no number matches nothing,
+/// as it equals nothing in `x = 'a'`. A NULL literal takes that type and
+/// leaves the choice to the others. Null when no argument needs converting.
+fn fieldArgsConverted(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan, arg_types: []const Type) PlanError!?Expr {
+    if (!std.ascii.eqlIgnoreCase(c.fn_name, "field")) return null;
+    var typed: std.ArrayList(Type) = .empty;
+    for (arg_plans, arg_types) |ap, t| if (ap != .null_lit) try typed.append(aa, t);
+    const target = scalar_fn.fieldCompareType(typed.items) orelse return null;
+    const args = try aa.dupe(Expr, c.args);
+    var changed = false;
+    for (args, arg_plans, arg_types) |*a, ap, t| {
+        if (@as(types.TypeTag, t) == @as(types.TypeTag, target)) continue;
+        a.* = if (ap == .null_lit)
+            .{ .null_lit = target }
+        else if (t.isString() or t.isTemporal())
+            try castCall(aa, a.*, target) orelse return null
+        else
+            try convertedArg(aa, a.*, t, target) orelse return null;
+        changed = true;
+    }
+    return if (changed) Expr{ .call = .{ .fn_name = c.fn_name, .args = args, .from_statement = c.from_statement } } else null;
 }
 
 /// An integer's FLOAT cast that the call converts again, to DOUBLE (an
