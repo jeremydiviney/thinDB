@@ -365,6 +365,8 @@ A column's DEFAULT fills it where an INSERT omits it, and where a VALUES row or 
 - the next id for an AUTO_INCREMENT column;
 - otherwise NULL.
 
+The rows of one INSERT take ids in order. An explicit id past the counter moves the counter past it, as in MySQL, so a later row of the same statement can't be given that id again. StarRocks keeps explicit ids off its counter.
+
 A NOT NULL column without a default has nothing to give, so writing `DEFAULT` for it fails as omitting it does (`ColumnNotFound`). `UPDATE t SET c = DEFAULT` sets c to its default the same way. Two cases refuse an AUTO_INCREMENT column with `UnsupportedOp`: an UPDATE, and a `DEFAULT` cell in VALUES rows that hold an expression. Those rows stream through INSERT ... SELECT, which reserves no ids. A joined UPDATE doesn't take `DEFAULT`.
 
 `DEFAULT NULL` declares the default a nullable column already has. On a NOT NULL or PRIMARY KEY column it's `SqlInvalidDefault`, as MySQL refuses it (1067).
@@ -1911,6 +1913,12 @@ Each rename is followed by a directory sync. When a schema opens, it resolves an
 Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over.
 
 SQL's `ALTER TABLE` takes MySQL's spellings of the actions. `ADD [COLUMN] (def, ...)` adds each listed column at the end and, as in MySQL, takes no `FIRST` or `AFTER`.
+
+`AUTO_INCREMENT [=] n` copies nothing:
+- It raises the table's id counter so the next generated id is at least `n`.
+- It writes the manifest at once, so a restart keeps the counter.
+- A counter already past `n` stays where it is, since lowering it could hand out an id a row holds. MySQL lowers it, but only as far as the largest id plus one.
+- On a table with no AUTO_INCREMENT column it does nothing, as in MySQL.
 
 ### 9.3 Inserts
 

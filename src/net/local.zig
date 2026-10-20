@@ -2685,6 +2685,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             var ops: std.ArrayList(AlterOp) = .empty;
             defer ops.deinit(ctx.allocator);
             var rename_to: ?PersistentTableTarget = null;
+            var auto_increment: ?u64 = null;
             for (at.actions) |action| switch (action) {
                 .add_column => |c| try ops.append(ctx.allocator, try addColumnOp(ctx, c)),
                 .drop_column => |name| try ops.append(ctx.allocator, .{ .drop = name }),
@@ -2713,6 +2714,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                     if (!sameNamespace(target, to)) return Error.UnsupportedOp;
                     rename_to = to;
                 },
+                .auto_increment => |n| auto_increment = n,
             };
             if (ops.items.len > 0) {
                 target.schema.alterTable(target.table_name, ops.items) catch |e| return thindb_api.remapError(Error, e);
@@ -2720,6 +2722,12 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
                 // Only no-op actions (an index, a table option): the table
                 // must still exist.
                 _ = try resolveTable(catalog, ctx.session.*, at.table);
+            }
+            // MySQL takes a counter on a table with no AUTO_INCREMENT column
+            // and never uses it.
+            if (auto_increment) |n| {
+                const t = try resolveTable(catalog, ctx.session.*, at.table);
+                if (@import("../api/table.zig").autoIncrementColumnIndex(t.schema) != null) try t.raiseAutoIncrement(n);
             }
             if (rename_to) |to| {
                 target.schema.renameTable(target.table_name, to.table_name) catch |e| return thindb_api.remapError(Error, e);
@@ -3626,9 +3634,9 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
 
     // AUTO_INCREMENT resolution must run under the Table mutex so the
     // counter we reserve and the rows we hand to insertBatch stay in
-    // lock-step. We reserve a contiguous block up front, then fill each
-    // omitted/NULL AI cell with the next id while also bumping the
-    // counter past any explicit value the caller supplied.
+    // lock-step. Rows take ids in order: an omitted/NULL AI cell takes the
+    // next id, and an explicit value bumps the counter past it, so a later
+    // row of the same statement can't be handed that value again.
     const ai_idx_opt = @import("../api/table.zig").autoIncrementColumnIndex(tbl_schema);
 
     var builder = try InsertColumnBuilder.init(ctx.allocator, tbl_schema, row_count);
@@ -3641,7 +3649,6 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
         const ai_col = tbl_schema.columns[ai_idx];
         const ai_src = schema_to_source[ai_idx];
 
-        var next_counter = t.reserveAutoIncrement(@intCast(row_count));
         for (rows) |row| {
             for (tbl_schema.columns, 0..) |col, si| {
                 const maybe_src = schema_to_source[si];
@@ -3654,8 +3661,7 @@ fn compileInsert(ctx: *CompileCtx, op: ir.InsertOp) !Query {
                         break :blk uv;
                     }
                     // Omitted or explicit NULL → take the next id.
-                    const id = next_counter;
-                    next_counter += 1;
+                    const id = t.reserveAutoIncrement(1);
                     if (ctx.last_insert_id == null) ctx.last_insert_id = id;
                     break :blk integerLiteralForType(ai_col.type, id) catch return Error.TypeMismatch;
                 } else if (maybe_src) |src|

@@ -1105,6 +1105,20 @@ pub const Table = struct {
         if (next > self.manifest.auto_inc_next) self.manifest.auto_inc_next = next;
     }
 
+    /// `ALTER TABLE ... AUTO_INCREMENT = n`: the next generated id is at
+    /// least `n`, persisted now so a restart keeps it. A counter already
+    /// past `n` stays, as lowering it could reissue an id a row holds.
+    pub fn raiseAutoIncrement(self: *Table, n: u64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.ensureUsable();
+        const previous = self.manifest.auto_inc_next;
+        if (n <= previous) return;
+        self.manifest.auto_inc_next = n;
+        errdefer self.manifest.auto_inc_next = previous;
+        try self.persistManifest(self.manifest, self.syncEnabled());
+    }
+
     /// Build a `ManifestEntry` for a freshly-written segment under this
     /// table's schema. Populates byte_size, row_group_count,
     /// leading_key_stats, and the new v4 per-column_stats. Caller
