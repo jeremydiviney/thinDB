@@ -2248,7 +2248,9 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
             }
         }
         if (cast.sameRepresentation(lc.type, rc.type)) continue;
-        const common = cast.commonType(lc.type, rc.type) orelse {
+        const l_filled = try filledType(u.left, lc.name, lc.type, rc.type);
+        const r_filled = try filledType(u.right, rc.name, rc.type, lc.type);
+        const common = cast.commonType(l_filled, r_filled) orelse {
             if (trace_jf) std.debug.print("[jf]   union widen skip: {s} {s} vs {s}\n", .{ lc.name, @tagName(lc.type), @tagName(rc.type) });
             continue;
         };
@@ -2272,82 +2274,77 @@ fn unifyUnionArmTypes(input: engine_v2.CompileInput, u: ir.SetUnion, left: *exec
 /// `other`, the other arm's: a bare NULL does, and so does `[]` beside an
 /// array or `map{}` beside a map.
 fn outputIsTypeless(op: *const ir.Op, name: []const u8, other: types.Type) bool {
-    return switch (outputSource(op, name) orelse return false) {
+    return switch (ir.outputSource(op, name) orelse return false) {
         .expr => |e| e == .null_lit or scalar_fn.isEmptyNestedLiteral(e, other),
-        .set_union => outputIsNull(op, name),
+        .set_union => ir.outputIsNull(op, name),
     };
 }
 
-/// Whether `name` is a bare NULL on every row of `op`'s output, through
-/// the nested unions a VALUES list of more than two rows builds, so
-/// `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
-fn outputIsNull(op: *const ir.Op, name: []const u8) bool {
-    return switch (outputSource(op, name) orelse return false) {
-        .expr => |e| e == .null_lit,
-        .set_union => |s| outputIsNull(s.left, s.col) and outputIsNull(s.right, s.col),
+/// `own`, the type of `name` in `op`'s output, with each part its source
+/// leaves a bare NULL taking the type `other` has there: a struct field, or
+/// every element of an array or every key or value of a map. So the arms of
+/// `VALUES (named_struct('a', NULL)), (named_struct('a', 25))` meet at an INT
+/// field rather than widening it to text. Through nested unions a part
+/// takes `other`'s type only where every arm leaves it NULL.
+fn filledType(op: *const ir.Op, name: []const u8, own: types.Type, other: types.Type) !types.Type {
+    return switch (ir.outputSource(op, name) orelse return own) {
+        .expr => |e| filledExprType(e, own, other),
+        .set_union => |s| filledType(s.left, s.col, own, try filledType(s.right, s.col, own, other)),
     };
+}
+
+fn filledExprType(e: ir.Expr, own: types.Type, other: types.Type) error{OutOfMemory}!types.Type {
+    if (e == .null_lit) return other;
+    if (e != .call) return own;
+    const call = e.call;
+    if (own.structFields()) |fields| {
+        const other_fields = other.structFields() orelse return own;
+        if (!std.mem.startsWith(u8, call.fn_name, scalar_fn.STRUCT_VALUE_PREFIX) or call.args.len != fields.len or other_fields.len != fields.len) return own;
+        var fallback = std.heap.stackFallback(16 * @sizeOf(types.StructField), std.heap.smp_allocator);
+        const allocator = fallback.get();
+        const filled = try allocator.alloc(types.StructField, fields.len);
+        defer allocator.free(filled);
+        for (filled, fields, other_fields, call.args) |*f, field, other_field, arg| {
+            f.* = .{ .name = field.name, .type = try filledExprType(arg, field.type, other_field.type) };
+        }
+        return types.structOf(filled);
+    }
+    if (own.arrayElement()) |element| {
+        const other_element = other.arrayElement() orelse return own;
+        if (!isArrayValue(e)) return own;
+        return types.arrayOf(try filledElementType(call.args, element, other_element));
+    }
+    if (own.mapTypes()) |m| {
+        const other_m = other.mapTypes() orelse return own;
+        if (!std.ascii.eqlIgnoreCase(call.fn_name, scalar_fn.MAP_FROM_ARRAYS_FN) or call.args.len != 2) return own;
+        if (!isArrayValue(call.args[0]) or !isArrayValue(call.args[1])) return own;
+        return types.mapOf(
+            try filledElementType(call.args[0].call.args, m.key, other_m.key),
+            try filledElementType(call.args[1].call.args, m.value, other_m.value),
+        );
+    }
+    return own;
+}
+
+/// An array literal's element type, filled where every element leaves a
+/// part NULL.
+fn filledElementType(elements: []const ir.Expr, own: types.Type, other: types.Type) error{OutOfMemory}!types.Type {
+    var filled = other;
+    for (elements) |element| filled = try filledExprType(element, own, filled);
+    return filled;
+}
+
+fn isArrayValue(e: ir.Expr) bool {
+    return e == .call and std.ascii.eqlIgnoreCase(e.call.fn_name, scalar_fn.ARRAY_VALUE_FN);
 }
 
 /// `name = NULL`, `name = []` or `name = map{}` typed as `ty`, replacing
 /// the arm's output slot in place.
 fn typedDerived(arena: std.mem.Allocator, op: *const ir.Op, col_name: []const u8, ty: types.Type) !ir.Derived {
     const name = try arena.dupe(u8, col_name);
-    const source = outputSource(op, col_name).?;
+    const source = ir.outputSource(op, col_name).?;
     if (source == .set_union or source.expr == .null_lit) return .{ .name = name, .expr = .{ .null_lit = ty } };
     return .{ .name = name, .expr = try scalar_fn.emptyNestedAs(arena, ty) };
-}
-
-const OutputSource = union(enum) {
-    expr: ir.Expr,
-    /// A union's column, which its right arm names as its left does when
-    /// one VALUES list builds both.
-    set_union: struct { left: *const ir.Op, right: *const ir.Op, col: []const u8 },
-};
-
-/// What `name` in `op`'s output derives from on every row, followed
-/// through the row-preserving and renaming nodes an arm's SELECT builds:
-/// an expression, or a union whose arms each hold it.
-fn outputSource(op: *const ir.Op, name: []const u8) ?OutputSource {
-    var cur = op;
-    var col = name;
-    while (true) switch (cur.*) {
-        .compute => |c| {
-            var i = c.derived.len;
-            while (i > 0) {
-                i -= 1;
-                if (std.ascii.eqlIgnoreCase(c.derived[i].name, col)) return .{ .expr = c.derived[i].expr };
-            }
-            cur = c.upstream;
-        },
-        .select => |p| {
-            col = projectedSource(p, col) orelse return null;
-            cur = p.upstream;
-        },
-        .alias => |a| {
-            if (types.splitQualifiedName(col)) |split| {
-                if (std.ascii.eqlIgnoreCase(split.qualifier, a.alias)) col = split.bare;
-            }
-            cur = a.upstream;
-        },
-        .exclude => |p| cur = p.upstream,
-        .filter => |f| cur = f.upstream,
-        .order_by => |o| cur = o.upstream,
-        .limit => |l| cur = l.upstream,
-        .materialize => |m| {
-            if (m.recursion != null) return null;
-            cur = m.upstream;
-        },
-        .set_union => |u| return .{ .set_union = .{ .left = u.left, .right = u.right, .col = col } },
-        else => return null,
-    };
-}
-
-fn projectedSource(p: ir.Op.Project, name: []const u8) ?[]const u8 {
-    for (p.columns, 0..) |src, i| {
-        const out = if (p.outputs) |outs| outs[i] orelse types.unqualifiedName(src) else types.unqualifiedName(src);
-        if (std.ascii.eqlIgnoreCase(out, types.unqualifiedName(name))) return src;
-    }
-    return null;
 }
 
 /// `name = to_T(name)` — replaces the arm's own output slot in place (a
