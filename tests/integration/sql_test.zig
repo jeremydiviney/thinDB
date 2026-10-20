@@ -2213,6 +2213,38 @@ test "sql: GROUP BY an expression the SELECT list doesn't show groups on a hidde
     try std.testing.expectError(error.SqlMixedAggAndPlainProjection, helpers.exec(allocator, db, "SELECT LOWER(s), COUNT(*) FROM gh GROUP BY UPPER(s)"));
 }
 
+test "sql: GROUP BY a CASE, IF or comparison the SELECT list repeats" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE gc (k BIGINT PRIMARY KEY, id INT, v INT)");
+    try helpers.exec(allocator, db, "INSERT INTO gc VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, NULL, 70)");
+    const cases = .{
+        .{ .key = "CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END", .keys = &[_]?[]const u8{ "hi", "lo" }, .sums = &[_]?[]const u8{ "50", "80" }, .sorted = &[_]?[]const u8{ "50", "80" } },
+        .{ .key = "IF(id > 1, 'hi', 'lo')", .keys = &[_]?[]const u8{ "hi", "lo" }, .sums = &[_]?[]const u8{ "50", "80" }, .sorted = &[_]?[]const u8{ "50", "80" } },
+        .{ .key = "CASE id WHEN 1 THEN 'one' ELSE 'other' END", .keys = &[_]?[]const u8{ "one", "other" }, .sums = &[_]?[]const u8{ "10", "120" }, .sorted = &[_]?[]const u8{ "10", "120" } },
+        // A computed operand anchors once for the SELECT item and the key.
+        .{ .key = "CASE WHEN id + 1 > 2 THEN 'hi' ELSE 'lo' END", .keys = &[_]?[]const u8{ "hi", "lo" }, .sums = &[_]?[]const u8{ "50", "80" }, .sorted = &[_]?[]const u8{ "50", "80" } },
+        // One a later WHEN reads is the CASE's own.
+        .{ .key = "CASE WHEN id IS NULL THEN 'none' WHEN id * 2 > 2 THEN 'big' ELSE 'small' END", .keys = &[_]?[]const u8{ "big", "none", "small" }, .sums = &[_]?[]const u8{ "50", "70", "10" }, .sorted = &[_]?[]const u8{ "10", "50", "70" } },
+        .{ .key = "id > 1", .keys = &[_]?[]const u8{ null, "0", "1" }, .sums = &[_]?[]const u8{ "70", "10", "50" }, .sorted = &[_]?[]const u8{ "10", "50", "70" } },
+        .{ .key = "id + 1 > 2", .keys = &[_]?[]const u8{ null, "0", "1" }, .sums = &[_]?[]const u8{ "70", "10", "50" }, .sorted = &[_]?[]const u8{ "10", "50", "70" } },
+    };
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("gc", .{})).flush();
+        inline for (cases) |c| {
+            try helpers.expectTexts(allocator, db, "SELECT " ++ c.key ++ ", SUM(v) FROM gc GROUP BY " ++ c.key ++ " ORDER BY 1", c.keys);
+            try helpers.expectTexts(allocator, db, "SELECT SUM(v), " ++ c.key ++ " FROM gc GROUP BY " ++ c.key ++ " ORDER BY 2", c.sums);
+            try helpers.expectTexts(allocator, db, "SELECT SUM(v) FROM gc GROUP BY " ++ c.key ++ " ORDER BY 1", c.sorted);
+        }
+        try helpers.expectTexts(allocator, db, "SELECT SUM(v) FROM gc GROUP BY ROLLUP(CASE WHEN id + 1 > 2 THEN 'hi' ELSE 'lo' END) ORDER BY 1", &.{ "50", "80", "130" });
+    }
+    try std.testing.expectError(error.SqlMixedAggAndPlainProjection, helpers.exec(allocator, db, "SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END, COUNT(*) FROM gc GROUP BY CASE WHEN id > 2 THEN 'hi' ELSE 'lo' END"));
+}
+
 test "sql: GROUP BY an aliased plain column" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
