@@ -101,7 +101,20 @@ pub const ScalarFn = struct {
     typed_kernel: ?TypedKernel = null,
     udf_kernel: ?udf_mod.ScalarKernel = null,
     user_data: ?*anyopaque = null,
+    /// The kernel reads an argument of one row, in a call over more, as
+    /// that value on every row (`broadcastRows`), so Compute passes a
+    /// constant argument once instead of a copy per row: a large array
+    /// constant would otherwise repeat on every row. Only kernels that
+    /// manage their own NULLs take it, since the generic NULL strategies
+    /// read every row of every argument.
+    broadcast_args: bool = false,
 };
+
+/// How many rows of argument `v` a kernel over `rows` reads: one when the
+/// argument is broadcast (`ScalarFn.broadcast_args`), else `rows`.
+pub fn broadcastRows(v: ColumnView, rows: usize) usize {
+    return if (v.rowCount() < rows) 1 else rows;
+}
 
 // ---------------------------------------------------------------------------
 // Registry

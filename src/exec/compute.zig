@@ -170,6 +170,11 @@ const CallPlan = struct {
     output_owned: bool,
     output_type: Type,
     arg_reach: ArgReach = .all,
+    /// An immutable call over only constants, which has one value on every
+    /// row: it runs once, over one row (`constant_value`), and each batch
+    /// takes copies of that row.
+    constant: bool = false,
+    constant_value: ?ColumnStore = null,
     /// Set for `array_map` over a lambda, which evaluates that instead of
     /// a kernel; `args` are then its arrays.
     lambda: ?*LambdaPlan = null,
@@ -1067,7 +1072,28 @@ pub const Compute = struct {
         // Output buffer is cleared by the caller for the root; for
         // internal nodes we clear before refilling here.
         if (plan.output_owned) plan.output.clear();
+        // Over no rows the call runs as any other does, so a constant that
+        // fails to evaluate fails only where a row reads it.
+        if (plan.constant and n > 0) {
+            const one = try self.constantRow(plan, in_values);
+            for (0..n) |_| try store.appendViewRange(self.allocator, plan.output, one, 0, 1);
+            return ensureNarrow(plan.output);
+        }
+        try self.runCall(plan, in_values, plan.output, n);
+    }
 
+    /// The one row of a constant call's value, evaluated on first use.
+    fn constantRow(self: *Compute, plan: *CallPlan, in_values: []const ColumnView) anyerror!ColumnView {
+        if (plan.constant_value == null) {
+            var one = try ColumnStore.init(self.allocator, plan.output_type, true);
+            errdefer one.deinit(self.allocator);
+            try self.runCall(plan, in_values, &one, 1);
+            plan.constant_value = one;
+        }
+        return plan.constant_value.?.view();
+    }
+
+    fn runCall(self: *Compute, plan: *CallPlan, in_values: []const ColumnView, out: *ColumnStore, n: usize) anyerror!void {
         // 1. Evaluate and coerce each arg (post-order). An argument that
         // fails over the whole batch, of a call that reads it on only some
         // rows (`ArgReach`), runs again over just those rows.
@@ -1097,14 +1123,14 @@ pub const Compute = struct {
         // 2. Run the kernel. Decimal (typed) kernels take precedence and get
         // the arg/out Types so they can align scales.
         if (plan.lambda) |lp| {
-            try self.evalLambda(lp, arg_views, in_values, plan.output, n);
+            try self.evalLambda(lp, arg_views, in_values, out, n);
         } else if (plan.func.typed_kernel) |tk| {
-            try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, plan.output, n);
+            try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, out, n);
         } else if (plan.func.kernel) |k| {
-            try k(self.allocator, arg_views, plan.output, n);
+            try k(self.allocator, arg_views, out, n);
         } else if (plan.func.udf_kernel) |k| {
             const ctx: udf_mod.ScalarContext = .{ .allocator = self.allocator, .user_data = plan.func.user_data };
-            try k(&ctx, arg_views, plan.output, n);
+            try k(&ctx, arg_views, out, n);
         } else {
             return Error.ComputeNoSuchOverload;
         }
@@ -1113,15 +1139,15 @@ pub const Compute = struct {
         // output (we allocated it that way) so the parent's null-check
         // sees correct validity; root calls only write when their
         // declared schema column is nullable.
-        if (plan.output.nulls != null) {
+        if (out.nulls != null) {
             switch (plan.func.null_strategy) {
-                .propagates => try writePropagatedNulls(self.allocator, plan.output, arg_views, n),
-                .absorbs => try writeAbsorbedNulls(self.allocator, plan.output, arg_views, n),
-                .zero_divisor => try writeZeroDivisorNulls(self.allocator, plan.output, arg_views, n),
+                .propagates => try writePropagatedNulls(self.allocator, out, arg_views, n),
+                .absorbs => try writeAbsorbedNulls(self.allocator, out, arg_views, n),
+                .zero_divisor => try writeZeroDivisorNulls(self.allocator, out, arg_views, n),
                 .kernel_managed => {}, // kernel already wrote the bitmap
             }
         }
-        try ensureNarrow(plan.output);
+        try ensureNarrow(out);
     }
 
     /// `array_map` over a batch: the body runs once over every element of
@@ -1388,15 +1414,26 @@ pub const Compute = struct {
     /// Argument `i` of `plan` over the batch, converted to its parameter
     /// type when resolve coerced it.
     fn callArg(self: *Compute, plan: *CallPlan, i: usize, in_values: []const ColumnView, n: usize) anyerror!ColumnView {
-        const raw = try self.srcRows(plan.args[i], in_values, n);
+        const broadcast = if (plan.func.broadcast_args and n > 1) try self.broadcastArg(plan.args[i], in_values) else null;
+        const raw = broadcast orelse try self.srcRows(plan.args[i], in_values, n);
         const casts = plan.arg_casts orelse return raw;
         const k = casts[i] orelse return raw;
         const buf = &plan.cast_buffers.?[i].?;
         buf.clear();
         var one_arg = [_]ColumnView{raw};
-        try k(self.allocator, &one_arg, buf, n);
+        try k(self.allocator, &one_arg, buf, if (broadcast == null) n else 1);
         try ensureNarrow(buf);
         return buf.view();
+    }
+
+    /// A constant argument's one row, which a call that broadcasts its
+    /// arguments reads on every row; null for an argument that varies.
+    fn broadcastArg(self: *Compute, src: ArgPlan, in_values: []const ColumnView) anyerror!?ColumnView {
+        return switch (src) {
+            .lit, .null_lit => try self.srcRows(src, in_values, 1),
+            .call => |sub| if (sub.constant) try self.constantRow(sub, in_values) else null,
+            .col, .case => null,
+        };
     }
 
     /// The batch value of one THEN/ELSE clause. Literals and bare NULLs
@@ -2484,6 +2521,7 @@ fn buildCallPlan(
         .output_owned = true,
         .output_type = func.return_type,
         .arg_reach = argReach(func),
+        .constant = constantCall(func, arg_plans),
     };
     return plan;
 }
@@ -3205,6 +3243,7 @@ fn freeCallPlan(runtime_allocator: Allocator, plan: *CallPlan) void {
         body.deinit();
     }
     if (plan.cast_buffers) |buffers| freeCastBuffers(runtime_allocator, buffers);
+    if (plan.constant_value) |*one| one.deinit(runtime_allocator);
     if (plan.output_owned) {
         plan.output.deinit(runtime_allocator);
         runtime_allocator.destroy(plan.output);
@@ -3500,6 +3539,19 @@ fn argRows(allocator: Allocator, reach: ArgReach, prior: []const ColumnView, n: 
             return rows;
         },
     }
+}
+
+/// Whether a call has one value on every row: an immutable built-in over
+/// literals and such calls only. A call without arguments may read the
+/// session or the clock, which the registry doesn't mark as volatile.
+fn constantCall(func: ScalarFn, args: []const ArgPlan) bool {
+    if (args.len == 0 or func.volatility != .immutable or func.udf_kernel != null) return false;
+    for (args) |a| switch (a) {
+        .lit, .null_lit => {},
+        .call => |sub| if (!sub.constant) return false,
+        .col, .case => return false,
+    };
+    return true;
 }
 
 fn argReach(func: ScalarFn) ArgReach {
