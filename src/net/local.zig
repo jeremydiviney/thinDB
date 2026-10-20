@@ -2388,7 +2388,12 @@ fn compileUpdate(ctx: *CompileCtx, u: ir.UpdateOp) anyerror!Query {
     var assigns: std.ArrayList(update_mod.Assignment) = .empty;
     for (u.assignments, named) |src, *name| {
         name.* = src.col;
-        const value = if (ir.isColumnDefault(src.value)) try insertFillExpr(ctx, aa, t.schema.columns[t.schema.columnIndex(src.col) orelse return Error.ColumnNotFound]) else hexAssigned(t.schema, src.col, src.value);
+        const value = if (ir.isColumnDefault(src.value)) blk: {
+            const col = t.schema.columns[t.schema.columnIndex(src.col) orelse return Error.ColumnNotFound];
+            // An UPDATE takes no new AUTO_INCREMENT id.
+            if (col.auto_increment) return Error.UnsupportedOp;
+            break :blk try insertFillExpr(ctx, aa, col);
+        } else hexAssigned(t.schema, src.col, src.value);
         try assigns.append(aa, .{ .col = src.col, .value = value });
     }
     try assigns.appendSlice(aa, try onUpdateStamps(ctx, aa, t.schema, named));
@@ -2993,23 +2998,86 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
         try plan.fill(ctx, t, out_schema, b.values, b.row_count, batch_schema, views);
         defer plan.release(ctx, views);
         if (streaming) {
-            total_rows += try writeInsertRows(t, rule, batch_schema, views, b.row_count);
+            total_rows += try writeInsertRows(ctx, t, rule, batch_schema, views, b.row_count);
             continue;
         }
         try staged.append(ctx.allocator, aa, t, plan, out_schema, batch_schema, views, b.row_count);
         if (staged.bytes > t.stage_bytes) {
-            total_rows += try staged.write(aa, t, rule);
+            total_rows += try staged.write(ctx, aa, t, rule);
             staged.deinit(ctx.allocator);
             staged = .{};
             streaming = true;
         }
     }
-    if (staged.row_count > 0) total_rows += try staged.write(aa, t, rule);
+    if (staged.row_count > 0) total_rows += try staged.write(ctx, aa, t, rule);
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
 }
 
-fn writeInsertRows(t: *ApiTable, rule: DuplicateRule, batch_schema: []const types.Column, views: []const storage.ColumnView, row_count: usize) !usize {
+/// Write one INSERT ... SELECT batch. A table with an AUTO_INCREMENT column
+/// takes its ids under the table mutex, as INSERT ... VALUES does, so the
+/// ids and the rows that took them land together.
+fn writeInsertRows(ctx: *CompileCtx, t: *ApiTable, rule: DuplicateRule, batch_schema: []const types.Column, views: []const storage.ColumnView, row_count: usize) !usize {
+    const ai_idx = @import("../api/table.zig").autoIncrementColumnIndex(t.schema) orelse return writeRowsByRule(t, rule, batch_schema, views, row_count);
+    const statement_lease = try t.acquireStatement();
+    defer if (statement_lease) |lease| lease.release();
+    const schema = try ctx.allocator.dupe(types.Column, batch_schema);
+    defer ctx.allocator.free(schema);
+    const filled = try ctx.allocator.dupe(storage.ColumnView, views);
+    defer ctx.allocator.free(filled);
+
+    t.mutex.lockUncancelable(t.io);
+    defer t.mutex.unlock(t.io);
+    filled[ai_idx] = try autoIncrementColumn(ctx, t, views[ai_idx], row_count);
+    defer freeAutoIncrementColumn(ctx.allocator, filled[ai_idx]);
+    schema[ai_idx].nullable = false;
+    switch (rule) {
+        .replace => {
+            try t.insertBatchLocked(schema, filled, row_count);
+            return row_count;
+        },
+        .resolve => |action| return duplicateAffectedRows(try t.insertBatchOnDuplicateLocked(schema, filled, row_count, action)),
+        .partial => |action| {
+            _ = try t.insertBatchOnDuplicateLocked(schema, filled, row_count, action);
+            return row_count;
+        },
+    }
+}
+
+/// An INSERT ... SELECT batch's AUTO_INCREMENT column as INSERT ... VALUES
+/// fills it: a NULL takes the next id, and a value moves the counter past
+/// it. The caller holds `t.mutex` and frees the column with
+/// `freeAutoIncrementColumn`.
+fn autoIncrementColumn(ctx: *CompileCtx, t: *ApiTable, view: storage.ColumnView, row_count: usize) !storage.ColumnView {
+    switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |values, tag| {
+            const T = std.meta.Child(@TypeOf(values));
+            const ids = try ctx.allocator.alloc(T, row_count);
+            errdefer ctx.allocator.free(ids);
+            for (values[0..row_count], ids, 0..) |v, *id, row| {
+                if (view.isValid(row)) {
+                    t.observeAutoIncrement(v);
+                    id.* = v;
+                    continue;
+                }
+                const next = t.reserveAutoIncrement(1);
+                if (ctx.last_insert_id == null) ctx.last_insert_id = next;
+                id.* = std.math.cast(T, next) orelse return Error.TypeMismatch;
+            }
+            return .{ .data = @unionInit(@FieldType(storage.ColumnView, "data"), @tagName(tag), ids) };
+        },
+        else => return Error.TypeMismatch,
+    }
+}
+
+fn freeAutoIncrementColumn(allocator: Allocator, view: storage.ColumnView) void {
+    switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |ids| allocator.free(ids),
+        else => {},
+    }
+}
+
+fn writeRowsByRule(t: *ApiTable, rule: DuplicateRule, batch_schema: []const types.Column, views: []const storage.ColumnView, row_count: usize) !usize {
     switch (rule) {
         .replace => {
             try t.insertBatch(batch_schema, views, row_count);
@@ -3065,14 +3133,14 @@ const StagedInsertRows = struct {
         self.row_count += row_count;
     }
 
-    fn write(self: *StagedInsertRows, aa: Allocator, t: *ApiTable, rule: DuplicateRule) !usize {
+    fn write(self: *StagedInsertRows, ctx: *CompileCtx, aa: Allocator, t: *ApiTable, rule: DuplicateRule) !usize {
         const batch_schema = try aa.alloc(types.Column, self.columns.len);
         const views = try aa.alloc(storage.ColumnView, self.columns.len);
         for (self.columns, self.column_types, t.schema.columns, batch_schema, views) |c, ty, col, *bs, *view| {
             view.* = c.view();
             bs.* = .{ .name = col.name, .type = ty, .nullable = c.nulls != null and (col.nullable or view.anyNull(self.row_count)) };
         }
-        return try writeInsertRows(t, rule, batch_schema, views, self.row_count);
+        return try writeInsertRows(ctx, t, rule, batch_schema, views, self.row_count);
     }
 
     fn deinit(self: *StagedInsertRows, allocator: Allocator) void {
@@ -3433,11 +3501,11 @@ fn compileDeleteFromSource(ctx: *CompileCtx, d: ir.DeleteOp) anyerror!Query {
 }
 
 /// The value for a table column an INSERT ... SELECT column list omits: the
-/// DEFAULT, the wall clock for DEFAULT CURRENT_TIMESTAMP, else NULL.
+/// DEFAULT, the wall clock for DEFAULT CURRENT_TIMESTAMP, else NULL. An
+/// AUTO_INCREMENT column's NULL takes the next id as its batch lands
+/// (`autoIncrementColumn`).
 fn insertFillExpr(ctx: *CompileCtx, aa: Allocator, col: types.Column) !exec.Expr {
-    // INSERT ... VALUES reserves AUTO_INCREMENT ids under the table mutex
-    // before building its one batch; a streamed source has no such step.
-    if (col.auto_increment) return Error.UnsupportedOp;
+    if (col.auto_increment) return .{ .null_lit = col.type };
     if (col.default_value) |dv| {
         const raw: i256 = switch (dv) {
             .decimal64 => |r| r,

@@ -298,9 +298,10 @@ test "DEFAULT as a VALUES cell of an AUTO_INCREMENT column takes the next id" {
     try exec(allocator, db, "INSERT INTO a (id, name) VALUES (DEFAULT, 'x'), (DEFAULT, 'y')");
     try exec(allocator, db, "INSERT INTO a VALUES (10, DEFAULT)");
     try exec(allocator, db, "INSERT INTO a VALUES (DEFAULT, 'z')");
-    try helpers.expectTexts(allocator, db, "SELECT concat(id, ',', coalesce(name, 'NULL')) FROM a ORDER BY id", &.{ "1,x", "2,y", "10,NULL", "11,z" });
-    // Expression rows stream through INSERT ... SELECT, which reserves no
-    // ids, and an UPDATE has none to give.
-    try expectRunError(allocator, db, "INSERT INTO a VALUES (DEFAULT, concat('a', 'b'))", thindb.net.Error.UnsupportedOp);
+    // An expression row streams through INSERT ... SELECT, which takes its
+    // ids as the rows land.
+    try exec(allocator, db, "INSERT INTO a VALUES (DEFAULT, concat('a', 'b'))");
+    try helpers.expectTexts(allocator, db, "SELECT concat(id, ',', coalesce(name, 'NULL')) FROM a ORDER BY id", &.{ "1,x", "2,y", "10,NULL", "11,z", "12,ab" });
+    // An UPDATE has no id to give.
     try expectRunError(allocator, db, "UPDATE a SET id = DEFAULT WHERE id = 1", thindb.net.Error.UnsupportedOp);
 }
