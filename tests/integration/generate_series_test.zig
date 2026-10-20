@@ -149,3 +149,33 @@ test "generate_series rejects a zero step, non-integer arguments and a wrong arg
     };
     inline for (cases) |c| try expectFailure(allocator, db, c[0], c[1]);
 }
+
+test "generate_series takes its arguments by name, in any order" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    const cases = .{
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, end=>5))", "2;3;4;5" },
+        .{ "SELECT * FROM TABLE(generate_series(end=>5, start=>2))", "2;3;4;5" },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, end=>5, step=>2))", "2;4" },
+        .{ "SELECT * FROM TABLE(generate_series(step => 2, START => 2, End => 5))", "2;4" },
+        .{ "SELECT * FROM generate_series(start => 1 + 1, end => (SELECT 3))", "2;3" },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, end=>NULL))", "" },
+    };
+    inline for (cases) |c| try expectRows(allocator, db, c[0], c[1]);
+
+    const failures = .{
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, stop=>5))", error.SqlFunctionArgMismatch },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2))", error.SqlFunctionArgMismatch },
+        .{ "SELECT * FROM TABLE(generate_series(step=>2))", error.SqlFunctionArgMismatch },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, step=>2, end=>4, start=>3))", error.SqlFunctionArgMismatch },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, 5))", error.SqlExpectedIdent },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, =>5))", error.SqlExpectedIdent },
+        .{ "SELECT * FROM TABLE(generate_series(end=>5, start=>2, step = 2))", error.SqlExpectedToken },
+        .{ "SELECT * FROM TABLE(generate_series(start=>2, end=>4, step->3))", error.SqlExpectedToken },
+    };
+    inline for (failures) |c| try expectFailure(allocator, db, c[0], c[1]);
+}

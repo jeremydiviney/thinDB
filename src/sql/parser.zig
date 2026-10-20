@@ -5455,23 +5455,27 @@ pub const Parser = struct {
     /// them, each under a name no column has, since a lateral call's Compute
     /// runs over the FROM items before it.
     fn parseExpandCall(self: *Parser, generator: ir.Op.Expand.Generator) ParseError!*ir.Op {
-        var derived: std.ArrayList(ir.Derived) = .empty;
         try self.expect(.lparen);
-        while (true) {
-            var arg = try self.parseValueExpr();
-            // A bare NULL parses as text; as a series argument it is a NULL
-            // integer.
-            if (arg == .null_lit and generator == .series) arg = .{ .null_lit = .bigint };
-            const name = try std.fmt.allocPrint(self.arena, "__expand_arg_{d}", .{derived.items.len});
-            try derived.append(self.arena, .{ .name = name, .expr = arg });
+        var values: std.ArrayList(ir.Expr) = .empty;
+        if (generator == .series and try self.namedArgumentAhead()) {
+            try values.appendSlice(self.arena, try self.parseSeriesNamedArgs());
+        } else while (true) {
+            try values.append(self.arena, try self.parseValueExpr());
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
         try self.expect(.rparen);
-        const n = derived.items.len;
+        const n = values.items.len;
         if (generator == .series and (n < 2 or n > 3)) return ParseError.SqlFunctionArgMismatch;
+        const derived = try self.arena.alloc(ir.Derived, n);
+        for (values.items, derived, 0..) |value, *d, i| {
+            // A bare NULL parses as text; as a series argument it is a NULL
+            // integer.
+            const arg: ir.Expr = if (value == .null_lit and generator == .series) .{ .null_lit = .bigint } else value;
+            d.* = .{ .name = try std.fmt.allocPrint(self.arena, "__expand_arg_{d}", .{i}), .expr = arg };
+        }
         const args = try self.arena.alloc([]const u8, n);
-        for (derived.items, args) |d, *name| name.* = d.name;
+        for (derived, args) |d, *name| name.* = d.name;
         const columns: []const []const u8 = switch (generator) {
             .series => &.{"generate_series"},
             .unnest => blk: {
@@ -5483,8 +5487,39 @@ pub const Parser = struct {
             },
         };
         const single = try self.allocOp(.{ .single_row = {} });
-        const compute = try self.allocOp(.{ .compute = .{ .derived = derived.items, .upstream = single } });
+        const compute = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
         return try self.allocOp(.{ .expand = .{ .upstream = compute, .generator = generator, .args = args, .columns = columns } });
+    }
+
+    /// Whether the call's arguments are named: `name =>` is next.
+    fn namedArgumentAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        return (try look.next()).tag == .fat_arrow;
+    }
+
+    /// `generate_series`'s arguments by name, in any order, as StarRocks
+    /// takes them: `start => 2, end => 5[, step => 2]`. Each is named at
+    /// most once, and start and end always.
+    fn parseSeriesNamedArgs(self: *Parser) ParseError![]const ir.Expr {
+        const names = [_][]const u8{ "start", "end", "step" };
+        var slots: [names.len]?ir.Expr = @splat(null);
+        while (true) {
+            if (self.cur.tag != .identifier and self.cur.tag != .kw_end) return ParseError.SqlExpectedIdent;
+            const name = self.cur.text;
+            try self.advance();
+            try self.expect(.fat_arrow);
+            const slot = for (names, 0..) |known, i| {
+                if (std.ascii.eqlIgnoreCase(name, known)) break i;
+            } else return ParseError.SqlFunctionArgMismatch;
+            if (slots[slot] != null) return ParseError.SqlFunctionArgMismatch;
+            slots[slot] = try self.parseValueExpr();
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const series_start = slots[0] orelse return ParseError.SqlFunctionArgMismatch;
+        const series_end = slots[1] orelse return ParseError.SqlFunctionArgMismatch;
+        const step = slots[2] orelse return try self.arena.dupe(ir.Expr, &.{ series_start, series_end });
+        return try self.arena.dupe(ir.Expr, &.{ series_start, series_end, step });
     }
 
     /// `[AS] alias [(column, ...)]` after a generate_series or unnest call.
