@@ -1966,13 +1966,13 @@ pub const Aggregate = struct {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
                         const acc = &avgs[g];
-                        acc.sum += @as(f64, @floatFromInt(sl[r]));
+                        acc.sum += types.floatOfInt(sl[r]);
                         acc.count += 1;
                     }
                 } else {
                     for (gids, 0..) |g, r| {
                         const acc = &avgs[g];
-                        acc.sum += @as(f64, @floatFromInt(sl[r]));
+                        acc.sum += types.floatOfInt(sl[r]);
                         acc.count += 1;
                     }
                 }
@@ -4104,7 +4104,7 @@ pub fn updateState(
                         s.avg.sum += @floatFromInt(v);
                     },
                     .decimal256 => |sl| for (sl[lo..hi]) |v| {
-                        s.avg.sum += @floatFromInt(v);
+                        s.avg.sum += types.floatOfInt(v);
                     },
                     .float => |sl| s.avg.sum += simd.sumFloat(f32, sl[lo..hi]),
                     .double => |sl| s.avg.sum += simd.sumFloat(f64, sl[lo..hi]),
@@ -4129,7 +4129,7 @@ pub fn updateState(
                 },
                 .decimal256 => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
-                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.sum += types.floatOfInt(v);
                     s.avg.count += 1;
                 },
                 .float => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
@@ -4225,7 +4225,7 @@ fn welfordUpdate(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !
         inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
                 if (!view.isValid(r)) continue;
-                welfordStep(&s.welford, @as(f64, @floatFromInt(v)));
+                welfordStep(&s.welford, types.floatOfInt(v));
             }
         },
         inline .float, .double => |slice| {
@@ -4262,7 +4262,7 @@ pub fn coMomentStep(m: *CoMomentAcc, x: f64, y: f64) void {
 
 pub fn numericAsF64(view: ColumnView, row: usize) f64 {
     return switch (view.data) {
-        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |sl| @floatFromInt(sl[row]),
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |sl| types.floatOfInt(sl[row]),
         inline .float, .double => |sl| sl[row],
         else => unreachable,
     };
@@ -5098,7 +5098,7 @@ pub fn appendAccToColumn(
             } else {
                 const distinct = try distinctRun(i256, list.items);
                 if (func == .avg_distinct) {
-                    const mean = @as(f64, @floatFromInt(distinct.sum)) / @as(f64, @floatFromInt(distinct.count));
+                    const mean = types.floatOfInt(distinct.sum) / @as(f64, @floatFromInt(distinct.count));
                     try col.data.double.append(allocator, mean / avgScaleDiv(in_type));
                 } else try col.data.decimal256.append(allocator, distinct.sum);
             },

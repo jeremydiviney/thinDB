@@ -382,6 +382,23 @@ pub fn decimalOf(spec: DecimalSpec) Type {
     return .{ .decimal256 = spec };
 }
 
+/// `v` as the nearest f64, for an integer of any width to 256 bits. LLVM
+/// lowers no 256-bit integer-to-float conversion on AArch64, so a wider one
+/// converts the top 64 bits of its magnitude, the bits below folded into a
+/// sticky bit so it rounds as the conversion itself would.
+pub inline fn floatOfInt(v: anytype) f64 {
+    const T = @TypeOf(v);
+    if (@typeInfo(T) == .comptime_int or @bitSizeOf(T) <= 128) return @floatFromInt(v);
+    const magnitude: u256 = @abs(@as(i256, v));
+    const f = if (magnitude >> 128 == 0) @as(f64, @floatFromInt(@as(u128, @intCast(magnitude)))) else wide: {
+        const shift: u8 = @intCast(192 - @as(u16, @clz(magnitude)));
+        var top: u64 = @truncate(magnitude >> shift);
+        if (magnitude & ((@as(u256, 1) << shift) - 1) != 0) top |= 1;
+        break :wide std.math.ldexp(@as(f64, @floatFromInt(top)), shift);
+    };
+    return if (v < 0) -f else f;
+}
+
 /// Build a `Type` for a DECIMAL(p, s). Picks the smallest backing that
 /// holds `p` digits.
 pub fn decimal(comptime p: u8, comptime s: u8) Type {
@@ -980,6 +997,31 @@ pub fn columnExcluded(columns: []const Column, index: usize, excluded: []const [
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "floatOfInt rounds an i256 to the nearest double, ties to even" {
+    const two_200: i256 = @as(i256, 1) << 200;
+    const cases = .{
+        .{ @as(i256, 12345), 12345.0 },
+        .{ two_200 + 1, std.math.ldexp(@as(f64, 1), 200) },
+        .{ two_200 + (@as(i256, 1) << 147), std.math.ldexp(@as(f64, 1), 200) },
+        .{ two_200 + (@as(i256, 1) << 147) + 1, std.math.ldexp(@as(f64, 1), 200) + std.math.ldexp(@as(f64, 1), 148) },
+        .{ -(two_200 + (@as(i256, 1) << 147) + 1), -(std.math.ldexp(@as(f64, 1), 200) + std.math.ldexp(@as(f64, 1), 148)) },
+        .{ (@as(i256, 3) << 200) + (@as(i256, 1) << 148), 3 * std.math.ldexp(@as(f64, 1), 200) },
+        .{ @as(i256, std.math.maxInt(i256)), std.math.ldexp(@as(f64, 1), 255) },
+        .{ @as(i256, std.math.minInt(i256)), -std.math.ldexp(@as(f64, 1), 255) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(@as(f64, c[1]), floatOfInt(c[0]));
+    // The digits read back as a double round correctly too.
+    var prng = std.Random.DefaultPrng.init(0x256);
+    const random = prng.random();
+    var buf: [80]u8 = undefined;
+    for (0..2000) |_| {
+        const raw: i256 = @bitCast([4]u64{ random.int(u64), random.int(u64), random.int(u64), random.int(u64) });
+        const v = raw >> random.intRangeAtMost(u8, 0, 254);
+        const digits = try std.fmt.bufPrint(&buf, "{d}", .{v});
+        try std.testing.expectEqual(try std.fmt.parseFloat(f64, digits), floatOfInt(v));
+    }
+}
 
 test "Type.fixedSize returns correct widths" {
     try std.testing.expectEqual(@as(?usize, 4), (Type{ .int = {} }).fixedSize());

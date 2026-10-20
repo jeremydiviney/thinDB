@@ -252,7 +252,7 @@ fn f64At(v: ColumnView, t: Type, row: usize) f64 {
     return switch (v.data) {
         .decimal64 => |s| @as(f64, @floatFromInt(s[row])) / pow10f(scaleOf(t)),
         .decimal128 => |s| @as(f64, @floatFromInt(s[row])) / pow10f(scaleOf(t)),
-        .decimal256 => |s| @as(f64, @floatFromInt(s[row])) / pow10f(scaleOf(t)),
+        .decimal256 => |s| types.floatOfInt(s[row]) / pow10f(scaleOf(t)),
         .float => |s| s[row],
         .double => |s| s[row],
         .tinyint => |s| @floatFromInt(s[row]),
@@ -589,7 +589,7 @@ fn textMantissa(comptime W: type, text: []const u8, s: u8) error{ArithmeticOverf
 
 /// A decimal as DOUBLE, as the cast and the float kernels read it.
 pub fn mantissaToDouble(m: i256, s: u8) f64 {
-    return @as(f64, @floatFromInt(m)) / pow10f(s);
+    return types.floatOfInt(m) / pow10f(s);
 }
 
 /// A text constant as `CAST(text AS DECIMAL(p,s))` reads it, for folding

@@ -2609,7 +2609,7 @@ fn scalarF64(v: Scalar) ?f64 {
         .integer => |i| @floatFromInt(i),
         .float => |f| f,
         .decimal => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
-        .wide => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
+        .wide => |d| types.floatOfInt(d.m) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
         .micros, .text, .uuid => null,
     };
 }

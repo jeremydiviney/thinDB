@@ -2137,7 +2137,7 @@ pub const Window = struct {
                         scaled_sum = try addDecimalSum(scaled_sum, items[perm[i]]);
                         n += 1;
                     }
-                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], @as(f64, @floatFromInt(scaled_sum)) / divisor / @as(f64, @floatFromInt(n)));
+                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], types.floatOfInt(scaled_sum) / divisor / @as(f64, @floatFromInt(n)));
                 }
             },
             else => return Error.WindowUnsupported,
@@ -2352,7 +2352,7 @@ pub const Window = struct {
                     scaled_sum = try addDecimalSum(scaled_sum, items[r]);
                     n += 1;
                 }
-                sum = @as(f64, @floatFromInt(scaled_sum)) / divisor;
+                sum = types.floatOfInt(scaled_sum) / divisor;
             },
             else => return Error.WindowUnsupported,
         }

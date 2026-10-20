@@ -590,7 +590,7 @@ pub fn assignScaled(comptime T: type, m_in: anytype, scale: u8) AssignError!T {
     const W = if (@TypeOf(m_in) == i256) i256 else i128;
     const m: W = m_in;
     if (T == bool) return m != 0;
-    if (@typeInfo(T) == .float) return assignNumber(T, @as(f64, @floatFromInt(m)) / std.math.pow(f64, 10.0, @floatFromInt(scale)));
+    if (@typeInfo(T) == .float) return assignNumber(T, types.floatOfInt(m) / std.math.pow(f64, 10.0, @floatFromInt(scale)));
     const unit = decimal.pow10Of(W, scale);
     const truncated = @divTrunc(m, unit);
     const rounds_away = @abs(@rem(m, unit)) * 2 >= @abs(unit);
