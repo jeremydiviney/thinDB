@@ -182,6 +182,14 @@ milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
 `STR_TO_DATE` kept to its DATE, whatever the format holds. `LAST_DAY(d, unit)` is the last day of d's
 month, quarter or year, the unit named in any case. A NULL unit gives NULL,
 and another unit fails the query with `InvalidLastDayUnit`.
+`TIME_SLICE(dt, INTERVAL n unit[, FLOOR | CEIL])` is the start of the n-unit
+period that holds dt, periods counted from 0001-01-01 00:00:00, so weeks
+start on Mondays. CEIL is the next period's start, even for a dt that starts
+its own, and NULL past 9999-12-31, as in StarRocks. n is a positive integer
+literal, and a dt before 0001-01-01 fails the query with
+`TimeSliceBeforeOrigin`. `DATE_SLICE` slices by a day or a longer unit and
+gives a DATE. Both take StarRocks' internal spelling
+`time_slice(dt, n, 'unit', 'floor')` too.
 
 `JODATIME_FORMAT(x, pattern)` writes a DATE or DATETIME under a Joda-Time
 pattern, and `STR_TO_JODATIME(text, pattern)` reads one into a DATETIME.
