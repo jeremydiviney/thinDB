@@ -1079,7 +1079,9 @@ pub const Regex = struct {
 
     /// `replaceAllScratch` from byte `start` on, keeping the text before
     /// it; a nonzero `occurrence` replaces only that match (1-based) and
-    /// leaves the others.
+    /// leaves the others. An empty match where the previous match ended is
+    /// no match, as in RE2's GlobalReplace, PostgreSQL and DuckDB: `.*`
+    /// replaces `abcd` once, not again at its end.
     pub fn replaceScratch(
         self: *const Regex,
         input: []const u8,
@@ -1100,12 +1102,19 @@ pub const Regex = struct {
 
         var pos: usize = start;
         var seen: usize = 0;
+        var last_end: ?usize = null;
         while (pos <= input.len) {
             const found = try self.findWith(scratch, input, pos, slots);
             if (!found) break;
             const m_start = slots[0].?;
             const m_end = slots[1].?;
             try out.appendSlice(allocator, input[pos..m_start]);
+            if (m_end == m_start and last_end == m_start) {
+                pos = afterMatch(input, m_start, m_end);
+                try out.appendSlice(allocator, input[m_end..@min(pos, input.len)]);
+                continue;
+            }
+            last_end = m_end;
             seen += 1;
             if (occurrence == 0 or seen == occurrence) {
                 try expandTemplate(allocator, out, template, input, slots);
@@ -1645,7 +1654,9 @@ test "regex: global replace + empty-match handling (no infinite loop)" {
     // a* matches empty before 'b' and at end → leading/trailing inserts.
     try expectReplace("a*", "b", "X", "XbX");
     try expectReplace("x*", "héllo", "-", "-h-é-l-l-o-");
-    try expectReplace("a*", "aaa", "X", "XX");
+    try expectReplace("a*", "aaa", "X", "X");
+    try expectReplace(".*", "abcd", "xx", "xx");
+    try expectReplace("b*", "abc", "-", "-a-c-");
 }
 
 fn expectMatchWith(pattern: []const u8, options: Options, input: []const u8, should_match: bool) !void {

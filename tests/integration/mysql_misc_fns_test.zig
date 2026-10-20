@@ -139,7 +139,10 @@ const scalar_cases = [_]Case{
     .{ .sql = "REGEXP_REPLACE('ABC', 'b', 'X', 1, 0, 'i')", .want = "AXC" },
     .{ .sql = "REGEXP_REPLACE('abc abc', 'b', 'X', 1, 5)", .want = "abc abc" },
     .{ .sql = "REGEXP_REPLACE('héllo wörld', 'l', 'L', 4)", .want = "hélLo wörLd" },
-    .{ .sql = "REGEXP_REPLACE('aaa', 'a*', 'X')", .want = "XX" },
+    // MySQL gives XX, replacing the empty match at the end too; thinDB
+    // follows RE2, PostgreSQL and DuckDB (DESIGN.md).
+    .{ .sql = "REGEXP_REPLACE('aaa', 'a*', 'X')", .want = "X" },
+    .{ .sql = "REGEXP_REPLACE('abcd', '.*', 'xx')", .want = "xx" },
     .{ .sql = "REGEXP_REPLACE('abc', 'x*', '-')", .want = "-a-b-c-" },
     .{ .sql = "REGEXP_REPLACE('héllo', 'x*', '-')", .want = "-h-é-l-l-o-" },
     .{ .sql = "REGEXP_REPLACE('abc', 'b', 'X', 1, NULL)", .want = null },
