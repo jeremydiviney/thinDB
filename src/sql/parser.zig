@@ -3463,7 +3463,12 @@ pub const Parser = struct {
             try self.advance();
             try self.expect(.kw_by);
             while (true) {
-                var key = if (try self.predicateValueAhead()) try self.parsePredicateValue() else try self.parseCallArg();
+                var key = if (try self.concatOrderPosition(values)) |v|
+                    v
+                else if (try self.predicateValueAhead())
+                    try self.parsePredicateValue()
+                else
+                    try self.parseCallArg();
                 if (self.cur.tag == .kw_desc) {
                     try self.advance();
                     const desc_args = try self.arena.alloc(ir.Expr, 1);
@@ -3498,6 +3503,25 @@ pub const Parser = struct {
         out[1] = .{ .lit = .{ .text = separator orelse "," } };
         if (keys.items.len > 0) out[2] = .{ .call = .{ .fn_name = scalar_fn.ORDER_KEY_FN, .args = try keys.toOwnedSlice(self.arena) } };
         return out;
+    }
+
+    /// MySQL's `GROUP_CONCAT(... ORDER BY <n>)`, an integer that is the whole
+    /// key: the n-th of the call's expressions, from 1, as MySQL and
+    /// StarRocks read it. Other dialects order by the constant.
+    fn concatOrderPosition(self: *Parser, values: []const ir.Expr) ParseError!?ir.Expr {
+        if (self.lex.dialect != .mysql or self.cur.tag != .integer) return null;
+        var look = self.lex.*;
+        const next = try look.next();
+        const whole_key = switch (next.tag) {
+            .comma, .kw_asc, .kw_desc, .rparen => true,
+            .identifier => !next.quoted and std.ascii.eqlIgnoreCase(next.text, "separator"),
+            else => false,
+        };
+        if (!whole_key) return null;
+        const k = self.cur.value.integer;
+        if (k < 1 or k > values.len) return ParseError.SqlInvalidProjection;
+        try self.advance();
+        return values[@intCast(k - 1)];
     }
 
     fn appendAggInputs(
