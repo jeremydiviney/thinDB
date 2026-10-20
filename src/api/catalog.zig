@@ -679,6 +679,31 @@ pub const Catalog = struct {
         return self.databases.get(name);
     }
 
+    pub const TableNamespace = struct { db: []const u8, schema: []const u8 };
+
+    /// The (database, schema) a table reference's qualifiers name in
+    /// `session`. The MySQL wire's flattened `db__schema` names both. A lone
+    /// qualifier names a schema of the current database; under MySQL, where
+    /// it names a database, it falls back to that database's default schema
+    /// when the current database has no such schema, as `USE` does.
+    pub fn tableNamespace(self: *Catalog, session: api.Session, database_name: ?[]const u8, schema_name: ?[]const u8) error{NoDatabaseSelected}!TableNamespace {
+        if (database_name) |db| return .{ .db = db, .schema = schema_name orelse session.current_schema };
+        const qualifier = schema_name orelse return .{
+            .db = session.current_db orelse return error.NoDatabaseSelected,
+            .schema = session.current_schema,
+        };
+        if (std.mem.indexOf(u8, qualifier, "__")) |sep| return .{ .db = qualifier[0..sep], .schema = qualifier[sep + 2 ..] };
+        if (session.dialect == .mysql and !self.currentDatabaseHasSchema(session, qualifier) and self.database(qualifier) != null) {
+            return .{ .db = qualifier, .schema = DatabaseMod.default_schema_name };
+        }
+        return .{ .db = session.current_db orelse return error.NoDatabaseSelected, .schema = qualifier };
+    }
+
+    fn currentDatabaseHasSchema(self: *Catalog, session: api.Session, schema_name: []const u8) bool {
+        const db = self.database(session.current_db orelse return false) orelse return false;
+        return db.schema(schema_name) != null;
+    }
+
     pub fn createDatabase(self: *Catalog, name: []const u8) !*Database {
         try validateDatabaseName(name);
         const lease = try self.acquireStatement(false);

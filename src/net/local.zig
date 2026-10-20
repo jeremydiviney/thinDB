@@ -986,7 +986,7 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
             if (ns.findTable(ref.name)) |t| return t;
         }
     }
-    const ns = try tableNamespace(session, ref);
+    const ns = try catalog.tableNamespace(session, ref.database, ref.schema);
     const db = catalog.database(ns.db) orelse return Error.DatabaseNotFound;
     const sc = db.schema(ns.schema) orelse return Error.SchemaNotFound;
     {
@@ -995,15 +995,6 @@ pub fn resolveTable(catalog: *Catalog, session: Session, ref: ir.TableRef) !*Api
         if (sc.tables.get(ref.name)) |t| return t;
     }
     return sc.openTable(ref.name, .{});
-}
-
-/// The (database, schema) a persistent table reference names.
-fn tableNamespace(session: Session, ref: ir.TableRef) Error!NameParts {
-    // MySQL-style `db__schema.table` arrives here as ref.schema = "db__schema",
-    // ref.database = null. Flatten it back to (db, schema) so the resolver
-    // doesn't go hunting for a literal schema named "db__schema".
-    if (ref.database == null) if (ref.schema) |s| if (splitDoubleUnderscore(s)) |parts| return parts;
-    return .{ .db = ref.database orelse try currentDbName(session), .schema = ref.schema orelse session.current_schema };
 }
 
 /// The session's current database name; `NoDatabaseSelected` when it has none.
@@ -1024,7 +1015,7 @@ const PersistentTableTarget = struct {
 };
 
 pub fn resolvePersistentTableTarget(catalog: *Catalog, session: Session, ref: ir.TableRef) !PersistentTableTarget {
-    const ns = try tableNamespace(session, ref);
+    const ns = try catalog.tableNamespace(session, ref.database, ref.schema);
     const db = catalog.database(ns.db) orelse return Error.DatabaseNotFound;
     const sc = db.schema(ns.schema) orelse return Error.SchemaNotFound;
     return .{
@@ -2485,7 +2476,7 @@ fn compileTableMaintenance(ctx: *CompileCtx, m: ir.TableMaintenance) !Query {
     const op_name = @tagName(m.kind);
     var cells: std.ArrayList([]const u8) = .empty;
     for (m.tables) |ref| {
-        const ns = try tableNamespace(ctx.session.*, ref);
+        const ns = try catalog.tableNamespace(ctx.session.*, ref.database, ref.schema);
         const label = try std.fmt.allocPrint(aa, "{s}__{s}.{s}", .{ ns.db, ns.schema, ref.name });
         const exists = if (resolveTable(catalog, ctx.session.*, ref)) |_| true else |err| switch (err) {
             error.TableNotFound, error.SchemaNotFound, error.DatabaseNotFound => false,

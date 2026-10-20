@@ -596,3 +596,49 @@ test "sql namespace: a current database dropped elsewhere counts as none selecte
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(i64, &[_]i64{2}, ids);
 }
+
+test "sql namespace: MySQL db.table names another database's default schema" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    const cat = db.owned_catalog.?;
+    const tw = try (try cat.createDatabase("warehouse")).table("t", schema_t, opts_t);
+    try tw.insert(&.{.{ .id = @as(i64, 9), .qty = @as(i32, 1) }});
+    try tw.flush();
+    const tr = try (try cat.createDatabase("reports")).table("t", schema_t, opts_t);
+    try tr.insert(&.{.{ .id = @as(i64, 7), .qty = @as(i32, 1) }});
+    try tr.flush();
+    const ts = try (try cat.database("main").?.createSchema("reports")).table("t", schema_t, opts_t);
+    try ts.insert(&.{.{ .id = @as(i64, 42), .qty = @as(i32, 1) }});
+    try ts.flush();
+
+    const mysql: thindb.api.Session = .{ .dialect = .mysql };
+    const cases = .{
+        .{ .sql = "SELECT id FROM warehouse.t", .ids = &[_]i64{9} },
+        .{ .sql = "SELECT id FROM reports.t", .ids = &[_]i64{42} },
+        .{ .sql = "SELECT id FROM reports__public.t", .ids = &[_]i64{7} },
+    };
+    inline for (cases) |c| {
+        var q = try runSqlSession(allocator, db, mysql, c.sql);
+        defer q.deinit();
+        const ids = try collectIds(allocator, &q);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c.ids, ids);
+    }
+    try std.testing.expectError(error.SchemaNotFound, runSqlSession(allocator, db, .{}, "SELECT id FROM warehouse.t"));
+
+    inline for (.{ "CREATE TABLE warehouse.u (id BIGINT)", "INSERT INTO warehouse.u VALUES (5)" }) |sql| {
+        var q = try runSqlSession(allocator, db, mysql, sql);
+        defer q.deinit();
+        while (try q.next()) |_| {}
+    }
+    var q = try runSqlSession(allocator, db, .{ .dialect = .mysql, .current_db = null }, "SELECT id FROM warehouse.u");
+    defer q.deinit();
+    const ids = try collectIds(allocator, &q);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &[_]i64{5}, ids);
+}
