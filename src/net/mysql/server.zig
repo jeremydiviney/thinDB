@@ -2233,6 +2233,7 @@ fn allocMysqlColumnType(allocator: Allocator, t: types.Type) ![]u8 {
         .datetime => allocator.dupe(u8, "datetime(6)"),
         .decimal64 => |spec| std.fmt.allocPrint(allocator, "decimal({d},{d})", .{ spec.p, spec.s }),
         .decimal128 => |spec| std.fmt.allocPrint(allocator, "decimal({d},{d})", .{ spec.p, spec.s }),
+        .decimal256 => |spec| std.fmt.allocPrint(allocator, "decimal({d},{d})", .{ spec.p, spec.s }),
         .uuid => allocator.dupe(u8, "char(36)"),
         .varchar => |n| std.fmt.allocPrint(allocator, "varchar({d})", .{n}),
         .char => |n| std.fmt.allocPrint(allocator, "char({d})", .{n}),
@@ -2285,6 +2286,7 @@ fn allocColumnDefaultText(allocator: Allocator, col: types.Column) !?[]const u8 
         .largeint => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .decimal64 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         .decimal128 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
+        .decimal256 => |x| try std.fmt.allocPrint(allocator, "{d}", .{x}),
         inline .float, .double => |x| blk: {
             var buf: [wire_format.FLOAT_TEXT_MAX]u8 = undefined;
             break :blk try allocator.dupe(u8, wire_format.floatText(&buf, x, .plain));
@@ -2301,7 +2303,7 @@ fn allocInfoDataType(allocator: Allocator, t: types.Type) ![]u8 {
         .smallint => allocator.dupe(u8, "smallint"),
         .int => allocator.dupe(u8, "int"),
         .bigint => allocator.dupe(u8, "bigint"),
-        .largeint, .decimal64, .decimal128 => allocator.dupe(u8, "decimal"),
+        .largeint, .decimal64, .decimal128, .decimal256 => allocator.dupe(u8, "decimal"),
         .boolean => allocator.dupe(u8, "tinyint"),
         .float => allocator.dupe(u8, "float"),
         .double => allocator.dupe(u8, "double"),
@@ -3071,6 +3073,7 @@ fn numericPrecisionCell(
         .double => try cellDup(allocator, owned, "22"),
         .decimal64 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.p}),
         .decimal128 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.p}),
+        .decimal256 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.p}),
         else => null,
     };
 }
@@ -3085,6 +3088,7 @@ fn numericScaleCell(
         .tinyint, .smallint, .int, .bigint, .largeint => try cellDup(allocator, owned, "0"),
         .decimal64 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.s}),
         .decimal128 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.s}),
+        .decimal256 => |spec| try cellFmt(allocator, owned, "{d}", .{spec.s}),
         else => null,
     };
 }

@@ -1808,14 +1808,16 @@ fn parseBaseColumnType(p: anytype) !types.Type {
         }
         return numericModifiers(p, .double);
     }
-    // StarRocks' DECIMAL32/64/128(p[, s]) name the width that holds p digits:
-    // 9, 18 or 38 at most.
+    // StarRocks' DECIMAL32/64/128/256(p[, s]) name the width that holds p
+    // digits: 9, 18, 38 or 76 at most.
     const width_digits: ?i64 = if (std.ascii.eqlIgnoreCase(name, "decimal32"))
         9
     else if (std.ascii.eqlIgnoreCase(name, "decimal64"))
         18
     else if (std.ascii.eqlIgnoreCase(name, "decimal128"))
         38
+    else if (std.ascii.eqlIgnoreCase(name, "decimal256"))
+        76
     else
         null;
     if (width_digits != null or asciiEqlAny(name, &.{ "decimal", "numeric", "dec", "fixed" })) {
@@ -1837,13 +1839,8 @@ fn parseBaseColumnType(p: anytype) !types.Type {
             try p.expect(.rparen);
         }
         try skipIntegerModifiers(p);
-        if (p_raw < 1 or p_raw > (width_digits orelse 38) or s_raw < 0 or s_raw > p_raw) return PE.SqlExpectedValue;
-        const p_u: u8 = @intCast(p_raw);
-        const s_u: u8 = @intCast(s_raw);
-        return if (p_u <= 18)
-            types.Type{ .decimal64 = .{ .p = p_u, .s = s_u } }
-        else
-            types.Type{ .decimal128 = .{ .p = p_u, .s = s_u } };
+        if (p_raw < 1 or p_raw > (width_digits orelse types.max_decimal_precision) or s_raw < 0 or s_raw > p_raw) return PE.SqlExpectedValue;
+        return types.decimalOf(.{ .p = @intCast(p_raw), .s = @intCast(s_raw) });
     }
     if (asciiEqlAny(name, &.{ "char", "character", "nchar" })) {
         if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "varying")) {
@@ -1898,17 +1895,18 @@ fn parseBaseColumnType(p: anytype) !types.Type {
     return PE.SqlExpectedKeyword;
 }
 
-/// A literal cell's value. A fraction whose digits no DOUBLE holds is its
-/// digits as text, which a column reads as it reads the same number
-/// quoted: a DECIMAL exactly, a DOUBLE as the nearest double.
+/// A literal cell's value. A fraction whose digits no DOUBLE holds, or an
+/// integer past LARGEINT, is its digits as text, which a column reads as it
+/// reads the same number quoted: a DECIMAL exactly, a DOUBLE as the nearest
+/// double.
 fn parseInsertValue(p: anytype) !?Value {
     if (p.cur.tag == .kw_null) {
         try p.advance();
         return null;
     }
-    if (try parse_predicate.inexactFractionAhead(p)) {
+    if (try parse_predicate.inexactFractionAhead(p) or try parse_predicate.wideIntegerAhead(p)) {
         const negative = p.cur.tag == .minus;
-        if (p.cur.tag != .floating) try p.advance();
+        if (p.cur.tag == .minus or p.cur.tag == .plus) try p.advance();
         const digits = if (negative) try std.fmt.allocPrint(p.arena, "-{s}", .{p.cur.text}) else try p.arena.dupe(u8, p.cur.text);
         try p.advance();
         return .{ .text = digits };

@@ -212,8 +212,9 @@ pub fn freeStrings(allocator: std.mem.Allocator, values: []?[]u8) void {
 }
 
 /// The first column of a result as text, NULL as null, the way the MySQL
-/// wire prints it: a boolean is 1 or 0, a LARGEINT keeps every digit, and an
-/// array or map reads as StarRocks prints it. Free with `freeStrings`.
+/// wire prints it: a boolean is 1 or 0, a LARGEINT and a DECIMAL keep every
+/// digit, and an array or map reads as StarRocks prints it. Free with
+/// `freeStrings`.
 pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
     const t = q.outputSchema()[0].type;
     var out: std.ArrayList(?[]u8) = .empty;
@@ -227,6 +228,10 @@ pub fn columnText(allocator: std.mem.Allocator, q: *RunResult) ![]?[]u8 {
             const text: ?[]u8 = if (!col.isValid(row)) null else switch (col.data) {
                 .string, .varchar, .char => |sv| try allocator.dupe(u8, sv.rowBytes(row)),
                 inline .boolean, .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => |s| try std.fmt.allocPrint(allocator, "{d}", .{s[row]}),
+                inline .decimal64, .decimal128, .decimal256 => |s| blk: {
+                    var buf: [thindb.exec.decimal.DECIMAL_TEXT_MAX]u8 = undefined;
+                    break :blk try allocator.dupe(u8, thindb.exec.decimal.formatDecimal(&buf, s[row], t.decimalSpec().?.s));
+                },
                 .nested => |sv| blk: {
                     var buf: std.ArrayList(u8) = .empty;
                     errdefer buf.deinit(allocator);

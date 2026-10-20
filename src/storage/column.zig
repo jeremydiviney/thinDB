@@ -75,6 +75,7 @@ pub const ColumnView = struct {
             .tinyint => |s| try buf.append(allocator, @bitCast(s[row])),
             .smallint => |s| try appendLittle(i16, allocator, buf, s[row]),
             .largeint, .decimal128 => |s| try appendLittle(i128, allocator, buf, s[row]),
+            .decimal256 => |s| try appendLittle(i256, allocator, buf, s[row]),
             .uuid => |s| try appendLittle(u128, allocator, buf, s[row]),
         }
     }
@@ -173,6 +174,7 @@ pub const ValueView = union(TypeTag) {
     json: StringView,
     nested: StringView,
     bitmap: StringView,
+    decimal256: []const i256,
 
     pub fn rowCount(self: ValueView) usize {
         return switch (self) {
@@ -191,6 +193,7 @@ pub const ValueView = union(TypeTag) {
             .char => |s| s.rowCount(),
             .decimal64 => |s| s.len,
             .decimal128 => |s| s.len,
+            .decimal256 => |s| s.len,
             .uuid => |s| s.len,
             .json => |s| s.rowCount(),
             .nested => |s| s.rowCount(),
@@ -278,6 +281,7 @@ pub const OwnedData = union(TypeTag) {
     json: OwnedStringColumn,
     nested: OwnedStringColumn,
     bitmap: OwnedStringColumn,
+    decimal256: []i256,
 
     pub fn rowCount(self: OwnedData) usize {
         return switch (self) {
@@ -296,6 +300,7 @@ pub const OwnedData = union(TypeTag) {
             .char => |s| s.offsets.len - 1,
             .decimal64 => |s| s.len,
             .decimal128 => |s| s.len,
+            .decimal256 => |s| s.len,
             .uuid => |s| s.len,
             .json => |s| s.offsets.len - 1,
             .nested => |s| s.offsets.len - 1,
@@ -320,6 +325,7 @@ pub const OwnedData = union(TypeTag) {
             .char => |s| .{ .char = s.view() },
             .decimal64 => |s| .{ .decimal64 = s },
             .decimal128 => |s| .{ .decimal128 = s },
+            .decimal256 => |s| .{ .decimal256 = s },
             .uuid => |s| .{ .uuid = s },
             .json => |s| .{ .json = s.view() },
             .nested => |s| .{ .nested = s.view() },
@@ -344,6 +350,7 @@ pub const OwnedData = union(TypeTag) {
             .char => |*s| s.deinit(allocator),
             .decimal64 => |s| allocator.free(s),
             .decimal128 => |s| allocator.free(s),
+            .decimal256 => |s| allocator.free(s),
             .uuid => |s| allocator.free(s),
             .json => |*s| s.deinit(allocator),
             .nested => |*s| s.deinit(allocator),

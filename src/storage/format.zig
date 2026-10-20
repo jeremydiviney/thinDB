@@ -166,6 +166,8 @@ pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic
 ///   - integer / boolean / date / datetime / decimal64: sign-extended
 ///     (or zero-extended for boolean) to i128
 ///   - largeint, decimal128: direct i128
+///   - decimal256: none (`typeHasStats`); the slot spans every i128 so it
+///     never excludes a range
 ///   - uuid (u128): XOR top bit then cast to i128 — preserves unsigned
 ///     ordering under signed comparison
 ///   - varchar / string / char: prefix encoding (see `encodeStringPrefix`)
@@ -184,7 +186,8 @@ pub const footer_trailer_size: usize = 8; // u32 footer_size + 4-byte magic
 ///     (`encodeStringPrefix` folded over non-null, non-empty values;
 ///     `maxInt(i128)` when the range has none). Lets ORDER BY pruning skip
 ///     ranges whose only "small" value is the ubiquitous empty string.
-///   - largeint / decimal128 / uuid: 0, unused (an i128 sum could overflow)
+///   - largeint / decimal128 / decimal256 / uuid: 0, unused (an i128 sum
+///     could overflow)
 ///
 /// `null_count` is exact for every type, so `COUNT(col)` over a fully-
 /// selected range is `row_count - null_count` without touching data.
@@ -304,14 +307,16 @@ pub const SegmentInfo = struct {
 /// True iff a column of this type carries meaningful min/max in the
 /// per-row-group `Stats` slot (and in the manifest entry). Stats are
 /// always stored as i128 with a per-type encoding (see `Stats`). Every
-/// column type carries stats now (float/double via `encodeFloatOrder`,
-/// NaN skipped at write time).
+/// column type carries stats (float/double via `encodeFloatOrder`, NaN
+/// skipped at write time) except decimal256, whose values an i128 can't
+/// hold.
 pub fn typeHasStats(t: @import("../types.zig").Type) bool {
     return switch (t) {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => true,
         .largeint, .decimal128, .uuid => true,
         .varchar, .string, .char, .json, .nested, .bitmap => true,
         .float, .double => true,
+        .decimal256 => false,
     };
 }
 
@@ -334,7 +339,7 @@ pub fn sumKindOf(t: @import("../types.zig").Type) SumKind {
         .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .decimal64 => .int,
         .float, .double => .float,
         .varchar, .string, .char, .json, .nested, .bitmap => .string_min,
-        .largeint, .decimal128, .uuid => .none,
+        .largeint, .decimal128, .uuid, .decimal256 => .none,
     };
 }
 

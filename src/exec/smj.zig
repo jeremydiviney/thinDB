@@ -763,6 +763,7 @@ fn appendColumnValueBytes(
         .largeint => |s| try appendSignedKey(allocator, out, i128, s[row]),
         .decimal64 => |s| try appendSignedKey(allocator, out, i64, s[row]),
         .decimal128 => |s| try appendSignedKey(allocator, out, i128, s[row]),
+        .decimal256 => |s| try appendSignedKey(allocator, out, i256, s[row]),
         .uuid => |s| try appendUnsignedKey(allocator, out, u128, s[row]),
         .varchar, .string, .char, .json, .nested, .bitmap => |sv| try appendStringKey(allocator, out, sv.rowBytes(row)),
     }

@@ -827,7 +827,7 @@ pub fn castFnName(arena: Allocator, ty: Type) Allocator.Error!?[]const u8 {
         .varchar, .char, .string => "to_string",
         .json => "to_json",
         .nested => return try nestedCastFnName(arena, ty),
-        .decimal64, .decimal128, .uuid, .bitmap => return null,
+        .decimal64, .decimal128, .decimal256, .uuid, .bitmap => return null,
     };
     return try arena.dupe(u8, name);
 }

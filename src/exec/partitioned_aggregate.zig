@@ -510,6 +510,11 @@ pub const PartitionedAggregate = struct {
                 const u: u128 = @bitCast(v);
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) (@as(u64, @truncate(u)) ^ @as(u64, @truncate(u >> 64))) else NULL_SENTINEL));
             },
+            .decimal256 => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
+                const u: u256 = @bitCast(v);
+                const folded = @as(u64, @truncate(u)) ^ @as(u64, @truncate(u >> 64)) ^ @as(u64, @truncate(u >> 128)) ^ @as(u64, @truncate(u >> 192));
+                h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) folded else NULL_SENTINEL));
+            },
             .uuid => |s| for (hashes, s[0..hashes.len], 0..) |*h, v, row| {
                 h.* = mix64(h.* ^ (if (view.isValid(@intCast(row))) (@as(u64, @truncate(v)) ^ @as(u64, @truncate(v >> 64))) else NULL_SENTINEL));
             },

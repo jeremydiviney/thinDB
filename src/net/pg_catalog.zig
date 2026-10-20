@@ -121,7 +121,7 @@ fn typeOid(t: types.Type) i32 {
         .double => 701,
         .date => 1082,
         .datetime => 1114,
-        .decimal64, .decimal128 => 1700,
+        .decimal64, .decimal128, .decimal256 => 1700,
         .uuid => 2950,
         .varchar, .string, .char, .json, .nested, .bitmap => 25,
     };
@@ -360,7 +360,7 @@ fn pgDataTypeName(t: types.Type) []const u8 {
         .tinyint, .smallint => "smallint",
         .int => "integer",
         .bigint => "bigint",
-        .largeint, .decimal64, .decimal128 => "numeric",
+        .largeint, .decimal64, .decimal128, .decimal256 => "numeric",
         .boolean => "boolean",
         .float => "real",
         .double => "double precision",

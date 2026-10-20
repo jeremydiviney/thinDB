@@ -330,6 +330,9 @@ pub const AccState = union(enum) {
     /// instead of 48 (the `?i128`'s 16-byte alignment would dominate).
     min_large: LargeAcc,
     max_large: LargeAcc,
+    /// SUM/MIN/MAX over a DECIMAL256 column, boxed like `concat`: an i256
+    /// inline would widen every group's state. Null until the first value.
+    wide: ?*i256,
     /// MIN/MAX over string-family columns. Holds the running extreme as a
     /// copy in the operator's `StringBank` (the view's bytes are transient
     /// per batch).
@@ -338,11 +341,16 @@ pub const AccState = union(enum) {
     avg: AvgAcc,
     bool_acc: BoolAcc,
     value_acc: ValueAcc,
-    max_by: MaxByAcc,
+    /// MAX_BY / MAX_BY_KEY over a wide key or payload, boxed in the arena on
+    /// the group's first keyed row (null until then): its two `Value`s are
+    /// the largest cell, and inline they would size every `AccState`.
+    max_by: ?*MaxByAcc,
     bitwise: BitwiseAcc,
     /// SUM/AVG(DISTINCT) over an integer or decimal column: every value's
     /// exact mantissa, deduplicated at finalize.
     distinct_exact: std.ArrayListUnmanaged(i128),
+    /// SUM/AVG(DISTINCT) over a DECIMAL256 column.
+    distinct_wide: std.ArrayListUnmanaged(i256),
     /// SUM/AVG(DISTINCT) over a float column.
     distinct_float: std.ArrayListUnmanaged(f64),
 
@@ -427,6 +435,7 @@ fn valueFromRow(aa: Allocator, view: ColumnView, row: u32) !types.Value {
         .largeint => |v| .{ .largeint = v[row] },
         .decimal64 => |v| .{ .decimal64 = v[row] },
         .decimal128 => |v| .{ .decimal128 = v[row] },
+        .decimal256 => |v| .{ .decimal256 = v[row] },
         .uuid => |v| .{ .uuid = v[row] },
         .varchar, .string, .char, .json, .nested, .bitmap => .{ .text = try aa.dupe(u8, stringRowBytes(view, @intCast(row))) },
     };
@@ -473,6 +482,7 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .largeint => |v| std.math.order(v[row], val.largeint),
         .decimal64 => |v| std.math.order(v[row], val.decimal64),
         .decimal128 => |v| std.math.order(v[row], val.decimal128),
+        .decimal256 => |v| std.math.order(v[row], val.decimal256),
         .uuid => |v| std.math.order(v[row], val.uuid),
         .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
         .json => |sv| json_binary.compare(sv.rowBytes(row), val.text),
@@ -488,24 +498,32 @@ fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, value_view: Colum
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!key_view.isValid(r)) continue;
-        if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
+        if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != .gt) continue;
         try replaceMaxBy(bank, aa, s, value_view, key_view, r);
     }
 }
 
 fn replaceMaxBy(bank: *StringBank, aa: Allocator, s: *AccState, value_view: ColumnView, key_view: ColumnView, row: u32) !void {
-    const seen = s.max_by.seen;
-    s.max_by.key = try replaceValueFromRow(bank, aa, if (seen) s.max_by.key else null, key_view, row);
+    const m = s.max_by orelse {
+        const cell = try aa.create(MaxByAcc);
+        cell.* = .{
+            .key = try replaceValueFromRow(bank, aa, null, key_view, row),
+            .value_null = !value_view.isValid(row),
+        };
+        if (!cell.value_null) cell.value = try replaceValueFromRow(bank, aa, null, value_view, row);
+        s.max_by = cell;
+        return;
+    };
+    m.key = try replaceValueFromRow(bank, aa, m.key, key_view, row);
     // A NULL winner hands its string copy back to the bank, so a group whose
     // winner flips between NULL and text keeps one copy, not one per flip.
-    const held: ?types.Value = if (s.max_by.value == .text) s.max_by.value else null;
-    s.max_by.value_null = !value_view.isValid(row);
-    if (!s.max_by.value_null) {
-        s.max_by.value = try replaceValueFromRow(bank, aa, held, value_view, row);
+    const held: ?types.Value = if (m.value == .text) m.value else null;
+    m.value_null = !value_view.isValid(row);
+    if (!m.value_null) {
+        m.value = try replaceValueFromRow(bank, aa, held, value_view, row);
     } else if (held) |h| {
-        s.max_by.value = .{ .text = try bank.replace(aa, h.text, "") };
+        m.value = .{ .text = try bank.replace(aa, h.text, "") };
     }
-    s.max_by.seen = true;
 }
 
 /// Row loop of the narrow MAX_BY scatter, specialized per key slice type and
@@ -572,6 +590,7 @@ fn appendValueToColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, 
         .largeint => try col.data.largeint.append(allocator, value.largeint),
         .decimal64 => try col.data.decimal64.append(allocator, value.decimal64),
         .decimal128 => try col.data.decimal128.append(allocator, value.decimal128),
+        .decimal256 => try col.data.decimal256.append(allocator, value.decimal256),
         .uuid => try col.data.uuid.append(allocator, value.uuid),
         .varchar => try col.data.varchar.appendValue(allocator, value.text),
         .string => try col.data.string.appendValue(allocator, value.text),
@@ -619,6 +638,11 @@ fn distinctNumericUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_star
                 if (view.isValid(r)) try s.distinct_exact.append(aa, v);
             }
         },
+        .decimal256 => |slice| {
+            for (slice[row_start..row_end], row_start..) |v, r| {
+                if (view.isValid(r)) try s.distinct_wide.append(aa, v);
+            }
+        },
         inline .float, .double => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
                 if (view.isValid(r)) try s.distinct_float.append(aa, v);
@@ -664,17 +688,17 @@ const AggColKind = enum { count, sum_int, sum_float, avg, min_int, max_int, min_
 fn aggColKind(func: AggFunc, in: ?Type, key_t: ?Type) AggColKind {
     return switch (func) {
         .count, .count_if => .count,
-        .sum => if (in != null and in.?.isFloat()) .sum_float else .sum_int,
+        .sum => if (in != null and in.?.isFloat()) .sum_float else if (in != null and in.? == .decimal256) .other else .sum_int,
         .avg => .avg,
         .min => if (in != null and in.?.isFloat())
             .min_float
-        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128))
+        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128 or in.? == .decimal256))
             .other
         else
             .min_int,
         .max => if (in != null and in.?.isFloat())
             .max_float
-        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128))
+        else if (in != null and (in.?.isString() or in.? == .largeint or in.? == .decimal128 or in.? == .decimal256))
             .other
         else
             .max_int,
@@ -757,10 +781,9 @@ const ValueAcc = struct {
 };
 
 const MaxByAcc = struct {
-    seen: bool = false,
-    key: types.Value = .{ .int = 0 },
+    key: types.Value,
     value: types.Value = .{ .int = 0 },
-    value_null: bool = false,
+    value_null: bool,
 };
 
 /// Types whose every value widens losslessly into an i64: the MAX_BY order
@@ -1039,6 +1062,9 @@ pub const Aggregate = struct {
     /// gather one group's columns back into `[]AccState`, so the existing
     /// `appendGroupRow` / `topkEntry` (which take `[]AccState`) run unchanged.
     state_scratch: []AccState = &.{},
+    /// The boxed `.max_by` cells `state_scratch` points into for the
+    /// narrow MAX_BY columns, one per aggregate.
+    max_by_scratch: []MaxByAcc = &.{},
     /// Per-group key bytes, indexed by gid; the bytes live in `arena`. Byte-key
     /// path only.
     /// Lets emit reconstruct each group's key columns in gid order without
@@ -1337,6 +1363,7 @@ pub const Aggregate = struct {
         if (group_col_indices.len > 0) {
             // Per-group gather scratch shared by every grouped emit path.
             self.state_scratch = try self.arena.allocator().alloc(AccState, aggs.len);
+            self.max_by_scratch = try self.arena.allocator().alloc(MaxByAcc, aggs.len);
             const st = self.upstream.stats();
             var est: u64 = 1;
             var known = true;
@@ -1817,7 +1844,10 @@ pub const Aggregate = struct {
             switch (a.func) {
                 .count => self.scatterCount(self.agg_cols[ai].count, gids, self.agg_col_indices[ai], batch),
                 .count_if => self.scatterCountIf(self.agg_cols[ai].count, gids, batch.values[self.agg_col_indices[ai].?]),
-                .sum => self.scatterSum(ai, gids, batch.values[self.agg_col_indices[ai].?]),
+                .sum => {
+                    const view = batch.values[self.agg_col_indices[ai].?];
+                    if (view.data == .decimal256) try self.scatterWide(ai, gids, view, aa_state, .sum) else self.scatterSum(ai, gids, view);
+                },
                 .min => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, true),
                 .max => try self.scatterMinMax(ai, gids, batch.values[self.agg_col_indices[ai].?], aa_state, false),
                 .avg => self.scatterAvg(self.agg_cols[ai].avg, gids, batch.values[self.agg_col_indices[ai].?]),
@@ -1931,7 +1961,7 @@ pub const Aggregate = struct {
         _ = self;
         const has_nulls = view.nulls != null;
         switch (view.data) {
-            inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128 => |sl| {
+            inline .int, .smallint, .tinyint, .boolean, .bigint, .decimal64, .largeint, .decimal128, .decimal256 => |sl| {
                 if (has_nulls) {
                     for (gids, 0..) |g, r| {
                         if (!view.isValid(r)) continue;
@@ -1977,7 +2007,7 @@ pub const Aggregate = struct {
         while (r < gids.len) : (r += 1) {
             if (!key_view.isValid(r)) continue;
             const s = &col[gids[r]];
-            if (s.max_by.seen and rowVsValue(key_view, r, s.max_by.key) != .gt) continue;
+            if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != .gt) continue;
             try replaceMaxBy(&self.str_bank, aa, s, value_view, key_view, r);
         }
     }
@@ -2067,6 +2097,7 @@ pub const Aggregate = struct {
                     }
                 }
             },
+            .decimal256 => try self.scatterWide(ai, gids, view, aa, if (is_min) .min else .max),
             inline .float, .double => |sl| {
                 const col = if (is_min) self.agg_cols[ai].min_float else self.agg_cols[ai].max_float;
                 for (gids, 0..) |g, r| {
@@ -2098,6 +2129,16 @@ pub const Aggregate = struct {
                 }
             },
             else => unreachable,
+        }
+    }
+
+    /// SUM / MIN / MAX scatter over a DECIMAL256 column into the `.other`
+    /// column's boxed `wide` cells. Mirrors `wideUpdate`.
+    fn scatterWide(self: *Aggregate, ai: usize, gids: []const u32, view: ColumnView, aa: Allocator, comptime func: AggFunc) !void {
+        const vals = view.data.decimal256;
+        const col = self.agg_cols[ai].other;
+        for (gids, 0..) |g, r| {
+            if (view.isValid(r)) try wideFold(aa, &col[g], func, vals[r]);
         }
     }
 
@@ -2449,14 +2490,16 @@ pub const Aggregate = struct {
     /// paths read (`appendGroupRow` / `topkEntry`), re-tagging key and payload
     /// with their column types. An unseen cell maps to the initial state.
     fn wrapMaxByNarrow(self: *Aggregate, ai: usize, s: MaxByNarrow) AccState {
-        if (!s.seen) return .{ .max_by = .{} };
+        if (!s.seen) return .{ .max_by = null };
         const up_schema = self.upstream.outputSchema();
         const key_t = up_schema[self.agg_key_indices[ai].?].type;
         const value: types.Value = if (self.aggs[ai].func == .max_by_key)
             .{ .int = 0 }
         else
             narrowValue(up_schema[self.agg_col_indices[ai].?].type, s.val, s.len);
-        return .{ .max_by = .{ .seen = true, .key = narrowScalarValue(key_t, s.key), .value = value, .value_null = s.val_null } };
+        const cell = &self.max_by_scratch[ai];
+        cell.* = .{ .key = narrowScalarValue(key_t, s.key), .value = value, .value_null = s.val_null };
+        return .{ .max_by = cell };
     }
 
     fn wrapValueNarrow(self: *Aggregate, ai: usize, s: ValueNarrow) AccState {
@@ -3095,8 +3138,9 @@ fn findAggByName(aggs: []const AggSpec, name: []const u8) ?usize {
 /// `aggOrderValue` is always defined for an orderable key.
 fn topkOrderable(func: AggFunc, out_t: Type) bool {
     return switch (func) {
-        .count, .count_if, .count_distinct, .sum, .avg => true,
-        .min, .max => !out_t.isString(),
+        .count, .count_if, .count_distinct, .avg => true,
+        .sum => out_t != .decimal256,
+        .min, .max => !out_t.isString() and out_t != .decimal256,
         else => false,
     };
 }
@@ -3200,6 +3244,29 @@ fn foldMinLarge(s: *AccState, m: i128) void {
 }
 fn foldMaxLarge(s: *AccState, m: i128) void {
     if (!s.max_large.present or m > s.max_large.v) s.max_large = .{ .v = m, .present = true };
+}
+
+/// Fold one DECIMAL256 value into a SUM/MIN/MAX `wide` cell, boxing the
+/// cell on the group's first value.
+fn wideFold(aa: Allocator, s: *AccState, comptime func: AggFunc, v: i256) !void {
+    const acc = s.wide orelse {
+        const cell = try aa.create(i256);
+        cell.* = v;
+        s.wide = cell;
+        return;
+    };
+    acc.* = switch (func) {
+        .sum => std.math.add(i256, acc.*, v) catch return Error.ArithmeticOverflow,
+        .min => @min(acc.*, v),
+        .max => @max(acc.*, v),
+        else => @compileError("wideFold folds SUM, MIN and MAX"),
+    };
+}
+
+fn wideUpdate(aa: Allocator, s: *AccState, comptime func: AggFunc, view: ColumnView, row_start: u32, row_end: u32) !void {
+    for (view.data.decimal256[row_start..row_end], row_start..) |v, r| {
+        if (view.isValid(r)) try wideFold(aa, s, func, v);
+    }
 }
 fn foldMinFloat(s: *AccState, m: f64) void {
     if (s.min_float == null or m < s.min_float.?) s.min_float = m;
@@ -3329,6 +3396,8 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .count => .{ .count = 0 },
         .sum => if (in != null and in.?.isFloat())
             .{ .sum_float = .{} }
+        else if (in != null and in.? == .decimal256)
+            .{ .wide = null }
         else
             // i128 accumulator covers BIGINT, LARGEINT, DECIMAL64, DECIMAL128.
             .{ .sum_int = .{} },
@@ -3336,6 +3405,8 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .min_float = null }
         else if (in != null and in.?.isString())
             .{ .min_str = null }
+        else if (in != null and in.? == .decimal256)
+            .{ .wide = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .min_large = .{} }
         else
@@ -3344,6 +3415,8 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
             .{ .max_float = null }
         else if (in != null and in.?.isString())
             .{ .max_str = null }
+        else if (in != null and in.? == .decimal256)
+            .{ .wide = null }
         else if (in != null and (in.? == .largeint or in.? == .decimal128))
             .{ .max_large = .{} }
         else
@@ -3353,13 +3426,15 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .bool_and => .{ .bool_acc = .{ .value = true } },
         .bool_or => .{ .bool_acc = .{ .value = false } },
         .any_value, .first, .last => .{ .value_acc = .{} },
-        .max_by, .max_by_key => .{ .max_by = .{} },
+        .max_by, .max_by_key => .{ .max_by = null },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
         // The identity is already seen, so no rows give it.
         .unsigned_bit_and => .{ .bitwise = .{ .seen = true, .value = -1 } },
         .unsigned_bit_or, .unsigned_bit_xor => .{ .bitwise = .{ .seen = true } },
         .sum_distinct, .avg_distinct => if (in != null and in.?.isFloat())
             .{ .distinct_float = .empty }
+        else if (in != null and in.? == .decimal256)
+            .{ .distinct_wide = .empty }
         else
             .{ .distinct_exact = .empty },
         .stddev_pop, .stddev_samp, .var_pop, .var_samp => .{ .welford = .{} },
@@ -3496,13 +3571,30 @@ fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) e
     }
 }
 
+/// The aggregates a DECIMAL256 input reaches: those whose state holds the
+/// value whole (SUM/MIN/MAX's boxed cell, a `types.Value`, the distinct
+/// set's bytes) or reads it as a double.
+fn takesWideDecimal(func: AggFunc) bool {
+    return switch (func) {
+        .count, .count_if, .count_distinct, .sum, .min, .max, .avg, .sum_distinct, .avg_distinct => true,
+        .any_value, .first, .last, .max_by, .max_by_key, .bool_and, .bool_or => true,
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => true,
+        else => false,
+    };
+}
+
 fn aggOutputType(func: AggFunc, in: ?Type) !Type {
+    if (in != null and in.? == .decimal256 and !takesWideDecimal(func)) return Error.AggregateUnsupportedType;
     return switch (func) {
         .count, .count_if, .count_distinct => .bigint,
         .sum => blk: {
             const t = in orelse return Error.AggregateColumnRequired;
-            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s).
-            if (t.decimalSpec()) |spec| break :blk .{ .decimal128 = .{ .p = 38, .s = spec.s } };
+            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), or
+            // DECIMAL(76, s) over a DECIMAL past 38 digits.
+            if (t.decimalSpec()) |spec| break :blk if (t == .decimal256)
+                .{ .decimal256 = .{ .p = types.max_decimal_precision, .s = spec.s } }
+            else
+                .{ .decimal128 = .{ .p = types.max_decimal128_precision, .s = spec.s } };
             if (t.isFloat()) break :blk .double;
             // DESIGN.md §3.4: an integer SUM is BIGINT and wraps on overflow,
             // as in StarRocks — every path accumulates exactly and truncates
@@ -3697,6 +3789,7 @@ fn updateStateRow(aa: Allocator, bank: *StringBank, s: *AccState, spec: AggSpec,
                 .boolean => |sl| s.sum_int.v += sl[row],
                 .bigint, .decimal64 => |sl| s.sum_int.v += sl[row],
                 .largeint, .decimal128 => |sl| s.sum_int.v += sl[row],
+                .decimal256 => |sl| return wideFold(aa, s, .sum, sl[row]),
                 .float => |sl| {
                     s.sum_float.v += sl[row];
                     s.sum_float.seen = true;
@@ -3749,6 +3842,7 @@ pub fn updateState(
             const view = batch.values[idx];
             const lo = row_start;
             const hi = row_end;
+            if (view.data == .decimal256) return wideUpdate(aa, s, .sum, view, lo, hi);
             if (view.nulls == null) {
                 // No nulls in this column: reduce the contiguous range with a
                 // tight SIMD kernel (no per-row validity branch). Small ints
@@ -3835,6 +3929,7 @@ pub fn updateState(
             const view = batch.values[idx];
             const lo = row_start;
             const hi = row_end;
+            if (view.data == .decimal256) return wideUpdate(aa, s, .min, view, lo, hi);
             // No-null numeric fast path: SIMD-reduce the range, fold the one
             // extreme into the accumulator. Strings can't reduce numerically —
             // they fall through to the scalar loop below.
@@ -3915,6 +4010,7 @@ pub fn updateState(
             const view = batch.values[idx];
             const lo = row_start;
             const hi = row_end;
+            if (view.data == .decimal256) return wideUpdate(aa, s, .max, view, lo, hi);
             if (view.nulls == null and hi > lo) switch (view.data) {
                 .int, .date => |sl| return foldMaxInt(s, simd.maxOf(i32, sl[lo..hi])),
                 .bigint, .datetime => |sl| return foldMaxInt(s, simd.maxOf(i64, sl[lo..hi])),
@@ -4007,6 +4103,9 @@ pub fn updateState(
                     .largeint, .decimal128 => |sl| for (sl[lo..hi]) |v| {
                         s.avg.sum += @floatFromInt(v);
                     },
+                    .decimal256 => |sl| for (sl[lo..hi]) |v| {
+                        s.avg.sum += @floatFromInt(v);
+                    },
                     .float => |sl| s.avg.sum += simd.sumFloat(f32, sl[lo..hi]),
                     .double => |sl| s.avg.sum += simd.sumFloat(f64, sl[lo..hi]),
                     else => unreachable,
@@ -4024,6 +4123,11 @@ pub fn updateState(
                     s.avg.count += 1;
                 },
                 .decimal128 => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
+                    if (!view.isValid(r)) continue;
+                    s.avg.sum += @as(f64, @floatFromInt(v));
+                    s.avg.count += 1;
+                },
+                .decimal256 => |slice| for (slice[row_start..row_end], row_start..) |v, r| {
                     if (!view.isValid(r)) continue;
                     s.avg.sum += @as(f64, @floatFromInt(v));
                     s.avg.count += 1;
@@ -4118,7 +4222,7 @@ pub fn updateState(
 /// time so the result is invariant to batch boundaries.
 fn welfordUpdate(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) !void {
     switch (view.data) {
-        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |slice| {
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |slice| {
             for (slice[row_start..row_end], row_start..) |v, r| {
                 if (!view.isValid(r)) continue;
                 welfordStep(&s.welford, @as(f64, @floatFromInt(v)));
@@ -4158,7 +4262,7 @@ pub fn coMomentStep(m: *CoMomentAcc, x: f64, y: f64) void {
 
 pub fn numericAsF64(view: ColumnView, row: usize) f64 {
     return switch (view.data) {
-        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |sl| @floatFromInt(sl[row]),
+        inline .int, .bigint, .boolean, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |sl| @floatFromInt(sl[row]),
         inline .float, .double => |sl| sl[row],
         else => unreachable,
     };
@@ -4443,7 +4547,7 @@ fn topKUpdate(aa: Allocator, s: *AccState, view: ColumnView, row_start: u32, row
             acc.nulls += 1;
             continue;
         }
-        var buf: [16]u8 = undefined;
+        var buf: [nested.ELEMENT_BYTES_MAX]u8 = undefined;
         const gop = try acc.counts.getOrPut(aa, nested.elementBytes(view, r, &buf));
         if (!gop.found_existing) {
             gop.key_ptr.* = try aa.dupe(u8, gop.key_ptr.*);
@@ -4743,6 +4847,11 @@ fn encodeOneValue(aa: Allocator, out: *std.ArrayList(u8), view: ColumnView, row:
             std.mem.writeInt(i128, &b, s[row], .little);
             try out.appendSlice(aa, &b);
         },
+        .decimal256 => |s| {
+            var b: [32]u8 = undefined;
+            std.mem.writeInt(i256, &b, s[row], .little);
+            try out.appendSlice(aa, &b);
+        },
         .uuid => |s| {
             var b: [16]u8 = undefined;
             std.mem.writeInt(u128, &b, s[row], .little);
@@ -4780,13 +4889,14 @@ fn avgUpdateInt(s: *AccState, view: ColumnView, row_start: u32, row_end: u32) vo
 }
 
 /// The sum and count of the distinct values in `values`, which it sorts.
-fn distinctRun(comptime T: type, values: []T) struct { sum: T, count: u64 } {
+fn distinctRun(comptime T: type, values: []T) !struct { sum: T, count: u64 } {
     std.mem.sortUnstable(T, values, {}, std.sort.asc(T));
     var sum: T = 0;
     var count: u64 = 0;
     for (values, 0..) |v, i| {
         if (i > 0 and v == values[i - 1]) continue;
-        sum += v;
+        // A DECIMAL256 sum raises past the i256 range, as `wideFold` does.
+        sum = if (T == i256) std.math.add(i256, sum, v) catch return Error.ArithmeticOverflow else sum + v;
         count += 1;
     }
     return .{ .sum = sum, .count = count };
@@ -4833,9 +4943,21 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else try col.data.double.append(allocator, total.v),
+            // A DECIMAL256 SUM, like a DECIMAL128 one, holds what its
+            // integer holds: `wideFold` raises past the i256 range.
+            .wide => |total| if (total) |v| {
+                try col.data.decimal256.append(allocator, v.*);
+            } else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            },
             else => unreachable,
         },
         .min, .max => switch (state) {
+            .wide => |m| if (m) |v| try col.data.decimal256.append(allocator, v.*) else {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            },
             .min_int, .max_int => {
                 const m: ?i64 = if (func == .min) state.min_int else state.max_int;
                 if (m) |v| switch (out_type) {
@@ -4922,17 +5044,18 @@ pub fn appendAccToColumn(
         },
         .max_by => {
             const v = state.max_by;
-            if (!v.seen or v.value_null) {
+            if (v == null or v.?.value_null) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
-            } else try appendValueToColumn(allocator, col, out_type, v.value);
+            } else try appendValueToColumn(allocator, col, out_type, v.?.value);
         },
         .max_by_key => {
-            const v = state.max_by;
-            if (!v.seen) {
+            if (state.max_by) |v| {
+                try appendValueToColumn(allocator, col, out_type, v.key);
+            } else {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
-            } else try appendValueToColumn(allocator, col, out_type, v.key);
+            }
         },
         .bit_and, .bit_or, .bit_xor => {
             const b = state.bitwise;
@@ -4951,7 +5074,7 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else {
-                const distinct = distinctRun(i128, list.items);
+                const distinct = try distinctRun(i128, list.items);
                 if (func == .avg_distinct) {
                     const mean = @as(f64, @floatFromInt(distinct.sum)) / @as(f64, @floatFromInt(distinct.count));
                     try col.data.double.append(allocator, mean / avgScaleDiv(in_type));
@@ -4966,8 +5089,18 @@ pub fn appendAccToColumn(
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else {
-                const distinct = distinctRun(f64, list.items);
+                const distinct = try distinctRun(f64, list.items);
                 try col.data.double.append(allocator, if (func == .avg_distinct) distinct.sum / @as(f64, @floatFromInt(distinct.count)) else distinct.sum);
+            },
+            .distinct_wide => |list| if (list.items.len == 0) {
+                try col.data.appendNullPlaceholder(allocator);
+                is_null = true;
+            } else {
+                const distinct = try distinctRun(i256, list.items);
+                if (func == .avg_distinct) {
+                    const mean = @as(f64, @floatFromInt(distinct.sum)) / @as(f64, @floatFromInt(distinct.count));
+                    try col.data.double.append(allocator, mean / avgScaleDiv(in_type));
+                } else try col.data.decimal256.append(allocator, distinct.sum);
             },
             else => unreachable,
         },
@@ -5596,6 +5729,11 @@ pub fn buildCompoundGroupKey(
                 std.mem.writeInt(i128, &b, s[row], .little);
                 try out.appendSlice(allocator, &b);
             },
+            .decimal256 => |s| {
+                var b: [32]u8 = undefined;
+                std.mem.writeInt(i256, &b, s[row], .little);
+                try out.appendSlice(allocator, &b);
+            },
             .uuid => |s| {
                 var b: [16]u8 = undefined;
                 std.mem.writeInt(u128, &b, s[row], .little);
@@ -5675,6 +5813,7 @@ fn fixedKeyWidth(data: storage.column.ValueView) ?u32 {
         .int, .date, .float => 4,
         .bigint, .datetime, .decimal64, .double => 8,
         .largeint, .decimal128, .uuid => 16,
+        .decimal256 => 32,
         .varchar, .string, .char, .json, .nested, .bitmap => null,
     };
 }
@@ -5687,6 +5826,7 @@ fn writeKeyColumn(comptime nullable: bool, out: []u8, spans: [][2]u32, view: sto
         .tinyint => |s| writeFixedKeys(i8, nullable, out, spans, view, s),
         .smallint => |s| writeFixedKeys(i16, nullable, out, spans, view, s),
         .largeint, .decimal128 => |s| writeFixedKeys(i128, nullable, out, spans, view, s),
+        .decimal256 => |s| writeFixedKeys(i256, nullable, out, spans, view, s),
         .uuid => |s| writeFixedKeys(u128, nullable, out, spans, view, s),
         .float => |s| writeFixedKeys(f32, nullable, out, spans, view, s),
         .double => |s| writeFixedKeys(f64, nullable, out, spans, view, s),
@@ -5847,6 +5987,11 @@ fn appendGroupKey(
                 const v = std.mem.readInt(i128, key_bytes[cursor..][0..16], .little);
                 cursor += 16;
                 try out_cols[i].data.decimal128.append(allocator, v);
+            },
+            .decimal256 => {
+                const v = std.mem.readInt(i256, key_bytes[cursor..][0..32], .little);
+                cursor += 32;
+                try out_cols[i].data.decimal256.append(allocator, v);
             },
             .uuid => {
                 const v = std.mem.readInt(u128, key_bytes[cursor..][0..16], .little);

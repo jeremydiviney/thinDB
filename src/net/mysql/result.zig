@@ -50,7 +50,7 @@ fn isNumericType(t: types.Type) bool {
         .tinyint, .smallint, .int, .bigint, .largeint => true,
         .boolean => true,
         .float, .double => true,
-        .decimal64, .decimal128 => true,
+        .decimal64, .decimal128, .decimal256 => true,
         else => false,
     };
 }
@@ -79,6 +79,7 @@ fn mysqlTypeOf(t: types.Type, protocol: Protocol) struct { type_byte: u8, decima
         .datetime => .{ .type_byte = MYSQL_TYPE_DATETIME, .decimals = 6, .len = 26, .charset = CHARSET_BINARY },
         .decimal64 => |spec| .{ .type_byte = MYSQL_TYPE_NEWDECIMAL, .decimals = spec.s, .len = @as(u32, spec.p) + 2, .charset = CHARSET_BINARY },
         .decimal128 => |spec| .{ .type_byte = MYSQL_TYPE_NEWDECIMAL, .decimals = spec.s, .len = @as(u32, spec.p) + 2, .charset = CHARSET_BINARY },
+        .decimal256 => |spec| .{ .type_byte = MYSQL_TYPE_NEWDECIMAL, .decimals = spec.s, .len = @as(u32, spec.p) + 2, .charset = CHARSET_BINARY },
         .uuid => .{ .type_byte = MYSQL_TYPE_STRING, .decimals = 0, .len = 36, .charset = CHARSET_UTF8MB4 },
         .varchar => |n| .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = @as(u32, n) * 4, .charset = CHARSET_UTF8MB4 },
         .char => |n| .{ .type_byte = MYSQL_TYPE_VAR_STRING, .decimals = 0, .len = @as(u32, n) * 4, .charset = CHARSET_UTF8MB4 },
@@ -166,6 +167,7 @@ fn formatCell(scratch: *std.ArrayList(u8), allocator: Allocator, schema_col: Col
         },
         .decimal64 => |s| try wire_format.formatDecimal(allocator, scratch, @as(i128, s[row]), schema_col.type),
         .decimal128 => |s| try wire_format.formatDecimal(allocator, scratch, s[row], schema_col.type),
+        .decimal256 => |s| try wire_format.formatDecimal(allocator, scratch, s[row], schema_col.type),
         .uuid => |s| {
             var buf: [40]u8 = undefined;
             try scratch.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));

@@ -3909,6 +3909,7 @@ fn appendKeyCell(allocator: Allocator, out: *std.ArrayList(u8), view: ColumnView
         .largeint => |s| try appendInt(allocator, out, i128, s[row]),
         .decimal64 => |s| try appendInt(allocator, out, i64, s[row]),
         .decimal128 => |s| try appendInt(allocator, out, i128, s[row]),
+        .decimal256 => |s| try appendInt(allocator, out, i256, s[row]),
         .uuid => |s| try appendInt(allocator, out, u128, s[row]),
         .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
             const bytes = sv.rowBytes(row);
@@ -3951,6 +3952,7 @@ pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32,
         .largeint => |s| return cmpOp(i128, s[lrow], right.data.largeint[rrow], op),
         .decimal64 => |s| return cmpOp(i64, s[lrow], right.data.decimal64[rrow], op),
         .decimal128 => |s| return cmpOp(i128, s[lrow], right.data.decimal128[rrow], op),
+        .decimal256 => |s| return cmpOp(i256, s[lrow], right.data.decimal256[rrow], op),
         .uuid => |s| return cmpOp(u128, s[lrow], right.data.uuid[rrow], op),
         .varchar => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.varchar.rowBytes(rrow), op),
         .string => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.string.rowBytes(rrow), op),

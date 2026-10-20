@@ -2399,9 +2399,10 @@ fn buildCallPlan(
         const slot = ap.lit;
         const typed: types.Value = if (slot.ty.decimalSpec()) |spec| blk: {
             if (!scalar_fn.arithTakesDouble(c.fn_name, arg_types)) continue;
-            const m: i128 = switch (slot.value) {
+            const m: i256 = switch (slot.value) {
                 .decimal64 => |x| x,
                 .decimal128 => |x| x,
+                .decimal256 => |x| x,
                 else => continue,
             };
             break :blk .{ .double = scalar_decimal.mantissaToDouble(m, spec.s) };
@@ -2718,6 +2719,7 @@ fn nullifConstantPlaced(aa: Allocator, c: Expr.Call, arg_plans: []const ArgPlan,
             const value: types.Value = if (ap.lit.ty.decimalSpec()) |spec| .{ .double = scalar_decimal.mantissaToDouble(switch (ap.lit.value) {
                 .decimal64 => |x| x,
                 .decimal128 => |x| x,
+                .decimal256 => |x| x,
                 else => continue,
             }, spec.s) } else ap.lit.value;
             break :number predicate_mod.placeComparedValue(value, other);
@@ -3289,7 +3291,8 @@ fn decimalLitSlot(runtime_allocator: Allocator, aa: Allocator, e: Expr) PlanErro
     slot.* = .{
         .value = switch (ty) {
             .decimal64 => .{ .decimal64 = @intCast(m) },
-            else => .{ .decimal128 = m },
+            .decimal128 => .{ .decimal128 = @intCast(m) },
+            else => .{ .decimal256 = m },
         },
         .ty = ty,
         .buf = try ColumnStore.init(runtime_allocator, ty, false),
@@ -3313,7 +3316,7 @@ pub fn literalType(v: types.Value) Error!Type {
         // Decimal Values carry just the raw int payload (no precision/
         // scale). Compute can't materialize a typed decimal column
         // without those — the producer must cast to the decimal type.
-        .decimal64, .decimal128 => Error.TypeMismatch,
+        .decimal64, .decimal128, .decimal256 => Error.TypeMismatch,
         .uuid => .uuid,
     };
 }
@@ -3453,7 +3456,7 @@ fn writeZeroDivisorNulls(
     const base = out.data.rowCount() - n;
     const bits = out.nulls.?.items;
     switch (arg_views[arg_views.len - 1].data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => |divisor| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128, .decimal256 => |divisor| {
             for (divisor[0..n], base..) |d, row| if (d == 0) clearBit(bits, row);
         },
         else => {},
@@ -3467,7 +3470,7 @@ fn clearBit(bits: []u8, row: usize) void {
 /// Only numeric columns divide; a divisor of any other type is never zero.
 fn zeroDivisorAt(divisor: ColumnView, row: usize) bool {
     return switch (divisor.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => |s| s[row] == 0,
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128, .decimal256 => |s| s[row] == 0,
         else => false,
     };
 }
@@ -3712,6 +3715,7 @@ fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n:
         .datetime => |x| while (i < n) : (i += 1) try buf.data.datetime.append(allocator, x),
         .decimal64 => |x| while (i < n) : (i += 1) try buf.data.decimal64.append(allocator, x),
         .decimal128 => |x| while (i < n) : (i += 1) try buf.data.decimal128.append(allocator, x),
+        .decimal256 => |x| while (i < n) : (i += 1) try buf.data.decimal256.append(allocator, x),
         .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
     }
     try ensureNarrow(buf);

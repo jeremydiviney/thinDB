@@ -956,6 +956,8 @@ fn keyValueI128(col: ColumnStore, r: u32) i128 {
         .string, .varchar, .char, .json, .nested, .bitmap => |s| storage.format.encodeStringPrefix(s.view().rowBytes(r)),
         .float => |l| storage.format.encodeFloatOrder(@as(f64, l.items[r])),
         .double => |l| storage.format.encodeFloatOrder(l.items[r]),
+        // `typeHasStats` is false for decimal256, so no prefix key has it.
+        .decimal256 => unreachable,
     };
 }
 

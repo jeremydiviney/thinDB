@@ -466,6 +466,11 @@ fn serializeGroupKey(
                 std.mem.writeInt(i128, &b, s[row], .little);
                 try out.appendSlice(allocator, &b);
             },
+            .decimal256 => |s| {
+                var b: [32]u8 = undefined;
+                std.mem.writeInt(i256, &b, s[row], .little);
+                try out.appendSlice(allocator, &b);
+            },
             .uuid => |s| {
                 var b: [16]u8 = undefined;
                 std.mem.writeInt(u128, &b, s[row], .little);
@@ -499,6 +504,7 @@ fn appendCellFromView(allocator: Allocator, dst: *ColumnStore, src: ColumnView, 
         .datetime => |*l| try l.append(allocator, src.data.datetime[src_idx]),
         .decimal64 => |*l| try l.append(allocator, src.data.decimal64[src_idx]),
         .decimal128 => |*l| try l.append(allocator, src.data.decimal128[src_idx]),
+        .decimal256 => |*l| try l.append(allocator, src.data.decimal256[src_idx]),
         .uuid => |*l| try l.append(allocator, src.data.uuid[src_idx]),
         .varchar => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),
         .string => |*s| try s.appendValue(allocator, stringBytes(src, src_idx)),

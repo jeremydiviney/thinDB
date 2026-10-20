@@ -2228,7 +2228,7 @@ pub const TableFnExec = struct {
                     h1.update(std.mem.asBytes(&bytes.len));
                     h2.update(std.mem.asBytes(&bytes.len));
                 },
-                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .uuid, .boolean => |s| {
+                inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .decimal256, .uuid, .boolean => |s| {
                     h1.update(std.mem.asBytes(&s[row]));
                     h2.update(std.mem.asBytes(&s[row]));
                 },
@@ -2487,6 +2487,7 @@ pub const TableFnExec = struct {
             .boolean => v == .boolean or int_lit,
             .decimal64 => v == .decimal64 or int_lit,
             .decimal128 => v == .decimal128 or int_lit,
+            .decimal256 => v == .decimal256 or int_lit,
             .uuid => v == .uuid,
         };
     }
@@ -2560,6 +2561,7 @@ pub const TableFnExec = struct {
             .largeint => |s| .{ .data = .{ .largeint = s[start..][0..n] } },
             .decimal64 => |s| .{ .data = .{ .decimal64 = s[start..][0..n] } },
             .decimal128 => |s| .{ .data = .{ .decimal128 = s[start..][0..n] } },
+            .decimal256 => |s| .{ .data = .{ .decimal256 = s[start..][0..n] } },
             .uuid => |s| .{ .data = .{ .uuid = s[start..][0..n] } },
             .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },
             .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[start..][0 .. n + 1], .bytes = sv.bytes } } },

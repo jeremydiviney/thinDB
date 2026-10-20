@@ -883,6 +883,7 @@ pub fn estimateColumnBytes(t: types.Type) usize {
         .int, .date, .float => 4,
         .bigint, .datetime, .decimal64, .double => 8,
         .largeint, .decimal128, .uuid => 16,
+        .decimal256 => 32,
         .varchar, .string, .char, .json, .nested, .bitmap => 32,
     };
 }

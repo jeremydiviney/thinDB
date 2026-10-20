@@ -1650,10 +1650,11 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     next_string_state_index += 1;
                     continue;
                 }
-                // decimal128 (i128 mantissa) can't be read through the i64
-                // physical slot — decline rather than truncate. decimal64 folds
-                // like a 64-bit int (mantissa) and recovers scale at emit.
-                if (input_type == .decimal128) return traceDecline(request, "decimal128 aggregate");
+                // decimal128 and decimal256 mantissas can't be read through
+                // the i64 physical slot — decline rather than truncate.
+                // decimal64 folds like a 64-bit int (mantissa) and recovers
+                // scale at emit.
+                if (input_type == .decimal128 or input_type == .decimal256) return traceDecline(request, "wide decimal aggregate");
                 // Temporal MIN/MAX folds as the day/µs int; SUM/AVG over a
                 // temporal reads its YYYYMMDD number in MySQL and is an error
                 // elsewhere, which the generic group-by handles.
@@ -1897,7 +1898,7 @@ fn valueAsNum(v: types.Value) ?Num {
         .boolean => |b| .{ .i = @intFromBool(b) },
         .float => |x| .{ .f = x },
         .double => |x| .{ .f = x },
-        .text, .uuid => null,
+        .text, .uuid, .decimal256 => null,
     };
 }
 

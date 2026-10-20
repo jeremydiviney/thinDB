@@ -60,6 +60,7 @@ fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
         .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
         .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
         .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
+        .decimal256 => |s| .{ .data = .{ .decimal256 = s[off..][0..n] }, .nulls = nulls },
         .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
         .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },

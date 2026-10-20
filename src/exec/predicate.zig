@@ -27,6 +27,7 @@ const scalar_fn_array = @import("scalar_fn_array.zig");
 const cast = @import("cast.zig");
 const scalar_fn_time = @import("scalar_fn_time.zig");
 const decimal_pow10 = @import("scalar_fn_decimal.zig").pow10;
+const decimal_pow10_of = @import("scalar_fn_decimal.zig").pow10Of;
 const decimal_rescale = @import("scalar_fn_decimal.zig").rescale;
 
 pub const PredicateOp = enum { eq, neq, lt, lte, gt, gte };
@@ -972,7 +973,7 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
     const lit: Scalar = switch (val) {
         .text => |t| textScalar(t, col_type) orelse return if (kind == .temporal) .not_temporal else .null_text,
         // No scale to place it by: only a decimal column (coerceValue) takes it.
-        .decimal64, .decimal128 => return .incomparable,
+        .decimal64, .decimal128, .decimal256 => return .incomparable,
         // A number column meets a DATE or DATETIME as its number, as MySQL
         // compares them.
         .date => |days| if (kind == .number) .{ .integer = scalar_fn_common.dateNumber(days) } else valueScalar(val, 0),
@@ -984,8 +985,9 @@ fn placeLiteral(val: Value, col_type: types.Type) LiteralPlacement {
         return if (number and kind == .text) .parse_rows else .incomparable;
     }
     return switch (col_type) {
-        .tinyint, .smallint, .int, .bigint, .largeint => placeOnGrid(lit, 0, col_type),
-        .decimal64, .decimal128 => |spec| placeOnGrid(lit, spec.s, col_type),
+        .tinyint, .smallint, .int, .bigint, .largeint => placeOnGrid(i128, lit, 0, col_type),
+        .decimal64, .decimal128 => |spec| placeOnGrid(i128, lit, spec.s, col_type),
+        .decimal256 => |spec| placeOnGrid(i256, lit, spec.s, col_type),
         .float => .{ .exact = .{ .float = @floatCast(scalarF64(lit) orelse return .incomparable) } },
         .double => .{ .exact = .{ .double = scalarF64(lit) orelse return .incomparable } },
         .date => placeOnDays(lit),
@@ -1001,7 +1003,7 @@ fn numberDigits(val: Value) ?ScaledInt {
     return switch (valueScalar(val, 0)) {
         .integer => |v| .{ .m = v, .s = 0 },
         .float => |v| scalar_fn_common.floatDigits(v),
-        .decimal, .micros, .text, .uuid => null,
+        .decimal, .wide, .micros, .text, .uuid => null,
     };
 }
 
@@ -1071,7 +1073,7 @@ fn placeFields(f: struct { i32, u32, u32 }, col_type: types.Type, clock: i64) Li
 /// parsing; null when it doesn't parse.
 fn textScalar(text: []const u8, col_type: types.Type) ?Scalar {
     return switch (comparisonKind(col_type)) {
-        .number => textNumber(text),
+        .number => if (col_type == .decimal256) textNumberWide(text) else textNumber(text),
         .temporal => textMicros(text),
         .text, .uuid => .{ .text = text },
     };
@@ -1079,7 +1081,7 @@ fn textScalar(text: []const u8, col_type: types.Type) ?Scalar {
 
 fn scalarComparableTo(lit: Scalar, col_type: types.Type) bool {
     return switch (comparisonKind(col_type)) {
-        .number => lit == .integer or lit == .float or lit == .decimal,
+        .number => lit == .integer or lit == .float or lit == .decimal or lit == .wide,
         .temporal => lit == .micros,
         .text => lit == .text,
         .uuid => false,
@@ -1090,40 +1092,44 @@ fn scalarComparableTo(lit: Scalar, col_type: types.Type) bool {
 /// lands on the column's grid of 10^-scale steps, else the two grid points
 /// around it.
 /// A double lands by its shortest digits (`floatDigits`), as it converts.
-fn placeOnGrid(lit: Scalar, scale: u8, col_type: types.Type) LiteralPlacement {
-    const d: ScaledInt = switch (lit) {
+/// The grid's steps are `W`s: i256 for a decimal256 column, i128 otherwise.
+fn placeOnGrid(comptime W: type, lit: Scalar, scale: u8, col_type: types.Type) LiteralPlacement {
+    const d: scalar_fn_common.ScaledIntOf(W) = switch (lit) {
         .integer => |v| .{ .m = v, .s = 0 },
-        .decimal => |d| d,
-        .float => |v| scalar_fn_common.floatDigits(v) orelse
+        .decimal => |d| .{ .m = d.m, .s = d.s },
+        // Only text against a decimal256 column reads as one.
+        .wide => |d| if (comptime W == i256) d else return .incomparable,
+        .float => |v| scalar_fn_common.floatDigitsOf(W, v) orelse
             return if (std.math.isFinite(v)) .{ .beyond = sideOf(v < 0) } else .incomparable,
         .micros, .text, .uuid => return .incomparable,
     };
-    const steps: struct { lo: i128, hi: i128 } = blk: {
+    const steps: struct { lo: W, hi: W } = blk: {
         if (d.s <= scale) {
-            const m = mulPow10(d.m, scale - d.s) orelse return .{ .beyond = sideOf(d.m < 0) };
+            const m = mulPow10(W, d.m, scale - d.s) orelse return .{ .beyond = sideOf(d.m < 0) };
             break :blk .{ .lo = m, .hi = m };
         }
-        const step = decimal_pow10(d.s - scale);
+        const step = decimal_pow10_of(W, d.s - scale);
         const lo = @divFloor(d.m, step);
         break :blk .{ .lo = lo, .hi = if (lo * step == d.m) lo else lo + 1 };
     };
     // Past the type's range on one side only when `lo` is its maximum or
     // `hi` its minimum: then the literal is still beyond every column value.
-    const lo = gridValue(steps.lo, col_type) orelse return .{ .beyond = sideOf(steps.hi <= 0) };
-    const hi = gridValue(steps.hi, col_type) orelse return .{ .beyond = .above };
+    const lo = gridValue(W, steps.lo, col_type) orelse return .{ .beyond = sideOf(steps.hi <= 0) };
+    const hi = gridValue(W, steps.hi, col_type) orelse return .{ .beyond = .above };
     if (steps.lo == steps.hi) return .{ .exact = lo };
     return .{ .between = .{ .lo = lo, .hi = hi } };
 }
 
-fn gridValue(m: i128, col_type: types.Type) ?Value {
+fn gridValue(comptime W: type, m: W, col_type: types.Type) ?Value {
     return switch (col_type) {
         .tinyint => .{ .tinyint = std.math.cast(i8, m) orelse return null },
         .smallint => .{ .smallint = std.math.cast(i16, m) orelse return null },
         .int => .{ .int = std.math.cast(i32, m) orelse return null },
         .bigint => .{ .bigint = std.math.cast(i64, m) orelse return null },
-        .largeint => .{ .largeint = m },
+        .largeint => .{ .largeint = std.math.cast(i128, m) orelse return null },
         .decimal64 => .{ .decimal64 = std.math.cast(i64, m) orelse return null },
-        .decimal128 => .{ .decimal128 = m },
+        .decimal128 => .{ .decimal128 = std.math.cast(i128, m) orelse return null },
+        .decimal256 => .{ .decimal256 = m },
         else => null,
     };
 }
@@ -1138,9 +1144,9 @@ fn placeOnDays(lit: Scalar) LiteralPlacement {
     return .{ .between = .{ .lo = .{ .date = lo }, .hi = .{ .date = hi } } };
 }
 
-fn mulPow10(m: i128, n: u8) ?i128 {
-    if (n > 38) return null;
-    return std.math.mul(i128, m, decimal_pow10(n)) catch null;
+fn mulPow10(comptime W: type, m: W, n: u8) ?W {
+    if (n > scalar_fn_common.decimalDigitsOf(W)) return null;
+    return std.math.mul(W, m, decimal_pow10_of(W, n)) catch null;
 }
 
 /// `col op x` where x lies strictly between the neighbouring column values
@@ -1194,7 +1200,7 @@ pub fn coerceValueRounded(val: *Value, target: types.Type) error{NoWidening}!voi
 const DecimalFit = enum { exact, round };
 
 fn coerceValueMode(val: *Value, target: types.Type, fit: DecimalFit) error{NoWidening}!void {
-    if (target.decimalSpec()) |spec| return coerceLiteralToDecimal(val, spec, target == .decimal128, fit);
+    if (target.decimalSpec() != null) return coerceLiteralToDecimal(val, target, fit);
     return tryWidenLiteral(val, ValueTag.fromType(target));
 }
 
@@ -1285,9 +1291,11 @@ fn fitInt(comptime T: type, v: i128) error{OutOfRange}!T {
 /// Scale a numeric/text literal to a decimal column's mantissa (value × 10^s),
 /// so the comparison kernel — which compares raw mantissas — sees both operands
 /// at the same scale. A literal beyond the column precision still coerces (the
-/// comparison just resolves to a constant); only an i128 overflow is rejected.
-fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool, fit: DecimalFit) error{NoWidening}!void {
-    const m: i128 = switch (val.*) {
+/// comparison just resolves to a constant); only a mantissa past the column's
+/// backing integer is rejected.
+fn coerceLiteralToDecimal(val: *Value, target: types.Type, fit: DecimalFit) error{NoWidening}!void {
+    const spec = target.decimalSpec().?;
+    const m: i256 = switch (val.*) {
         .tinyint => |v| try intToDecimalMantissa(v, spec.s),
         .smallint => |v| try intToDecimalMantissa(v, spec.s),
         .int => |v| try intToDecimalMantissa(v, spec.s),
@@ -1298,19 +1306,20 @@ fn coerceLiteralToDecimal(val: *Value, spec: types.DecimalSpec, is128: bool, fit
         .double => |v| try floatToDecimalMantissa(v, spec.s, fit),
         .decimal64 => |v| v,
         .decimal128 => |v| v,
+        .decimal256 => |v| v,
         else => return error.NoWidening,
     };
-    if (is128) {
-        val.* = .{ .decimal128 = m };
-    } else {
-        val.* = .{ .decimal64 = std.math.cast(i64, m) orelse return error.NoWidening };
-    }
+    val.* = switch (target) {
+        .decimal256 => .{ .decimal256 = m },
+        .decimal128 => .{ .decimal128 = std.math.cast(i128, m) orelse return error.NoWidening },
+        else => .{ .decimal64 = std.math.cast(i64, m) orelse return error.NoWidening },
+    };
 }
 
-fn intToDecimalMantissa(iv: i128, scale: u8) error{NoWidening}!i128 {
-    var m = iv;
+fn intToDecimalMantissa(iv: i128, scale: u8) error{NoWidening}!i256 {
+    var m: i256 = iv;
     var i: u8 = 0;
-    while (i < scale) : (i += 1) m = std.math.mul(i128, m, 10) catch return error.NoWidening;
+    while (i < scale) : (i += 1) m = std.math.mul(i256, m, 10) catch return error.NoWidening;
     return m;
 }
 
@@ -1995,7 +2004,7 @@ fn cellsKeyOrder(values: []const ColumnView, key_idxs: []const usize, i: usize, 
 /// null for any other value.
 fn cellKeyOrder(view: ColumnView, idx: usize, ref: Value) ?std.math.Order {
     return switch (view.data) {
-        inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
+        inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .decimal256, .uuid => |col, tag| {
             if (std.meta.activeTag(ref) != @field(ValueTag, @tagName(tag))) return null;
             return std.math.order(col[idx], @field(ref, @tagName(tag)));
         },
@@ -2022,6 +2031,7 @@ fn cellMatchesValue(view: ColumnView, idx: usize, ref: Value) bool {
         .datetime => |s| ref == .datetime and s[idx] == ref.datetime,
         .decimal64 => |s| ref == .decimal64 and s[idx] == ref.decimal64,
         .decimal128 => |s| ref == .decimal128 and s[idx] == ref.decimal128,
+        .decimal256 => |s| ref == .decimal256 and s[idx] == ref.decimal256,
         .uuid => |s| ref == .uuid and s[idx] == ref.uuid,
         .json => |sv| jsonOrder(sv.rowBytes(idx), valueJsonOperand(ref)) == .eq,
         .nested => |sv| ref == .text and std.mem.eql(u8, sv.rowBytes(idx), ref.text),
@@ -2201,7 +2211,7 @@ fn foldSetArms(allocator: std.mem.Allocator, comptime junction: Junction, arms: 
 pub fn evaluateInSetMask(allocator: std.mem.Allocator, view: ColumnView, values: []const Value, negate: bool, n: usize, mask: []bool) !void {
     if (n >= IN_SET_LOOKUP_MIN_ROWS) {
         switch (view.data) {
-            inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid => |col, tag| {
+            inline .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .decimal256, .uuid => |col, tag| {
                 return evalInNumericSet(allocator, @field(ValueTag, @tagName(tag)), view, col, values, negate, n, mask);
             },
             inline .varchar, .string, .char => |sv| if (values.len > IN_SET_LINEAR_MAX) return evalInTextHashSet(allocator, sv, view, values, negate, n, mask),
@@ -2416,6 +2426,9 @@ const Scalar = union(enum) {
     integer: i128,
     float: f64,
     decimal: ScaledInt,
+    /// A decimal256 value, or text read beside one: an i128 mantissa holds
+    /// neither.
+    wide: WideScaledInt,
     micros: i64,
     text: []const u8,
     uuid: u128,
@@ -2423,12 +2436,13 @@ const Scalar = union(enum) {
 
 /// `m × 10^-s`.
 const ScaledInt = scalar_fn_common.ScaledInt;
+const WideScaledInt = scalar_fn_common.ScaledIntOf(i256);
 
 pub const ComparisonKind = enum { number, temporal, text, uuid };
 
 pub fn comparisonKind(ty: types.Type) ComparisonKind {
     return switch (ty) {
-        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128 => .number,
+        .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .float, .double, .decimal64, .decimal128, .decimal256 => .number,
         .date, .datetime => .temporal,
         .varchar, .string, .char, .json, .nested, .bitmap => .text,
         .uuid => .uuid,
@@ -2465,6 +2479,7 @@ fn cellScalar(view: ColumnView, ty: types.Type, i: usize) Scalar {
         .double => |s| .{ .float = s[i] },
         .decimal64 => |s| .{ .decimal = .{ .m = s[i], .s = scale } },
         .decimal128 => |s| .{ .decimal = .{ .m = s[i], .s = scale } },
+        .decimal256 => |s| .{ .wide = .{ .m = s[i], .s = scale } },
         .date => |s| .{ .micros = @as(i64, s[i]) * std.time.us_per_day },
         .datetime => |s| .{ .micros = s[i] },
         .uuid => |s| .{ .uuid = s[i] },
@@ -2488,7 +2503,7 @@ fn valueJsonOperand(v: Value) ?json_binary.Operand {
         .int => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
         .bigint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
         .largeint => |x| .{ .number = .{ .exact = .{ .m = x, .s = 0 } } },
-        .decimal64, .decimal128, .date, .datetime, .uuid => null,
+        .decimal64, .decimal128, .decimal256, .date, .datetime, .uuid => null,
     };
 }
 
@@ -2502,7 +2517,7 @@ fn cellJsonOperand(view: ColumnView, ty: types.Type, i: usize) ?json_binary.Oper
         .boolean => |s| .{ .boolean = s[i] != 0 },
         .float => |s| .{ .number = .{ .double = s[i] } },
         .double => |s| .{ .number = .{ .double = s[i] } },
-        .date, .datetime, .uuid => null,
+        .date, .datetime, .uuid, .decimal256 => null,
         .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => switch (cellScalar(view, ty, i)) {
             .integer => |m| .{ .number = .{ .exact = .{ .m = m, .s = 0 } } },
             .decimal => |d| .{ .number = .{ .exact = d } },
@@ -2530,6 +2545,7 @@ fn valueScalar(v: Value, decimal_scale: u8) Scalar {
         .double => |x| .{ .float = x },
         .decimal64 => |m| .{ .decimal = .{ .m = m, .s = decimal_scale } },
         .decimal128 => |m| .{ .decimal = .{ .m = m, .s = decimal_scale } },
+        .decimal256 => |m| .{ .wide = .{ .m = m, .s = decimal_scale } },
         .date => |x| .{ .micros = @as(i64, x) * std.time.us_per_day },
         .datetime => |x| .{ .micros = x },
         .uuid => |x| .{ .uuid = x },
@@ -2551,7 +2567,7 @@ fn scalarOrder(a: Scalar, b: Scalar) ?std.math.Order {
         .text => |at| std.mem.order(u8, at, b.text),
         .micros => |am| if (b == .micros) std.math.order(am, b.micros) else null,
         .uuid => |au| if (b == .uuid) std.math.order(au, b.uuid) else null,
-        .integer, .float, .decimal => numberOrder(a, b),
+        .integer, .float, .decimal, .wide => numberOrder(a, b),
     };
 }
 
@@ -2559,6 +2575,7 @@ fn textOrder(text: []const u8, other: Scalar) ?std.math.Order {
     return switch (other) {
         .micros => |m| std.math.order((textMicros(text) orelse return null).micros, m),
         .integer, .float, .decimal => numberOrder(textNumber(text) orelse return null, other),
+        .wide => numberOrder(textNumberWide(text) orelse return null, other),
         .text, .uuid => null,
     };
 }
@@ -2570,17 +2587,20 @@ fn numberOrder(a: Scalar, b: Scalar) ?std.math.Order {
         if (std.math.isNan(af) or std.math.isNan(bf)) return null;
         return std.math.order(af, bf);
     }
-    const ad = scalarDecimal(a) orelse return null;
-    const bd = scalarDecimal(b) orelse return null;
-    if (ad.s == bd.s) return std.math.order(ad.m, bd.m);
-    if (ad.s < bd.s) return rescaledOrder(ad.m, bd.s - ad.s, bd.m);
-    return rescaledOrder(bd.m, ad.s - bd.s, ad.m).invert();
+    if (a == .wide or b == .wide) return scaledOrder(i256, scalarWide(a) orelse return null, scalarWide(b) orelse return null);
+    return scaledOrder(i128, scalarDecimal(a) orelse return null, scalarDecimal(b) orelse return null);
 }
 
-/// Order of `m × 10^shift` against `other`. A product past i128 lies beyond
+fn scaledOrder(comptime W: type, ad: scalar_fn_common.ScaledIntOf(W), bd: scalar_fn_common.ScaledIntOf(W)) std.math.Order {
+    if (ad.s == bd.s) return std.math.order(ad.m, bd.m);
+    if (ad.s < bd.s) return rescaledOrder(W, ad.m, bd.s - ad.s, bd.m);
+    return rescaledOrder(W, bd.m, ad.s - bd.s, ad.m).invert();
+}
+
+/// Order of `m × 10^shift` against `other`. A product past `W` lies beyond
 /// every value `other` can hold, so the sign of `m` alone decides.
-fn rescaledOrder(m: i128, shift: u8, other: i128) std.math.Order {
-    const scaled = mulPow10(m, shift) orelse return if (m > 0) .gt else .lt;
+fn rescaledOrder(comptime W: type, m: W, shift: u8, other: W) std.math.Order {
+    const scaled = mulPow10(W, m, shift) orelse return if (m > 0) .gt else .lt;
     return std.math.order(scaled, other);
 }
 
@@ -2589,6 +2609,7 @@ fn scalarF64(v: Scalar) ?f64 {
         .integer => |i| @floatFromInt(i),
         .float => |f| f,
         .decimal => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
+        .wide => |d| @as(f64, @floatFromInt(d.m)) / std.math.pow(f64, 10.0, @floatFromInt(d.s)),
         .micros, .text, .uuid => null,
     };
 }
@@ -2597,6 +2618,15 @@ fn scalarDecimal(v: Scalar) ?ScaledInt {
     return switch (v) {
         .integer => |i| .{ .m = i, .s = 0 },
         .decimal => |d| d,
+        .float, .wide, .micros, .text, .uuid => null,
+    };
+}
+
+fn scalarWide(v: Scalar) ?WideScaledInt {
+    return switch (v) {
+        .integer => |i| .{ .m = i, .s = 0 },
+        .decimal => |d| .{ .m = d.m, .s = d.s },
+        .wide => |d| d,
         .float, .micros, .text, .uuid => null,
     };
 }
@@ -2605,6 +2635,14 @@ fn scalarDecimal(v: Scalar) ?ScaledInt {
 fn textNumber(raw: []const u8) ?Scalar {
     return switch (scalar_fn_common.textNumber(raw) orelse return null) {
         .exact => |d| .{ .decimal = d },
+        .float => |f| .{ .float = f },
+    };
+}
+
+/// `textNumber` beside a decimal256, keeping up to 76 digits exact.
+fn textNumberWide(raw: []const u8) ?Scalar {
+    return switch (scalar_fn_common.textNumberOf(i256, raw) orelse return null) {
+        .exact => |d| .{ .wide = d },
         .float => |f| .{ .float = f },
     };
 }
@@ -2743,6 +2781,10 @@ fn sameRepresentationMask(left: ColumnView, right: ColumnView, op: PredicateOp, 
             const r = right.data.decimal128;
             for (0..n) |i| mask[i] = cmp(i128, l[i], r[i], op);
         },
+        .decimal256 => |l| {
+            const r = right.data.decimal256;
+            for (0..n) |i| mask[i] = cmp(i256, l[i], r[i], op);
+        },
         .uuid => |l| {
             const r = right.data.uuid;
             for (0..n) |i| mask[i] = cmp(u128, l[i], r[i], op);
@@ -2826,6 +2868,10 @@ pub fn evaluateMaskWithPred(view: ColumnView, p: Predicate, n: usize, mask: []bo
         .largeint => |s| cmpInto(i128, s[0..n], p.val.largeint, mask[0..n], op),
         .decimal64 => |s| cmpInto(i64, s[0..n], p.val.decimal64, mask[0..n], op),
         .decimal128 => |s| cmpInto(i128, s[0..n], p.val.decimal128, mask[0..n], op),
+        // No vector compare for i256: the plain loop.
+        .decimal256 => |s| for (s[0..n], mask[0..n]) |x, *m| {
+            m.* = cmp(i256, x, p.val.decimal256, op);
+        },
         .uuid => |s| cmpInto(u128, s[0..n], p.val.uuid, mask[0..n], op),
     }
     clearNullRows(view.nulls, mask[0..n]);
@@ -2933,7 +2979,7 @@ pub fn typeHasRange(t: types.Type) bool {
         .int, .bigint, .smallint, .tinyint, .largeint => true,
         .boolean, .date, .datetime => true,
         .decimal64, .decimal128 => true,
-        .varchar, .string, .char, .json, .nested, .bitmap, .uuid, .float, .double => false,
+        .varchar, .string, .char, .json, .nested, .bitmap, .uuid, .float, .double, .decimal256 => false,
     };
 }
 
@@ -2952,7 +2998,7 @@ pub fn valueToRangeI128(v: Value) ?i128 {
         .largeint => |x| x,
         .decimal64 => |x| x,
         .decimal128 => |x| x,
-        .text, .uuid, .float, .double => null,
+        .text, .uuid, .float, .double, .decimal256 => null,
     };
 }
 
@@ -3011,6 +3057,8 @@ pub fn statsOverlapPredicateBlankAware(s: storage.format.Stats, op: PredicateOp,
         .smallint => |x| x,
         .decimal64 => |x| x,
         .largeint, .decimal128 => |x| x,
+        // A decimal256 column carries no min/max (`typeHasRange`).
+        .decimal256 => return true,
         .uuid => |x| storage.format.encodeUnsignedU128(x),
         .text => |x| {
             const enc = storage.format.encodeStringPrefix(x);
@@ -3190,7 +3238,7 @@ test "evaluateInSetMask: set lookups agree with the per-row scan" {
     const list_lens = [_]usize{ 0, 1, 8, 9, 40, 300 };
     const row_counts = [_]usize{ 5, 31, 32, n };
 
-    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .uuid }) |tag| {
+    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .date, .datetime, .decimal64, .decimal128, .decimal256, .uuid }) |tag| {
         const T = @FieldType(Value, @tagName(tag));
         var col: [n]T = undefined;
         for (&col) |*c| c.* = @intCast(rand.intRangeAtMost(u8, 0, 60));
@@ -3208,7 +3256,7 @@ test "evaluateInSetMask: set lookups agree with the per-row scan" {
 
     // Literal ranges at the type's extremes, inside and past the bitmap's
     // span: a value below the smallest literal must not wrap into it.
-    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .datetime, .decimal128, .uuid }) |tag| {
+    inline for (.{ .int, .bigint, .smallint, .tinyint, .largeint, .datetime, .decimal128, .decimal256, .uuid }) |tag| {
         const T = @FieldType(Value, @tagName(tag));
         const lo = std.math.minInt(T);
         const hi = std.math.maxInt(T);

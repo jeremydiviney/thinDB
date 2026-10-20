@@ -477,3 +477,102 @@ test "decimal: grouped SUM/AVG/MIN/MAX scale correctly" {
     try std.testing.expectApproxEqAbs(@as(f64, 2.333333), av[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f64, 15.0), av[1], 1e-9);
 }
+
+const NINES_76 = "9" ** 76;
+const DIGITS_76 = "1234567890" ** 7 ++ "123456";
+
+fn expectOverflow(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    try std.testing.expectError(error.ArithmeticOverflow, q.next());
+}
+
+test "decimal: DECIMAL past 38 digits keeps every digit through the WAL and segments" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true, .auto_flush_secs = 0 });
+        defer db.close();
+        try helpers.exec(allocator, db, "CREATE TABLE w (id INT PRIMARY KEY, a DECIMAL(50,15), b DECIMAL(76,0), c DECIMAL256(40,10) DEFAULT 1.5)");
+        try helpers.exec(allocator, db, "INSERT INTO w (id, a, b) VALUES (1, 12345678901234567890123456789012345.123456789012345, " ++ DIGITS_76 ++ ")");
+        const t = try db.openTable("w", .{});
+        try t.flush();
+        // Left in the memtable, so the reopen replays it from the WAL.
+        try helpers.exec(allocator, db, "INSERT INTO w VALUES (2, -0.000000000000001, -" ++ NINES_76 ++ ", NULL)");
+    }
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .wal_enabled = true });
+    defer db.close();
+    try helpers.expectTexts(allocator, db, "SELECT a FROM w ORDER BY id", &.{ "12345678901234567890123456789012345.123456789012345", "-0.000000000000001" });
+    try helpers.expectTexts(allocator, db, "SELECT b FROM w ORDER BY id", &.{ DIGITS_76, "-" ++ NINES_76 });
+    try helpers.expectTexts(allocator, db, "SELECT c FROM w ORDER BY id", &.{ "1.5000000000", null });
+    try helpers.expectText(allocator, db, "SELECT typeof(a) FROM w WHERE id = 1", "decimal256(50, 15)");
+}
+
+test "decimal: SUM, MIN, MAX, DISTINCT, GROUP BY and window SUM over DECIMAL256" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE s (id INT PRIMARY KEY, g INT, v DECIMAL(76,0), f DECIMAL(40,10))");
+    try helpers.exec(allocator, db, "INSERT INTO s VALUES (1, 1, " ++ NINES_76 ++ ", 1.5), (2, 1, " ++ NINES_76 ++ ", 2.25), (3, 2, -5, NULL), (4, 2, NULL, 1.5)");
+    try helpers.exec(allocator, db, "INSERT INTO s VALUES (5, 3, " ++ NINES_76 ++ ", NULL), (6, 3, " ++ NINES_76 ++ ", NULL), (7, 3, " ++ NINES_76 ++ ", NULL), (8, 3, " ++ NINES_76 ++ ", NULL), (9, 3, " ++ NINES_76 ++ ", NULL), (10, 3, " ++ NINES_76 ++ ", NULL)");
+    const t = try db.openTable("s", .{});
+    try t.flush();
+
+    // A SUM holds what its i256 holds, past DECIMAL(76)'s digits, as a
+    // DECIMAL128 SUM holds its i128; six 76-digit nines pass even that.
+    try helpers.expectText(allocator, db, "SELECT SUM(v) FROM s WHERE g = 1", "1" ++ "9" ** 75 ++ "8");
+    try helpers.expectTexts(allocator, db, "SELECT SUM(v) FROM s WHERE g < 3 GROUP BY g ORDER BY g", &.{ "1" ++ "9" ** 75 ++ "8", "-5" });
+    try expectOverflow(allocator, db, "SELECT SUM(v) FROM s WHERE g = 3");
+    try helpers.expectText(allocator, db, "SELECT MIN(v) FROM s", "-5");
+    try helpers.expectText(allocator, db, "SELECT MAX(v) FROM s", NINES_76);
+    try helpers.expectText(allocator, db, "SELECT SUM(DISTINCT v) FROM s", "9" ** 75 ++ "4");
+    try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT v) FROM s", "2");
+    try helpers.expectText(allocator, db, "SELECT SUM(f) FROM s", "5.2500000000");
+
+    var q = try runSql(allocator, db, "SELECT AVG(f) FROM s");
+    defer q.deinit();
+    const av = try collectDouble(allocator, &q, 0);
+    defer allocator.free(av);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.75), av[0], 1e-12);
+
+    try helpers.expectTexts(allocator, db, "SELECT v FROM s GROUP BY v ORDER BY v", &.{ null, "-5", NINES_76 });
+    try helpers.expectTexts(
+        allocator,
+        db,
+        "SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM s WHERE g < 3 ORDER BY id",
+        &.{ NINES_76, "1" ++ "9" ** 75 ++ "8", "9" ** 75 ++ "4", "-5" },
+    );
+}
+
+test "decimal: 76-digit literals compare, compute and print exactly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE l (id INT PRIMARY KEY, v DECIMAL(76,0), f DECIMAL(40,10))");
+    try helpers.exec(allocator, db, "INSERT INTO l VALUES (1, " ++ DIGITS_76 ++ ", 1.5), (2, -" ++ NINES_76 ++ ", NULL), (3, 7, 2.25)");
+
+    try helpers.expectTexts(allocator, db, "SELECT id FROM l WHERE v IN (" ++ DIGITS_76 ++ ", -" ++ NINES_76 ++ ") ORDER BY id", &.{ "1", "2" });
+    try helpers.expectTexts(allocator, db, "SELECT id FROM l WHERE v = " ++ DIGITS_76, &.{"1"});
+    try helpers.expectTexts(allocator, db, "SELECT id FROM l WHERE v < 8 ORDER BY id", &.{ "2", "3" });
+    try helpers.expectText(allocator, db, "SELECT typeof(" ++ DIGITS_76 ++ ")", "decimal256(76, 0)");
+    try helpers.expectText(allocator, db, "SELECT typeof(" ++ DIGITS_76 ++ "7)", "double");
+    try helpers.expectText(allocator, db, "SELECT f * 2 + 1 FROM l WHERE id = 1", "4.0000000000");
+    try helpers.expectText(allocator, db, "SELECT v - 7 FROM l WHERE id = 3", "0");
+    // A product past its DECIMAL(76) is an overflow error, as at 38 digits.
+    try expectOverflow(allocator, db, "SELECT v * 10 FROM l WHERE id = 1");
+    try helpers.expectText(allocator, db, "SELECT [12345678901234567890123456789012345678901234567890123456.12345678901234567890]", "[12345678901234567890123456789012345678901234567890123456.12345678901234567890]");
+    try helpers.expectTexts(allocator, db, "SELECT v FROM l ORDER BY v DESC", &.{ DIGITS_76, "7", "-" ++ NINES_76 });
+
+    try helpers.exec(allocator, db, "CREATE TABLE r (v DECIMAL(76,0) PRIMARY KEY, tag VARCHAR(8))");
+    try helpers.exec(allocator, db, "INSERT INTO r VALUES (" ++ DIGITS_76 ++ ", 'big'), (7, 'seven'), (8, 'eight')");
+    const r = try db.openTable("r", .{});
+    try r.flush();
+    try helpers.expectTexts(allocator, db, "SELECT r.tag FROM l JOIN r ON l.v = r.v ORDER BY l.id", &.{ "big", "seven" });
+    try helpers.expectTexts(allocator, db, "SELECT tag FROM r WHERE v = " ++ DIGITS_76, &.{"big"});
+}

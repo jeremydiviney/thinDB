@@ -523,7 +523,7 @@ pub fn truthPredicate(p: anytype, operand: ir.Expr) @TypeOf(p.*).Err!PredicateEx
 fn literalTruth(v: Value) ?PredicateExpr {
     return switch (v) {
         .boolean => |b| .{ .always = b },
-        inline .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128 => |x| .{ .always = x != 0 },
+        inline .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128, .decimal256 => |x| .{ .always = x != 0 },
         .text => |s| if (scalar_fn_common.textBoolean(s)) |b| .{ .always = b } else .unknown,
         .date, .datetime, .uuid => null,
     };
@@ -738,7 +738,7 @@ fn parseColOps(p: anytype, col_dup: []const u8) @TypeOf(p.*).Err!PredicateExpr {
             if (p.cur.tag == .kw_null) {
                 try p.advance();
                 saw_value = true;
-            } else if (p.cur.isHexLiteral() or try inexactFractionAhead(p) or !try literalLedAhead(p)) {
+            } else if (p.cur.isHexLiteral() or try inexactFractionAhead(p) or try wideIntegerAhead(p) or !try literalLedAhead(p)) {
                 try expr_entries.append(p.arena, try makeComparisonExprPredicate(p, col_dup, .eq, try p.parseScalar()));
                 saw_value = true;
             } else {
@@ -1171,6 +1171,16 @@ pub fn inexactFractionAhead(p: anytype) @TypeOf(p.*).Err!bool {
     return tok.tag == .floating and !exec_expr.fractionFitsDouble(tok.text, tok.value.floating);
 }
 
+/// Whether the value at the cursor is a signed or unsigned integer literal
+/// past LARGEINT, whose digits only a DECIMAL holds exactly.
+pub fn wideIntegerAhead(p: anytype) @TypeOf(p.*).Err!bool {
+    const tok = try unsignedTokenAhead(p);
+    if (tok.tag != .big_integer) return false;
+    const magnitude = std.fmt.parseInt(u128, tok.value.big_integer, 10) catch return true;
+    if (p.cur.tag == .minus) return magnitude > @as(u128, 1) << 127;
+    return magnitude > std.math.maxInt(i128);
+}
+
 /// `col LIKE <expression>`: the `like` scalar reads the pattern per row with
 /// backslash as its escape, so only that ESCAPE character is accepted here.
 fn makeLikeCallPredicate(p: anytype, col: []const u8, pattern: ir.Expr, escape: ?[]const u8) @TypeOf(p.*).Err!PredicateExpr {
@@ -1344,7 +1354,7 @@ fn hexResolved(p: anytype, lhs: ir.Expr, rhs: ir.Expr) @TypeOf(p.*).Err![2]ir.Ex
 
 fn isNumberValue(v: Value) bool {
     return switch (v) {
-        .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128, .boolean => true,
+        .int, .bigint, .tinyint, .smallint, .largeint, .float, .double, .decimal64, .decimal128, .decimal256, .boolean => true,
         .text, .date, .datetime, .uuid => false,
     };
 }

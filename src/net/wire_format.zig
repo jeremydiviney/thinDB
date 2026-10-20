@@ -35,25 +35,28 @@ pub fn formatUuid(buf: []u8, v: u128) ![]const u8 {
     });
 }
 
-/// Decimal width is unbounded (i128 whole part + scale), so it lands into
-/// a caller-owned ArrayList rather than a fixed buffer.
-pub fn formatDecimal(allocator: Allocator, out: *std.ArrayList(u8), v: i128, t: types.Type) !void {
+/// Decimal width is unbounded (whole part + scale), so it lands into a
+/// caller-owned ArrayList rather than a fixed buffer. `v` is a decimal
+/// mantissa of any width up to i256; one up to i128 formats in u128.
+pub fn formatDecimal(allocator: Allocator, out: *std.ArrayList(u8), v: anytype, t: types.Type) !void {
     const spec = t.decimalSpec() orelse return;
-    var num_buf: [64]u8 = undefined;
+    const T = @TypeOf(v);
+    const U = if (T != comptime_int and @bitSizeOf(T) > 128) u256 else u128;
+    var num_buf: [80]u8 = undefined;
     if (spec.s == 0) {
         try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{v}));
         return;
     }
     const negative = v < 0;
-    const abs: u128 = if (negative) @intCast(-@as(i128, v)) else @intCast(v);
-    var divisor: u128 = 1;
+    const abs: U = @abs(v);
+    var divisor: U = 1;
     var i: usize = 0;
     while (i < spec.s) : (i += 1) divisor *= 10;
     const whole = abs / divisor;
     const frac = abs % divisor;
     if (negative) try out.append(allocator, '-');
     try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}.", .{whole}));
-    var pad_buf: [40]u8 = undefined;
+    var pad_buf: [80]u8 = undefined;
     const written = std.fmt.bufPrint(&pad_buf, "{d}", .{frac}) catch unreachable;
     var pad: usize = 0;
     while (pad + written.len < spec.s) : (pad += 1) try out.append(allocator, '0');

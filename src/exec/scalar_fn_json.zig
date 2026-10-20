@@ -570,7 +570,7 @@ fn appendSqlValue(aa: Allocator, out: *std.ArrayList(u8), t: Type, arg: ColumnVi
         defer if (norm.owned) aa.free(norm.bytes);
         return out.appendSlice(aa, norm.bytes);
     }
-    var buf: [64]u8 = undefined;
+    var buf: [dec.DECIMAL_TEXT_MAX]u8 = undefined;
     switch (arg.data) {
         .varchar, .string, .char, .json => |sv| try jb.appendString(aa, out, sv.rowBytes(row)),
         .nested => |sv| {
@@ -594,7 +594,7 @@ fn appendSqlValue(aa: Allocator, out: *std.ArrayList(u8), t: Type, arg: ColumnVi
             const x: f64 = s[row];
             if (std.math.isFinite(x)) try jb.appendDouble(aa, out, x) else try jb.appendNull(aa, out);
         },
-        inline .decimal64, .decimal128 => |s| {
+        inline .decimal64, .decimal128, .decimal256 => |s| {
             const scale: u8 = if (t.decimalSpec()) |spec| spec.s else 0;
             try jb.appendNumber(aa, out, .decimal, dec.formatDecimal(&buf, s[row], scale));
         },

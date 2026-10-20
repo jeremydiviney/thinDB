@@ -513,6 +513,7 @@ pub fn viewValueAt(aa: Allocator, view: storage.ColumnView, row: u32) !?types.Va
         .largeint => |s| .{ .largeint = s[row] },
         .decimal64 => |s| .{ .decimal64 = s[row] },
         .decimal128 => |s| .{ .decimal128 = s[row] },
+        .decimal256 => |s| .{ .decimal256 = s[row] },
         .uuid => |s| .{ .uuid = s[row] },
     };
 }

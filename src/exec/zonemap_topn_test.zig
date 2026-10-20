@@ -64,6 +64,7 @@ fn cellOf(arena: std.mem.Allocator, v: ColumnView, row: usize) !Cell {
         .datetime => |s| .{ .int = s[row] },
         .decimal64 => |s| .{ .int = s[row] },
         .decimal128 => |s| .{ .int = s[row] },
+        .decimal256 => |s| .{ .int = @intCast(s[row]) },
         .uuid => |s| .{ .int = @bitCast(s[row]) },
         .float => |s| .{ .flt = @as(u64, @bitCast(@as(f64, s[row]))) },
         .double => |s| .{ .flt = @bitCast(s[row]) },

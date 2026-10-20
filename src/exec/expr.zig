@@ -402,10 +402,11 @@ pub fn exactLiteralValue(e: Expr) ?Value {
 }
 
 /// Whether a fractional literal token (`text`, lexed as `value`) keeps its
-/// value as a DOUBLE: an exponent form or one past 38 digits is a DOUBLE
-/// literal, and a plain decimal one is when the double holds its digits.
+/// value as a DOUBLE: an exponent form or one past DECIMAL's 76 digits is a
+/// DOUBLE literal, and a plain decimal one is when the double holds its
+/// digits.
 pub fn fractionFitsDouble(text: []const u8, value: f64) bool {
-    if (std.mem.indexOfScalar(u8, text, '.') == null or std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > 38) return true;
+    if (std.mem.indexOfScalar(u8, text, '.') == null or std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > types.max_decimal_precision) return true;
     return doubleHoldsDigits(text, value);
 }
 

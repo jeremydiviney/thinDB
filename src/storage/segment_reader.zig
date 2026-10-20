@@ -651,6 +651,7 @@ fn decodeRawColumn(
         .bitmap => return .{ .data = .{ .bitmap = try decodeStringRaw(allocator, values, row_count) }, .nulls = nulls },
         .decimal64 => return .{ .data = .{ .decimal64 = try decodeFixed(i64, allocator, values, row_count) }, .nulls = nulls },
         .decimal128 => return .{ .data = .{ .decimal128 = try decodeFixed(i128, allocator, values, row_count) }, .nulls = nulls },
+        .decimal256 => return .{ .data = .{ .decimal256 = try decodeFixed(i256, allocator, values, row_count) }, .nulls = nulls },
         .uuid => return .{ .data = .{ .uuid = try decodeFixed(u128, allocator, values, row_count) }, .nulls = nulls },
     }
 }
@@ -1092,6 +1093,7 @@ pub fn viewRawColumn(
         .largeint => return fixedView(i128, values, row_count, nulls, .largeint),
         .decimal64 => return fixedView(i64, values, row_count, nulls, .decimal64),
         .decimal128 => return fixedView(i128, values, row_count, nulls, .decimal128),
+        .decimal256 => return fixedView(i256, values, row_count, nulls, .decimal256),
         .uuid => return fixedView(u128, values, row_count, nulls, .uuid),
         .varchar => return stringView(values, row_count, nulls, .varchar),
         .string => return stringView(values, row_count, nulls, .string),

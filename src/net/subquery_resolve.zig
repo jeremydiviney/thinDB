@@ -694,9 +694,10 @@ const TypedValue = struct {
 /// The value as a predicate literal. A decimal travels as its exact digits:
 /// validation parses numeric text onto the compared column's own scale.
 fn comparableValue(arena: Allocator, tv: TypedValue) !Value {
-    const mantissa: i128 = switch (tv.val) {
+    const mantissa: i256 = switch (tv.val) {
         .decimal64 => |m| m,
         .decimal128 => |m| m,
+        .decimal256 => |m| m,
         else => return tv.val,
     };
     var text: std.ArrayList(u8) = .empty;
@@ -748,9 +749,10 @@ pub fn evaluateSetValue(ctx: *CompileCtx, value: *ir.Expr) !?SessionVar {
         .null_of => return null,
     };
     const spec = tv.ty.decimalSpec() orelse return .{ .value = tv.val, .type = tv.ty };
-    const mantissa: i128 = switch (tv.val) {
+    const mantissa: i256 = switch (tv.val) {
         .decimal64 => |m| m,
         .decimal128 => |m| m,
+        .decimal256 => |m| m,
         else => return Error.TypeMismatch,
     };
     return .{ .value = .{ .double = scalar_decimal.mantissaToDouble(mantissa, spec.s) }, .type = .double };
@@ -810,6 +812,7 @@ fn extractScalarValue(allocator: Allocator, view: storage.ColumnView) !Value {
         .datetime => |s| .{ .datetime = s[0] },
         .decimal64 => |s| .{ .decimal64 = s[0] },
         .decimal128 => |s| .{ .decimal128 = s[0] },
+        .decimal256 => |s| .{ .decimal256 = s[0] },
         .uuid => |s| .{ .uuid = s[0] },
         .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
         .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(0)) },
@@ -840,6 +843,7 @@ fn extractScalarValueAt(allocator: Allocator, view: storage.ColumnView, idx: usi
         .datetime => |s| .{ .datetime = s[idx] },
         .decimal64 => |s| .{ .decimal64 = s[idx] },
         .decimal128 => |s| .{ .decimal128 = s[idx] },
+        .decimal256 => |s| .{ .decimal256 = s[idx] },
         .uuid => |s| .{ .uuid = s[idx] },
         .varchar => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },
         .string => |sv| .{ .text = try allocator.dupe(u8, sv.rowBytes(idx)) },

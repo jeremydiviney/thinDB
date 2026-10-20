@@ -1327,6 +1327,15 @@ fn writeRawColumnBlock(
                 buf.appendSliceAssumeCapacity(&b);
             }
         },
+        .decimal256 => |data| {
+            const slice = data[row_start..row_end];
+            try buf.ensureUnusedCapacity(allocator, slice.len * 32);
+            for (slice) |v| {
+                var b: [32]u8 = undefined;
+                std.mem.writeInt(i256, &b, v, .little);
+                buf.appendSliceAssumeCapacity(&b);
+            }
+        },
         .uuid => |data| {
             const slice = data[row_start..row_end];
             try buf.ensureUnusedCapacity(allocator, slice.len * 16);
@@ -1347,6 +1356,9 @@ fn computeStats(view: ColumnView, row_start: usize, row_end: usize) format.Stats
         .tinyint => |d| extentInt(i8, view, d, row_start, row_end),
         .smallint => |d| extentInt(i16, view, d, row_start, row_end),
         .largeint, .decimal128 => |d| extentInt(i128, view, d, row_start, row_end),
+        // No min/max for i256 values (`format.typeHasStats`): the full i128
+        // range never excludes the block, and the null count stays exact.
+        .decimal256 => .{ .min = std.math.minInt(i128), .max = std.math.maxInt(i128), .null_count = nullCount(view, row_start, row_end) },
         .uuid => |d| blk: {
             // u128 → i128 via top-bit XOR so signed compare preserves unsigned
             // ordering. See `format.encodeUnsignedU128`.
@@ -1428,6 +1440,14 @@ fn extentInt(comptime T: type, view: ColumnView, data: []const T, row_start: usi
         if (with_sum) sum += v;
     }
     return .{ .min = @intCast(lo), .max = @intCast(hi), .sum = sum, .null_count = nulls };
+}
+
+fn nullCount(view: ColumnView, row_start: usize, row_end: usize) u64 {
+    var nulls: u64 = 0;
+    for (row_start..row_end) |r| {
+        if (!view.isValid(r)) nulls += 1;
+    }
+    return nulls;
 }
 
 fn computeStringStats(view: ColumnView, sv: StringView, row_start: usize, row_end: usize) format.Stats {

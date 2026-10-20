@@ -237,7 +237,7 @@ fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: Column
         .uuid => |s| try appendBigEndian(allocator, key, s[row]),
         // Dates, datetimes and decimals are signed integers too: with the sign
         // bit flipped, big-endian bytes sort like the values.
-        inline .int, .bigint, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128 => |s| {
+        inline .int, .bigint, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |s| {
             const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
             const bits: Bits = @bitCast(s[row]);
             try appendBigEndian(allocator, key, bits ^ (@as(Bits, 1) << (@bitSizeOf(Bits) - 1)));
@@ -1112,8 +1112,8 @@ fn appendStarRocksTypeName(allocator: Allocator, out: *std.ArrayList(u8), t: Typ
     switch (t) {
         .varchar, .string => try out.appendSlice(allocator, "varchar"),
         .char => try out.appendSlice(allocator, "char"),
-        .decimal64, .decimal128 => |spec| {
-            const width: u8 = if (spec.p <= 9) 32 else if (spec.p <= 18) 64 else 128;
+        .decimal64, .decimal128, .decimal256 => |spec| {
+            const width: u16 = if (spec.p <= 9) 32 else if (spec.p <= 18) 64 else if (spec.p <= 38) 128 else 256;
             try out.print(allocator, "decimal{d}({d}, {d})", .{ width, spec.p, spec.s });
         },
         .nested => |n| switch (n.*) {

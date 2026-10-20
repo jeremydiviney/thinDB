@@ -716,6 +716,9 @@ pub fn appendBinaryCell(
         .decimal128 => |s| {
             try wire_format.formatDecimal(allocator, out, s[row], col.type);
         },
+        .decimal256 => |s| {
+            try wire_format.formatDecimal(allocator, out, s[row], col.type);
+        },
         .varchar, .char, .string, .json, .nested, .bitmap => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
     }
 }

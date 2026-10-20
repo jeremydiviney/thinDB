@@ -414,24 +414,49 @@ fn scanMoment(s: []const u8) ?Moment {
 pub const TEXT_SPACE = " \t\r\n";
 
 /// A decimal value: mantissa `m` at scale `s`, i.e. m / 10^s.
-pub const ScaledInt = struct { m: i128, s: u8 };
+pub const ScaledInt = ScaledIntOf(i128);
+
+/// A decimal value with a mantissa of type `W` (i128, or i256 for the
+/// widest DECIMALs).
+pub fn ScaledIntOf(comptime W: type) type {
+    return struct { m: W, s: u8 };
+}
+
+/// The digits every value of mantissa type `W` holds: 38 in an i128, 76
+/// in an i256.
+pub fn decimalDigitsOf(comptime W: type) u8 {
+    return switch (W) {
+        i128 => types.max_decimal128_precision,
+        i256 => types.max_decimal_precision,
+        else => @compileError("a decimal mantissa is an i128 or an i256"),
+    };
+}
 
 /// A number read from text: exact when it is plain decimal digits a DECIMAL
 /// holds, a double otherwise.
-pub const TextNumber = union(enum) {
-    exact: ScaledInt,
-    float: f64,
-};
+pub const TextNumber = TextNumberOf(i128);
+
+pub fn TextNumberOf(comptime W: type) type {
+    return union(enum) {
+        exact: ScaledIntOf(W),
+        float: f64,
+    };
+}
 
 /// Text read as a number, the way StarRocks casts it: surrounding spaces
 /// ignored, plain decimal digits kept exact, an exponent form read as a
 /// double; anything else is not a number.
 pub fn textNumber(raw: []const u8) ?TextNumber {
+    return textNumberOf(i128, raw);
+}
+
+/// `textNumber` keeping up to `decimalDigitsOf(W)` digits exact.
+pub fn textNumberOf(comptime W: type, raw: []const u8) ?TextNumberOf(W) {
     const text = std.mem.trim(u8, raw, TEXT_SPACE);
     var i: usize = 0;
     const negative = i < text.len and text[i] == '-';
     if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
-    var m: i128 = 0;
+    var m: W = 0;
     var digits: usize = 0;
     var scale: u8 = 0;
     var seen_point = false;
@@ -442,7 +467,7 @@ pub fn textNumber(raw: []const u8) ?TextNumber {
             seen_point = true;
         } else if (c >= '0' and c <= '9') {
             digits += 1;
-            if (digits > 38) {
+            if (digits > decimalDigitsOf(W)) {
                 exact = false;
                 continue;
             }
@@ -460,31 +485,35 @@ pub fn textNumber(raw: []const u8) ?TextNumber {
     return if (std.math.isFinite(f)) .{ .float = f } else null;
 }
 
-/// 10^38: every DECIMAL value's magnitude is below it.
-const DECIMAL_LIMIT: u128 = std.math.powi(u128, 10, 38) catch unreachable;
-
 /// A double as the decimal it prints as: the shortest digits that read back
 /// as the same double. MySQL converts a DOUBLE to a DECIMAL through these
 /// digits, so `1.005e0` is 1.005 rather than the binary value just below
 /// it. Null when it isn't finite or needs more than 38 digits before the
 /// point; digits past scale 38 round away.
 pub fn floatDigits(x: f64) ?ScaledInt {
+    return floatDigitsOf(i128, x);
+}
+
+/// `floatDigits` within `decimalDigitsOf(W)` digits.
+pub fn floatDigitsOf(comptime W: type, x: f64) ?ScaledIntOf(W) {
     if (!std.math.isFinite(x)) return null;
+    const limit = comptime decimalDigitsOf(W);
+    const ceiling = comptime std.math.powi(W, 10, limit) catch unreachable;
     const float_fmt = std.fmt.float;
     const d = float_fmt.binaryToDecimal(u64, @bitCast(x), std.math.floatMantissaBits(f64), std.math.floatExponentBits(f64), false, &float_fmt.Backend64_TablesFull);
-    const m: i128 = if (d.sign) -@as(i128, d.mantissa) else d.mantissa;
+    const m: W = if (d.sign) -@as(W, d.mantissa) else d.mantissa;
     if (d.exponent >= 0) {
-        const unit = std.math.powi(i128, 10, @intCast(d.exponent)) catch return null;
-        const whole = std.math.mul(i128, m, unit) catch return null;
-        if (@abs(whole) >= DECIMAL_LIMIT) return null;
+        const unit = std.math.powi(W, 10, @intCast(d.exponent)) catch return null;
+        const whole = std.math.mul(W, m, unit) catch return null;
+        if (@abs(whole) >= ceiling) return null;
         return .{ .m = whole, .s = 0 };
     }
     const s: u32 = @intCast(-d.exponent);
-    if (s <= 38) return .{ .m = m, .s = @intCast(s) };
-    const unit = std.math.powi(i128, 10, s - 38) catch return .{ .m = 0, .s = 38 };
+    if (s <= limit) return .{ .m = m, .s = @intCast(s) };
+    const unit = std.math.powi(W, 10, s - limit) catch return .{ .m = 0, .s = limit };
     const q = @divTrunc(m, unit);
     const rounds_away = @abs(@rem(m, unit)) * 2 >= @abs(unit);
-    return .{ .m = if (!rounds_away) q else if (m < 0) q - 1 else q + 1, .s = 38 };
+    return .{ .m = if (!rounds_away) q else if (m < 0) q - 1 else q + 1, .s = limit };
 }
 
 /// The longest text `floatText` writes: a sign, `0.`, 14 zeros and 17 digits.

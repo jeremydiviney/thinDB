@@ -1724,7 +1724,7 @@ pub fn schemaFingerprint(schema: TableSchema) u64 {
                 std.mem.writeInt(u32, &b, n, .little);
                 hasher.update(&b);
             },
-            .decimal64, .decimal128 => |spec| {
+            .decimal64, .decimal128, .decimal256 => |spec| {
                 hasher.update(&[_]u8{ spec.p, spec.s });
             },
             else => {},

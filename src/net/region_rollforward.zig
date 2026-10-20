@@ -1498,6 +1498,7 @@ fn hashValue(h: *std.hash.Wyhash, v: Value) void {
         .text => |s| hstr(h, s),
         .largeint => |x| h.update(std.mem.asBytes(&x)),
         .decimal128 => |x| h.update(std.mem.asBytes(&x)),
+        .decimal256 => |x| h.update(std.mem.asBytes(&x)),
         .uuid => |x| h.update(std.mem.asBytes(&x)),
     }
 }

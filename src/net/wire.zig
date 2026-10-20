@@ -545,6 +545,7 @@ pub fn typeExtra(t: Type) u32 {
         .char => |n| n,
         .decimal64 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
         .decimal128 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
+        .decimal256 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
         else => 0,
     };
 }
@@ -569,6 +570,7 @@ fn encodeColumnData(
         .largeint => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .decimal64 => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .decimal128 => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
+        .decimal256 => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .uuid => |s| try writeFixedBytes(allocator, out, std.mem.sliceAsBytes(s[0..row_count])),
         .varchar => |sv| try writeStringColumn(allocator, out, sv, row_count),
         .string => |sv| try writeStringColumn(allocator, out, sv, row_count),
@@ -732,6 +734,7 @@ pub const OwnedColumnBuffers = struct {
             .largeint => .{ .largeint = std.mem.bytesAsSlice(i128, self.data)[0..n] },
             .decimal64 => .{ .decimal64 = std.mem.bytesAsSlice(i64, self.data)[0..n] },
             .decimal128 => .{ .decimal128 = std.mem.bytesAsSlice(i128, self.data)[0..n] },
+            .decimal256 => .{ .decimal256 = std.mem.bytesAsSlice(i256, self.data)[0..n] },
             .uuid => .{ .uuid = std.mem.bytesAsSlice(u128, self.data)[0..n] },
             .varchar => .{ .varchar = .{ .offsets = self.offsets.?, .bytes = self.data } },
             .string => .{ .string = .{ .offsets = self.offsets.?, .bytes = self.data } },
@@ -788,9 +791,7 @@ fn allocAlignedDup(allocator: Allocator, src: []const u8) ![]align(16) u8 {
 }
 
 pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
-    // The native wire doesn't carry a nested shape yet.
-    if (tag == @intFromEnum(TypeTag.nested) or tag > @intFromEnum(TypeTag.bitmap)) return Error.WireUnknownType;
-    const tt: TypeTag = @enumFromInt(tag);
+    const tt = std.enums.fromInt(TypeTag, tag) orelse return Error.WireUnknownType;
     return switch (tt) {
         .int => .int,
         .bigint => .bigint,
@@ -813,8 +814,13 @@ pub fn typeFromTagAndExtra(tag: u8, extra: u32) !Type {
             .p = @intCast((extra >> 8) & 0xFF),
             .s = @intCast(extra & 0xFF),
         } },
+        .decimal256 => .{ .decimal256 = .{
+            .p = @intCast((extra >> 8) & 0xFF),
+            .s = @intCast(extra & 0xFF),
+        } },
         .uuid => .uuid,
         .json => .json,
+        // The native wire doesn't carry a nested shape yet.
         .nested => Error.WireUnknownType,
         .bitmap => .bitmap,
     };

@@ -54,7 +54,7 @@ const COMPACT_MIN_SLACK: usize = 1 << 20;
 pub fn scatterColumn(alloc: Allocator, store: *ColumnStore, v: ColumnView, rows: []const u32) !void {
     const base = store.rowCount();
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |s, tag| {
             const l = &@field(store.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, rows.len);
             for (rows) |r| l.appendAssumeCapacity(s[r]);
@@ -126,7 +126,7 @@ fn runsDominate(rows: []const u32) bool {
 pub fn gatherColumn(alloc: Allocator, dst: *ColumnStore, srcs: []const ColumnView, refs: []const u32) !void {
     const base = dst.rowCount();
     switch (dst.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |*l, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |*l, tag| {
             try l.ensureUnusedCapacity(alloc, refs.len);
             for (refs) |r| {
                 l.appendAssumeCapacity(@field(srcs[r >> REF_ROW_BITS].data, @tagName(tag))[r & REF_ROW_MASK]);
@@ -183,7 +183,7 @@ pub const appendViewRange = store_mod.appendViewRange;
 pub fn appendRowValue(alloc: Allocator, dst: *ColumnStore, v: ColumnView, i: usize) !void {
     if (!v.isValid(i)) return dst.appendNulls(alloc, 1);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |s, tag| {
             try @field(dst.data, @tagName(tag)).append(alloc, s[i]);
         },
         .varchar, .string, .char, .json, .nested, .bitmap => |s| switch (dst.data) {
@@ -202,7 +202,7 @@ const NO_MATCH: u32 = std.math.maxInt(u32);
 fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: []const u32) !void {
     const base = dst.rowCount();
     switch (src.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |vals, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |vals, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, ords.len);
             for (ords) |o| l.appendAssumeCapacity(if (o == NO_MATCH) 0 else vals[o]);
@@ -228,7 +228,7 @@ fn gatherColumnOpt(alloc: Allocator, dst: *ColumnStore, src: ColumnView, ords: [
 fn appendRepeat(alloc: Allocator, dst: *ColumnStore, v: ColumnView, row: usize, count: usize) !void {
     if (!v.isValid(row)) return dst.appendNulls(alloc, count);
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |s, tag| {
             const l = &@field(dst.data, @tagName(tag));
             try l.ensureUnusedCapacity(alloc, count);
             l.appendNTimesAssumeCapacity(s[row], count);
@@ -296,7 +296,7 @@ fn routeKeyBytes(v: ColumnView, r: usize, wide: *i64) []const u8 {
             wide.* = s[r];
             break :blk std.mem.asBytes(wide);
         },
-        inline .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s| std.mem.asBytes(&s[r]),
+        inline .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |s| std.mem.asBytes(&s[r]),
     };
 }
 
@@ -3066,7 +3066,7 @@ pub const RegionWorker = struct {
 /// `sa` scratch — rows/8 bytes, ~1/64 of the data a full copy would move.
 fn sliceViewRange(sa: Allocator, v: ColumnView, lo: usize, hi: usize) !ColumnView {
     const data: @TypeOf(v.data) = switch (v.data) {
-        inline .int, .bigint, .boolean, .float, .double, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .uuid => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), s[lo..hi]),
+        inline .int, .bigint, .boolean, .float, .double, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256, .uuid => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), s[lo..hi]),
         inline .varchar, .string, .char, .json, .nested, .bitmap => |s, tag| @unionInit(@TypeOf(v.data), @tagName(tag), .{
             .offsets = s.offsets[lo .. hi + 1],
             .bytes = s.bytes,
@@ -3543,7 +3543,7 @@ pub const RegionPool = struct {
 /// Approximate retained capacity of one store (validity bitmap excluded).
 fn storeRetainedBytes(c: *const ColumnStore) usize {
     return switch (c.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |l| l.capacity * @sizeOf(std.meta.Child(@TypeOf(l.items))),
         .varchar, .string, .char, .json, .nested, .bitmap => |s| blk: {
             var n: usize = s.offsets.capacity * @sizeOf(u32) + s.bytes.capacity;
             if (s.wide_offsets) |w| n += w.capacity * @sizeOf(u64);
