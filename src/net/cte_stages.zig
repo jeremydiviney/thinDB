@@ -35,6 +35,7 @@ const join_mod = @import("../exec/join.zig");
 const cast = @import("../exec/cast.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const compute = @import("../exec/compute.zig");
+const expr_mod = @import("../exec/expr.zig");
 const udf = @import("../udf.zig");
 const api = @import("../api/api.zig");
 const recursive_cte = @import("recursive_cte.zig");
@@ -1987,7 +1988,8 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                 }
             }
-            const wq = try up.window(w.specs, w.calls, input.effectiveDop());
+            const typed = try typedLagLeadDefaults(input, &up, w.calls);
+            const wq = try up.window(w.specs, typed.calls, input.effectiveDop());
             // Window-chain pairing: when this window's IR chain reaches an
             // upstream window with the SAME partition set through
             // grouping-preserving ops, that window emits in its sorted
@@ -2054,7 +2056,17 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                 }
             }
-            return wq;
+            if (typed.added.len == 0) return wq;
+            var full = wq;
+            errdefer full.deinit();
+            var kept: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer kept.deinit(input.allocator);
+            for (full.outputSchema()) |col| {
+                for (typed.added) |a| {
+                    if (std.mem.eql(u8, a, col.name)) break;
+                } else try kept.append(input.allocator, col.name);
+            }
+            return try full.project(kept.items);
         },
         .join => |j| {
             // INNER picks its build side from realized stats at exec, so
@@ -2357,6 +2369,64 @@ pub fn castDerived(arena: std.mem.Allocator, col_name: []const u8, fn_name: []co
     const args = try arena.alloc(ir.Expr, 1);
     args[0] = .{ .col_ref = name };
     return .{ .name = name, .expr = .{ .call = .{ .fn_name = fn_name, .args = args } } };
+}
+
+const TypedWindowCalls = struct {
+    calls: []const ir.WindowCall,
+    /// The columns a Compute under the window added for `calls`, which the
+    /// window's output drops.
+    added: []const []const u8 = &.{},
+};
+
+/// LAG/LEAD with a default the window can't write as its value's type —
+/// text for a DATE (`LAG(d, 1, '2020-01-01')`), a number for text, a column
+/// of another type, an expression (`1 + 2 + 3`) — reads it as
+/// `CAST(default AS <value type>)`, as StarRocks does, from a column a
+/// Compute adds over `up`.
+fn typedLagLeadDefaults(input: engine_v2.CompileInput, up: *exec.Query, calls: []const ir.WindowCall) !TypedWindowCalls {
+    const arena = input.node_arena;
+    const schema = up.outputSchema();
+    var derived: std.ArrayList(ir.Derived) = .empty;
+    var typed: ?[]ir.WindowCall = null;
+    for (calls, 0..) |c, i| {
+        if ((c.func != .lag and c.func != .lead) or c.args.len < 3 or c.args[0] != .col_ref) continue;
+        const value = types.findColumn(schema, c.args[0].col_ref) orelse continue;
+        const ty = schema[value].type;
+        if (lagLeadDefaultFits(c.args[2], ty, schema)) continue;
+        const fn_name = try scalar_fn.castFnName(arena, ty) orelse continue;
+        const name = try std.fmt.allocPrint(arena, "__window_default_{d}", .{i});
+        try derived.append(arena, .{ .name = name, .expr = .{ .call = .{ .fn_name = fn_name, .args = try arena.dupe(ir.Expr, c.args[2..3]) } } });
+        const out = typed orelse try arena.dupe(ir.WindowCall, calls);
+        typed = out;
+        const args = try arena.dupe(ir.Expr, c.args);
+        args[2] = .{ .col_ref = name };
+        out[i].args = args;
+    }
+    const out = typed orelse return .{ .calls = calls };
+    up.* = try engine_v2.computeDerivedFused(input.allocator, up.*, derived.items, input.udf_registry);
+    const added = try arena.alloc([]const u8, derived.items.len);
+    for (added, derived.items) |*a, d| a.* = d.name;
+    return .{ .calls = out, .added = added };
+}
+
+/// Whether the window writes LAG/LEAD's `default` into a `ty` value column
+/// as it is: NULL, a column of that type, a number for a number, text for
+/// text.
+fn lagLeadDefaultFits(default: ir.Expr, ty: types.Type, schema: []const types.Column) bool {
+    const v = switch (default) {
+        .null_lit => return true,
+        .col_ref => |name| {
+            const i = types.findColumn(schema, name) orelse return true;
+            return std.meta.eql(schema[i].type, ty);
+        },
+        .lit => |lit| lit,
+        else => expr_mod.literalValue(default) orelse return false,
+    };
+    return switch (v) {
+        .text => ty.isString(),
+        .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128 => ty.isInteger() or ty.isFloat() or ty.isDecimal(),
+        else => false,
+    };
 }
 
 /// Ride-the-order eligibility: every spec of the (potential rider) window

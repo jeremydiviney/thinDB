@@ -1093,3 +1093,31 @@ test "window: COUNT, SUM and AVG of DISTINCT values over every frame shape" {
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT VAR_SAMP(DISTINCT v) OVER () FROM dw"));
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COUNT(DISTINCT v, g) OVER () FROM dw"));
 }
+
+test "window: a LAG/LEAD default of another type or an expression reads as the value's type" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE cd (c0 INT PRIMARY KEY, c1 INT, c2 VARCHAR(20), c5 DECIMAL(10, 2), c6 DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO cd VALUES (1, 10, 'a', 3.33, '2021-11-11'), (2, 20, 'aa', 4.33, '2022-12-11'), (3, 30, 'aaa', 5.33, '2022-06-11')");
+
+    const cases = .{
+        .{ "SELECT lag(c1, 1, 1 + 2 + 3) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "6", "10", "20" } },
+        .{ "SELECT lead(c2, 1, 1 + 2 + 3) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "aa", "aaa", "6" } },
+        .{ "SELECT lead(c2, 5, day('2021-01-02')) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "2", "2", "2" } },
+        .{ "SELECT CAST(lag(c6, 1, '2020-01-01') OVER (ORDER BY c0) AS STRING) FROM cd ORDER BY c0", &[_]?[]const u8{ "2020-01-01", "2021-11-11", "2022-12-11" } },
+        .{ "SELECT CAST(lead(c5, 1, '12345') OVER (ORDER BY c0) AS STRING) FROM cd ORDER BY c0", &[_]?[]const u8{ "4.33", "5.33", "12345.00" } },
+        .{ "SELECT lag(c1, 1, c0 * 100) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "100", "10", "20" } },
+        .{ "SELECT lag(c2, 1, c0) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "1", "a", "aa" } },
+        .{ "SELECT lag(c1, 1, c5) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ "3", "10", "20" } },
+        .{ "SELECT lag(c1, 1, NULL) OVER (ORDER BY c0) FROM cd ORDER BY c0", &[_]?[]const u8{ null, "10", "20" } },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, c[0], c[1]);
+
+    var star = try runSql(allocator, db, "SELECT *, lag(c1, 1, 1 + 2 + 3) OVER (ORDER BY c0) AS l FROM cd");
+    defer star.deinit();
+    try std.testing.expectEqual(@as(usize, 6), star.outputSchema().len);
+}
