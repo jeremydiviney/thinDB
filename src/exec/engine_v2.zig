@@ -1203,12 +1203,12 @@ fn buildGlobalAggregateReduced(
 // stream_scan / scan_topn / scan_full_sort shapes (e.g. ClickBench Q20, Q24-27).
 const ScanSelectPlan = struct {
     scan: ir.Op.Scan,
-    where_filter: ?ir.Op.Filter = null,
-    /// A second WHERE filter sitting BELOW the compute layers (directly over
-    /// the scan) — produced when the parser splits an AND so base-column
-    /// conjuncts stay pushable while computed ones (`__pred_expr`) ride above
-    /// the Compute. Applied before the compute layers.
-    scan_filter: ?ir.Op.Filter = null,
+    /// The scan body's WHERE filters, outermost first. The parser splits an
+    /// AND so base-column conjuncts sit directly over the scan and computed
+    /// ones (`__pred_expr`) over their Compute; a struct path's Compute
+    /// (net/struct_paths) stacks one more layer under both.
+    filters: [MAX_SCAN_FILTERS]ScanFilter = undefined,
+    filter_count: usize = 0,
     compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined,
     compute_layer_count: usize = 0,
     order_by: ?ir.Op.OrderBy = null,
@@ -1236,7 +1236,15 @@ const ScanSelectPlan = struct {
     post_compute_count: usize = 0,
 };
 
+const ScanFilter = struct {
+    filter: ir.Op.Filter,
+    /// The compute layers above this filter: it reads the output of
+    /// `compute_layers[layers_above..]`.
+    layers_above: usize,
+};
+
 const MAX_SCAN_COMPUTES = 4;
+const MAX_SCAN_FILTERS = 8;
 const MAX_SCAN_EXCLUDES = 4;
 
 fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
@@ -1279,11 +1287,10 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
             else => break,
         }
     }
-    // The scan body: an optional row-local Compute, an optional WHERE, and
-    // any `.exclude` decorators (plan-builder API), in any order, down to
-    // the table scan.
-    var where_filter: ?ir.Op.Filter = null;
-    var scan_filter: ?ir.Op.Filter = null;
+    // The scan body: row-local Computes, WHERE filters and any `.exclude`
+    // decorators (plan-builder API), in any order, down to the table scan.
+    var filters: [MAX_SCAN_FILTERS]ScanFilter = undefined;
+    var filter_count: usize = 0;
     var compute_layers: [MAX_SCAN_COMPUTES][]const ir.Derived = undefined;
     var compute_layer_count: usize = 0;
     var excludes: [MAX_SCAN_EXCLUDES][]const []const u8 = undefined;
@@ -1297,18 +1304,9 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
                 op = c.upstream;
             },
             .filter => |f| {
-                // A filter directly over the scan is pushable. One above any
-                // compute — at the top, or between the SELECT list's compute
-                // and the WHERE's hidden-anchor compute — is the WHERE; the
-                // builder places it after the computes when it reads a
-                // derived column. Allow one of each.
-                if (compute_layer_count == 0 or f.upstream.* == .compute) {
-                    if (where_filter != null) return null;
-                    where_filter = f;
-                } else {
-                    if (scan_filter != null) return null;
-                    scan_filter = f;
-                }
+                if (filter_count == MAX_SCAN_FILTERS) return null;
+                filters[filter_count] = .{ .filter = f, .layers_above = compute_layer_count };
+                filter_count += 1;
                 op = f.upstream;
             },
             .exclude => |p| {
@@ -1323,8 +1321,8 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
     if (op.* != .scan) return null;
     return .{
         .scan = op.scan,
-        .where_filter = where_filter,
-        .scan_filter = scan_filter,
+        .filters = filters,
+        .filter_count = filter_count,
         .compute_layers = compute_layers,
         .compute_layer_count = compute_layer_count,
         .order_by = order_by,
@@ -1389,13 +1387,18 @@ fn tryScanSelectLateMat(
     // Derived output/probe columns aren't base columns the late-mat fetch can
     // resolve by location — leave those to the naive path.
     if (plan.compute_layer_count > 0) return null;
+    const where_filter: ?ir.Op.Filter = switch (plan.filter_count) {
+        0 => null,
+        1 => plan.filters[0].filter,
+        else => return null,
+    };
 
     const allocator = input.allocator;
 
     // Probe set = WHERE columns ∪ ORDER BY columns, all base columns.
     var probe: std.ArrayListUnmanaged([]const u8) = .empty;
     defer probe.deinit(allocator);
-    if (plan.where_filter) |f| {
+    if (where_filter) |f| {
         // The late-mat probes take per-row kernel predicates only; a subquery
         // lookup set or UNKNOWN takes the full scan.
         if (!exec.predicate.kernelsOnly(f.predicate)) return null;
@@ -1431,18 +1434,18 @@ fn tryScanSelectLateMat(
     // and is byte-identical to the full scan regardless of projection width or
     // a WHERE — so try it first whenever there's an ORDER BY.
     if (plan.order_by) |o| {
-        if (try exec.zonemapTopN(allocator, table, input.accountant, probe.items, predicateOrAlways(plan.where_filter), o.specs, output_names, n, offset, input.effectiveDop())) |q| {
+        if (try exec.zonemapTopN(allocator, table, input.accountant, probe.items, predicateOrAlways(where_filter), o.specs, output_names, n, offset, input.effectiveDop())) |q| {
             return q;
         }
     }
 
     // LateScan only pays off with a real WHERE that decodes fewer columns than
     // the wide output; otherwise the naive bounded scan is as good or better.
-    if (plan.where_filter == null) return null;
+    const where = where_filter orelse return null;
     if (!outputWiderThanProbe(table, output_names, probe.items)) return null;
 
     const specs: ?[]const exec.SortSpec = if (plan.order_by) |o| o.specs else null;
-    return try exec.lateScan(allocator, table, input.accountant, probe.items, plan.where_filter.?.predicate, specs, output_names, n, offset);
+    return try exec.lateScan(allocator, table, input.accountant, probe.items, where.predicate, specs, output_names, n, offset);
 }
 
 fn predicateOrAlways(filter: ?ir.Op.Filter) exec.PredicateExpr {
@@ -1478,35 +1481,23 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
     errdefer q.deinit();
 
     // A WHERE predicate over base-table columns pushes into the scan (early
-    // filtering / zonemap pruning). A predicate that references a column
-    // PRODUCED by a compute layer — e.g. `WHERE UPPER(s)='x'`, whose parser-
-    // derived `__pred_expr` lives in a Compute below the Filter — must run
-    // AFTER those computes instead. `matchScanSelect` flattens the
-    // compute/filter order, so decide here from the predicate's own columns.
-    const filter_after_compute = if (plan.where_filter) |f| blk: {
-        var pcols: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer pcols.deinit(allocator);
-        try exec.predicate.collectColumnNames(allocator, &pcols, f.predicate);
-        for (pcols.items) |pc| {
-            if (types.findColumn(table.schema.columns, pc) == null) break :blk true;
-        }
-        break :blk false;
-    } else false;
-
-    // Pushable base-column filter (below the computes) goes straight onto the
-    // scan first.
-    if (plan.scan_filter) |sf| q = try q.filter(sf.predicate);
-    if (plan.where_filter) |f| {
-        if (!filter_after_compute) q = try q.filter(f.predicate);
+    // filtering / zonemap pruning). One that reads a column a compute layer
+    // under it derives — `WHERE UPPER(s)='x'` reads its parser-derived
+    // `__pred_expr` — runs right above that layer instead.
+    var on_scan: [MAX_SCAN_FILTERS]bool = undefined;
+    var fi = plan.filter_count;
+    while (fi > 0) {
+        fi -= 1;
+        on_scan[fi] = try filterReadsScan(allocator, table, plan, plan.filters[fi]);
+        if (on_scan[fi]) q = try q.filter(plan.filters[fi].filter.predicate);
     }
+    try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], plan.compute_layer_count);
     var compute_i = plan.compute_layer_count;
     while (compute_i > 0) {
         compute_i -= 1;
         const derived = plan.compute_layers[compute_i];
         if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
-    }
-    if (plan.where_filter) |f| {
-        if (filter_after_compute) q = try q.filter(f.predicate);
+        try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], compute_i);
     }
     // Innermost exclude first (they were collected outermost-first walking
     // down). Each is a complement-projection over the current schema, so a
@@ -1608,6 +1599,32 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
     }
     return q;
+}
+
+/// Whether `f` reads only base columns that no compute layer under it
+/// derives, so it may run on the scan itself.
+fn filterReadsScan(allocator: std.mem.Allocator, table: *api.Table, plan: ScanSelectPlan, f: ScanFilter) !bool {
+    var cols: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer cols.deinit(allocator);
+    try exec.predicate.collectColumnNames(allocator, &cols, f.filter.predicate);
+    for (cols.items) |c| {
+        if (types.findColumn(table.schema.columns, c) == null) return false;
+        for (plan.compute_layers[f.layers_above..plan.compute_layer_count]) |layer| {
+            for (layer) |d| if (types.columnNameEql(d.name, c)) return false;
+        }
+    }
+    return true;
+}
+
+/// Apply, innermost first, the filters not already on the scan that sit
+/// right above compute layer `layer` (`compute_layer_count`: the scan).
+fn applyLayerFilters(q: *exec.Query, plan: ScanSelectPlan, on_scan: []const bool, layer: usize) !void {
+    var fi = plan.filter_count;
+    while (fi > 0) {
+        fi -= 1;
+        const f = plan.filters[fi];
+        if (!on_scan[fi] and f.layers_above == layer) q.* = try q.*.filter(f.filter.predicate);
+    }
 }
 
 /// Whether projection item `index` is flagged replace-on-collision.

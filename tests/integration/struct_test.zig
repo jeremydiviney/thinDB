@@ -98,6 +98,13 @@ test "STRUCT: field access" {
     try expectTexts(allocator, db, "SELECT s.a + 10 FROM sc ORDER BY id", &.{ "11", null, null, "12" });
     try expectTexts(allocator, db, "SELECT id FROM sc WHERE s.a > 1", &.{"4"});
     try expectTexts(allocator, db, "SELECT id FROM sc WHERE s.b = 'y' OR n.id = 30 ORDER BY id", &.{ "2", "3" });
+    // A path's Compute sits under both halves of a split AND.
+    try expectTexts(allocator, db, "SELECT s.b FROM sc WHERE id > 1 AND abs(id) < 4 ORDER BY id", &.{ "y", null });
+    try expectTexts(allocator, db, "SELECT id FROM sc WHERE s.a >= 1 AND abs(id) < 9 ORDER BY id", &.{ "1", "4" });
+    try expectTexts(allocator, db, "SELECT n.inner.y FROM sc WHERE id > 1 AND abs(id) < 9 AND n.id > 30", &.{"q"});
+    try expectTexts(allocator, db, "SELECT map_size(n.m), n.inner.x FROM sc WHERE id < 4 AND n.tags[1] > 0 ORDER BY id LIMIT 2", &.{"1"});
+    try expectTexts(allocator, db, "SELECT max(s.a) FROM sc WHERE id > 1 AND abs(id) < 9", &.{"2"});
+    try expectTexts(allocator, db, "SELECT upper(s.b) FROM sc WHERE s.b IS NOT NULL AND abs(id) > 0 GROUP BY upper(s.b) ORDER BY 1", &.{ "X", "Y" });
     try expectTexts(allocator, db, "SELECT id FROM sc WHERE s.a IS NOT NULL ORDER BY s.a DESC", &.{ "4", "1" });
     try expectTexts(allocator, db, "SELECT s.b FROM sc WHERE s.b IS NOT NULL GROUP BY s.b ORDER BY s.b", &.{ "x", "y" });
     try expectTexts(allocator, db, "SELECT max(n.id) FROM sc", &.{"40"});
