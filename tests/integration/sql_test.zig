@@ -4913,6 +4913,15 @@ test "sql: a CTE or derived table column list renames the query's columns by pos
         .{ "SELECT a FROM (SELECT id, qty FROM x) AS d(a, b) WHERE b > 15 ORDER BY a", &[_]i64{ 2, 3 } },
         .{ "SELECT d.b FROM (SELECT id, qty FROM x) d (a, b) WHERE d.a = 1", &[_]i64{10} },
         .{ "WITH t(a, b) AS (SELECT x.id, y.qty AS id FROM x JOIN x AS y ON x.id = y.id) SELECT a * 100 + b FROM t ORDER BY a", &[_]i64{ 110, 220, 330 } },
+        // Over a star the names apply to the star's columns in order.
+        .{ "WITH t(a, b) AS (SELECT * FROM x) SELECT a + b FROM t ORDER BY a", &[_]i64{ 11, 22, 33 } },
+        .{ "SELECT k FROM (SELECT * FROM x) d(v, k) WHERE k > 15 ORDER BY v", &[_]i64{ 20, 30 } },
+        .{ "SELECT i * 100 + p FROM (SELECT * FROM x a, x b WHERE a.id = b.id) d(i, q, j, p) ORDER BY i", &[_]i64{ 110, 220, 330 } },
+        .{ "SELECT x + y FROM (SELECT * FROM TABLE(unnest(ARRAY<INT>[1])) t0(x), TABLE(unnest(ARRAY<INT>[2, 3])) t1(x)) t2(x, y) ORDER BY 1", &[_]i64{ 3, 4 } },
+        .{ "SELECT c FROM (SELECT *, id * 2 FROM x) d(a, b, c) WHERE a = 3", &[_]i64{6} },
+        .{ "SELECT n FROM (SELECT * FROM TABLE(generate_series(1, 3))) d(n) ORDER BY n", &[_]i64{ 1, 2, 3 } },
+        .{ "SELECT a FROM (SELECT * FROM x) d(a, b) WHERE EXISTS (SELECT 1 FROM x y WHERE y.id = d.a AND y.qty > 15) ORDER BY a", &[_]i64{ 2, 3 } },
+        .{ "SELECT id FROM x WHERE id IN (SELECT a FROM (SELECT * FROM x) d(a, b) WHERE b < 25) ORDER BY id", &[_]i64{ 1, 2 } },
     };
     inline for (cases) |c| {
         const got = try helpers.collectBigints(allocator, db, c[0]);
@@ -4923,8 +4932,13 @@ test "sql: a CTE or derived table column list renames the query's columns by pos
 
     try helpers.expectRunError(allocator, db, "WITH t(a) AS (SELECT id, qty FROM x) SELECT a FROM t", error.SqlColumnListCountMismatch);
     try helpers.expectRunError(allocator, db, "WITH t(a, A) AS (SELECT id, qty FROM x) SELECT a FROM t", error.SqlColumnListRepeated);
-    try helpers.expectRunError(allocator, db, "WITH t(a, b) AS (SELECT * FROM x) SELECT a FROM t", error.SqlColumnListOverStar);
     try helpers.expectRunError(allocator, db, "SELECT a FROM (SELECT id FROM x) AS d(a, b)", error.SqlColumnListCountMismatch);
+    try helpers.expectRunError(allocator, db, "SELECT a FROM (SELECT * FROM x) AS d(a)", error.SqlColumnListCountMismatch);
+
+    try helpers.exec(allocator, db, "CREATE VIEW vx AS SELECT b FROM (SELECT * FROM x) d(a, b)");
+    const viewed = try helpers.collectBigintsCtx(allocator, db, "SELECT b FROM vx ORDER BY b");
+    defer allocator.free(viewed);
+    try std.testing.expectEqualSlices(i64, &.{ 10, 20, 30 }, viewed);
     // The listed names replace the query's own.
     try helpers.expectRunError(allocator, db, "WITH t(a) AS (SELECT id FROM x) SELECT id FROM t", error.ColumnNotFound);
 }

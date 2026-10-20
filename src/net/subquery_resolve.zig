@@ -123,6 +123,7 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
         .select => {
             try hoistOuterAggregates(ctx, op);
             try resolveSubqueriesInOp(ctx, op.select.upstream);
+            if (op.select.column_list) |names| try nameColumnsByPosition(ctx, op, names);
         },
         .exclude => |p| try resolveSubqueriesInOp(ctx, @constCast(p.upstream)),
         .filter => try resolveFilterSubqueries(ctx, op),
@@ -167,6 +168,29 @@ pub fn resolveSubqueriesInOp(ctx: *CompileCtx, op: *ir.Op) anyerror!void {
             try resolveDuplicateAssignments(ctx, i.on_duplicate);
         },
     }
+}
+
+/// A column list over a star (`(SELECT * FROM a, b) t(x, y)`) names the
+/// relation's columns by position, which only its compiled schema tells: a
+/// join's, a table's or a function's. A copy of the relation compiles for
+/// that schema, and the select becomes one of each column by its compiled
+/// name, as for a list over named items.
+fn nameColumnsByPosition(ctx: *CompileCtx, op: *ir.Op, names: []const []const u8) !void {
+    const na = ctx.nodeArena();
+    const relation = op.select.upstream;
+    const body = if (relation.* == .materialize) relation.materialize.upstream else relation;
+    var q = try local.compileSubplan(ctx, try body.cloneTree(na));
+    defer q.deinit();
+    const schema = q.outputSchema();
+    if (schema.len != names.len) return error.SqlColumnListCountMismatch;
+    const columns = try na.alloc([]const u8, names.len);
+    const outputs = try na.alloc(?[]const u8, names.len);
+    for (schema, names, columns, outputs, 0..) |column, name, *dst, *out, i| {
+        for (columns[0..i]) |prior| if (types.columnNameEql(prior, column.name)) return error.SqlColumnListOverStar;
+        dst.* = try na.dupe(u8, column.name);
+        out.* = name;
+    }
+    op.select = .{ .columns = columns, .outputs = outputs, .upstream = relation };
 }
 
 /// ON DUPLICATE KEY UPDATE values are evaluated per duplicate row with only
@@ -963,7 +987,7 @@ fn outputColumns(ctx: *CompileCtx, op: *const ir.Op, depth: u32, budget: *u32) A
         .materialize => |m| return try outputColumns(ctx, m.upstream, depth + 1, budget),
         .set_union => |u| return try outputColumns(ctx, u.left, depth + 1, budget),
         .limit, .order_by, .filter, .exclude => return try outputColumns(ctx, blockUpstream(op).?, depth + 1, budget),
-        .select => |p| for (p.columns, 0..) |c, i| {
+        .select => |p| if (p.column_list) |list| return list else for (p.columns, 0..) |c, i| {
             if (isStar(c)) {
                 const upstream = try outputColumns(ctx, p.upstream, depth + 1, budget) orelse return null;
                 try names.appendSlice(na, upstream);
@@ -3854,6 +3878,7 @@ fn exactColumns(ctx: *CompileCtx, op: *const ir.Op, depth: u32, budget: *u32) Al
         .set_union => |u| return try exactColumns(ctx, u.left, depth + 1, budget),
         .limit, .order_by, .filter => return try exactColumns(ctx, blockUpstream(op).?, depth + 1, budget),
         .select => |p| {
+            if (p.column_list) |list| return list;
             if (hasStar(p.columns)) {
                 const expanded = (try expandStars(ctx, p)) orelse return null;
                 for (expanded.columns, expanded.outputs.?) |c, o| try names.append(na, o orelse types.unqualifiedName(c));
