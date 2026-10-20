@@ -29,6 +29,7 @@ pub const ParsedWindowCall = struct {
     args: []const ir.Expr,
     ignore_nulls: bool,
     spec_kind: SpecKind,
+    agg: ?ir.WindowAgg = null,
 };
 
 pub const SpecKind = union(enum) {
@@ -105,6 +106,11 @@ pub fn validateWindowCall(
             if (args.len != 1) return error.InvalidShape;
             if (ignore_nulls) return error.InvalidShape;
             if (args[0] == .col_ref and std.mem.eql(u8, args[0].col_ref, "*")) return error.InvalidShape;
+        },
+        // The aggregate's value, then its second column.
+        .aggregate => {
+            if (args.len < 1 or args.len > 2) return error.InvalidShape;
+            if (ignore_nulls) return error.InvalidShape;
         },
     }
 }

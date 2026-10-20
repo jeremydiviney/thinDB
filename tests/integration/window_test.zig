@@ -1151,7 +1151,8 @@ test "window: COUNT, SUM and AVG of DISTINCT values over every frame shape" {
     try std.testing.expectError(error.WindowUnsupported, helpers.exec(allocator, db, "SELECT AVG(DISTINCT s) OVER () FROM dw"));
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COUNT(DISTINCT *) OVER () FROM dw"));
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT VAR_SAMP(DISTINCT v) OVER () FROM dw"));
-    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT COUNT(DISTINCT v, g) OVER () FROM dw"));
+    // The distinct (v, g) pairs with no NULL, as GROUP BY counts them.
+    try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v, g) OVER () FROM dw ORDER BY k", &.{ "4", "4", "4", "4", "4", "4", "4" });
 }
 
 test "window: a LAG/LEAD default of another type or an expression reads as the value's type" {
@@ -1180,4 +1181,99 @@ test "window: a LAG/LEAD default of another type or an expression reads as the v
     var star = try runSql(allocator, db, "SELECT *, lag(c1, 1, 1 + 2 + 3) OVER (ORDER BY c0) AS l FROM cd");
     defer star.deinit();
     try std.testing.expectEqual(@as(usize, 6), star.outputSchema().len);
+}
+
+test "window: any other aggregate runs over each row's frame" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE aw (k BIGINT PRIMARY KEY, g BIGINT, v INT, s VARCHAR(5), b BOOLEAN)");
+    try helpers.exec(allocator, db, "INSERT INTO aw VALUES (1, 1, 30, 'c', false), (2, 1, 10, 'a', NULL), (3, 1, 20, 'b', true), (4, 2, NULL, NULL, false), (5, 2, 50, 'x', false), (6, 2, 40, 'e', true), (7, 2, 45, 'f', NULL)");
+    const expectTexts = helpers.expectTexts;
+
+    // A whole partition, a running frame, and a row whose key is NULL.
+    try expectTexts(allocator, db, "SELECT max_by(s, v) OVER (PARTITION BY g) FROM aw ORDER BY k", &.{ "c", "c", "c", "x", "x", "x", "x" });
+    try expectTexts(allocator, db, "SELECT min_by(s, v) OVER (PARTITION BY g) FROM aw ORDER BY k", &.{ "a", "a", "a", "e", "e", "e", "e" });
+    try expectTexts(allocator, db, "SELECT min_by(s, v) OVER (PARTITION BY g ORDER BY k) FROM aw ORDER BY k", &.{ "c", "a", "a", null, "x", "e", "e" });
+    // Sliding frames start afresh; an empty one is the aggregate of no rows.
+    try expectTexts(allocator, db, "SELECT max_by(s, v) OVER (ORDER BY k ROWS BETWEEN 3 FOLLOWING AND 4 FOLLOWING) FROM aw ORDER BY k", &.{ "x", "x", "f", "f", null, null, null });
+    try expectTexts(allocator, db, "SELECT count_if(v > 25) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM aw ORDER BY k", &.{ "1", "1", "0", "1", "2", "3", "2" });
+    try expectTexts(allocator, db, "SELECT count_if(v > 25) OVER (ORDER BY k ROWS BETWEEN 9 FOLLOWING AND 10 FOLLOWING) FROM aw ORDER BY k", &.{ "0", "0", "0", "0", "0", "0", "0" });
+    try expectTexts(allocator, db, "SELECT bool_or(b) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM aw ORDER BY k", &.{ "0", "0", "1", "1", "0", "1", "1" });
+    try expectTexts(allocator, db, "SELECT bool_and(b) OVER (ORDER BY k) FROM aw ORDER BY k", &.{ "0", "0", "0", "0", "0", "0", "0" });
+
+    // ARRAY_AGG and GROUP_CONCAT, ordered, DISTINCT, and over RANGE peers.
+    try expectTexts(allocator, db, "SELECT CAST(array_agg(v) OVER (PARTITION BY g ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[30]", "[30,10]", "[30,10,20]", "[null]", "[null,50]", "[null,50,40]", "[null,50,40,45]" });
+    try expectTexts(allocator, db, "SELECT CAST(array_agg(s ORDER BY v DESC) OVER (PARTITION BY g) AS STRING) FROM aw ORDER BY k", &.{ "[\"c\",\"b\",\"a\"]", "[\"c\",\"b\",\"a\"]", "[\"c\",\"b\",\"a\"]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]" });
+    try expectTexts(allocator, db, "SELECT CAST(array_agg(DISTINCT g) OVER (ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[1]", "[1]", "[1]", "[1,2]", "[1,2]", "[1,2]", "[1,2]" });
+    try expectTexts(allocator, db, "SELECT group_concat(s ORDER BY k) OVER (ORDER BY g) FROM aw ORDER BY k", &.{ "c,a,b", "c,a,b", "c,a,b", "c,a,b,x,e,f", "c,a,b,x,e,f", "c,a,b,x,e,f", "c,a,b,x,e,f" });
+    try expectTexts(allocator, db, "SELECT group_concat(DISTINCT g ORDER BY g SEPARATOR '-') OVER () FROM aw ORDER BY k", &.{ "1-2", "1-2", "1-2", "1-2", "1-2", "1-2", "1-2" });
+    try expectTexts(allocator, db, "SELECT CAST(approx_top_k(g) OVER () AS STRING) FROM aw WHERE k < 3", &.{ "[{\"item\":1,\"count\":2}]", "[{\"item\":1,\"count\":2}]" });
+
+    // Inside an expression, a CASE condition, under a GROUP BY, and read
+    // from a subquery.
+    try expectTexts(allocator, db, "SELECT concat('<', max_by(s, v) OVER (PARTITION BY g), '>') FROM aw ORDER BY k", &.{ "<c>", "<c>", "<c>", "<x>", "<x>", "<x>", "<x>" });
+    try expectTexts(allocator, db, "SELECT CASE WHEN max_by(s, v) OVER (PARTITION BY g) = 'c' THEN 'one' ELSE 'two' END FROM aw ORDER BY k", &.{ "one", "one", "one", "two", "two", "two", "two" });
+    try expectTexts(allocator, db, "SELECT max_by(g, SUM(v)) OVER () FROM aw GROUP BY g ORDER BY g", &.{ "2", "2" });
+    try expectTexts(allocator, db, "SELECT k FROM (SELECT k, max_by(s, v + k) OVER (PARTITION BY g) AS m FROM aw) x WHERE m = 'x' ORDER BY k", &.{ "4", "5", "6", "7" });
+
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT max_by(s) OVER () FROM aw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT max_by(s, v) IGNORE NULLS OVER () FROM aw"));
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT array_unique_agg(v) OVER () FROM aw"));
+}
+
+test "window: an aggregate over a large partitioned input gives what it gives on one thread" {
+    const allocator = std.testing.allocator;
+    const Row = struct { id: i64, g: i64, amt: f64 };
+    // Past the row count where a partitioned window sorts and evaluates on
+    // several threads.
+    const rows: usize = 70_000;
+    const seed = try allocator.alloc(Row, rows);
+    defer allocator.free(seed);
+    for (seed, 0..) |*row, i| row.* = .{ .id = @intCast(i), .g = @intCast(i % 7), .amt = @floatFromInt(i % 1000) };
+
+    var expected: [7]?[]const u8 = undefined;
+    var texts: [7][64]u8 = undefined;
+    for (0..7) |g| {
+        var count_above: i64 = 0;
+        var running_sum: i64 = 0;
+        var n: i64 = 0;
+        var last_amt: f64 = 0;
+        for (seed) |row| {
+            if (row.g != g) continue;
+            n += 1;
+            if (row.amt > 500) count_above += 1;
+            running_sum += count_above;
+            last_amt = row.amt;
+        }
+        expected[g] = try std.fmt.bufPrint(&texts[g], "{d},{d},{d},{d}", .{ g, last_amt, running_sum, @divExact(n * (n + 1), 2) });
+    }
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .auto_flush_secs = 0, .max_dop = dop });
+        defer db.close();
+        const facts = try db.table("facts", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .bigint },
+                .{ .name = "amt", .type = .double },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .unique = false });
+        try facts.insert(seed);
+        try facts.flush();
+        try helpers.expectTexts(allocator, db,
+            \\SELECT CONCAT_WS(',', g, MAX(m), SUM(c), SUM(r)) FROM (
+            \\  SELECT g, max_by(amt, id) OVER (PARTITION BY g) AS m,
+            \\    count_if(amt > 500) OVER (PARTITION BY g ORDER BY id) AS c,
+            \\    ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS r
+            \\  FROM facts) x GROUP BY g ORDER BY g
+        , &expected);
+    }
 }

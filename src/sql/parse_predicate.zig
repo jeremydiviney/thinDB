@@ -274,14 +274,7 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
             if (filter != null) return PE.SqlInvalidProjection;
             try p.advance();
             const spec_kind = try parse_window.parseWindowSpecOrRef(p);
-            const wfunc = p.windowFuncForCall(col_dup, saw_distinct) orelse return PE.SqlInvalidProjection;
-            parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch return PE.SqlInvalidProjection;
-            const hidden = try p.materializeWindowExpr(.{
-                .func = wfunc,
-                .args = args,
-                .ignore_nulls = ignore_nulls,
-                .spec_kind = spec_kind,
-            });
+            const hidden = try p.materializeWindowExpr(try p.windowCall(col_dup, args, saw_distinct, ignore_nulls, spec_kind));
             const lhs = try p.continueBinaryFrom(.{ .col_ref = hidden });
             if (try parseComparisonTail(p, lhs)) |pred| return pred;
             const anchored = switch (lhs) {

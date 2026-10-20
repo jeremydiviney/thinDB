@@ -1345,26 +1345,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
                 hostr(h, spec.col);
                 hostr(h, spec.arg2_col);
                 hstr(h, spec.as);
-                switch (spec.params) {
-                    .none => hu(h, 0),
-                    .percentile => |p| {
-                        hu(h, 1);
-                        hu(h, @bitCast(p));
-                    },
-                    .concat => |c| {
-                        hu(h, if (c.distinct) 3 else 2);
-                        hstr(h, c.separator);
-                    },
-                    .top_k => |k| {
-                        hu(h, 4);
-                        hu(h, k);
-                    },
-                    .mann_whitney => |m| {
-                        hu(h, 5);
-                        hu(h, @intFromEnum(m.alternative));
-                        hu(h, @intFromBool(m.continuity_correction));
-                    },
-                }
+                hashAggParams(h, spec.params);
             }
             try hashOp(h, g.upstream, entry);
         },
@@ -1432,6 +1413,10 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
                 for (c.args) |e| try hashExpr(h, e);
                 hu(h, @intFromBool(c.ignore_nulls));
                 hstr(h, c.output_name);
+                if (c.agg) |agg| {
+                    hu(h, @intFromEnum(agg.func));
+                    hashAggParams(h, agg.params);
+                }
             }
             try hashOp(h, w.upstream, entry);
         },
@@ -1479,6 +1464,29 @@ fn hashBound(h: *std.hash.Wyhash, b: ir.FrameBound) void {
     switch (b) {
         .preceding, .following => |n| hu(h, n),
         else => {},
+    }
+}
+
+fn hashAggParams(h: *std.hash.Wyhash, params: ir.AggParams) void {
+    switch (params) {
+        .none => hu(h, 0),
+        .percentile => |p| {
+            hu(h, 1);
+            hu(h, @bitCast(p));
+        },
+        .concat => |c| {
+            hu(h, if (c.distinct) 3 else 2);
+            hstr(h, c.separator);
+        },
+        .top_k => |k| {
+            hu(h, 4);
+            hu(h, k);
+        },
+        .mann_whitney => |m| {
+            hu(h, 5);
+            hu(h, @intFromEnum(m.alternative));
+            hu(h, @intFromBool(m.continuity_correction));
+        },
     }
 }
 

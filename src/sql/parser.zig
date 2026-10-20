@@ -1164,6 +1164,32 @@ pub const Parser = struct {
         };
     }
 
+    /// The call `name(args) OVER spec` makes: a window function, or any other
+    /// built-in aggregate run over each row's frame, its inputs as the
+    /// call's args (`ir.WindowAgg`).
+    pub fn windowCall(self: *Parser, name: []const u8, args: []const ir.Expr, distinct: bool, ignore_nulls: bool, spec_kind: parse_window.SpecKind) ParseError!ParsedWindowCall {
+        if (self.windowFuncForCall(name, distinct)) |func| {
+            if (parse_window.validateWindowCall(func, args, ignore_nulls)) |_| {
+                return .{ .func = func, .args = args, .ignore_nulls = ignore_nulls, .spec_kind = spec_kind };
+            } else |_| {}
+        }
+        const plain = self.aggregateFuncForName(name) orelse return ParseError.SqlInvalidProjection;
+        if (plain == .udf or ignore_nulls or isUniqueAgg(name)) return ParseError.SqlInvalidProjection;
+        const agg = (try self.parsedAggFromArgs(name, plain, args, distinct)).agg;
+        const value = aggArgExpr(agg.col, agg.arg_expr) orelse return ParseError.SqlInvalidProjection;
+        const inputs: []const ir.Expr = if (aggArgExpr(agg.arg2_col, agg.arg2_expr)) |second|
+            try self.arena.dupe(ir.Expr, &.{ value, second })
+        else
+            try self.arena.dupe(ir.Expr, &.{value});
+        return .{
+            .func = .aggregate,
+            .args = inputs,
+            .ignore_nulls = false,
+            .spec_kind = spec_kind,
+            .agg = .{ .func = agg.func, .params = agg.params },
+        };
+    }
+
     pub fn aggregateFuncForName(self: *const Parser, name: []const u8) ?ir.AggFunc {
         if (aggForName(name, self.lex.dialect)) |func| return func;
         if (self.udf_registry) |registry| {
@@ -2508,16 +2534,7 @@ pub const Parser = struct {
                 if (filter != null) return ParseError.SqlInvalidProjection;
                 try self.advance();
                 const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                const wfunc = self.windowFuncForCall(first, saw_distinct) orelse
-                    return ParseError.SqlInvalidProjection;
-                parse_window.validateWindowCall(wfunc, args, ignore_nulls) catch
-                    return ParseError.SqlInvalidProjection;
-                const call: ParsedWindowCall = .{
-                    .func = wfunc,
-                    .args = args,
-                    .ignore_nulls = ignore_nulls,
-                    .spec_kind = spec_kind,
-                };
+                const call = try self.windowCall(first, args, saw_distinct, ignore_nulls, spec_kind);
                 if (self.cur.tag == .kw_is) {
                     try self.advance();
                     var negated = false;
@@ -4492,16 +4509,7 @@ pub const Parser = struct {
                         if (filter != null) return ParseError.SqlInvalidProjection;
                         try self.advance();
                         const spec_kind = try parse_window.parseWindowSpecOrRef(self);
-                        const wfunc = self.windowFuncForCall(name, saw_distinct) orelse
-                            return ParseError.SqlInvalidProjection;
-                        parse_window.validateWindowCall(wfunc, nested_args, ignore_nulls) catch
-                            return ParseError.SqlInvalidProjection;
-                        const hidden_name = try self.materializeWindowExpr(.{
-                            .func = wfunc,
-                            .args = nested_args,
-                            .ignore_nulls = ignore_nulls,
-                            .spec_kind = spec_kind,
-                        });
+                        const hidden_name = try self.materializeWindowExpr(try self.windowCall(name, nested_args, saw_distinct, ignore_nulls, spec_kind));
                         return ir.Expr{ .col_ref = hidden_name };
                     }
                     if (ignore_nulls) return ParseError.SqlInvalidProjection;
@@ -9324,6 +9332,7 @@ fn buildWindowOp(
                 .args = normalized.args,
                 .ignore_nulls = normalized.ignore_nulls,
                 .output_name = p.name,
+                .agg = normalized.agg,
             });
         },
         else => {},
@@ -9353,6 +9362,7 @@ fn buildWindowOp(
             .args = normalized.args,
             .ignore_nulls = normalized.ignore_nulls,
             .output_name = ref.name,
+            .agg = normalized.agg,
         });
     }
 
@@ -9406,12 +9416,13 @@ fn normalizeWindowCallArgs(
         .args = args,
         .ignore_nulls = call.ignore_nulls,
         .spec_kind = call.spec_kind,
+        .agg = call.agg,
     };
 }
 
 fn windowArgNeedsPrecompute(func: ir.WindowFunc, arg_idx: usize, arg: ir.Expr) bool {
     return switch (func) {
-        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct => switch (arg) {
+        .sum, .avg, .count, .min, .max, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr, .count_distinct, .sum_distinct, .avg_distinct, .aggregate => switch (arg) {
             .col_ref => false,
             else => true,
         },
