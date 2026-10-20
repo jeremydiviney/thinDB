@@ -153,6 +153,7 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
         .unknown => return .unknown,
         .not => |child| return child.*,
         .@"and" => |kids| {
+            if (notLikeOf(kids)) |like| return like;
             const out = try p.arena.alloc(PredicateExpr, kids.len);
             for (kids, out) |k, *o| o.* = try negatePredicate(p, k);
             return .{ .@"or" = out };
@@ -184,6 +185,17 @@ pub fn negatePredicate(p: anytype, e: PredicateExpr) @TypeOf(p.*).Err!PredicateE
     }
 }
 
+/// The LIKE whose negation `kids` are: `negatePredicate` builds NOT LIKE as
+/// `c IS NOT NULL AND NOT (c LIKE p)`, since a bare NOT matches the NULL rows
+/// LIKE leaves out. Negating it again gives the LIKE back, which a NULL row
+/// is still UNKNOWN for, where `c IS NULL OR c LIKE p` would hold.
+fn notLikeOf(kids: []const PredicateExpr) ?PredicateExpr {
+    if (kids.len != 2 or kids[0] != .is_not_null or kids[1] != .not) return null;
+    const like = kids[1].not.*;
+    if (like != .like or !std.mem.eql(u8, like.like.col, kids[0].is_not_null)) return null;
+    return like;
+}
+
 pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     const PE = @TypeOf(p.*).Err;
     if (p.cur.tag == .lparen) {
@@ -208,13 +220,19 @@ pub fn parseAtom(p: anytype) @TypeOf(p.*).Err!PredicateExpr {
     // NULL on the LHS — generated SQL guards optional parameters with
     // `(:param IS NULL OR ...)`. IS [NOT] NULL folds to a constant, and any
     // comparison with NULL is UNKNOWN, as `col = NULL` is in parseColOps. A
-    // bare NULL (`NULL XOR x`) is UNKNOWN too.
+    // bare NULL (`NULL XOR x`) is UNKNOWN too. IN, BETWEEN, LIKE and REGEXP
+    // read a NULL column: `NULL NOT IN (SELECT ...)` holds where the
+    // subquery has no rows.
     if (p.cur.tag == .kw_null) {
         try p.advance();
         const null_lhs: ir.Expr = .{ .null_lit = .string };
         if (try isArithAhead(p)) return try parseExprOps(p, null_lhs);
         if (p.cur.tag == .kw_is) return try parseIsOps(p, null_lhs);
         if (p.cur.tag == .null_safe_eq) return (try parseComparisonTail(p, null_lhs)).?;
+        switch (p.cur.tag) {
+            .kw_not, .kw_in, .kw_between, .kw_like, .kw_regexp => return try parseColOps(p, try anchorColumn(p, null_lhs)),
+            else => {},
+        }
         if (!isComparisonToken(p.cur.tag)) return .unknown;
         _ = try parseComparisonToken(p);
         _ = try p.parseScalar();
