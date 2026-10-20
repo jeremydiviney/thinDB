@@ -410,3 +410,32 @@ test "session var: a SET that fails changes no variable" {
     try std.testing.expectEqual(@as(?i64, 2), try varInt(session, "k"));
     try std.testing.expectEqual(@as(?i64, 2), try varInt(session, "j"));
 }
+
+test "session var: a var leads IS, IN, BETWEEN and arithmetic predicates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const cases = .{
+        .{ .sql = "SET @w = 5; SELECT id FROM t WHERE @w IS NOT NULL AND id < 3 ORDER BY id", .ids = &[_]i64{ 1, 2 } },
+        .{ .sql = "SET @w = 5; SELECT id FROM t WHERE @w IS NULL", .ids = &[_]i64{} },
+        .{ .sql = "SELECT id FROM t WHERE @never_set IS NULL AND id = 1", .ids = &[_]i64{1} },
+        .{ .sql = "SET @w = 15; SELECT id FROM t WHERE @w + 10 > qty ORDER BY id", .ids = &[_]i64{ 1, 2 } },
+        .{ .sql = "SET @w = 2; SELECT id FROM t WHERE @w IN (1, 2) AND id = 4", .ids = &[_]i64{4} },
+        .{ .sql = "SET @w = 2; SELECT id FROM t WHERE @w BETWEEN 3 AND 5", .ids = &[_]i64{} },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, c.sql);
+        defer allocator.free(ids);
+        try std.testing.expectEqualSlices(i64, c.ids, ids);
+    }
+
+    var q = try runSql(allocator, db, "SET @w = 5; SELECT @w IS NULL, @w IS NOT NULL, @never_set IS NULL");
+    defer q.deinit();
+    const batch = (try q.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+    for (batch.values, [_]u8{ 0, 1, 1 }) |view, expected| try std.testing.expectEqual(expected, view.data.boolean[0]);
+}
