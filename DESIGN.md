@@ -377,7 +377,7 @@ A column's DEFAULT fills it where an INSERT omits it (on a unique table, only in
 
 The rows of one INSERT take ids in order. An explicit id past the counter moves the counter past it, as in MySQL, so a later row of the same statement can't be given that id again. StarRocks keeps explicit ids off its counter.
 
-A NOT NULL column without a default has nothing to give, so writing `DEFAULT` for it fails as omitting it does (`ColumnNotFound`). `UPDATE t SET c = DEFAULT` sets c to its default the same way. Two cases refuse an AUTO_INCREMENT column with `UnsupportedOp`: an UPDATE, and a `DEFAULT` cell in VALUES rows that hold an expression. Those rows stream through INSERT ... SELECT, which reserves no ids. A joined UPDATE doesn't take `DEFAULT`.
+A NOT NULL column without a default has nothing to give, so writing `DEFAULT` for it fails as omitting it does (`ColumnNotFound`). `UPDATE t SET c = DEFAULT` sets c to its default the same way. An UPDATE refuses `DEFAULT` for an AUTO_INCREMENT column with `UnsupportedOp`, as it has no new id to give. INSERT ... SELECT fills the column as INSERT ... VALUES does, and so do VALUES rows that hold an expression, which stream through it. Each batch takes its ids under the table mutex as it lands: a NULL or omitted cell takes the next id, and a value moves the counter past it. A joined UPDATE doesn't take `DEFAULT`.
 
 `DEFAULT NULL` declares the default a nullable column already has. On a NOT NULL or PRIMARY KEY column it's `SqlInvalidDefault`, as MySQL refuses it (1067).
 

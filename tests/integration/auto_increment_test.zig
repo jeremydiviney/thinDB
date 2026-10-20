@@ -266,3 +266,35 @@ test "AUTO_INCREMENT: ALTER TABLE AUTO_INCREMENT = n raises the counter across r
     try expectRunError(allocator, db, "ALTER TABLE t AUTO_INCREMENT = 'x'", error.SqlExpectedValue);
     try expectRunError(allocator, db, "ALTER TABLE ghost AUTO_INCREMENT = 5", thindb.net.Error.TableNotFound);
 }
+
+test "AUTO_INCREMENT: INSERT ... SELECT takes ids as INSERT ... VALUES does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE src (k INT, label VARCHAR(8))");
+    try exec(allocator, db, "INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY AUTO_INCREMENT, label VARCHAR(8) NOT NULL)");
+    try exec(allocator, db, "INSERT INTO t (label) SELECT label FROM src ORDER BY k");
+    // A selected value moves the counter past it, and a NULL takes the next id.
+    try exec(allocator, db, "INSERT INTO t (id, label) SELECT CASE WHEN k = 2 THEN 10 END, label FROM src ORDER BY k");
+    // An expression VALUES row runs as INSERT ... SELECT.
+    try exec(allocator, db, "INSERT INTO t (id, label) VALUES (DEFAULT, concat('x', 'y'))");
+    try exec(allocator, db, "INSERT INTO t (label) VALUES ('z')");
+    const t = try db.openTable("t", .{});
+    try t.flush();
+
+    const ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id ASC");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 10, 11, 12, 13 }, ids);
+    try helpers.expectTexts(allocator, db, "SELECT label FROM t ORDER BY id", &.{ "a", "b", "c", "a", "b", "c", "xy", "z" });
+
+    try exec(allocator, db, "CREATE TABLE narrow (id TINYINT PRIMARY KEY AUTO_INCREMENT, k INT)");
+    try exec(allocator, db, "INSERT INTO narrow (id, k) VALUES (127, 0)");
+    try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "INSERT INTO narrow (k) SELECT k FROM src"));
+    // An UPDATE has no new id to give.
+    try std.testing.expectError(error.UnsupportedOp, exec(allocator, db, "UPDATE t SET id = DEFAULT WHERE id = 1"));
+}
