@@ -1294,3 +1294,44 @@ test "Iceberg's bucket and truncate transforms match the Iceberg spec and StarRo
         try helpers.expectTexts(allocator, db, "SELECT __ICEBERG_TRANSFORM_TRUNCATE(s, w) FROM ice ORDER BY id", &.{ "iceberg", "中文abc", null, null });
     }
 }
+
+test "FIELD compares text as text, numbers as numbers and a mix as doubles, and a NULL argument matches nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    const cases = .{
+        .{ "FIELD(1, 1, 1)", "1" },
+        .{ "FIELD(1, 1.0)", "1" },
+        .{ "FIELD(2.50, 2.5)", "1" },
+        .{ "FIELD(1, 2, 1.0)", "2" },
+        .{ "FIELD('01.0', 001.0, 0001.0)", "1" },
+        .{ "FIELD('01', '1')", "0" },
+        .{ "FIELD('01', '1', 1)", "1" },
+        .{ "FIELD('a', 'b', 1)", "0" },
+        .{ "FIELD('a', NULL, 'a')", "2" },
+        .{ "FIELD(1, NULL, 1)", "2" },
+        .{ "FIELD(NULL, NULL, 1)", "0" },
+        .{ "FIELD(NULL, NULL)", "0" },
+        .{ "FIELD(TRUE, 2, 1)", "2" },
+        .{ "FIELD(9007199254740993, 9007199254740992, 9007199254740993)", "2" },
+        .{ "FIELD(CAST(18446744073709551617 AS LARGEINT), 18446744073709551616, 18446744073709551617)", "2" },
+        .{ "FIELD(DATE '2022-02-02', CAST('2022-02-02' AS DATETIME))", "0" },
+        .{ "FIELD(DATE '2022-02-02', 20220202)", "1" },
+        .{ "FIELD(DATE '2022-02-02', DATE '2022-02-02')", "1" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, "SELECT " ++ c[0], c[1]);
+
+    try helpers.exec(allocator, db, "CREATE TABLE fd (id BIGINT PRIMARY KEY, i INT, d DOUBLE, m DECIMAL(6,2), s VARCHAR(10))");
+    try helpers.exec(allocator, db, "INSERT INTO fd VALUES (1, 3, 1.1111, 2.50, '3'), (2, 2, 5.0, NULL, 'x'), (3, NULL, 5.5, 1.00, NULL)");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("fd", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT FIELD(i, 3, 2, 1) FROM fd ORDER BY id", &.{ "1", "2", "0" });
+        try helpers.expectTexts(allocator, db, "SELECT FIELD(d, 1.1111, 6 - 1, 5 + 0.5) FROM fd ORDER BY id", &.{ "1", "2", "3" });
+        try helpers.expectTexts(allocator, db, "SELECT FIELD(m, 1, 2.5) FROM fd ORDER BY id", &.{ "2", "0", "1" });
+        try helpers.expectTexts(allocator, db, "SELECT FIELD(s, i, 'x') FROM fd ORDER BY id", &.{ "1", "0", "0" });
+        try helpers.expectTexts(allocator, db, "SELECT FIELD(s, 'x', '3') FROM fd ORDER BY id", &.{ "2", "1", "0" });
+        try helpers.expectTexts(allocator, db, "SELECT id FROM fd ORDER BY FIELD(i, 2, 3), id", &.{ "3", "2", "1" });
+    }
+}
