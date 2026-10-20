@@ -494,11 +494,12 @@ test "correlated NOT IN lifted onto its domain skips NULLs in the set as the key
 
     // Each pair asks one question through a keyed path and through the
     // domain. id 2's set is {NULL} and id 1's holds a NULL: a skipped NULL
-    // keeps the row. A NULL outer value is never NOT IN, even an empty set.
+    // keeps the row. id 3's NULL outer value is NOT IN only the empty set
+    // the last pair gives it.
     const pairs = .{
         .{ "y.id = x.k + 10", "y.id - x.k = 10", &[_]?i64{ 1, 2, 4, 5 } },
         .{ "y.id >= x.k", "y.id - x.k >= 0", &[_]?i64{ 1, 4, 5 } },
-        .{ "y.id = x.k + 30", "y.id - x.k = 30", &[_]?i64{ 1, 2, 4, 5 } },
+        .{ "y.id = x.k + 30", "y.id - x.k = 30", &[_]?i64{ 1, 2, 3, 4, 5 } },
     };
     inline for (pairs) |pair| {
         inline for (.{ pair[0], pair[1] }) |corr| {
@@ -1061,4 +1062,40 @@ test "a NOT IN subquery whose WHERE reads only the outer row runs once, not over
     const counts = try collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT * FROM g0 WHERE c0 NOT IN (SELECT c0 FROM g1 WHERE g0.c1)) t");
     defer allocator.free(counts);
     try std.testing.expectEqualSlices(i64, &.{1000}, counts);
+}
+
+test "a correlated NOT IN passes a NULL probe exactly where the subquery has no rows for it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE o (id INT, k1 INT, k3 INT)");
+    try exec(allocator, db, "CREATE TABLE i (k1 INT, k3 INT)");
+    try exec(allocator, db, "INSERT INTO o VALUES (1, 1, 1), (2, 2, 1), (3, NULL, 1), (4, NULL, 9), (5, 3, NULL), (6, NULL, NULL), (7, 5, 2), (8, NULL, 2), (9, NULL, 4)");
+    try exec(allocator, db, "INSERT INTO i VALUES (1, 1), (7, 1), (5, 2), (8, 3), (NULL, 4)");
+    try exec(allocator, db, "CREATE TABLE n (id INT, k1 INT, k2 INT, k3 INT)");
+    try exec(allocator, db, "INSERT INTO n VALUES (1, 1, 1, 1), (2, 1, 2, 1), (3, 1, 3, 2), (4, 11, 1, 11), (5, 11, 2, 1), (6, 2, 3, 2), (7, 2, 3, NULL), (8, NULL, NULL, NULL)");
+
+    // DuckDB's answers, except the row NOT IN, which DuckDB can't correlate:
+    // it holds as the one-column NOT IN beside it does.
+    const cases = .{
+        .{ .sql = "SELECT id FROM o WHERE o.k1 NOT IN (SELECT i.k1 FROM i WHERE i.k3 = o.k3) ORDER BY id", .expected = &[_]i64{ 2, 4, 5, 6 } },
+        .{ .sql = "SELECT id FROM o WHERE o.k1 NOT IN (SELECT i.k1 FROM i WHERE i.k3 < o.k3) ORDER BY id", .expected = &[_]i64{ 1, 2, 3, 5, 6, 7 } },
+        .{ .sql = "SELECT id FROM o WHERE o.k1 NOT IN (SELECT i.k1 FROM i WHERE i.k3 = o.k3 OR i.k3 = o.k3 + 5) ORDER BY id", .expected = &[_]i64{ 2, 4, 5, 6 } },
+        .{ .sql = "SELECT id FROM o WHERE (o.k1, o.k1) NOT IN (SELECT i.k1, i.k1 FROM i WHERE i.k3 = o.k3) ORDER BY id", .expected = &[_]i64{ 2, 4, 5, 6 } },
+        .{ .sql = "SELECT id FROM o WHERE o.k1 NOT IN (SELECT i.k1 FROM i WHERE i.k3 = o.k3 AND o.id > 3) ORDER BY id", .expected = &[_]i64{ 1, 2, 3, 4, 5, 6 } },
+        .{ .sql = "SELECT id FROM o WHERE (o.k1, o.k3) NOT IN (SELECT i.k1, i.k3 FROM i WHERE i.k1 > 100) ORDER BY id", .expected = &[_]i64{ 1, 2, 3, 4, 5, 6, 7, 8, 9 } },
+        .{ .sql = "SELECT id FROM o WHERE o.k1 IN (SELECT i.k1 FROM i WHERE i.k3 = o.k3) ORDER BY id", .expected = &[_]i64{ 1, 7 } },
+        .{ .sql = "SELECT id FROM n l1 WHERE l1.k1 NOT IN (SELECT l3.k1 FROM n l3 WHERE l3.k3 = l1.k3) ORDER BY id", .expected = &[_]i64{ 7, 8 } },
+        .{ .sql = "SELECT id FROM n l1 WHERE l1.k1 NOT IN (SELECT l3.k1 FROM n l3 WHERE l3.k3 != l1.k3) ORDER BY id", .expected = &[_]i64{ 6, 7, 8 } },
+    };
+    inline for (cases) |c| {
+        const ids = try collectBigints(allocator, db, c.sql);
+        defer allocator.free(ids);
+        std.testing.expectEqualSlices(i64, c.expected, ids) catch |err| {
+            std.debug.print("query: {s}\n", .{c.sql});
+            return err;
+        };
+    }
 }

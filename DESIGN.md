@@ -1624,7 +1624,11 @@ In the join with the FROM, a NULL enclosing value compares with plain `=`
 and matches no inner row; the join back matches NULL to NULL, so its outer
 row still finds its domain row (a count of 0, a NULL scalar). NOT IN keeps
 thinDB's IN-set dialect on every path: NULLs among the subquery's values are
-skipped, and a NULL compared value never passes.
+skipped, and a NULL compared value passes only where the subquery has no
+rows for its outer row, as an uncorrelated NOT IN with no rows passes every
+row. A keyed set answers that from its own rows, keeping the distinct
+correlation keys it drained; every other path resolves the subquery's NOT
+EXISTS beside it.
 
 A FROM that itself reads enclosing values, as a LATERAL derived table would,
 is lifted in place rather than joined. A relation that reads them carries the
