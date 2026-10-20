@@ -179,6 +179,7 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "first", .func = .first },
     .{ .name = "last", .func = .last },
     .{ .name = "max_by", .func = .max_by },
+    .{ .name = "min_by", .func = .min_by },
     .{ .name = "bit_and", .func = .bit_and, .mysql = .unsigned_bit_and },
     .{ .name = "bit_or", .func = .bit_or, .mysql = .unsigned_bit_or },
     .{ .name = "bit_xor", .func = .bit_xor, .mysql = .unsigned_bit_xor },
@@ -271,6 +272,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .first => "first",
         .last => "last",
         .max_by => "max_by",
+        .min_by => "min_by",
         .bit_and, .unsigned_bit_and => "bit_and",
         .bit_or, .unsigned_bit_or => "bit_or",
         .bit_xor, .unsigned_bit_xor => "bit_xor",
@@ -279,7 +281,7 @@ fn aggFuncName(f: ir.AggFunc) ?[]const u8 {
         .var_pop => "var_pop",
         .var_samp => "var_samp",
         inline .bitmap_agg, .bitmap_union, .bitmap_union_count, .bitmap_intersect => |b| @tagName(b),
-        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf, .max_by_key => null,
+        .count_distinct, .sum_distinct, .avg_distinct, .percentile, .percentile_disc, .percentile_approx, .covar_pop, .covar_samp, .corr, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .udf, .max_by_key, .min_by_key => null,
     };
 }
 
@@ -3682,7 +3684,7 @@ pub const Parser = struct {
 
         // PERCENTILE_CONT(x, p) stores p as an aggregate param; MEDIAN(x) is
         // percentile_cont(x, 0.5).
-        if (func == .max_by or func == .covar_pop or func == .covar_samp or func == .corr or func == .mann_whitney_u_test or func == .percentile_approx_weighted) {
+        if (func == .max_by or func == .min_by or func == .covar_pop or func == .covar_samp or func == .corr or func == .mann_whitney_u_test or func == .percentile_approx_weighted) {
             const pair_params: ir.AggParams = switch (func) {
                 .mann_whitney_u_test => .{ .mann_whitney = mannWhitneyParams(args) orelse return ParseError.SqlInvalidProjection },
                 // The fourth argument is the t-digest's compression, which
@@ -3700,7 +3702,7 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     value_col = try self.arena.dupe(u8, c);
                 },
-                else => value_expr = if (func == .max_by) args[0] else numericNullArg(args[0]),
+                else => value_expr = if (func == .max_by or func == .min_by) args[0] else numericNullArg(args[0]),
             }
             var key_col: ?[]const u8 = null;
             var key_expr: ?ir.Expr = null;
@@ -3709,12 +3711,13 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, c, "*")) return ParseError.SqlInvalidProjection;
                     key_col = try self.arena.dupe(u8, c);
                 },
-                else => key_expr = if (func == .max_by) args[1] else numericNullArg(args[1]),
+                else => key_expr = if (func == .max_by or func == .min_by) args[1] else numericNullArg(args[1]),
             }
-            const default_name = if (func == .max_by)
-                try self.arena.dupe(u8, "max_by(expr)")
-            else
-                try std.fmt.allocPrint(self.arena, "{s}({s},{s})", .{ func_name, value_col orelse "expr", key_col orelse "expr" });
+            const default_name = switch (func) {
+                .max_by => try self.arena.dupe(u8, "max_by(expr)"),
+                .min_by => try self.arena.dupe(u8, "min_by(expr)"),
+                else => try std.fmt.allocPrint(self.arena, "{s}({s},{s})", .{ func_name, value_col orelse "expr", key_col orelse "expr" }),
+            };
             return .{ .default_name = default_name, .agg = .{
                 .func = func,
                 .col = value_col,
@@ -3917,7 +3920,7 @@ pub const Parser = struct {
         var out = agg;
         switch (agg.func) {
             .udf => return ParseError.SqlInvalidProjection,
-            .max_by, .max_by_key => {
+            .max_by, .max_by_key, .min_by, .min_by_key => {
                 out.arg2_expr = try self.filterCase(filter, aggArgExpr(agg.arg2_col, agg.arg2_expr) orelse return ParseError.SqlInvalidProjection);
                 out.arg2_col = null;
             },

@@ -966,7 +966,7 @@ fn isReservedAggregateName(name: []const u8) bool {
     const names = [_][]const u8{
         "count",        "sum",         "min",        "max",      "avg",
         "stddev_pop",   "stddev_samp", "var_pop",    "var_samp", "count_distinct",
-        "group_concat", "string_agg",  "percentile", "max_by",
+        "group_concat", "string_agg",  "percentile", "max_by",   "min_by",
     };
     for (names) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;

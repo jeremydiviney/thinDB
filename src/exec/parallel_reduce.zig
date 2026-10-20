@@ -30,10 +30,11 @@ const ColumnView = @import("../storage/storage.zig").ColumnView;
 
 /// The two-phase partial/combine split carries exactly these functions.
 /// COUNT/SUM re-sum; MIN/MAX/ANY_VALUE fold representatives (NULL-skipping);
-/// MAX_BY rides a hidden `max_by_key` twin carrying the winning ord.
+/// MAX_BY (MIN_BY) rides a hidden `max_by_key` (`min_by_key`) twin carrying
+/// the winning ord.
 pub fn combinable(aggs: []const ir.AggSpec) bool {
     for (aggs) |a| switch (a.func) {
-        .count, .sum, .min, .max, .any_value, .max_by => {},
+        .count, .sum, .min, .max, .any_value, .max_by, .min_by => {},
         else => return false,
     };
     return true;
@@ -48,18 +49,18 @@ pub fn combinable(aggs: []const ir.AggSpec) bool {
 pub fn partialSpecs(arena: Allocator, up_schema: []const types.Column, aggs: []const ir.AggSpec) !?[]const ir.AggSpec {
     var n_hidden: usize = 0;
     for (aggs) |a| {
-        if (a.func == .max_by) n_hidden += 1;
+        if (keyTwin(a.func) != null) n_hidden += 1;
     }
     if (n_hidden == 0) return aggs;
     const buf = try arena.alloc(ir.AggSpec, aggs.len + n_hidden);
     @memcpy(buf[0..aggs.len], aggs);
     var j: usize = aggs.len;
     for (aggs) |a| {
-        if (a.func != .max_by) continue;
+        const twin = keyTwin(a.func) orelse continue;
         const ord_name = a.arg2_col orelse return null;
         const ord_idx = types.findColumn(up_schema, ord_name) orelse return null;
         buf[j] = .{
-            .func = .max_by_key,
+            .func = twin,
             .col = a.col,
             .arg2_col = ord_name,
             .as = try std.fmt.allocPrint(arena, "__mb_ord__{s}", .{a.as}),
@@ -68,6 +69,15 @@ pub fn partialSpecs(arena: Allocator, up_schema: []const types.Column, aggs: []c
         j += 1;
     }
     return buf;
+}
+
+/// The hidden partial that carries a MAX_BY / MIN_BY's winning ord.
+fn keyTwin(func: ir.AggFunc) ?ir.AggFunc {
+    return switch (func) {
+        .max_by => .max_by_key,
+        .min_by => .min_by_key,
+        else => null,
+    };
 }
 
 /// Combine-phase specs over the partial rows, read by `.as`, type-forced to
@@ -91,13 +101,14 @@ pub fn combineSpecs(
                 .max => .max,
                 .any_value => .any_value,
                 .max_by => .max_by,
+                .min_by => .min_by,
                 else => unreachable,
             },
             .col = a.as,
             .as = a.as,
             .out_type_override = part_schema[n_group_cols + i].type,
         };
-        if (a.func == .max_by) {
+        if (keyTwin(a.func) != null) {
             combine[i].arg2_col = part_aggs[hj].as;
             hj += 1;
         }
@@ -457,6 +468,7 @@ test "parallel reduce matches serial global aggregate" {
         .{ .func = .min, .col = "id", .as = "mn" },
         .{ .func = .max, .col = "id", .as = "mx" },
         .{ .func = .max_by, .col = "v", .arg2_col = "id", .as = "mb" },
+        .{ .func = .min_by, .col = "v", .arg2_col = "id", .as = "nb" },
     };
 
     const up = try StableRows.create(allocator, &schema, ids, vals, &.{}, 777);
@@ -472,6 +484,8 @@ test "parallel reduce matches serial global aggregate" {
     try testing.expectEqual(@as(i64, n - 1), b.values[3].data.bigint[0]);
     // max_by(v, id): value at the highest id.
     try testing.expectEqual(vals[n - 1], b.values[4].data.bigint[0]);
+    // min_by(v, id): value at the lowest id.
+    try testing.expectEqual(vals[0], b.values[5].data.bigint[0]);
     try testing.expectEqual(@as(?exec.Batch, null), try q.next());
 }
 

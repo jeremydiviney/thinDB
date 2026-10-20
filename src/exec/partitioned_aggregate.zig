@@ -94,7 +94,7 @@ pub fn nearUnique(groups: u64, rows: u64) bool {
 fn heavyStateAggCount(aggs: []const AggSpec) usize {
     var n: usize = 0;
     for (aggs) |a| switch (a.func) {
-        .max_by, .max_by_key, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
+        .max_by, .max_by_key, .min_by, .min_by_key, .any_value, .first, .last, .group_concat, .count_distinct, .sum_distinct, .avg_distinct => n += 1,
         else => {},
     };
     return n;

@@ -1085,6 +1085,46 @@ test "MAX_BY skips NULL keys, and the greatest key's row wins even when its valu
     }
 }
 
+test "MIN_BY skips NULL keys, and the least key's row wins even when its value is NULL" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE mb (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, o BIGINT, f DOUBLE, v BIGINT, s VARCHAR(16))");
+    try exec(
+        allocator,
+        db,
+        "INSERT INTO mb (id, g, o, f, v, s) VALUES " ++
+            "(1,1,1,1.0,10,'a'), (2,1,2,2.0,NULL,NULL), " ++
+            "(3,2,1,1.0,7,'x'), (4,2,NULL,3.0,99,'zz'), " ++
+            "(5,3,NULL,1.0,5,'n'), " ++
+            "(6,4,1,1.0,NULL,NULL), (7,4,3,2.0,8,'late'), (8,4,2,9.0,NULL,NULL)",
+    );
+    const t = try db.openTable("mb", .{});
+    try t.flush();
+
+    // The BIGINT key takes the narrow aggregate cells, the DOUBLE key the wide ones.
+    {
+        var q = try runSql(allocator, db, "SELECT g, MIN_BY(v, o), MIN_BY(v, f), MAX_BY(v, o) FROM mb GROUP BY g ORDER BY g");
+        defer q.deinit();
+        const cells = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(cells);
+        try std.testing.expectEqualSlices(?i64, &[_]?i64{ 1, 10, 10, null, 2, 7, 7, 7, 3, null, 5, null, 4, null, null, 8 }, cells);
+    }
+    const cases = .{
+        .{ "SELECT MIN_BY(s, o) AS m FROM mb GROUP BY g ORDER BY g", &[_]?[]const u8{ "a", "x", null, null } },
+        .{ "SELECT MIN_BY(s, f) AS m FROM mb GROUP BY g ORDER BY g", &[_]?[]const u8{ "a", "x", "n", null } },
+        .{ "SELECT MIN_BY(s, -o) AS m FROM mb", &[_]?[]const u8{"late"} },
+        .{ "SELECT MIN_BY(s, f + id) AS m FROM mb", &[_]?[]const u8{"a"} },
+        .{ "SELECT MIN_BY(s, o) FILTER (WHERE id <> 1 AND id <> 6) AS m FROM mb", &[_]?[]const u8{"x"} },
+        .{ "SELECT MIN_BY(v, o) AS m FROM mb WHERE g = 3", &[_]?[]const u8{null} },
+    };
+    inline for (cases) |c| try helpers.expectTexts(allocator, db, c[0], c[1]);
+}
+
 test "NULL in arithmetic ahead of a comparison makes it UNKNOWN" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

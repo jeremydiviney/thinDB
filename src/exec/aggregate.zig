@@ -108,6 +108,9 @@ pub const AggFunc = enum {
     /// of the value. Never produced by the parser; producers must set
     /// `out_type_override` to the key column's type.
     max_by_key,
+    /// MAX_BY and its twin with the least second argument winning instead.
+    min_by,
+    min_by_key,
     /// Bitwise aggregates over integer-family inputs.
     bit_and,
     bit_or,
@@ -187,7 +190,7 @@ pub const AggFunc = enum {
 pub fn aggsAllowGroupCap(aggs: []const AggSpec) bool {
     for (aggs) |a| switch (a.func) {
         .count, .sum, .min, .max, .avg, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor, .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => {},
-        .any_value, .first, .last, .max_by, .max_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .bitmap_agg, .bitmap_union, .bitmap_union_count, .bitmap_intersect, .udf => return false,
+        .any_value, .first, .last, .max_by, .max_by_key, .min_by, .min_by_key, .sum_distinct, .avg_distinct, .count_distinct, .percentile, .percentile_disc, .percentile_approx, .group_concat, .approx_top_k, .mann_whitney_u_test, .percentile_approx_weighted, .bitmap_agg, .bitmap_union, .bitmap_union_count, .bitmap_intersect, .udf => return false,
     };
     return true;
 }
@@ -341,7 +344,7 @@ pub const AccState = union(enum) {
     avg: AvgAcc,
     bool_acc: BoolAcc,
     value_acc: ValueAcc,
-    /// MAX_BY / MAX_BY_KEY over a wide key or payload, boxed in the arena on
+    /// MAX_BY / MIN_BY and their key twins over a wide key or payload, boxed in the arena on
     /// the group's first keyed row (null until then): its two `Value`s are
     /// the largest cell, and inline they would size every `AccState`.
     max_by: ?*MaxByAcc,
@@ -491,14 +494,35 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
     };
 }
 
+/// Which end of the key order a MAX_BY / MIN_BY cell keeps.
+const KeyEnd = enum {
+    max,
+    min,
+
+    fn of(func: AggFunc) KeyEnd {
+        return if (func == .min_by or func == .min_by_key) .min else .max;
+    }
+
+    /// How a row's key must compare with the cell's to replace it: strictly
+    /// past it, so ties keep the first row.
+    fn replaces(end: KeyEnd) std.math.Order {
+        return if (end == .min) .lt else .gt;
+    }
+};
+
+/// Whether `func` is a two-phase twin emitting its winning key.
+fn byKeyOnly(func: AggFunc) bool {
+    return func == .max_by_key or func == .min_by_key;
+}
+
 /// MAX_BY follows StarRocks: a row with a NULL key is skipped, and the
 /// greatest key's row wins even when its value is NULL, so the result is
-/// NULL then. Ties keep the first row.
-fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
+/// NULL then. Ties keep the first row. MIN_BY is the same with the least key.
+fn maxByUpdate(aa: Allocator, bank: *StringBank, s: *AccState, end: KeyEnd, value_view: ColumnView, key_view: ColumnView, row_start: u32, row_end: u32) !void {
     var r: u32 = row_start;
     while (r < row_end) : (r += 1) {
         if (!key_view.isValid(r)) continue;
-        if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != .gt) continue;
+        if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != end.replaces()) continue;
         try replaceMaxBy(bank, aa, s, value_view, key_view, r);
     }
 }
@@ -529,9 +553,9 @@ fn replaceMaxBy(bank: *StringBank, aa: Allocator, s: *AccState, value_view: Colu
 /// Row loop of the narrow MAX_BY scatter, specialized per key slice type and
 /// payload kind (`vs`: a scalar slice, a `StringView`, or `{}` for
 /// MAX_BY_KEY). Same rules as `maxByUpdate`: a row with a NULL key is
-/// skipped, a strictly greater key replaces the cell (a NULL value included),
-/// ties keep the first.
-fn maxByNarrowRows(bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: []const u32, key_view: ColumnView, ks: anytype, value_view: ColumnView, vs: anytype) !void {
+/// skipped, a strictly greater (MIN_BY: lesser) key replaces the cell (a NULL
+/// value included), ties keep the first.
+fn maxByNarrowRows(comptime end: KeyEnd, bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: []const u32, key_view: ColumnView, ks: anytype, value_view: ColumnView, vs: anytype) !void {
     const V = @TypeOf(vs);
     const key_nulls = key_view.nulls != null;
     const value_nulls = value_view.nulls != null;
@@ -539,7 +563,7 @@ fn maxByNarrowRows(bank: *StringBank, aa: Allocator, col: []MaxByNarrow, gids: [
         if (key_nulls and !key_view.isValid(r)) continue;
         const k: i64 = ks[r];
         const s = &col[g];
-        if (s.seen and k <= s.key) continue;
+        if (s.seen and (if (end == .max) k <= s.key else k >= s.key)) continue;
         s.key = k;
         s.val_null = value_nulls and !value_view.isValid(r);
         if (V == storage.StringView) {
@@ -708,8 +732,8 @@ fn aggColKind(func: AggFunc, in: ?Type, key_t: ?Type) AggColKind {
         // `types.Value`-carrying AccState. Float / 128-bit keys or payloads
         // and `.last` (overwrites, so it is not a first-wins load) stay wide.
         .any_value, .first => if (in != null and narrowPayload(in.?)) .value_narrow else .other,
-        .max_by => if (key_t != null and narrowScalar(key_t.?) and in != null and narrowPayload(in.?)) .max_by_narrow else .other,
-        .max_by_key => if (key_t != null and narrowScalar(key_t.?)) .max_by_narrow else .other,
+        .max_by, .min_by => if (key_t != null and narrowScalar(key_t.?) and in != null and narrowPayload(in.?)) .max_by_narrow else .other,
+        .max_by_key, .min_by_key => if (key_t != null and narrowScalar(key_t.?)) .max_by_narrow else .other,
         else => .other,
     };
 }
@@ -1867,8 +1891,10 @@ pub const Aggregate = struct {
                         try updateStateRow(aa_state, &self.str_bank, s, a, batch, self.agg_col_indices[ai], r);
                     }
                 },
-                .max_by, .max_by_key => switch (self.agg_cols[ai]) {
-                    .max_by_narrow => |col| try self.scatterMaxByNarrow(col, ai, a.func == .max_by_key, gids, batch, aa_state),
+                .max_by, .max_by_key, .min_by, .min_by_key => switch (self.agg_cols[ai]) {
+                    .max_by_narrow => |col| switch (KeyEnd.of(a.func)) {
+                        inline else => |end| try self.scatterMaxByNarrow(end, col, ai, byKeyOnly(a.func), gids, batch, aa_state),
+                    },
                     else => try self.scatterMaxBy(ai, gids, batch, aa_state),
                 },
                 .any_value, .first => switch (self.agg_cols[ai]) {
@@ -2003,11 +2029,12 @@ pub const Aggregate = struct {
         const key_view = batch.values[self.agg_key_indices[ai].?];
         const value_view = batch.values[self.agg_col_indices[ai].?];
         const col = self.agg_cols[ai].other;
+        const replaces = KeyEnd.of(self.aggs[ai].func).replaces();
         var r: u32 = 0;
         while (r < gids.len) : (r += 1) {
             if (!key_view.isValid(r)) continue;
             const s = &col[gids[r]];
-            if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != .gt) continue;
+            if (s.max_by) |m| if (rowVsValue(key_view, r, m.key) != replaces) continue;
             try replaceMaxBy(&self.str_bank, aa, s, value_view, key_view, r);
         }
     }
@@ -2033,16 +2060,16 @@ pub const Aggregate = struct {
     /// branch; the payload is the widened scalar or a copy of the string bytes
     /// in `str_bank`. MAX_BY_KEY only tracks the key, so its payload column
     /// contributes validity alone and may be any type.
-    fn scatterMaxByNarrow(self: *Aggregate, col: []MaxByNarrow, ai: usize, key_only: bool, gids: []const u32, batch: Batch, aa: Allocator) !void {
+    fn scatterMaxByNarrow(self: *Aggregate, comptime end: KeyEnd, col: []MaxByNarrow, ai: usize, key_only: bool, gids: []const u32, batch: Batch, aa: Allocator) !void {
         const key_view = batch.values[self.agg_key_indices[ai].?];
         const value_view = batch.values[self.agg_col_indices[ai].?];
         switch (key_view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |ks| {
                 if (key_only) {
-                    try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, {});
+                    try maxByNarrowRows(end, &self.str_bank, aa, col, gids, key_view, ks, value_view, {});
                 } else switch (value_view.data) {
-                    inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
-                    inline .varchar, .string, .char, .json, .nested, .bitmap => |vs| try maxByNarrowRows(&self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vs| try maxByNarrowRows(end, &self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
+                    inline .varchar, .string, .char, .json, .nested, .bitmap => |vs| try maxByNarrowRows(end, &self.str_bank, aa, col, gids, key_view, ks, value_view, vs),
                     else => unreachable,
                 }
             },
@@ -2493,7 +2520,7 @@ pub const Aggregate = struct {
         if (!s.seen) return .{ .max_by = null };
         const up_schema = self.upstream.outputSchema();
         const key_t = up_schema[self.agg_key_indices[ai].?].type;
-        const value: types.Value = if (self.aggs[ai].func == .max_by_key)
+        const value: types.Value = if (byKeyOnly(self.aggs[ai].func))
             .{ .int = 0 }
         else
             narrowValue(up_schema[self.agg_col_indices[ai].?].type, s.val, s.len);
@@ -3426,7 +3453,7 @@ pub fn initialState(func: AggFunc, in: ?Type) AccState {
         .bool_and => .{ .bool_acc = .{ .value = true } },
         .bool_or => .{ .bool_acc = .{ .value = false } },
         .any_value, .first, .last => .{ .value_acc = .{} },
-        .max_by, .max_by_key => .{ .max_by = null },
+        .max_by, .max_by_key, .min_by, .min_by_key => .{ .max_by = null },
         .bit_and, .bit_or, .bit_xor => .{ .bitwise = .{} },
         // The identity is already seen, so no rows give it.
         .unsigned_bit_and => .{ .bitwise = .{ .seen = true, .value = -1 } },
@@ -3577,7 +3604,7 @@ fn aggColStat(a: AggSpec, out_type: Type, src: ?exec.ColStat, upper_rows: u64) e
 fn takesWideDecimal(func: AggFunc) bool {
     return switch (func) {
         .count, .count_if, .count_distinct, .sum, .min, .max, .avg, .sum_distinct, .avg_distinct => true,
-        .any_value, .first, .last, .max_by, .max_by_key, .bool_and, .bool_or => true,
+        .any_value, .first, .last, .max_by, .max_by_key, .min_by, .min_by_key, .bool_and, .bool_or => true,
         .stddev_pop, .stddev_samp, .var_pop, .var_samp, .covar_pop, .covar_samp, .corr => true,
         else => false,
     };
@@ -3611,10 +3638,10 @@ fn aggOutputType(func: AggFunc, in: ?Type) !Type {
         },
         .percentile_disc => in orelse return Error.AggregateColumnRequired,
         .bool_and, .bool_or => .boolean,
-        .any_value, .first, .last, .max_by => in orelse return Error.AggregateColumnRequired,
+        .any_value, .first, .last, .max_by, .min_by => in orelse return Error.AggregateColumnRequired,
         // The output is the KEY column's type, unknowable from `in` —
         // internal producers must set `out_type_override`.
-        .max_by_key => Error.AggregateUnsupportedType,
+        .max_by_key, .min_by_key => Error.AggregateUnsupportedType,
         .bit_and, .bit_or, .bit_xor => .bigint,
         .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => .largeint,
         // Arrays concatenate into one array (ARRAY_AGG).
@@ -3688,7 +3715,7 @@ pub fn validateAggFn(func: AggFunc, in: ?Type, params: AggParams, arg2_in: ?Type
         .any_value, .first, .last => {
             _ = in orelse return Error.AggregateColumnRequired;
         },
-        .max_by, .max_by_key => {
+        .max_by, .max_by_key, .min_by, .min_by_key => {
             _ = in orelse return Error.AggregateColumnRequired;
             _ = arg2_in orelse return Error.AggregateColumnRequired;
         },
@@ -4159,10 +4186,10 @@ pub fn updateState(
         .any_value, .first, .last => {
             try valueUpdate(aa, bank, s, func, batch.values[col_idx.?], row_start, row_end);
         },
-        .max_by, .max_by_key => {
+        .max_by, .max_by_key, .min_by, .min_by_key => {
             const key_name = spec.arg2_col orelse return Error.AggregateColumnRequired;
             const key_idx = types.findColumn(batch.schema, key_name) orelse return Error.ColumnNotFound;
-            try maxByUpdate(aa, bank, s, batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
+            try maxByUpdate(aa, bank, s, KeyEnd.of(func), batch.values[col_idx.?], batch.values[key_idx], row_start, row_end);
         },
         .bit_and, .bit_or, .bit_xor, .unsigned_bit_and, .unsigned_bit_or, .unsigned_bit_xor => {
             try bitwiseUpdate(s, func, batch.values[col_idx.?], row_start, row_end);
@@ -5042,14 +5069,14 @@ pub fn appendAccToColumn(
                 is_null = true;
             } else try appendValueToColumn(allocator, col, out_type, v.value);
         },
-        .max_by => {
+        .max_by, .min_by => {
             const v = state.max_by;
             if (v == null or v.?.value_null) {
                 try col.data.appendNullPlaceholder(allocator);
                 is_null = true;
             } else try appendValueToColumn(allocator, col, out_type, v.?.value);
         },
-        .max_by_key => {
+        .max_by_key, .min_by_key => {
             if (state.max_by) |v| {
                 try appendValueToColumn(allocator, col, out_type, v.key);
             } else {

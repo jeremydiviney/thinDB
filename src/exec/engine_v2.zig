@@ -1678,7 +1678,7 @@ fn hasConcatAgg(aggs: []const exec.AggSpec) bool {
 }
 
 fn hasMaxByAgg(aggs: []const exec.AggSpec) bool {
-    for (aggs) |a| if (a.func == .max_by) return true;
+    for (aggs) |a| if (a.func == .max_by or a.func == .min_by) return true;
     return false;
 }
 
