@@ -1407,7 +1407,20 @@ pub const Parser = struct {
         if (self.cur.tag == .kw_group) {
             try self.advance();
             try self.expect(.kw_by);
+            // A GROUP BY condition's computed operand (`CASE WHEN id + 1 > 2`)
+            // anchors beside the SELECT list's, reading the column a SELECT
+            // item's copy of it reads, so the two copies are one tree.
+            const anchor_mark = self.predicate_derived.items.len;
+            try self.predicate_derived.appendSlice(self.arena, projection_predicate_derived);
+            const old_enabled = self.predicate_derived_enabled;
+            const old_scope = self.predicate_derived_scope;
+            self.predicate_derived_enabled = true;
+            self.predicate_derived_scope = anchor_mark;
+            defer self.predicate_derived_enabled = old_enabled;
+            defer self.predicate_derived_scope = old_scope;
+            defer self.predicate_derived.shrinkRetainingCapacity(anchor_mark);
             const clause = try self.parseGroupByClause();
+            projection_predicate_derived = try self.arena.dupe(ir.Derived, self.predicate_derived.items[anchor_mark..]);
             group_exprs = clause.exprs;
             grouping_sets = clause.sets;
         }
@@ -5443,23 +5456,27 @@ pub const Parser = struct {
     /// them, each under a name no column has, since a lateral call's Compute
     /// runs over the FROM items before it.
     fn parseExpandCall(self: *Parser, generator: ir.Op.Expand.Generator) ParseError!*ir.Op {
-        var derived: std.ArrayList(ir.Derived) = .empty;
         try self.expect(.lparen);
-        while (true) {
-            var arg = try self.parseValueExpr();
-            // A bare NULL parses as text; as a series argument it is a NULL
-            // integer.
-            if (arg == .null_lit and generator == .series) arg = .{ .null_lit = .bigint };
-            const name = try std.fmt.allocPrint(self.arena, "__expand_arg_{d}", .{derived.items.len});
-            try derived.append(self.arena, .{ .name = name, .expr = arg });
+        var values: std.ArrayList(ir.Expr) = .empty;
+        if (generator == .series and try self.namedArgumentAhead()) {
+            try values.appendSlice(self.arena, try self.parseSeriesNamedArgs());
+        } else while (true) {
+            try values.append(self.arena, try self.parseValueExpr());
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
         try self.expect(.rparen);
-        const n = derived.items.len;
+        const n = values.items.len;
         if (generator == .series and (n < 2 or n > 3)) return ParseError.SqlFunctionArgMismatch;
+        const derived = try self.arena.alloc(ir.Derived, n);
+        for (values.items, derived, 0..) |value, *d, i| {
+            // A bare NULL parses as text; as a series argument it is a NULL
+            // integer.
+            const arg: ir.Expr = if (value == .null_lit and generator == .series) .{ .null_lit = .bigint } else value;
+            d.* = .{ .name = try std.fmt.allocPrint(self.arena, "__expand_arg_{d}", .{i}), .expr = arg };
+        }
         const args = try self.arena.alloc([]const u8, n);
-        for (derived.items, args) |d, *name| name.* = d.name;
+        for (derived, args) |d, *name| name.* = d.name;
         const columns: []const []const u8 = switch (generator) {
             .series => &.{"generate_series"},
             .unnest => blk: {
@@ -5471,8 +5488,39 @@ pub const Parser = struct {
             },
         };
         const single = try self.allocOp(.{ .single_row = {} });
-        const compute = try self.allocOp(.{ .compute = .{ .derived = derived.items, .upstream = single } });
+        const compute = try self.allocOp(.{ .compute = .{ .derived = derived, .upstream = single } });
         return try self.allocOp(.{ .expand = .{ .upstream = compute, .generator = generator, .args = args, .columns = columns } });
+    }
+
+    /// Whether the call's arguments are named: `name =>` is next.
+    fn namedArgumentAhead(self: *Parser) ParseError!bool {
+        var look = self.lex.*;
+        return (try look.next()).tag == .fat_arrow;
+    }
+
+    /// `generate_series`'s arguments by name, in any order, as StarRocks
+    /// takes them: `start => 2, end => 5[, step => 2]`. Each is named at
+    /// most once, and start and end always.
+    fn parseSeriesNamedArgs(self: *Parser) ParseError![]const ir.Expr {
+        const names = [_][]const u8{ "start", "end", "step" };
+        var slots: [names.len]?ir.Expr = @splat(null);
+        while (true) {
+            if (self.cur.tag != .identifier and self.cur.tag != .kw_end) return ParseError.SqlExpectedIdent;
+            const name = self.cur.text;
+            try self.advance();
+            try self.expect(.fat_arrow);
+            const slot = for (names, 0..) |known, i| {
+                if (std.ascii.eqlIgnoreCase(name, known)) break i;
+            } else return ParseError.SqlFunctionArgMismatch;
+            if (slots[slot] != null) return ParseError.SqlFunctionArgMismatch;
+            slots[slot] = try self.parseValueExpr();
+            if (self.cur.tag != .comma) break;
+            try self.advance();
+        }
+        const series_start = slots[0] orelse return ParseError.SqlFunctionArgMismatch;
+        const series_end = slots[1] orelse return ParseError.SqlFunctionArgMismatch;
+        const step = slots[2] orelse return try self.arena.dupe(ir.Expr, &.{ series_start, series_end });
+        return try self.arena.dupe(ir.Expr, &.{ series_start, series_end, step });
     }
 
     /// `[AS] alias [(column, ...)]` after a generate_series or unnest call.
@@ -8013,7 +8061,7 @@ pub const Parser = struct {
                 }
                 try self.expect(.rparen);
             } else {
-                const e = try self.parseScalar();
+                const e = try self.parseValueExpr();
                 if (groupingConstructorArgs(e, "rollup")) |args| {
                     any_sets = true;
                     var mask: u64 = 0;
@@ -8082,11 +8130,11 @@ pub const Parser = struct {
 
     /// One set of `GROUPING SETS (...)`: `(a, b)`, `()` or a lone `a`.
     fn parseGroupingSet(self: *Parser, exprs: *std.ArrayList(ir.Expr)) ParseError!u64 {
-        if (self.cur.tag != .lparen) return self.groupKeyBit(exprs, try self.parseScalar());
+        if (self.cur.tag != .lparen) return self.groupKeyBit(exprs, try self.parseValueExpr());
         try self.advance();
         var mask: u64 = 0;
         while (self.cur.tag != .rparen) {
-            mask |= try self.groupKeyBit(exprs, try self.parseScalar());
+            mask |= try self.groupKeyBit(exprs, try self.parseValueExpr());
             if (self.cur.tag != .comma) break;
             try self.advance();
         }
@@ -8097,7 +8145,7 @@ pub const Parser = struct {
     /// The bit of grouping key `e` among `exprs`, adding it when new.
     fn groupKeyBit(self: *Parser, exprs: *std.ArrayList(ir.Expr), e: ir.Expr) ParseError!u64 {
         for (exprs.items, 0..) |known, i| {
-            if (exprEqual(known, e)) return @as(u64, 1) << @intCast(i);
+            if (exec_expr.eql(known, e)) return @as(u64, 1) << @intCast(i);
         }
         if (exprs.items.len == 64) return ParseError.SqlInvalidProjection;
         try exprs.append(self.arena, e);
@@ -8289,7 +8337,7 @@ pub const Parser = struct {
     /// key's column, so `YEAR(d) + 1` under `GROUP BY YEAR(d)` reads the
     /// grouped value rather than `d`, which the GroupBy doesn't keep.
     fn readHiddenKeys(self: *Parser, e: ir.Expr, hidden: []const ir.Derived) ParseError!ir.Expr {
-        for (hidden) |h| if (exprEqual(e, h.expr)) return .{ .col_ref = h.name };
+        for (hidden) |h| if (exec_expr.eql(e, h.expr)) return .{ .col_ref = h.name };
         switch (e) {
             .call => |c| {
                 const args = try self.arena.alloc(ir.Expr, c.args.len);
@@ -8409,7 +8457,7 @@ pub const Parser = struct {
             },
             else => {
                 for (proj, 0..) |p, i| switch (p.kind) {
-                    .expr => |e| if (exprEqual(e, ge)) return i,
+                    .expr => |e| if (exec_expr.eql(e, ge)) return i,
                     else => {},
                 };
                 return null;
@@ -9081,7 +9129,7 @@ fn exprHasGroupingCall(e: ir.Expr) bool {
 /// repeats, or the column a key groups on.
 fn groupKeyIndex(keys: anytype, arg: ir.Expr) ?usize {
     for (keys.exprs, 0..) |key, j| {
-        if (exprEqual(key, arg)) return j;
+        if (exec_expr.eql(key, arg)) return j;
     }
     if (arg == .col_ref) {
         for (keys.cols, 0..) |col, j| {
@@ -9104,23 +9152,6 @@ fn groupingColumnNames(arena: std.mem.Allocator, count: usize) ParseError![]cons
 /// A mask of the first `n` grouping keys.
 fn lowBits(n: usize) u64 {
     return if (n >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(n)) - 1;
-}
-
-fn exprEqual(a: ir.Expr, b: ir.Expr) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .col_ref => |x| std.ascii.eqlIgnoreCase(x, b.col_ref),
-        .lit => |x| valueEqual(x, b.lit),
-        .null_lit => |x| std.meta.eql(x, b.null_lit),
-        .call => |x| blk: {
-            const y = b.call;
-            if (!std.mem.eql(u8, x.fn_name, y.fn_name)) break :blk false;
-            if (x.args.len != y.args.len) break :blk false;
-            for (x.args, y.args) |xa, ya| if (!exprEqual(xa, ya)) break :blk false;
-            break :blk true;
-        },
-        else => false,
-    };
 }
 
 /// An integer literal past BIGINT in an expression: DECIMAL(n,0) as in
@@ -9166,27 +9197,6 @@ fn fractionalLiteral(arena: std.mem.Allocator, text: []const u8, value: f64) Par
     const dot = std.mem.indexOfScalar(u8, text, '.') orelse return .{ .lit = .{ .double = value } };
     if (std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > types.max_decimal_precision) return .{ .lit = .{ .double = value } };
     return try exec_expr.decimalLiteralExpr(arena, text, @intCast(text.len - 1), @intCast(text.len - dot - 1));
-}
-
-fn valueEqual(a: @import("../types.zig").Value, b: @import("../types.zig").Value) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .text => |s| std.mem.eql(u8, s, b.text),
-        .boolean => |x| x == b.boolean,
-        .float => |x| x == b.float,
-        .double => |x| x == b.double,
-        .uuid => |x| x == b.uuid,
-        .int => |x| x == b.int,
-        .bigint => |x| x == b.bigint,
-        .smallint => |x| x == b.smallint,
-        .tinyint => |x| x == b.tinyint,
-        .largeint => |x| x == b.largeint,
-        .date => |x| x == b.date,
-        .datetime => |x| x == b.datetime,
-        .decimal64 => |x| x == b.decimal64,
-        .decimal128 => |x| x == b.decimal128,
-        .decimal256 => |x| x == b.decimal256,
-    };
 }
 
 /// Lower the window ProjItems collected from a SELECT into a single
