@@ -67,6 +67,7 @@ pub const ElemClass = enum(u8) {
     boolean = 9,
     bytes = 10,
     nested = 11,
+    i256 = 12,
 
     pub fn of(t: Type) ElemClass {
         return switch (t) {
@@ -75,6 +76,7 @@ pub const ElemClass = enum(u8) {
             .int, .date => .i32,
             .bigint, .datetime, .decimal64 => .i64,
             .largeint, .decimal128 => .i128,
+            .decimal256 => .i256,
             .uuid => .u128,
             .float => .f32,
             .double => .f64,
@@ -91,6 +93,7 @@ pub const ElemClass = enum(u8) {
             .i32, .f32 => 4,
             .i64, .f64 => 8,
             .i128, .u128 => 16,
+            .i256 => 32,
             .bytes, .nested => null,
         };
     }
@@ -395,8 +398,8 @@ const ViewKeys = struct {
         const iv = self.view.isValid(i);
         const jv = self.view.isValid(j);
         if (!iv or !jv) return if (iv == jv) .eq else if (iv) .gt else .lt;
-        var bi: [16]u8 = undefined;
-        var bj: [16]u8 = undefined;
+        var bi: [ELEMENT_BYTES_MAX]u8 = undefined;
+        var bj: [ELEMENT_BYTES_MAX]u8 = undefined;
         return elementOrder(classOfView(self.view), elementBytes(self.view, i, &bi), elementBytes(self.view, j, &bj));
     }
 };
@@ -475,6 +478,7 @@ fn classOfView(v: ColumnView) ElemClass {
         .int, .date => .i32,
         .bigint, .datetime, .decimal64 => .i64,
         .largeint, .decimal128 => .i128,
+        .decimal256 => .i256,
         .uuid => .u128,
         .float => .f32,
         .double => .f64,
@@ -484,8 +488,11 @@ fn classOfView(v: ColumnView) ElemClass {
     };
 }
 
+/// The widest fixed element, a DECIMAL256's 32 bytes.
+pub const ELEMENT_BYTES_MAX = 32;
+
 /// Row `row` of `v` as an array stores it as an element.
-pub fn elementBytes(v: ColumnView, row: usize, buf: *[16]u8) []const u8 {
+pub fn elementBytes(v: ColumnView, row: usize, buf: *[ELEMENT_BYTES_MAX]u8) []const u8 {
     const w = classOfView(v).width() orelse return varBytes(v, row);
     writeFixed(buf[0..w], v, row);
     return buf[0..w];
@@ -698,7 +705,7 @@ pub fn appendStruct(allocator: Allocator, out: *std.ArrayList(u8), fields: []con
     for (values, 0..) |v, i| {
         if (v.isValid(row)) {
             out.items[vb_at + (i >> 3)] |= @as(u8, 1) << @intCast(i & 7);
-            var buf: [16]u8 = undefined;
+            var buf: [ELEMENT_BYTES_MAX]u8 = undefined;
             try out.appendSlice(allocator, elementBytes(v, row, &buf));
         }
         std.mem.writeInt(u32, out.items[offsets_at + 4 * (i + 1) ..][0..4], @intCast(out.items.len - data_at), .little);
@@ -863,6 +870,7 @@ pub fn elementOrder(class: ElemClass, x: []const u8, y: []const u8) std.math.Ord
         .i64 => std.math.order(std.mem.readInt(i64, x[0..8], .little), std.mem.readInt(i64, y[0..8], .little)),
         .i128 => std.math.order(std.mem.readInt(i128, x[0..16], .little), std.mem.readInt(i128, y[0..16], .little)),
         .u128 => std.math.order(std.mem.readInt(u128, x[0..16], .little), std.mem.readInt(u128, y[0..16], .little)),
+        .i256 => std.math.order(std.mem.readInt(i256, x[0..32], .little), std.mem.readInt(i256, y[0..32], .little)),
         .f32 => types.floatOrder(@as(f32, @bitCast(std.mem.readInt(u32, x[0..4], .little))), @as(f32, @bitCast(std.mem.readInt(u32, y[0..4], .little)))),
         .f64 => types.floatOrder(@as(f64, @bitCast(std.mem.readInt(u64, x[0..8], .little))), @as(f64, @bitCast(std.mem.readInt(u64, y[0..8], .little)))),
         .bytes => std.mem.order(u8, x, y),
@@ -931,7 +939,7 @@ fn appendSlotText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, a: Arr
 }
 
 fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw: []const u8, style: TextStyle) TextError!void {
-    var buf: [64]u8 = undefined;
+    var buf: [dec.DECIMAL_TEXT_MAX]u8 = undefined;
     switch (t) {
         .nested => {
             // A map or struct element of a PostgreSQL array is a quoted
@@ -971,6 +979,7 @@ fn appendElementText(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
         },
         .decimal64 => |spec| try out.appendSlice(allocator, dec.formatDecimal(&buf, std.mem.readInt(i64, raw[0..8], .little), spec.s)),
         .decimal128 => |spec| try out.appendSlice(allocator, dec.formatDecimal(&buf, std.mem.readInt(i128, raw[0..16], .little), spec.s)),
+        .decimal256 => |spec| try out.appendSlice(allocator, dec.formatDecimal(&buf, std.mem.readInt(i256, raw[0..32], .little), spec.s)),
         .tinyint => try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{@as(i8, @bitCast(raw[0]))})),
         .smallint => try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{std.mem.readInt(i16, raw[0..2], .little)})),
         .int => try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{std.mem.readInt(i32, raw[0..4], .little)})),
@@ -1266,7 +1275,7 @@ fn appendSlotJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, a: Arr
 }
 
 fn appendElementJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw: []const u8) JsonError!void {
-    var buf: [64]u8 = undefined;
+    var buf: [dec.DECIMAL_TEXT_MAX]u8 = undefined;
     switch (t) {
         .nested => try appendJson(allocator, out, t, raw),
         .bitmap => return error.NotJson,
@@ -1304,6 +1313,7 @@ fn appendElementJson(allocator: Allocator, out: *std.ArrayList(u8), t: Type, raw
         },
         .decimal64 => |spec| try json_binary.appendNumber(allocator, out, .decimal, dec.formatDecimal(&buf, std.mem.readInt(i64, raw[0..8], .little), spec.s)),
         .decimal128 => |spec| try json_binary.appendNumber(allocator, out, .decimal, dec.formatDecimal(&buf, std.mem.readInt(i128, raw[0..16], .little), spec.s)),
+        .decimal256 => |spec| try json_binary.appendNumber(allocator, out, .decimal, dec.formatDecimal(&buf, std.mem.readInt(i256, raw[0..32], .little), spec.s)),
         .date, .datetime, .uuid => {
             var text: std.ArrayList(u8) = .empty;
             defer text.deinit(allocator);
@@ -1452,7 +1462,8 @@ fn appendTextElement(allocator: Allocator, out: *ColumnStore, t: Type, text: []c
         .date => |*l| try l.append(allocator, common.textToDate(text) orelse return false),
         .datetime => |*l| try l.append(allocator, common.textToDatetime(text) orelse return false),
         .decimal64 => |*l| try l.append(allocator, std.math.cast(i64, dec.textConstantMantissa(text, t.decimalSpec().?) orelse return false) orelse return false),
-        .decimal128 => |*l| try l.append(allocator, dec.textConstantMantissa(text, t.decimalSpec().?) orelse return false),
+        .decimal128 => |*l| try l.append(allocator, std.math.cast(i128, dec.textConstantMantissa(text, t.decimalSpec().?) orelse return false) orelse return false),
+        .decimal256 => |*l| try l.append(allocator, dec.textConstantMantissa(text, t.decimalSpec().?) orelse return false),
         .uuid => |*l| try l.append(allocator, parseUuid(text) orelse return false),
         inline .tinyint, .smallint, .int, .bigint, .largeint => |*l| {
             const T = std.meta.Elem(@TypeOf(l.items));

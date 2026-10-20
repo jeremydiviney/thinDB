@@ -110,7 +110,7 @@ fn minMaxIntEligible(t: Type) bool {
 }
 
 fn welfordEligible(t: Type) bool {
-    return t.isInteger() or t.isDecimal() or t == .boolean or t == .float or t == .double;
+    return t.isInteger() or (t.isDecimal() and t != .decimal256) or t == .boolean or t == .float or t == .double;
 }
 
 /// The compact state of aggregate `a` over input column `in_col` (null for
@@ -119,12 +119,14 @@ fn welfordEligible(t: Type) bool {
 fn compactKind(a: AggSpec, in_col: ?types.Column) ?CompactKind {
     return switch (a.func) {
         .count => .count,
+        // A DECIMAL256 overflows the i128 sum words.
         .sum => blk: {
             const nullable = in_col.?.nullable;
+            if (in_col.?.type == .decimal256) break :blk null;
             if (in_col.?.type.isFloat()) break :blk if (nullable) .sum_float_null else .sum_float;
             break :blk if (nullable) .sum_int_null else .sum_int;
         },
-        .avg => .avg,
+        .avg => if (in_col.?.type == .decimal256) null else .avg,
         .min, .max => blk: {
             const t = in_col.?.type;
             if (minMaxIntEligible(t)) break :blk if (a.func == .min) .min_int else .max_int;
@@ -1622,7 +1624,7 @@ pub const RadixLeaseAggregate = struct {
     fn appendColumnRows(aa: Allocator, src: ColumnView, rows: []const usize, out: *ColumnStore) !void {
         const dst_start = out.rowCount();
         switch (src.data) {
-            inline .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .largeint, .decimal64, .decimal128, .float, .double => |sl, tag| {
+            inline .int, .bigint, .smallint, .tinyint, .boolean, .date, .datetime, .largeint, .decimal64, .decimal128, .decimal256, .float, .double => |sl, tag| {
                 const list = &@field(out.data, @tagName(tag));
                 try list.ensureUnusedCapacity(aa, rows.len);
                 for (rows) |r| list.appendAssumeCapacity(sl[r]);

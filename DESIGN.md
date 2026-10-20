@@ -66,7 +66,7 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 | | `LARGEINT` | i128 |
 | Float | `FLOAT` | f32 |
 | | `DOUBLE` | f64 |
-| Decimal | `DECIMAL(p, s)` | i64 (`p ≤ 18`) or i128 (`p ≤ 38`). `p` is total digits, `s` is digits after the decimal point. |
+| Decimal | `DECIMAL(p, s)` | i64 (`p ≤ 18`), i128 (`p ≤ 38`) or i256 (`p ≤ 76`). `p` is total digits, `s` is digits after the decimal point. |
 | String | `CHAR(N)` | Fixed-width bytes |
 | | `VARCHAR(N)` | Variable-width bytes. `N` is recorded but not enforced: a longer value is stored whole, as in DuckDB |
 | | `STRING` | Variable-width bytes, unbounded (effective limit: 64 MB / value) |
@@ -86,7 +86,7 @@ global state, a deliberate exception: shapes are immutable, so every
 
 `TYPEOF(x)` names x's type as StarRocks does: `varchar` for any text, a
 decimal by the width its precision implies (`decimal32(9, 2)`,
-`decimal128(19, 2)`), and nested types spelled out (`map<int,varchar>`,
+`decimal128(19, 2)`, `decimal256(50, 15)`), and nested types spelled out (`map<int,varchar>`,
 `struct<a int, b date>`). An integer literal is an INT here, where
 StarRocks types it by size, so `TYPEOF(1)` is `int`, not `tinyint`.
 
@@ -345,7 +345,9 @@ MySQL DDL type names without a type of their own map onto the table above:
 - `TIME` is `STRING`, holding the `HH:MM:SS[.ffffff]` text.
 - `ENUM` and `SET` are `STRING`; their label lists are not enforced.
 
-StarRocks' `DECIMAL32(p, s)`, `DECIMAL64(p, s)` and `DECIMAL128(p, s)` are `DECIMAL(p, s)`, in DDL and CAST. The precision is required and at most 9, 18 or 38, the digits the named width holds.
+StarRocks' `DECIMAL32(p, s)`, `DECIMAL64(p, s)`, `DECIMAL128(p, s)` and `DECIMAL256(p, s)` are `DECIMAL(p, s)`, in DDL and CAST. The precision is required and at most 9, 18, 38 or 76, the digits the named width holds.
+
+A DECIMAL past 38 digits is a DECIMAL256. Its blocks are raw 32-byte mantissas with no min/max stats, so no zone map or stats lane sees it; a key Bloom filter does. The generic aggregate, window, sort and join paths carry it; the specialized aggregate lanes (V2 handlers, radix, region, top-N) decline it to the generic path. AVG, VAR, STDDEV and CORR over it are DOUBLE, as over every decimal, and so lose digits past a double's 17.
 
 A TIME function (`HOUR`, `TIME_TO_SEC`, `TIME`, `TIMEDIFF`, `ADDTIME` and the rest) reads a number argument as MySQL does. It reads the `HHMMSS` digits, or a DATETIME from 14 digits on. A number past 838:59:59, or one whose minute or second is past 59, is no TIME and gives NULL. Text past the range clamps to 838:59:59 instead.
 
@@ -437,11 +439,13 @@ literal as its digits, which a DECIMAL column reads exactly; rows with an
 expression cell are read as expressions, where every fraction is its
 DECIMAL. The exponent form
 (`1e3`, `2.5E-3`, `6.02e+23`) is DOUBLE, and so is a literal of more than
-38 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
+76 digits. A literal beyond the DOUBLE range (`1e400`) is an error, not ±inf.
 An integer literal past BIGINT is DECIMAL(n,0) of its digits. Past 38
 digits it is LARGEINT while it fits, as StarRocks types it
-(`170141183460469231731687303715884105727`), and DOUBLE after that; MySQL
-keeps DECIMAL to 65 digits, but thinDB's DECIMAL stops at 38.
+(`170141183460469231731687303715884105727`), then DECIMAL(n,0) again to 76
+digits, and DOUBLE after that (MySQL's own DECIMAL stops at 65). An INSERT's
+literal row writes an integer past LARGEINT as its digits, as it does an
+inexact fraction.
 `-9223372036854775808` is BIGINT, as in MySQL.
 
 In the MySQL dialect a hex literal (`0x41`, `X'41'`) is a byte string, as
@@ -579,10 +583,12 @@ infinite operand or an overflow still gives ±inf.
 | Any integer type up to `BIGINT` | `BIGINT`. Wraps on overflow, like the operators. |
 | `LARGEINT` | `LARGEINT` |
 | `FLOAT`, `DOUBLE` | `DOUBLE` |
-| `DECIMAL(p, s)` | `DECIMAL(38, s)`. Errors at the i128 ceiling. |
+| `DECIMAL(p, s)`, `p ≤ 38` | `DECIMAL(38, s)`. Errors at the i128 ceiling. |
+| `DECIMAL(p, s)`, `p > 38` | `DECIMAL(76, s)`. Errors at the i256 ceiling. |
 
 Every SUM path (generic, V2 handlers, radix, region, SMA metadata, affine
-reduction) accumulates exactly in i128 and truncates to BIGINT at emit. That
+reduction) accumulates exactly in i128 and truncates to BIGINT at emit. A
+DECIMAL256 SUM runs only on the generic path, in an i256. That
 equals the wrapped sum, because truncation commutes with addition mod 2^64.
 ORDER BY and HAVING on a SUM see the emitted, wrapped value. `AVG` divides the
 exact sum and returns `DOUBLE`. `MIN`/`MAX` return the input type. `COUNT`
@@ -743,7 +749,7 @@ one instead of adding its own:
 | `DECIMAL(p1, s1) * DECIMAL(p2, s2)` | `DECIMAL(p1 + p2, s1 + s2)` |
 | `DECIMAL(p1, s1) / DECIMAL(p2, s2)` | `DECIMAL(p1 - s1 + s2 + s, s)`, where `s` is `s1 + 6` up to `s1 = 6`, then `max(s1, 12)` |
 
-Result precisions exceeding 38 are clamped to 38, with overflow → error rather than truncation. Mixed decimal/integer arithmetic promotes the integer to decimal first.
+Result precisions are clamped to 38 while every operand has at most 38 digits, so arithmetic over the narrower decimals stays in an i128, and to 76 once an operand has more. A result past its precision is an overflow error rather than truncation. COALESCE, IF, CASE, GREATEST, LEAST and array literals take the same cap: their common type over ≤38-digit operands stays at 38 digits. Mixed decimal/integer arithmetic promotes the integer to decimal first.
 
 The quotient's scale is StarRocks'. Only the dividend's scale decides it, and an integer dividend counts as scale 0, so `7 / CAST(3 AS DECIMAL(16,6))` is 2.333333, and a DECIMAL(16,6) over any decimal has scale 12. MySQL adds 4 digits instead (`div_precision_increment`). A ROUND over a quotient sees those digits, so `ROUND(3953 / 0.855350)` is 4621 here and in StarRocks (4621.499971), where a 4-digit quotient (4621.5000) would round to 4622.
 
@@ -2158,7 +2164,7 @@ Errors propagate to callers. Outside the XA commit protocol, an error is not a b
 | Limit | v1 value |
 |---|---|
 | Max columns per table | 1,024 |
-| Max precision for DECIMAL | 38 |
+| Max precision for DECIMAL | 76 |
 | Max string value | 64 MB |
 | Max segments per table | 2^32 |
 | Max rows per segment | 2^32 |

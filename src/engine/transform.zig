@@ -81,6 +81,7 @@ fn columnRowOrder(col: ColumnStore, a: u32, b: u32, comptime json_values: bool) 
         .datetime => |l| std.math.order(l.items[a], l.items[b]),
         .decimal64 => |l| std.math.order(l.items[a], l.items[b]),
         .decimal128 => |l| std.math.order(l.items[a], l.items[b]),
+        .decimal256 => |l| std.math.order(l.items[a], l.items[b]),
         .uuid => |l| std.math.order(l.items[a], l.items[b]),
     };
 }
@@ -114,6 +115,7 @@ fn viewRowOrder(va: ColumnView, a: usize, vb: ColumnView, b: usize, comptime jso
         .datetime => |l| std.math.order(l[a], vb.data.datetime[b]),
         .decimal64 => |l| std.math.order(l[a], vb.data.decimal64[b]),
         .decimal128 => |l| std.math.order(l[a], vb.data.decimal128[b]),
+        .decimal256 => |l| std.math.order(l[a], vb.data.decimal256[b]),
         .uuid => |l| std.math.order(l[a], vb.data.uuid[b]),
     };
 }
@@ -160,6 +162,7 @@ pub fn subViewAligned(v: ColumnView, off: usize, n: usize) ColumnView {
         .largeint => |s| .{ .data = .{ .largeint = s[off..][0..n] }, .nulls = nulls },
         .decimal64 => |s| .{ .data = .{ .decimal64 = s[off..][0..n] }, .nulls = nulls },
         .decimal128 => |s| .{ .data = .{ .decimal128 = s[off..][0..n] }, .nulls = nulls },
+        .decimal256 => |s| .{ .data = .{ .decimal256 = s[off..][0..n] }, .nulls = nulls },
         .uuid => |s| .{ .data = .{ .uuid = s[off..][0..n] }, .nulls = nulls },
         .varchar => |sv| .{ .data = .{ .varchar = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
         .string => |sv| .{ .data = .{ .string = .{ .offsets = sv.offsets[off..][0 .. n + 1], .bytes = sv.bytes } }, .nulls = nulls },
@@ -238,6 +241,10 @@ pub fn appendAllColumn(
             .decimal128 => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
         },
+        .decimal256 => |s| switch (out.data) {
+            .decimal256 => |*list| try list.appendSlice(allocator, s),
+            else => unreachable,
+        },
         .uuid => |s| switch (out.data) {
             .uuid => |*list| try list.appendSlice(allocator, s),
             else => unreachable,
@@ -310,6 +317,10 @@ pub fn appendColumnRange(
         },
         .decimal128 => |s| switch (out.data) {
             .decimal128 => |*list| try list.appendSlice(allocator, s[start..end]),
+            else => unreachable,
+        },
+        .decimal256 => |s| switch (out.data) {
+            .decimal256 => |*list| try list.appendSlice(allocator, s[start..end]),
             else => unreachable,
         },
         .uuid => |s| switch (out.data) {
@@ -407,6 +418,7 @@ pub fn writeAppendSlice(view: ColumnView, lo: usize, hi: usize, out: *ColumnStor
         .tinyint => |s| writeFixedSlice(i8, s, lo, hi, out, prep),
         .smallint => |s| writeFixedSlice(i16, s, lo, hi, out, prep),
         inline .largeint, .decimal128 => |s| writeFixedSlice(i128, s, lo, hi, out, prep),
+        inline .decimal256 => |s| writeFixedSlice(i256, s, lo, hi, out, prep),
         .uuid => |s| writeFixedSlice(u128, s, lo, hi, out, prep),
     }
     if (out.nulls) |nb| {
@@ -548,6 +560,10 @@ pub fn appendOneRow(
         },
         .decimal128 => |s| switch (out.data) {
             .decimal128 => |*list| try list.append(allocator, s[row]),
+            else => unreachable,
+        },
+        .decimal256 => |s| switch (out.data) {
+            .decimal256 => |*list| try list.append(allocator, s[row]),
             else => unreachable,
         },
         .uuid => |s| switch (out.data) {
@@ -801,6 +817,13 @@ pub fn appendByIndices(
             },
             else => unreachable,
         },
+        .decimal256 => |s| switch (out.data) {
+            .decimal256 => |*list| {
+                try list.ensureUnusedCapacity(allocator, indices.len);
+                for (indices) |idx| list.appendAssumeCapacity(s[idx]);
+            },
+            else => unreachable,
+        },
         .uuid => |s| switch (out.data) {
             .uuid => |*list| {
                 try list.ensureUnusedCapacity(allocator, indices.len);
@@ -1027,6 +1050,10 @@ fn appendMaskedValues(
             .decimal128 => |*list| try compactInto(i128, allocator, s, mask, list),
             else => return error.ColumnTypeMismatch,
         },
+        .decimal256 => |s| switch (out.data) {
+            .decimal256 => |*list| try compactInto(i256, allocator, s, mask, list),
+            else => return error.ColumnTypeMismatch,
+        },
         .uuid => |s| switch (out.data) {
             .uuid => |*list| try compactInto(u128, allocator, s, mask, list),
             else => return error.ColumnTypeMismatch,
@@ -1221,6 +1248,12 @@ pub fn applyPermutation(
             errdefer dst.deinit(allocator);
             for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
             break :blk DataStore{ .decimal128 = dst };
+        },
+        .decimal256 => |l| blk: {
+            var dst: std.ArrayList(i256) = try .initCapacity(allocator, perm.len);
+            errdefer dst.deinit(allocator);
+            for (perm) |p| dst.appendAssumeCapacity(l.items[p]);
+            break :blk DataStore{ .decimal256 = dst };
         },
         .uuid => |l| blk: {
             var dst: std.ArrayList(u128) = try .initCapacity(allocator, perm.len);

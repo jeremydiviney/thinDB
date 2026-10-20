@@ -960,16 +960,17 @@ fn isFloatType(typ: Type) bool {
     return typ == .float or typ == .double;
 }
 
-// Map a COUNT(DISTINCT) column type to its key-derivation kind. Exhaustive: the
-// handler supports distinct over every column type, so it never declines on type
-// grounds. A new Type variant breaks this switch — a deliberate compile-time
-// prompt to pick its distinct keying.
-fn distinctKindFor(typ: Type) DistinctKind {
+// Map a COUNT(DISTINCT) column type to its key-derivation kind, or null for a
+// DECIMAL256, whose 256 bits no key kind holds (the generic aggregate counts
+// it). Exhaustive: a new Type variant breaks this switch — a deliberate
+// compile-time prompt to pick its distinct keying.
+fn distinctKindFor(typ: Type) ?DistinctKind {
     return switch (typ) {
         .boolean, .tinyint, .smallint, .int, .bigint, .date, .datetime, .decimal64 => .int,
         .largeint, .decimal128, .uuid => .wide,
         .float, .double => .float,
         .varchar, .string, .char, .json, .nested, .bitmap => .string,
+        .decimal256 => null,
     };
 }
 
@@ -1164,7 +1165,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
                 },
                 .count_distinct => {
                     const ctyp = resolveAggInputType(table, probe_schema, agg.col.?) orelse return declineFree(allocator, plans, &needed);
-                    p.dkind = distinctKindFor(ctyp);
+                    p.dkind = distinctKindFor(ctyp) orelse return declineFree(allocator, plans, &needed);
                 },
                 .udf => {
                     const registry = request.udf_registry.?;

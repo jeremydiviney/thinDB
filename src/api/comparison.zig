@@ -52,6 +52,7 @@ pub fn evalRow(view: storage.ColumnView, row: u32, pred: exec.Predicate) bool {
         .char => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
         .decimal64 => |s| cmpVal(i64, s[row], pred.val.decimal64, pred.op),
         .decimal128 => |s| cmpVal(i128, s[row], pred.val.decimal128, pred.op),
+        .decimal256 => |s| cmpVal(i256, s[row], pred.val.decimal256, pred.op),
         .uuid => |s| cmpVal(u128, s[row], pred.val.uuid, pred.op),
         .json => |sv| cmpJson(sv.rowBytes(row), pred.val.text, pred.op),
         .nested => |sv| cmpStr(sv.rowBytes(row), pred.val.text, pred.op),
@@ -127,6 +128,11 @@ pub fn appendPredicateValueBytes(
         .largeint, .decimal128 => |v| {
             var b: [16]u8 = undefined;
             std.mem.writeInt(i128, &b, v, .little);
+            try buf.appendSlice(aa, &b);
+        },
+        .decimal256 => |v| {
+            var b: [32]u8 = undefined;
+            std.mem.writeInt(i256, &b, v, .little);
             try buf.appendSlice(aa, &b);
         },
         .decimal64 => |v| try storage.format.appendI64(aa, buf, v),

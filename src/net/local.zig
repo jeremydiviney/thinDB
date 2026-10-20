@@ -3431,9 +3431,10 @@ fn insertFillExpr(ctx: *CompileCtx, aa: Allocator, col: types.Column) !exec.Expr
     // before building its one batch; a streamed source has no such step.
     if (col.auto_increment) return Error.UnsupportedOp;
     if (col.default_value) |dv| {
-        const raw: i128 = switch (dv) {
+        const raw: i256 = switch (dv) {
             .decimal64 => |r| r,
             .decimal128 => |r| r,
+            .decimal256 => |r| r,
             else => return .{ .lit = dv },
         };
         // Compute has no decimal literal: rebuild the exact value from text.
@@ -3518,7 +3519,7 @@ fn coerceDefaultLiteral(dv: Value, col_type: types.Type) !Value {
         const s = std.mem.trim(u8, v.text, " ");
         v = switch (col_type) {
             .tinyint, .smallint, .int, .bigint, .largeint => .{ .bigint = std.fmt.parseInt(i64, s, 10) catch return Error.TypeMismatch },
-            .float, .double, .decimal64, .decimal128 => .{ .double = std.fmt.parseFloat(f64, s) catch return Error.TypeMismatch },
+            .float, .double, .decimal64, .decimal128, .decimal256 => .{ .double = std.fmt.parseFloat(f64, s) catch return Error.TypeMismatch },
             .boolean => .{ .boolean = std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "true") },
             else => v,
         };
@@ -4140,6 +4141,7 @@ pub const InsertColumnBuilder = struct {
                 .smallint => 2,
                 .tinyint, .boolean => 1,
                 .largeint, .decimal128, .uuid => 16,
+                .decimal256 => 32,
                 .varchar, .string, .char, .json, .nested, .bitmap => 0,
             };
             fixed_slabs[i] = if (per_row == 0)
@@ -4226,6 +4228,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.fixed_cursor[col_idx] / 2,
             .tinyint, .boolean => self.fixed_cursor[col_idx],
             .largeint, .decimal128, .uuid => self.fixed_cursor[col_idx] / 16,
+            .decimal256 => self.fixed_cursor[col_idx] / 32,
             .varchar, .string, .char, .json, .nested, .bitmap => self.string_offsets[col_idx].items.len - 1,
         };
     }
@@ -4237,6 +4240,7 @@ pub const InsertColumnBuilder = struct {
             .smallint => self.writeFixedZero(col_idx, 2),
             .tinyint, .boolean => self.writeFixedZero(col_idx, 1),
             .largeint, .decimal128, .uuid => self.writeFixedZero(col_idx, 16),
+            .decimal256 => self.writeFixedZero(col_idx, 32),
             .varchar, .string, .char, .json, .nested, .bitmap => {
                 const cur = self.string_offsets[col_idx].items[self.string_offsets[col_idx].items.len - 1];
                 try self.string_offsets[col_idx].append(self.allocator, cur);
@@ -4270,6 +4274,7 @@ pub const InsertColumnBuilder = struct {
             .datetime => self.writeFixedInt(col_idx, i64, try coerceToDateTime(v)),
             .decimal64 => |spec| self.writeFixedInt(col_idx, i64, try coerceToDecimal64(v, spec)),
             .decimal128 => |spec| self.writeFixedInt(col_idx, i128, try coerceToDecimal128(v, spec)),
+            .decimal256 => |spec| self.writeFixedInt(col_idx, i256, try coerceToDecimal256(v, spec)),
             .uuid => self.writeFixedInt(col_idx, u128, try coerceToUuid(v)),
             .varchar, .string, .char, .json, .nested, .bitmap => {
                 const sb = &self.string_bytes[col_idx];
@@ -4317,6 +4322,7 @@ pub const InsertColumnBuilder = struct {
                 .datetime => .{ .datetime = std.mem.bytesAsSlice(i64, self.fixed_slabs[i])[0..self.row_count] },
                 .decimal64 => .{ .decimal64 = std.mem.bytesAsSlice(i64, self.fixed_slabs[i])[0..self.row_count] },
                 .decimal128 => .{ .decimal128 = std.mem.bytesAsSlice(i128, self.fixed_slabs[i])[0..self.row_count] },
+                .decimal256 => .{ .decimal256 = std.mem.bytesAsSlice(i256, self.fixed_slabs[i])[0..self.row_count] },
                 .uuid => .{ .uuid = std.mem.bytesAsSlice(u128, self.fixed_slabs[i])[0..self.row_count] },
                 .varchar => .{ .varchar = .{
                     .offsets = self.string_offsets[i].items,
@@ -4385,7 +4391,7 @@ fn coerceToDecimal64(v: Value, spec: @import("../types.zig").DecimalSpec) !i64 {
     return switch (v) {
         .decimal64 => |d| d,
         inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try scaleIntToDecimal(i64, x, spec.s),
-        .float, .double, .text => std.math.cast(i64, try decimalLiteralMantissa(v, spec)) orelse error.ValueOutOfRange,
+        .float, .double, .text => std.math.cast(i64, try decimalLiteralMantissa(i128, v, spec)) orelse error.ValueOutOfRange,
         else => Error.TypeMismatch,
     };
 }
@@ -4395,7 +4401,18 @@ fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128
         .decimal64 => |d| @as(i128, d),
         .decimal128 => |d| d,
         inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try scaleIntToDecimal(i128, x, spec.s),
-        .float, .double, .text => try decimalLiteralMantissa(v, spec),
+        .float, .double, .text => try decimalLiteralMantissa(i128, v, spec),
+        else => Error.TypeMismatch,
+    };
+}
+
+fn coerceToDecimal256(v: Value, spec: @import("../types.zig").DecimalSpec) !i256 {
+    return switch (v) {
+        .decimal64 => |d| @as(i256, d),
+        .decimal128 => |d| d,
+        .decimal256 => |d| d,
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| try scaleIntToDecimal(i256, x, spec.s),
+        .float, .double, .text => try decimalLiteralMantissa(i256, v, spec),
         else => Error.TypeMismatch,
     };
 }
@@ -4403,18 +4420,18 @@ fn coerceToDecimal128(v: Value, spec: @import("../types.zig").DecimalSpec) !i128
 /// A float or text literal as a DECIMAL(p,s) column's mantissa, by the
 /// assignment rule: its digits (a double's shortest ones) rounded half away
 /// from zero to the scale, and ValueOutOfRange past the precision.
-fn decimalLiteralMantissa(v: Value, spec: @import("../types.zig").DecimalSpec) !i128 {
-    const d: exec_common.ScaledInt = switch (v) {
-        .float => |x| exec_common.floatDigits(x) orelse return error.ValueOutOfRange,
-        .double => |x| exec_common.floatDigits(x) orelse return error.ValueOutOfRange,
-        .text => |s| switch (exec_common.textNumber(s) orelse return Error.TypeMismatch) {
+fn decimalLiteralMantissa(comptime W: type, v: Value, spec: @import("../types.zig").DecimalSpec) !W {
+    const d: exec_common.ScaledIntOf(W) = switch (v) {
+        .float => |x| exec_common.floatDigitsOf(W, x) orelse return error.ValueOutOfRange,
+        .double => |x| exec_common.floatDigitsOf(W, x) orelse return error.ValueOutOfRange,
+        .text => |s| switch (exec_common.textNumberOf(W, s) orelse return Error.TypeMismatch) {
             .exact => |d| d,
-            .float => |f| exec_common.floatDigits(f) orelse return error.ValueOutOfRange,
+            .float => |f| exec_common.floatDigitsOf(W, f) orelse return error.ValueOutOfRange,
         },
         else => return Error.TypeMismatch,
     };
-    const m = exec_decimal.rescale(d.m, d.s, spec.s) orelse return error.ValueOutOfRange;
-    if (@abs(m) >= exec_decimal.pow10(spec.p)) return error.ValueOutOfRange;
+    const m = exec_decimal.rescaleOf(W, d.m, d.s, spec.s) orelse return error.ValueOutOfRange;
+    if (@abs(m) >= exec_decimal.pow10Of(W, spec.p)) return error.ValueOutOfRange;
     return m;
 }
 

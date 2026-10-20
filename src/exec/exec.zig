@@ -774,7 +774,7 @@ fn hashKeyBlock(view: ColumnView, start: usize, tuples: []u64, sketch: *KeySketc
             sketch.add(h);
             t.* = mixKey(t.* ^ h);
         },
-        inline .largeint, .decimal128, .uuid => |s| for (tuples, start..) |*t, r| {
+        inline .largeint, .decimal128, .decimal256, .uuid => |s| for (tuples, start..) |*t, r| {
             const h = if (view.isValid(r)) std.hash.Wyhash.hash(0, std.mem.asBytes(&s[r])) else NULL_KEY_HASH;
             sketch.add(h);
             t.* = mixKey(t.* ^ h);
@@ -1781,6 +1781,7 @@ pub const scalar_fn = @import("scalar_fn.zig");
 pub const ScalarFn = scalar_fn.ScalarFn;
 pub const nested = @import("nested.zig");
 pub const bitmap = @import("bitmap.zig");
+pub const decimal = @import("scalar_fn_decimal.zig");
 
 pub const compute_op = @import("compute.zig");
 pub const Compute = compute_op.Compute;

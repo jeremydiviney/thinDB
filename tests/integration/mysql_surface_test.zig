@@ -90,7 +90,7 @@ fn openDb(allocator: std.mem.Allocator, dir: anytype) !*thindb.Database {
     return db;
 }
 
-test "mysql literals: an integer past BIGINT is DECIMAL, then DOUBLE" {
+test "mysql literals: an integer past BIGINT is DECIMAL, LARGEINT past 38 digits, DECIMAL again, then DOUBLE" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -102,7 +102,8 @@ test "mysql literals: an integer past BIGINT is DECIMAL, then DOUBLE" {
     try expectText(allocator, db, "SELECT CAST(12345678901234567890 + 1 AS CHAR)", "12345678901234567891");
     try expectText(allocator, db, "SELECT CAST(-12345678901234567890 AS CHAR)", "-12345678901234567890");
     try expectType(allocator, db, "SELECT 9223372036854775808", .{ .decimal128 = .{ .p = 19, .s = 0 } });
-    try expectType(allocator, db, "SELECT 1234567890123456789012345678901234567890", .double);
+    try expectType(allocator, db, "SELECT 1234567890123456789012345678901234567890", .{ .decimal256 = .{ .p = 40, .s = 0 } });
+    try expectType(allocator, db, "SELECT 1" ++ "0" ** 76, .double);
     try expectType(allocator, db, "SELECT -9223372036854775808", .bigint);
     try expectBigint(allocator, db, "SELECT -9223372036854775808", std.math.minInt(i64));
     try expectBigint(allocator, db, "SELECT 9223372036854775807", std.math.maxInt(i64));

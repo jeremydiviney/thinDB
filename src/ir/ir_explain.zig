@@ -781,7 +781,7 @@ fn joinPredicates(allocator: Allocator, out: *std.ArrayList(u8), children: []con
 }
 
 fn writeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) anyerror!void {
-    var buf: [64]u8 = undefined;
+    var buf: [96]u8 = undefined;
     switch (v) {
         .int => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
         .bigint => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "{d}", .{x})),
@@ -802,6 +802,7 @@ fn writeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) anyerror!
         .datetime => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "datetime({d})", .{x})),
         .decimal64 => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "decimal64({d})", .{x})),
         .decimal128 => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "decimal128({d})", .{x})),
+        .decimal256 => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "decimal256({d})", .{x})),
         .uuid => |x| try out.appendSlice(allocator, try std.fmt.bufPrint(&buf, "uuid({d})", .{x})),
     }
 }

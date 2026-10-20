@@ -525,6 +525,12 @@ fn appendBinaryCell(
             try wire_format.formatDecimal(allocator, &buf, s[row], col.type);
             try packet.appendLenEncString(allocator, out, buf.items);
         },
+        .decimal256 => |s| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try wire_format.formatDecimal(allocator, &buf, s[row], col.type);
+            try packet.appendLenEncString(allocator, out, buf.items);
+        },
         .uuid => |s| {
             var buf: [40]u8 = undefined;
             const text = try wire_format.formatUuid(&buf, s[row]);

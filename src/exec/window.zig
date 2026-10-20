@@ -295,7 +295,7 @@ pub const Window = struct {
             if (sp.frame.kind == .range and (offset_bound(sp.frame.start) or offset_bound(sp.frame.end))) {
                 if (ocols.len != 1) return Error.WindowUnsupported;
                 switch (input_schema[ocols[0]].type) {
-                    .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128 => {},
+                    .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128, .decimal256 => {},
                     else => return Error.WindowUnsupported,
                 }
             }
@@ -2084,17 +2084,17 @@ pub const Window = struct {
                     if (saw_any) try writeDouble(out, perm[i], sum) else setNull(out, perm[i]);
                 }
             },
-            inline .decimal64, .decimal128 => |l| {
+            inline .decimal64, .decimal128, .decimal256 => |l| {
                 const items = l.items;
-                var sum: i128 = 0;
+                var sum: DecimalSum(@TypeOf(l.items)) = 0;
                 var saw_any = false;
                 var i: usize = p_start;
                 while (i < p_end) : (i += 1) {
                     if (isValid(view, perm[i])) {
-                        sum += @as(i128, items[perm[i]]);
+                        sum = try addDecimalSum(sum, items[perm[i]]);
                         saw_any = true;
                     }
-                    if (saw_any) try writeDecimal128(out, perm[i], sum) else setNull(out, perm[i]);
+                    if (saw_any) try writeDecimalSum(out, perm[i], sum) else setNull(out, perm[i]);
                 }
             },
             else => return Error.WindowUnsupported,
@@ -2126,18 +2126,18 @@ pub const Window = struct {
                     if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], sum / @as(f64, @floatFromInt(n)));
                 }
             },
-            inline .decimal64, .decimal128 => |l| {
+            inline .decimal64, .decimal128, .decimal256 => |l| {
                 const spec = self.input_schema[plan.value_col].type.decimalSpec().?;
                 const divisor = std.math.pow(f64, 10, @floatFromInt(spec.s));
                 const items = l.items;
-                var scaled_sum: i128 = 0;
+                var scaled_sum: DecimalSum(@TypeOf(l.items)) = 0;
                 var i: usize = p_start;
                 while (i < p_end) : (i += 1) {
                     if (isValid(view, perm[i])) {
-                        scaled_sum += @as(i128, items[perm[i]]);
+                        scaled_sum = try addDecimalSum(scaled_sum, items[perm[i]]);
                         n += 1;
                     }
-                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], @as(f64, @floatFromInt(scaled_sum)) / divisor / @as(f64, @floatFromInt(n)));
+                    if (n == 0) setNull(out, perm[i]) else try writeDouble(out, perm[i], types.floatOfInt(scaled_sum) / divisor / @as(f64, @floatFromInt(n)));
                 }
             },
             else => return Error.WindowUnsupported,
@@ -2290,17 +2290,17 @@ pub const Window = struct {
                 }
                 if (!saw_value) setNull(out, out_idx) else try writeDouble(out, out_idx, sum);
             },
-            inline .decimal64, .decimal128 => |l| {
+            inline .decimal64, .decimal128, .decimal256 => |l| {
                 const items = l.items;
-                var sum: i128 = 0;
+                var sum: DecimalSum(@TypeOf(l.items)) = 0;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
                     const r = perm[k];
                     if (!isValid(view, r)) continue;
                     saw_value = true;
-                    sum += @as(i128, items[r]);
+                    sum = try addDecimalSum(sum, items[r]);
                 }
-                if (!saw_value) setNull(out, out_idx) else try writeDecimal128(out, out_idx, sum);
+                if (!saw_value) setNull(out, out_idx) else try writeDecimalSum(out, out_idx, sum);
             },
             else => return Error.WindowUnsupported,
         }
@@ -2340,19 +2340,19 @@ pub const Window = struct {
                     n += 1;
                 }
             },
-            inline .decimal64, .decimal128 => |l| {
+            inline .decimal64, .decimal128, .decimal256 => |l| {
                 const spec = self.input_schema[plan.value_col].type.decimalSpec().?;
                 const divisor = std.math.pow(f64, 10, @floatFromInt(spec.s));
                 const items = l.items;
-                var scaled_sum: i128 = 0;
+                var scaled_sum: DecimalSum(@TypeOf(l.items)) = 0;
                 var k: usize = lo;
                 while (k <= hi) : (k += 1) {
                     const r = perm[k];
                     if (!isValid(view, r)) continue;
-                    scaled_sum += @as(i128, items[r]);
+                    scaled_sum = try addDecimalSum(scaled_sum, items[r]);
                     n += 1;
                 }
-                sum = @as(f64, @floatFromInt(scaled_sum)) / divisor;
+                sum = types.floatOfInt(scaled_sum) / divisor;
             },
             else => return Error.WindowUnsupported,
         }
@@ -2486,9 +2486,14 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
         .count, .count_distinct => .bigint,
         .sum, .sum_distinct => blk: {
             const t = schema[plan.value_col].type;
-            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), matching
-            // the aggregate operator.
-            if (t.decimalSpec()) |spec| break :blk Type{ .decimal128 = .{ .p = 38, .s = spec.s } };
+            // DESIGN.md §3.4: SUM(DECIMAL(p, s)) -> DECIMAL(38, s), or
+            // DECIMAL(76, s) over a DECIMAL past 38 digits, matching the
+            // aggregate operator. A DISTINCT sum keeps an i128.
+            if (t.decimalSpec()) |spec| {
+                if (t != .decimal256) break :blk Type{ .decimal128 = .{ .p = types.max_decimal128_precision, .s = spec.s } };
+                if (c.func == .sum_distinct) return Error.WindowUnsupported;
+                break :blk Type{ .decimal256 = .{ .p = types.max_decimal_precision, .s = spec.s } };
+            }
             switch (t) {
                 .int, .bigint, .tinyint, .smallint => break :blk Type{ .bigint = {} },
                 .largeint => break :blk Type{ .largeint = {} },
@@ -2496,7 +2501,7 @@ fn outputType(c: ir.WindowCall, plan: Window.CallPlan, schema: []const Column) !
                 else => return Error.WindowUnsupported,
             }
         },
-        .avg_distinct => if (isSummable(schema[plan.value_col].type)) Type{ .double = {} } else Error.WindowUnsupported,
+        .avg_distinct => if (isSummable(schema[plan.value_col].type) and schema[plan.value_col].type != .decimal256) Type{ .double = {} } else Error.WindowUnsupported,
         .avg, .var_pop, .var_samp, .stddev_pop, .stddev_samp, .covar_pop, .covar_samp, .corr => Type{ .double = {} },
         .ntile, .session_number => .bigint,
         .percent_rank, .cume_dist => Type{ .double = {} },
@@ -2593,7 +2598,7 @@ const DistinctAcc = struct {
 
     fn add(self: *DistinctAcc, row: u32) !void {
         if (!isValid(self.x, row)) return;
-        var buf: [16]u8 = undefined;
+        var buf: [nested.ELEMENT_BYTES_MAX]u8 = undefined;
         const key = nested.elementBytes(self.x, row, &buf);
         const allocator = self.arena.allocator();
         const entry = try self.seen.getOrPut(allocator, key);
@@ -2698,6 +2703,7 @@ fn preSizeColumn(allocator: Allocator, out: *ColumnStore, t: Type, n: usize) !vo
         .datetime => |*l| try l.appendNTimes(allocator, 0, n),
         .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
         .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
+        .decimal256 => |*l| try l.appendNTimes(allocator, 0, n),
         .uuid => |*l| try l.appendNTimes(allocator, 0, n),
         .varchar, .string, .char, .json, .nested, .bitmap => return Error.WindowUnsupported,
     }
@@ -3251,7 +3257,7 @@ fn range_order(view: ColumnView, t: Type, candidate: usize, current: usize, delt
     return switch (view.data) {
         inline .tinyint, .smallint, .int, .bigint, .largeint => |values| std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + delta),
         inline .float, .double => |values| types.floatOrder(@as(f64, values[candidate]), @as(f64, values[current]) + @as(f64, @floatFromInt(delta))),
-        inline .decimal64, .decimal128 => |values| blk: {
+        inline .decimal64, .decimal128, .decimal256 => |values| blk: {
             var scale: i256 = 1;
             for (0..t.decimalSpec().?.s) |_| scale *= 10;
             break :blk std.math.order(@as(i256, values[candidate]), @as(i256, values[current]) + @as(i256, delta) * scale);
@@ -3341,6 +3347,7 @@ pub fn orderPrefix(col: ColumnStore, row: u32, desc: bool) u64 {
         .decimal64 => |l| @as(u64, @bitCast(l.items[row])) ^ SIGN64,
         .largeint => |l| @truncate((@as(u128, @bitCast(l.items[row])) ^ (@as(u128, 1) << 127)) >> 64),
         .decimal128 => |l| @truncate((@as(u128, @bitCast(l.items[row])) ^ (@as(u128, 1) << 127)) >> 64),
+        .decimal256 => |l| @truncate((@as(u256, @bitCast(l.items[row])) ^ (@as(u256, 1) << 255)) >> 192),
         .uuid => |l| @truncate(l.items[row] >> 64),
         .float => |l| floatNorm(@as(f64, l.items[row])),
         .double => |l| floatNorm(l.items[row]),
@@ -3398,6 +3405,7 @@ fn digestCell(h: *std.hash.Wyhash, col: ColumnStore, row: u32) void {
         .decimal64 => |l| hashInt(h, l.items[row]),
         .largeint => |l| hashI128(h, l.items[row]),
         .decimal128 => |l| hashI128(h, l.items[row]),
+        .decimal256 => |l| h.update(std.mem.asBytes(&l.items[row])),
         .uuid => |l| h.update(std.mem.asBytes(&l.items[row])),
         .float => |l| hashInt(h, @as(i64, @bitCast(floatNorm(@as(f64, l.items[row]))))),
         .double => |l| hashInt(h, @as(i64, @bitCast(floatNorm(l.items[row])))),
@@ -3461,6 +3469,28 @@ fn writeDecimal128(out: *ColumnStore, row: u32, v: i128) !void {
     setValid(out, row);
 }
 
+/// The running SUM of a DECIMAL column's mantissas: i128 over DECIMAL64 and
+/// DECIMAL128 items, i256 over DECIMAL256 ones.
+fn DecimalSum(comptime Items: type) type {
+    return if (std.meta.Child(Items) == i256) i256 else i128;
+}
+
+/// A DECIMAL256 sum checks each step: its 76 digits sit close to i256's
+/// limit, where a wrapped sum would read as a valid one.
+fn addDecimalSum(sum: anytype, v: @TypeOf(sum)) !@TypeOf(sum) {
+    if (@TypeOf(sum) == i256) return std.math.add(i256, sum, v) catch Error.ArithmeticOverflow;
+    return sum + v;
+}
+
+fn writeDecimalSum(out: *ColumnStore, row: u32, v: anytype) !void {
+    if (@TypeOf(v) == i128) return writeDecimal128(out, row, v);
+    switch (out.data) {
+        .decimal256 => |*l| l.items[row] = v,
+        else => return Error.WindowUnsupported,
+    }
+    setValid(out, row);
+}
+
 fn writeDouble(out: *ColumnStore, row: u32, v: f64) !void {
     switch (out.data) {
         .double => |*l| l.items[row] = v,
@@ -3488,6 +3518,12 @@ fn writeLiteral(out: *ColumnStore, row: u32, lit: Value) !void {
             else => return Error.WindowUnsupported,
         },
         .decimal128 => |*l| l.items[row] = switch (lit) {
+            .decimal128 => |x| x,
+            .decimal64 => |x| x,
+            else => return Error.WindowUnsupported,
+        },
+        .decimal256 => |*l| l.items[row] = switch (lit) {
+            .decimal256 => |x| x,
             .decimal128 => |x| x,
             .decimal64 => |x| x,
             else => return Error.WindowUnsupported,
@@ -3572,6 +3608,10 @@ fn copyCell(src: ColumnStore, src_row: u32, out: *ColumnStore, out_row: u32) !vo
         },
         .decimal128 => |l| switch (out.data) {
             .decimal128 => |*o| o.items[out_row] = l.items[src_row],
+            else => return Error.WindowUnsupported,
+        },
+        .decimal256 => |l| switch (out.data) {
+            .decimal256 => |*o| o.items[out_row] = l.items[src_row],
             else => return Error.WindowUnsupported,
         },
         .uuid => |l| switch (out.data) {

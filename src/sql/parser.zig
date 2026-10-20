@@ -4475,7 +4475,7 @@ pub const Parser = struct {
                 const largeint_min = self.cur.tag == .big_integer and
                     if (signedMagnitude(self.cur.value.big_integer, true)) |v| v == std.math.minInt(i128) else false;
                 const rhs = try self.parseCallAtom();
-                if (largeint_min and rhs == .lit) return ir.Expr{ .lit = .{ .largeint = std.math.minInt(i128) } };
+                if (largeint_min and exec_expr.decimalLiteral(rhs) != null) return ir.Expr{ .lit = .{ .largeint = std.math.minInt(i128) } };
                 return try self.negateExpr(rhs);
             },
             .bang => {
@@ -4710,6 +4710,7 @@ pub const Parser = struct {
             .datetime => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
             .decimal64 => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
             .decimal128 => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
+            .decimal256 => |x| try std.fmt.allocPrint(aa, "{d}", .{x}),
             .uuid => try aa.dupe(u8, "uuid"),
         };
     }
@@ -9154,12 +9155,13 @@ fn lowBits(n: usize) u64 {
 }
 
 /// An integer literal past BIGINT in an expression: DECIMAL(n,0) as in
-/// MySQL; past DECIMAL's 38 digits, LARGEINT while it fits, as StarRocks
-/// types it, and DOUBLE after that (MySQL's own DECIMAL cap is 65).
+/// MySQL; past 38 digits, LARGEINT while it fits, as StarRocks types it,
+/// then DECIMAL(n,0) again to DECIMAL's 76 digits, and DOUBLE after that
+/// (MySQL's own DECIMAL cap is 65).
 fn bigIntegerLiteral(arena: std.mem.Allocator, digits: []const u8) ParseError!ir.Expr {
-    if (digits.len > 38) {
+    if (digits.len > types.max_decimal128_precision) {
         if (std.fmt.parseInt(i128, digits, 10)) |v| return .{ .lit = .{ .largeint = v } } else |_| {}
-        return .{ .lit = .{ .double = try bigIntegerDouble(digits, false) } };
+        if (digits.len > types.max_decimal_precision) return .{ .lit = .{ .double = try bigIntegerDouble(digits, false) } };
     }
     return try exec_expr.decimalLiteralExpr(arena, digits, @intCast(digits.len), 0);
 }
@@ -9189,11 +9191,11 @@ fn bigIntegerDouble(digits: []const u8, negate: bool) ParseError!f64 {
 
 /// A fractional literal without an exponent is the exact DECIMAL of its
 /// digits, as in MySQL, StarRocks and DuckDB: `1.10` is DECIMAL(3,2) and
-/// `.5` DECIMAL(1,1). The exponent form, and a literal past 38 digits, is
-/// DOUBLE.
+/// `.5` DECIMAL(1,1). The exponent form, and a literal past DECIMAL's 76
+/// digits, is DOUBLE.
 fn fractionalLiteral(arena: std.mem.Allocator, text: []const u8, value: f64) ParseError!ir.Expr {
     const dot = std.mem.indexOfScalar(u8, text, '.') orelse return .{ .lit = .{ .double = value } };
-    if (std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > 38) return .{ .lit = .{ .double = value } };
+    if (std.mem.indexOfAny(u8, text, "eE") != null or text.len - 1 > types.max_decimal_precision) return .{ .lit = .{ .double = value } };
     return try exec_expr.decimalLiteralExpr(arena, text, @intCast(text.len - 1), @intCast(text.len - dot - 1));
 }
 

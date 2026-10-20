@@ -529,6 +529,10 @@ pub const Memtable = struct {
                 .decimal128 => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
                 else => return Error.TypeMismatch,
             },
+            .decimal256 => |s| switch (col.data) {
+                .decimal256 => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
+                else => return Error.TypeMismatch,
+            },
             .uuid => |s| switch (col.data) {
                 .uuid => |*list| try list.appendSlice(self.allocator, s[0..row_count]),
                 else => return Error.TypeMismatch,
@@ -680,6 +684,7 @@ pub const Memtable = struct {
             .datetime => |*list| try list.append(self.allocator, @as(i64, value)),
             .decimal64 => |*list| try list.append(self.allocator, @as(i64, value)),
             .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
+            .decimal256 => |*list| try list.append(self.allocator, @as(i256, value)),
             .uuid => |*list| try list.append(self.allocator, @as(u128, value)),
             else => return Error.TypeMismatch,
         }
@@ -723,6 +728,7 @@ pub const Memtable = struct {
         switch (col.data) {
             .largeint => |*list| try list.append(self.allocator, value),
             .decimal128 => |*list| try list.append(self.allocator, value),
+            .decimal256 => |*list| try list.append(self.allocator, value),
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -782,6 +788,7 @@ pub const Memtable = struct {
             .largeint => |*list| try list.append(self.allocator, @as(i128, value)),
             .decimal64 => |*list| try list.append(self.allocator, value),
             .decimal128 => |*list| try list.append(self.allocator, @as(i128, value)),
+            .decimal256 => |*list| try list.append(self.allocator, @as(i256, value)),
             else => return Error.TypeMismatch,
         }
         if (col.nulls != null) try col.appendValidBit(self.allocator, col.data.rowCount() - 1, true);
@@ -886,6 +893,7 @@ pub fn columnsByteSize(columns: []const ColumnStore) usize {
             .bitmap => |s| s.offsets.items.len * @sizeOf(u32) + s.bytes.items.len,
             .decimal64 => |l| l.items.len * @sizeOf(i64),
             .decimal128 => |l| l.items.len * @sizeOf(i128),
+            .decimal256 => |l| l.items.len * @sizeOf(i256),
             .uuid => |l| l.items.len * @sizeOf(u128),
         };
         if (col.nulls) |n| total += n.items.len;

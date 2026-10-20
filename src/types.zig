@@ -54,6 +54,8 @@ pub const TypeTag = enum(u8) {
     /// storage, the WAL and row movement treat it as bytes, as they treat a
     /// nested value.
     bitmap = 19,
+    /// Fixed-point decimal with i256 backing (39 <= precision <= 76).
+    decimal256 = 20,
 };
 
 /// The shape of a nested type. Interned (`internNested`): the process keeps
@@ -141,7 +143,7 @@ fn appendTypeKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), t: Type)
     try key.append(allocator, @intFromEnum(std.meta.activeTag(t)));
     const payload: u64 = switch (t) {
         .varchar, .char => |n| n,
-        .decimal64, .decimal128 => |spec| (@as(u64, spec.p) << 8) | spec.s,
+        .decimal64, .decimal128, .decimal256 => |spec| (@as(u64, spec.p) << 8) | spec.s,
         .nested => |n| @intFromPtr(n),
         else => 0,
     };
@@ -210,7 +212,7 @@ pub fn appendTypeText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), t: 
     switch (t) {
         .varchar => |n| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "varchar({d})", .{n}) catch unreachable),
         .char => |n| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "char({d})", .{n}) catch unreachable),
-        .decimal64, .decimal128 => |spec| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "decimal({d},{d})", .{ spec.p, spec.s }) catch unreachable),
+        .decimal64, .decimal128, .decimal256 => |spec| try out.appendSlice(allocator, std.fmt.bufPrint(&buf, "decimal({d},{d})", .{ spec.p, spec.s }) catch unreachable),
         .nested => |n| switch (n.*) {
             .array => |element| {
                 try out.appendSlice(allocator, "array<");
@@ -319,9 +321,8 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
         try expectTypeChar(text, pos, ',');
         const s = try typeTextInt(u8, text, pos);
         try expectTypeChar(text, pos, ')');
-        if (p == 0 or p > 38 or s > p) return error.InvalidTypeText;
-        const spec: DecimalSpec = .{ .p = p, .s = s };
-        return if (p <= 18) .{ .decimal64 = spec } else .{ .decimal128 = spec };
+        if (p == 0 or p > max_decimal_precision or s > p) return error.InvalidTypeText;
+        return decimalOf(.{ .p = p, .s = s });
     }
     inline for (@typeInfo(Type).@"union".fields) |f| {
         if (f.type == void and std.mem.eql(u8, name, f.name)) return @unionInit(Type, f.name, {});
@@ -360,25 +361,52 @@ fn typeTextInt(comptime T: type, text: []const u8, pos: *usize) TypeTextError!T 
     return std.fmt.parseInt(T, text[start..pos.*], 10) catch error.InvalidTypeText;
 }
 
-/// Precision/scale carried by both decimal type variants.
+/// Precision/scale carried by every decimal type variant.
 pub const DecimalSpec = struct {
-    /// Total number of significant digits. Range [1, 38].
+    /// Total number of significant digits. Range [1, 76].
     p: u8,
     /// Digits after the decimal point. Range [0, p].
     s: u8,
 };
 
+/// The most digits a DECIMAL holds, in its i256 backing.
+pub const max_decimal_precision: u8 = 76;
+/// The most digits the i128 backing holds.
+pub const max_decimal128_precision: u8 = 38;
+
+/// The decimal type of `spec`, in the smallest backing that holds its
+/// precision.
+pub fn decimalOf(spec: DecimalSpec) Type {
+    if (spec.p <= 18) return .{ .decimal64 = spec };
+    if (spec.p <= max_decimal128_precision) return .{ .decimal128 = spec };
+    return .{ .decimal256 = spec };
+}
+
+/// `v` as the nearest f64, for an integer of any width to 256 bits. LLVM
+/// lowers no 256-bit integer-to-float conversion on AArch64, so a wider one
+/// converts the top 64 bits of its magnitude, the bits below folded into a
+/// sticky bit so it rounds as the conversion itself would.
+pub inline fn floatOfInt(v: anytype) f64 {
+    const T = @TypeOf(v);
+    if (@typeInfo(T) == .comptime_int or @bitSizeOf(T) <= 128) return @floatFromInt(v);
+    const magnitude: u256 = @abs(@as(i256, v));
+    const f = if (magnitude >> 128 == 0) @as(f64, @floatFromInt(@as(u128, @intCast(magnitude)))) else wide: {
+        const shift: u8 = @intCast(192 - @as(u16, @clz(magnitude)));
+        var top: u64 = @truncate(magnitude >> shift);
+        if (magnitude & ((@as(u256, 1) << shift) - 1) != 0) top |= 1;
+        break :wide std.math.ldexp(@as(f64, @floatFromInt(top)), shift);
+    };
+    return if (v < 0) -f else f;
+}
+
 /// Build a `Type` for a DECIMAL(p, s). Picks the smallest backing that
 /// holds `p` digits.
 pub fn decimal(comptime p: u8, comptime s: u8) Type {
     comptime {
-        if (p == 0 or p > 38) @compileError("DECIMAL precision must be in 1..=38");
+        if (p == 0 or p > max_decimal_precision) @compileError("DECIMAL precision must be in 1..=76");
         if (s > p) @compileError("DECIMAL scale must be <= precision");
     }
-    return if (p <= 18)
-        .{ .decimal64 = .{ .p = p, .s = s } }
-    else
-        .{ .decimal128 = .{ .p = p, .s = s } };
+    return decimalOf(.{ .p = p, .s = s });
 }
 
 pub const Type = union(TypeTag) {
@@ -403,6 +431,7 @@ pub const Type = union(TypeTag) {
     json,
     nested: *const Nested,
     bitmap,
+    decimal256: DecimalSpec,
 
     pub fn fixedSize(self: Type) ?usize {
         return switch (self) {
@@ -418,6 +447,7 @@ pub const Type = union(TypeTag) {
             .largeint => @sizeOf(i128),
             .decimal64 => @sizeOf(i64),
             .decimal128 => @sizeOf(i128),
+            .decimal256 => @sizeOf(i256),
             .uuid => @sizeOf(u128),
             .varchar, .string, .char, .json, .nested, .bitmap => null,
         };
@@ -505,7 +535,7 @@ pub const Type = union(TypeTag) {
 
     pub fn isDecimal(self: Type) bool {
         return switch (self) {
-            .decimal64, .decimal128 => true,
+            .decimal64, .decimal128, .decimal256 => true,
             else => false,
         };
     }
@@ -513,8 +543,7 @@ pub const Type = union(TypeTag) {
     /// Returns the (p, s) of a decimal column, or null if not a decimal.
     pub fn decimalSpec(self: Type) ?DecimalSpec {
         return switch (self) {
-            .decimal64 => |spec| spec,
-            .decimal128 => |spec| spec,
+            .decimal64, .decimal128, .decimal256 => |spec| spec,
             else => null,
         };
     }
@@ -533,6 +562,7 @@ pub const Type = union(TypeTag) {
             .largeint => T == i128 or T == comptime_int,
             .decimal64 => T == i64 or T == comptime_int,
             .decimal128 => T == i128 or T == comptime_int,
+            .decimal256 => T == i256 or T == comptime_int,
             .uuid => T == Uuid or T == u128 or T == comptime_int,
             .varchar, .string, .char, .json, .nested, .bitmap => isStringLikeType(T),
         };
@@ -644,6 +674,7 @@ pub const ValueTag = enum(u8) {
     decimal64 = 12,
     decimal128 = 13,
     uuid = 14,
+    decimal256 = 15,
 
     pub fn fromType(t: Type) ValueTag {
         return switch (t) {
@@ -660,6 +691,7 @@ pub const ValueTag = enum(u8) {
             .largeint => .largeint,
             .decimal64 => .decimal64,
             .decimal128 => .decimal128,
+            .decimal256 => .decimal256,
             .uuid => .uuid,
         };
     }
@@ -680,6 +712,7 @@ pub const Value = union(ValueTag) {
     decimal64: i64,
     decimal128: i128,
     uuid: u128,
+    decimal256: i256,
 
     pub fn compare(self: Value, other: Value) std.math.Order {
         std.debug.assert(std.meta.activeTag(self) == std.meta.activeTag(other));
@@ -696,6 +729,7 @@ pub const Value = union(ValueTag) {
             .largeint => |a| std.math.order(a, other.largeint),
             .decimal64 => |a| std.math.order(a, other.decimal64),
             .decimal128 => |a| std.math.order(a, other.decimal128),
+            .decimal256 => |a| std.math.order(a, other.decimal256),
             .uuid => |a| std.math.order(a, other.uuid),
             .text => |a| switch (std.mem.order(u8, a, other.text)) {
                 .lt => .lt,
@@ -963,6 +997,31 @@ pub fn columnExcluded(columns: []const Column, index: usize, excluded: []const [
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "floatOfInt rounds an i256 to the nearest double, ties to even" {
+    const two_200: i256 = @as(i256, 1) << 200;
+    const cases = .{
+        .{ @as(i256, 12345), 12345.0 },
+        .{ two_200 + 1, std.math.ldexp(@as(f64, 1), 200) },
+        .{ two_200 + (@as(i256, 1) << 147), std.math.ldexp(@as(f64, 1), 200) },
+        .{ two_200 + (@as(i256, 1) << 147) + 1, std.math.ldexp(@as(f64, 1), 200) + std.math.ldexp(@as(f64, 1), 148) },
+        .{ -(two_200 + (@as(i256, 1) << 147) + 1), -(std.math.ldexp(@as(f64, 1), 200) + std.math.ldexp(@as(f64, 1), 148)) },
+        .{ (@as(i256, 3) << 200) + (@as(i256, 1) << 148), 3 * std.math.ldexp(@as(f64, 1), 200) },
+        .{ @as(i256, std.math.maxInt(i256)), std.math.ldexp(@as(f64, 1), 255) },
+        .{ @as(i256, std.math.minInt(i256)), -std.math.ldexp(@as(f64, 1), 255) },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(@as(f64, c[1]), floatOfInt(c[0]));
+    // The digits read back as a double round correctly too.
+    var prng = std.Random.DefaultPrng.init(0x256);
+    const random = prng.random();
+    var buf: [80]u8 = undefined;
+    for (0..2000) |_| {
+        const raw: i256 = @bitCast([4]u64{ random.int(u64), random.int(u64), random.int(u64), random.int(u64) });
+        const v = raw >> random.intRangeAtMost(u8, 0, 254);
+        const digits = try std.fmt.bufPrint(&buf, "{d}", .{v});
+        try std.testing.expectEqual(try std.fmt.parseFloat(f64, digits), floatOfInt(v));
+    }
+}
 
 test "Type.fixedSize returns correct widths" {
     try std.testing.expectEqual(@as(?usize, 4), (Type{ .int = {} }).fixedSize());

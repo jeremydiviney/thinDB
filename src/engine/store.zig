@@ -530,7 +530,7 @@ pub const ColumnStore = struct {
 /// copies rather than per-value appends.
 pub fn appendViewRange(alloc: Allocator, dst: *ColumnStore, v: ColumnView, start: usize, end: usize) !void {
     switch (v.data) {
-        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128 => |s, tag| {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .boolean, .uuid, .float, .double, .date, .datetime, .decimal64, .decimal128, .decimal256 => |s, tag| {
             try @field(dst.data, @tagName(tag)).appendSlice(alloc, s[start..end]);
         },
         .varchar, .string, .char, .json, .nested, .bitmap => |sv| switch (dst.data) {
@@ -677,6 +677,7 @@ pub const DataStore = union(TypeTag) {
     json: StringStore,
     nested: StringStore,
     bitmap: StringStore,
+    decimal256: std.ArrayList(i256),
 
     pub fn init(allocator: Allocator, t: Type) Allocator.Error!DataStore {
         return initCapacity(allocator, t, 0, 0);
@@ -714,6 +715,7 @@ pub const DataStore = union(TypeTag) {
             .char => .{ .char = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
             .decimal64 => .{ .decimal64 = try ensuredCapList(i64, allocator, rows_cap) },
             .decimal128 => .{ .decimal128 = try ensuredCapList(i128, allocator, rows_cap) },
+            .decimal256 => .{ .decimal256 = try ensuredCapList(i256, allocator, rows_cap) },
             .uuid => .{ .uuid = try ensuredCapList(u128, allocator, rows_cap) },
             .json => .{ .json = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
             .nested => .{ .nested = try StringStore.initCapacity(allocator, rows_cap, bytes_cap) },
@@ -744,6 +746,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*ss| ss.deinit(allocator),
             .decimal64 => |*list| list.deinit(allocator),
             .decimal128 => |*list| list.deinit(allocator),
+            .decimal256 => |*list| list.deinit(allocator),
             .uuid => |*list| list.deinit(allocator),
             .json => |*ss| ss.deinit(allocator),
             .nested => |*ss| ss.deinit(allocator),
@@ -769,6 +772,7 @@ pub const DataStore = union(TypeTag) {
             .char => |s| s.rowCount(),
             .decimal64 => |l| l.items.len,
             .decimal128 => |l| l.items.len,
+            .decimal256 => |l| l.items.len,
             .uuid => |l| l.items.len,
             .json => |s| s.rowCount(),
             .nested => |s| s.rowCount(),
@@ -793,6 +797,7 @@ pub const DataStore = union(TypeTag) {
             .char => |s| .{ .char = s.view() },
             .decimal64 => |l| .{ .decimal64 = l.items },
             .decimal128 => |l| .{ .decimal128 = l.items },
+            .decimal256 => |l| .{ .decimal256 = l.items },
             .uuid => |l| .{ .uuid = l.items },
             .json => |s| .{ .json = s.view() },
             .nested => |s| .{ .nested = s.view() },
@@ -817,6 +822,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*s| s.clear(),
             .decimal64 => |*l| l.clearRetainingCapacity(),
             .decimal128 => |*l| l.clearRetainingCapacity(),
+            .decimal256 => |*l| l.clearRetainingCapacity(),
             .uuid => |*l| l.clearRetainingCapacity(),
             .json => |*s| s.clear(),
             .nested => |*s| s.clear(),
@@ -851,6 +857,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*s| try s.appendValue(allocator, ""),
             .decimal64 => |*l| try l.append(allocator, 0),
             .decimal128 => |*l| try l.append(allocator, 0),
+            .decimal256 => |*l| try l.append(allocator, 0),
             .uuid => |*l| try l.append(allocator, 0),
             .json => |*s| try s.appendValue(allocator, ""),
             .nested => |*s| try s.appendValue(allocator, ""),
@@ -877,6 +884,7 @@ pub const DataStore = union(TypeTag) {
             .char => |*s| try s.appendEmptyValues(allocator, n),
             .decimal64 => |*l| try l.appendNTimes(allocator, 0, n),
             .decimal128 => |*l| try l.appendNTimes(allocator, 0, n),
+            .decimal256 => |*l| try l.appendNTimes(allocator, 0, n),
             .uuid => |*l| try l.appendNTimes(allocator, 0, n),
             .json => |*s| try s.appendEmptyValues(allocator, n),
             .nested => |*s| try s.appendEmptyValues(allocator, n),

@@ -1704,6 +1704,7 @@ const TypeWireTag = enum(u8) {
     /// Followed by u32 length + the canonical type text.
     nested = 17,
     bitmap = 18,
+    decimal256 = 19,
 };
 
 fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
@@ -1734,6 +1735,11 @@ fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) Enco
         },
         .decimal128 => |spec| {
             try out.append(allocator, @intFromEnum(TypeWireTag.decimal128));
+            try out.append(allocator, spec.p);
+            try out.append(allocator, spec.s);
+        },
+        .decimal256 => |spec| {
+            try out.append(allocator, @intFromEnum(TypeWireTag.decimal256));
             try out.append(allocator, spec.p);
             try out.append(allocator, spec.s);
         },
@@ -1807,6 +1813,13 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
             const s = bytes[cursor.* + 1];
             cursor.* += 2;
             break :blk types.Type{ .decimal128 = .{ .p = p, .s = s } };
+        },
+        .decimal256 => blk: {
+            if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
+            const p = bytes[cursor.*];
+            const s = bytes[cursor.* + 1];
+            cursor.* += 2;
+            break :blk types.Type{ .decimal256 = .{ .p = p, .s = s } };
         },
         .uuid => .uuid,
     };
@@ -2473,6 +2486,11 @@ pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) Enco
         .decimal128 => |x| {
             std.mem.writeInt(i128, b[0..16], x, .little);
             try out.appendSlice(allocator, &b);
+        },
+        .decimal256 => |x| {
+            var w: [32]u8 = undefined;
+            std.mem.writeInt(i256, &w, x, .little);
+            try out.appendSlice(allocator, &w);
         },
         .uuid => |x| {
             std.mem.writeInt(u128, b[0..16], x, .little);
@@ -3752,6 +3770,11 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
             if (c + 16 > bytes.len) return Error.IrCorrupt;
             cursor.* = c + 16;
             break :blk Value{ .decimal128 = std.mem.readInt(i128, bytes[c..][0..16], .little) };
+        },
+        .decimal256 => blk: {
+            if (c + 32 > bytes.len) return Error.IrCorrupt;
+            cursor.* = c + 32;
+            break :blk Value{ .decimal256 = std.mem.readInt(i256, bytes[c..][0..32], .little) };
         },
         .uuid => blk: {
             if (c + 16 > bytes.len) return Error.IrCorrupt;

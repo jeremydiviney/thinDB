@@ -135,6 +135,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator,
             .char => |n| n,
             .decimal64 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
             .decimal128 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
+            .decimal256 => |spec| (@as(u32, spec.p) << 8) | @as(u32, spec.s),
             else => 0,
         };
         if (c.type == .nested) {
@@ -201,8 +202,8 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
         if (cursor + 1 + 1 + 4 > bytes.len) return Error.SchemaCorrupt;
         const tag_byte = bytes[cursor];
         cursor += 1;
-        if (tag_byte < 1 or tag_byte > @intFromEnum(TypeTag.bitmap)) return Error.SchemaCorrupt;
-        const tag: TypeTag = @enumFromInt(tag_byte);
+        if (tag_byte < 1) return Error.SchemaCorrupt;
+        const tag = std.enums.fromInt(TypeTag, tag_byte) orelse return Error.SchemaCorrupt;
         const nullable = bytes[cursor] != 0;
         cursor += 1;
         const extra = format.readU32(bytes[cursor .. cursor + 4]);
@@ -225,6 +226,7 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
             // Decimal extra: high byte = precision, low byte = scale.
             .decimal64 => .{ .decimal64 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .decimal128 => .{ .decimal128 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
+            .decimal256 => .{ .decimal256 = .{ .p = @intCast((extra >> 8) & 0xff), .s = @intCast(extra & 0xff) } },
             .uuid => .uuid,
             .json => .json,
             .bitmap => .bitmap,
@@ -308,6 +310,7 @@ pub fn schemasEqual(a: TableSchema, b: TableSchema) bool {
             .char => |n| if (n != bc.type.char) return false,
             .decimal64 => |spec| if (spec.p != bc.type.decimal64.p or spec.s != bc.type.decimal64.s) return false,
             .decimal128 => |spec| if (spec.p != bc.type.decimal128.p or spec.s != bc.type.decimal128.s) return false,
+            .decimal256 => |spec| if (spec.p != bc.type.decimal256.p or spec.s != bc.type.decimal256.s) return false,
             .nested => |n| if (n != bc.type.nested) return false,
             else => {},
         }
@@ -346,7 +349,7 @@ fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), c: Column) !void {
     };
     try buf.append(scratch, 1 | on_update);
     try buf.append(scratch, @intFromEnum(@as(types.ValueTag, dv)));
-    var tmp: [16]u8 = undefined;
+    var tmp: [32]u8 = undefined;
     switch (dv) {
         .int => |x| {
             std.mem.writeInt(i32, tmp[0..4], x, .little);
@@ -393,6 +396,10 @@ fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), c: Column) !void {
         .decimal128 => |x| {
             std.mem.writeInt(i128, tmp[0..16], x, .little);
             try buf.appendSlice(scratch, tmp[0..16]);
+        },
+        .decimal256 => |x| {
+            std.mem.writeInt(i256, tmp[0..32], x, .little);
+            try buf.appendSlice(scratch, tmp[0..32]);
         },
         .uuid => |x| {
             std.mem.writeInt(u128, tmp[0..16], x, .little);
@@ -503,6 +510,12 @@ fn decodeDefaultValue(arena: Allocator, bytes: []const u8, cursor: *usize) !?typ
             const v = std.mem.readInt(i128, bytes[cursor.*..][0..16], .little);
             cursor.* += 16;
             break :blk types.Value{ .decimal128 = v };
+        },
+        .decimal256 => blk: {
+            if (cursor.* + 32 > bytes.len) return Error.SchemaCorrupt;
+            const v = std.mem.readInt(i256, bytes[cursor.*..][0..32], .little);
+            cursor.* += 32;
+            break :blk types.Value{ .decimal256 = v };
         },
         .uuid => blk: {
             if (cursor.* + 16 > bytes.len) return Error.SchemaCorrupt;

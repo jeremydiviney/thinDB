@@ -206,6 +206,7 @@ fn predicateMatches(view: ColumnView, row: u32, op_byte: u8, val: Value) bool {
         .largeint => |s| cmpI(i128, s[row], val.largeint, op_byte),
         .decimal64 => |s| cmpI(i64, s[row], val.decimal64, op_byte),
         .decimal128 => |s| cmpI(i128, s[row], val.decimal128, op_byte),
+        .decimal256 => |s| cmpI(i256, s[row], val.decimal256, op_byte),
         .uuid => |s| cmpI(u128, s[row], val.uuid, op_byte),
         .varchar => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
         .string => |sv| cmpStr(sv.rowBytes(row), val.text, op_byte),
@@ -322,6 +323,7 @@ pub fn encodeColumnRange(
         .largeint => |s| try writePackedI128(allocator, out, s[from..to]),
         .decimal64 => |s| try writePackedI64(allocator, out, s[from..to]),
         .decimal128 => |s| try writePackedI128(allocator, out, s[from..to]),
+        .decimal256 => |s| try writePackedI256(allocator, out, s[from..to]),
         .uuid => |s| try writePackedBytes(allocator, out, std.mem.sliceAsBytes(s[from..to])),
         .varchar, .string, .char, .json, .nested, .bitmap => |sv| try writePackedStrings(allocator, out, sv, from, to),
     }
@@ -397,6 +399,15 @@ fn decodeColumnRange(
             }
             cursor += want;
         },
+        .decimal256 => {
+            const want = @as(usize, n) * 32;
+            if (cursor + want > payload.len) return Error.WalCorrupt;
+            for (0..n) |i| {
+                const v = std.mem.readInt(i256, payload[cursor + i * 32 ..][0..32], .little);
+                try appendOne(allocator, col, schema_col, .{ .i256 = v }, nulls, i);
+            }
+            cursor += want;
+        },
         .uuid => {
             const want = @as(usize, n) * 16;
             if (cursor + want > payload.len) return Error.WalCorrupt;
@@ -445,6 +456,7 @@ const TypedValue = union(enum) {
     i32: i32,
     i64: i64,
     i128: i128,
+    i256: i256,
     u8: u8,
     u128: u128,
     f32: f32,
@@ -479,6 +491,7 @@ fn appendOne(
         .datetime => |*l| try l.append(allocator, v.i64),
         .decimal64 => |*l| try l.append(allocator, v.i64),
         .decimal128 => |*l| try l.append(allocator, v.i128),
+        .decimal256 => |*l| try l.append(allocator, v.i256),
         .uuid => |*l| try l.append(allocator, v.u128),
         .varchar => |*ss| try ss.appendValue(allocator, v.bytes),
         .string => |*ss| try ss.appendValue(allocator, v.bytes),
@@ -521,6 +534,14 @@ fn writePackedI128(allocator: Allocator, out: *std.ArrayList(u8), slice: []const
     for (slice) |v| {
         var b: [16]u8 = undefined;
         std.mem.writeInt(i128, &b, v, .little);
+        out.appendSliceAssumeCapacity(&b);
+    }
+}
+fn writePackedI256(allocator: Allocator, out: *std.ArrayList(u8), slice: []const i256) !void {
+    try out.ensureUnusedCapacity(allocator, slice.len * 32);
+    for (slice) |v| {
+        var b: [32]u8 = undefined;
+        std.mem.writeInt(i256, &b, v, .little);
         out.appendSliceAssumeCapacity(&b);
     }
 }
@@ -616,6 +637,12 @@ fn decodeValue(tag: ValueTag, payload: []const u8, cursor: *usize) !Value {
             const v = std.mem.readInt(i128, payload[c..][0..16], .little);
             cursor.* = c + 16;
             break :blk Value{ .decimal128 = v };
+        },
+        .decimal256 => blk: {
+            if (c + 32 > payload.len) return Error.WalCorrupt;
+            const v = std.mem.readInt(i256, payload[c..][0..32], .little);
+            cursor.* = c + 32;
+            break :blk Value{ .decimal256 = v };
         },
         .uuid => blk: {
             if (c + 16 > payload.len) return Error.WalCorrupt;
@@ -942,6 +969,10 @@ fn colColMatches(lv: ColumnView, rv: ColumnView, row: u32, op: u8) bool {
         },
         .decimal128 => switch (rv.data) {
             .decimal128 => cmpI(i128, lv.data.decimal128[row], rv.data.decimal128[row], op),
+            else => false,
+        },
+        .decimal256 => switch (rv.data) {
+            .decimal256 => cmpI(i256, lv.data.decimal256[row], rv.data.decimal256[row], op),
             else => false,
         },
         .uuid => switch (rv.data) {

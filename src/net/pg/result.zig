@@ -66,7 +66,7 @@ fn pgTypeOf(t: Type) TypeInfo {
         .double => .{ .oid = OID_FLOAT8, .type_size = 8 },
         .date => .{ .oid = OID_DATE, .type_size = 4 },
         .datetime => .{ .oid = OID_TIMESTAMP, .type_size = 8 },
-        .decimal64, .decimal128 => .{ .oid = OID_NUMERIC, .type_size = -1 },
+        .decimal64, .decimal128, .decimal256 => .{ .oid = OID_NUMERIC, .type_size = -1 },
         .uuid => .{ .oid = OID_UUID, .type_size = 16 },
         .varchar, .string, .char => .{ .oid = OID_TEXT, .type_size = -1 },
         .json => .{ .oid = OID_JSON, .type_size = -1 },
@@ -172,6 +172,7 @@ fn formatCell(
         },
         .decimal64 => |s| try wire_format.formatDecimal(allocator, scratch, @as(i128, s[row]), schema_col.type),
         .decimal128 => |s| try wire_format.formatDecimal(allocator, scratch, s[row], schema_col.type),
+        .decimal256 => |s| try wire_format.formatDecimal(allocator, scratch, s[row], schema_col.type),
         .uuid => |s| {
             var buf: [40]u8 = undefined;
             try scratch.appendSlice(allocator, try wire_format.formatUuid(&buf, s[row]));

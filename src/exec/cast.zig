@@ -456,14 +456,18 @@ fn numberMeetsTemporal(n: Type, t: Type) ?Type {
     return commonType(n, if (t == .date) .int else .bigint);
 }
 
-/// No decimal covers a LARGEINT, whose values run to 39 digits. Beside a
-/// decimal with a fraction it meets as DOUBLE, as in StarRocks. Beside a
-/// DECIMAL(p,0), StarRocks meets it at DECIMAL(38,0) and lets that type's
-/// values run past its 38 digits; thinDB's decimals keep their precision, so
-/// the type covering both is LARGEINT, which holds every DECIMAL(p,0) value
-/// and prints the same digits.
+/// No decimal of up to 38 digits covers a LARGEINT, whose values run to 39
+/// digits. Beside such a decimal with a fraction it meets as DOUBLE, as in
+/// StarRocks. Beside a DECIMAL(p,0), StarRocks meets it at DECIMAL(38,0) and
+/// lets that type's values run past its 38 digits; thinDB's decimals keep
+/// their precision, so the type covering both is LARGEINT, which holds every
+/// DECIMAL(p,0) value and prints the same digits. A wider decimal meets it
+/// at the decimal keeping 39 integer digits beside its scale, up to 76 in
+/// all.
 fn largeintMeetsDecimal(d: Type) Type {
-    return if (d.decimalSpec().?.s > 0) .double else .largeint;
+    const spec = d.decimalSpec().?;
+    if (d == .decimal256) return decimal.decTypeFor(@max(spec.p - spec.s, 39) + spec.s, spec.s);
+    return if (spec.s > 0) .double else .largeint;
 }
 
 /// Two declared-length text types meet at the longer VARCHAR, as in MySQL;
@@ -545,7 +549,7 @@ pub fn assignsByRule(from: Type, to: Type) bool {
 pub fn assignValue(comptime T: type, v: types.Value) AssignError!T {
     return switch (v) {
         .text => |s| assignText(T, s),
-        .date, .datetime, .decimal64, .decimal128, .uuid => error.TypeMismatch,
+        .date, .datetime, .decimal64, .decimal128, .decimal256, .uuid => error.TypeMismatch,
         inline else => |x| assignNumber(T, x),
     };
 }
@@ -580,11 +584,14 @@ pub fn assignNumber(comptime T: type, v: anytype) AssignError!T {
     }
 }
 
-/// A decimal, mantissa `m` at scale `scale`, written into a `T` column.
-pub fn assignScaled(comptime T: type, m: i128, scale: u8) AssignError!T {
+/// A decimal, mantissa `m` (up to an i256) at scale `scale`, written into
+/// a `T` column.
+pub fn assignScaled(comptime T: type, m_in: anytype, scale: u8) AssignError!T {
+    const W = if (@TypeOf(m_in) == i256) i256 else i128;
+    const m: W = m_in;
     if (T == bool) return m != 0;
-    if (@typeInfo(T) == .float) return assignNumber(T, @as(f64, @floatFromInt(m)) / std.math.pow(f64, 10.0, @floatFromInt(scale)));
-    const unit = decimal.pow10(scale);
+    if (@typeInfo(T) == .float) return assignNumber(T, types.floatOfInt(m) / std.math.pow(f64, 10.0, @floatFromInt(scale)));
+    const unit = decimal.pow10Of(W, scale);
     const truncated = @divTrunc(m, unit);
     const rounds_away = @abs(@rem(m, unit)) * 2 >= @abs(unit);
     return assignNumber(T, if (!rounds_away) truncated else if (m < 0) truncated - 1 else truncated + 1);
@@ -614,7 +621,7 @@ pub fn assignText(comptime T: type, text: []const u8) AssignError!T {
 /// scale to spell it by.
 pub fn appendAssignedText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value) (AssignError || Allocator.Error)!void {
     switch (v) {
-        .decimal64, .decimal128 => return error.TypeMismatch,
+        .decimal64, .decimal128, .decimal256 => return error.TypeMismatch,
         else => try appendText(allocator, text, v, 0),
     }
 }
@@ -623,7 +630,7 @@ pub fn appendAssignedText(allocator: Allocator, text: *std.ArrayList(u8), v: typ
 /// scale `scale`, but a boolean as 1 or 0: MySQL has no boolean, and stores
 /// TRUE in a text column as 1.
 fn appendText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value, scale: u8) (AssignError || Allocator.Error)!void {
-    var buf: [64]u8 = undefined;
+    var buf: [decimal.DECIMAL_TEXT_MAX]u8 = undefined;
     switch (v) {
         .text => |s| try text.appendSlice(allocator, s),
         .boolean => |b| try text.append(allocator, if (b) '1' else '0'),
@@ -632,7 +639,7 @@ fn appendText(allocator: Allocator, text: *std.ArrayList(u8), v: types.Value, sc
             var float_buf: [common.FLOAT_TEXT_MAX]u8 = undefined;
             try text.appendSlice(allocator, common.floatText(&float_buf, x, .plain));
         },
-        inline .decimal64, .decimal128 => |m| try text.appendSlice(allocator, decimal.formatDecimal(&buf, m, scale)),
+        inline .decimal64, .decimal128, .decimal256 => |m| try text.appendSlice(allocator, decimal.formatDecimal(&buf, m, scale)),
         .date => |d| try text.appendSlice(allocator, common.formatDate(&buf, d) catch return error.ValueOutOfRange),
         .datetime => |d| try text.appendSlice(allocator, common.formatDateTime(&buf, d) catch return error.ValueOutOfRange),
         .uuid => return error.TypeMismatch,
@@ -669,7 +676,7 @@ fn assignTextRows(allocator: Allocator, src: ColumnView, from: Type, rows: usize
     offsets[0] = 0;
     for (0..rows) |i| {
         if (src.isValid(i)) try appendText(allocator, &bytes, switch (src.data) {
-            inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128, .date, .datetime => |values, tag| @unionInit(types.Value, @tagName(tag), values[i]),
+            inline .tinyint, .smallint, .int, .bigint, .largeint, .float, .double, .decimal64, .decimal128, .decimal256, .date, .datetime => |values, tag| @unionInit(types.Value, @tagName(tag), values[i]),
             .boolean => |values| .{ .boolean = values[i] != 0 },
             else => return error.TypeMismatch,
         }, scale);
@@ -686,9 +693,9 @@ fn assignRows(comptime T: type, src: ColumnView, from: Type, dst: anytype) Assig
         .boolean => |values| for (dst, values[0..dst.len], 0..) |*d, v, i| {
             d.* = if (src.isValid(i)) slotOf(try assignNumber(T, v != 0)) else 0;
         },
-        inline .decimal64, .decimal128 => |values| {
+        inline .decimal64, .decimal128, .decimal256 => |values| {
             const scale = switch (from) {
-                .decimal64, .decimal128 => |spec| spec.s,
+                .decimal64, .decimal128, .decimal256 => |spec| spec.s,
                 else => return error.TypeMismatch,
             };
             for (dst, values[0..dst.len], 0..) |*d, v, i| {
@@ -778,7 +785,7 @@ pub fn preservesOrder(from: Type, to: Type) OrderKept {
             else => .none,
         },
         .boolean, .tinyint, .smallint, .int, .bigint, .largeint => switch (to) {
-            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => .strict,
+            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128, .decimal256 => .strict,
             .float => if (integerBits(from) <= std.math.floatMantissaBits(f32) + 1) .strict else .merging,
             .double => if (integerBits(from) <= std.math.floatMantissaBits(f64) + 1) .strict else .merging,
             else => .none,
@@ -786,11 +793,11 @@ pub fn preservesOrder(from: Type, to: Type) OrderKept {
         .float, .double => switch (to) {
             .double => .strict,
             .float => if (from == .float) .strict else .merging,
-            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128 => .merging,
+            .tinyint, .smallint, .int, .bigint, .largeint, .decimal64, .decimal128, .decimal256 => .merging,
             else => .none,
         },
-        .decimal64, .decimal128 => |spec| switch (to) {
-            .decimal64, .decimal128 => |target| if (target.s >= spec.s) .strict else .merging,
+        .decimal64, .decimal128, .decimal256 => |spec| switch (to) {
+            .decimal64, .decimal128, .decimal256 => |target| if (target.s >= spec.s) .strict else .merging,
             .tinyint, .smallint, .int, .bigint, .largeint, .float, .double => .merging,
             else => .none,
         },
