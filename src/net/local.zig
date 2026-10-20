@@ -1515,6 +1515,10 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     if (unbound) |u| if (options.unbound) |out| {
         out.* = try u.dupe(allocator);
     };
+    if (unbound == null) if (try unbound_refs.findUnknownQualifier(ctx.nodeArena(), catalog, session_cell.*, root)) |u| {
+        if (options.unbound) |out| out.* = try u.dupe(allocator);
+        return error.ColumnNotFound;
+    };
     if (unbound == null) {
         // Dead-branch elimination: prune UNION arms that provably yield zero
         // rows (constant-false filters — the parser already folds literal
