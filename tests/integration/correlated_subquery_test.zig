@@ -1012,3 +1012,53 @@ test "a keyed correlated scalar whose outer value several inner keys come to com
         };
     }
 }
+
+test "a subquery WHERE conjunct over only the outer row guards the outer row instead of correlating" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setupScopes(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    // Where the guard isn't TRUE the subquery has no rows: IN and EXISTS
+    // fail, NOT IN and NOT EXISTS hold, a NULL compared value included
+    // (id 3). An aggregate without GROUP BY still has its one row there.
+    // Rows are DuckDB's.
+    const cases = .{
+        .{ "x.v NOT IN (SELECT y.v FROM ex_u y WHERE x.k > 25)", &[_]?i64{ 1, 2 } },
+        .{ "x.v NOT IN (SELECT y.v FROM ex_u y WHERE y.v IS NOT NULL AND x.id <> 3)", &[_]?i64{ 1, 3 } },
+        .{ "x.v IN (SELECT y.v FROM ex_u y WHERE x.k > 25)", &[_]?i64{ 4, 5 } },
+        .{ "x.v NOT IN (SELECT y.v FROM ex_u y WHERE y.v IS NOT NULL AND (x.k > 25 OR x.v = 5))", &[_]?i64{ 1, 2 } },
+        .{ "EXISTS (SELECT 1 FROM ex_u y WHERE y.v = x.v AND x.k > 25)", &[_]?i64{ 4, 5 } },
+        .{ "NOT EXISTS (SELECT 1 FROM ex_u y WHERE y.v = x.v AND x.k > 25)", &[_]?i64{ 1, 2, 3 } },
+        .{ "x.v IN (SELECT y.v FROM ex_u y WHERE y.id < x.k AND x.k > 30)", &[_]?i64{ 4, 5 } },
+        .{ "x.v NOT IN (SELECT y.v FROM ex_u y WHERE y.id < x.k AND x.k > 30 AND y.v IS NOT NULL)", &[_]?i64{ 1, 2, 3 } },
+        .{ "x.v IN (SELECT y.v FROM ex_u y WHERE y.id <> x.k AND x.k > 30)", &[_]?i64{ 4, 5 } },
+        .{ "EXISTS (SELECT y.v FROM ex_u y WHERE x.k < 25 GROUP BY y.v)", &[_]?i64{ 1, 2 } },
+        .{ "EXISTS (SELECT MAX(y.v) FROM ex_u y WHERE x.k > 25)", &[_]?i64{ 1, 2, 3, 4, 5 } },
+        .{ "NOT EXISTS (SELECT MAX(y.v) FROM ex_u y WHERE x.k > 25)", &[_]?i64{} },
+    };
+    inline for (cases) |case| {
+        expectCells(allocator, db, "SELECT x.id FROM ex_t x WHERE " ++ case[0] ++ " ORDER BY x.id", case[1]) catch |err| {
+            std.debug.print("failed: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
+test "a NOT IN subquery whose WHERE reads only the outer row runs once, not over every outer value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Paired with every outer value, the subquery's rows would be 6M, far
+    // past the budget; run once, they are 2,000.
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .query_memory_budget = 16 << 20 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE g0 (c0 INT, c1 VARCHAR(20))");
+    try exec(allocator, db, "CREATE TABLE g1 (c0 INT, c1 VARCHAR(20))");
+    try exec(allocator, db, "INSERT INTO g0 SELECT generate_series, generate_series FROM TABLE(generate_series(1, 3000))");
+    try exec(allocator, db, "INSERT INTO g1 SELECT generate_series, generate_series FROM TABLE(generate_series(1, 2000))");
+    const counts = try collectBigints(allocator, db, "SELECT COUNT(*) FROM (SELECT * FROM g0 WHERE c0 NOT IN (SELECT c0 FROM g1 WHERE g0.c1)) t");
+    defer allocator.free(counts);
+    try std.testing.expectEqualSlices(i64, &.{1000}, counts);
+}
