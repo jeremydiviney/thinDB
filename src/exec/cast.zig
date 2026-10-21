@@ -528,8 +528,10 @@ fn sameNestedRepresentation(a: Type, b: Type) bool {
 // float or boolean column, and a fraction rounds half away from zero into an
 // integer column, as MySQL and DuckDB do (StarRocks truncates). A number, a
 // DATE or a DATETIME lands in a text column as the text `CAST(x AS CHAR)`
-// gives it. Text that isn't a number is a TypeMismatch, and a value the
-// column can't hold is ValueOutOfRange where a CAST would clamp it.
+// gives it. An integer lands in a DATE or DATETIME column as CAST reads it
+// (`YYYYMMDD`, `YYYYMMDDhhmmss`), as MySQL and StarRocks store one. Text
+// that isn't a number is a TypeMismatch, and a value the column can't hold
+// is ValueOutOfRange where a CAST would clamp it.
 // ---------------------------------------------------------------------------
 
 pub const AssignError = error{ TypeMismatch, ValueOutOfRange };
@@ -730,7 +732,8 @@ pub fn freeAssignedColumn(allocator: Allocator, view: ColumnView) void {
 /// assignment rule as it lands (`assignColumn`). A decimal target always
 /// takes one when the types differ: the memtable matches decimal columns on
 /// tag alone, so a payload at another scale would be stored misread. Text
-/// parses into a DATE or DATETIME target, and a DATETIME lands in a DATE
+/// parses into a DATE or DATETIME target, an integer reads as its
+/// `YYYYMMDD` digits, and a DATETIME lands in a DATE
 /// column as its day, as MySQL and StarRocks store it: a DATE stepped by
 /// days is a DATETIME at midnight. An array takes an array of other elements
 /// or text, converted element by element. A number lands in a JSON column as
@@ -745,7 +748,7 @@ pub fn assignmentCastExpr(arena: Allocator, name: []const u8, from: Type, to: Ty
     else if (to.isDecimal())
         from.isInteger() or from.isFloat() or from.isDecimal() or from == .boolean or (from.isString() and from != .json)
     else if (to == .date or to == .datetime)
-        from.isString() or from == .date or from == .datetime
+        from.isString() or from.isInteger() or from == .date or from == .datetime
     else if (to == .json)
         from.isInteger() or from.isFloat() or from.isDecimal()
     else if (castCost(@as(TypeTag, from), @as(TypeTag, to))) |cost|

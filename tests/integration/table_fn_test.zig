@@ -1793,8 +1793,8 @@ test "table UDF input conversion: conversions the assignment rule refuses stay c
     try db.registerTableFn(month_echo);
 
     const cases = .{
-        // BIGINT into the DATE `month`.
-        "SELECT * FROM TABLE(month_echo((SELECT customerNumber AS customer, CAST(amount AS BIGINT) AS month, CAST(amount AS BIGINT) AS amt FROM monthly)) PARTITION BY customer)",
+        // DOUBLE into the DATE `month`.
+        "SELECT * FROM TABLE(month_echo((SELECT customerNumber AS customer, CAST(amount AS DOUBLE) AS month, CAST(amount AS BIGINT) AS amt FROM monthly)) PARTITION BY customer)",
         // DATE into the BIGINT `amt`.
         "SELECT * FROM TABLE(month_echo((SELECT customerNumber AS customer, d AS month, d AS amt FROM monthly)) PARTITION BY customer)",
         // A convertible type is still held to the NOT NULL declaration.
@@ -1958,11 +1958,11 @@ test "table UDF input conversion: a failed create leaves the input to the caller
     });
     try std.testing.checkAllAllocationFailures(std.testing.allocator, createOverStub, .{&converting});
 
-    // `g` converts but `amt` is refused (BIGINT into DATE).
+    // `g` converts but `amt` is refused (BIGINT into UUID).
     const refused = comptime runningEntry(&.{
         .{ .name = "id", .type = .bigint },
         .{ .name = "g", .type = .bigint },
-        .{ .name = "amt", .type = .date },
+        .{ .name = "amt", .type = .uuid },
     });
     try std.testing.expectError(thindb.exec.Error.TableFnInputMismatch, createOverStub(std.testing.allocator, &refused));
 }

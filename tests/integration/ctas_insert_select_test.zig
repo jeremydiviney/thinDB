@@ -805,6 +805,46 @@ test "INSERT SELECT: text parses into DATE and DATETIME columns" {
     try std.testing.expectEqualSlices(i64, &.{3}, count);
 }
 
+test "INSERT and UPDATE: an integer lands in a DATE or DATETIME column as CAST reads it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE nd (id BIGINT PRIMARY KEY, d DATE, ts DATETIME)");
+    try exec(allocator, db, "INSERT INTO nd VALUES (1, 19920101, 20240315102030), (2, 990101, 19920201)");
+    try exec(allocator, db, "INSERT INTO nd SELECT 3, 20240229, 20240229");
+    try exec(allocator, db, "CREATE TABLE ns (k BIGINT PRIMARY KEY, n INT, b BIGINT)");
+    try exec(allocator, db, "INSERT INTO ns VALUES (4, 20250704, 20250704235959), (5, NULL, NULL)");
+    try exec(allocator, db, "INSERT INTO nd SELECT k, n, b FROM ns");
+    try exec(allocator, db, "UPDATE nd SET d = 20260101 WHERE id = 2");
+    try exec(allocator, db, "INSERT INTO nd (id, d) VALUES (3, NULL) ON DUPLICATE KEY UPDATE ts = 20300102");
+
+    const got = try helpers.collectStrings(allocator, db, "SELECT CONCAT(id, ' ', COALESCE(CAST(d AS CHAR), '-'), ' ', COALESCE(CAST(ts AS CHAR), '-')) FROM nd ORDER BY id");
+    defer helpers.freeStrings(allocator, got);
+    const want = [_][]const u8{
+        "1 1992-01-01 2024-03-15 10:20:30",
+        "2 2026-01-01 1992-02-01 00:00:00",
+        "3 2024-02-29 2030-01-02 00:00:00",
+        "4 2025-07-04 2025-07-04 23:59:59",
+        "5 - -",
+    };
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g.?);
+
+    // A number that isn't a date fails the write, as text that isn't one does.
+    try helpers.expectRunError(allocator, db, "INSERT INTO nd VALUES (6, 20241399, NULL)", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO nd VALUES (6, NULL, 2024)", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO nd SELECT 6, 20240230, NULL", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "UPDATE nd SET d = 7 WHERE id = 1", error.TypeMismatch);
+    try helpers.expectRunError(allocator, db, "INSERT INTO nd VALUES (6, 1.5, NULL)", error.TypeMismatch);
+    const count = try collectBigints(allocator, db, "SELECT COUNT(*) FROM nd");
+    defer allocator.free(count);
+    try std.testing.expectEqualSlices(i64, &.{5}, count);
+}
+
 test "INSERT SELECT: omitted columns take their DEFAULT, the clock, or NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
