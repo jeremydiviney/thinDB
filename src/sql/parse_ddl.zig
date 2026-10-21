@@ -891,9 +891,11 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     // implying PRIMARY KEY here would silently dedupe. BUCKETS is a
     // distribution detail with no single-node meaning; parsed and ignored.
     var sort_key: ?[]const []const u8 = null;
+    var duplicate_key: ?[]const []const u8 = null;
     var dist_key: ?[]const []const u8 = null;
     while (true) {
-        if (p.cur.tag == .kw_order and sort_key == null) {
+        if (p.cur.tag == .kw_order) {
+            if (sort_key != null) return PE.SqlInvalidProjection;
             try p.advance();
             if (p.cur.tag != .kw_by) return PE.SqlExpectedKeyword;
             try p.advance();
@@ -935,7 +937,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
             try p.expect(.rparen);
         } else if (p.cur.tag == .identifier and asciiEqlAny(p.cur.text, &.{ "unique", "duplicate" })) {
             // StarRocks `UNIQUE KEY (cols)` upserts like PRIMARY KEY;
-            // `DUPLICATE KEY (cols)` is a non-unique sort key.
+            // `DUPLICATE KEY (cols)` is a non-unique sort key, unless an
+            // ORDER BY names the sort key, as in StarRocks.
             const is_unique = std.ascii.eqlIgnoreCase(p.cur.text, "unique");
             try p.advance();
             if (p.cur.tag != .kw_key) return PE.SqlExpectedKeyword;
@@ -947,8 +950,8 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
                 if (table_pk != null or inline_pk != null) return PE.SqlInvalidProjection;
                 table_pk = key_cols;
             } else {
-                if (sort_key != null) return PE.SqlInvalidProjection;
-                sort_key = key_cols;
+                if (duplicate_key != null) return PE.SqlInvalidProjection;
+                duplicate_key = key_cols;
             }
         } else if (p.cur.tag == .identifier and std.ascii.eqlIgnoreCase(p.cur.text, "comment")) {
             // Table COMMENT [=] 'text': accepted, not stored.
@@ -1001,7 +1004,7 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
     const has_pk = inline_pk != null or table_pk != null;
     // At most one key clause: PRIMARY KEY (unique) or ORDER BY (non-unique).
     // With neither, the table orders by its first column, as CTAS does.
-    if (has_pk and sort_key != null) return PE.SqlInvalidProjection;
+    if (has_pk and (sort_key != null or duplicate_key != null)) return PE.SqlInvalidProjection;
     const unique = has_pk;
     const order_key: []const []const u8 = if (table_pk) |tpk|
         tpk
@@ -1009,7 +1012,7 @@ pub fn parseCreateTableBody(p: anytype, is_temp: bool) !*ir.Op {
         const one = try p.arena.alloc([]const u8, 1);
         one[0] = ipk;
         break :blk one;
-    } else if (sort_key) |sk|
+    } else if (sort_key orelse duplicate_key) |sk|
         sk
     else if (dist_key) |dk|
         dk

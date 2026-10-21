@@ -985,6 +985,50 @@ test "sql ddl: CREATE TABLE PROPERTIES ignores StarRocks layout keys, rejects un
     inline for (rejected) |sql| try expectRunError(allocator, db, sql, error.SqlUnknownTableProperty);
 }
 
+test "sql ddl: ORDER BY names the sort key of a DUPLICATE KEY table, and a key repeats no column" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+
+    // The clauses after DUPLICATE KEY all apply: ORDER BY and PROPERTIES.
+    try exec(allocator, db,
+        \\CREATE TABLE dk (k1 INT NOT NULL, k2 INT NOT NULL, v BIGINT)
+        \\DUPLICATE KEY(k1, k2) COMMENT "OLAP" DISTRIBUTED BY HASH(k1, k2) BUCKETS 1
+        \\ORDER BY (k2, k1) PROPERTIES ("replication_num" = "1", "compression" = "zstd")
+    );
+    const t = try db.openTable("dk", .{});
+    try std.testing.expectEqual(@as(usize, 2), t.schema.order_key.len);
+    try std.testing.expectEqualStrings("k2", t.schema.order_key[0]);
+    try std.testing.expectEqualStrings("k1", t.schema.order_key[1]);
+    try std.testing.expect(!t.schema.unique);
+    try std.testing.expectEqual(thindb.types.TableCompression.zstd, t.schema.compression);
+    try exec(allocator, db, "INSERT INTO dk VALUES (1, 3, 10), (1, 3, 10), (2, 1, 20)");
+    const kept = try collectBigints(allocator, db, "SELECT v FROM dk ORDER BY k2, k1");
+    defer allocator.free(kept);
+    try std.testing.expectEqualSlices(i64, &.{ 20, 10, 10 }, kept);
+
+    try exec(allocator, db, "CREATE TABLE ob (k1 INT, k2 INT) ORDER BY (k2) DUPLICATE KEY(k1)");
+    const ob = try db.openTable("ob", .{});
+    try std.testing.expectEqualStrings("k2", ob.schema.order_key[0]);
+
+    const repeated = .{
+        "CREATE TABLE r (k1 INT, k2 INT, v INT) DUPLICATE KEY(k1, k2) DISTRIBUTED BY HASH(k1, k2) BUCKETS 1 ORDER BY (k2, k1, k2)",
+        "CREATE TABLE r (k1 INT, k2 INT) ORDER BY (k1, K1)",
+        "CREATE TABLE r (k1 INT, k2 INT, PRIMARY KEY (k1, k2, k1))",
+        "CREATE TABLE r (k1 INT, k2 INT) DUPLICATE KEY(k2, k2)",
+    };
+    inline for (repeated) |sql| try expectRunError(allocator, db, sql, error.DuplicateColumn);
+    inline for (.{
+        "CREATE TABLE r (k1 INT, k2 INT) ORDER BY (k1) ORDER BY (k2)",
+        "CREATE TABLE r (k1 INT, k2 INT) DUPLICATE KEY(k1) DUPLICATE KEY(k2)",
+        "CREATE TABLE r (k1 INT, k2 INT, PRIMARY KEY (k1)) DUPLICATE KEY(k1)",
+    }) |sql| try expectRunError(allocator, db, sql, error.SqlInvalidProjection);
+    try std.testing.expectError(error.TableNotFound, db.openTable("r", .{}));
+}
+
 test "sql ddl: StarRocks CREATE TABLE — DISTRIBUTED BY HASH key + BUCKETS + replication_num" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
