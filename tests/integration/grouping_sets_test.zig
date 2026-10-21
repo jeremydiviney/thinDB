@@ -85,3 +85,14 @@ test "GROUPING() tells a rolled-up key's NULL from a NULL key" {
     try helpers.expectRunError(allocator, db, "SELECT GROUPING(v) FROM sales GROUP BY g WITH ROLLUP", error.SqlInvalidProjection);
     try helpers.expectRunError(allocator, db, "SELECT g FROM sales GROUP BY ROLLUP(g) WITH ROLLUP", error.SqlInvalidProjection);
 }
+
+test "GROUPING SETS with GROUPING() over a CTE that sorts its rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try openSales(allocator, tmp.dir, false);
+    defer db.close();
+    try expectInts(allocator, db, "WITH c AS (SELECT * FROM sales ORDER BY g) SELECT count(DISTINCT v) AS n, g, grouping(g) AS fg, h, grouping(h) AS fh FROM c GROUP BY GROUPING SETS ((), (g), (g, h)) ORDER BY fg DESC, g, fh DESC, h, n LIMIT 10 OFFSET 0", &.{ 5, 2, 1, 1, 3, 1, 2 });
+    try expectInts(allocator, db, "WITH c AS (SELECT * FROM sales ORDER BY g) SELECT multi_distinct_count(v) AS n, g, grouping(g) AS fg, h, grouping(h) AS fh FROM c GROUP BY GROUPING SETS ((), (g), (g, h)) ORDER BY fg DESC, g, fh DESC, h, n", &.{ 5, 2, 1, 1, 3, 1, 2 });
+    try expectInts(allocator, db, "WITH c AS (SELECT * FROM sales ORDER BY v DESC LIMIT 4) SELECT count(*) AS n, grouping(g) AS fg FROM c GROUP BY GROUPING SETS ((), (g)) ORDER BY fg DESC, n", &.{ 4, 1, 3 });
+}

@@ -1257,7 +1257,14 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         post_computes[post_compute_count] = top.compute.derived;
         post_compute_count += 1;
     }
-    if (post_compute_count > 0 and top.* == .select) op = top else post_compute_count = 0;
+    // Computes over the SELECT list, ORDER BY or LIMIT read the block's
+    // output rows (a GROUPING SETS key nulled over a sorted CTE); any other
+    // Compute is the scan body's.
+    const over_decorator = switch (top.*) {
+        .select, .order_by, .limit => true,
+        else => false,
+    };
+    if (post_compute_count > 0 and over_decorator) op = top else post_compute_count = 0;
     // Top decorators — Project (SELECT list), LIMIT, ORDER BY — can nest in any
     // order above the scan body; peel each at most once.
     var project_columns: ?[]const []const u8 = null;
