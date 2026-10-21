@@ -629,6 +629,13 @@ pairs where neither side is NULL, by the same rule; CORR is also NULL where
 either side is constant, as in StarRocks and PostgreSQL, where DuckDB gives
 NaN.
 
+`GROUP_CONCAT(a, b, ...)` concatenates its values on each row, as in MySQL.
+A second argument that is a text literal is the exception outside the MySQL
+dialect: `GROUP_CONCAT(x, '-')` there is `STRING_AGG(x, '-')`, the literal
+the separator, as DuckDB reads it. In the MySQL dialect it concatenates, as
+MySQL and StarRocks do, so `GROUP_CONCAT(name, '-')` is `b-,a-`.
+`STRING_AGG(x, sep)` takes the separator in every dialect.
+
 `PERCENTILE_CONT(x, p)` (and `MEDIAN(x)`, its p = 0.5) interpolates at index
 p×(n−1) of the sorted values, as PostgreSQL and DuckDB do.
 `PERCENTILE_DISC(x, p)`, and StarRocks' `PERCENTILE_DISC_LC`, is the first

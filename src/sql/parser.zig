@@ -3362,7 +3362,7 @@ pub const Parser = struct {
         }
         if (self.aggregateFuncForName(name) == .group_concat) {
             const values = if (std.ascii.eqlIgnoreCase(name, "map_agg")) try self.mapAggEntry(args.items) else args.items;
-            const canonical = try self.parseConcatCallTail(values, distinct or impliesDistinct(name));
+            const canonical = try self.parseConcatCallTail(name, values, distinct or impliesDistinct(name));
             try self.expect(.rparen);
             return canonical;
         }
@@ -3540,10 +3540,12 @@ pub const Parser = struct {
     /// DESC], ...] [SEPARATOR 's'])` call, returned as its canonical
     /// arguments `(value, separator [, order key])`. Several values
     /// concatenate per row. A second argument that is a text literal is the
-    /// separator (STRING_AGG, and StarRocks' legacy GROUP_CONCAT). DISTINCT
+    /// separator (STRING_AGG, and GROUP_CONCAT outside MySQL, as DuckDB reads
+    /// it). MySQL's GROUP_CONCAT concatenates it, as MySQL and StarRocks do;
+    /// only StarRocks' legacy mode reads it as the separator. DISTINCT
     /// without ORDER BY orders by the values, as MySQL does. The ORDER BY keys
     /// pack into one key that compares as bytes.
-    fn parseConcatCallTail(self: *Parser, values: []const ir.Expr, distinct: bool) ParseError![]const ir.Expr {
+    fn parseConcatCallTail(self: *Parser, name: []const u8, values: []const ir.Expr, distinct: bool) ParseError![]const ir.Expr {
         if (values.len == 0) return ParseError.SqlInvalidProjection;
         for (values) |v| if (v == .col_ref and std.mem.eql(u8, v.col_ref, "*")) return ParseError.SqlInvalidProjection;
         var keys: std.ArrayList(ir.Expr) = .empty;
@@ -3582,7 +3584,8 @@ pub const Parser = struct {
             try self.advance();
         }
         var concatenated = values;
-        if (separator == null and values.len == 2 and values[1] == .lit and values[1].lit == .text) {
+        const literal_separates = self.lex.dialect != .mysql or !std.ascii.eqlIgnoreCase(name, "group_concat");
+        if (separator == null and literal_separates and values.len == 2 and values[1] == .lit and values[1].lit == .text) {
             separator = values[1].lit.text;
             concatenated = values[0..1];
         }
