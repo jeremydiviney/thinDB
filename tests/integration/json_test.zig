@@ -357,3 +357,24 @@ test "JSON: CAST to an array, map or struct reads the value the JSON holds, and 
     try helpers.expectText(allocator, db, "SELECT to_json(map{NULL: 1})", null);
     try helpers.expectText(allocator, db, "SELECT CAST(CAST(to_json(map{'a': [1, 2]}) AS MAP<STRING, ARRAY<INT>>) AS STRING)", "{\"a\":[1,2]}");
 }
+
+test "JSON: a number written into a JSON column lands as the JSON number it spells" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+
+    try exec(allocator, db, "CREATE TABLE jn (id INT, v JSON)");
+    try exec(allocator, db, "INSERT INTO jn VALUES (1, 5), (2, 2.5), (3, -1e300), (4, '[1]')");
+    try exec(allocator, db, "INSERT INTO jn SELECT 5, 7");
+    try exec(allocator, db, "INSERT INTO jn SELECT 6, 2.5");
+    try exec(allocator, db, "INSERT INTO jn SELECT 7, CAST(1.25 AS DOUBLE)");
+    try exec(allocator, db, "INSERT INTO jn SELECT 8, CAST(3 AS LARGEINT)");
+    try exec(allocator, db, "INSERT INTO jn SELECT generate_series + 10, generate_series FROM TABLE(generate_series(1, 3))");
+    try helpers.expectTexts(allocator, db, "SELECT concat(id, ' ', CAST(v AS CHAR)) FROM jn ORDER BY id", &.{ "1 5", "2 2.5", "3 -1e300", "4 [1]", "5 7", "6 2.5", "7 1.25", "8 3", "11 1", "12 2", "13 3" });
+    try std.testing.expectEqual(@as(i64, 6), try firstInt(db, "SELECT SUM(get_json_int(v, '$')) FROM jn WHERE id > 10", allocator));
+
+    try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "INSERT INTO jn VALUES (20, true)"));
+    try std.testing.expectError(error.TypeMismatch, exec(allocator, db, "INSERT INTO jn SELECT 21, DATE '2024-01-01'"));
+}

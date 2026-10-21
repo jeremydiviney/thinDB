@@ -4393,7 +4393,7 @@ pub const InsertColumnBuilder = struct {
             .varchar, .string, .char, .json, .nested, .bitmap => {
                 const sb = &self.string_bytes[col_idx];
                 if (col.type == .json) {
-                    try sb.appendSlice(self.allocator, try coerceToJsonText(v));
+                    try appendJsonText(self.allocator, sb, v);
                 } else if (col.type == .nested) {
                     if (v != .text) return Error.TypeMismatch;
                     exec.nested.parseText(self.allocator, col.type, v.text, sb) catch |err| return switch (err) {
@@ -4469,11 +4469,19 @@ pub const InsertColumnBuilder = struct {
     }
 };
 
-fn coerceToJsonText(v: Value) ![]const u8 {
-    return switch (v) {
-        .text => |s| s,
-        else => Error.TypeMismatch,
-    };
+/// A literal written into a JSON column, as the JSON text the memtable
+/// parses: text as is, a number as the JSON number it spells, as an INSERT
+/// ... SELECT writes one (`assignmentCastExpr`).
+fn appendJsonText(allocator: Allocator, text: *std.ArrayList(u8), v: Value) !void {
+    switch (v) {
+        .text => |s| try text.appendSlice(allocator, s),
+        .tinyint, .smallint, .int, .bigint, .largeint => try exec_cast.appendAssignedText(allocator, text, v),
+        inline .float, .double => |x| {
+            if (!std.math.isFinite(x)) return Error.TypeMismatch;
+            try exec_cast.appendAssignedText(allocator, text, v);
+        },
+        else => return Error.TypeMismatch,
+    }
 }
 
 fn coerceToDate(v: Value) !i32 {
