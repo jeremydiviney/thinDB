@@ -834,8 +834,11 @@ pub const TableSchema = struct {
             }
         }
 
-        for (self.order_key) |key| {
+        for (self.order_key, 0..) |key, i| {
             if (self.columnIndex(key) == null) return TableSchemaError.OrderKeyColumnMissing;
+            // A repeat sorts nothing the first use didn't, and a unique key
+            // can't hold one column twice; MySQL and StarRocks refuse it too.
+            if (columnNameIn(self.order_key[0..i], key)) return TableSchemaError.DuplicateColumn;
         }
     }
 
@@ -1103,6 +1106,15 @@ test "TableSchema.validate rejects order key that isn't a column" {
         .unique = false,
     };
     try std.testing.expectError(TableSchemaError.OrderKeyColumnMissing, schema.validate());
+}
+
+test "TableSchema.validate rejects an order key that names a column twice" {
+    const schema = TableSchema{
+        .columns = &.{ .{ .name = "k1", .type = .int }, .{ .name = "k2", .type = .int } },
+        .order_key = &.{ "k2", "k1", "K2" },
+        .unique = false,
+    };
+    try std.testing.expectError(TableSchemaError.DuplicateColumn, schema.validate());
 }
 
 test "TableSchema.validate rejects empty columns" {

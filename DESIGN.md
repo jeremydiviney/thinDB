@@ -398,7 +398,9 @@ Every table requires an **order key** at creation. The order key is one or more 
 - Uniqueness enforcement (when `unique = true`)
 - Efficient compaction (sorted merge of segments)
 
-The order key may be marked `unique = true` or `unique = false` (default).
+The order key may be marked `unique = true` or `unique = false` (default). It names each column once: a key that repeats one is `DuplicateColumn` (`ORDER BY (k2, k1, k2)`, `PRIMARY KEY (a, a)`), as MySQL and StarRocks refuse it.
+
+In SQL, PRIMARY KEY (or StarRocks' UNIQUE KEY) gives a unique key, and `ORDER BY (cols)` or StarRocks' `DUPLICATE KEY (cols)` a non-unique one. With both, ORDER BY names the sort key, as in StarRocks. With neither, `DISTRIBUTED BY HASH (cols)` is the non-unique key, else the first column.
 
 On a unique table, an INSERT row whose key the table holds replaces the stored row: the last writer wins. An INSERT whose column list leaves non-key columns out is a partial update instead, as StarRocks runs one on a primary-key table (`enable_insert_partial_update`). The held row takes the listed columns and keeps its others, while a new key's row fills them with their defaults. Either way it counts one affected row per INSERT row. A list naming every column replaces the row, so the CDC upsert keeps its path. REPLACE resets the columns it leaves out, as MySQL's does. INSERT IGNORE and ON DUPLICATE KEY UPDATE keep their MySQL meaning. PG COPY and the native bulk insert always replace the whole row.
 
