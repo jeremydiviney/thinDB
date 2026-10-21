@@ -862,15 +862,7 @@ pub fn mysqlAggInputs(input: CompileInput, q: *exec.Query, aggs: []const exec.Ag
     for (aggs, 0..) |a, i| {
         const col = a.col orelse continue;
         const idx = types.findColumn(schema, col) orelse continue;
-        const in = schema[idx].type;
-        const expr = if (input.session.dialect == .mysql and exec.aggregate_op.readsTemporalAsNumber(a.func, in))
-            try exec.expr_mod.call(input.node_arena, "to_bigint", &.{.{ .col_ref = col }})
-        else if (exec.aggregate_op.readsOperandBits(a.func, in))
-            try exec.expr_mod.call(input.node_arena, exec.scalar_fn.bitOperatorFn(.bitor, .mysql), &.{ .{ .col_ref = col }, .{ .lit = .{ .bigint = 0 } } })
-        else if (exec.aggregate_op.readsInputTruth(a.func, in))
-            try exec.expr_mod.call(input.node_arena, "to_boolean", &.{.{ .col_ref = col }})
-        else
-            continue;
+        const expr = try aggInputReading(input, a.func, schema[idx].type, col) orelse continue;
         if (out.len == 0) out = try input.node_arena.dupe(exec.AggSpec, aggs);
         const name = try std.fmt.allocPrint(input.node_arena, "__agg_number_{d}", .{i});
         try derived.append(input.allocator, .{ .name = name, .expr = expr });
@@ -879,6 +871,19 @@ pub fn mysqlAggInputs(input: CompileInput, q: *exec.Query, aggs: []const exec.Ag
     if (derived.items.len == 0) return aggs;
     q.* = try q.computeWithRegistry(try input.node_arena.dupe(ir.Derived, derived.items), input.udf_registry);
     return out;
+}
+
+/// What a `func` aggregate reads its input column `col` of type `in` as
+/// (`mysqlAggInputs`), or null when it reads the column as it is.
+pub fn aggInputReading(input: CompileInput, func: exec.AggFunc, in: types.Type, col: []const u8) !?ir.Expr {
+    const arena = input.node_arena;
+    if (input.session.dialect == .mysql and exec.aggregate_op.readsTemporalAsNumber(func, in))
+        return try exec.expr_mod.call(arena, "to_bigint", &.{.{ .col_ref = col }});
+    if (exec.aggregate_op.readsOperandBits(func, in))
+        return try exec.expr_mod.call(arena, exec.scalar_fn.bitOperatorFn(.bitor, .mysql), &.{ .{ .col_ref = col }, .{ .lit = .{ .bigint = 0 } } });
+    if (exec.aggregate_op.readsInputTruth(func, in))
+        return try exec.expr_mod.call(arena, "to_boolean", &.{.{ .col_ref = col }});
+    return null;
 }
 
 fn nameInDerivedList(derived: []const ir.Derived, name: []const u8) bool {
@@ -1257,7 +1262,14 @@ fn matchScanSelect(root: *const ir.Op) ?ScanSelectPlan {
         post_computes[post_compute_count] = top.compute.derived;
         post_compute_count += 1;
     }
-    if (post_compute_count > 0 and top.* == .select) op = top else post_compute_count = 0;
+    // Computes over the SELECT list, ORDER BY or LIMIT read the block's
+    // output rows (a GROUPING SETS key nulled over a sorted CTE); any other
+    // Compute is the scan body's.
+    const over_decorator = switch (top.*) {
+        .select, .order_by, .limit => true,
+        else => false,
+    };
+    if (post_compute_count > 0 and over_decorator) op = top else post_compute_count = 0;
     // Top decorators — Project (SELECT list), LIMIT, ORDER BY — can nest in any
     // order above the scan body; peel each at most once.
     var project_columns: ?[]const []const u8 = null;

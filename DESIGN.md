@@ -504,7 +504,7 @@ Byte strings are text, which holds any bytes. `TO_BINARY(s[, format])` reads `s`
 
 `XX_HASH3_64(s, ...)` and `XX_HASH3_128(s, ...)` are StarRocks' XXH3 hashes, by the xxHash spec (`util/xxh3.zig`). `XX_HASH3_64` hashes each argument with the previous hash as its seed, the first with seed 0, and is a signed BIGINT. `XX_HASH3_128` hashes the arguments run together, so `XX_HASH3_128('hello', 'world')` is `XX_HASH3_128('helloworld')`, and is a signed LARGEINT whose high 64 bits are the hash's high half. A NULL argument makes either NULL.
 
-Regular expressions (`util/regex.zig`) are RE2's linear-time subset, POSIX bracket classes such as `[[:lower:]]` included. Matching is by bytes, so a Unicode property class (`\p{Han}`, `[\p{L}]`) is `RegexInvalidPattern`. Every `REGEXP_*` function reads each row's own pattern. `REGEXP_COUNT(s, p)` counts the matches, each search resuming where the last match ended, or one character on after an empty match. `REGEXP_REPLACE` replaces every match but an empty one where the previous match ended, as RE2, PostgreSQL, DuckDB and StarRocks do: `REGEXP_REPLACE('abcd', '.*', 'x')` is 'x', where MySQL gives 'xx'. `REGEXP_EXTRACT(s, p, group)` is a capture group of the first match, where group 0 is the whole match. It gives '' when nothing matches or the group took no part in the match. `REGEXP_EXTRACT_ALL(s, p, group)` is the array of that group across every match. Both give '' or an empty array for a group the pattern doesn't have, as StarRocks does. Unlike StarRocks, which gives NULL for a malformed pattern read from a column, thinDB fails the query with `RegexInvalidPattern`, as MySQL does.
+Regular expressions (`util/regex.zig`) are RE2's linear-time subset, POSIX bracket classes such as `[[:lower:]]` included. Matching is by bytes, so a Unicode property class (`\p{Han}`, `[\p{L}]`) is `RegexInvalidPattern`. A `{` that starts no `{n}`, `{n,}` or `{n,m}` repeat is a literal brace, as in RE2, so `a{,2}` matches the text `a{,2}`. Every `REGEXP_*` function reads each row's own pattern. `REGEXP_COUNT(s, p)` counts the matches, each search resuming where the last match ended, or one character on after an empty match. `REGEXP_REPLACE` replaces every match but an empty one where the previous match ended, as RE2, PostgreSQL, DuckDB and StarRocks do: `REGEXP_REPLACE('abcd', '.*', 'x')` is 'x', where MySQL gives 'xx'. `REGEXP_EXTRACT(s, p, group)` is a capture group of the first match, where group 0 is the whole match. It gives '' when nothing matches or the group took no part in the match. `REGEXP_EXTRACT_ALL(s, p, group)` is the array of that group across every match. Both give '' or an empty array for a group the pattern doesn't have, as StarRocks does. Unlike StarRocks, which gives NULL for a malformed pattern read from a column, thinDB fails the query with `RegexInvalidPattern`, as MySQL does.
 
 **`a DIV b` with a DOUBLE or DECIMAL operand** divides exactly, as MySQL
 does, reading a double as its shortest digits, and truncates the quotient
@@ -1418,7 +1418,9 @@ its aggregate, and the operator folds each row's frame into the aggregate
 operator's own accumulator, so a whole partition gives its GROUP BY value. A
 frame that keeps the last row's start and ends no earlier folds on into the
 same state, a row whose frame is the last one's shares its result, and any
-other frame folds afresh. These calls write their output column whole, so a
+other frame folds afresh. A window aggregate reads its input as the aggregate does
+(`engine_v2.aggInputReading`): `BOOL_OR(n) OVER` reads a number's truth, and in
+the MySQL dialect `SUM(d) OVER` adds a DATE's YYYYMMDD number. These calls write their output column whole, so a
 spec that runs one evaluates serially. A UDF aggregate, `ARRAY_UNIQUE_AGG`,
 FILTER and IGNORE NULLS stay refused under OVER.
 

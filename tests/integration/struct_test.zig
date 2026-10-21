@@ -153,6 +153,11 @@ test "STRUCT: comparison, ordering, grouping and conditionals" {
     // A NULL field orders first, as a NULL array element does.
     try expectTexts(allocator, db, "SELECT id FROM sc WHERE s < row(2, 'a') ORDER BY id", &.{ "1", "2", "4" });
     try expectTexts(allocator, db, "SELECT count(*) FROM (SELECT row(id % 2) AS k FROM sc) t GROUP BY k ORDER BY 1", &.{ "2", "2" });
+    // A field of a grouping key reads above the GROUP BY.
+    try expectTexts(allocator, db, "SELECT s FROM sc WHERE s.a IS NOT NULL GROUP BY s ORDER BY s.a DESC", &.{ "{\"a\":2,\"b\":null}", "{\"a\":1,\"b\":\"x\"}" });
+    try expectTexts(allocator, db, "SELECT max(id) FROM sc GROUP BY s ORDER BY s.b, max(id)", &.{ "3", "4", "1", "2" });
+    try expectTexts(allocator, db, "SELECT max(id) FROM sc GROUP BY sc.s ORDER BY sc.s.b DESC, 1", &.{ "2", "1", "3", "4" });
+    try expectTexts(allocator, db, "SELECT max(id) FROM sc GROUP BY s HAVING s.a > 1", &.{"4"});
     try expectTexts(allocator, db, "SELECT COALESCE(s, row(0, 'z')) FROM sc ORDER BY id", &.{ "{\"a\":1,\"b\":\"x\"}", "{\"a\":null,\"b\":\"y\"}", "{\"a\":0,\"b\":\"z\"}", "{\"a\":2,\"b\":null}" });
     try expectTexts(allocator, db, "SELECT IF(id > 2, s, NULL) FROM sc ORDER BY id", &.{ null, null, null, "{\"a\":2,\"b\":null}" });
 }

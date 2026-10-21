@@ -1988,7 +1988,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     }
                 }
             }
-            const typed = try typedLagLeadDefaults(input, &up, w.calls);
+            const typed = try typedWindowInputs(input, &up, w.calls);
             const wq = try up.window(w.specs, typed.calls, input.effectiveDop());
             // Window-chain pairing: when this window's IR chain reaches an
             // upstream window with the SAME partition set through
@@ -2382,13 +2382,28 @@ const TypedWindowCalls = struct {
 /// text for a DATE (`LAG(d, 1, '2020-01-01')`), a number for text, a column
 /// of another type, an expression (`1 + 2 + 3`) — reads it as
 /// `CAST(default AS <value type>)`, as StarRocks does, from a column a
-/// Compute adds over `up`.
-fn typedLagLeadDefaults(input: engine_v2.CompileInput, up: *exec.Query, calls: []const ir.WindowCall) !TypedWindowCalls {
+/// Compute adds over `up`. A window aggregate reads its input there too as
+/// the aggregate does (`engine_v2.aggInputReading`): BOOL_OR over a number
+/// reads its truth, and MySQL's SUM over a DATE reads its YYYYMMDD number.
+fn typedWindowInputs(input: engine_v2.CompileInput, up: *exec.Query, calls: []const ir.WindowCall) !TypedWindowCalls {
     const arena = input.node_arena;
     const schema = up.outputSchema();
     var derived: std.ArrayList(ir.Derived) = .empty;
     var typed: ?[]ir.WindowCall = null;
     for (calls, 0..) |c, i| {
+        if (windowAggFunc(c)) |func| {
+            if (c.args.len == 0 or c.args[0] != .col_ref) continue;
+            const value = types.findColumn(schema, c.args[0].col_ref) orelse continue;
+            const expr = try engine_v2.aggInputReading(input, func, schema[value].type, c.args[0].col_ref) orelse continue;
+            const name = try std.fmt.allocPrint(arena, "__window_input_{d}", .{i});
+            try derived.append(arena, .{ .name = name, .expr = expr });
+            const out = typed orelse try arena.dupe(ir.WindowCall, calls);
+            typed = out;
+            const args = try arena.dupe(ir.Expr, c.args);
+            args[0] = .{ .col_ref = name };
+            out[i].args = args;
+            continue;
+        }
         if ((c.func != .lag and c.func != .lead) or c.args.len < 3 or c.args[0] != .col_ref) continue;
         const value = types.findColumn(schema, c.args[0].col_ref) orelse continue;
         const ty = schema[value].type;
@@ -2407,6 +2422,23 @@ fn typedLagLeadDefaults(input: engine_v2.CompileInput, up: *exec.Query, calls: [
     const added = try arena.alloc([]const u8, derived.items.len);
     for (added, derived.items) |*a, d| a.* = d.name;
     return .{ .calls = out, .added = added };
+}
+
+/// The aggregate a window call runs over its frame, for the calls whose
+/// input an aggregate reads through `engine_v2.aggInputReading`.
+fn windowAggFunc(c: ir.WindowCall) ?exec.AggFunc {
+    return switch (c.func) {
+        .aggregate => c.agg.?.func,
+        .sum => .sum,
+        .avg => .avg,
+        .sum_distinct => .sum_distinct,
+        .avg_distinct => .avg_distinct,
+        .var_pop => .var_pop,
+        .var_samp => .var_samp,
+        .stddev_pop => .stddev_pop,
+        .stddev_samp => .stddev_samp,
+        else => null,
+    };
 }
 
 /// Whether the window writes LAG/LEAD's `default` into a `ty` value column
