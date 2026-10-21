@@ -4253,7 +4253,7 @@ test "sql: expanded scalar function spellings execute" {
     try std.testing.expectEqual(@as(usize, 64), b.values[18].data.string.rowBytes(0).len);
 }
 
-test "sql: null_or_empty is true for NULL and the empty string, and never NULL" {
+test "sql: null_or_empty is true for NULL and the empty string or array, and never NULL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4268,6 +4268,12 @@ test "sql: null_or_empty is true for NULL and the empty string, and never NULL" 
     try helpers.expectText(allocator, db, "SELECT null_or_empty(NULL)", "1");
     try helpers.expectText(allocator, db, "SELECT null_or_empty('')", "1");
     try helpers.expectText(allocator, db, "SELECT null_or_empty('x')", "0");
+
+    try helpers.exec(allocator, db, "CREATE TABLE noa (id BIGINT PRIMARY KEY, a ARRAY<INT>)");
+    try helpers.exec(allocator, db, "INSERT INTO noa VALUES (1, []), (2, NULL), (3, [1, 2]), (4, [NULL])");
+    try helpers.expectTexts(allocator, db, "SELECT null_or_empty(a) FROM noa ORDER BY id", &.{ "1", "1", "0", "0" });
+    try helpers.expectText(allocator, db, "SELECT null_or_empty([[1, 2], [1]])", "0");
+    try helpers.expectText(allocator, db, "SELECT null_or_empty(CAST([] AS ARRAY<INT>))", "1");
 }
 
 test "sql: append_trailing_char_if_absent appends one byte where it's absent" {
