@@ -283,6 +283,11 @@ test "ARRAY: ARRAY_AGG keeps NULLs and follows ORDER BY" {
     try expectTexts(allocator, db, "SELECT array_agg(v ORDER BY id) FROM g GROUP BY k ORDER BY k", &.{ "[10,null,10]", "[30,20]" });
     try expectTexts(allocator, db, "SELECT array_sort(array_agg(v)) FROM g GROUP BY s ORDER BY s", &.{ "[20]", "[10,10,30]", "[null]" });
     try expectText(allocator, db, "SELECT array_agg(DISTINCT v) FROM g", "[null,10,20,30]");
+    try expectText(allocator, db, "SELECT array_agg_distinct(v) FROM g", "[null,10,20,30]");
+    try expectTexts(allocator, db, "SELECT array_agg_distinct(v) FROM g GROUP BY k ORDER BY k", &.{ "[null,10]", "[20,30]" });
+    try expectText(allocator, db, "SELECT array_agg_distinct(s ORDER BY s DESC) FROM g", "[\"y\",\"x\",null]");
+    try expectText(allocator, db, "SELECT array_agg_distinct(a ORDER BY a) FROM g", "[null,[],[1],[2,3]]");
+    try expectText(allocator, db, "SELECT cardinality(array_agg_distinct(a ORDER BY id)) FROM g", "4");
     try expectText(allocator, db, "SELECT array_agg(s ORDER BY s DESC, id) FROM g", "[\"y\",\"x\",\"x\",\"x\",null]");
     try expectText(allocator, db, "SELECT array_agg(a ORDER BY id) FROM g", "[[1],[2,3],null,[],[1]]");
     try expectText(allocator, db, "SELECT array_agg(v) FROM g WHERE id > 100", null);
@@ -318,6 +323,12 @@ test "ARRAY: ARRAY_AGG and GROUP_CONCAT ORDER BY take NULLS FIRST / NULLS LAST" 
     const got = try helpers.columnText(allocator, &q);
     defer helpers.freeStrings(allocator, got);
     try std.testing.expectEqualStrings("[null,30,20,10,10]", got[0].?);
+
+    var d = try helpers.runSqlMysql(allocator, db, "SELECT array_agg_distinct(v ORDER BY 1 DESC) FROM g");
+    defer d.deinit();
+    const distinct_got = try helpers.columnText(allocator, &d);
+    defer helpers.freeStrings(allocator, distinct_got);
+    try std.testing.expectEqualStrings("[30,20,10,null]", distinct_got[0].?);
 }
 
 test "ARRAY: ARRAY_UNIQUE_AGG is the distinct elements of a group's arrays" {

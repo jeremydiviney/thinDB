@@ -221,6 +221,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
     .{ .name = "string_agg", .func = .group_concat },
     // A GROUP_CONCAT of one-element arrays, which concatenates them.
     .{ .name = "array_agg", .func = .group_concat },
+    // StarRocks' ARRAY_AGG(DISTINCT x), `impliesDistinct`.
+    .{ .name = "array_agg_distinct", .func = .group_concat },
     // A GROUP_CONCAT of one-entry maps (`Parser.mapAggEntry`).
     .{ .name = "map_agg", .func = .group_concat },
     // A GROUP_CONCAT of the arrays themselves, which `uniqueAggResult`
@@ -229,7 +231,8 @@ const AggNames = [_]struct { name: []const u8, func: ir.AggFunc, postgres: ?ir.A
 };
 
 fn impliesDistinct(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "multi_distinct_count") or std.ascii.eqlIgnoreCase(name, "multi_distinct_sum");
+    return std.ascii.eqlIgnoreCase(name, "multi_distinct_count") or std.ascii.eqlIgnoreCase(name, "multi_distinct_sum") or
+        std.ascii.eqlIgnoreCase(name, "array_agg_distinct");
 }
 
 fn isUniqueAgg(name: []const u8) bool {
@@ -3359,7 +3362,7 @@ pub const Parser = struct {
         }
         if (self.aggregateFuncForName(name) == .group_concat) {
             const values = if (std.ascii.eqlIgnoreCase(name, "map_agg")) try self.mapAggEntry(args.items) else args.items;
-            const canonical = try self.parseConcatCallTail(values, distinct);
+            const canonical = try self.parseConcatCallTail(values, distinct or impliesDistinct(name));
             try self.expect(.rparen);
             return canonical;
         }
@@ -3923,7 +3926,7 @@ pub const Parser = struct {
             .col_ref => |c| c,
             else => "expr",
         };
-        const value = if (std.ascii.eqlIgnoreCase(func_name, "array_agg"))
+        const value = if (std.ascii.eqlIgnoreCase(func_name, "array_agg") or std.ascii.eqlIgnoreCase(func_name, "array_agg_distinct"))
             ir.Expr{ .call = .{ .fn_name = scalar_fn.ARRAY_VALUE_FN, .args = try self.arena.dupe(ir.Expr, args[0..1]) } }
         else if (std.ascii.eqlIgnoreCase(func_name, "map_agg") or isUniqueAgg(func_name))
             args[0]
