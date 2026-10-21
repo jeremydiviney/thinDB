@@ -158,6 +158,9 @@ pub const ParseError = error{
     SqlComparatorLambdaInvalid,
 } || LexError;
 
+/// The fields of a lambda body's `(a, b)` pair, as `row(a, b)` names them.
+const PAIR_FIELDS = "col1,col2";
+
 /// `postgres` and `mysql` name the function a name means in that dialect
 /// where it differs: MySQL and StarRocks read STD, STDDEV and VARIANCE as
 /// the population statistics, PostgreSQL reads STDDEV and VARIANCE as the
@@ -1055,6 +1058,10 @@ pub const Parser = struct {
     /// dotted name over one is a field path, `x.a.b`, which keeps every
     /// name rather than dropping a schema qualifier.
     lambda_params: std.ArrayList([]const u8) = .empty,
+    /// Set while a lambda body that opens with `(` is parsed, until that
+    /// parenthesis is read: `(a, b)` there is a pair, which `map_apply`'s
+    /// lambda returns.
+    lambda_pair_body: bool = false,
     aggregate_expr_refs: std.ArrayList(AggExprRef) = .empty,
     aggregate_expr_counter: usize = 0,
     aggregate_expr_refs_enabled: bool = false,
@@ -3429,7 +3436,9 @@ pub const Parser = struct {
         self.predicate_derived_scope = self.predicate_derived.items.len;
         try self.lambda_params.appendSlice(self.arena, params.items);
         const body = try self.arena.create(ir.Expr);
+        self.lambda_pair_body = self.cur.tag == .lparen;
         body.* = try self.parseValueExpr();
+        self.lambda_pair_body = false;
         return .{ .lambda = .{ .params = try params.toOwnedSlice(self.arena), .body = body } };
     }
 
@@ -3460,6 +3469,18 @@ pub const Parser = struct {
             const left = try self.callOf(scalar_fn.ARRAY_PAIRS_LEFT_FN, &.{first});
             const right = try self.callOf(scalar_fn.ARRAY_PAIRS_RIGHT_FN, &.{first});
             return try self.callOf(scalar_fn.ARRAY_SORT_CMP_FN, &.{ first, try self.callOf("array_map", &.{ args[0], left, right }) });
+        }
+        if (std.ascii.eqlIgnoreCase(name, "map_apply")) {
+            // The lambda maps each entry to a `(key, value)` pair.
+            if (args.len != 2) return ParseError.SqlExpectedValue;
+            const l = args[0].lambda;
+            const body = l.body.*;
+            if (body != .call or !std.mem.eql(u8, body.call.fn_name, scalar_fn.STRUCT_VALUE_PREFIX ++ PAIR_FIELDS)) return ParseError.SqlExpectedValue;
+            const keys = try self.callOf("map_keys", &.{first});
+            const values = try self.callOf("map_values", &.{first});
+            const new_keys = try self.callOf("array_map", &.{ .{ .lambda = .{ .params = l.params, .body = &body.call.args[0] } }, keys, values });
+            const new_values = try self.callOf("array_map", &.{ .{ .lambda = .{ .params = l.params, .body = &body.call.args[1] } }, keys, values });
+            return try self.callOf(scalar_fn.MAP_FROM_ARRAYS_FN, &.{ new_keys, new_values });
         }
         const map_fns = [_][]const u8{ "map_filter", "transform_values", "transform_keys" };
         for (map_fns) |f| {
@@ -4603,6 +4624,8 @@ pub const Parser = struct {
                 // `(SELECT ...)` / `(WITH ... SELECT ...)` is captured
                 // as a scalar_subquery node; everything else recurses
                 // through the binary expression parser.
+                const pair = self.lambda_pair_body;
+                self.lambda_pair_body = false;
                 try self.advance();
                 if (self.startsQuery(self.cur.tag)) {
                     const source = try self.parseExpressionSubquery();
@@ -4610,6 +4633,12 @@ pub const Parser = struct {
                     return ir.Expr{ .scalar_subquery = @ptrCast(source) };
                 }
                 const inner = try self.parseValueExpr();
+                if (pair and self.cur.tag == .comma) {
+                    try self.advance();
+                    const second = try self.parseValueExpr();
+                    try self.expect(.rparen);
+                    return try self.structValue(PAIR_FIELDS, &.{ inner, second });
+                }
                 try self.expect(.rparen);
                 return inner;
             },

@@ -1,8 +1,8 @@
 //! Lambdas end-to-end: `array_map` and the StarRocks functions that read a
 //! lambda's values (`array_filter`, `any_match`, `all_match`,
 //! `array_sortby`, `array_sort` with a comparator, `map_filter`,
-//! `transform_values`, `transform_keys`), plus the plain-array forms those
-//! lower to. Results are checked by their StarRocks text.
+//! `transform_values`, `transform_keys`, `map_apply`), plus the plain-array
+//! forms those lower to. Results are checked by their StarRocks text.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -153,6 +153,21 @@ test "LAMBDA: the functions that read a lambda" {
     try expectText(allocator, db, "SELECT transform_values((k, v) -> v * 10, map{1: 1, 2: 2})", "{1:10,2:20}");
     try expectText(allocator, db, "SELECT transform_keys((k, v) -> k + v, map{1: 1, 2: 2})", "{2:1,4:2}");
     try expectText(allocator, db, "SELECT transform_values((k, v) -> v, NULL)", null);
+
+    // map_apply's lambda maps each entry to a (key, value) pair; a repeated
+    // key keeps its last value.
+    try expectText(allocator, db, "SELECT map_apply((k, v) -> (k + 1, v * 2), map{1: 10, 2: 20})", "{2:20,3:40}");
+    try expectText(allocator, db, "SELECT map_apply((k, v) -> (v, k), map{'a': 1, 'b': 2})", "{1:\"a\",2:\"b\"}");
+    try expectText(allocator, db, "SELECT map_apply((k, v) -> (1, v), map{1: 'x', 2: 'y'})", "{1:\"y\"}");
+    try expectText(allocator, db, "SELECT map_apply((k, v) -> ((k + 1) * 2, (v)), map{1: 1})", "{4:1}");
+    try expectText(allocator, db, "SELECT map_apply(map{1: 1}, (k, v) -> (k, v + 1))", "{1:2}");
+    try expectText(allocator, db, "SELECT map_apply((k, v) -> (k, v), NULL)", null);
+    try exec(allocator, db, "CREATE TABLE mt (pk INT PRIMARY KEY, m MAP<INT, ARRAY<VARCHAR(4)>>)");
+    try exec(allocator, db, "INSERT INTO mt VALUES (1, map{0: ['1', '2']}), (2, map{1: []}), (3, NULL), (4, map{3: ['3', NULL]})");
+    try expectTexts(allocator, db, "SELECT map_apply((k, v) -> (k + 1, array_length(v)), m) FROM mt ORDER BY pk", &.{ "{1:2}", "{2:0}", null, "{4:2}" });
+    try expectTexts(allocator, db, "SELECT t.pk FROM mt t JOIN mt s ON map_apply((k, v) -> (k + 1, v), s.m) = map_apply((k, v) -> (k + 1, v), t.m) ORDER BY t.pk", &.{ "1", "2", "4" });
+    try helpers.expectRunError(allocator, db, "SELECT map_apply((k, v) -> k, map{1: 1})", error.SqlExpectedValue);
+    try helpers.expectRunError(allocator, db, "SELECT map_apply((k, v) -> (k, v, k), map{1: 1})", error.SqlExpectedToken);
 }
 
 test "LAMBDA: the plain-array forms" {
