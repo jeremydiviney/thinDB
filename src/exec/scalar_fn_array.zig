@@ -118,6 +118,7 @@ pub fn resolveArray(aa: Allocator, name: []const u8, arg_types: []const Type) Al
     const element = array.arrayElement() orelse return null;
     if (arg_types.len == 1) {
         if (eql(name, "array_length") or eql(name, "cardinality")) return overload(aa, name, arg_types, .int, lengthKernel);
+        if (eql(name, "null_or_empty")) return overload(aa, name, arg_types, .boolean, nullOrEmptyKernel);
         if (eql(name, "array_distinct")) return overload(aa, name, arg_types, array, distinctKernel);
         if (eql(name, "array_sort") and element != .json) return overload(aa, name, arg_types, array, sortKernel);
         if (eql(name, scalar_fn.ARRAY_PAIRS_LEFT_FN)) return overload(aa, name, arg_types, array, PairsKernel(.left));
@@ -817,6 +818,17 @@ fn lengthKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, a
             continue;
         };
         try appendValue(allocator, out, "int", @as(i32, @intCast(a.count)));
+    }
+}
+
+/// NULL_OR_EMPTY(arr): whether the array is NULL or has no elements, never
+/// NULL, as for text.
+fn nullOrEmptyKernel(allocator: Allocator, arg_types: []const Type, out_type: Type, args: []const ColumnView, out: *ColumnStore, rows: usize) anyerror!void {
+    _ = arg_types;
+    _ = out_type;
+    for (0..rows) |r| {
+        const empty = if (arrayAt(args[0], r)) |a| a.count == 0 else true;
+        try appendValue(allocator, out, "boolean", @intFromBool(empty));
     }
 }
 
