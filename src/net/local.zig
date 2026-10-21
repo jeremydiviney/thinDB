@@ -4488,6 +4488,7 @@ fn coerceToDate(v: Value) !i32 {
     return switch (v) {
         .date => |d| d,
         .text => |s| parseDateLiteral(s) catch Error.TypeMismatch,
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |n| exec_common.numberToDate(std.math.cast(i64, n) orelse return Error.TypeMismatch) orelse Error.TypeMismatch,
         else => Error.TypeMismatch,
     };
 }
@@ -4497,6 +4498,7 @@ fn coerceToDateTime(v: Value) !i64 {
         .datetime => |d| d,
         .text => |s| parseDateTimeLiteral(s) catch Error.TypeMismatch,
         .date => |d| @as(i64, d) * (86_400 * 1_000_000),
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |n| exec_common.numberToDatetime(std.math.cast(i64, n) orelse return Error.TypeMismatch) orelse Error.TypeMismatch,
         else => Error.TypeMismatch,
     };
 }
