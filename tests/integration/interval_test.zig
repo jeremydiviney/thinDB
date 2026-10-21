@@ -690,7 +690,7 @@ test "INTERVAL n MILLISECOND, TIMESTAMPADD(MILLISECOND, ...) and DATE_TRUNC to a
     inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
 }
 
-test "NEXT_DAY, PREVIOUS_DAY, WEEK_ISO, DAYOFWEEK_ISO, TO_ISO8601, TO_DATETIME_NTZ and ADD_MONTHS, as in StarRocks" {
+test "NEXT_DAY, PREVIOUS_DAY, WEEK_ISO, DAYOFWEEK_ISO, TO_ISO8601, TO_DATETIME[_NTZ] and ADD_MONTHS, as in StarRocks" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -724,11 +724,24 @@ test "NEXT_DAY, PREVIOUS_DAY, WEEK_ISO, DAYOFWEEK_ISO, TO_ISO8601, TO_DATETIME_N
         .{ "TO_DATETIME_NTZ(-1001, 3)", "1969-12-31 23:59:58.999000" },
         .{ "TO_DATETIME_NTZ(1598306400, 10)", null },
         .{ "TO_DATETIME_NTZ(9223372036854775807, 0)", null },
+        // TO_DATETIME reads the count in the session zone, UTC in thinDB;
+        // CAST and TIMESTAMP read a number as YYYYMMDDhhmmss.
+        .{ "TO_DATETIME(1598306400)", "2020-08-24 22:00:00" },
+        .{ "to_datetime(1598306400123, 3)", "2020-08-24 22:00:00.123000" },
+        .{ "TO_DATETIME(0, 0)", "1970-01-01 00:00:00" },
+        .{ "TO_DATETIME(1598306400, 10)", null },
+        .{ "TO_DATETIME(1598306400, NULL)", null },
+        .{ "TO_DATETIME(NULL, NULL)", null },
+        .{ "TO_DATETIME('2020-08-24 22:00:00')", "2020-08-24 22:00:00" },
+        .{ "TO_DATETIME(DATE '2020-08-24')", "2020-08-24 00:00:00" },
+        .{ "CAST(20200824220000 AS DATETIME)", "2020-08-24 22:00:00" },
+        .{ "TIMESTAMP(20200824)", "2020-08-24 00:00:00" },
         .{ "ADD_MONTHS('2024-01-31', 1)", "2024-02-29 00:00:00" },
         .{ "ADD_MONTHS(DATE '2024-03-31', -1)", "2024-02-29 00:00:00" },
     };
     inline for (cases) |c| try helpers.expectTexts(allocator, db, "SELECT CAST(" ++ c[0] ++ " AS CHAR)", &.{c[1]});
     try std.testing.expectError(error.InvalidWeekdayName, helpers.exec(allocator, db, "SELECT NEXT_DAY('2023-04-05', 'Frid')"));
+    try helpers.expectTexts(allocator, db, "SELECT CAST(to_datetime(t.ts, t.sc) AS CHAR) FROM (VALUES (1598306400, 0), (-1001, 3), (NULL, 0), (1598306400, NULL)) AS t(ts, sc)", &.{ "2020-08-24 22:00:00", "1969-12-31 23:59:58.999000", null, null });
 
     try helpers.exec(allocator, db, "CREATE TABLE nd (id BIGINT PRIMARY KEY, d DATE, dt DATETIME, w VARCHAR(10))");
     try helpers.exec(allocator, db,
