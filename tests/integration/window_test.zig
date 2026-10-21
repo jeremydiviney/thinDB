@@ -1155,6 +1155,36 @@ test "window: COUNT, SUM and AVG of DISTINCT values over every frame shape" {
     try expectTexts(allocator, db, "SELECT COUNT(DISTINCT v, g) OVER () FROM dw ORDER BY k", &.{ "4", "4", "4", "4", "4", "4", "4" });
 }
 
+test "window: SELECT DISTINCT dedups the rows the windows annotate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE sdw (k BIGINT PRIMARY KEY, g BIGINT, v INT)");
+    try helpers.exec(allocator, db, "INSERT INTO sdw VALUES (1, 1, 5), (2, 1, 5), (3, 1, 7), (4, 2, 1), (5, 2, 1), (6, 2, NULL), (7, 2, 4)");
+
+    const cases = .{
+        .{ "SELECT DISTINCT g, COUNT(v) OVER (PARTITION BY g) AS c FROM sdw ORDER BY g", &[_]?i64{ 1, 3, 2, 3 } },
+        .{ "SELECT DISTINCT v, COUNT(*) OVER (PARTITION BY v) AS c FROM sdw ORDER BY v", &[_]?i64{ null, 1, 1, 2, 4, 1, 5, 2, 7, 1 } },
+        .{ "SELECT DISTINCT g, MAX(v) OVER (PARTITION BY g) - MIN(v) OVER (PARTITION BY g) AS spread FROM sdw ORDER BY g", &[_]?i64{ 1, 2, 2, 3 } },
+        .{ "SELECT DISTINCT COUNT(v) OVER (PARTITION BY g) AS c FROM sdw ORDER BY c", &[_]?i64{3} },
+        .{ "SELECT DISTINCT g, SUM(v) OVER (PARTITION BY g) AS s FROM sdw ORDER BY g DESC LIMIT 1", &[_]?i64{ 2, 6 } },
+        .{ "SELECT COUNT(*) FROM (SELECT DISTINCT g, ROW_NUMBER() OVER (ORDER BY k) AS r FROM sdw) t", &[_]?i64{7} },
+        .{ "WITH d AS (SELECT DISTINCT g, COUNT(*) OVER (PARTITION BY g) AS c FROM sdw) SELECT g, c FROM d ORDER BY g", &[_]?i64{ 1, 3, 2, 4 } },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(got);
+        errdefer std.debug.print("query: {s}\n", .{c[0]});
+        try std.testing.expectEqualSlices(?i64, c[1], got);
+    }
+    try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT DISTINCT *, ROW_NUMBER() OVER () FROM sdw"));
+}
+
 test "window: a LAG/LEAD default of another type or an expression reads as the value's type" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

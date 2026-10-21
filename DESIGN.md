@@ -709,7 +709,8 @@ every row takes the other arm's type, through the nested unions a VALUES list
 builds, so `VALUES (1), (NULL), (NULL)` is INT wherever its NULLs stand.
 
 `SELECT DISTINCT` over a grouped query dedups the grouped rows after HAVING
-and before ORDER BY and LIMIT. An ORDER BY key the SELECT list doesn't carry
+and before ORDER BY and LIMIT. Over window functions it dedups the rows the
+windows annotate, after QUALIFY, as MySQL and DuckDB do. An ORDER BY key the SELECT list doesn't carry
 orders each distinct row by its first occurrence in that order, as MySQL does:
 by the key's least value ascending, its greatest descending.
 

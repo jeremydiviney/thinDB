@@ -1363,9 +1363,9 @@ pub const Parser = struct {
         try self.advance();
 
         // Optional DISTINCT — desugars to grouping on every projected item
-        // (resolved after the projection list is parsed). DISTINCT combined
-        // with aggregates / GROUP BY / HAVING / window functions / `*` is
-        // rejected: those need a second dedup layer above the aggregate.
+        // (resolved after the projection list is parsed). Over aggregates or
+        // windows it dedups their output rows instead (`distinctRows`).
+        // DISTINCT with `*`, or with HAVING but no grouping, is rejected.
         const distinct = try self.parseSelectModifiers();
         self.select_distinct = distinct;
 
@@ -1614,8 +1614,9 @@ pub const Parser = struct {
         var post_group_pred_derived: []const ir.Derived = &.{};
         var group_alias_renames: []const exec_predicate.ColRename = &.{};
         // Over a grouped query DISTINCT dedups the grouped rows, after HAVING
-        // and before ORDER BY (`distinctRows`).
-        const distinct_as_group = distinct and !has_agg and !has_group;
+        // and before ORDER BY (`distinctRows`), and over windows it dedups
+        // the rows the windows annotate.
+        const distinct_as_group = distinct and !has_agg and !has_group and !has_window;
         if (distinct_as_group) {
             // SELECT DISTINCT a, b, expr ≡ SELECT a, b, expr GROUP BY 1, 2, 3:
             // every projected item becomes a grouping key (markGroupKey
@@ -1687,7 +1688,7 @@ pub const Parser = struct {
             };
         }
 
-        if (has_agg or has_group or distinct) {
+        if (has_agg or has_group or distinct_as_group) {
             if (projection_predicate_derived.len > 0) {
                 root = try self.allocOp(.{ .compute = .{ .derived = projection_predicate_derived, .upstream = root } });
             }
@@ -1963,6 +1964,10 @@ pub const Parser = struct {
                 root = try self.allocOp(.{ .filter = .{ .predicate = bound, .upstream = root } });
             }
             root = try self.addOrderKeyComputes(root, order_anchors, order_keys);
+            if (distinct) {
+                for (proj) |p| if (p.kind == .star) return ParseError.SqlInvalidProjection;
+                root = try self.distinctRows(root, proj, pending_order_specs orelse &.{}, &.{});
+            }
             if (pending_order_specs) |specs| {
                 root = try self.allocOp(.{ .order_by = .{ .specs = specs, .upstream = root } });
             }
