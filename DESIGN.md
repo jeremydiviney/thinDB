@@ -339,6 +339,11 @@ dialect `||` is OR and `!` is NOT, as in StarRocks and MySQL without
 `PIPES_AS_CONCAT`, which `SET sql_mode` doesn't turn on. The other dialects
 read `||` as concatenation.
 
+A NULL ahead of a comparison, IN, BETWEEN, LIKE or REGEXP is UNKNOWN, as is
+NOT of one. `NULL NOT IN (SELECT ...)` is TRUE only when the subquery returns
+no rows. `NOT LIKE` over a NULL row is UNKNOWN too, even when it is negated
+again or read as a value.
+
 Some clause words aren't reserved in MySQL: `TEMP`, `TEMPORARY`, `MATERIALIZED`,
 `TABLES` and `COPY`, and the window words `CURRENT`, `UNBOUNDED`, `PRECEDING`,
 `FOLLOWING` and `RESPECT`. They are keywords only where they open their clause,

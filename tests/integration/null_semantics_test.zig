@@ -1140,3 +1140,42 @@ test "NULL in arithmetic ahead of a comparison makes it UNKNOWN" {
     try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM n WHERE NULL * 2 = 0", "0");
     try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM n WHERE NOT (NULL + v > 0)", "0");
 }
+
+test "a NULL ahead of IN, BETWEEN, LIKE or REGEXP is UNKNOWN, and NOT IN an empty subquery holds" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE e (k BIGINT)");
+
+    const counts = .{
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL NOT IN (SELECT v FROM nt)", "0" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL IN (SELECT v FROM nt)", "0" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL NOT IN (SELECT k FROM e)", "6" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL IN (SELECT k FROM e)", "0" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL NOT IN (10, 20)", "0" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NOT (NULL IN (10, 20))", "0" },
+        .{ "SELECT COUNT(*) FROM nt WHERE NULL NOT BETWEEN 1 AND 2", "0" },
+    };
+    inline for (counts) |case| try helpers.expectText(allocator, db, case[0], case[1]);
+
+    try helpers.expectText(allocator, db, "SELECT NULL NOT IN (1, 2)", null);
+    try helpers.expectText(allocator, db, "SELECT NULL IN (1)", null);
+    try helpers.expectText(allocator, db, "SELECT NULL BETWEEN 1 AND 2", null);
+    try helpers.expectText(allocator, db, "SELECT NULL NOT LIKE 'a%'", null);
+    try helpers.expectText(allocator, db, "SELECT NULL REGEXP 'a'", null);
+}
+
+test "NOT LIKE stays UNKNOWN on a NULL row, negated again or read as a value" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, std.testing.io, tmp.dir);
+    defer db.close();
+
+    try helpers.expectTexts(allocator, db, "SELECT coalesce(CAST((s NOT LIKE 'a%') AS CHAR), 'N') FROM nt ORDER BY id", &.{ "0", "N", "1", "N", "N", "N" });
+    try helpers.expectTexts(allocator, db, "SELECT coalesce(CAST((NOT (s LIKE 'a%')) AS CHAR), 'N') FROM nt ORDER BY id", &.{ "0", "N", "1", "N", "N", "N" });
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM nt WHERE NOT (s NOT LIKE 'a%')", "1");
+    try helpers.expectText(allocator, db, "SELECT COUNT(*) FROM nt WHERE NOT (s IS NOT NULL AND NOT (s LIKE 'a%'))", "5");
+}
