@@ -1507,6 +1507,10 @@ pub fn compileInStatementWithOptions(allocator: Allocator, catalog: *Catalog, se
     try predicate_pushdown.pushComputeThroughUnions(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
     exec.prof.addPhase("compile.push_compute_unions", @intCast(exec.prof.nowTicks() - t_push_compute_unions));
     try struct_paths.derivePaths(ctx.nodeArena(), catalog, session_cell.*, @constCast(root));
+    if (session_cell.group_concat_max_len) |n| {
+        var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+        try capGroupConcats(ctx.nodeArena(), @constCast(root), n, &visited);
+    }
     // The two removal rewrites below delete SQL before any operator binds it,
     // so a reference that can never resolve would vanish with its unused item
     // and the statement would run. Keep the tree whole then: the binder
@@ -1578,6 +1582,10 @@ pub fn compileSubplan(ctx: *CompileCtx, op: *const ir.Op) anyerror!Query {
         // Subquery inners compile before the statement's own passes reach
         // them.
         try struct_paths.derivePaths(ctx.nodeArena(), ctx.catalog, ctx.session.*, @constCast(op));
+        if (ctx.session.group_concat_max_len) |n| {
+            var visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty;
+            try capGroupConcats(ctx.nodeArena(), @constCast(op), n, &visited);
+        }
         const v2_input = engine_v2.CompileInput{
             .allocator = try ctx.executionAllocator(),
             .catalog = ctx.catalog,
@@ -2433,6 +2441,7 @@ fn compileSetVar(ctx: *CompileCtx, sv: ir.SetVar) !Query {
         if (a.session_option) |option| {
             switch (option) {
                 .max_dop => ctx.session.max_dop = try maxDopSetting(if (value) |v| v.value else null),
+                .group_concat_max_len => ctx.session.group_concat_max_len = try groupConcatMaxLen(if (value) |v| v.value else null),
             }
             continue;
         }
@@ -2463,6 +2472,46 @@ fn maxDopSetting(value: ?Value) Error!u32 {
     };
     if (n < 0) return Error.TypeMismatch;
     return std.math.cast(u32, n) orelse std.math.maxInt(u32);
+}
+
+/// `SET group_concat_max_len` takes an integer, raised to MySQL's least
+/// value of 4; NULL and DEFAULT keep every byte.
+fn groupConcatMaxLen(value: ?Value) Error!?u64 {
+    const v = value orelse return null;
+    const n: i128 = switch (v) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint => |x| x,
+        else => return Error.TypeMismatch,
+    };
+    return std.math.cast(u64, @max(n, 4)) orelse std.math.maxInt(u64);
+}
+
+/// Every GROUP BY's GROUP_CONCAT under `op` cut at `max_len` bytes, the
+/// session's `group_concat_max_len`. A CTE read twice is capped once.
+fn capGroupConcats(arena: Allocator, op: *ir.Op, max_len: u64, visited: *std.AutoHashMapUnmanaged(*const ir.Op, void)) !void {
+    if (op.* == .materialize and (try visited.getOrPut(arena, op)).found_existing) return;
+    if (op.* == .group_by) {
+        const aggs = try arena.dupe(exec.AggSpec, op.group_by.aggs);
+        for (aggs) |*a| if (a.func == .group_concat and a.params == .concat) {
+            a.params.concat.max_len = max_len;
+        };
+        op.group_by.aggs = aggs;
+    }
+    switch (op.*) {
+        inline else => |*payload| {
+            const Payload = @TypeOf(payload.*);
+            if (@typeInfo(Payload) != .@"struct") return;
+            inline for (@typeInfo(Payload).@"struct".fields) |field| {
+                const child = @field(payload.*, field.name);
+                if (field.type == *ir.Op) {
+                    try capGroupConcats(arena, child, max_len, visited);
+                } else if (field.type == ?*ir.Op) {
+                    if (child) |c| try capGroupConcats(arena, c, max_len, visited);
+                } else if (field.type == []const *ir.Op) {
+                    for (child) |c| try capGroupConcats(arena, c, max_len, visited);
+                }
+            }
+        },
+    }
 }
 
 fn compileAdmin(ctx: *CompileCtx, a: ir.AdminOp) !Query {

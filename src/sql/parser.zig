@@ -7696,7 +7696,7 @@ pub const Parser = struct {
             try self.advance();
             const value: ir.Expr = if (self.cur.tag == .kw_default) default: {
                 try self.advance();
-                break :default .{ .lit = .{ .bigint = 0 } };
+                break :default .{ .null_lit = .bigint };
             } else try self.parseScalar();
             return .{ .name = option.sqlName(), .value = value, .session_option = option };
         }
@@ -9876,7 +9876,7 @@ test "SET thindb_max_dop parses as a session option in every spelling" {
         try std.testing.expectEqual(@as(i32, 4), op.set_var.assignments[0].value.lit.int);
     }
     const reset = try parseDialect(aa, "SET thindb_max_dop = DEFAULT", .neutral);
-    try std.testing.expectEqual(@as(i64, 0), reset.set_var.assignments[0].value.lit.bigint);
+    try std.testing.expect(reset.set_var.assignments[0].value == .null_lit);
 
     const user_var = try parseDialect(aa, "SET @thindb_max_dop = 4", .mysql);
     try std.testing.expect(user_var.set_var.assignments[0].session_option == null);

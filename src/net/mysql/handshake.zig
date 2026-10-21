@@ -360,7 +360,7 @@ pub fn systemVariableValue(var_in: []const u8, current_schema: []const u8) []con
     if (std.mem.eql(u8, v, "wait_timeout")) return "28800";
     if (std.mem.eql(u8, v, "interactive_timeout")) return "28800";
     if (std.mem.eql(u8, v, "max_connections")) return "256";
-    if (std.mem.eql(u8, v, "group_concat_max_len")) return "1024";
+    if (std.mem.eql(u8, v, "group_concat_max_len")) return "18446744073709551615";
     if (std.mem.eql(u8, v, "sql_select_limit")) return "18446744073709551615";
 
     if (std.mem.eql(u8, v, "tx_isolation") or std.mem.eql(u8, v, "transaction_isolation"))

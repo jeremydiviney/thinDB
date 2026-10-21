@@ -636,6 +636,17 @@ the separator, as DuckDB reads it. In the MySQL dialect it concatenates, as
 MySQL and StarRocks do, so `GROUP_CONCAT(name, '-')` is `b-,a-`.
 `STRING_AGG(x, sep)` takes the separator in every dialect.
 
+`SET group_concat_max_len = n` cuts the text of every GROUP BY's
+GROUP_CONCAT in the session's later statements to n bytes, then back to the
+start of a character, as MySQL does. An n below 4 is 4, MySQL's least value.
+Unset, or set to DEFAULT or NULL, the text is whole: MySQL's default of 1024
+would silently drop data, so thinDB keeps every byte unless asked, and
+`@@group_concat_max_len` reads 18446744073709551615 then. The cap is a
+parameter of the aggregate (`ConcatParams.max_len`), set at compile time, so
+every lane that finishes a GROUP_CONCAT cuts it the same way; the group top-N
+lane, which joins its text without one, declines a capped one. ARRAY_AGG and
+MAP_AGG are GROUP_CONCATs whose output isn't text, and stay whole.
+
 `PERCENTILE_CONT(x, p)` (and `MEDIAN(x)`, its p = 0.5) interpolates at index
 p×(n−1) of the sorted values, as PostgreSQL and DuckDB do.
 `PERCENTILE_DISC(x, p)`, and StarRocks' `PERCENTILE_DISC_LC`, is the first
