@@ -92,6 +92,17 @@ test "STRUCT: field access" {
     try expectTexts(allocator, db, "SELECT x.s.a FROM sc x ORDER BY id", &.{ "1", null, null, "2" });
     try expectTexts(allocator, db, "SELECT n.inner.y FROM sc ORDER BY id", &.{ "p", null, null, "q" });
     try expectTexts(allocator, db, "SELECT sc.n.inner.x FROM sc ORDER BY id", &.{ "1.5", null, null, null });
+    // The database and schema a bare table name resolves into qualify it.
+    try expectTexts(allocator, db, "SELECT main.sc.s.b FROM sc ORDER BY id", &.{ "x", "y", null, null });
+    try expectTexts(allocator, db, "SELECT MAIN.SC.n.inner.y FROM sc ORDER BY id", &.{ "p", null, null, "q" });
+    try expectTexts(allocator, db, "SELECT main.public.sc.s.a FROM sc ORDER BY id", &.{ "1", null, null, "2" });
+    try expectTexts(allocator, db, "SELECT main.x.s.a FROM sc x ORDER BY id", &.{ "1", null, null, "2" });
+    // Ahead of no table name it is the struct column it names.
+    try exec(allocator, db, "CREATE TABLE nm (id INT PRIMARY KEY, main STRUCT<a INT, public STRUCT<c STRUCT<d INT>>>, o STRUCT<public STRUCT<c STRUCT<d INT>>>)");
+    try exec(allocator, db, "INSERT INTO nm VALUES (1, row(5, row(row(6))), row(row(row(7))))");
+    try expectText(allocator, db, "SELECT main.a FROM nm", "5");
+    try expectText(allocator, db, "SELECT main.public.c.d FROM nm", "6");
+    try expectText(allocator, db, "SELECT o.public.c.d FROM nm", "7");
     try expectTexts(allocator, db, "SELECT n.tags[2] FROM sc ORDER BY id", &.{ "2", null, null, null });
     try expectTexts(allocator, db, "SELECT n.m['k'] FROM sc ORDER BY id", &.{ "1", null, null, null });
     try expectTexts(allocator, db, "SELECT n.inner FROM sc ORDER BY id", &.{ "{\"x\":1.5,\"y\":\"p\"}", null, null, "{\"x\":null,\"y\":\"q\"}" });
@@ -204,4 +215,7 @@ test "STRUCT: nested paths through joins, unions and derived tables" {
     try expectTexts(allocator, db, "SELECT row(map1).col1 FROM sc2 ORDER BY v1", &.{ "{1:{10:{100:101}}}", "{2:{20:{200:202}}}", "{3:{30:{300:303}}}" });
     try expectTexts(allocator, db, "SELECT named_struct('a', st1, 'b', st2).b.ss3.sss1 FROM sc2 ORDER BY v1", &.{ "1", "2", "3" });
     try expectText(allocator, db, "SELECT CAST(row(1, 2, 3) AS STRUCT<a DOUBLE, b STRING, c BIGINT>)", "{\"a\":1,\"b\":\"2\",\"c\":3}");
+    try expectTexts(allocator, db, "WITH input AS (SELECT struct([1, 2, 3], [4, 5, 6]) AS s UNION ALL SELECT struct([5, 6, 7], [6, 7]) AS s) SELECT s.col1 FROM input ORDER BY 1", &.{ "[1,2,3]", "[5,6,7]" });
+    try expectTexts(allocator, db, "WITH input AS (SELECT struct([1, 2, 3], [4, 5, 6]) AS s UNION ALL SELECT NULL AS s UNION ALL SELECT struct([5, 6, 7], [6, 7]) AS s) SELECT s.col1 FROM input ORDER BY 1", &.{ null, "[1,2,3]", "[5,6,7]" });
+    try expectTexts(allocator, db, "SELECT s.col2 FROM (SELECT struct(1, 'a') AS s) x", &.{"a"});
 }

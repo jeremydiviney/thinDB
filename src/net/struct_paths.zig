@@ -31,6 +31,7 @@ const local = @import("local.zig");
 pub fn derivePaths(arena: Allocator, catalog: *api.Catalog, session: api.Session, root: *ir.Op) !void {
     var pass: Pass = .{ .arena = arena, .catalog = catalog, .session = session };
     try pass.survey(root);
+    if (!pass.engaged) pass.engaged = pass.namesUnqualifiedPath();
     if (!pass.engaged) return;
     pass.visited.clearRetainingCapacity();
     var slot = root;
@@ -44,6 +45,11 @@ const Pass = struct {
     /// Every table name and alias the statement names, which a dotted
     /// name's first segment may be instead of a column.
     qualifiers: std.ArrayList([]const u8) = .empty,
+    /// The database and schema of every table the statement scans, which
+    /// qualify a dotted name only ahead of a table name (`db.t.s.a`).
+    namespaces: std.ArrayList([]const u8) = .empty,
+    /// Every `a.b` name the statement reads.
+    dotted: std.ArrayList([]const u8) = .empty,
     visited: std.AutoHashMapUnmanaged(*const ir.Op, void) = .empty,
     engaged: bool = false,
     hidden_count: usize = 0,
@@ -59,6 +65,10 @@ const Pass = struct {
                 if (s.table.schema) |n| try self.qualifiers.append(self.arena, n);
                 if (s.table.database) |n| try self.qualifiers.append(self.arena, n);
                 if (s.alias) |a| try self.qualifiers.append(self.arena, a);
+                if (self.catalog.tableNamespace(self.session, s.table.database, s.table.schema)) |ns| {
+                    try self.namespaces.append(self.arena, ns.db);
+                    try self.namespaces.append(self.arena, ns.schema);
+                } else |_| {}
                 if (self.tableColumns(s)) |columns| {
                     for (columns) |c| if (c.type.structFields() != null) {
                         self.engaged = true;
@@ -81,11 +91,23 @@ const Pass = struct {
             try self.collectNames(op, &names, &derived);
             for (names.items) |name| if (isDeepName(name)) {
                 self.engaged = true;
+            } else if (std.mem.indexOfScalar(u8, name, '.') != null and !isStar(name)) {
+                try self.dotted.append(self.arena, name);
             };
         }
         var children: [2]**ir.Op = undefined;
         for (childSlots(op, &children)) |child| try self.survey(child.*);
         if (op.* == .table_fn) for (op.table_fn.inputs) |input| try self.survey(input);
+    }
+
+    /// Whether some `a.b` name's `a` names no table of the statement, so
+    /// may be a CTE's or derived table's struct column and `b` its field.
+    fn namesUnqualifiedPath(self: *const Pass) bool {
+        for (self.dotted.items) |name| {
+            const dot = std.mem.indexOfScalar(u8, name, '.').?;
+            if (!contains(self.qualifiers.items, name[0..dot])) return true;
+        }
+        return false;
     }
 
     fn tableColumns(self: *Pass, s: ir.Op.Scan) ?[]const types.Column {
@@ -277,7 +299,7 @@ const Pass = struct {
         var path = segments.items;
         var root_start: usize = 0;
         var root = path[0];
-        while (path.len > 1 and contains(self.qualifiers.items, path[0])) {
+        while (path.len > 1 and self.qualifies(path)) {
             if (path.len == 2) return null;
             root = name[root_start .. root_start + path[0].len + 1 + path[1].len];
             root_start += path[0].len + 1;
@@ -302,6 +324,15 @@ const Pass = struct {
             expr = .{ .call = .{ .fn_name = fn_name, .args = args } };
         }
         return expr;
+    }
+
+    fn qualifies(self: *const Pass, path: []const []const u8) bool {
+        if (contains(self.qualifiers.items, path[0])) return true;
+        var i: usize = 0;
+        while (i + 2 < path.len and contains(self.namespaces.items, path[i])) : (i += 1) {
+            if (contains(self.qualifiers.items, path[i + 1])) return true;
+        }
+        return false;
     }
 
     /// The one STRUCT column of `src` whose fields hold `path`, or null when
