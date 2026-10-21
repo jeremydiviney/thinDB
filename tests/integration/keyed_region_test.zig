@@ -992,12 +992,12 @@ test "keyed region: TVF inputs convert to their declared types as in ordinary ex
         \\           CAST(month AS SMALLINT) AS month
         \\
     ++ tail);
-    // A refused conversion (BIGINT into DATE) fails either way.
+    // A refused conversion (DOUBLE into DATE) fails either way.
     inline for (.{ "WITH ", "WITH KEYED BY (custLC) " }) |head| {
         var q = helpers.runSql(allocator, db, head ++
             \\stepped AS (
             \\  SELECT * FROM TABLE(month_step((
-            \\    SELECT amount, amount AS day, projectId, custLC, month FROM inv WHERE projectId >= 100
+            \\    SELECT amount, CAST(amount AS DOUBLE) AS day, projectId, custLC, month FROM inv WHERE projectId >= 100
             \\  )) PARTITION BY custLC)
             \\)
             \\SELECT * FROM stepped
