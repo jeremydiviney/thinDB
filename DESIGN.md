@@ -1417,7 +1417,9 @@ its aggregate, and the operator folds each row's frame into the aggregate
 operator's own accumulator, so a whole partition gives its GROUP BY value. A
 frame that keeps the last row's start and ends no earlier folds on into the
 same state, a row whose frame is the last one's shares its result, and any
-other frame folds afresh. These calls write their output column whole, so a
+other frame folds afresh. A window aggregate reads its input as the aggregate does
+(`engine_v2.aggInputReading`): `BOOL_OR(n) OVER` reads a number's truth, and in
+the MySQL dialect `SUM(d) OVER` adds a DATE's YYYYMMDD number. These calls write their output column whole, so a
 spec that runs one evaluates serially. A UDF aggregate, `ARRAY_UNIQUE_AGG`,
 FILTER and IGNORE NULLS stay refused under OVER.
 

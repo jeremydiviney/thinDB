@@ -1245,6 +1245,11 @@ test "window: any other aggregate runs over each row's frame" {
     try expectTexts(allocator, db, "SELECT count_if(v > 25) OVER (ORDER BY k ROWS BETWEEN 9 FOLLOWING AND 10 FOLLOWING) FROM aw ORDER BY k", &.{ "0", "0", "0", "0", "0", "0", "0" });
     try expectTexts(allocator, db, "SELECT bool_or(b) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM aw ORDER BY k", &.{ "0", "0", "1", "1", "0", "1", "1" });
     try expectTexts(allocator, db, "SELECT bool_and(b) OVER (ORDER BY k) FROM aw ORDER BY k", &.{ "0", "0", "0", "0", "0", "0", "0" });
+    // A number reads as its truth, as the aggregates read it.
+    try expectTexts(allocator, db, "SELECT bool_or(v) OVER (PARTITION BY g ORDER BY k) FROM aw ORDER BY k", &.{ "1", "1", "1", null, "1", "1", "1" });
+    try expectTexts(allocator, db, "SELECT bool_and(v - 10) OVER (PARTITION BY g ORDER BY k) FROM aw ORDER BY k", &.{ "1", "0", "0", null, "1", "1", "1" });
+    try expectTexts(allocator, db, "SELECT count_if(v) OVER () FROM aw WHERE k < 3", &.{ "2", "2" });
+    try expectTexts(allocator, db, "SELECT sum(a) FROM (SELECT bool_or(g) OVER (PARTITION BY g ORDER BY k) AS a FROM aw) t", &.{"7"});
 
     // ARRAY_AGG and GROUP_CONCAT, ordered, DISTINCT, and over RANGE peers.
     try expectTexts(allocator, db, "SELECT CAST(array_agg(v) OVER (PARTITION BY g ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[30]", "[30,10]", "[30,10,20]", "[null]", "[null,50]", "[null,50,40]", "[null,50,40,45]" });
@@ -1261,6 +1266,19 @@ test "window: any other aggregate runs over each row's frame" {
     try expectTexts(allocator, db, "SELECT CASE WHEN max_by(s, v) OVER (PARTITION BY g) = 'c' THEN 'one' ELSE 'two' END FROM aw ORDER BY k", &.{ "one", "one", "one", "two", "two", "two", "two" });
     try expectTexts(allocator, db, "SELECT max_by(g, SUM(v)) OVER () FROM aw GROUP BY g ORDER BY g", &.{ "2", "2" });
     try expectTexts(allocator, db, "SELECT k FROM (SELECT k, max_by(s, v + k) OVER (PARTITION BY g) AS m FROM aw) x WHERE m = 'x' ORDER BY k", &.{ "4", "5", "6", "7" });
+
+    // In MySQL a SUM over a DATE adds its YYYYMMDD numbers, as the aggregate does.
+    try helpers.exec(allocator, db, "CREATE TABLE ad (k BIGINT PRIMARY KEY, d DATE)");
+    try helpers.exec(allocator, db, "INSERT INTO ad VALUES (1, '2024-01-02'), (2, '2024-01-03')");
+    {
+        var q = try helpers.runSqlMysqlSession(allocator, db, "SELECT SUM(d) OVER (ORDER BY k) FROM ad ORDER BY k");
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        try std.testing.expectEqual(@as(usize, 2), got.len);
+        try std.testing.expectEqualStrings("20240102", got[0].?);
+        try std.testing.expectEqualStrings("40480205", got[1].?);
+    }
 
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT max_by(s) OVER () FROM aw"));
     try std.testing.expectError(error.SqlInvalidProjection, helpers.exec(allocator, db, "SELECT max_by(s, v) IGNORE NULLS OVER () FROM aw"));
