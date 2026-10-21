@@ -17,8 +17,9 @@
 //!   that's plain substitution, not a pattern feature.
 //!
 //! Matching is byte-oriented (ASCII-aware). UTF-8 bytes flow through
-//! `.` and negated classes fine; Unicode property classes (`\p{...}`)
-//! and non-ASCII case folding are out of scope.
+//! `.` and negated classes fine. A Unicode property class (`\p{...}`,
+//! `\P{...}`) is an invalid pattern, and non-ASCII case folding is out of
+//! scope.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -259,7 +260,7 @@ const Parser = struct {
             'd', 'D', 'w', 'W', 's', 'S' => {
                 return self.node(.{ .class = shorthandClass(c) });
             },
-            else => return self.literal(unescapeByte(c)),
+            else => return self.literal(try escapedByte(c)),
         }
     }
 
@@ -292,7 +293,7 @@ const Parser = struct {
                         for (0..256) |b| if (sub.contains(@intCast(b))) cc.add(@intCast(b));
                         continue;
                     },
-                    else => lo = unescapeByte(e),
+                    else => lo = try escapedByte(e),
                 }
             } else {
                 lo = self.advance();
@@ -305,7 +306,7 @@ const Parser = struct {
                     _ = self.advance();
                     const e = self.peek() orelse return Error.RegexInvalidPattern;
                     _ = self.advance();
-                    hi = unescapeByte(e);
+                    hi = try escapedByte(e);
                 } else {
                     hi = self.advance();
                 }
@@ -362,6 +363,14 @@ fn isGraph(b: u8) bool {
 
 fn isPunct(b: u8) bool {
     return isGraph(b) and !std.ascii.isAlphanumeric(b);
+}
+
+/// The byte `\c` stands for. A Unicode property class would need classes
+/// over UTF-8 sequences, so `\p` and `\P` refuse the pattern rather than
+/// read as the letter.
+fn escapedByte(c: u8) Error!u8 {
+    if (c == 'p' or c == 'P') return Error.RegexInvalidPattern;
+    return unescapeByte(c);
 }
 
 fn unescapeByte(c: u8) u8 {
@@ -1574,6 +1583,10 @@ test "regex: invalid patterns rejected" {
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "abc)"));
     // Lookaround is explicitly unsupported (only `(?:` is allowed).
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "a(?=b)"));
+    // So are Unicode property classes, in a class or out of one.
+    inline for (.{ "\\p{Han}", "\\pL", "[\\p{Han}]+", "[^\\P{L}]", "[a-\\p]" }) |pattern| {
+        try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, pattern));
+    }
 }
 
 test "regex: dot does not match newline" {
