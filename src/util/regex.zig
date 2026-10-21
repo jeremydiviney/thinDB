@@ -163,7 +163,7 @@ const Parser = struct {
                     max = 1;
                 },
                 '{' => {
-                    const parsed = try self.parseBraces();
+                    const parsed = try self.parseBraces() orelse break;
                     min = parsed.min;
                     max = parsed.max;
                 },
@@ -179,21 +179,37 @@ const Parser = struct {
         return atom;
     }
 
-    fn parseBraces(self: *Parser) Error!struct { min: u32, max: ?u32 } {
+    /// A `{n}`, `{n,}` or `{n,m}` repeat at the cursor, or null with the
+    /// cursor unmoved when the brace starts no repeat (`{,2}`, `{x}`), which
+    /// then reads as a literal `{`, as in RE2.
+    fn parseBraces(self: *Parser) Error!?struct { min: u32, max: ?u32 } {
+        const start = self.pos;
         _ = self.advance(); // '{'
+        if (!self.atDigit()) {
+            self.pos = start;
+            return null;
+        }
         const min = try self.parseInt();
         var max: ?u32 = min;
         if (self.peek() == ',') {
             _ = self.advance();
             if (self.peek() == '}') {
                 max = null; // {n,}
-            } else {
+            } else if (self.atDigit()) {
                 max = try self.parseInt();
             }
         }
-        if (self.peek() != '}') return Error.RegexInvalidPattern;
+        if (self.peek() != '}') {
+            self.pos = start;
+            return null;
+        }
         _ = self.advance();
         return .{ .min = min, .max = max };
+    }
+
+    fn atDigit(self: *Parser) bool {
+        const c = self.peek() orelse return false;
+        return c >= '0' and c <= '9';
     }
 
     fn parseInt(self: *Parser) Error!u32 {
@@ -242,7 +258,13 @@ const Parser = struct {
                 return self.node(.eol);
             },
             '\\' => return self.parseEscape(),
-            ')', '*', '+', '?', '{' => return Error.RegexInvalidPattern,
+            ')', '*', '+', '?' => return Error.RegexInvalidPattern,
+            '{' => {
+                // A repeat with nothing to repeat.
+                if ((try self.parseBraces()) != null) return Error.RegexInvalidPattern;
+                _ = self.advance();
+                return self.literal(c);
+            },
             else => {
                 _ = self.advance();
                 return self.literal(c);
@@ -1611,6 +1633,20 @@ test "regex: bounded + unbounded repetition" {
     try expectMatch("^a{2,}$", "aaaaa", true);
     try expectMatch("^a{2,}$", "a", false);
     try expectMatch("^a{2,3}$", "aaaa", false);
+}
+
+test "regex: a brace that starts no repeat is a literal brace, as in RE2" {
+    try expectMatch("^a{,2}$", "a{,2}", true);
+    try expectMatch("^a{,2}$", "aa", false);
+    try expectMatch("^a{,}$", "a{,}", true);
+    try expectMatch("^a{x}$", "a{x}", true);
+    try expectMatch("^a{2$", "a{2", true);
+    try expectMatch("^a{2,x}$", "a{2,x}", true);
+    try expectMatch("^{}$", "{}", true);
+    try expectMatch("^x{,}{2}$", "x{,}}", true);
+    // A real repeat still needs something to repeat.
+    try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "{2}"));
+    try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "a|{1,3}"));
 }
 
 test "regex: multi-way alternation + nested groups" {
