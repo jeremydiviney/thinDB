@@ -237,6 +237,7 @@ test "agg on expr: FILTER (WHERE ...) aggregates only the rows its condition hol
     // An ARRAY_AGG the filter leaves empty is NULL, not `[NULL]`.
     try helpers.expectTexts(allocator, db, "SELECT ARRAY_AGG(product) FILTER (WHERE qty < 20) FROM sales GROUP BY id ORDER BY id", &.{ "[\"A\"]", null, "[\"A\"]", null, null });
     try helpers.expectText(allocator, db, "SELECT ARRAY_AGG(DISTINCT product) FILTER (WHERE qty < 20) FROM sales", "[\"A\"]");
+    try helpers.expectText(allocator, db, "SELECT ARRAY_AGG_DISTINCT(product) FILTER (WHERE qty < 20) FROM sales", "[\"A\"]");
     try helpers.expectTexts(allocator, db, "SELECT product FROM sales GROUP BY product HAVING SUM(qty) FILTER (WHERE amount > 120) > 20 ORDER BY product", &.{ "B", "C" });
     try helpers.expectTexts(allocator, db, "SELECT product FROM sales GROUP BY product ORDER BY COUNT(*) FILTER (WHERE qty > 15) DESC, product", &.{ "B", "C", "A" });
     try helpers.expectText(allocator, db, "SELECT COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM sales)) FROM sales", "2");

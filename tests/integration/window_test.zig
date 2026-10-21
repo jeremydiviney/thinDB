@@ -1209,6 +1209,7 @@ test "window: any other aggregate runs over each row's frame" {
     try expectTexts(allocator, db, "SELECT CAST(array_agg(v) OVER (PARTITION BY g ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[30]", "[30,10]", "[30,10,20]", "[null]", "[null,50]", "[null,50,40]", "[null,50,40,45]" });
     try expectTexts(allocator, db, "SELECT CAST(array_agg(s ORDER BY v DESC) OVER (PARTITION BY g) AS STRING) FROM aw ORDER BY k", &.{ "[\"c\",\"b\",\"a\"]", "[\"c\",\"b\",\"a\"]", "[\"c\",\"b\",\"a\"]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]", "[\"x\",\"f\",\"e\",null]" });
     try expectTexts(allocator, db, "SELECT CAST(array_agg(DISTINCT g) OVER (ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[1]", "[1]", "[1]", "[1,2]", "[1,2]", "[1,2]", "[1,2]" });
+    try expectTexts(allocator, db, "SELECT CAST(array_agg_distinct(g) OVER (ORDER BY k) AS STRING) FROM aw ORDER BY k", &.{ "[1]", "[1]", "[1]", "[1,2]", "[1,2]", "[1,2]", "[1,2]" });
     try expectTexts(allocator, db, "SELECT group_concat(s ORDER BY k) OVER (ORDER BY g) FROM aw ORDER BY k", &.{ "c,a,b", "c,a,b", "c,a,b", "c,a,b,x,e,f", "c,a,b,x,e,f", "c,a,b,x,e,f", "c,a,b,x,e,f" });
     try expectTexts(allocator, db, "SELECT group_concat(DISTINCT g ORDER BY g SEPARATOR '-') OVER () FROM aw ORDER BY k", &.{ "1-2", "1-2", "1-2", "1-2", "1-2", "1-2", "1-2" });
     try expectTexts(allocator, db, "SELECT CAST(approx_top_k(g) OVER () AS STRING) FROM aw WHERE k < 3", &.{ "[{\"item\":1,\"count\":2}]", "[{\"item\":1,\"count\":2}]" });
