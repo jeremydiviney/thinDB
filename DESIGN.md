@@ -1394,6 +1394,10 @@ peer groups (`GROUPS`). Bounded `RANGE` currently accepts one numeric order
 column; decimal offsets respect the order column's scale. `FIRST_VALUE`,
 `LAST_VALUE`, and `NTH_VALUE` honor the actual frame, including empty frames
 and `IGNORE NULLS`. Temporal range offsets and `EXCLUDE` remain unsupported.
+An aggregate over a frame from `UNBOUNDED PRECEDING` takes one sweep of the
+partition. To `CURRENT ROW` each row takes the running value; to `n PRECEDING`
+or `n FOLLOWING` in `ROWS`, the running value n rows away. A frame with a
+bounded start folds row by row.
 
 `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `COVAR_POP`, `COVAR_SAMP`
 and `CORR` are aggregate windows too, under every name their aggregates take

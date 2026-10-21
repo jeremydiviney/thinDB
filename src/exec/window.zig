@@ -2030,6 +2030,7 @@ pub const Window = struct {
                 }
                 return;
             },
+            .prefix_shifted => return self.fillAggregatePrefixShifted(plan, spec.frame.end, perm, p_start, p_end, cell),
             .general => {},
         }
 
@@ -2041,13 +2042,53 @@ pub const Window = struct {
             const lo_i: i64 = @max(fb.start, @as(i64, @intCast(p_start)));
             const hi_i: i64 = @min(fb.end_inclusive, @as(i64, @intCast(p_end - 1)));
             if (lo_i > hi_i) {
-                switch (plan.func) {
-                    .count, .count_distinct => try writeBigint(cell.column, orig, 0),
-                    else => setNullCell(cell, orig),
-                }
+                try writeEmptyFrame(plan.func, cell, orig);
                 continue;
             }
             try self.evalAggOverFrame(plan, perm, @intCast(lo_i), @intCast(hi_i), cell, orig);
+        }
+    }
+
+    /// Row i's frame `ROWS BETWEEN UNBOUNDED PRECEDING AND n PRECEDING` (or
+    /// `n FOLLOWING`) is row i - n's (or i + n's) running frame, so one
+    /// running sweep, copied n rows over, answers every row where a fold per
+    /// row would be quadratic in the partition. The copies run against the
+    /// shift so each reads a running value before it is overwritten. The
+    /// sweep stops where the last frame does: a PRECEDING frame never reads
+    /// the partition's last n rows, whose sum could overflow.
+    fn fillAggregatePrefixShifted(
+        self: *Window,
+        plan: CallPlan,
+        end: ir.FrameBound,
+        perm: []const u32,
+        p_start: usize,
+        p_end: usize,
+        cell: OutCell,
+    ) !void {
+        if (p_start >= p_end) return;
+        const len = p_end - p_start;
+        switch (end) {
+            .preceding => |n| {
+                if (n < len) try self.fillAggregatePrefix(plan, perm, p_start, p_end - @as(usize, @intCast(n)), cell);
+                var i = p_end;
+                while (i > p_start) {
+                    i -= 1;
+                    if (i - p_start < n) {
+                        try writeEmptyFrame(plan.func, cell, perm[i]);
+                    } else {
+                        try broadcastOutputCell(cell, perm[i - @as(usize, @intCast(n))], perm[i]);
+                    }
+                }
+            },
+            .following => |n| {
+                try self.fillAggregatePrefix(plan, perm, p_start, p_end, cell);
+                const last = p_end - 1;
+                for (p_start..last) |i| {
+                    const src = if (last - i <= n) last else i + @as(usize, @intCast(n));
+                    try broadcastOutputCell(cell, perm[src], perm[i]);
+                }
+            },
+            else => unreachable,
         }
     }
 
@@ -2929,6 +2970,14 @@ const OutCell = struct {
     string_scratch: ?[]?[]const u8 = null,
 };
 
+/// An aggregate over no rows: COUNT is 0, the others NULL.
+fn writeEmptyFrame(func: ir.WindowFunc, cell: OutCell, row: u32) !void {
+    switch (func) {
+        .count, .count_distinct => try writeBigint(cell.column, row, 0),
+        else => setNullCell(cell, row),
+    }
+}
+
 fn setNullCell(cell: OutCell, row: u32) void {
     if (cell.string_scratch) |s| {
         s[row] = null;
@@ -3397,6 +3446,9 @@ const FrameShape = enum {
     /// UNBOUNDED PRECEDING TO CURRENT ROW — running aggregate, one
     /// forward sweep.
     prefix_to_current,
+    /// ROWS UNBOUNDED PRECEDING TO N PRECEDING / N FOLLOWING — the running
+    /// aggregate, shifted N rows.
+    prefix_shifted,
     /// Anything else (N PRECEDING / N FOLLOWING / sliding) falls back
     /// to the naive per-row scan.
     general,
@@ -3408,6 +3460,7 @@ fn classifyFrame(frame: ir.Frame) FrameShape {
     return switch (frame.end) {
         .unbounded_following => .whole_partition,
         .current_row => .prefix_to_current,
+        .preceding, .following => if (frame.kind == .rows) .prefix_shifted else .general,
         else => .general,
     };
 }
