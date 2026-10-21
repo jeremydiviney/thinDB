@@ -211,11 +211,12 @@ const VALIDATE_MAIN =
     \\                .tinyint => |*l| try l.append(allocator, @intCast(i)),
     \\                .smallint => |*l| try l.append(allocator, @intCast(i)),
     \\                .largeint, .decimal128 => |*l| try l.append(allocator, @intCast(i)),
+    \\                .decimal256 => |*l| try l.append(allocator, @intCast(i)),
     \\                .float => |*l| try l.append(allocator, @floatFromInt(i)),
     \\                .double => |*l| try l.append(allocator, @floatFromInt(i)),
     \\                .boolean => |*l| try l.append(allocator, 0),
     \\                .uuid => |*l| try l.append(allocator, @intCast(i)),
-    \\                .varchar, .string, .char, .json => |*sv| try sv.appendValue(allocator, "x"),
+    \\                .varchar, .string, .char, .json, .nested, .bitmap => |*sv| try sv.appendValue(allocator, "x"),
     \\            }
     \\            if (st.nulls != null) try st.appendValidBit(allocator, st.rowCount() - 1, true);
     \\        }
@@ -733,4 +734,58 @@ test "embedded SDK imports only std, builtin and other embedded files" {
         }
     }
     try std.testing.expectEqualStrings("", missing.items);
+}
+
+// The wrapper and the validator are source the server compiles at CREATE
+// FUNCTION, so no build of thinDB itself analyzes them: a TypeTag the
+// validator's switch didn't name failed every Zig function on the server
+// that shipped it. Semantic analysis alone (no code emitted) catches that.
+test "the generated wrapper and validator compile against the embedded SDK" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "storage");
+    try tmp.dir.createDirPath(io, "engine");
+    for (EMBEDDED_SDK) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.path, .data = f.data });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fn_src.zig", .data =
+        \\const tdb = @import("tdb");
+        \\pub const spec = tdb.TableFnSpec{ .name = "running_total", .execution = .partitioned };
+        \\pub const Input = struct { id: ?i64, g: ?i32, amt: ?i64, note: ?[]const u8 };
+        \\pub const Output = struct { id: ?i64, running: i64 };
+        \\pub fn process(ctx: *tdb.Ctx, p: tdb.Partition(Input), out: *tdb.Writer(Output)) !void {
+        \\    _ = ctx;
+        \\    const ids = p.col(.id);
+        \\    const amts = p.col(.amt);
+        \\    var running: i64 = 0;
+        \\    for (0..p.len) |i| {
+        \\        running += amts.get(i) orelse 0;
+        \\        try out.row(.{ .id = ids.get(i), .running = running });
+        \\    }
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dll_main.zig", .data = WRAPPER_MAIN });
+    try tmp.dir.writeFile(io, .{ .sub_path = "validate_main.zig", .data = VALIDATE_MAIN });
+    const cwd = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(cwd);
+
+    const zig_exe = try findZigExe(allocator, io);
+    defer allocator.free(zig_exe);
+    var compile_log: std.ArrayList(u8) = .empty;
+    defer compile_log.deinit(allocator);
+    const builds = [_][]const []const u8{
+        &.{ zig_exe, "build-lib", "-dynamic", "-fno-emit-bin", "--dep", "tdb", "-Mroot=dll_main.zig", "-Mtdb=udf_sdk.zig" },
+        &.{ zig_exe, "build-exe", "-fno-emit-bin", "--dep", "tdb", "-Mroot=validate_main.zig", "-Mtdb=udf_sdk.zig" },
+    };
+    for (builds) |argv| {
+        compile_log.clearRetainingCapacity();
+        runZig(allocator, io, argv, cwd, &compile_log) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            Error.ZigCompileFailed => {
+                std.debug.print("{s} {s}:\n{s}\n", .{ argv[1], argv[argv.len - 2], compile_log.items });
+                return err;
+            },
+            else => return err,
+        };
+    }
 }
