@@ -1183,6 +1183,47 @@ test "window: a LAG/LEAD default of another type or an expression reads as the v
     try std.testing.expectEqual(@as(usize, 6), star.outputSchema().len);
 }
 
+test "window: ROWS from UNBOUNDED PRECEDING to n PRECEDING or FOLLOWING folds each row's frame" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ws (k BIGINT PRIMARY KEY, g INT, v INT, d DECIMAL(10, 2))");
+    try helpers.exec(allocator, db, "INSERT INTO ws SELECT x, x % 3, IF(x % 7 = 0, NULL, (x * 37) % 23), CAST((x * 13) % 11 AS DECIMAL(10, 2)) / 4 FROM generate_series(1, 60) t(x)");
+
+    try helpers.expectTexts(allocator, db, "SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) FROM ws WHERE k <= 5 ORDER BY k", &.{ null, null, "14", "19", "38" });
+    try helpers.expectTexts(allocator, db, "SELECT COUNT(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) FROM ws WHERE k <= 5 ORDER BY k", &.{ "0", "0", "1", "2", "3" });
+    try helpers.expectTexts(allocator, db, "SELECT MAX(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) FROM ws WHERE k <= 5 ORDER BY k", &.{ "14", "19", "19", "19", "19" });
+
+    // Each answer matches the same frame with a bounded start, which folds
+    // the frame row by row.
+    const aggs = .{ "SUM(v)", "AVG(v)", "COUNT(*)", "COUNT(v)", "MIN(v)", "MAX(v)", "STDDEV_SAMP(v)", "COUNT(DISTINCT v)", "SUM(DISTINCT v)", "SUM(d)", "AVG(d)" };
+    const ends = .{ "1 PRECEDING", "2 PRECEDING", "100 PRECEDING", "3 FOLLOWING", "100 FOLLOWING" };
+    const partitions = .{ "ORDER BY k", "PARTITION BY g ORDER BY k" };
+    inline for (aggs) |agg| inline for (ends) |end| inline for (partitions) |partition| {
+        const shifted = "SELECT CAST(" ++ agg ++ " OVER (" ++ partition ++ " ROWS BETWEEN UNBOUNDED PRECEDING AND " ++ end ++ ") AS STRING) FROM ws ORDER BY k";
+        const bounded = "SELECT CAST(" ++ agg ++ " OVER (" ++ partition ++ " ROWS BETWEEN 1000 PRECEDING AND " ++ end ++ ") AS STRING) FROM ws ORDER BY k";
+        const got = try helpers.collectStrings(allocator, db, shifted);
+        defer helpers.freeStrings(allocator, got);
+        const want = try helpers.collectStrings(allocator, db, bounded);
+        defer helpers.freeStrings(allocator, want);
+        try std.testing.expectEqual(want.len, got.len);
+        for (want, got) |w, g| {
+            if (w == null or g == null) {
+                std.testing.expect(w == null and g == null) catch |err| {
+                    std.debug.print("query: {s}\n", .{shifted});
+                    return err;
+                };
+            } else std.testing.expectEqualStrings(w.?, g.?) catch |err| {
+                std.debug.print("query: {s}\n", .{shifted});
+                return err;
+            };
+        }
+    };
+}
+
 test "window: any other aggregate runs over each row's frame" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
