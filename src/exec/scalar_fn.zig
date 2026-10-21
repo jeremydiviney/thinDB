@@ -1734,6 +1734,13 @@ pub const builtins = [_]ScalarFn{
     .{ .name = "from_unixtime", .arg_types = &.{ .bigint, .string, .string }, .return_type = .string, .null_strategy = .kernel_managed, .kernel = date.fromUnixtimeZoneKernel },
     .{ .name = "to_datetime_ntz", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.toDatetimeNtzKernel },
     .{ .name = "to_datetime_ntz", .arg_types = &.{ .bigint, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.toDatetimeNtzKernel },
+    // TO_DATETIME as a statement spells it: TO_DATETIME_NTZ, as thinDB's
+    // session zone is UTC, and CAST's reading of a date or text.
+    .{ .name = "__to_datetime", .arg_types = &.{.bigint}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.toDatetimeNtzKernel },
+    .{ .name = "__to_datetime", .arg_types = &.{ .bigint, .int }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.toDatetimeNtzKernel },
+    .{ .name = "__to_datetime", .arg_types = &.{.datetime}, .return_type = .datetime, .kernel = date.datetimeIdentityKernel },
+    .{ .name = "__to_datetime", .arg_types = &.{.date}, .return_type = .datetime, .kernel = date.dateToDatetimeKernel },
+    .{ .name = "__to_datetime", .arg_types = &.{.string}, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.stringToDatetimeKernel },
     .{ .name = "date_trunc", .arg_types = &.{ .string, .datetime }, .return_type = .datetime, .kernel = date.dateTruncKernel },
     .{ .name = "time_slice", .arg_types = &.{ .datetime, .bigint, .string, .string }, .return_type = .datetime, .null_strategy = .kernel_managed, .kernel = date.timeSliceKernel },
     .{ .name = "date_slice", .arg_types = &.{ .date, .bigint, .string, .string }, .return_type = .date, .null_strategy = .kernel_managed, .kernel = date.dateSliceKernel(.date) },
@@ -2072,6 +2079,10 @@ const FUNCTION_ALIASES = [_]struct { alias: []const u8, name: []const u8 }{
     .{ .alias = "ceiling", .name = "ceil" },
     .{ .alias = "char", .name = "chr" },
     .{ .alias = "get_json_object", .name = "get_json_string" },
+    // StarRocks' TO_DATETIME reads a number as a unix count. `to_datetime`
+    // inside the engine is CAST's, which reads it as YYYYMMDDhhmmss, as
+    // TIMESTAMP(n) does.
+    .{ .alias = "to_datetime", .name = "__to_datetime" },
     .{ .alias = "timestamp", .name = "to_datetime" },
     .{ .alias = "add_months", .name = "months_add" },
     .{ .alias = "dround", .name = "round" },

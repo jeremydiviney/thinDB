@@ -178,6 +178,9 @@ case. Text is read as a DATETIME. `WEEK_ISO` is `WEEKOFYEAR`, and
 `DAYOFWEEK_ISO` counts Monday as 1. `TO_ISO8601` writes a DATETIME with a
 `T` and six fraction digits. `TO_DATETIME_NTZ(n[, scale])` reads seconds,
 milliseconds or microseconds (scale 0, 3 or 6) since 1970 with no time zone.
+`TO_DATETIME(n[, scale])` is the same. StarRocks reads the count in the
+session's zone, and thinDB's is UTC. `CAST(n AS DATETIME)` and
+`TIMESTAMP(n)` read a number as YYYYMMDDhhmmss instead.
 `ADD_MONTHS` is `MONTHS_ADD`. `STR2DATE(text, format)` is
 `STR_TO_DATE` kept to its DATE, whatever the format holds. `LAST_DAY(d, unit)` is the last day of d's
 month, quarter or year, the unit named in any case. A NULL unit gives NULL,
