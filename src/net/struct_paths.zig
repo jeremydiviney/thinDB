@@ -143,10 +143,30 @@ const Pass = struct {
             i -= 1;
             const op = reading[i];
             try self.renameOp(op, visible);
-            // Above a GROUP BY only its keys are left.
+            // Above a GROUP BY only its keys are left, so a path from a key
+            // the GROUP BY drops is read again from the key above it.
             if (op.* == .group_by) {
                 var kept: std.ArrayList(exec.predicate.ColRename) = .empty;
-                for (visible) |r| if (contains(op.group_by.group_cols, r.to)) try kept.append(self.arena, r);
+                var again: std.ArrayList(ir.Derived) = .empty;
+                for (visible) |r| {
+                    if (contains(op.group_by.group_cols, r.to)) {
+                        try kept.append(self.arena, r);
+                        continue;
+                    }
+                    if (i == 0) continue;
+                    for (paths.items) |p| if (types.columnNameEql(p.name, r.to)) {
+                        if (!containsMatch(op.group_by.group_cols, pathRoot(p.expr))) break;
+                        try kept.append(self.arena, r);
+                        try again.append(self.arena, p);
+                        break;
+                    };
+                }
+                if (again.items.len > 0) {
+                    const above = upstreamSlot(reading[i - 1]);
+                    const recompute = try self.arena.create(ir.Op);
+                    recompute.* = .{ .compute = .{ .derived = again.items, .upstream = above.* } };
+                    above.* = recompute;
+                }
                 visible = kept.items;
             }
         }
@@ -452,6 +472,18 @@ fn renamedNames(arena: Allocator, names: []const []const u8, renames: []const ex
 
 /// A name of four or more parts, which only a field path has: the parser
 /// drops the first of three (`schema.table.col`).
+/// The STRUCT column a path's field calls read.
+fn pathRoot(expr: ir.Expr) []const u8 {
+    var at = expr;
+    while (at == .call) at = at.call.args[0];
+    return at.col_ref;
+}
+
+fn containsMatch(columns: []const []const u8, name: []const u8) bool {
+    for (columns) |c| if (nameMatches(c, name) or nameMatches(name, c)) return true;
+    return false;
+}
+
 fn isDeepName(name: []const u8) bool {
     return std.mem.count(u8, name, ".") >= 3;
 }
