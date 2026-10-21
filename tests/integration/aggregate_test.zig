@@ -510,6 +510,57 @@ test "aggregate: GROUP_CONCAT ORDER BY <n> names its n-th expression in MySQL" {
     try std.testing.expectEqualStrings("b,a,c", constant[0].?);
 }
 
+test "aggregate: SET group_concat_max_len cuts GROUP_CONCAT's text at a whole character" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE ss (id INT PRIMARY KEY, g INT, name VARCHAR(10), subject VARCHAR(10))");
+    try helpers.exec(allocator, db, "INSERT INTO ss VALUES (1, 1, 'Ti', 'English'), (2, 2, 'Ti', '物理'), (3, 3, '张', '三'), (4, 4, 'ab', 'cd'), (5, 4, 'ef', 'gh')");
+
+    const ORDERED = "SELECT GROUP_CONCAT(name, subject ORDER BY 1, 2) FROM ss GROUP BY g ORDER BY 1";
+    const cases = .{
+        .{ "SET group_concat_max_len = 5", ORDERED, &[_]?[]const u8{ "TiEng", "Ti物", "abcd,", "张" } },
+        .{ "SET group_concat_max_len = 6", ORDERED, &[_]?[]const u8{ "TiEngl", "Ti物", "abcd,e", "张三" } },
+        .{ "SET group_concat_max_len = 8", ORDERED, &[_]?[]const u8{ "TiEnglis", "Ti物理", "abcd,efg", "张三" } },
+        // Below MySQL's least value of 4 the cap is 4.
+        .{ "SET group_concat_max_len = 1", ORDERED, &[_]?[]const u8{ "Ti", "TiEn", "abcd", "张" } },
+        .{ "SET SESSION group_concat_max_len = -121", ORDERED, &[_]?[]const u8{ "Ti", "TiEn", "abcd", "张" } },
+        .{ "SET group_concat_max_len = 4; SET group_concat_max_len = DEFAULT", ORDERED, &[_]?[]const u8{ "TiEnglish", "Ti物理", "abcd,efgh", "张三" } },
+        .{ "SET @@session.group_concat_max_len = 6", "SELECT GROUP_CONCAT(name) FROM ss GROUP BY g ORDER BY 1", &[_]?[]const u8{ "Ti", "Ti", "ab,ef", "张" } },
+        .{ "SET group_concat_max_len = 4", "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '--') FROM ss", &[_]?[]const u8{"Ti--"} },
+        .{ "SET group_concat_max_len = 4", "SELECT g FROM ss GROUP BY g HAVING GROUP_CONCAT(name) = 'ab,e' ORDER BY 1", &[_]?[]const u8{"4"} },
+        .{ "SET group_concat_max_len = 4", "SELECT x FROM (SELECT GROUP_CONCAT(subject) AS x FROM ss WHERE g = 4) d", &[_]?[]const u8{"cd,g"} },
+        .{ "SET group_concat_max_len = 4", "SELECT CAST(@@group_concat_max_len AS CHAR)", &[_]?[]const u8{"4"} },
+        .{ "SET group_concat_max_len = 2", "SELECT CAST(@@session.group_concat_max_len AS CHAR)", &[_]?[]const u8{"4"} },
+    };
+    inline for (cases) |c| {
+        var q = try helpers.runSqlMysql(allocator, db, c[0] ++ "; " ++ c[1]);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        expectStringsEqual(c[2], got) catch |err| {
+            std.debug.print("query: {s}; {s}\n", .{ c[0], c[1] });
+            return err;
+        };
+    }
+
+    // A later statement without the SET keeps every byte, and ARRAY_AGG is
+    // not text, so the cap leaves it whole.
+    const whole = try helpers.collectStrings(allocator, db, "SELECT GROUP_CONCAT(subject ORDER BY id) FROM ss");
+    defer helpers.freeStrings(allocator, whole);
+    try std.testing.expectEqualStrings("English,物理,三,cd,gh", whole[0].?);
+    var arrays = try helpers.runSqlMysql(allocator, db, "SET group_concat_max_len = 4; SELECT CAST(ARRAY_AGG(subject ORDER BY id) AS VARCHAR) FROM ss");
+    defer arrays.deinit();
+    const array_text = try helpers.columnText(allocator, &arrays);
+    defer helpers.freeStrings(allocator, array_text);
+    try std.testing.expectEqualStrings("[\"English\",\"物理\",\"三\",\"cd\",\"gh\"]", array_text[0].?);
+
+    try std.testing.expectError(error.TypeMismatch, helpers.runSqlMysql(allocator, db, "SET group_concat_max_len = 'x'"));
+}
+
 fn expectStringsEqual(want: []const ?[]const u8, got: []const ?[]u8) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {

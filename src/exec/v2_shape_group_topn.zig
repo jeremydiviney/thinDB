@@ -1690,6 +1690,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                     else => return traceDecline(request, "group_concat params"),
                 };
                 if (agg.arg2_col != null or params.distinct) return traceDecline(request, "ordered or distinct group_concat");
+                if (params.max_len != null) return traceDecline(request, "group_concat_max_len");
                 const col_name = agg.col orelse return traceDecline(request, "aggregate column");
                 const input_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "aggregate type");
                 // Nested values concatenate into one value, which this lane's

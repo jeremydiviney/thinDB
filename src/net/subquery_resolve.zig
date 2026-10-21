@@ -44,6 +44,7 @@ const compute_mod = @import("../exec/compute.zig");
 const scalar_decimal = @import("../exec/scalar_fn_decimal.zig");
 const json_binary = @import("../exec/json_binary.zig");
 const SessionVar = @import("../api/api.zig").SessionVar;
+const Session = @import("../api/api.zig").Session;
 
 const storage = @import("../storage/storage.zig");
 
@@ -355,6 +356,19 @@ fn systemVariableValue(c: exec.expr_mod.Expr.Call, current_schema: []const u8) e
     if (std.fmt.parseInt(i64, text, 10)) |n| return .{ .bigint = n } else |_| return .{ .text = text };
 }
 
+/// The value `@@name` holds when the session set it (`SET
+/// group_concat_max_len = 8`); null when `c` reads anything else.
+fn sessionVariableValue(c: exec.expr_mod.Expr.Call, session: Session) ?types.Value {
+    if (!std.mem.eql(u8, c.fn_name, exec.scalar_fn.SYSTEM_VARIABLE_FN) or c.args.len != 1 or c.args[0] != .lit or c.args[0].lit != .text) return null;
+    var name = c.args[0].lit.text;
+    for ([_][]const u8{ "session.", "local." }) |scope| {
+        if (std.ascii.startsWithIgnoreCase(name, scope)) name = name[scope.len..];
+    }
+    if (!std.ascii.eqlIgnoreCase(name, "group_concat_max_len")) return null;
+    const n = session.group_concat_max_len orelse return null;
+    return .{ .largeint = n };
+}
+
 /// `lowered` collects the correlated scalar subqueries of a Compute's
 /// expressions for the LEFT JOIN lowering; null elsewhere.
 fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScalars) anyerror!void {
@@ -430,6 +444,10 @@ fn resolveSubqueriesInExpr(ctx: *CompileCtx, e: *ir.Expr, lowered: ?*LoweredScal
             }
             if (systemTextTypeName(c)) |text| {
                 e.* = .{ .lit = .{ .text = text } };
+                return;
+            }
+            if (sessionVariableValue(c, ctx.session.*)) |v| {
+                e.* = .{ .lit = v };
                 return;
             }
             if (systemVariableValue(c, ctx.session.current_schema) catch null) |v| {

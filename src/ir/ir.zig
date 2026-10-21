@@ -108,7 +108,7 @@ fn sameAggParams(a: AggParams, b: AggParams) bool {
     return switch (a) {
         .none => true,
         .percentile => |fraction| fraction == b.percentile,
-        .concat => |c| c.distinct == b.concat.distinct and std.mem.eql(u8, c.separator, b.concat.separator),
+        .concat => |c| c.distinct == b.concat.distinct and c.max_len == b.concat.max_len and std.mem.eql(u8, c.separator, b.concat.separator),
         .top_k => |k| k == b.top_k,
         .mann_whitney => |m| std.meta.eql(m, b.mann_whitney),
     };
@@ -787,13 +787,16 @@ pub const SetAssignment = struct {
     session_option: ?SessionOption = null,
 };
 
-/// The session settings `SET thindb_<name> = v` changes.
+/// The session settings `SET thindb_<name> = v` changes, and MySQL's
+/// `group_concat_max_len`.
 pub const SessionOption = enum {
     max_dop,
+    group_concat_max_len,
 
     pub fn sqlName(self: SessionOption) []const u8 {
         return switch (self) {
             .max_dop => "thindb_max_dop",
+            .group_concat_max_len => "group_concat_max_len",
         };
     }
 

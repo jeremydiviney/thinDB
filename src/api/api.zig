@@ -433,6 +433,9 @@ pub const Session = struct {
     /// A statement's `/*+ SET_VAR(thindb_max_dop = N) */` hint, which takes
     /// the place of `max_dop` for that statement alone.
     statement_max_dop: ?u32 = null,
+    /// `SET group_concat_max_len = N`: the bytes a GROUP_CONCAT's text keeps,
+    /// at least 4, as in MySQL. Null keeps all of it.
+    group_concat_max_len: ?u64 = null,
 
     /// The cap a compile puts on parallelism, below the server's max_dop.
     pub fn dopCap(self: Session) ?usize {

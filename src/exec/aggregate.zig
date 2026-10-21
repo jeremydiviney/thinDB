@@ -220,7 +220,19 @@ pub const ConcatParams = struct {
     separator: []const u8,
     /// Each distinct value once, ordered by the first row it came from (MySQL).
     distinct: bool = false,
+    /// The bytes a text result keeps, cut back to a whole character, as
+    /// MySQL cuts one at `group_concat_max_len`. Null keeps all of them.
+    max_len: ?u64 = null,
 };
+
+/// `text` cut to at most `max_len` bytes and back to a character's start.
+fn concatPrefix(text: []const u8, max_len: ?u64) []const u8 {
+    const limit = max_len orelse return text;
+    if (text.len <= limit) return text;
+    var end: usize = @intCast(limit);
+    while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+    return text[0..end];
+}
 
 pub const AggSpec = struct {
     func: AggFunc,
@@ -5180,7 +5192,7 @@ pub fn appendAccToColumn(
                     orderConcatEntries(c, spec.params.concat.distinct);
                     try appendConcatNested(allocator, col, c);
                 } else if (c.entries.items.len == 0) {
-                    try col.data.string.appendValue(allocator, c.buf.items);
+                    try col.data.string.appendValue(allocator, concatPrefix(c.buf.items, spec.params.concat.max_len));
                 } else {
                     const params = spec.params.concat;
                     orderConcatEntries(c, params.distinct);
@@ -5190,7 +5202,7 @@ pub fn appendAccToColumn(
                         if (i > 0) try joined.appendSlice(allocator, params.separator);
                         try joined.appendSlice(allocator, e.value(c.buf.items));
                     }
-                    try col.data.string.appendValue(allocator, joined.items);
+                    try col.data.string.appendValue(allocator, concatPrefix(joined.items, params.max_len));
                 }
             } else {
                 try col.data.appendNullPlaceholder(allocator);
