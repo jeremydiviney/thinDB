@@ -444,6 +444,36 @@ test "aggregate: GROUP_CONCAT takes any value type, ORDER BY, DISTINCT and SEPAR
     try helpers.expectRunError(allocator, db, "SELECT COUNT(n ORDER BY n) FROM gct", error.SqlExpectedToken);
 }
 
+test "aggregate: GROUP_CONCAT concatenates a second text literal in MySQL, and reads it as the separator elsewhere" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE s (id INT PRIMARY KEY, name VARCHAR(10))");
+    try helpers.exec(allocator, db, "INSERT INTO s VALUES (1, 'b'), (2, 'a'), (3, NULL)");
+
+    const mysql_cases = .{
+        .{ "SELECT GROUP_CONCAT(name, '-' ORDER BY id) FROM s", "b-,a-" },
+        .{ "SELECT GROUP_CONCAT('x', 'y')", "xy" },
+        .{ "SELECT GROUP_CONCAT(name, '-' ORDER BY id SEPARATOR '|') FROM s", "b-|a-" },
+        .{ "SELECT STRING_AGG(name, '-' ORDER BY id) FROM s", "b-a" },
+    };
+    inline for (mysql_cases) |c| {
+        var q = try helpers.runSqlMysql(allocator, db, c[0]);
+        defer q.deinit();
+        const got = try helpers.columnText(allocator, &q);
+        defer helpers.freeStrings(allocator, got);
+        std.testing.expectEqualStrings(c[1], got[0].?) catch |err| {
+            std.debug.print("query: {s}\n", .{c[0]});
+            return err;
+        };
+    }
+    try helpers.expectText(allocator, db, "SELECT GROUP_CONCAT(name, '-' ORDER BY id) FROM s", "b-a");
+    try helpers.expectText(allocator, db, "SELECT STRING_AGG(name, '-' ORDER BY id) FROM s", "b-a");
+}
+
 test "aggregate: GROUP_CONCAT ORDER BY <n> names its n-th expression in MySQL" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
