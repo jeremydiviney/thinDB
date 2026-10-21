@@ -169,6 +169,7 @@ test "REGEXP_COUNT, REGEXP_EXTRACT and REGEXP_EXTRACT_ALL count and cut out ever
     try helpers.expectText(allocator, db, "SELECT REGEXP_EXTRACT_ALL('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 2)", "[\"d\",\"e\"]");
     try helpers.expectText(allocator, db, "SELECT REGEXP_EXTRACT('AbCdExCeF', '([[:lower:]]+)C([[:lower:]]+)', 0)", "bCd");
     try std.testing.expectError(error.RegexInvalidPattern, exec(allocator, db, "SELECT REGEXP_COUNT('abc', '(a')"));
+    try std.testing.expectError(error.RegexInvalidPattern, exec(allocator, db, "SELECT REGEXP_REPLACE('abc中文def', '[\\p{Han}]+', 'xx')"));
 }
 
 test "LIKE: backslash escapes by default, ESCAPE names another character" {
