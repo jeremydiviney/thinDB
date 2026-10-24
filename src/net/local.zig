@@ -2709,7 +2709,7 @@ fn compileDdl(ctx: *CompileCtx, d: ir.DdlOp) !Query {
             // A missing table fails the statement before anything is
             // dropped, as MySQL's atomic DROP TABLE does.
             if (!dt.if_exists) for (dt.tables) |ref| {
-                _ = try resolveTable(catalog, ctx.session.*, ref);
+                if (!try tableExists(catalog, ctx.session.*, ref)) return Error.TableNotFound;
             };
             for (dt.tables) |ref| try dropTable(ctx, catalog, ref, dt.if_exists);
         },
@@ -3587,6 +3587,18 @@ fn dropTable(ctx: *CompileCtx, catalog: *Catalog, ref: ir.TableRef, if_exists: b
         ApiError.TableNotFound => if (!if_exists) return Error.TableNotFound,
         else => return thindb_api.remapError(Error, e),
     };
+}
+
+/// Unlike `resolveTable`, opens nothing: a table a crash damaged won't open,
+/// and dropping it is how it is repaired.
+fn tableExists(catalog: *Catalog, session: Session, ref: ir.TableRef) !bool {
+    if (ref.database == null and ref.schema == null) {
+        if (session.temp_namespace) |ns| {
+            if (ns.contains(ref.name)) return true;
+        }
+    }
+    const sc = (try resolvePersistentTableTarget(catalog, session, ref)).schema;
+    return sc.hasTable(ref.name);
 }
 
 /// An added column backfills existing rows with its default, or NULL. A
