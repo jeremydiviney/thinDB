@@ -564,7 +564,7 @@ pub const Schema = struct {
     /// Whether `name` has a table directory holding its schema.
     fn tableOnDisk(self: *Schema, name: []const u8) !bool {
         var dir = self.schema_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
+            error.FileNotFound, error.NotDir => return false,
             else => return err,
         };
         defer dir.close(self.io);
@@ -668,6 +668,19 @@ pub const Schema = struct {
         return build;
     }
 
+    /// Whether a table of this name exists, open or not. It opens nothing, so
+    /// it also answers for a table that exists but won't open (a crash
+    /// damaged it), which a DROP must still find.
+    pub fn hasTable(self: *Schema, name: []const u8) !bool {
+        if (isReservedTableName(name)) return false;
+        {
+            self.tables_mutex.lockUncancelable(self.io);
+            defer self.tables_mutex.unlock(self.io);
+            if (self.tables.contains(name)) return true;
+        }
+        return self.tableOnDisk(name);
+    }
+
     /// Open an existing table by name. The schema is loaded from the
     /// persisted `schema.bin`. Errors if the table doesn't exist.
     pub fn openTable(
@@ -682,19 +695,7 @@ pub const Schema = struct {
         defer self.tables_mutex.unlock(self.io);
         if (self.dropping.contains(name)) return Error.TableBusy;
         if (self.tables.get(name)) |existing| return existing;
-
-        var probe = self.schema_dir.openDir(self.io, name, .{}) catch |err| switch (err) {
-            error.FileNotFound, error.NotDir => return Error.TableNotFound,
-            else => return err,
-        };
-        probe.access(self.io, "schema.bin", .{ .read = true }) catch |err| {
-            probe.close(self.io);
-            return switch (err) {
-                error.FileNotFound => Error.TableNotFound,
-                else => err,
-            };
-        };
-        probe.close(self.io);
+        if (!try self.tableOnDisk(name)) return Error.TableNotFound;
 
         const t = try Table.open(
             self.allocator,

@@ -407,6 +407,48 @@ test "sql ddl: DROP TABLE drops a list, and a missing table drops none of it" {
     try expectRunError(allocator, db, "SELECT id FROM b", thindb.net.Error.TableNotFound);
 }
 
+test "sql ddl: DROP TABLE drops a table a crash damaged past opening" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+        try exec(allocator, db, "INSERT INTO t VALUES (1)");
+        try (try db.openTable("t", .{})).flush();
+    }
+    {
+        var segments = try tmp.dir.openDir(io, "main/public/t/segments", .{ .iterate = true });
+        defer segments.close(io);
+        var name_buf: [64]u8 = undefined;
+        const lost = blk: {
+            var it = segments.iterate();
+            while (try it.next(io)) |entry| {
+                if (std.mem.endsWith(u8, entry.name, ".dat")) {
+                    @memcpy(name_buf[0..entry.name.len], entry.name);
+                    break :blk name_buf[0..entry.name.len];
+                }
+            }
+            return error.TestUnexpectedResult;
+        };
+        // An OS crash kept the segment's name and lost its data.
+        try segments.writeFile(io, .{ .sub_path = lost, .data = "" });
+    }
+
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    try expectRunError(allocator, db, "SELECT id FROM t", error.SegmentDamaged);
+    try exec(allocator, db, "DROP TABLE t");
+    try expectRunError(allocator, db, "DROP TABLE t", thindb.net.Error.TableNotFound);
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    try exec(allocator, db, "INSERT INTO t VALUES (5)");
+    const ids = try collectBigints(allocator, db, "SELECT id FROM t");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{5}, ids);
+}
+
 test "sql ddl: TRUNCATE TABLE clears persisted rows and preserves schema" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
