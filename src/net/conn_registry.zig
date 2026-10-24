@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 /// Awake-clock milliseconds: the time base of transfer marks and
 /// activity timestamps.
@@ -283,7 +284,9 @@ pub const ConnectionState = struct {
 /// A connection's socket writer. Every send, including the implicit
 /// ones when a large result overflows the buffer, carries a write mark
 /// on the connection's state, so the reaper can end a send the client
-/// has stopped draining. Must not move once `interface` is in use.
+/// has stopped draining, and parks the statement's admission so a slow
+/// client doesn't shrink other statements' fan-outs. Must not move once
+/// `interface` is in use.
 pub const GuardedStreamWriter = struct {
     stream_writer: std.Io.net.Stream.Writer,
     stream_vtable: *const std.Io.Writer.VTable,
@@ -311,6 +314,8 @@ pub const GuardedStreamWriter = struct {
         const self = fromInterface(w);
         self.state.beginWrite(nowMs(self.stream_writer.io));
         defer self.state.endTransfer();
+        var parked = core_scheduler.global().parkAdmission();
+        defer parked.unpark();
         return self.stream_vtable.drain(w, data, splat);
     }
 
@@ -318,6 +323,8 @@ pub const GuardedStreamWriter = struct {
         const self = fromInterface(w);
         self.state.beginWrite(nowMs(self.stream_writer.io));
         defer self.state.endTransfer();
+        var parked = core_scheduler.global().parkAdmission();
+        defer parked.unpark();
         return self.stream_vtable.sendFile(w, file_reader, limit);
     }
 };
@@ -607,6 +614,9 @@ const StalledSender = struct {
     result: ?std.Io.Writer.Error = null,
     bytes_sent: usize = 0,
     done: std.atomic.Value(bool) = .init(false),
+    /// Send under a statement admission lease, as a query's result does.
+    admit: bool = false,
+    admitted: std.atomic.Value(bool) = .init(false),
 
     /// Far more than loopback buffers hold, so the send blocks for good
     /// once the peer stops reading.
@@ -614,6 +624,9 @@ const StalledSender = struct {
 
     fn run(self: *StalledSender) void {
         defer self.done.store(true, .release);
+        var lease: ?core_scheduler.Lease = if (self.admit) core_scheduler.global().acquire() else null;
+        defer if (lease) |*held| held.release();
+        if (lease) |held| self.admitted.store(held.admission, .release);
         var buffer: [16 * 1024]u8 = undefined;
         var writer: GuardedStreamWriter = .init(self.stream, self.io, &buffer, self.state);
         const chunk: [64 * 1024]u8 = @splat('x');
@@ -669,6 +682,59 @@ test "the write deadline aborts a send the client stopped draining" {
     try std.testing.expect(send_ended);
     try std.testing.expectEqual(@as(?std.Io.Writer.Error, error.WriteFailed), sender.result);
     try std.testing.expectEqual(@as(u64, 0), s.transfer_wait.load(.acquire));
+}
+
+test "a statement blocked sending to a client that stopped reading leaves fan-out sizing" {
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try address.listen(io, .{ .mode = .stream, .protocol = .tcp });
+    defer listener.deinit(io);
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    var client_open = true;
+    defer if (client_open) client.close(io);
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+
+    var reg = Registry.init(std.testing.allocator);
+    defer reg.deinit();
+    var s = ConnectionState.init(6, 0);
+    s.reap_socket = accepted.socket.handle;
+    try reg.register(&s);
+    defer reg.unregister(6);
+
+    const sched = core_scheduler.global();
+    const before = @atomicLoad(usize, &sched.statements, .acquire);
+    var sender: StalledSender = .{ .io = io, .stream = accepted, .state = &s, .admit = true };
+    const thread = try std.Thread.spawn(.{}, StalledSender.run, .{&sender});
+    var parked_while_sending = false;
+    for (0..5000) |_| {
+        if (sender.done.load(.acquire)) break;
+        if (sender.admitted.load(.acquire) and s.transfer_wait.load(.acquire) != 0 and
+            @atomicLoad(usize, &sched.statements, .acquire) == before)
+        {
+            parked_while_sending = true;
+            break;
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    for (0..1000) |_| {
+        if (sender.done.load(.acquire)) break;
+        if (reg.reapStalledTransfers(io, nowMs(io), .{ .read_ms = 0, .write_ms = 1 }) > 0) break;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    for (0..10_000) |_| {
+        if (sender.done.load(.acquire)) break;
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    } else {
+        // Unblock the sender so a failing run ends instead of hanging.
+        client.close(io);
+        client_open = false;
+    }
+    thread.join();
+
+    if (!sender.admitted.load(.acquire)) return error.SkipZigTest;
+    try std.testing.expect(parked_while_sending);
+    try std.testing.expectEqual(before, @atomicLoad(usize, &sched.statements, .acquire));
 }
 
 test "cancelAbandonedQueries cancels only an armed statement whose client is gone" {
