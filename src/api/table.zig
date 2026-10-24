@@ -227,6 +227,7 @@ pub const Table = struct {
 
         var manifest = try storage.readManifest(allocator, io, table_dir, fp);
         errdefer manifest.deinit();
+        try checkSegmentFiles(io, segments_dir, manifest, name);
         // Fresh manifests (no file on disk) carry column_count=0; set
         // from the schema so future writes emit the right per-entry size.
         if (manifest.column_count == 0) manifest.column_count = @intCast(schema.columns.len);
@@ -253,6 +254,15 @@ pub const Table = struct {
         defer engine.wal.deinitSegmentTombstones(allocator, &replayed_tombstones);
         const replayed = try engine.wal.replayFromCheckpoint(allocator, io, table_dir, fp, memtable, manifest.wal_checkpoint, &replayed_tombstones);
         if (replayed.did_replay) manifest.wal_checkpoint = replayed.checkpoint;
+        if (replayed.discarded_bytes > 0) std.debug.print(
+            "thindb: table '{s}': WAL replay ended at byte {d}, ignoring the {d} bytes after it ({s})\n",
+            .{
+                name,
+                replayed.checkpoint.offset,
+                replayed.discarded_bytes,
+                if (replayed.discarded_all_zero) "all zero: writes an OS crash cut off" else "not zero: a torn write, or a disk fault if the OS didn't crash",
+            },
+        );
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -536,9 +546,8 @@ pub const Table = struct {
     /// or DELETE (`Statement`), or the rows an INSERT ... SELECT gathers into
     /// one batch, which the table validates whole before taking any of it.
     /// Within the bound a failed statement leaves nothing behind, as MySQL
-    /// rolls it back. Past it, an UPDATE or DELETE commits in chunks of about
-    /// this size and an INSERT ... SELECT streams batch by batch, so memory
-    /// stays bounded.
+    /// rolls it back. Past it, an UPDATE, DELETE or INSERT ... SELECT commits
+    /// in chunks of about this size, so memory stays bounded.
     pub const STATEMENT_STAGE_BYTES: usize = 64 << 20;
 
     /// One UPDATE or DELETE, staged step by step and committed whole (#335).
@@ -885,7 +894,10 @@ pub const Table = struct {
     /// the target (in which case `WalWriter.truncate` has bumped synced past
     /// our offset and `awaitDurable` returns immediately).
     pub fn awaitStatementDurable(self: *Table, target: ?u64) !void {
-        if (self.syncEnabled()) if (target) |o| if (self.wal) |*w| try w.awaitDurable(self.io, o);
+        if (self.syncEnabled()) if (target) |o| if (self.wal) |*w| w.awaitDurable(self.io, o) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
         try self.writeTombstoneFiles();
     }
 
@@ -1184,7 +1196,10 @@ pub const Table = struct {
         // A tombstone can hide a row whose replacement so far lives only in
         // the WAL (UPDATE, upsert). Syncing the log first means power loss
         // can't keep the tombstone and lose the replacement.
-        if (sync) if (self.wal) |*w| try w.awaitAllDurable(self.io);
+        if (sync) if (self.wal) |*w| w.awaitAllDurable(self.io) catch |err| {
+            self.recordIoFailure(err);
+            return err;
+        };
         for (pending.items) |p| {
             const bytes = try storage.tombstone.encode(self.allocator, p.tombs.rows);
             defer self.allocator.free(bytes);
@@ -1633,6 +1648,38 @@ pub const Table = struct {
         return false;
     }
 };
+
+/// Fail with `SegmentDamaged` when a segment the manifest lists is missing
+/// or not the size it was written at. An OS crash before a new segment
+/// reached the disk leaves it empty while the manifest naming it survives:
+/// scans would fail on it, and answers from manifest statistics would count
+/// rows that are gone. Runs before the orphan sweep, so the files that could
+/// restore the table stay on disk.
+fn checkSegmentFiles(io: Io, segments_dir: Io.Dir, manifest: storage.Manifest, table_name: []const u8) !void {
+    var damaged = false;
+    for (manifest.segments.items) |entry| {
+        var buf: [32]u8 = undefined;
+        const name = try Table.segmentFileName(&buf, entry.segment_id);
+        const stat = segments_dir.statFile(io, name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                damaged = true;
+                std.debug.print("thindb: table '{s}' segment {s} ({d} rows) is missing\n", .{ table_name, name, entry.row_count });
+                continue;
+            },
+            else => return err,
+        };
+        if (stat.size == entry.byte_size) continue;
+        damaged = true;
+        std.debug.print(
+            "thindb: table '{s}' segment {s} ({d} rows) is {d} bytes on disk, {d} in the manifest\n",
+            .{ table_name, name, entry.row_count, stat.size, entry.byte_size },
+        );
+    }
+    if (damaged) {
+        std.debug.print("thindb: table '{s}' refuses to open until it is dropped and reloaded\n", .{table_name});
+        return Error.SegmentDamaged;
+    }
+}
 
 /// Either loads the persisted schema, validates against the caller-provided
 /// one, or — when no schema.bin exists — clones the caller schema and

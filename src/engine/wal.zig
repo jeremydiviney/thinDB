@@ -52,6 +52,12 @@
 //!
 //! A one-step statement logs a plain `replace` record. Older binaries reject
 //! a `statement` record as WalUnknownRecord rather than skip it.
+//!
+//! Replay stops at the first record whose length or checksum doesn't hold:
+//! an OS crash leaves the bytes past the last fsync torn, zeroed, or written
+//! out of order, and none of them were acknowledged under `.per_flush`.
+//! A record whose checksum holds but whose type is unknown came from a newer
+//! binary and fails replay instead.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -254,6 +260,12 @@ pub const WalWriter = struct {
     /// added latency for the single-writer case.
     waiters: u32 = 0,
 
+    /// Set once an fsync of this log fails. Linux may drop the dirty pages
+    /// that fsync could not write and report success to the next one, so a
+    /// retry would acknowledge records that never reached the disk. Every
+    /// later wait not already covered fails instead.
+    sync_failed: bool = false,
+
     /// Diagnostic: number of times `awaitDurable` actually called
     /// `file.sync()` (i.e., this thread became the group-commit leader).
     /// Followers do not increment. Compare against the total `awaitDurable`
@@ -270,16 +282,12 @@ pub const WalWriter = struct {
         dir: Io.Dir,
         schema_fingerprint: u64,
     ) !WalWriter {
-        // Create-or-truncate. (Replay happens BEFORE create; the caller
-        // either replayed and then truncated, or there was nothing to replay.)
-        var file = try dir.createFile(io, wal_filename, .{});
-        errdefer file.close(io);
-
+        // Replaces any log on disk. (Replay happens BEFORE create; the caller
+        // either replayed and then flushed, or there was nothing to replay.)
         var generation: [16]u8 = undefined;
         io.random(&generation);
-        const hdr = makeHeader(schema_fingerprint, generation);
-        try file.writeStreamingAll(io, &hdr);
-        try file.sync(io);
+        var file = try installFreshLog(io, dir, schema_fingerprint, generation);
+        errdefer file.close(io);
         try storage.syncDirectory(io, dir);
 
         return .{
@@ -310,6 +318,21 @@ pub const WalWriter = struct {
         format.writeU64(hdr[8..16], schema_fingerprint);
         @memcpy(hdr[16..32], &generation);
         return hdr;
+    }
+
+    /// Write a header-only log aside, sync it, and rename it over the live
+    /// one, so a crash leaves the old log or the whole new header, never a
+    /// log truncated in place. The caller syncs the directory.
+    fn installFreshLog(io: Io, dir: Io.Dir, schema_fingerprint: u64, generation: [16]u8) !Io.File {
+        const temporary = "wal.tmp";
+        const file = try dir.createFile(io, temporary, .{});
+        errdefer dir.deleteFile(io, temporary) catch {};
+        errdefer file.close(io);
+        const hdr = makeHeader(schema_fingerprint, generation);
+        try file.writePositionalAll(io, &hdr, 0);
+        try file.sync(io);
+        try Io.Dir.rename(dir, temporary, dir, wal_filename, io);
+        return file;
     }
 
     /// Encode the newly-added rows (`memtable.columns[ci]` from `from..to`)
@@ -362,28 +385,22 @@ pub const WalWriter = struct {
             self.coord_mu.unlock(self.io);
         }
 
-        const temporary = "wal.tmp";
         var generation: [16]u8 = undefined;
         self.io.random(&generation);
-        const new_file = try self.dir.createFile(self.io, temporary, .{});
-        var owns_new = true;
-        errdefer if (owns_new) new_file.close(self.io);
-        errdefer self.dir.deleteFile(self.io, temporary) catch {};
-        const hdr = makeHeader(schema_fingerprint, generation);
-        try new_file.writeStreamingAll(self.io, &hdr);
-        try new_file.sync(self.io);
-        try Io.Dir.rename(self.dir, temporary, self.dir, wal_filename, self.io);
+        const new_file = try installFreshLog(self.io, self.dir, schema_fingerprint, generation);
         self.file.close(self.io);
         self.file = new_file;
-        owns_new = false;
         self.generation = generation;
         self.physical_offset = header_size;
 
         // Anything that was waiting on offsets <= `write_offset` is now
         // implicitly durable (its data is either in a segment or was a delete
         // already applied + segmented out). Bump synced_offset to cover them.
+        // A failed fsync of the retired log no longer matters for the same
+        // reason.
         self.coord_mu.lockUncancelable(self.io);
         self.synced_offset = self.write_offset;
+        self.sync_failed = false;
         self.in_progress = false;
         self.coord_cv.broadcast(self.io);
         self.coord_mu.unlock(self.io);
@@ -423,6 +440,7 @@ pub const WalWriter = struct {
         defer self.waiters -= 1;
 
         while (self.synced_offset < target_offset) {
+            if (self.sync_failed) return error.DurabilityUncertain;
             if (self.in_progress) {
                 self.coord_cv.waitUncancelable(io, &self.coord_mu);
                 continue;
@@ -473,9 +491,11 @@ pub const WalWriter = struct {
             self.fsync_count += 1;
             if (result) |_| {
                 if (snap > self.synced_offset) self.synced_offset = snap;
-            } else |_| {}
+            } else |_| {
+                self.sync_failed = true;
+            }
             self.coord_cv.broadcast(io);
-            try result;
+            result catch return error.DurabilityUncertain;
         }
     }
 
@@ -490,6 +510,11 @@ pub const WalWriter = struct {
     /// Build the framed bytes (header + payload + checksum), write to file,
     /// and advance `write_offset`. No fsync — durability is established by
     /// a separate `awaitDurable` call after the Table mutex is released.
+    ///
+    /// The write is positional at `physical_offset`: a failed one leaves the
+    /// end of the log where it was, so the next record overwrites whatever
+    /// part of it landed instead of following it, where replay would stop
+    /// before reaching it.
     fn writeRecord(self: *WalWriter, t: RecordType, payload: []const u8) !u64 {
         const total = record_header_size + payload.len + record_trailer_size;
         const buf = try self.allocator.alloc(u8, total);
@@ -502,7 +527,10 @@ pub const WalWriter = struct {
         const checksum = std.hash.XxHash64.hash(0, buf[0 .. 5 + payload.len]);
         format.writeU64(buf[5 + payload.len ..][0..8], checksum);
 
-        try self.file.writeStreamingAll(self.io, buf);
+        self.file.writePositionalAll(self.io, buf, self.physical_offset) catch |err| {
+            self.file.setLength(self.io, self.physical_offset) catch {};
+            return err;
+        };
         self.physical_offset += total;
 
         self.coord_mu.lockUncancelable(self.io);
@@ -513,7 +541,16 @@ pub const WalWriter = struct {
     }
 };
 
-pub const ReplayResult = struct { did_replay: bool = false, checkpoint: Checkpoint = .{} };
+pub const ReplayResult = struct {
+    did_replay: bool = false,
+    checkpoint: Checkpoint = .{},
+    /// Bytes past the last valid record that replay ignored: what a crash
+    /// left of the writes after the last fsync.
+    discarded_bytes: usize = 0,
+    /// Whether every ignored byte was zero, the usual shape of a crash. A
+    /// non-zero tail on a log no crash interrupted points at the disk.
+    discarded_all_zero: bool = true,
+};
 
 /// Read the WAL (if any) and apply the records past `checkpoint` and the
 /// last flush_marker into `mt`. Segment offsets from `replace` records
@@ -533,6 +570,10 @@ pub fn replayFromCheckpoint(
     };
     defer allocator.free(bytes);
 
+    // A log gets its header synced before any record goes in, so one with no
+    // header never held an acknowledged record: an older binary created it
+    // in place and crashed before the header reached the disk.
+    if (std.mem.allEqual(u8, bytes, 0)) return .{ .discarded_bytes = bytes.len };
     if (bytes.len < legacy_header_size) return Error.WalTooSmall;
     if (!std.mem.eql(u8, bytes[0..4], &wal_magic)) return Error.WalBadMagic;
     const version = format.readU16(bytes[4..6]);
@@ -543,31 +584,30 @@ pub fn replayFromCheckpoint(
     const fp = format.readU64(bytes[8..16]);
     if (fp != schema_fingerprint) return Error.WalSchemaFingerprintMismatch;
 
-    // First pass: find the position immediately after the last flush_marker.
+    // First pass: find the end of the valid records and the position
+    // immediately after the last flush_marker.
     var replay_start: usize = actual_header_size;
     if (checkpoint.offset != 0 and std.mem.eql(u8, &generation, &checkpoint.generation)) {
-        if (checkpoint.offset < actual_header_size or checkpoint.offset > bytes.len) return Error.WalCorrupt;
-        replay_start = @intCast(checkpoint.offset);
+        if (checkpoint.offset < actual_header_size) return Error.WalCorrupt;
+        // The manifest already holds every record up to its checkpoint. A
+        // log shorter than that lost unsynced records a flush had covered.
+        replay_start = @intCast(@min(checkpoint.offset, bytes.len));
     }
-    var cursor: usize = replay_start;
-    while (cursor < bytes.len) {
-        const next = readRecord(bytes, cursor) catch |err| switch (err) {
-            // Truncated tail (partial write before crash) — stop here.
+    var end: usize = replay_start;
+    while (end < bytes.len) {
+        const next = readRecord(bytes, end) catch |err| switch (err) {
             Error.WalCorrupt, Error.WalTooSmall => break,
             else => return err,
         };
         if (next.type == .flush_marker) replay_start = next.cursor_after;
-        cursor = next.cursor_after;
+        end = next.cursor_after;
     }
 
     // Second pass: replay everything after `replay_start`.
     var did_replay: bool = false;
-    cursor = replay_start;
-    while (cursor < bytes.len) {
-        const rec = readRecord(bytes, cursor) catch |err| switch (err) {
-            Error.WalCorrupt, Error.WalTooSmall => break,
-            else => return err,
-        };
+    var cursor: usize = replay_start;
+    while (cursor < end) {
+        const rec = try readRecord(bytes, cursor);
         switch (rec.type) {
             .insert => try codec.applyInsertRecord(allocator, rec.payload, mt),
             .delete => try codec.applyDeleteRecord(allocator, rec.payload, mt),
@@ -580,7 +620,12 @@ pub fn replayFromCheckpoint(
         cursor = rec.cursor_after;
     }
 
-    return .{ .did_replay = did_replay, .checkpoint = .{ .generation = generation, .offset = cursor } };
+    return .{
+        .did_replay = did_replay,
+        .checkpoint = .{ .generation = generation, .offset = end },
+        .discarded_bytes = bytes.len - end,
+        .discarded_all_zero = std.mem.allEqual(u8, bytes[end..], 0),
+    };
 }
 
 const ReadRecord = struct {
@@ -589,19 +634,21 @@ const ReadRecord = struct {
     cursor_after: usize,
 };
 
+/// The record at `off`. The checksum is checked before the type, so a torn
+/// or zeroed tail reads as `WalCorrupt` (the end of the log) and only a
+/// record that is whole reports an unknown type.
 fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
     if (off + record_header_size > bytes.len) return Error.WalTooSmall;
-    const tag_byte = bytes[off];
-    if (tag_byte < 1 or tag_byte > @intFromEnum(RecordType.statement)) return Error.WalUnknownRecord;
-    const t: RecordType = @enumFromInt(tag_byte);
     const payload_len = format.readU32(bytes[off + 1 .. off + 5]);
     const payload_end = off + record_header_size + payload_len;
     if (payload_end + record_trailer_size > bytes.len) return Error.WalCorrupt;
     const checksum_stored = format.readU64(bytes[payload_end .. payload_end + 8]);
     const checksum_actual = std.hash.XxHash64.hash(0, bytes[off..payload_end]);
     if (checksum_stored != checksum_actual) return Error.WalCorrupt;
+    const tag_byte = bytes[off];
+    if (tag_byte < 1 or tag_byte > @intFromEnum(RecordType.statement)) return Error.WalUnknownRecord;
     return .{
-        .type = t,
+        .type = @enumFromInt(tag_byte),
         .payload = bytes[off + record_header_size .. payload_end],
         .cursor_after = payload_end + record_trailer_size,
     };
@@ -857,6 +904,140 @@ test "a statement record replays all its steps, or none once torn" {
     _ = try replayFromCheckpoint(a, io, tmp.dir, 77, &recovered, .{}, &tombstones);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, recovered.columns[0].data.bigint.items);
     try std.testing.expectEqual(@as(usize, 0), tombstones.count());
+}
+
+const tail_schema = types.TableSchema{
+    .columns = &.{.{ .name = "id", .type = .bigint }},
+    .order_key = &.{"id"},
+    .unique = false,
+};
+
+/// A log holding one insert record of ids 1 and 2, as `a` owns it.
+fn twoRowLog(a: Allocator, io: Io, dir: Io.Dir) ![]u8 {
+    var source = try Memtable.init(a, tail_schema);
+    defer source.deinit();
+    try source.insertRows(&.{ .{ .id = @as(i64, 1) }, .{ .id = @as(i64, 2) } });
+    {
+        var writer = try WalWriter.create(a, io, dir, 11);
+        defer writer.deinit();
+        _ = try writer.appendInsert(&source, 0, 2);
+    }
+    return dir.readFileAlloc(io, wal_filename, a, .unlimited);
+}
+
+test "replay ends at a zeroed tail instead of failing on it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try twoRowLog(a, io, tmp.dir);
+    defer a.free(log);
+    const zeros: [4064]u8 = @splat(0);
+    // The records an OS crash cut off, and a log that lost all of them: the
+    // shape the 2026-10-24 crash left, which failed with WalUnknownRecord.
+    inline for (.{ true, false }) |keep_records| {
+        const kept = if (keep_records) log else log[0..header_size];
+        const torn = try std.mem.concat(a, u8, &.{ kept, &zeros });
+        defer a.free(torn);
+        try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = torn });
+        var recovered = try Memtable.init(a, tail_schema);
+        defer recovered.deinit();
+        var tombstones: SegmentTombstones = .empty;
+        defer deinitSegmentTombstones(a, &tombstones);
+        const result = try replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones);
+        try std.testing.expectEqual(keep_records, result.did_replay);
+        try std.testing.expectEqual(@as(u64, if (keep_records) 2 else 0), recovered.row_count);
+        try std.testing.expectEqual(@as(u64, kept.len), result.checkpoint.offset);
+        try std.testing.expectEqual(zeros.len, result.discarded_bytes);
+        try std.testing.expect(result.discarded_all_zero);
+    }
+}
+
+test "replay ends at a torn tail that isn't zero and reports it" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try twoRowLog(a, io, tmp.dir);
+    defer a.free(log);
+    const garbage: [100]u8 = @splat(0xab);
+    const torn = try std.mem.concat(a, u8, &.{ log, &garbage });
+    defer a.free(torn);
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = torn });
+    var recovered = try Memtable.init(a, tail_schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    const result = try replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, recovered.columns[0].data.bigint.items);
+    try std.testing.expectEqual(garbage.len, result.discarded_bytes);
+    try std.testing.expect(!result.discarded_all_zero);
+}
+
+test "a whole record of an unknown type still fails replay" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try twoRowLog(a, io, tmp.dir);
+    defer a.free(log);
+    var record: [record_header_size + record_trailer_size]u8 = undefined;
+    record[0] = @intFromEnum(RecordType.statement) + 1;
+    format.writeU32(record[1..5], 0);
+    format.writeU64(record[5..13], std.hash.XxHash64.hash(0, record[0..5]));
+    const newer = try std.mem.concat(a, u8, &.{ log, &record });
+    defer a.free(newer);
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = newer });
+    var recovered = try Memtable.init(a, tail_schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    try std.testing.expectError(Error.WalUnknownRecord, replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones));
+}
+
+test "a checkpoint past the end of its log replays nothing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try twoRowLog(a, io, tmp.dir);
+    defer a.free(log);
+    var recovered = try Memtable.init(a, tail_schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    const full = try replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones);
+    // A flush published this checkpoint; the crash then lost the unsynced
+    // records it covers.
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = log[0 .. header_size + 3] });
+    recovered.clear();
+    const again = try replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, full.checkpoint, &tombstones);
+    try std.testing.expect(!again.did_replay);
+    try std.testing.expectEqual(@as(u64, 0), recovered.row_count);
+}
+
+test "a log with no header replays as empty" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const zeros: [header_size + 7]u8 = @splat(0);
+    inline for (.{ 0, legacy_header_size - 1, zeros.len }) |len| {
+        try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = zeros[0..len] });
+        var recovered = try Memtable.init(a, tail_schema);
+        defer recovered.deinit();
+        var tombstones: SegmentTombstones = .empty;
+        defer deinitSegmentTombstones(a, &tombstones);
+        const result = try replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones);
+        try std.testing.expect(!result.did_replay);
+        try std.testing.expectEqual(@as(usize, len), result.discarded_bytes);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = wal_filename, .data = "tDB" });
+    var recovered = try Memtable.init(a, tail_schema);
+    defer recovered.deinit();
+    var tombstones: SegmentTombstones = .empty;
+    defer deinitSegmentTombstones(a, &tombstones);
+    try std.testing.expectError(Error.WalTooSmall, replayFromCheckpoint(a, io, tmp.dir, 11, &recovered, .{}, &tombstones));
 }
 
 test "truncate failure clears the group-commit coordinator" {

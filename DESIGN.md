@@ -854,7 +854,9 @@ Manifest v11 has a 56-byte header, including a 16-byte WAL generation and the co
 
 The exact binary layouts live in [src/storage/manifest.zig](src/storage/manifest.zig) and [src/engine/wal.zig](src/engine/wal.zig). Segment entries include row/byte counts, leading-key statistics, per-column statistics, and cardinality sketches.
 
-Durable mode syncs output files before publishing references, and syncs affected parent directories on POSIX before reclaiming the old WAL or inputs. Windows performs file sync and same-volume replacement; the directory-sync helper is unsupported there. `sync_mode = .none` remains the default and does not promise power-loss durability.
+Durable mode syncs output files before publishing references, and syncs affected parent directories on POSIX before reclaiming the old WAL or inputs. Windows performs file sync and same-volume replacement; the directory-sync helper is unsupported there. `thindb-server` runs durable mode (`sync_mode = .per_flush`) unless started with `--no-fsync`; the embedded library keeps `.none` as its default, which does not promise power-loss durability.
+
+Under `.none` the replacement WAL is still synced, while the segment it hands its rows to may not be. An OS crash can then leave a durable manifest naming a segment whose data never reached the disk (2026-10-24: new segments came back empty while their manifests survived). Open therefore compares every listed segment's size with its manifest entry before anything else touches the table. A missing or short segment fails the open with `SegmentDamaged` (§9.8), naming each such segment in the server log, and the orphan sweep doesn't run, so files that could restore the table stay on disk. The table stays unreadable, rather than answering without those rows, until it is dropped and reloaded from its source.
 
 ### 4.3 Segment file
 
@@ -960,7 +962,7 @@ The min-size guard on the time trigger prevents pathologically tiny segments on 
    b. Encode, then zstd-compress.
    c. Write the block, accumulating offsets + min/max for the footer.
 5. Write the footer.
-6. `fsync` the segment file (optional in v1; non-durable mode skips this).
+6. `fsync` the segment file (`.per_flush`, the server default; `.none` skips this).
 7. Update the manifest: read current, append the new segment, write `manifest.new`, `rename` over `manifest`.
 8. Discard the detached memtable.
 
@@ -1884,6 +1886,12 @@ Throughput scales sub-linearly with thread count (each fsync is now amortized ov
 
 Truncate (called at end of flush) coordinates with `awaitDurable`: it drains the current leader, then bumps `synced_offset` to the pre-truncate `write_offset` so any pending waiters from before the truncate become no-ops (their data is now in a segment, not the WAL).
 
+Records are written positionally at the end of the last whole record. An append that fails part way (a full disk) leaves that end where it was and truncates the file back to it, so the next record overwrites the fragment instead of following it, where replay would stop before reaching it. A new log, at open and at every replacement, is written as `wal.tmp`, synced and renamed over `wal`, so a crash never leaves a log truncated in place.
+
+An fsync failure is sticky. Linux may drop the dirty pages a failed fsync couldn't write and report the next fsync clean, so retrying would acknowledge records that are gone. Once a sync of the log fails, every wait not already covered by an earlier successful sync returns `DurabilityUncertain`, which fences the catalog (`RecoveryRequired`, as for a failed directory sync) until a reopen replays whatever the file really holds. A replacement log owes nothing to the one it replaced, so it starts with the failure cleared.
+
+Replay stops at the first record whose length or checksum fails, the checksum checked before the record type. An OS crash leaves the bytes past the last fsync torn, zeroed, or written back out of order, and none of them were acknowledged under `.per_flush`, so replay keeps everything before that record and ignores the rest. A log the crash zeroed after its header therefore opens with nothing to replay; before the checksum came first, it failed with `WalUnknownRecord` (2026-10-24). The server log reports the ignored byte count and whether it was all zero; a non-zero tail on a log no crash interrupted points at the disk. A record whose checksum holds but whose type is unknown came from a newer binary and still fails replay. A manifest checkpoint past the end of its log means the crash lost unsynced records the flush had already covered, and replays nothing. A log file that is empty or all zero never held an acknowledged record (a header is synced before any record goes in) and replays as empty.
+
 Tombstones never get ahead of the log. A tombstone can hide a row whose replacement, from an UPDATE or a unique-key upsert, so far lives only in the WAL. So every `.tomb` write (`Table.writeTombstoneFile`, `Table.mergeTombstones`) syncs the WAL first whenever sync is on.
 
 ---
@@ -2126,7 +2134,7 @@ SchemaMismatch, UnsupportedUniqueKeyType, UpsertRequiresUniqueKey,
 TableNotFound, TableAlreadyExists, ColumnNotFound,
 ColumnAlreadyExists, UnsupportedAlterOp, UniqueKeyColumnDrop,
 FunctionAlreadyExists, FunctionInvalidDefinition,
-WalOrphaned, XaBranchTooLarge, XaInvalidXid,
+WalOrphaned, SegmentDamaged, XaBranchTooLarge, XaInvalidXid,
 DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
 InvalidDatabaseName, NoDatabaseSelected, InvalidSchemaName,
 ```
@@ -2134,6 +2142,8 @@ InvalidDatabaseName, NoDatabaseSelected, InvalidSchemaName,
 `UniqueKeyColumnDrop`: ALTER TABLE dropped a column of a unique order key (§9.2). It is refused even when the column was renamed earlier in the same ALTER.
 
 `WalOrphaned`: a `wal` file sits inside the table's `segments/` directory. Replay only reads the log beside the manifest, so that file holds acknowledged rows a normal open would silently drop; the table refuses to open until an operator moves the log into place (same schema fingerprint) or aside.
+
+`SegmentDamaged`: a segment the table's manifest lists is missing or isn't the size the manifest recorded, because an OS crash lost it before it reached the disk (§4.2). The table refuses to open, and the server log names each damaged segment and its row count. DROP TABLE still works, so the table can be dropped and reloaded from its source.
 
 **Execution-level (`src/exec/exec.zig`):**
 ```

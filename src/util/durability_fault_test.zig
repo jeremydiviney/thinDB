@@ -15,11 +15,17 @@ const DirectorySyncFault = struct {
     /// When set, deleting an entry whose name starts with this prefix is
     /// refused, as Windows refuses one another handle still holds.
     delete_fail_prefix: ?[]const u8 = null,
+    /// File (not directory) syncs to refuse, as a disk reporting EIO does.
+    file_sync_failures: usize = 0,
+    /// Positional writes to cut short: half the bytes land, then the disk
+    /// reports itself full.
+    write_failures: usize = 0,
 
     fn io(self: *@This()) Io {
         const base = self.threaded.io();
         self.vtable = base.vtable.*;
         self.vtable.fileSync = sync;
+        self.vtable.fileWritePositional = writePositional;
         self.vtable.dirRename = rename;
         self.vtable.dirDeleteFile = deleteFile;
         return .{ .userdata = base.userdata, .vtable = &self.vtable };
@@ -29,14 +35,33 @@ const DirectorySyncFault = struct {
         const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
         const self: *DirectorySyncFault = @fieldParentPtr("threaded", threaded);
         const base = threaded.io();
-        if (self.remaining > 0) {
-            const stat = file.stat(base) catch return error.Unexpected;
-            if (stat.kind == .directory) {
+        if (self.remaining > 0 or self.file_sync_failures > 0) {
+            // Windows refuses to stat a write-only handle; it never syncs a
+            // directory through here either.
+            const is_directory = if (file.stat(base)) |stat| stat.kind == .directory else |_| false;
+            if (is_directory and self.remaining > 0) {
                 self.remaining -= 1;
                 if (self.remaining == 0) return error.InputOutput;
             }
+            if (!is_directory and self.file_sync_failures > 0) {
+                self.file_sync_failures -= 1;
+                return error.InputOutput;
+            }
         }
         return base.vtable.fileSync(base.userdata, file);
+    }
+
+    fn writePositional(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+        const threaded: *Io.Threaded = @ptrCast(@alignCast(userdata.?));
+        const self: *DirectorySyncFault = @fieldParentPtr("threaded", threaded);
+        const base = threaded.io();
+        if (self.write_failures > 0 and header.len == 0 and data.len == 1 and data[0].len > 1) {
+            self.write_failures -= 1;
+            const part = data[0][0 .. data[0].len / 2];
+            _ = try base.vtable.fileWritePositional(base.userdata, file, &.{}, &.{part}, 1, offset);
+            return error.NoSpaceLeft;
+        }
+        return base.vtable.fileWritePositional(base.userdata, file, header, data, splat, offset);
     }
 
     fn rename(userdata: ?*anyopaque, old_dir: Io.Dir, old_path: []const u8, new_dir: Io.Dir, new_path: []const u8) Io.Dir.RenameError!void {
@@ -391,4 +416,101 @@ test "durability: a replacing publish refused both commit and rollback fences th
     defer db.close();
     try expectIds(a, try db.openTable("replaced", .{}), &.{7});
     try expectNoSwapLeftovers(tmp);
+}
+
+const wal = @import("../engine/wal.zig");
+const Memtable = @import("../engine/memtable.zig").Memtable;
+
+test "durability: a failed WAL fsync fails every later wait it didn't cover" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}) };
+    defer fault.threaded.deinit();
+    const io = fault.io();
+    var log = try wal.WalWriter.create(a, io, tmp.dir, 1);
+    defer log.deinit();
+    const first = try log.appendFlushMarker(1);
+    try log.awaitDurable(io, first);
+    const second = try log.appendFlushMarker(2);
+    fault.file_sync_failures = 1;
+    try std.testing.expectError(error.DurabilityUncertain, log.awaitDurable(io, second));
+    // Linux may report the next fsync clean after dropping the pages the
+    // failed one couldn't write: a retry must not acknowledge them.
+    try std.testing.expectError(error.DurabilityUncertain, log.awaitDurable(io, second));
+    try log.awaitDurable(io, first);
+    // A fresh log owes nothing to the one it replaced.
+    try log.truncate(1);
+    try log.awaitDurable(io, try log.appendFlushMarker(3));
+}
+
+test "durability: a failed WAL fsync fences the table until reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var fault = DirectorySyncFault{ .threaded = .init(a, .{}) };
+        defer fault.threaded.deinit();
+        const db = try api.Database.open(a, fault.io(), tmp.dir, .{ .sync_mode = .per_flush, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("t", alter_test_table, .{ .order_key = &.{"id"} });
+        try table.insert(&.{.{ .id = @as(i64, 7) }});
+        fault.file_sync_failures = 1;
+        try std.testing.expectError(error.DurabilityUncertain, table.insert(&.{.{ .id = @as(i64, 8) }}));
+        try std.testing.expectError(error.RecoveryRequired, table.insert(&.{.{ .id = @as(i64, 9) }}));
+        try std.testing.expectError(error.RecoveryRequired, exec.scan(a, table));
+    }
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    // Row 8's record reached the file even though its fsync failed: an
+    // uncertain write may still be there after reopen.
+    try expectIds(a, try db.openTable("t", .{}), &.{ 7, 8 });
+}
+
+test "durability: a failed WAL append leaves no gap before the next record" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}) };
+    defer fault.threaded.deinit();
+    const io = fault.io();
+    var rows = try Memtable.init(a, alter_test_table);
+    defer rows.deinit();
+    try rows.insertRows(&.{ .{ .id = @as(i64, 1) }, .{ .id = @as(i64, 2) }, .{ .id = @as(i64, 3) } });
+    {
+        var log = try wal.WalWriter.create(a, io, tmp.dir, 5);
+        defer log.deinit();
+        _ = try log.appendInsert(&rows, 0, 1);
+        fault.write_failures = 1;
+        try std.testing.expectError(error.NoSpaceLeft, log.appendInsert(&rows, 1, 2));
+        _ = try log.appendInsert(&rows, 2, 3);
+    }
+    var recovered = try Memtable.init(a, alter_test_table);
+    defer recovered.deinit();
+    var tombstones: wal.SegmentTombstones = .empty;
+    defer wal.deinitSegmentTombstones(a, &tombstones);
+    const result = try wal.replayFromCheckpoint(a, std.testing.io, tmp.dir, 5, &recovered, .{}, &tombstones);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, recovered.columns[0].data.bigint.items);
+    try std.testing.expectEqual(@as(usize, 0), result.discarded_bytes);
+}
+
+test "durability: a failed table insert append takes its rows back" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}) };
+    defer fault.threaded.deinit();
+    {
+        const db = try api.Database.open(a, fault.io(), tmp.dir, .{ .sync_mode = .per_flush, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("t", alter_test_table, .{ .order_key = &.{"id"} });
+        try table.insert(&.{.{ .id = @as(i64, 7) }});
+        fault.write_failures = 1;
+        try std.testing.expectError(error.NoSpaceLeft, table.insert(&.{.{ .id = @as(i64, 8) }}));
+        try table.insert(&.{.{ .id = @as(i64, 9) }});
+        try expectIds(a, table, &.{ 7, 9 });
+    }
+    const db = try api.Database.open(a, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try expectIds(a, try db.openTable("t", .{}), &.{ 7, 9 });
 }

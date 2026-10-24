@@ -40,6 +40,11 @@ pub const Error = error{
     /// acknowledged rows that replay would never see; the table refuses to
     /// open until an operator moves the log into place or aside.
     WalOrphaned,
+    /// A segment the manifest lists is missing, or isn't the size it was
+    /// written at: an OS crash lost it before it reached the disk. The table
+    /// refuses to open, rather than answer without those rows, until it is
+    /// dropped and reloaded from its source.
+    SegmentDamaged,
     XaBranchTooLarge,
     XaInvalidXid,
     DatabaseInUse,
@@ -165,16 +170,18 @@ pub const Config = struct {
     /// `thindb-server` passes auto unless `--compact-threads` says otherwise.
     compact_threads: usize = 1,
 
-    /// Durability mode. `.none` (default) returns from flush/delete as
-    /// soon as bytes are in the OS page cache — fast but lossy on power
-    /// loss. `.per_flush` fsyncs each segment + tombstone file after
-    /// writing, and routes the manifest update through an atomic
-    /// write-tmp-then-rename with an fsync on the temp. Adds ~3-15 ms
-    /// per flush on consumer NVMe; reads are unaffected.
+    /// Durability mode. `.per_flush` makes every acknowledged write survive
+    /// an OS crash or power loss: each statement waits for its WAL fsync
+    /// (group commit), and segments, tombstone files, the manifest and the
+    /// directories that name them are synced before anything refers to
+    /// them. A flush costs a few ms more on NVMe; reads are unaffected.
+    /// `thindb-server` runs `.per_flush` unless started with `--no-fsync`.
     ///
-    /// Note: v0.7 fsync does NOT fsync the parent directory. NTFS handles
-    /// rename durability via its journal; on Linux ext4 there is a small
-    /// theoretical hole closed by future WAL support.
+    /// `.none` (the embedded default) leaves writes in the OS page cache. A
+    /// process crash loses nothing, but an OS crash can lose acked rows and
+    /// newly written segments a durable manifest already names (the table
+    /// then fails to open with `SegmentDamaged`). Only for data that can be
+    /// reloaded.
     sync_mode: SyncMode = .none,
 
     /// Enable the write-ahead log. When true, every insert and delete is
