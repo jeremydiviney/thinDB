@@ -63,7 +63,11 @@ const usage_text =
     \\  --no-wal                Disable the write-ahead log (default: on). Without it, rows acked
     \\                          but not yet flushed are lost on a crash or kill — only for
     \\                          disposable bench data dirs where data is reimportable.
-    \\  --max-dop N             Max worker threads per query for the parallel scan leaf (default 1 =
+    \\  --no-fsync              Don't fsync writes (default: every acked write, segment and
+    \\                          manifest is fsynced). Without it an OS crash or power loss can
+    \\                          lose acked rows and leave tables unreadable — only for
+    \\                          disposable bench data dirs where data is reimportable.
+    \\  --max-dop N            Max worker threads per query for the parallel scan leaf (default 1 =
     \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
     \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
@@ -187,6 +191,7 @@ pub fn main(init: std.process.Init) !u8 {
     // WAL on by default (matches the library): crash between ack and flush
     // must not shed acknowledged rows. --no-wal for disposable bench dirs.
     var enable_wal: bool = true;
+    var enable_fsync: bool = true;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
@@ -282,6 +287,10 @@ pub fn main(init: std.process.Init) !u8 {
             enable_wal = false;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--no-fsync")) {
+            enable_fsync = false;
+            continue;
+        }
         if (try takeU32(arg, "--max-connections", &iter, err_w)) |v| {
             max_connections = v;
             continue;
@@ -373,6 +382,10 @@ pub fn main(init: std.process.Init) !u8 {
         .compact_threads = if (compact_threads) |v| v else 0,
         .file_scan_access = if (file_root) |root| .{ .root = root } else .disabled,
         .wal_enabled = enable_wal,
+        // A server's clients take an ack as durable, unlike the embedded
+        // library's default: under `.none` an OS crash lost acked rows and
+        // whole segments (2026-10-24).
+        .sync_mode = if (enable_fsync) .per_flush else .none,
     };
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
@@ -398,6 +411,10 @@ pub fn main(init: std.process.Init) !u8 {
     installSignalHandler();
 
     try out_w.print("thindb-server starting\n  data-dir: {s}\n", .{data_dir});
+    try out_w.print("  durability: {s}, {s}\n", .{
+        if (enable_wal) "WAL on" else "WAL OFF (--no-wal)",
+        if (enable_fsync) "fsync on" else "fsync OFF (--no-fsync): an OS crash can lose acked writes",
+    });
     try printMemoryBanner(out_w, cfg);
 
     var listeners: [3]Listener = undefined;

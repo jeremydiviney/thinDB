@@ -3041,21 +3041,17 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const views = try aa.alloc(storage.ColumnView, tbl_columns.len);
     var staged: StagedInsertRows = .{};
     defer staged.deinit(ctx.allocator);
-    var streaming = false;
     var total_rows: usize = 0;
     while (try source.next()) |b| {
         try plan.fill(ctx, t, out_schema, b.values, b.row_count, batch_schema, views);
         defer plan.release(ctx, views);
-        if (streaming) {
-            total_rows += try writeInsertRows(ctx, t, rule, batch_schema, views, b.row_count);
-            continue;
-        }
         try staged.append(ctx.allocator, aa, t, plan, out_schema, batch_schema, views, b.row_count);
+        // Each write waits for its log fsync, so a big statement writes in
+        // staging-bound chunks rather than source batch by batch.
         if (staged.bytes > t.stage_bytes) {
             total_rows += try staged.write(ctx, aa, t, rule);
             staged.deinit(ctx.allocator);
             staged = .{};
-            streaming = true;
         }
     }
     if (staged.row_count > 0) total_rows += try staged.write(ctx, aa, t, rule);

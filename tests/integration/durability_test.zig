@@ -205,3 +205,106 @@ test "durability: published manifest skips its untruncated WAL generation" {
     while (try q.next()) |b| rows += b.row_count;
     try std.testing.expectEqual(@as(usize, 1), rows);
 }
+
+fn expectIds(a: std.mem.Allocator, t: *thindb.Table, expected: []const i64) !void {
+    var q = try thindb.scan(a, t);
+    defer q.deinit();
+    var ids: std.ArrayList(i64) = .empty;
+    defer ids.deinit(a);
+    while (try q.next()) |b| try ids.appendSlice(a, b.values[0].data.bigint[0..b.row_count]);
+    std.mem.sort(i64, ids.items, {}, std.sort.asc(i64));
+    try std.testing.expectEqualSlices(i64, expected, ids.items);
+}
+
+test "durability: a log whose records a crash zeroed still opens" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema: thindb.TableSchema = .{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    {
+        const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0, .sync_mode = .per_flush });
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+        try t.insert(&.{ .{ .id = @as(i64, 1) }, .{ .id = @as(i64, 2) } });
+    }
+    // The 2026-10-24 crash left logs that kept their synced header and read
+    // back zeros for the rest of the block; opening one failed with
+    // WalUnknownRecord, and every read of the table with it.
+    const log = try tmp.dir.readFileAlloc(io, "main/public/t/wal", a, .unlimited);
+    defer a.free(log);
+    var torn: [4096]u8 = @splat(0);
+    @memcpy(torn[0..32], log[0..32]);
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/public/t/wal", .data = &torn });
+    {
+        const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0, .sync_mode = .per_flush });
+        defer db.close();
+        const t = try db.openTable("t", .{});
+        try expectIds(a, t, &.{ 1, 2 });
+        try t.insert(&.{.{ .id = @as(i64, 3) }});
+    }
+    const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    try expectIds(a, try db.openTable("t", .{}), &.{ 1, 2, 3 });
+}
+
+test "durability: a segment a crash lost fails the open until the table is dropped" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const schema: thindb.TableSchema = .{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    inline for (.{ true, false }) |emptied| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0, .sync_mode = .per_flush });
+            defer db.close();
+            const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+            try t.insert(&.{.{ .id = @as(i64, 1) }});
+            try t.flush();
+            try t.insert(&.{.{ .id = @as(i64, 2) }});
+            try t.flush();
+        }
+        var segments = try tmp.dir.openDir(io, "main/public/t/segments", .{ .iterate = true });
+        defer segments.close(io);
+        var name_buf: [64]u8 = undefined;
+        const lost = blk: {
+            var it = segments.iterate();
+            while (try it.next(io)) |entry| {
+                if (std.mem.endsWith(u8, entry.name, ".dat")) {
+                    @memcpy(name_buf[0..entry.name.len], entry.name);
+                    break :blk name_buf[0..entry.name.len];
+                }
+            }
+            return error.TestUnexpectedResult;
+        };
+        // An OS crash keeps the new file's name and loses its unsynced
+        // data, or loses the file outright.
+        if (emptied) {
+            try segments.writeFile(io, .{ .sub_path = lost, .data = "" });
+        } else {
+            try segments.deleteFile(io, lost);
+        }
+        // A file no manifest entry names: what a lost compaction's inputs
+        // would be, and the sweep at open must not reclaim it now.
+        try segments.writeFile(io, .{ .sub_path = "00000000000000099999.dat", .data = "kept" });
+
+        const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0, .sync_mode = .per_flush });
+        defer db.close();
+        try std.testing.expectError(error.SegmentDamaged, db.openTable("t", .{}));
+        try std.testing.expectError(error.SegmentDamaged, db.openTable("t", .{}));
+        try segments.access(io, "00000000000000099999.dat", .{});
+        try db.dropTable("t");
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+        try t.insert(&.{.{ .id = @as(i64, 5) }});
+        try t.flush();
+        try expectIds(a, t, &.{5});
+    }
+}
