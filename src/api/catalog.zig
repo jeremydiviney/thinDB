@@ -76,11 +76,15 @@ pub const Catalog = struct {
     }
 
     pub const zig_fn_build_dir_name = "_zigfn_build";
+    /// DROP DATABASE renames a database's directory into this one before
+    /// deleting it, so a crash never leaves it half deleted under its name.
+    /// Whatever is still here at open is deleted.
+    pub const database_drop_dir_name = "_dropped";
 
     /// The engine's own directories beside the database directories in the
     /// root: the XA branch store and commit journal, the per-session temp
-    /// namespaces, and LANGUAGE zig build scratch (which holds the loaded
-    /// libraries). No database takes one of these names in any letter case,
+    /// namespaces, LANGUAGE zig build scratch (which holds the loaded
+    /// libraries), and dropped databases awaiting delete. No database takes one of these names in any letter case,
     /// since Windows and macOS fold case. The set is explicit rather than
     /// every name with a leading underscore, so a user database such as
     /// `_staging` keeps working.
@@ -88,6 +92,7 @@ pub const Catalog = struct {
         write_journal.xa_dir_name,
         temp_namespace.temp_root_dir_name,
         zig_fn_build_dir_name,
+        database_drop_dir_name,
     };
 
     /// The rule every path from a database name to a root directory applies:
@@ -131,6 +136,7 @@ pub const Catalog = struct {
         // currently alive; if we're booting fresh, every previous tenant
         // is gone.
         temp_namespace.sweepStaleTempDirs(io, root_dir);
+        storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ root_dir, io, database_drop_dir_name }) catch {};
 
         // The shared cross-query memory pool. A caller-provided pool (multi-
         // Catalog processes sharing one budget) is adopted as-is; otherwise
@@ -288,12 +294,11 @@ pub const Catalog = struct {
         }, cf.or_replace or skip_persist);
 
         if (skip_persist) return;
-        var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch
-            try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+        var dir = try self.openDefinitionDir(db, "_functions");
         defer dir.close(self.io);
         var namebuf: [300]u8 = undefined;
         const fname = try fnFileName(&namebuf, cf.name);
-        try dir.writeFile(self.io, .{ .sub_path = fname, .data = text.items });
+        try self.writeDefinition(dir, fname, text.items);
     }
 
     pub fn dropSqlFunction(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
@@ -305,6 +310,7 @@ pub const Catalog = struct {
             var namebuf: [300]u8 = undefined;
             const fname = fnFileName(&namebuf, name) catch return true;
             dir.deleteFile(self.io, fname) catch {};
+            try self.syncDefinitionDir(dir);
         }
         return true;
     }
@@ -361,16 +367,37 @@ pub const Catalog = struct {
     }
 
     fn persistView(self: *Catalog, db: *Database, name: []const u8, text: []const u8) !void {
-        var dir = db.db_dir.openDir(self.io, "_views", .{}) catch
-            try db.db_dir.createDirPathOpen(self.io, "_views", .{});
+        var dir = try self.openDefinitionDir(db, "_views");
         defer dir.close(self.io);
         var namebuf: [300]u8 = undefined;
         const fname = try fnFileName(&namebuf, name);
+        try self.writeDefinition(dir, fname, text);
+    }
+
+    /// `<db>/<name>`, the database's own `_functions` or `_views`,
+    /// created on first use. A new one is synced into the database directory
+    /// before any definition is written in it.
+    fn openDefinitionDir(self: *Catalog, db: *Database, name: []const u8) !Io.Dir {
+        if (db.db_dir.openDir(self.io, name, .{})) |dir| return dir else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        const dir = try db.db_dir.createDirPathOpen(self.io, name, .{});
+        errdefer dir.close(self.io);
+        if (self.config.sync_mode != .none) storage.syncDirectory(self.io, db.db_dir) catch return Error.DurabilityUncertain;
+        return dir;
+    }
+
+    /// Writes `fname` whole under a `.tmp` name no loader reads, then
+    /// renames it in, so a crash leaves the old definition or the new one.
+    fn writeDefinition(self: *Catalog, dir: Io.Dir, fname: []const u8, text: []const u8) !void {
         var tmpbuf: [304]u8 = undefined;
-        // Not `.sql`, so `loadViews` never reads a half-written one.
         const tmp_name = try std.fmt.bufPrint(&tmpbuf, "{s}.tmp", .{fname});
-        // A replaced definition stays whole until the new one takes its name.
         try storage.writeFileAtomic(self.io, dir, tmp_name, fname, text, self.config.sync_mode != .none);
+    }
+
+    fn syncDefinitionDir(self: *Catalog, dir: Io.Dir) !void {
+        if (self.config.sync_mode != .none) storage.syncDirectory(self.io, dir) catch return Error.DurabilityUncertain;
     }
 
     pub fn dropView(self: *Catalog, db_name: []const u8, name: []const u8) !bool {
@@ -382,6 +409,7 @@ pub const Catalog = struct {
             var namebuf: [300]u8 = undefined;
             const fname = fnFileName(&namebuf, name) catch return true;
             dir.deleteFile(self.io, fname) catch {};
+            try self.syncDefinitionDir(dir);
         }
         return true;
     }
@@ -427,12 +455,11 @@ pub const Catalog = struct {
             };
             errdefer handle.deinit(self.allocator);
             try self.zig_fns.append(self.allocator, handle);
-            var pdir = db.db_dir.openDir(self.io, "_functions", .{}) catch
-                try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+            var pdir = try self.openDefinitionDir(db, "_functions");
             defer pdir.close(self.io);
             var pbuf: [256]u8 = undefined;
             const pname = try dllPathFileName(&pbuf, lower);
-            try pdir.writeFile(self.io, .{ .sub_path = pname, .data = source });
+            try self.writeDefinition(pdir, pname, source);
             return;
         }
         const scratch_rel = try std.fmt.allocPrint(self.allocator, "{s}/{s}_{s}", .{ zig_fn_build_dir_name, db_name, lower });
@@ -477,12 +504,11 @@ pub const Catalog = struct {
         try self.zig_fns.append(self.allocator, handle);
 
         // Persist the source (skip failures only if the fn came from load).
-        var dir = db.db_dir.openDir(self.io, "_functions", .{}) catch
-            try db.db_dir.createDirPathOpen(self.io, "_functions", .{});
+        var dir = try self.openDefinitionDir(db, "_functions");
         defer dir.close(self.io);
         var fbuf: [256]u8 = undefined;
         const fname = try zigFnFileName(&fbuf, lower);
-        try dir.writeFile(self.io, .{ .sub_path = fname, .data = source });
+        try self.writeDefinition(dir, fname, source);
     }
 
     /// Drop a LANGUAGE zig function: unregister, unload, remove the
@@ -507,6 +533,7 @@ pub const Catalog = struct {
             dir.deleteFile(self.io, fname) catch {};
             const pname = dllPathFileName(&fbuf, name) catch return true;
             dir.deleteFile(self.io, pname) catch {};
+            try self.syncDefinitionDir(dir);
         }
         return true;
     }
@@ -723,6 +750,10 @@ pub const Catalog = struct {
 
         const db = try Database.create(self.allocator, self.io, self.root_dir, name, self.config, self);
         errdefer db.closeInPlace();
+        if (self.config.sync_mode != .none) {
+            storage.syncDirectory(self.io, db.db_dir) catch return Error.DurabilityUncertain;
+            storage.syncDirectory(self.io, self.root_dir) catch return Error.DurabilityUncertain;
+        }
         try self.databases.put(db.name, db);
         return db;
     }
@@ -739,6 +770,10 @@ pub const Catalog = struct {
         if (self.databases.get(name)) |existing| return existing;
         const db = try Database.create(self.allocator, self.io, self.root_dir, name, self.config, self);
         errdefer db.closeInPlace();
+        if (self.config.sync_mode != .none) {
+            storage.syncDirectory(self.io, db.db_dir) catch return Error.DurabilityUncertain;
+            storage.syncDirectory(self.io, self.root_dir) catch return Error.DurabilityUncertain;
+        }
         try self.databases.put(db.name, db);
         return db;
     }
@@ -760,7 +795,11 @@ pub const Catalog = struct {
         self.views.dropDatabase(name);
         self.sql_fns.dropDatabase(name);
         self.unloadZigFunctions(name);
-        try self.root_dir.deleteTree(self.io, name);
+        var drop_dir = try self.root_dir.createDirPathOpen(self.io, database_drop_dir_name, .{});
+        defer drop_dir.close(self.io);
+        var aside_buf: [16]u8 = undefined;
+        const aside = try storage.randomAsideName(self.io, &aside_buf, "");
+        try storage.deleteTreeAside(self.io, self.root_dir, name, drop_dir, aside, self.config.sync_mode != .none);
     }
 
     pub fn listDatabases(self: *Catalog, allocator: Allocator) ![][]u8 {

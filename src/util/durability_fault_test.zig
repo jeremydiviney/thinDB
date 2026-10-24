@@ -112,6 +112,57 @@ test "durability: atomic publication retries temporary Windows refusal and prese
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "state.tmp", .{}));
 }
 
+const Ddl = enum { create_database, create_schema, create_table, rename_table, drop_table, drop_schema, drop_database };
+
+/// Runs `ddl` on a fresh catalog with the `fail_at`th directory sync from its
+/// start failing (0 fails none) and returns how many directory syncs it ran.
+fn runDdlFailingSync(a: std.mem.Allocator, ddl: Ddl, fail_at: usize) !usize {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fault = DirectorySyncFault{ .threaded = .init(a, .{}) };
+    defer fault.threaded.deinit();
+    const cat = try api.Catalog.open(a, fault.io(), tmp.dir, .{ .sync_mode = .per_flush });
+    defer cat.close();
+    const db = try cat.createDatabase("d");
+    const s = try db.createSchema("s");
+    if (ddl == .rename_table or ddl == .drop_table) _ = try s.table("t", .{
+        .columns = &.{.{ .name = "id", .type = .bigint }},
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"} });
+    const budget = if (fail_at == 0) std.math.maxInt(usize) else fail_at;
+    fault.remaining = budget;
+    switch (ddl) {
+        .create_database => _ = try cat.createDatabase("e"),
+        .create_schema => _ = try db.createSchema("r"),
+        .create_table => _ = try s.table("u", .{
+            .columns = &.{.{ .name = "id", .type = .bigint }},
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"} }),
+        .rename_table => try s.renameTable("t", "v"),
+        .drop_table => try s.dropTable("t"),
+        .drop_schema => try db.dropSchema("s"),
+        .drop_database => try cat.dropDatabase("d"),
+    }
+    return budget - fault.remaining;
+}
+
+test "durability: no DDL succeeds past a failed directory sync" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for (std.enums.values(Ddl)) |ddl| {
+        const syncs = try runDdlFailingSync(a, ddl, 0);
+        try std.testing.expect(syncs > 0);
+        for (1..syncs + 1) |fail_at| {
+            if (runDdlFailingSync(a, ddl, fail_at)) |_| {
+                std.debug.print("{t} succeeded with directory sync {d} of {d} failing\n", .{ ddl, fail_at, syncs });
+                return error.TestUnexpectedResult;
+            } else |_| {}
+        }
+    }
+}
+
 test "durability: post-rename directory sync failure fences writes until reopen" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

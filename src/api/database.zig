@@ -24,8 +24,19 @@ const CatalogMod = @import("catalog.zig");
 const Catalog = CatalogMod.Catalog;
 
 const snapshot = @import("../util/snapshot.zig");
+const storage = @import("../storage/storage.zig");
 
 pub const default_schema_name: []const u8 = "public";
+/// DROP SCHEMA renames a schema's directory under this prefix before deleting
+/// it, so a crash never leaves it half deleted under its name. The leading
+/// underscore keeps discovery from taking one for a schema.
+const schema_drop_prefix = "_dropped_";
+
+/// _functions, _views, _temp and dropped schemas: a database's own
+/// directories beside its schemas, which no schema name may take.
+fn isInternalDirName(name: []const u8) bool {
+    return name.len > 0 and name[0] == '_';
+}
 pub const back_compat_database_name: []const u8 = "main";
 
 pub const Database = struct {
@@ -147,15 +158,31 @@ pub const Database = struct {
     ) !void {
         var iter_dir = db_dir.openDir(io, ".", .{ .iterate = true }) catch return;
         defer iter_dir.close(io);
+        var dropped: std.ArrayList([]u8) = .empty;
+        defer {
+            for (dropped.items) |name| allocator.free(name);
+            dropped.deinit(allocator);
+        }
         var dir_it = iter_dir.iterate();
         while (try dir_it.next(io)) |entry| {
             if (entry.kind != .directory) continue;
+            if (std.mem.startsWith(u8, entry.name, schema_drop_prefix)) {
+                const name = try allocator.dupe(u8, entry.name);
+                errdefer allocator.free(name);
+                try dropped.append(allocator, name);
+                continue;
+            }
             if (std.mem.eql(u8, entry.name, default_schema_name)) continue;
-            if (entry.name.len > 0 and entry.name[0] == 0x5F) continue; // _functions, _temp: database-internal, never schemas
+            if (isInternalDirName(entry.name)) continue;
             if (self.schemas.get(entry.name) != null) continue;
             const s = Schema.open(allocator, io, db_dir, entry.name, config) catch continue;
             s.database = self;
             try self.schemas.put(s.name, s);
+        }
+        // Dropped schemas a crash kept from being deleted, collected first
+        // since deleting edits the directory being walked.
+        for (dropped.items) |name| {
+            storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ db_dir, io, name }) catch {};
         }
     }
 
@@ -196,6 +223,7 @@ pub const Database = struct {
         self.schemas_mutex.lockUncancelable(self.io);
         defer self.schemas_mutex.unlock(self.io);
 
+        if (isInternalDirName(name)) return Error.InvalidSchemaName;
         if (self.schemas.get(name) != null) return Error.SchemaAlreadyExists;
         if (self.db_dir.openDir(self.io, name, .{})) |probe_| {
             var probe = probe_;
@@ -208,12 +236,14 @@ pub const Database = struct {
 
         const s = try Schema.open(self.allocator, self.io, self.db_dir, name, self.config);
         errdefer s.close();
+        if (self.config.sync_mode != .none) storage.syncDirectory(self.io, self.db_dir) catch return Error.DurabilityUncertain;
         s.database = self;
         try self.schemas.put(s.name, s);
         return s;
     }
 
     pub fn dropSchema(self: *Database, name: []const u8) !void {
+        if (isInternalDirName(name)) return Error.SchemaNotFound;
         const statement_lease = if (self.config.statement_gate) |gate| try gate.acquire(true) else null;
         defer if (statement_lease) |lease| lease.release();
         self.schemas_mutex.lockUncancelable(self.io);
@@ -230,7 +260,9 @@ pub const Database = struct {
             probe.close(self.io);
         }
 
-        try self.db_dir.deleteTree(self.io, name);
+        var aside_buf: [schema_drop_prefix.len + 16]u8 = undefined;
+        const aside = try storage.randomAsideName(self.io, &aside_buf, schema_drop_prefix);
+        try storage.deleteTreeAside(self.io, self.db_dir, name, self.db_dir, aside, self.config.sync_mode != .none);
     }
 
     pub fn listSchemas(self: *Database, allocator: Allocator) ![][]u8 {

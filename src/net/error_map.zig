@@ -13,6 +13,7 @@ pub const Category = enum {
     no_database_selected,
     schema_not_found,
     schema_already_exists,
+    invalid_schema_name,
     column_not_found,
     ambiguous_column,
     query_cancelled,
@@ -47,6 +48,7 @@ pub fn classify(err_name: []const u8) Category {
     if (std.mem.eql(u8, err_name, "NoDatabaseSelected")) return .no_database_selected;
     if (std.mem.eql(u8, err_name, "SchemaNotFound")) return .schema_not_found;
     if (std.mem.eql(u8, err_name, "SchemaAlreadyExists")) return .schema_already_exists;
+    if (std.mem.eql(u8, err_name, "InvalidSchemaName")) return .invalid_schema_name;
     if (std.mem.eql(u8, err_name, "ColumnNotFound")) return .column_not_found;
     if (std.mem.eql(u8, err_name, "SqlOnColumnAmbiguous")) return .ambiguous_column;
     if (std.mem.eql(u8, err_name, "QueryCancelled")) return .query_cancelled;
@@ -110,6 +112,7 @@ test "classify recognizes known errors" {
         .{ "TableNotFound", Category.table_not_found },
         .{ "DatabaseAlreadyExists", Category.database_already_exists },
         .{ "InvalidDatabaseName", Category.invalid_database_name },
+        .{ "InvalidSchemaName", Category.invalid_schema_name },
         .{ "NoDatabaseSelected", Category.no_database_selected },
         .{ "QueryCancelled", Category.query_cancelled },
         .{ "ArithmeticOverflow", Category.numeric_out_of_range },

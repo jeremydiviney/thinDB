@@ -81,6 +81,29 @@ pub fn writeFileAtomic(
     if (durable) syncDirectory(io, dir) catch return error.DurabilityUncertain;
 }
 
+/// Delete directory `name` in `parent` so that a crash never leaves it half
+/// deleted under its name: rename it to `aside_name` in `aside_dir`, sync
+/// both directories when `durable`, then delete it there. A crash between
+/// the steps leaves the whole directory aside, for its owner to sweep at
+/// open. Once the rename stands, a failed delete costs only disk until that
+/// sweep, so it isn't reported.
+pub fn deleteTreeAside(io: Io, parent: Io.Dir, name: []const u8, aside_dir: Io.Dir, aside_name: []const u8, durable: bool) !void {
+    try retryTransientWindowsRefusal(io, Io.Dir.rename, .{ parent, name, aside_dir, aside_name, io });
+    if (durable) {
+        syncDirectory(io, parent) catch return error.DurabilityUncertain;
+        syncDirectory(io, aside_dir) catch return error.DurabilityUncertain;
+    }
+    retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ aside_dir, io, aside_name }) catch {};
+}
+
+/// `prefix` followed by 16 random hex digits: a name no other directory set
+/// aside under `prefix` takes.
+pub fn randomAsideName(io: Io, buf: []u8, prefix: []const u8) ![]u8 {
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    return std.fmt.bufPrint(buf, "{s}{x:0>16}", .{ prefix, std.mem.readInt(u64, &bytes, .little) });
+}
+
 /// Windows can temporarily refuse to rename or delete a directory entry while
 /// another handle or a filesystem filter still holds it. Runs `op(args...)`,
 /// retrying AccessDenied with exponential backoff (1..32 ms) on Windows only.
