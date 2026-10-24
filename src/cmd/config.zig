@@ -27,7 +27,7 @@ pub const ParseError = error{InvalidConfigLine} || std.mem.Allocator.Error;
 
 /// CLI switches that take no value. In the file they carry a truthy/falsy
 /// value; only a truthy value emits the bare `--flag`.
-const bool_flags = [_][]const u8{ "no-wal", "no-compaction", "profile-ops", "trace-group-by" };
+const bool_flags = [_][]const u8{ "no-wal", "no-fsync", "no-compaction", "profile-ops", "trace-group-by" };
 
 fn isBoolFlag(key: []const u8) bool {
     for (bool_flags) |f| if (std.mem.eql(u8, key, f)) return true;
