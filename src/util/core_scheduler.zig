@@ -64,6 +64,10 @@ threadlocal var thread_holds_core: bool = false;
 /// fan-out from a worker thread gets only what is idle.
 threadlocal var thread_admitted: bool = false;
 
+/// Per-thread flag: is THIS thread's admission parked for a blocking send
+/// (see `parkAdmission`)? Its statement is out of `statements` and `busy`.
+threadlocal var thread_parked: bool = false;
+
 /// CAS spinlock — see module note on why not Io.Mutex. The critical section is
 /// only the bucket arithmetic (a scan over a handful of cores), held for
 /// microseconds, so spinning never matters in practice.
@@ -95,6 +99,18 @@ pub const Lease = struct {
 
     pub fn release(self: *Lease) void {
         self.sched.release(self);
+    }
+};
+
+/// An admission taken out of fan-out sizing by `parkAdmission`; `unpark`
+/// counts it again. Empty when parking was a no-op.
+pub const Parked = struct {
+    sched: ?*CoreScheduler = null,
+
+    pub fn unpark(self: *Parked) void {
+        const sched = self.sched orelse return;
+        self.sched = null;
+        sched.unparkAdmission();
     }
 };
 
@@ -194,6 +210,31 @@ pub const CoreScheduler = struct {
         self.busy -|= held;
     }
 
+    /// Take the calling thread's statement out of fan-out sizing while it
+    /// blocks sending results. A statement waiting on a slow client runs no
+    /// work, yet counted it shrinks every other statement's share toward one
+    /// thread on an idle machine (#805). Only the sizing counts change: the
+    /// admission slot stays held, so admission control is unchanged. A no-op
+    /// on a thread without an admission lease or already parked.
+    pub fn parkAdmission(self: *CoreScheduler) Parked {
+        if (!thread_admitted or thread_parked) return .{};
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.statements -|= 1;
+        self.busy -|= 1;
+        thread_parked = true;
+        return .{ .sched = self };
+    }
+
+    fn unparkAdmission(self: *CoreScheduler) void {
+        if (!thread_parked) return;
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.statements += 1;
+        self.busy += 1;
+        thread_parked = false;
+    }
+
     /// Threads a fan-out may run right now. The +1 is the calling thread,
     /// already counted in `busy` (its statement's admission or its parent's
     /// grant). Caller holds `lock`.
@@ -258,13 +299,18 @@ pub const CoreScheduler = struct {
         self.lock.lock();
         const idx: usize = @intCast(lease.core_index);
         if (self.cores[idx].leased > 0) self.cores[idx].leased -= 1;
-        if (lease.admission) {
+        // A parked admission is already out of the counts; its `unpark` then
+        // finds nothing to restore.
+        if (lease.admission and !thread_parked) {
             self.statements -|= 1;
             self.busy -|= 1;
         }
         self.lock.unlock();
         thread_holds_core = false;
-        if (lease.admission) thread_admitted = false;
+        if (lease.admission) {
+            thread_admitted = false;
+            thread_parked = false;
+        }
         if (PIN_THREADS) affinity.unpinCurrentThread(self.all_mask);
     }
 
@@ -425,6 +471,34 @@ test "admission leases count statements and their threads" {
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), s.statements);
     try std.testing.expectEqual(@as(usize, 0), s.busy);
+}
+
+test "a parked admission leaves fan-out sizing until it is unparked" {
+    var s = try CoreScheduler.init(std.testing.allocator);
+    defer s.deinit();
+    if (s.cores.len == 0) return error.SkipZigTest;
+    s.disabled = false;
+    const unadmitted = s.parkAdmission();
+    try std.testing.expect(unadmitted.sched == null);
+
+    var lease = s.acquire();
+    var parked = s.parkAdmission();
+    try std.testing.expectEqual(@as(usize, 0), s.statements);
+    try std.testing.expectEqual(@as(usize, 0), s.busy);
+    const twice = s.parkAdmission();
+    try std.testing.expect(twice.sched == null);
+    try std.testing.expectEqual(@as(u16, 1), s.cores[@intCast(lease.core_index)].leased);
+    parked.unpark();
+    parked.unpark();
+    try std.testing.expectEqual(@as(usize, 1), s.statements);
+    try std.testing.expectEqual(@as(usize, 1), s.busy);
+
+    var late = s.parkAdmission();
+    lease.release();
+    late.unpark();
+    try std.testing.expectEqual(@as(usize, 0), s.statements);
+    try std.testing.expectEqual(@as(usize, 0), s.busy);
+    for (s.cores) |c| try std.testing.expectEqual(@as(u16, 0), c.leased);
 }
 
 test "holder never takes a second slot (no hold-and-wait)" {
