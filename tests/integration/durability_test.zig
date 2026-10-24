@@ -272,35 +272,39 @@ test "durability: a segment a crash lost fails the open until the table is dropp
             try t.insert(&.{.{ .id = @as(i64, 2) }});
             try t.flush();
         }
-        var segments = try tmp.dir.openDir(io, "main/public/t/segments", .{ .iterate = true });
-        defer segments.close(io);
-        var name_buf: [64]u8 = undefined;
-        const lost = blk: {
-            var it = segments.iterate();
-            while (try it.next(io)) |entry| {
-                if (std.mem.endsWith(u8, entry.name, ".dat")) {
-                    @memcpy(name_buf[0..entry.name.len], entry.name);
-                    break :blk name_buf[0..entry.name.len];
+        {
+            // Closed before the drop: Windows refuses to rename a directory
+            // while a handle inside it is open.
+            var segments = try tmp.dir.openDir(io, "main/public/t/segments", .{ .iterate = true });
+            defer segments.close(io);
+            var name_buf: [64]u8 = undefined;
+            const lost = blk: {
+                var it = segments.iterate();
+                while (try it.next(io)) |entry| {
+                    if (std.mem.endsWith(u8, entry.name, ".dat")) {
+                        @memcpy(name_buf[0..entry.name.len], entry.name);
+                        break :blk name_buf[0..entry.name.len];
+                    }
                 }
+                return error.TestUnexpectedResult;
+            };
+            // An OS crash keeps the new file's name and loses its unsynced
+            // data, or loses the file outright.
+            if (emptied) {
+                try segments.writeFile(io, .{ .sub_path = lost, .data = "" });
+            } else {
+                try segments.deleteFile(io, lost);
             }
-            return error.TestUnexpectedResult;
-        };
-        // An OS crash keeps the new file's name and loses its unsynced
-        // data, or loses the file outright.
-        if (emptied) {
-            try segments.writeFile(io, .{ .sub_path = lost, .data = "" });
-        } else {
-            try segments.deleteFile(io, lost);
+            // A file no manifest entry names: what a lost compaction's inputs
+            // would be, and the sweep at open must not reclaim it now.
+            try segments.writeFile(io, .{ .sub_path = "00000000000000099999.dat", .data = "kept" });
         }
-        // A file no manifest entry names: what a lost compaction's inputs
-        // would be, and the sweep at open must not reclaim it now.
-        try segments.writeFile(io, .{ .sub_path = "00000000000000099999.dat", .data = "kept" });
 
         const db = try thindb.Database.open(a, io, tmp.dir, .{ .auto_flush_secs = 0, .sync_mode = .per_flush });
         defer db.close();
         try std.testing.expectError(error.SegmentDamaged, db.openTable("t", .{}));
         try std.testing.expectError(error.SegmentDamaged, db.openTable("t", .{}));
-        try segments.access(io, "00000000000000099999.dat", .{});
+        try tmp.dir.access(io, "main/public/t/segments/00000000000000099999.dat", .{});
         try db.dropTable("t");
         const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
         try t.insert(&.{.{ .id = @as(i64, 5) }});
