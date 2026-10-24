@@ -546,9 +546,8 @@ pub const Table = struct {
     /// or DELETE (`Statement`), or the rows an INSERT ... SELECT gathers into
     /// one batch, which the table validates whole before taking any of it.
     /// Within the bound a failed statement leaves nothing behind, as MySQL
-    /// rolls it back. Past it, an UPDATE or DELETE commits in chunks of about
-    /// this size and an INSERT ... SELECT streams batch by batch, so memory
-    /// stays bounded.
+    /// rolls it back. Past it, an UPDATE, DELETE or INSERT ... SELECT commits
+    /// in chunks of about this size, so memory stays bounded.
     pub const STATEMENT_STAGE_BYTES: usize = 64 << 20;
 
     /// One UPDATE or DELETE, staged step by step and committed whole (#335).
