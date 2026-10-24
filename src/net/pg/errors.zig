@@ -45,6 +45,7 @@ pub fn mapInternal(err: anyerror) Mapped {
         .no_database_selected => .{ .sqlstate = "3D000".*, .message = "no database selected" },
         .schema_not_found => .{ .sqlstate = "3F000".*, .message = "schema does not exist" },
         .schema_already_exists => .{ .sqlstate = "42P06".*, .message = "schema already exists" },
+        .invalid_schema_name => .{ .sqlstate = "42602".*, .message = "invalid schema name" },
         .table_already_exists => .{ .sqlstate = "42P07".*, .message = "relation already exists" },
         .column_not_found => .{ .sqlstate = "42703".*, .message = "column does not exist" },
         .ambiguous_column => .{ .sqlstate = "42702".*, .message = "column reference is ambiguous" },

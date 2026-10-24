@@ -87,15 +87,22 @@ const table_build_prefix = "__ctas_";
 /// The prefix and the decimal digits of any u64.
 const table_build_dir_name_max = table_build_prefix.len + 20;
 
+/// Directory names under this prefix hold a dropped table on its way out:
+/// DROP TABLE renames the table here before deleting it, so a crash never
+/// leaves it half deleted under its name (`storage.deleteTreeAside`).
+const table_drop_prefix = "__drop_";
+
 fn isReservedTableName(name: []const u8) bool {
-    return alter.isReservedTableName(name) or std.mem.startsWith(u8, name, table_build_prefix);
+    return alter.isReservedTableName(name) or std.mem.startsWith(u8, name, table_build_prefix) or
+        std.mem.startsWith(u8, name, table_drop_prefix);
 }
 
 /// A crash ends a build's statement with it. A build directory that stands
 /// is one whose publish never took its name, and a replacing build's original
 /// is back under that name by now (`alter.recoverInterruptedAlters` runs
-/// first), so every build directory a schema finds as it opens is garbage.
-fn deleteTableBuildLeftovers(allocator: Allocator, io: Io, schema_dir: Io.Dir) !void {
+/// first), so every build directory a schema finds as it opens is garbage,
+/// as is every dropped table a crash kept from being deleted.
+fn deleteDeadTableDirs(allocator: Allocator, io: Io, schema_dir: Io.Dir) !void {
     var names: std.ArrayList([]u8) = .empty;
     defer {
         for (names.items) |name| allocator.free(name);
@@ -105,12 +112,13 @@ fn deleteTableBuildLeftovers(allocator: Allocator, io: Io, schema_dir: Io.Dir) !
     // being walked.
     var it = schema_dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, table_build_prefix)) continue;
+        if (entry.kind != .directory) continue;
+        if (!std.mem.startsWith(u8, entry.name, table_build_prefix) and !std.mem.startsWith(u8, entry.name, table_drop_prefix)) continue;
         const name = try allocator.dupe(u8, entry.name);
         errdefer allocator.free(name);
         try names.append(allocator, name);
     }
-    // No name resolves to a build directory, so one a refusal keeps costs
+    // No name resolves to one of these directories, so one a refusal keeps costs
     // only disk until the next open.
     for (names.items) |name| {
         storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ schema_dir, io, name }) catch {};
@@ -318,7 +326,7 @@ pub const Schema = struct {
             d.close(io);
         }
         try alter.recoverInterruptedAlters(allocator, io, schema_dir);
-        try deleteTableBuildLeftovers(allocator, io, schema_dir);
+        try deleteDeadTableDirs(allocator, io, schema_dir);
 
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -545,6 +553,9 @@ pub const Schema = struct {
             options.row_group_size orelse self.config.row_group_size,
         );
         errdefer t.close();
+        // The table's own files are synced; the entry naming its directory
+        // is the schema directory's.
+        if (creating and self.config.sync_mode != .none) storage.syncDirectory(self.io, self.schema_dir) catch return Error.DurabilityUncertain;
 
         try self.tables.put(t.name, t);
         return t;
@@ -752,7 +763,9 @@ pub const Schema = struct {
         // An original an ALTER set aside but failed to delete goes first:
         // the next open would otherwise put it back under the dropped name.
         try alter.deleteAlterLeftovers(self.io, self.schema_dir, owned_name);
-        try self.schema_dir.deleteTree(self.io, owned_name);
+        var aside_buf: [table_drop_prefix.len + 16]u8 = undefined;
+        const aside = try storage.randomAsideName(self.io, &aside_buf, table_drop_prefix);
+        try storage.deleteTreeAside(self.io, self.schema_dir, owned_name, self.schema_dir, aside, self.config.sync_mode != .none);
     }
 
     /// Apply schema operations (`.add`, `.drop`, `.rename` columns) to a
@@ -818,6 +831,7 @@ pub const Schema = struct {
         // Same contract as execAlter's swap: a failure here leaves the table
         // without directory handles, so fence it until reopen.
         errdefer t.requireRecovery();
+        if (t.syncEnabled()) storage.syncDirectory(self.io, self.schema_dir) catch return Error.DurabilityUncertain;
         try self.reopenTableDirs(t, new_name, had_wal);
 
         const new_owned = try self.allocator.dupe(u8, new_name);

@@ -471,3 +471,33 @@ test "materialized view: DROP leaves nothing a reopen brings back, a leftover as
     try std.testing.expectEqual(@as(usize, 0), try countSwapDirs(sc));
     try expectListed(allocator, sc, &.{"src"});
 }
+
+// A definition file is written whole under a `.tmp` name the loaders skip,
+// then renamed in: a crash before the rename leaves only that `.tmp`, which a
+// reopen ignores.
+test "a definition a crash left half written is never loaded" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .sync_mode = .per_flush });
+        defer db.close();
+        try exec(allocator, db, "CREATE FUNCTION kept(x BIGINT) RETURNS TABLE AS (SELECT x AS one)");
+        try exec(allocator, db, "CREATE VIEW kept_v AS SELECT 3 AS three");
+        try tmp.dir.access(io, "main/_functions/kept.sql", .{});
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "main/_functions/kept.sql.tmp", .{}));
+        try exec(allocator, db, "CREATE FUNCTION gone(x BIGINT) RETURNS TABLE AS (SELECT x AS one)");
+        try exec(allocator, db, "DROP FUNCTION gone");
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "main/_functions/gone.sql", .{}));
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/_functions/torn.sql.tmp", .data = "CREATE FUNCTION torn(x BIGINT) RETURNS TABLE AS (SELECT x AS one)" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/_views/torn_v.sql.tmp", .data = "CREATE VIEW torn_v AS SELECT 4 AS four" });
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{});
+    defer db.close();
+    try std.testing.expectEqual(@as(i64, 7), try firstIntIn(allocator, db, "main", "SELECT * FROM kept(7)"));
+    try std.testing.expectEqual(@as(i64, 3), try firstIntIn(allocator, db, "main", "SELECT * FROM kept_v"));
+    try std.testing.expectError(error.FunctionNotFound, execIn(allocator, db, "main", "SHOW CREATE FUNCTION torn"));
+    try std.testing.expectError(error.FunctionNotFound, execIn(allocator, db, "main", "SHOW CREATE FUNCTION gone"));
+    try std.testing.expectError(error.TableNotFound, firstIntIn(allocator, db, "main", "SELECT * FROM torn_v"));
+}

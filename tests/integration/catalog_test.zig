@@ -372,3 +372,104 @@ test "Catalog: reopening skips the zig function build directory" {
     try std.testing.expectEqualStrings("main", names[0]);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, thindb.Catalog.zig_fn_build_dir_name ++ "/public", .{}));
 }
+
+fn expectAbsent(io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
+    try std.testing.expectError(error.FileNotFound, dir.access(io, path, .{}));
+}
+
+// A drop renames the directory aside before deleting it, so a crash between
+// the two leaves it whole under the aside name. Reopening deletes it there
+// rather than adopting a half-deleted database, schema or table.
+test "Catalog: reopening deletes what a crash left set aside by a drop" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const cat = try thindb.Catalog.open(a, io, tmp.dir, .{});
+        defer cat.close();
+        _ = try cat.createDatabase("main");
+    }
+    const aside = [_][]const u8{
+        "_dropped/0123456789abcdef/public/t/schema.bin",
+        "main/_dropped_0123456789abcdef/t/schema.bin",
+        "main/public/__drop_0123456789abcdef/schema.bin",
+    };
+    for (aside) |path| {
+        try tmp.dir.createDirPath(io, std.fs.path.dirname(path).?);
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "aside" });
+    }
+    const cat = try thindb.Catalog.open(a, io, tmp.dir, .{});
+    defer cat.close();
+    const db = cat.database("main").?;
+    const schemas = try db.listSchemas(a);
+    defer freeNames(a, schemas);
+    try std.testing.expectEqual(@as(usize, 1), schemas.len);
+    const tables = try db.schema("public").?.listTables(a);
+    defer freeNames(a, tables);
+    try std.testing.expectEqual(@as(usize, 0), tables.len);
+    try expectAbsent(io, tmp.dir, "_dropped");
+    try expectAbsent(io, tmp.dir, "main/_dropped_0123456789abcdef");
+    try expectAbsent(io, tmp.dir, "main/public/__drop_0123456789abcdef");
+}
+
+test "Catalog: drops leave nothing behind under the dropped name or aside" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const cat = try thindb.Catalog.open(a, io, tmp.dir, .{ .sync_mode = .per_flush });
+        defer cat.close();
+        const db = try cat.createDatabase("d");
+        const s = try db.createSchema("s");
+        inline for (.{ "kept", "gone" }) |name| {
+            const t = try s.table(name, schema_v1, opts_v1);
+            try t.insert(&.{.{ .id = @as(i64, 1), .qty = @as(i32, 2), .active = true, .tag = "x" }});
+            try t.flush();
+        }
+        try s.dropTable("gone");
+        try expectAbsent(io, tmp.dir, "d/s/gone");
+        try std.testing.expectEqual(@as(usize, 1), try countEntries(io, tmp.dir, "d/s"));
+        try db.dropSchema("s");
+        try expectAbsent(io, tmp.dir, "d/s");
+        try std.testing.expectEqual(@as(usize, 1), try countEntries(io, tmp.dir, "d"));
+        try cat.dropDatabase("d");
+        try expectAbsent(io, tmp.dir, "d");
+        try std.testing.expectEqual(@as(usize, 0), try countEntries(io, tmp.dir, thindb.Catalog.database_drop_dir_name));
+        try std.testing.expectError(thindb.Error.InvalidDatabaseName, cat.createDatabase("_DROPPED"));
+    }
+    const cat = try thindb.Catalog.open(a, io, tmp.dir, .{});
+    defer cat.close();
+    try std.testing.expect(cat.database("d") == null);
+    try expectAbsent(io, tmp.dir, thindb.Catalog.database_drop_dir_name);
+}
+
+fn countEntries(io: std.Io, root: std.Io.Dir, path: []const u8) !usize {
+    var dir = try root.openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next(io)) |_| count += 1;
+    return count;
+}
+
+// Discovery never takes a name with a leading underscore for a schema: those
+// are the database's own directories. So no schema may take one either, and
+// no DROP SCHEMA may delete one.
+test "Catalog: a schema name can't take a database's own directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(a, io, tmp.dir, .{});
+    defer db.close();
+    try tmp.dir.createDirPath(io, "main/_functions");
+    try tmp.dir.writeFile(io, .{ .sub_path = "main/_functions/keep", .data = "engine" });
+    for ([_][]const u8{ "_functions", "_views", "_dropped_0123456789abcdef", "_mine" }) |name| {
+        try std.testing.expectError(thindb.Error.InvalidSchemaName, db.createSchema(name));
+        try std.testing.expectError(thindb.Error.SchemaNotFound, db.dropSchema(name));
+    }
+    try sql_helpers.expectRunError(a, db, "CREATE SCHEMA _mine", thindb.Error.InvalidSchemaName);
+    try tmp.dir.access(io, "main/_functions/keep", .{});
+}

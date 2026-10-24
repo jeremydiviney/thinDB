@@ -26,6 +26,7 @@ pub fn mapInternal(err: anyerror, fallback_msg: ?[]const u8) Mapped {
         .no_database_selected => .{ .code = 1046, .sqlstate = "3D000".*, .message = "No database selected" },
         .schema_not_found => .{ .code = 1146, .sqlstate = "42S02".*, .message = "Schema not found" },
         .schema_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Schema exists" },
+        .invalid_schema_name => .{ .code = 1102, .sqlstate = "42000".*, .message = "Incorrect schema name" },
         .table_already_exists => .{ .code = 1050, .sqlstate = "42S01".*, .message = "Table exists" },
         .column_not_found => .{ .code = 1054, .sqlstate = "42S22".*, .message = "Unknown column" },
         .ambiguous_column => .{ .code = 1052, .sqlstate = "23000".*, .message = "Column in on clause is ambiguous" },

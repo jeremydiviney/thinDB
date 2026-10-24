@@ -818,6 +818,7 @@ The quotient's scale is StarRocks'. Only the dividend's scale decides it, and an
   __alter_new_<table_name>/        ← ALTER TABLE's rewritten table before the swap (transient)
   __alter_old_<table_name>/        ← the original, set aside during an ALTER or REFRESH swap (transient)
   __ctas_<n>/                      ← a CTAS, CREATE MATERIALIZED VIEW or REFRESH target while its query runs (transient)
+  __drop_<hex>/                    ← a dropped table between its rename aside and its delete (transient)
 ```
 
 `<seg_id>` is a monotonically increasing u64. `.tomb` files are absent until the first delete that hits that segment.
@@ -829,12 +830,19 @@ A catalog root holds databases, each holding schemas of tables laid out as above
   <database>/
     <schema>/<table_name>/...
     _functions/                    ← persisted function sources
+    _views/                        ← persisted view definitions
+    _dropped_<hex>/                ← a dropped schema between its rename aside and its delete (transient)
   _xa/                             ← XA branch records and the commit journal
   _temp/                           ← per-session temporary tables (swept at open)
   _zigfn_build/                    ← zig function build scratch
+  _dropped/<hex>/                  ← a dropped database between its rename aside and its delete (transient)
 ```
 
 Every other directory under the root is a database. The engine's names are reserved (`Catalog.reserved_database_names`, compared without case), and one check, `Catalog.validateDatabaseName`, guards every path that maps a name to a root directory: discovery at open skips them, and CREATE DATABASE, DROP DATABASE, USE and COM_INIT_DB refuse them with `InvalidDatabaseName` (§9.8). The same check refuses a name that isn't a single path component: empty, `.`, `..`, or containing `/`, `\` or NUL. The set is explicit rather than every name with a leading underscore, so a user database such as `_staging` keeps working; a new engine directory at the root must join it. DROP DATABASE removes only a database the catalog loaded, never a directory by name alone.
+
+Inside a database every directory with a leading underscore is the database's own, so discovery never takes one for a schema, CREATE SCHEMA refuses such a name with `InvalidSchemaName` (§9.8), and DROP SCHEMA reports it as not found.
+
+No crash leaves a DDL statement half done on disk. DROP TABLE, DROP SCHEMA and DROP DATABASE rename the directory aside under a random name (`__drop_<hex>` in the schema, `_dropped_<hex>` in the database, `_dropped/<hex>` at the root), sync the directories the rename touched, then delete it there. A crash before the rename leaves the whole directory under its name. A crash after it leaves the directory aside, and the next open of its parent deletes it. CREATE TABLE, CREATE SCHEMA and CREATE DATABASE sync the parent directory before they return, and RENAME TABLE syncs the schema directory. A function or view definition is written whole under `<file>.tmp`, which no loader reads, and renamed into place. A new `_functions` or `_views` directory is synced into its database, and DROP FUNCTION and DROP VIEW sync the directory after the delete. Under `sync_mode = .none` the renames still happen and only the syncs are skipped. A failed sync fails the statement with `DurabilityUncertain`.
 
 ### 4.2 Manifest
 
@@ -1991,7 +1999,7 @@ try db.dropTable("orders_v2");
 3. Rename the shadow into place. This rename commits the swap.
 4. Delete the original.
 
-Each rename is followed by a directory sync. When a schema opens, it resolves any swap that a crash or a persistent refusal interrupted. Before the commit, it puts the original back. After the commit, it deletes what is left over. DROP TABLE and RENAME TABLE delete an original that a committed swap failed to delete, so the next open can't restore it under the old name. A replacing table build (REFRESH MATERIALIZED VIEW, §8.2) publishes with steps 2 to 4, its build in the shadow's place, and recovers the same way. Names starting `__alter_` or `__ctas_` (a table build, §8.2) are reserved: no table can be created or renamed under one, and none is listed or opened.
+Each rename is followed by a directory sync. When a schema opens, it resolves any swap that a crash or a persistent refusal interrupted. Before the commit, it puts the original back. After the commit, it deletes what is left over. DROP TABLE and RENAME TABLE delete an original that a committed swap failed to delete, so the next open can't restore it under the old name. A replacing table build (REFRESH MATERIALIZED VIEW, §8.2) publishes with steps 2 to 4, its build in the shadow's place, and recovers the same way. Names starting `__alter_`, `__ctas_` (a table build, §8.2) or `__drop_` (a DROP TABLE set aside, §4.1) are reserved: no table can be created or renamed under one, and none is listed or opened.
 
 Writes are paused during the copy; reads see the old version until swap, the new version after. Each segment is rewritten under its own id with its rows in the same order, so its `.tomb` and `.bloom` sidecars are copied into the shadow unchanged: deletes and key filters carry over. The table keeps its compression.
 
@@ -2120,7 +2128,7 @@ ColumnAlreadyExists, UnsupportedAlterOp, UniqueKeyColumnDrop,
 FunctionAlreadyExists, FunctionInvalidDefinition,
 WalOrphaned, XaBranchTooLarge, XaInvalidXid,
 DatabaseInUse, TableBusy, ReservedTableName, RecoveryRequired, DurabilityUncertain, DatabaseClosed,
-InvalidDatabaseName, NoDatabaseSelected,
+InvalidDatabaseName, NoDatabaseSelected, InvalidSchemaName,
 ```
 
 `UniqueKeyColumnDrop`: ALTER TABLE dropped a column of a unique order key (§9.2). It is refused even when the column was renamed earlier in the same ALTER.
@@ -2195,6 +2203,8 @@ Scalar functions reject bad arguments with their own errors, which reach a clien
 `ReservedTableName` rejects creating or renaming a table under the `__alter_` or `__ctas_` prefix, which ALTER TABLE's swap and table builds use (§9.2, §8.2).
 
 `InvalidDatabaseName` rejects a database name reserved for the engine's own root directories, or one that isn't a single path component (§4.1), even under IF EXISTS or IF NOT EXISTS, since MySQL checks the name first too. The MySQL wire reports it as 1102 (`42000`, `Incorrect database name`), the PostgreSQL wire as `42602`.
+
+`InvalidSchemaName` rejects a schema name with a leading underscore, the database's own directories (§4.1). The MySQL wire reports it as 1102 (`42000`, `Incorrect schema name`), the PostgreSQL wire as `42602`.
 
 `NoDatabaseSelected` means a statement needed the session's current database and the session has none. A session holds its current database by name (`Session.current_db`, null for none). It loses it by dropping that database, as a MySQL session does, or when another session drops it: each statement treats a name the catalog no longer holds as none. Without a current database, USE, CREATE and DROP DATABASE, SHOW DATABASES, FROM-less SELECTs and fully qualified table references keep working. An unqualified table reference fails with this error, as do statements that act on the current database: functions, views, schemas and XA START. `DATABASE()` and `current_database()` return NULL and PROCESSLIST shows a NULL db. MySQL keeps the dropped name in a session whose database another session dropped; thinDB reports none there too. The MySQL wire reports it as 1046 (`3D000`, `No database selected`), the PostgreSQL wire as `3D000`.
 

@@ -30,6 +30,9 @@ pub const Error = error{
     NoDatabaseSelected,
     SchemaNotFound,
     SchemaAlreadyExists,
+    /// A schema name starting with an underscore: those name a database's
+    /// own directories (functions, views, dropped schemas awaiting delete).
+    InvalidSchemaName,
     FunctionAlreadyExists,
     FunctionInvalidDefinition,
     FunctionNotFound,
