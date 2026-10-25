@@ -109,6 +109,8 @@ for (const t of targets) {
   mkdirSync(join(bundle, "zig"), { recursive: true });
 
   copyFileSync(join(DIST, "build", t.triple, "bin", t.exe), join(bundle, t.exe));
+  // The BSD licenses of the compiled-in zstd and lz4 require their notices to ship with the binary.
+  for (const f of ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]) copyFileSync(join(REPO, f), join(bundle, f));
 
   // The toolchain archives contain a zig-<arch>-<os>-<ver>/ top dir; strip it.
   if (t.ext === "zip") {
@@ -135,6 +137,9 @@ share in-memory structs with the server, so only the identical toolchain is
 safe.
 
 Built from thinDB ${gitVersion}, Zig ${zigVersion}.
+
+thinDB is licensed under the Apache License 2.0 (LICENSE). Third-party code in
+the server binary is listed in THIRD_PARTY_NOTICES.md.
 `);
   console.log(`[stage] ${t.bundleName}`);
 }

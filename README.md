@@ -203,4 +203,10 @@ Then open `http://localhost:4321`.
 | `cd docs-site && bun run build` | Validate and build the documentation site |
 
 Before making a non-trivial engine change, read [DESIGN.md](DESIGN.md). Keep thinDB thin, explicit,
-and predictable.
+and predictable. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+## License
+
+thinDB is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attributions. The license does not grant rights to
+the thinDB name.
