@@ -271,6 +271,78 @@ test "narrow MAX_BY / MAX_BY_KEY / ANY_VALUE / FIRST cells match the wide path a
     try std.testing.expectEqual(GROUPS, groups_seen);
 }
 
+test "grouped COUNT / SUM / AVG / MIN / MAX match brute force, all-NULL group included" {
+    const a = std.testing.allocator;
+    var full = try buildFixture(a);
+    defer for (&full) |*c| c.deinit(a);
+
+    const aggs = [_]AggSpec{
+        .{ .func = .count, .as = "n" },
+        .{ .func = .count, .col = "ord", .as = "n_ord" },
+        .{ .func = .sum, .col = "ord", .as = "s_ord" },
+        .{ .func = .sum, .col = "ordf", .as = "s_ordf" },
+        .{ .func = .avg, .col = "v_i", .as = "a_vi" },
+        .{ .func = .min, .col = "ord", .as = "mn_ord" },
+        .{ .func = .max, .col = "ordf", .as = "mx_ordf" },
+        .{ .func = .max, .col = "v_i", .as = "mx_vi" },
+    };
+    const group_cols = [_][]const u8{"g"};
+
+    const src = try Source.create(a, &full);
+    const q = exec.makeQuery(a, src);
+    var agg = q.groupBy(&group_cols, &aggs) catch |e| {
+        var qq = q;
+        qq.deinit();
+        return e;
+    };
+    defer agg.deinit();
+
+    var groups_seen: usize = 0;
+    while (try agg.next()) |b| {
+        for (0..b.row_count) |r| {
+            const g: usize = @intCast(b.values[0].data.int[r]);
+            var n: i64 = 0;
+            var n_ord: i64 = 0;
+            var s_ord: ?i64 = null;
+            var mn_ord: ?i64 = null;
+            var mx_ord: ?i64 = null;
+            var mx_vi: ?i32 = null;
+            var vi_sum: i64 = 0;
+            var vi_n: i64 = 0;
+            for (0..ROWS) |i| {
+                if (groupOf(i) != g) continue;
+                n += 1;
+                if (ordOf(i)) |k| {
+                    n_ord += 1;
+                    s_ord = (s_ord orelse 0) + k;
+                    mn_ord = @min(mn_ord orelse k, k);
+                    mx_ord = @max(mx_ord orelse k, k);
+                }
+                if (viOf(i)) |v| {
+                    vi_sum += v;
+                    vi_n += 1;
+                    mx_vi = @max(mx_vi orelse v, v);
+                }
+            }
+            try expectI64Cell(b.values[1], r, n);
+            try expectI64Cell(b.values[2], r, n_ord);
+            try expectI64Cell(b.values[3], r, s_ord);
+            try expectF64Cell(b.values[4], r, s_ord);
+            if (vi_n == 0) {
+                try std.testing.expect(!b.values[5].isValid(r));
+            } else {
+                try std.testing.expect(b.values[5].isValid(r));
+                try std.testing.expectEqual(@as(f64, @floatFromInt(vi_sum)) / @as(f64, @floatFromInt(vi_n)), b.values[5].data.double[r]);
+            }
+            try expectI64Cell(b.values[6], r, mn_ord);
+            try expectF64Cell(b.values[7], r, mx_ord);
+            try expectI32Cell(b.values[8], r, mx_vi);
+            groups_seen += 1;
+        }
+    }
+    try std.testing.expectEqual(GROUPS, groups_seen);
+}
+
 const improving_schema = [_]Column{
     .{ .name = "g", .type = .int, .nullable = false },
     .{ .name = "run", .type = .int, .nullable = false },
