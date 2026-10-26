@@ -12,6 +12,12 @@
 //! another worker pulls). Only the view-struct arrays are per-`next()` scratch
 //! — the tap copies those under the lock.
 //!
+//! The first pull runs on the calling thread before any worker is reserved. A
+//! stable upstream can still be blocking — a group-topN pipeline or a sort does
+//! all of its work in the first `next()` and only hands out finished ranges
+//! after — and pulled from a worker it would run with the reduce's grant
+//! already taken (one thread) while the other workers wait on the tap (#815).
+//!
 //! Combine correctness over "empty" partials: post-#79 a global aggregate
 //! over zero rows emits COUNT=0 and NULL for everything else, and every
 //! combine function skips NULLs (`max_by` skips a partial whose hidden ord
@@ -138,6 +144,8 @@ pub const ParallelReduceAggregate = struct {
     const Tap = struct {
         mu: std.atomic.Mutex = .unlocked,
         upstream: *exec.Query,
+        /// The primed first batch, handed out by the first pull.
+        pending: ?exec.Batch = null,
         done: bool = false,
         err: ?anyerror = null,
     };
@@ -156,17 +164,25 @@ pub const ParallelReduceAggregate = struct {
             // Spinlock (`std.atomic.Mutex`): the hold is one buffer-backed
             // upstream.next() + a view-struct memcpy — microseconds against
             // each worker's ~64K-row fold between pulls.
-            while (!t.mu.tryLock()) std.atomic.spinLoopHint();
+            var spins: usize = 0;
+            while (!t.mu.tryLock()) : (spins += 1) {
+                if (spins < 1024) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+            }
             defer t.mu.unlock();
             if (t.err) |e| return e;
-            if (t.done) return null;
-            const maybe = t.upstream.next() catch |e| {
-                t.err = e;
-                return e;
-            };
-            const b = maybe orelse {
-                t.done = true;
-                return null;
+            const b = if (t.pending) |p| blk: {
+                t.pending = null;
+                break :blk p;
+            } else blk: {
+                if (t.done) return null;
+                const maybe = t.upstream.next() catch |e| {
+                    t.err = e;
+                    return e;
+                };
+                break :blk maybe orelse {
+                    t.done = true;
+                    return null;
+                };
             };
             // A digest-sidecar batch's values are placeholders — folding them
             // outside the lock would need the sidecar copied too. No stable
@@ -303,7 +319,7 @@ pub const ParallelReduceAggregate = struct {
 
     fn runWorkers(self: *ParallelReduceAggregate) !void {
         const aa = self.spec_arena.allocator();
-        var grant = core_scheduler.reserveWorkers(self.dop);
+        var grant = core_scheduler.reserveWorkers(if (self.tap.done) 1 else self.dop);
         defer grant.release();
         self.workers = try aa.alloc(Worker, grant.count);
         for (self.workers) |*w| {
@@ -335,6 +351,11 @@ pub const ParallelReduceAggregate = struct {
             return null;
         }
         self.emitted = true;
+        if (try self.upstream.next()) |first| {
+            self.tap.pending = first;
+        } else {
+            self.tap.done = true;
+        }
         try self.runWorkers();
         if (self.tap.err) |e| return e;
         for (self.workers) |*w| {
@@ -393,6 +414,8 @@ const StableRows = struct {
     batch_rows: usize,
     cursor: usize = 0,
     views: []ColumnView,
+    /// Set to the thread that served the first pull, when non-null.
+    first_pull_thread: ?*std.Thread.Id = null,
 
     fn create(allocator: Allocator, schema: []const types.Column, ids: []const i64, vals: []const i64, valid: []const bool, batch_rows: usize) !exec.Query {
         const self = try allocator.create(StableRows);
@@ -410,6 +433,9 @@ const StableRows = struct {
     }
 
     pub fn next(self: *StableRows) !?exec.Batch {
+        if (self.cursor == 0) {
+            if (self.first_pull_thread) |t| t.* = std.Thread.getCurrentId();
+        }
         if (self.cursor >= self.ids.len) return null;
         const lo = self.cursor;
         const hi = @min(lo + self.batch_rows, self.ids.len);
@@ -509,4 +535,34 @@ test "parallel reduce empty input keeps the serial empty dialect" {
     try testing.expectEqual(@as(i64, 0), b.values[0].data.bigint[0]);
     try testing.expect(!b.values[1].isValid(0));
     try testing.expect(!b.values[2].isValid(0));
+}
+
+test "parallel reduce pulls the first batch on the calling thread" {
+    const allocator = testing.allocator;
+    const schema = [_]types.Column{
+        .{ .name = "id", .type = .bigint },
+        .{ .name = "v", .type = .bigint },
+    };
+    const n = 5_000;
+    const ids = try allocator.alloc(i64, n);
+    defer allocator.free(ids);
+    const vals = try allocator.alloc(i64, n);
+    defer allocator.free(vals);
+    for (ids, vals, 0..) |*id, *v, i| {
+        id.* = @intCast(i);
+        v.* = @intCast(i % 10);
+    }
+    const aggs = [_]ir.AggSpec{
+        .{ .func = .count, .col = null, .as = "c" },
+        .{ .func = .sum, .col = "v", .as = "s" },
+    };
+    var first_pull: std.Thread.Id = 0;
+    const up = try StableRows.create(allocator, &schema, ids, vals, &.{}, 256);
+    exec.queryAs(StableRows, up).?.first_pull_thread = &first_pull;
+    var q = (try ParallelReduceAggregate.create(allocator, std.heap.c_allocator, up, &aggs, 4)).?;
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try testing.expectEqual(std.Thread.getCurrentId(), first_pull);
+    try testing.expectEqual(@as(i64, n), b.values[0].data.bigint[0]);
+    try testing.expectEqual(@as(i64, 22_500), b.values[1].data.bigint[0]);
 }
