@@ -9,7 +9,7 @@
   <p>
     <img alt="Status: technical preview" src="https://img.shields.io/badge/status-technical_preview-e67b5f" />
     <img alt="Zig 0.16" src="https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&amp;logoColor=white" />
-    <img alt="Version 0.1.0-dev" src="https://img.shields.io/badge/version-0.1.0--dev-51b89c" />
+    <img alt="Version 0.1" src="https://img.shields.io/badge/version-0.1-51b89c" />
   </p>
 </div>
 
@@ -26,6 +26,11 @@ cost-based query optimizer.
   kernels, parallel scans, and specialized aggregation paths.
 - **Use existing SQL clients.** Connect with MySQL or PostgreSQL drivers, CLIs, and connection
   pools. Both listeners share the same catalog.
+- **A broad analytical dialect.** MySQL-flavored SQL that also accepts much of StarRocks'
+  surface: `ARRAY`, `MAP`, and `STRUCT` columns with lambdas, `BITMAP`, 76-digit decimals,
+  `GROUPING SETS`, recursive CTEs, and several hundred built-in functions.
+- **Crash-safe by default.** The server fsyncs every acknowledged write through a group-committed
+  write-ahead log, and flushes, compactions, and DDL publish atomically.
 - **Embed it or run it.** Import the Zig library directly or launch `thindb-server` as a
   standalone multi-wire process.
 - **Extend it in Zig.** Register scalar and aggregate kernels, create typed table functions,
@@ -42,6 +47,9 @@ git clone https://github.com/jeremydiviney/thinDB.git
 cd thinDB
 zig build -Doptimize=ReleaseFast
 ```
+
+Prebuilt server bundles for Linux, macOS, and Windows are published from each green build of `main`
+on the [releases page](https://github.com/jeremydiviney/thinDB/releases).
 
 Start the server with a local data directory:
 
@@ -93,11 +101,11 @@ ORDER BY revenue DESC;
 
 | Area | Current surface |
 |---|---|
-| Storage | Immutable columnar segments, memtables, WAL, row-group statistics, encodings, compression, tombstones, flush, and compaction |
-| SQL | Filters, expressions, grouping, exact aggregates, joins, CTEs, subqueries, windows, sorting, limits, JSON navigation, and file scans |
-| Connectivity | MySQL wire, PostgreSQL wire, prepared statements, native wire, and in-process connections |
-| Types | Integer widths, floats, decimal, strings, boolean, date, datetime, UUID, and JSON |
-| Operations | Per-query and process memory budgets, cache sizing, parallelism controls, diagnostics, and background maintenance |
+| Storage | Immutable columnar segments, memtables, a crash-safe WAL, row-group statistics, Bloom filters, encodings, compression, tombstones, flush, and compaction |
+| SQL | Filters, expressions, grouping with `ROLLUP`/`CUBE`/`GROUPING SETS`, exact aggregates, joins, CTEs including `WITH RECURSIVE`, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, windows, sorting, limits, JSON navigation, lambdas, `UNNEST`, `generate_series`, materialized views, and file scans |
+| Connectivity | MySQL wire, PostgreSQL wire, prepared statements, native wire, XA for exactly-once ingest, and in-process connections |
+| Types | Integers from 8 to 128 bits, floats, `DECIMAL` up to 76 digits, strings, boolean, date, datetime, UUID, JSON, `ARRAY`, `MAP`, `STRUCT`, and `BITMAP` |
+| Operations | Per-query and process memory budgets (cgroup-aware), cache sizing, server and per-session parallelism caps, `SHOW PROCESSLIST` and `KILL`, diagnostics, and background maintenance |
 | Extensibility | Reusable SQL table functions, typed Zig table UDFs, embedded scalar UDFs, and aggregate UDFs |
 
 ## Three function models
@@ -153,20 +161,23 @@ flowchart LR
     F --> S
 ```
 
-The write path accumulates recent rows in memtables and persists accepted work through the WAL
-when configured. Flush and compaction produce immutable sorted segments. Queries read a stable
-snapshot and prune segments and row groups using stored statistics before decoding columns.
+The write path accumulates recent rows in memtables. The server logs each write to a per-table
+WAL and fsyncs it before acknowledging. The embedded library logs writes too, but skips the fsync
+unless it is opened with `sync_mode = .per_flush`.
+Flush and compaction produce immutable sorted segments. Each statement reads a stable snapshot and
+prunes segments and row groups using stored statistics before decoding columns.
 
 ## Project status
 
-thinDB is a **technical preview** at version `0.1.0-dev`. The engine and wire protocols are
-actively tested, including analytical benchmark workloads, but this is not yet a drop-in MySQL
-or PostgreSQL replacement.
+thinDB is a **technical preview** at version `0.1`; each green build of `main` ships as a
+`v0.1.N` release. The engine and wire protocols are actively tested, including analytical benchmark
+workloads, but this is not yet a drop-in MySQL or PostgreSQL replacement.
 
 Current design boundaries:
 
 - Single-node only: no distribution, replication, or sharding.
-- Analytics first: not a general OLTP database or full transactional compatibility layer.
+- Analytics first: not a general OLTP database, and no multi-statement transactions.
+- No spill to disk: a query that doesn't fit its memory budget fails cleanly.
 - MySQL and PostgreSQL compatibility is intentionally a supported subset.
 - No timezone-aware datetime type yet.
 - Native Zig functions run in-process and are for trusted code only.

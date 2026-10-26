@@ -4,12 +4,16 @@ import PageHeader from '../../components/PageHeader.astro'
 import CodeBlock from '../../components/CodeBlock.astro'
 import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
+import { withBase } from '../../lib/base'
 const headings = [
   { depth: 2, slug: 'scalar-functions', text: 'Scalar functions' },
   { depth: 3, slug: 'string', text: 'String and binary' },
   { depth: 3, slug: 'math', text: 'Math and numeric' },
   { depth: 3, slug: 'date-time', text: 'Date and time' },
   { depth: 3, slug: 'json', text: 'JSON' },
+  { depth: 3, slug: 'network', text: 'Network addresses' },
+  { depth: 3, slug: 'nested', text: 'Arrays, maps, and lambdas' },
+  { depth: 3, slug: 'bitmap', text: 'Bitmaps' },
   { depth: 3, slug: 'conditional-conversion', text: 'Conditional and conversion' },
   { depth: 2, slug: 'aggregate-functions', text: 'Aggregate functions' },
   { depth: 2, slug: 'special-forms', text: 'Special SQL forms' },
@@ -18,21 +22,23 @@ const headings = [
 ]
 ---
 <DocsLayout title="Built-in functions" description="Reference for thinDB scalar and aggregate SQL functions." headings={headings}>
-  <PageHeader eyebrow="SQL reference" title="Built-in functions" description="The shipped registry covers string processing, regular expressions, math, dates, JSON, conversion, conditional logic, exact aggregates, and statistical aggregates." />
+  <PageHeader eyebrow="SQL reference" title="Built-in functions" description="The shipped registry covers strings, regular expressions, URLs, math, dates, JSON, network addresses, arrays, maps, lambdas, bitmaps, conversion, conditional logic, and exact and statistical aggregates." />
   <h2 id="scalar-functions">Scalar functions</h2>
   <p>Function names are case-insensitive in SQL. The tables below list the public names present in the scalar registry; aliases are shown separately because they may be useful when porting MySQL or PostgreSQL queries.</p>
 
   <h3 id="string">String and binary</h3>
   <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
-    <tr><td>Case and trim</td><td><code>upper</code>, <code>ucase</code>, <code>lower</code>, <code>lcase</code>, <code>initcap</code>, <code>trim</code>, <code>ltrim</code>, <code>rtrim</code></td></tr>
+    <tr><td>Case and trim</td><td><code>upper</code>, <code>ucase</code>, <code>lower</code>, <code>lcase</code>, <code>initcap</code>, <code>trim</code>, <code>ltrim</code>, <code>rtrim</code>, and <code>TRIM([LEADING | TRAILING | BOTH] chars FROM s)</code></td></tr>
     <tr><td>Length and bytes</td><td><code>length</code>, <code>char_length</code>, <code>octet_length</code>, <code>bit_length</code></td></tr>
-    <tr><td>Compose</td><td><code>concat</code>, <code>concat_ws</code>, <code>repeat</code>, <code>space</code>, <code>lpad</code>, <code>rpad</code></td></tr>
+    <tr><td>Compose</td><td><code>concat</code>, <code>concat_ws</code>, <code>repeat</code>, <code>space</code>, <code>lpad</code>, <code>rpad</code>, <code>elt</code>, <code>insert</code>, <code>make_set</code>, <code>quote</code>, <code>append_trailing_char_if_absent</code></td></tr>
     <tr><td>Slice</td><td><code>substring</code>, <code>left</code>, <code>right</code>, <code>split_part</code>, <code>substring_index</code></td></tr>
-    <tr><td>Search</td><td><code>instr</code>, <code>locate</code>, <code>position</code>, <code>strpos</code>, <code>field</code>, <code>find_in_set</code>, <code>starts_with</code>, <code>ends_with</code></td></tr>
-    <tr><td>Transform</td><td><code>replace</code>, <code>translate</code>, <code>reverse</code>, <code>strcmp</code></td></tr>
-    <tr><td>Regular expressions</td><td><code>regexp_like</code>, <code>regexp_replace</code>, <code>regexp_substr</code></td></tr>
-    <tr><td>Characters and encodings</td><td><code>ascii</code>, <code>ord</code>, <code>char</code>, <code>chr</code>, <code>hex</code>, <code>unhex</code>, <code>bin</code>, <code>to_base64</code>, <code>from_base64</code>, <code>conv</code></td></tr>
-    <tr><td>Hashes</td><td><code>crc32</code>, <code>md5</code>, <code>md5sum</code>, <code>sha1</code>, <code>sha2</code>, <code>sha256</code>, <code>murmur_hash3_32</code>, <code>xx_hash3_64</code>, <code>xx_hash3_128</code></td></tr>
+    <tr><td>Search</td><td><code>instr</code>, <code>locate</code>, <code>position</code>, <code>strpos</code>, <code>field</code>, <code>find_in_set</code>, <code>starts_with</code>, <code>ends_with</code>, <code>ngram_search</code>, <code>ngram_search_case_insensitive</code></td></tr>
+    <tr><td>Transform</td><td><code>replace</code>, <code>translate</code>, <code>reverse</code>, <code>strcmp</code>, <code>soundex</code>, <code>null_or_empty</code></td></tr>
+    <tr><td>Regular expressions</td><td><code>regexp_like</code>, <code>regexp_replace</code>, <code>regexp_substr</code>, <code>regexp_extract</code>, <code>regexp_extract_all</code>, <code>regexp_count</code>, <code>regexp_instr</code></td></tr>
+    <tr><td>URLs</td><td><code>url_encode</code>, <code>url_decode</code>, <code>url_extract_host</code>, <code>url_extract_parameter</code></td></tr>
+    <tr><td>Characters and encodings</td><td><code>ascii</code>, <code>ord</code>, <code>char</code>, <code>chr</code>, <code>hex</code>, <code>unhex</code>, <code>bin</code>, <code>to_base64</code>, <code>from_base64</code>, <code>to_binary</code>, <code>from_binary</code>, <code>conv</code></td></tr>
+    <tr><td>Display</td><td><code>bar</code>, <code>format_bytes</code></td></tr>
+    <tr><td>Hashes</td><td><code>crc32</code>, <code>md5</code>, <code>md5sum</code>, <code>sha1</code>, <code>sha2</code>, <code>sha256</code>, <code>murmur_hash3_32</code>, <code>xx_hash3_64</code>, <code>xx_hash3_128</code>; encryption with <code>aes_encrypt</code> and <code>aes_decrypt</code></td></tr>
   </tbody></table></div>
   <CodeBlock language="sql" code={`SELECT
   upper(trim(name)) AS normalized,
@@ -47,17 +53,19 @@ FROM imports;`} />
     <tr><td>Powers and logs</td><td><code>pow</code>, <code>power</code>, <code>square</code>, <code>sqrt</code>, <code>cbrt</code>, <code>exp</code>, <code>ln</code>, <code>log</code>, <code>log10</code>, <code>log2</code></td></tr>
     <tr><td>Trigonometry</td><td><code>sin</code>, <code>cos</code>, <code>tan</code>, <code>asin</code>, <code>acos</code>, <code>atan</code>, <code>atan2</code>, <code>cot</code>, <code>degrees</code>, <code>radians</code>, <code>pi</code></td></tr>
     <tr><td>Comparison</td><td><code>greatest</code>, <code>least</code></td></tr>
-    <tr><td>Bits and random</td><td><code>bit_count</code>, <code>rand</code>, <code>random</code></td></tr>
+    <tr><td>Bits</td><td><code>bitand</code>, <code>bitor</code>, <code>bitxor</code>, <code>bitnot</code>, <code>bit_shift_left</code>, <code>bit_shift_right</code>, <code>bit_count</code></td></tr>
+    <tr><td>Buckets and random</td><td><code>equiwidth_bucket</code>, <code>interval(n, n1, n2, ...)</code> (how many of the ascending bounds <code>n</code> reaches), <code>rand</code>, <code>random</code></td></tr>
     <tr><td>Operator kernels</td><td><code>add</code>, <code>sub</code>, <code>mul</code>, <code>div</code> back SQL arithmetic and are callable by name.</td></tr>
   </tbody></table></div>
 
   <h3 id="date-time">Date and time</h3>
   <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
-    <tr><td>Parts</td><td><code>year</code>, <code>quarter</code>, <code>month</code>, <code>monthname</code>, <code>day</code>, <code>dayofmonth</code>, <code>dayofweek</code>, <code>dayofyear</code>, <code>dayname</code>, <code>hour</code>, <code>minute</code>, <code>second</code></td></tr>
-    <tr><td>Construct and boundaries</td><td><code>makedate</code>, <code>last_day</code>, <code>date_trunc</code></td></tr>
-    <tr><td>Differences</td><td><code>datediff</code>, <code>date_diff</code>, <code>timestampdiff</code>, and <code>a - b</code> in one unit: <code>years_diff</code>, <code>months_diff</code>, <code>weeks_diff</code>, <code>days_diff</code>, <code>hours_diff</code>, <code>minutes_diff</code>, <code>seconds_diff</code>, <code>milliseconds_diff</code></td></tr>
-    <tr><td>Add and subtract</td><td><code>date_add</code>, <code>date_sub</code>, <code>date_add_months</code>, <code>date_add_years</code>, <code>timestampadd</code> (each returns a <code>DATETIME</code>; a <code>DATE</code> moves as its midnight), and a <code>DATETIME</code> moved <code>n</code> units: <code>years_add</code>, <code>quarters_add</code>, <code>months_add</code>, <code>weeks_add</code>, <code>days_add</code>, <code>hours_add</code>, <code>minutes_add</code>, <code>seconds_add</code>, <code>milliseconds_add</code>, <code>microseconds_add</code>, each with a <code>_sub</code> (<code>years_sub</code> …)</td></tr>
-    <tr><td>Format and epoch</td><td><code>date_format</code>, <code>unix_timestamp</code>, <code>from_unixtime</code></td></tr>
+    <tr><td>Parts</td><td><code>year</code>, <code>quarter</code>, <code>month</code>, <code>monthname</code>, <code>day</code>, <code>dayofmonth</code>, <code>dayofweek</code>, <code>dayofyear</code>, <code>dayname</code>, <code>dayofweek_iso</code>, <code>weekday</code>, <code>week</code>, <code>weekofyear</code>, <code>week_iso</code>, <code>yearweek</code>, <code>hour</code>, <code>minute</code>, <code>second</code>, <code>microsecond</code>, <code>date</code>, <code>time</code></td></tr>
+    <tr><td>Construct and boundaries</td><td><code>makedate</code>, <code>from_days</code>, <code>last_day</code>, <code>next_day</code>, <code>previous_day</code>, <code>date_trunc</code>, and the bucket a time falls in with <code>time_slice</code> and <code>date_slice</code></td></tr>
+    <tr><td>Differences</td><td><code>datediff</code>, <code>date_diff</code>, <code>timestampdiff</code>, <code>timediff</code>, <code>period_diff</code>, <code>to_days</code>, <code>to_seconds</code>, <code>time_to_sec</code>, and <code>a - b</code> in one unit: <code>years_diff</code>, <code>months_diff</code>, <code>weeks_diff</code>, <code>days_diff</code>, <code>hours_diff</code>, <code>minutes_diff</code>, <code>seconds_diff</code>, <code>milliseconds_diff</code></td></tr>
+    <tr><td>Add and subtract</td><td><code>date_add</code>, <code>date_sub</code>, <code>date_add_months</code>, <code>date_add_years</code>, <code>date_add_quarters</code>, <code>date_add_weeks</code>, <code>date_add_hours</code>, <code>date_add_minutes</code>, <code>date_add_seconds</code>, <code>date_add_millis</code>, <code>date_add_micros</code>, <code>timestampadd</code> (each returns a <code>DATETIME</code>; a <code>DATE</code> moves as its midnight), and a <code>DATETIME</code> moved <code>n</code> units: <code>years_add</code>, <code>quarters_add</code>, <code>months_add</code>, <code>weeks_add</code>, <code>days_add</code>, <code>hours_add</code>, <code>minutes_add</code>, <code>seconds_add</code>, <code>milliseconds_add</code>, <code>microseconds_add</code>, each with a <code>_sub</code> (<code>years_sub</code> …), plus <code>addtime</code>, <code>subtime</code>, and <code>period_add</code></td></tr>
+    <tr><td>Format and parse</td><td><code>date_format</code>, <code>get_format</code>, <code>to_iso8601</code>, <code>jodatime_format</code>, <code>str_to_date</code>, <code>str_to_time</code>, <code>str_to_jodatime</code>, <code>to_tera_date</code>, <code>to_tera_timestamp</code>, <code>to_datetime_ntz</code></td></tr>
+    <tr><td>Epoch</td><td><code>unix_timestamp</code>, <code>from_unixtime</code></td></tr>
     <tr><td>Time zones</td><td><code>convert_tz(dt, from_zone, to_zone)</code>, <code>from_unixtime(n, format, zone)</code></td></tr>
   </tbody></table></div>
   <Callout type="note" title="Time zones"><p>A zone is a fixed offset (<code>'+08:00'</code>, <code>'-0530'</code>, <code>'UTC+8'</code>, <code>'Z'</code>) or a tz database name such as <code>'America/New_York'</code>, which follows that zone's daylight-saving rules. Named zones are read from the TZif files under the <code>TZDIR</code> environment variable, or <code>/usr/share/zoneinfo</code> when it is unset. Windows has no zone files, so set <code>TZDIR</code> there to use named zones. A zone thinDB doesn't know makes <code>convert_tz</code> NULL, and <code>from_unixtime</code> renders it as UTC.</p></Callout>
@@ -102,28 +110,60 @@ FROM events;`} />
     <tr><td><code>json_length</code></td><td>Array/object length.</td></tr>
     <tr><td><code>json_contains</code></td><td>Document/candidate containment predicate.</td></tr>
     <tr><td><code>json_keys</code></td><td>Object keys as JSON.</td></tr>
-    <tr><td><code>to_json</code></td><td>Validated JSON value from text.</td></tr>
+    <tr><td><code>json_query</code></td><td>JSON at a path, as <code>json_extract</code> returns it.</td></tr>
+    <tr><td><code>json_exists</code></td><td>Whether a path selects a value.</td></tr>
+    <tr><td><code>json_remove</code></td><td>The document without the values at one or more paths.</td></tr>
+    <tr><td><code>json_quote</code></td><td>Text as a quoted JSON string.</td></tr>
+    <tr><td><code>get_json_string</code> (alias <code>get_json_object</code>), <code>get_json_int</code>, <code>get_json_double</code>, <code>get_json_bool</code></td><td>The value at a path as <code>VARCHAR</code>, <code>BIGINT</code>, <code>DOUBLE</code>, or <code>BOOLEAN</code>.</td></tr>
+    <tr><td><code>to_json</code>, <code>parse_json</code></td><td>Validated JSON value from text.</td></tr>
   </tbody></table></div>
 
+  <h3 id="network">Network addresses</h3>
+  <p><code>inet_aton</code> and <code>inet_ntoa</code> convert IPv4 text to and from an integer; <code>inet6_aton</code> and <code>inet6_ntoa</code> convert IPv4 or IPv6 text to and from binary. <code>is_ipv4</code>, <code>is_ipv6</code>, <code>is_ipv4_compat</code>, and <code>is_ipv4_mapped</code> test an address.</p>
+
+  <h3 id="nested">Arrays, maps, and lambdas</h3>
+  <div class="table-scroll"><table><thead><tr><th>Purpose</th><th>Functions</th></tr></thead><tbody>
+    <tr><td>Build arrays</td><td><code>[a, b, ...]</code>, <code>split</code>, <code>array_generate</code>, <code>array_repeat</code>, <code>array_append</code>, <code>array_concat</code>, <code>array_flatten</code></td></tr>
+    <tr><td>Read arrays</td><td><code>arr[i]</code>, <code>element_at</code>, <code>array_length</code>, <code>cardinality</code>, <code>array_slice</code>, <code>array_join</code>, <code>array_position</code>, <code>array_contains</code>, <code>array_contains_all</code>, <code>array_contains_seq</code>, <code>arrays_overlap</code></td></tr>
+    <tr><td>Reshape arrays</td><td><code>array_distinct</code>, <code>array_sort</code>, <code>array_sortby</code>, <code>array_reverse</code>, <code>array_remove</code>, <code>array_intersect</code>, <code>array_difference</code></td></tr>
+    <tr><td>Reduce arrays</td><td><code>array_min</code>, <code>array_max</code>, <code>array_sum</code>, <code>array_avg</code>, <code>cosine_similarity</code>, <code>cosine_similarity_norm</code>, <code>l2_distance</code></td></tr>
+    <tr><td>Lambdas</td><td><code>array_map</code>, <code>array_filter</code>, <code>any_match</code>, <code>all_match</code>, <code>array_sort</code> with a comparator, <code>array_sortby</code> with a key lambda</td></tr>
+    <tr><td>Maps</td><td><code>map&#123;k: v&#125;</code>, <code>map(k, v, ...)</code>, <code>map_from_arrays</code>, <code>str_to_map</code>, <code>m[key]</code>, <code>element_at</code>, <code>map_size</code>, <code>map_keys</code>, <code>map_values</code>, <code>map_concat</code>, <code>distinct_map_keys</code>, and the lambdas <code>map_filter</code>, <code>map_apply</code>, <code>transform_keys</code>, <code>transform_values</code></td></tr>
+    <tr><td>Structs</td><td><code>row(...)</code>, <code>struct(...)</code>, <code>named_struct('name', value, ...)</code>, <code>s.field</code>, <code>s[i]</code></td></tr>
+  </tbody></table></div>
+  <CodeBlock language="sql" code={`SELECT
+  array_map(x -> x * 2, [1, 2, 3]),                  -- [2,4,6]
+  array_filter([1, 2, 3], x -> x > 1),               -- [2,3]
+  array_sort([3, 1, 2], (x, y) -> y - x),            -- [3,2,1]
+  transform_values((k, v) -> v + 1, map{'a': 1}),    -- {"a":2}
+  map_filter((k, v) -> v > 1, map{'a': 1, 'b': 2});  -- {"b":2}`} />
+  <p>A lambda is <code>x -&gt; expr</code> or <code>(x, y) -&gt; expr</code> and may read columns of the row. A map lambda takes the key and value. The column types themselves are described in <a href={withBase('/reference/data-types/#nested')}>Data types</a>.</p>
+
+  <h3 id="bitmap">Bitmaps</h3>
+  <p><code>to_bitmap</code>, <code>bitmap_empty</code>, <code>bitmap_from_string</code>, <code>array_to_bitmap</code>, <code>bitmap_from_binary</code>, and <code>base64_to_bitmap</code> build a bitmap. <code>bitmap_count</code>, <code>bitmap_min</code>, <code>bitmap_max</code>, <code>bitmap_contains</code>, and <code>bitmap_has_any</code> read one. <code>bitmap_or</code>, <code>bitmap_and</code>, <code>bitmap_xor</code>, <code>bitmap_andnot</code>, <code>bitmap_remove</code>, <code>bitmap_subset_in_range</code>, <code>bitmap_subset_limit</code>, and <code>sub_bitmap</code> combine and slice them. <code>bitmap_to_string</code>, <code>bitmap_to_array</code>, <code>bitmap_to_binary</code>, <code>bitmap_to_base64</code>, and <code>bitmap_hash</code> convert them back.</p>
+
   <h3 id="conditional-conversion">Conditional and conversion</h3>
-  <p><code>coalesce</code>, <code>if</code>, <code>ifnull</code>, and <code>nullif</code> implement null-aware conditional expressions. Conversions include <code>to_tinyint</code>, <code>to_smallint</code>, <code>to_int</code>, <code>to_bigint</code>, <code>to_largeint</code>, <code>to_double</code>, <code>to_boolean</code>, <code>to_string</code>, <code>to_date</code>, and <code>to_datetime</code>. Use <code>CAST(value AS DECIMAL(p,s))</code> for a precision/scale-specific decimal conversion.</p>
+  <p><code>coalesce</code>, <code>if</code>, <code>ifnull</code>, and <code>nullif</code> implement null-aware conditional expressions; <code>assert_true</code> raises an error on a false value, <code>uuid</code> returns a random UUID string, and <code>sleep(seconds)</code> pauses. Conversions include <code>to_tinyint</code>, <code>to_smallint</code>, <code>to_int</code>, <code>to_bigint</code>, <code>to_largeint</code>, <code>to_float</code>, <code>to_double</code>, <code>to_boolean</code>, <code>to_string</code>, <code>to_date</code>, and <code>to_datetime</code>. Use <code>CAST(value AS DECIMAL(p,s))</code> for a precision/scale-specific decimal conversion.</p>
 
   <h2 id="aggregate-functions">Aggregate functions</h2>
   <div class="table-scroll"><table><thead><tr><th>Family</th><th>Functions</th></tr></thead><tbody>
     <tr><td>Core</td><td><code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code>, <code>count_if</code> (alias <code>countif</code>)</td></tr>
-    <tr><td>Distinct</td><td><code>count(distinct x)</code>, <code>sum(distinct x)</code>, <code>avg(distinct x)</code></td></tr>
-    <tr><td>Boolean and bitwise</td><td><code>bool_and</code>, <code>bool_or</code>, <code>bit_and</code>, <code>bit_or</code>, <code>bit_xor</code></td></tr>
-    <tr><td>Value selection</td><td><code>any_value</code>, <code>first</code>, <code>last</code>, <code>max_by</code> (<code>max_by(value, key)</code>)</td></tr>
-    <tr><td>Statistics</td><td><code>stddev_pop</code>, <code>stddev_samp</code> (aliases <code>std</code>, <code>stddev</code>), <code>var_pop</code>, <code>var_samp</code> (aliases <code>variance</code>, <code>variance_pop</code>, <code>variance_samp</code>)</td></tr>
-    <tr><td>Exact cardinality</td><td><code>count_distinct</code>, <code>approx_count_distinct</code>. Both currently use the exact distinct implementation.</td></tr>
-    <tr><td>Percentiles</td><td>Exact <code>percentile</code>, <code>percentile_cont</code>, and <code>median</code>.</td></tr>
-    <tr><td>Strings</td><td><code>group_concat</code> and alias <code>string_agg</code> with a separator payload.</td></tr>
+    <tr><td>Distinct</td><td><code>count(distinct x)</code>, <code>sum(distinct x)</code>, <code>avg(distinct x)</code>, <code>multi_distinct_count</code>, <code>multi_distinct_sum</code></td></tr>
+    <tr><td>Boolean and bitwise</td><td><code>bool_and</code>, <code>bool_or</code> (aliases <code>booland_agg</code>, <code>boolor_agg</code>), <code>bit_and</code>, <code>bit_or</code>, <code>bit_xor</code></td></tr>
+    <tr><td>Value selection</td><td><code>any_value</code>, <code>first</code>, <code>last</code>, <code>max_by(value, key)</code>, <code>min_by(value, key)</code></td></tr>
+    <tr><td>Statistics</td><td><code>stddev_pop</code>, <code>stddev_samp</code> (aliases <code>std</code>, <code>stddev</code>), <code>var_pop</code>, <code>var_samp</code> (aliases <code>variance</code>, <code>variance_pop</code>, <code>variance_samp</code>), <code>covar_pop</code>, <code>covar_samp</code>, <code>corr</code>, and <code>mann_whitney_u_test</code>, which returns JSON</td></tr>
+    <tr><td>Cardinality</td><td><code>count_distinct</code>, <code>approx_count_distinct</code>, <code>ndv</code>, <code>approx_count_distinct_hll_sketch</code>, <code>bitmap_union_int</code>. All of them count exactly.</td></tr>
+    <tr><td>Percentiles</td><td><code>percentile(x, p)</code>, <code>percentile_cont(x, p)</code>, and <code>median</code> interpolate; <code>percentile_disc</code> returns an input value; <code>percentile_approx</code> and <code>percentile_approx_weighted</code> return StarRocks' answer, computed exactly. The <code>WITHIN GROUP (ORDER BY ...)</code> form is not supported.</td></tr>
+    <tr><td>Top values</td><td><code>approx_top_k(x, k)</code> returns the <code>k</code> most frequent values as <code>ARRAY&lt;STRUCT&lt;item, count&gt;&gt;</code>, counted exactly.</td></tr>
+    <tr><td>Collections</td><td><code>group_concat</code> (alias <code>string_agg</code>), <code>array_agg</code>, <code>array_agg_distinct</code>, <code>array_unique_agg</code>, <code>map_agg(key, value)</code>. <code>group_concat</code> and <code>array_agg</code> take an <code>ORDER BY</code> inside the call.</td></tr>
+    <tr><td>Bitmaps</td><td><code>bitmap_agg</code>, <code>bitmap_union</code>, <code>bitmap_union_count</code>, <code>bitmap_intersect</code></td></tr>
   </tbody></table></div>
-  <Callout type="warning" title="Memory-sensitive aggregates"><p>Exact distinct aggregates, exact percentile, and <code>group_concat</code> keep unbounded per-group state. Size the query and process memory budgets for their cardinality, or use a bounded query shape.</p></Callout>
+  <p>Any aggregate takes <code>FILTER (WHERE condition)</code>, and any aggregate can run as a <a href={withBase('/sql/windows/')}>window function</a>.</p>
+  <Callout type="warning" title="Memory-sensitive aggregates"><p>Exact distinct aggregates, exact percentiles, <code>approx_top_k</code>, and the collection aggregates keep unbounded per-group state. Size the query and process memory budgets for their cardinality, or use a bounded query shape.</p></Callout>
 
   <h2 id="special-forms">Special SQL forms</h2>
   <div class="table-scroll"><table><thead><tr><th>Form</th><th>Behavior</th></tr></thead><tbody>
-    <tr><td><code>EXTRACT(field FROM value)</code></td><td>Lowers to <code>year</code>, <code>month</code>, <code>day</code>, <code>hour</code>, <code>minute</code>, or <code>second</code>. Other fields are rejected.</td></tr>
+    <tr><td><code>EXTRACT(field FROM value)</code></td><td>Fields are <code>YEAR</code>, <code>QUARTER</code>, <code>MONTH</code>, <code>WEEK</code>, <code>DAY</code>, <code>DAYOFYEAR</code>, <code>HOUR</code>, <code>MINUTE</code>, <code>SECOND</code>, <code>MICROSECOND</code>, and MySQL's compound units such as <code>YEAR_MONTH</code> and <code>DAY_SECOND</code>. Other fields are rejected.</td></tr>
     <tr><td><code>CAST(value AS type)</code></td><td>Lowers to the appropriate typed conversion, including precision/scale-aware decimal casts. Text cast to <code>DATE</code> or <code>DATETIME</code> is NULL when it isn't a date. A number cast to an integer type is NULL outside that type's range, as in StarRocks: a LARGEINT past 2^63 - 1 cast to <code>BIGINT</code> is NULL, and so is a number argument outside the range of a function's integer parameter.</td></tr>
     <tr><td><code>json -&gt; path</code></td><td>MySQL-style JSON extraction; lowers to <code>json_extract</code>.</td></tr>
     <tr><td><code>json -&gt;&gt; path</code></td><td>JSON scalar extraction; lowers to <code>json_value</code>.</td></tr>

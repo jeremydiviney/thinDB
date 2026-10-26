@@ -5,36 +5,53 @@ import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
 const headings = [
   { depth: 2, slug: 'write-path', text: 'Write path' },
+  { depth: 2, slug: 'durability', text: 'Durability modes' },
   { depth: 2, slug: 'flush', text: 'Flush' },
   { depth: 2, slug: 'wal', text: 'Write-ahead log' },
+  { depth: 2, slug: 'crash-recovery', text: 'Crash recovery' },
   { depth: 2, slug: 'segments', text: 'Segments and pruning' },
   { depth: 2, slug: 'compaction', text: 'Compaction' },
   { depth: 2, slug: 'read-consistency', text: 'Read consistency' },
 ]
 ---
-<DocsLayout title="Storage and durability" description="Understand thinDB memtables, WAL, segments, flush, compaction, and snapshot reads." headings={headings}>
-  <PageHeader eyebrow="Operate" title="Storage and durability" description="Writes enter a mutable in-memory table and become immutable, sorted columnar segments. WAL, atomic manifests, tombstones, and compaction provide the local durability lifecycle." />
+<DocsLayout title="Storage and durability" description="Understand thinDB memtables, WAL, segments, flush, compaction, crash recovery, and snapshot reads." headings={headings}>
+  <PageHeader eyebrow="Operate" title="Storage and durability" description="Writes enter a mutable in-memory table and become immutable, sorted columnar segments. The WAL, atomic manifests, tombstones, and compaction provide the local durability lifecycle." />
   <h2 id="write-path">Write path</h2>
-  <ol class="steps"><li><strong>Validate and append.</strong> Values are checked against the strict table schema and accumulated in a memtable.</li><li><strong>Log when enabled.</strong> Insert/delete records enter the per-table WAL before the operation acknowledges.</li><li><strong>Flush.</strong> The memtable is sorted by the order key and encoded into an immutable segment.</li><li><strong>Publish.</strong> A replacement manifest is written and atomically renamed into place.</li><li><strong>Compact.</strong> Background merges combine segments and apply tombstones.</li></ol>
+  <ol class="steps"><li><strong>Validate and append.</strong> Values are checked against the strict table schema and accumulated in a memtable.</li><li><strong>Log.</strong> Each statement's changes enter the per-table WAL as one record before the statement acknowledges.</li><li><strong>Flush.</strong> The memtable is sorted by the order key and encoded into an immutable segment.</li><li><strong>Publish.</strong> A replacement manifest is written and atomically renamed into place.</li><li><strong>Compact.</strong> Background merges combine segments and apply tombstones.</li></ol>
+
+  <h2 id="durability">Durability modes</h2>
+  <div class="table-scroll"><table><thead><tr><th>Mode</th><th>Default for</th><th>An acknowledged write survives</th></tr></thead><tbody>
+    <tr><td><code>sync_mode = .per_flush</code></td><td><code>thindb-server</code></td><td>A process crash, an OS crash, or power loss. Each statement waits for its WAL fsync (group commit), and segments, tombstone files, the manifest, and the directories that name them are synced before anything refers to them.</td></tr>
+    <tr><td><code>sync_mode = .none</code></td><td>The embedded library; the server with <code>--no-fsync</code></td><td>A process crash. Writes stay in the OS page cache, so an OS crash can lose acknowledged rows and newly written segments. Use it only for data that can be reloaded.</td></tr>
+  </tbody></table></div>
+  <p>The WAL is on by default in both the server and the embedded library. <code>--no-wal</code> (or <code>wal_enabled = false</code>) turns it off, which loses rows not yet flushed whenever the process stops. Durable mode costs a few milliseconds per flush on NVMe; reads are unaffected.</p>
 
   <h2 id="flush">Flush</h2>
   <p>A flush fires when any configured row, byte, or age threshold is met. Defaults are 1,000,000 rows, 64 MiB, or roughly 30 seconds from the first write. The server runs the background sweep; embedded applications must run <code>Database.runBackgroundFlusher</code>, invoke <code>backgroundFlushSweep</code>, or call <code>Table.flush</code> explicitly.</p>
-  <Callout type="warning" title="Embedded shutdown"><p>Without WAL or an explicit flush, rows remaining only in a memtable are lost when the process exits. Tests and batch jobs that require persisted data should end with <code>t.flush()</code>.</p></Callout>
+  <Callout type="warning" title="Embedded shutdown"><p>With the WAL disabled and no explicit flush, rows remaining only in a memtable are lost when the process exits. Tests and batch jobs that require persisted data should end with <code>t.flush()</code>.</p></Callout>
 
   <h2 id="wal">Write-ahead log</h2>
-  <p>When enabled, insert and delete batches append to a per-table WAL and fsync before returning. Reopen replays entries that were not captured by a completed segment flush. Group commit is used by the server write path to amortize concurrent durability work.</p>
-  <p>Batch rows in one insert when possible: the WAL durability cost is per insert/delete call, not per row. Segment durability and manifest syncing are controlled separately by the embedded <code>sync_mode</code>.</p>
+  <p>Inserts, deletes, and updates append to a per-table WAL. An <code>UPDATE</code> or <code>DELETE</code> logs one record for the whole statement, so replay applies all of it or none of it. Reopen replays entries that were not captured by a completed segment flush. The server write path group-commits concurrent statements to amortize fsyncs.</p>
+  <p>Batch rows in one insert when possible: the WAL durability cost is per statement, not per row.</p>
+
+  <h2 id="crash-recovery">Crash recovery</h2>
+  <ul>
+    <li><strong>Torn WAL tail.</strong> Replay stops at the first record whose length or checksum fails and keeps everything before it. Under <code>.per_flush</code> none of the bytes past the last fsync were acknowledged. The server log reports how many bytes it ignored.</li>
+    <li><strong>Damaged segments.</strong> Open checks each segment the manifest lists against its recorded size. A missing or short segment, which only an OS crash under <code>.none</code> can leave, fails the open with <code>SegmentDamaged</code> and names the segment in the server log. The table stays unreadable rather than answering without those rows; <code>DROP TABLE</code> still works so it can be reloaded from its source.</li>
+    <li><strong>Crash-safe DDL.</strong> <code>DROP</code> renames the directory aside before deleting it, <code>CREATE</code> and <code>RENAME TABLE</code> sync the parent directory, and function and view definitions are written whole and renamed into place. No crash leaves a DDL statement half done.</li>
+    <li><strong>Failed fsync.</strong> An fsync failure is sticky: the statement fails with <code>DurabilityUncertain</code> and the catalog refuses further work with <code>RecoveryRequired</code> until a reopen replays what the files really hold.</li>
+  </ul>
 
   <h2 id="segments">Segments and pruning</h2>
   <p>Each segment contains rows sorted by the table order key and divided into row groups (65,536 rows by default). Column blocks carry encoding/compression metadata, validity bits where nullable, and statistics such as min, max, sum, and null count.</p>
-  <p>Manifest and row-group statistics support range pruning. Encodings include fixed-width, dictionary, frame-of-reference, run-length, and string compression paths selected by column shape. Decoded blocks enter an LRU buffer pool and remain pinned while in use.</p>
+  <p>Manifest and row-group statistics support range pruning, and per-row-group Bloom filters on key columns prune equality lookups. Encodings include fixed-width, dictionary, frame-of-reference, run-length, and string compression paths selected by column shape; blocks are LZ4-compressed by default. Decoded blocks enter an LRU buffer pool and remain pinned while in use.</p>
 
   <h2 id="compaction">Compaction</h2>
   <p>Compaction performs a sorted merge, resolves last-writer-wins rows for unique keys, removes tombstoned rows, writes replacement segments, and atomically publishes a new manifest. Background selection considers segment count and tombstone pressure.</p>
   <p>Old segments remain safe for readers already holding a snapshot. Physical deletion waits until the relevant ownership and snapshot rules permit it.</p>
 
   <h2 id="read-consistency">Read consistency</h2>
-  <p>A query captures a manifest and memtable snapshot at start. It sees a stable combination of published segments and eligible in-memory rows even while writers flush or compact. Reads run concurrently; write orchestration serializes catalog/table mutations.</p>
-  <Callout type="note" title="Isolation boundary"><p>This snapshot behavior protects a single query. It is not a general multi-statement transaction or cross-table atomic snapshot contract.</p></Callout>
+  <p>Each statement captures one snapshot of every table it reads, including the deletes published at that moment, and every scan of a table within the statement reads that snapshot. It sees a stable combination of published segments and eligible in-memory rows even while writers flush or compact. Each <code>UPDATE</code> or <code>DELETE</code> commits once, so readers never see part of one. Reads run concurrently; write orchestration serializes catalog/table mutations.</p>
+  <Callout type="note" title="Isolation boundary"><p>This snapshot behavior protects a single statement. It is not a multi-statement transaction; the separate XA path covers external distributed commits.</p></Callout>
   <PageLinks previous={{ label: 'Server configuration', href: '/operations/server/' }} next={{ label: 'Data types', href: '/reference/data-types/' }} />
 </DocsLayout>

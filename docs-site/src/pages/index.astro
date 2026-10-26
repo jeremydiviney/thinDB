@@ -24,7 +24,7 @@ const headings = [
   </div>
 
   <h2 id="what-thindb-is">What thinDB is</h2>
-  <p>thinDB stores immutable, order-key-sorted columnar segments and evaluates analytical queries through vectorized operators. An optional write-ahead log can protect accepted writes, memtables absorb recent rows, and background flush and compaction turn those rows into prunable segments.</p>
+  <p>thinDB stores immutable, order-key-sorted columnar segments and evaluates analytical queries through vectorized operators. A write-ahead log, on by default, protects acknowledged writes (the server fsyncs each one), memtables absorb recent rows, and background flush and compaction turn those rows into prunable segments.</p>
   <p>The engine is deliberately local. There is no coordinator, distributed shuffle, replica protocol, or cost-based optimizer. Query structure stays visible and predictable while the engine selects bounded physical paths such as hash versus sort grouping and join algorithms.</p>
 
   <Callout type="note" title="Release status">

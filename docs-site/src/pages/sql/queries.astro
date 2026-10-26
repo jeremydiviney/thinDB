@@ -8,32 +8,37 @@ const headings = [
   { depth: 2, slug: 'select', text: 'SELECT pipeline' },
   { depth: 2, slug: 'predicates', text: 'Predicates' },
   { depth: 2, slug: 'grouping', text: 'Grouping and aggregates' },
+  { depth: 2, slug: 'grouping-sets', text: 'ROLLUP, CUBE, and GROUPING SETS' },
   { depth: 2, slug: 'ctes-and-subqueries', text: 'CTEs and subqueries' },
   { depth: 2, slug: 'sets-and-ordering', text: 'Sets and ordering' },
+  { depth: 2, slug: 'row-sources', text: 'VALUES, series, and UNNEST' },
   { depth: 2, slug: 'files', text: 'Query files' },
   { depth: 2, slug: 'explain', text: 'EXPLAIN' },
 ]
 ---
-<DocsLayout title="Query data" description="Query thinDB with filters, grouping, CTEs, subqueries, and file scans." headings={headings}>
+<DocsLayout title="Query data" description="Query thinDB with filters, grouping, grouping sets, CTEs, set operations, subqueries, and file scans." headings={headings}>
   <PageHeader eyebrow="SQL guide" title="Query data" description="thinDB supports the analytical SQL shapes needed to scan, transform, group, combine, and rank columnar data while keeping execution behavior explicit." />
   <h2 id="select">SELECT pipeline</h2>
   <CodeBlock language="sql" code={`SELECT
   customer_id,
   amount * exchange_rate AS converted_amount,
-  CASE WHEN amount >= 1000 THEN 'large' ELSE 'standard' END AS band
+  CASE WHEN amount >= 1000 THEN 'large' ELSE 'standard' END AS band,
+  CASE status WHEN 'paid' THEN 1 WHEN 'void' THEN -1 ELSE 0 END AS sign
 FROM invoices
 WHERE issued_on >= DATE '2026-01-01'
 ORDER BY converted_amount DESC
 LIMIT 100 OFFSET 20;`} />
-  <p>Projection expressions support column references, typed literals, arithmetic, casts, scalar functions, searched <code>CASE WHEN</code>, and scalar subqueries. Aliases can be referenced by downstream ordering where unambiguous.</p>
+  <p>Projection expressions support column references, typed literals, arithmetic, casts, scalar functions, searched and simple <code>CASE</code>, scalar subqueries, session variables, and nested-value access such as <code>arr[1]</code>, <code>m['key']</code>, and <code>s.field</code>. Aliases can be referenced by downstream ordering where unambiguous.</p>
 
   <h2 id="predicates">Predicates</h2>
-  <p>Use <code>=</code>, <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>BETWEEN</code>, <code>IN</code>, <code>LIKE</code>, <code>IS NULL</code>, <code>IS NOT NULL</code>, and boolean <code>AND</code>/<code>OR</code>/<code>NOT</code>. SQL three-valued null semantics apply.</p>
+  <p>Use <code>=</code>, <code>&lt;&gt;</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code>, the null-safe <code>&lt;=&gt;</code> and <code>IS [NOT] DISTINCT FROM</code>, <code>BETWEEN</code>, <code>IN</code>, <code>LIKE</code>, <code>REGEXP</code>/<code>RLIKE</code>, <code>IS NULL</code>, <code>IS NOT NULL</code>, and boolean <code>AND</code>/<code>OR</code>/<code>NOT</code>. Row values compare element-wise, so <code>(a, b) IN ((1, 2), (3, 4))</code> works. SQL three-valued null semantics apply.</p>
   <CodeBlock language="sql" code={`SELECT * FROM events
 WHERE occurred_at BETWEEN '2026-07-01 00:00:00' AND '2026-07-31 23:59:59'
   AND kind IN ('checkout', 'refund')
   AND source LIKE 'web%'
+  AND path REGEXP '^/api/v[0-9]+/'
   AND deleted_at IS NULL;`} />
+  <Callout type="note" title="NOT IN with NULLs"><p>A NULL inside a <code>NOT IN</code> list or subquery result is skipped rather than making every comparison unknown, so <code>x NOT IN (1, NULL)</code> is true for <code>x = 2</code>. This differs from standard three-valued logic.</p></Callout>
 
   <h2 id="grouping">Grouping and aggregates</h2>
   <CodeBlock language="sql" code={`SELECT
@@ -41,18 +46,29 @@ WHERE occurred_at BETWEEN '2026-07-01 00:00:00' AND '2026-07-31 23:59:59'
   COUNT(*) AS invoice_count,
   COUNT(DISTINCT currency) AS currencies,
   SUM(amount) AS total,
-  AVG(amount) AS average,
+  SUM(amount) FILTER (WHERE status = 'paid') AS paid_total,
   MAX_BY(invoice_id, amount) AS largest_invoice
 FROM invoices
 GROUP BY customer_id
 HAVING SUM(amount) > 10000
 ORDER BY total DESC
 LIMIT 50;`} />
-  <p>Grouping can route through hash, sort, radix, low-cardinality, or partitioned execution based on input shape and memory budget. This physical choice does not reorder the logical query.</p>
+  <p><code>agg(...) FILTER (WHERE condition)</code> aggregates only the rows where the condition is true. Grouping can route through hash, sort, radix, low-cardinality, or partitioned execution based on input shape and memory budget. This physical choice does not reorder the logical query.</p>
+
+  <h2 id="grouping-sets">ROLLUP, CUBE, and GROUPING SETS</h2>
+  <CodeBlock language="sql" code={`SELECT region, product, SUM(amount) AS total, GROUPING(region, product) AS level
+FROM sales
+GROUP BY ROLLUP(region, product)
+ORDER BY region, product;
+
+SELECT region, channel, COUNT(*)
+FROM sales
+GROUP BY GROUPING SETS ((region), (channel), ());`} />
+  <p><code>GROUP BY ... WITH ROLLUP</code>, <code>ROLLUP(...)</code>, <code>CUBE(...)</code> (up to 12 columns), <code>GROUPING SETS</code>, and mixes such as <code>GROUP BY a, ROLLUP(b)</code> are supported, up to 4,096 sets. <code>GROUPING()</code> and <code>GROUPING_ID()</code> work in the select list, <code>HAVING</code>, <code>ORDER BY</code>, and <code>CASE</code>. As in MySQL, empty input returns no rows, not a grand-total row.</p>
 
   <h2 id="ctes-and-subqueries">CTEs and subqueries</h2>
-  <CodeBlock language="sql" code={`WITH customer_totals AS (
-  SELECT customer_id, SUM(amount) AS total
+  <CodeBlock language="sql" code={`WITH customer_totals(customer_id, total) AS (
+  SELECT customer_id, SUM(amount)
   FROM invoices
   GROUP BY customer_id
 ), active AS (
@@ -61,12 +77,45 @@ LIMIT 50;`} />
 SELECT c.customer_id, c.total
 FROM customer_totals c
 WHERE c.customer_id IN (SELECT customer_id FROM active)
-  AND c.total > (SELECT AVG(total) FROM customer_totals);`} />
-  <p>Supported forms include named CTEs, scalar subqueries, <code>IN</code>/<code>NOT IN</code> subqueries, <code>EXISTS</code>/<code>NOT EXISTS</code>, derived tables, and correlated equality/range subqueries covered by the parser and integration suite.</p>
+  AND c.total > (SELECT AVG(total) FROM customer_totals);
+
+WITH RECURSIVE ancestry(id, parent_id, depth) AS (
+  SELECT id, parent_id, 0 FROM accounts WHERE id = 42
+  UNION ALL
+  SELECT a.id, a.parent_id, r.depth + 1
+  FROM accounts a JOIN ancestry r ON a.id = r.parent_id
+)
+SELECT * FROM ancestry;`} />
+  <p>Supported forms include named CTEs with optional column lists, <code>WITH RECURSIVE</code> (MySQL 8.4 rules), scalar subqueries, <code>IN</code>/<code>NOT IN</code> subqueries, <code>EXISTS</code>/<code>NOT EXISTS</code>, derived tables with column lists (<code>FROM (...) AS d(a, b)</code>), and correlated subqueries. A recursive CTE stops when a step adds no rows, or at a <code>LIMIT</code> on its body.</p>
 
   <h2 id="sets-and-ordering">Sets and ordering</h2>
-  <p><code>UNION ALL</code> combines compatible query outputs. <code>DISTINCT</code>, multi-column <code>ORDER BY</code>, ascending/descending direction, null ordering, <code>LIMIT</code>, <code>OFFSET</code>, and ANSI <code>FETCH</code> forms are available where parsed by the current grammar.</p>
-  <Callout type="warning" title="UNION limitation"><p><code>UNION</code> with implicit duplicate elimination is not implemented. Use <code>UNION ALL</code>, or explicitly deduplicate the combined result when an equivalent query shape is available.</p></Callout>
+  <CodeBlock language="sql" code={`SELECT customer_id FROM invoices
+UNION
+SELECT customer_id FROM refunds
+ORDER BY customer_id;
+
+SELECT customer_id FROM invoices
+EXCEPT
+SELECT customer_id FROM churned;
+
+SELECT * FROM invoices ORDER BY ALL DESC LIMIT 10;`} />
+  <p><code>UNION [ALL | DISTINCT]</code>, <code>INTERSECT [DISTINCT]</code>, and <code>EXCEPT [DISTINCT]</code> (also spelled <code>MINUS</code>) combine compatible query outputs. <code>INTERSECT</code> binds tighter than <code>UNION</code> and <code>EXCEPT</code>, and a trailing <code>ORDER BY</code>/<code>LIMIT</code> applies to the whole chain; parenthesize an arm to give it its own. <code>INTERSECT ALL</code> and <code>EXCEPT ALL</code> are rejected.</p>
+  <p><code>DISTINCT</code>, multi-column <code>ORDER BY</code>, ordinals, <code>ORDER BY ALL</code> (every select item, left to right), <code>NULLS FIRST</code>/<code>NULLS LAST</code>, <code>LIMIT</code>, <code>OFFSET</code>, and ANSI <code>FETCH FIRST n ROWS ONLY</code> are available.</p>
+
+  <h2 id="row-sources">VALUES, series, and UNNEST</h2>
+  <CodeBlock language="sql" code={`SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v(n, label);
+
+SELECT d.n, DATE '2026-01-01' + INTERVAL d.n MONTH AS month_start
+FROM generate_series(0, 11) AS d(n);
+
+SELECT o.order_id, item.sku
+FROM orders o, unnest(o.skus) AS item(sku);`} />
+  <ul>
+    <li><code>VALUES</code> rows and <code>TABLE t</code> stand anywhere a query can: at the top level, in set-operation arms, derived tables, CTE bodies, and subqueries.</li>
+    <li><code>generate_series(start, stop[, step])</code> returns one <code>BIGINT</code> column with inclusive bounds. Write it bare or as <code>TABLE(generate_series(...))</code>; arguments may also be named (<code>start =&gt;</code>, <code>end =&gt;</code>, <code>step =&gt;</code>).</li>
+    <li><code>unnest(a1[, a2 ...])</code> returns a row per array position, zipping several arrays; NULL and empty arrays produce no rows.</li>
+    <li>Both read the <code>FROM</code> items before them (lateral), so they can expand a column of each row.</li>
+  </ul>
 
   <h2 id="files">Query files</h2>
   <p>With <code>--file-root PATH</code>, SQL may scan approved CSV, JSON, and Parquet files under that root through <code>read_csv</code>, <code>read_json</code>, <code>read_parquet</code>, or recognized file sources. Paths outside the configured root are rejected.</p>

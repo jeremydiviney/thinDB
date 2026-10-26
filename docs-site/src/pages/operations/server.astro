@@ -4,12 +4,16 @@ import PageHeader from '../../components/PageHeader.astro'
 import CodeBlock from '../../components/CodeBlock.astro'
 import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
+import { withBase } from '../../lib/base'
 const headings = [
   { depth: 2, slug: 'baseline', text: 'Production baseline' },
   { depth: 2, slug: 'config-file', text: 'Configuration file' },
   { depth: 2, slug: 'listeners-and-access', text: 'Listeners and access' },
+  { depth: 2, slug: 'durability', text: 'Durability' },
   { depth: 2, slug: 'memory', text: 'Memory budgets' },
   { depth: 2, slug: 'parallelism-and-compaction', text: 'Parallelism and compaction' },
+  { depth: 2, slug: 'session-settings', text: 'Session settings' },
+  { depth: 2, slug: 'running-queries', text: 'Running queries' },
   { depth: 2, slug: 'diagnostics', text: 'Diagnostics' },
 ]
 ---
@@ -45,12 +49,13 @@ cache-size = 12G
 memory-budget = 8G
 query-memory-budget = 4294967296 # raw bytes only (no suffix)
 max-dop = 16
-no-wal = false`} />
+no-wal = false
+no-fsync = false`} />
   <CodeBlock language="bash" code={`thindb-server --data-dir /var/lib/thindb --config /etc/thindb/thindb.conf`} />
   <ul>
     <li><strong>Precedence:</strong> a command-line flag overrides the same setting from the file, which overrides the built-in default (<code>CLI &gt; file &gt; default</code>).</li>
     <li><strong>Comments</strong> begin a line with <code>#</code>; inline comments are not supported, so a value may itself contain <code>#</code>. Wrap a value in quotes to preserve leading or trailing spaces.</li>
-    <li><strong>Boolean toggles</strong> (<code>no-wal</code>, <code>no-compaction</code>) take <code>true</code>/<code>false</code> in the file.</li>
+    <li><strong>Boolean toggles</strong> (<code>no-wal</code>, <code>no-fsync</code>, <code>no-compaction</code>) take <code>true</code>/<code>false</code> in the file.</li>
   </ul>
 
   <h2 id="listeners-and-access">Listeners and access</h2>
@@ -65,25 +70,41 @@ no-wal = false`} />
     <tr><td><code>--max-connections N</code></td><td><code>256</code></td><td>Process-wide cap across all wires.</td></tr>
     <tr><td><code>--idle-timeout-secs N</code></td><td><code>0</code></td><td>Close connections after read silence; zero disables.</td></tr>
     <tr><td><code>--file-root PATH</code></td><td>disabled</td><td>Allow SQL file scans only beneath this root.</td></tr>
-    <tr><td><code>--xa-timeout-secs N</code></td><td><code>86400</code></td><td>Rollback stale prepared XA branches; zero disables.</td></tr>
+    <tr><td><code>--xa-timeout-secs N</code></td><td><code>0</code></td><td>Roll back prepared XA branches older than N seconds; zero (the default) keeps them until the coordinator resolves them. Set it above the Flink checkpoint interval plus the longest downtime you tolerate.</td></tr>
   </tbody></table></div>
   <Callout type="warning" title="Secret handling"><p>Passing a password as a <em>flag</em> places it in process arguments, which local process-inspection tools can read. To keep a password out of <code>ps</code>, set <code>mysql-password</code> / <code>pg-password</code> in a <a href="#config-file">config file</a> (mode <code>600</code>) instead — file values are read into memory and never become command-line arguments.</p></Callout>
 
+  <h2 id="durability">Durability</h2>
+  <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead><tbody>
+    <tr><td><code>--no-fsync</code></td><td>fsync on</td><td>Stop fsyncing writes. By default every acknowledged write, segment, and manifest is fsynced, so an acked write survives power loss. Without it an OS crash can lose acked rows and leave tables unreadable.</td></tr>
+    <tr><td><code>--no-wal</code></td><td>WAL on</td><td>Disable the write-ahead log. Rows acked but not yet flushed are then lost on any crash or kill.</td></tr>
+  </tbody></table></div>
+  <p>Both are for disposable data directories whose data can be reimported, such as benchmarks. The server log states at startup whether fsync is on. See <a href={withBase('/operations/storage/#durability')}>Storage and durability</a>.</p>
+
   <h2 id="memory">Memory budgets</h2>
   <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Automatic behavior</th><th>Controls</th></tr></thead><tbody>
-    <tr><td><code>--query-memory-budget B</code></td><td>Approximately 25% of physical RAM, floor 256 MiB.</td><td>One query's blocking operators.</td></tr>
-    <tr><td><code>--memory-budget B</code></td><td>Approximately 50% of physical RAM, floor 256 MiB.</td><td>Shared reservations across concurrent queries.</td></tr>
-    <tr><td><code>--cache-size B</code></td><td>Current engine auto-sizing uses approximately 35% of RAM, floor 256 MiB.</td><td>One global decompressed block buffer pool shared by every table.</td></tr>
+    <tr><td><code>--query-memory-budget B</code></td><td>Approximately 25% of usable RAM, floor 256 MiB.</td><td>One query's blocking operators.</td></tr>
+    <tr><td><code>--memory-budget B</code></td><td>Approximately 50% of usable RAM, floor 256 MiB.</td><td>Shared reservations across concurrent queries.</td></tr>
+    <tr><td><code>--cache-size B</code></td><td>Approximately 35% of usable RAM, floor 256 MiB.</td><td>One global decompressed block buffer pool shared by every table.</td></tr>
   </tbody></table></div>
-  <p>Sorts, hash group-by, hash-join build sides, sort-merge buffers, and materialization reserve query memory. The decompressed block cache is a separate bucket. A tracked budget of <code>0</code> disables that tracker.</p>
+  <p>Sorts, hash group-by, hash-join build sides, sort-merge buffers, and materialization reserve query memory. The decompressed block cache is a separate bucket. A tracked budget of <code>0</code> disables that tracker. Usable RAM is physical memory capped by the process's cgroup limit, so a container limit or a systemd <code>MemoryMax</code> sizes the automatic budgets.</p>
   <Callout type="warning" title="No spill"><p>Blocking operators do not spill to disk. A query that cannot fit its estimated or actual budget fails with <code>MemoryBudgetExceeded</code> instead of silently degrading.</p></Callout>
 
   <h2 id="parallelism-and-compaction">Parallelism and compaction</h2>
   <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
-    <tr><td><code>--max-dop N</code></td><td>Maximum scan/filter workers per query, further limited by a shared worker-slot budget.</td></tr>
-    <tr><td><code>--compact-threads N</code></td><td>Threads used for block encode/compress during compaction; zero selects about 25% of physical cores.</td></tr>
+    <tr><td><code>--max-dop N</code></td><td>Maximum workers per query. The default, <code>1</code>, runs every query serially; raise it to use more cores. A shared worker-slot budget of about one less than the core count further limits each query.</td></tr>
+    <tr><td><code>--compact-threads N</code></td><td>Threads used for block encode/compress during compaction. The default, <code>0</code>, selects about 25% of physical cores.</td></tr>
     <tr><td><code>--no-compaction</code></td><td>Disables the background compactor. Use only as an operational escape hatch; segment count will grow.</td></tr>
   </tbody></table></div>
+
+  <h2 id="session-settings">Session settings</h2>
+  <CodeBlock language="sql" code={`SET thindb_max_dop = 4;
+SELECT /*+ SET_VAR(thindb_max_dop = 1) */ COUNT(*) FROM events;
+SET group_concat_max_len = 4096;`} />
+  <ul>
+    <li><code>SET thindb_max_dop = N</code> caps the connection's later statements, and <code>/*+ SET_VAR(thindb_max_dop = N) */</code> caps one statement. A client can lower parallelism below <code>--max-dop</code> but never raise it; <code>0</code>, <code>NULL</code>, and <code>DEFAULT</code> mean the server's value.</li>
+    <li><code>SET group_concat_max_len = n</code> cuts each <code>GROUP_CONCAT</code> result to <code>n</code> bytes, as MySQL does. By default results are not cut.</li>
+  </ul>
 
   <h2 id="running-queries">Running queries</h2>
   <p><code>SHOW PROCESSLIST</code> on the MySQL wire lists every connection on both wires. Each row shows the id, user, client address, schema, command, seconds in its current state, and the running statement. <code>SHOW PROCESSLIST</code> shows the statement's first 100 bytes; <code>SHOW FULL PROCESSLIST</code> shows up to 1 KiB of it.</p>
