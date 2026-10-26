@@ -98,7 +98,7 @@ USING 'C:/functions/running_total.dll';
 -- Linux
 CREATE FUNCTION running_total LANGUAGE zig
 USING '/opt/thindb/functions/running_total.so';`} />
-  <p>The direct tier loads the library without invoking the compiler. It must export <code>thindb_tvf_abi_version</code>, <code>thindb_tvf_descriptor</code>, and <code>thindb_tvf_process</code>; the current ABI version is <code>3</code>. The descriptor name must equal the DDL name.</p>
+  <p>The direct tier loads the library without invoking the compiler. It must export <code>thindb_tvf_abi_version</code>, <code>thindb_tvf_descriptor</code>, and <code>thindb_tvf_process</code>; the current ABI version is <code>6</code>. The descriptor name must equal the DDL name.</p>
   <Callout type="warning" title="Exact build contract"><p>A prebuilt library is not an arbitrary C ABI plugin. Build it with the same Zig version and byte-identical thinDB UDF SDK/wrapper used by the target server. ABI version checks catch known incompatibility, but matching the server build environment remains your responsibility.</p></Callout>
   <p>The server-generated build uses the submitted function as <code>fn_src.zig</code>, the embedded <code>udf_sdk.zig</code> as module <code>tdb</code>, and a wrapper that reflects the function descriptor. For reproducible external builds, vendor these files from the exact thinDB revision deployed to the server and compile a dynamic ReleaseFast library for the server's operating system and architecture.</p>
 

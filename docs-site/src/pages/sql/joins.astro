@@ -2,24 +2,25 @@
 import DocsLayout from '../../layouts/DocsLayout.astro'
 import PageHeader from '../../components/PageHeader.astro'
 import CodeBlock from '../../components/CodeBlock.astro'
-import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
 const headings = [
   { depth: 2, slug: 'join-types', text: 'Join types' },
   { depth: 2, slug: 'equality-joins', text: 'Equality joins' },
-  { depth: 2, slug: 'range-joins', text: 'Range joins' },
+  { depth: 2, slug: 'general-on', text: 'General ON conditions' },
   { depth: 2, slug: 'execution', text: 'Execution behavior' },
   { depth: 2, slug: 'limitations', text: 'Current limitations' },
 ]
 ---
-<DocsLayout title="Joins" description="Join tables in thinDB using equality and supported range predicates." headings={headings}>
-  <PageHeader eyebrow="SQL guide" title="Joins" description="Combine columnar relations with inner, left, right, and full joins over equality and supported range predicates. thinDB selects from several local algorithms without a distributed planner." />
+<DocsLayout title="Joins" description="Join tables in thinDB with equality keys, ranges, and general ON conditions." headings={headings}>
+  <PageHeader eyebrow="SQL guide" title="Joins" description="Combine columnar relations with inner, outer, cross, and natural joins. Equality keys drive hash and merge execution; any other ON condition is checked per candidate pair. thinDB selects from several local algorithms without a distributed planner." />
   <h2 id="join-types">Join types</h2>
   <div class="table-scroll"><table><thead><tr><th>SQL form</th><th>Result</th></tr></thead><tbody>
-    <tr><td><code>INNER JOIN</code> / <code>JOIN</code></td><td>Rows with matching keys or supported range predicates.</td></tr>
+    <tr><td><code>INNER JOIN</code> / <code>JOIN</code></td><td>Pairs of rows that satisfy the <code>ON</code> condition.</td></tr>
     <tr><td><code>LEFT [OUTER] JOIN</code></td><td>All left rows, null-extending unmatched right columns.</td></tr>
     <tr><td><code>RIGHT [OUTER] JOIN</code></td><td>All right rows, null-extending unmatched left columns.</td></tr>
     <tr><td><code>FULL [OUTER] JOIN</code></td><td>All matched and unmatched rows from both sides.</td></tr>
+    <tr><td><code>CROSS JOIN</code>, <code>FROM a, b</code></td><td>The Cartesian product. Equalities in <code>WHERE</code> between comma-joined sources become join keys.</td></tr>
+    <tr><td><code>JOIN ... USING (c, ...)</code>, <code>NATURAL JOIN</code></td><td>An equality join on the named (or all shared) columns. Each shared column appears once: the left value for inner and left joins, the right value for right joins, and <code>COALESCE(left, right)</code> for full joins.</td></tr>
   </tbody></table></div>
 
   <h2 id="equality-joins">Equality joins</h2>
@@ -32,25 +33,29 @@ JOIN customers AS c
 SELECT c.customer_id
 FROM customers c
 LEFT JOIN invoices i ON c.customer_id = i.customer_id
-WHERE i.invoice_id IS NULL;`} />
-  <p>Composite equality joins are supported. Qualify columns in multi-table queries so the parser can assign each key to the correct side.</p>
-  <Callout type="note" title="Outer join keys"><p>The executor drops the right-side copy of equality join keys. For unmatched right rows in <code>RIGHT</code> and <code>FULL</code> joins, the retained left key is null rather than a SQL-standard coalesced key. Project and coalesce explicit non-key columns when that distinction matters.</p></Callout>
+WHERE i.invoice_id IS NULL;
 
-  <h2 id="range-joins">Range joins</h2>
+SELECT * FROM invoices JOIN customers USING (customer_id);`} />
+  <p>Composite equality keys are supported, and keys of different numeric, text, temporal, or nested types compare at their common type. Qualify columns in multi-table queries so each key resolves to one side.</p>
+
+  <h2 id="general-on">General ON conditions</h2>
   <CodeBlock language="sql" code={`SELECT e.event_id, p.price
 FROM events e
-JOIN prices p
+LEFT JOIN prices p
   ON e.product_id = p.product_id
  AND e.occurred_at >= p.valid_from
- AND e.occurred_at < p.valid_to;`} />
-  <p>Inner joins may combine equality keys with supported inequality ranges. The engine includes a range-sweep path for compatible shapes. General boolean predicates are not a fallback nested-loop expression language; the parser validates the supported join predicate structure.</p>
+ AND e.occurred_at < p.valid_to;
+
+SELECT a.id, b.id
+FROM accounts a
+JOIN accounts b ON a.parent_id = b.id OR a.alias_of = b.id;`} />
+  <p>An <code>ON</code> clause may hold ranges, <code>&lt;&gt;</code>, <code>OR</code>, expressions over both inputs, or just <code>TRUE</code>, in inner and outer joins. Top-level <code>left.col = right.col</code> conjuncts still become join keys. The rest of the condition is a residual: an inner join filters on it after matching keys, and an outer join checks it for each candidate pair, so a left row whose candidates all fail is null-extended exactly as the SQL standard requires.</p>
 
   <h2 id="execution">Execution behavior</h2>
   <p>The execution layer includes hash join, sort-merge join, nested-loop join, and range-sweep join. The <code>auto</code> route uses manifest statistics and can respond to skew. Algorithm choice is internal physical execution, not a semantic SQL rewrite.</p>
-  <ul><li>Order keys and segment statistics can reduce scan work before the join.</li><li>Hash execution is effective for ordinary equality joins that fit the query budget.</li><li>Sort-merge provides a bounded path for ordered inputs and skewed keys.</li><li>Nested-loop is reserved for shapes where the other algorithms do not apply.</li></ul>
+  <ul><li>Order keys, segment statistics, and key Bloom filters can reduce scan work before the join.</li><li>Hash execution is effective for ordinary equality joins that fit the query budget.</li><li>Sort-merge provides a bounded path for ordered inputs and skewed keys.</li><li>An outer join with a residual condition runs the nested-loop join over candidate pairs taken from a key index on the right input. With no equality key at all, every pair is a candidate, so keep at least one equality key on large inputs.</li></ul>
 
   <h2 id="limitations">Current limitations</h2>
-  <Callout type="warning" title="ON predicates"><p>Arbitrary <code>OR</code> expressions and unrestricted computed boolean predicates in <code>ON</code> are rejected. Non-equality ranges are limited to inner joins. Use equality keys plus supported range clauses, or move single-table filters into <code>WHERE</code> before joining.</p></Callout>
-  <p><code>SEMI JOIN</code>, <code>ANTI JOIN</code>, <code>CROSS JOIN</code>, <code>NATURAL JOIN</code>, and broad MySQL/PostgreSQL join-hint compatibility are not implemented in the SQL parser. Express semi/anti behavior with <code>EXISTS</code>/<code>NOT EXISTS</code> or supported outer-join shapes, and prefer explicit <code>ON left.key = right.key</code> predicates.</p>
+  <p><code>SEMI JOIN</code> and <code>ANTI JOIN</code> syntax is not implemented. Express semi and anti joins with <code>EXISTS</code>/<code>NOT EXISTS</code> or <code>IN</code>/<code>NOT IN</code> subqueries. Join hints such as <code>[broadcast]</code> or <code>[shuffle]</code> are not accepted.</p>
   <PageLinks previous={{ label: 'Query data', href: '/sql/queries/' }} next={{ label: 'Window functions', href: '/sql/windows/' }} />
 </DocsLayout>

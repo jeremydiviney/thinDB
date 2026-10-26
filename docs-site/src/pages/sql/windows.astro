@@ -2,7 +2,6 @@
 import DocsLayout from '../../layouts/DocsLayout.astro'
 import PageHeader from '../../components/PageHeader.astro'
 import CodeBlock from '../../components/CodeBlock.astro'
-import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
 const headings = [
   { depth: 2, slug: 'syntax', text: 'Syntax' },
@@ -11,7 +10,7 @@ const headings = [
   { depth: 2, slug: 'nulls-and-offsets', text: 'Nulls and offsets' },
 ]
 ---
-<DocsLayout title="Window functions" description="Use ranking, value access, and aggregate window functions in thinDB." headings={headings}>
+<DocsLayout title="Window functions" description="Use ranking, distribution, value access, statistical, and aggregate window functions in thinDB." headings={headings}>
   <PageHeader eyebrow="SQL guide" title="Window functions" description="Compute rankings, running totals, comparisons, and partition-level values without collapsing rows." />
   <h2 id="syntax">Syntax</h2>
   <CodeBlock language="sql" code={`SELECT
@@ -35,14 +34,17 @@ QUALIFY recency = 1;`} />
 
   <h2 id="supported-functions">Supported functions</h2>
   <div class="table-scroll"><table><thead><tr><th>Family</th><th>Functions</th></tr></thead><tbody>
-    <tr><td>Ranking</td><td><code>row_number</code>, <code>rank</code>, <code>dense_rank</code></td></tr>
+    <tr><td>Ranking</td><td><code>row_number</code>, <code>rank</code>, <code>dense_rank</code>, <code>ntile</code></td></tr>
+    <tr><td>Distribution</td><td><code>cume_dist</code>, <code>percent_rank</code></td></tr>
     <tr><td>Value access</td><td><code>lag</code>, <code>lead</code>, <code>first_value</code>, <code>last_value</code>, <code>nth_value</code></td></tr>
-    <tr><td>Aggregate windows</td><td><code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code></td></tr>
+    <tr><td>Statistics</td><td><code>var_pop</code>, <code>var_samp</code>, <code>stddev_pop</code>, <code>stddev_samp</code>, <code>covar_pop</code>, <code>covar_samp</code>, <code>corr</code>, under every alias their aggregates take</td></tr>
+    <tr><td>Sessions</td><td><code>session_number(x, delta)</code> numbers each partition's sessions from 1; a row starts a new session when <code>x</code> jumps past the previous value by more than <code>delta</code>.</td></tr>
+    <tr><td>Any aggregate</td><td>Every built-in aggregate takes <code>OVER</code>: <code>sum</code>, <code>avg</code>, <code>count</code>, <code>min</code>, <code>max</code>, their <code>DISTINCT</code> forms, <code>max_by</code>, <code>min_by</code>, <code>array_agg</code>, <code>group_concat</code>, <code>bool_or</code>, <code>count_if</code>, <code>approx_top_k</code>, and the rest.</td></tr>
   </tbody></table></div>
-  <Callout type="warning" title="Reserved, not shipped"><p><code>ntile</code>, <code>cume_dist</code>, and <code>percent_rank</code> have reserved parser identities but are rejected by the execution layer. Do not depend on them yet.</p></Callout>
+  <p>A window aggregate over a whole partition returns that partition's <code>GROUP BY</code> value.</p>
 
   <h2 id="frames">Frames</h2>
-  <p><code>ROWS</code>, <code>RANGE</code>, and <code>GROUPS</code> frame kinds are represented. Bounds include unbounded preceding/following, current row, and supported offset bounds. Without <code>ORDER BY</code>, the default covers the whole partition. With ordering, the default is equivalent to <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>.</p>
+  <p><code>ROWS</code>, <code>RANGE</code>, and <code>GROUPS</code> frame kinds are represented. Bounds include unbounded preceding/following, current row, and supported offset bounds. Without <code>ORDER BY</code>, the default covers the whole partition. With ordering, the default is equivalent to <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. Ranking, distribution, and session functions ignore the frame.</p>
   <CodeBlock language="sql" code={`AVG(amount) OVER (
   PARTITION BY customer_id
   ORDER BY issued_on
@@ -50,11 +52,12 @@ QUALIFY recency = 1;`} />
 )`} />
 
   <h2 id="nulls-and-offsets">Nulls and offsets</h2>
-  <p><code>LAG</code> and <code>LEAD</code> accept an expression, optional offset, and optional default. Value functions support <code>IGNORE NULLS</code> where meaningful; the default is <code>RESPECT NULLS</code>.</p>
+  <p><code>LAG</code> and <code>LEAD</code> accept an expression, optional offset, and optional default. Value functions support <code>IGNORE NULLS</code> where meaningful, written either after the call's closing parenthesis or after its first argument; the default is <code>RESPECT NULLS</code>.</p>
   <CodeBlock language="sql" code={`SELECT
   invoice_id,
   LAG(amount, 1, 0) OVER (PARTITION BY customer_id ORDER BY issued_on) AS prior_amount,
-  FIRST_VALUE(memo) IGNORE NULLS OVER (PARTITION BY customer_id ORDER BY issued_on) AS first_memo
+  FIRST_VALUE(memo) IGNORE NULLS OVER (PARTITION BY customer_id ORDER BY issued_on) AS first_memo,
+  LAST_VALUE(memo IGNORE NULLS) OVER (PARTITION BY customer_id ORDER BY issued_on) AS last_memo
 FROM invoices;`} />
   <PageLinks previous={{ label: 'Joins', href: '/sql/joins/' }} next={{ label: 'Built-in functions', href: '/sql/functions/' }} />
 </DocsLayout>

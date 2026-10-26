@@ -6,53 +6,81 @@ import Callout from '../../components/Callout.astro'
 import PageLinks from '../../components/PageLinks.astro'
 const headings = [
   { depth: 2, slug: 'create-tables', text: 'Create tables' },
+  { depth: 2, slug: 'alter-tables', text: 'Alter tables' },
   { depth: 2, slug: 'write-data', text: 'Write data' },
   { depth: 2, slug: 'update-and-delete', text: 'Update and delete' },
   { depth: 2, slug: 'copy', text: 'COPY streaming' },
   { depth: 2, slug: 'views-and-temporary-tables', text: 'Views and temporary tables' },
 ]
 ---
-<DocsLayout title="Tables and data" description="Create thinDB tables and write, update, delete, or stream rows." headings={headings}>
-  <PageHeader eyebrow="SQL guide" title="Tables and data" description="Define strict columnar tables, load rows directly or from queries, and use update, delete, upsert, views, and streaming COPY where the workload needs them." />
+<DocsLayout title="Tables and data" description="Create and alter thinDB tables and write, update, delete, or stream rows." headings={headings}>
+  <PageHeader eyebrow="SQL guide" title="Tables and data" description="Define strict columnar tables, load rows directly or from queries, and use update, delete, upsert, views, materialized views, and streaming COPY where the workload needs them." />
   <h2 id="create-tables">Create tables</h2>
   <CodeBlock language="sql" code={`CREATE TABLE invoices (
-  invoice_id BIGINT PRIMARY KEY,
+  invoice_id BIGINT AUTO_INCREMENT PRIMARY KEY,
   customer_id BIGINT NOT NULL,
   issued_on DATE NOT NULL,
   amount DECIMAL(18, 2) NOT NULL,
-  memo VARCHAR(256),
-  imported_at DATETIME DEFAULT '2026-07-10 00:00:00'
+  memo VARCHAR(256) DEFAULT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
+
+CREATE TABLE events (
+  account_id BIGINT,
+  occurred_at DATETIME,
+  payload JSON
+) ORDER BY (account_id, occurred_at);
 
 CREATE TABLE invoice_summary AS
 SELECT customer_id, SUM(amount) AS total
 FROM invoices
 GROUP BY customer_id;`} />
-  <p>A primary key supplies a unique order key. Tables can also use a non-unique order key through the embedded schema API. SQL columns are nullable by default; <code>PRIMARY KEY</code>, <code>NOT NULL</code>, <code>SERIAL</code>, and <code>AUTO_INCREMENT</code> make the relevant column non-nullable. Defaults must be compatible with the declared type.</p>
-  <p>Supported lifecycle statements include <code>CREATE TABLE</code>, <code>CREATE TABLE AS SELECT</code>, <code>ALTER TABLE</code>, <code>TRUNCATE TABLE</code>, and <code>DROP TABLE [IF EXISTS]</code>.</p>
+  <p>Every table is sorted on an order key. <code>PRIMARY KEY</code> makes it unique, with last-writer-wins resolution of repeated keys. <code>ORDER BY (cols)</code> (or StarRocks' <code>DUPLICATE KEY (cols)</code>) gives a non-unique key that keeps every row. With no key clause the table orders by its first column. Choose the key your queries filter and group on: segments and row groups are pruned by it.</p>
+  <p>SQL columns are nullable by default; <code>PRIMARY KEY</code>, <code>NOT NULL</code>, <code>SERIAL</code>, and <code>AUTO_INCREMENT</code> make the relevant column non-nullable. Defaults may be a literal, <code>NULL</code>, or <code>CURRENT_TIMESTAMP</code>; a <code>DATETIME</code> column may also declare <code>ON UPDATE CURRENT_TIMESTAMP</code>.</p>
+  <p>Supported lifecycle statements include <code>CREATE TABLE [IF NOT EXISTS]</code>, <code>CREATE TABLE AS SELECT</code>, <code>ALTER TABLE</code>, <code>RENAME TABLE</code>, <code>TRUNCATE TABLE</code>, and <code>DROP TABLE [IF EXISTS]</code>. A <code>CREATE TABLE AS SELECT</code> whose query fails leaves no table behind.</p>
+
+  <h2 id="alter-tables">Alter tables</h2>
+  <CodeBlock language="sql" code={`ALTER TABLE invoices ADD COLUMN currency VARCHAR(3) DEFAULT 'USD' AFTER amount;
+ALTER TABLE invoices ADD (region VARCHAR(16), channel VARCHAR(16));
+ALTER TABLE invoices RENAME COLUMN memo TO note;
+ALTER TABLE invoices DROP COLUMN channel;
+ALTER TABLE invoices AUTO_INCREMENT = 100000;`} />
+  <p><code>ADD [COLUMN]</code> takes <code>FIRST</code> or <code>AFTER col</code>, or a parenthesized list added at the end. <code>DROP COLUMN</code>, <code>RENAME COLUMN</code>, <code>RENAME TO</code>, and <code>AUTO_INCREMENT = n</code> are supported. A column of a non-unique order key can be dropped; a <code>PRIMARY KEY</code> column cannot (<code>UniqueKeyColumnDrop</code>). Changing an existing column's type is not supported yet.</p>
+  <p>ALTER rewrites the table into a shadow copy and swaps it in atomically. Reads see the old version until the swap; writes wait for it. Deletes and key filters carry over.</p>
 
   <h2 id="write-data">Write data</h2>
-  <CodeBlock language="sql" code={`INSERT INTO invoices (invoice_id, customer_id, issued_on, amount)
+  <CodeBlock language="sql" code={`INSERT INTO invoices (customer_id, issued_on, amount)
 VALUES
-  (1001, 42, DATE '2026-07-01', 125.00),
-  (1002, 42, DATE '2026-07-08', 75.50);
+  (42, DATE '2026-07-01', 125.00),
+  (42, DATE '2026-07-08', 75.50);
 
 INSERT INTO invoice_archive
 SELECT * FROM invoices WHERE issued_on < DATE '2026-01-01';
 
-INSERT INTO invoices VALUES (1002, 42, DATE '2026-07-08', 80.00)
-ON DUPLICATE KEY UPDATE amount = 80.00;`} />
-  <p>Unique tables use last-writer-wins key resolution. <code>INSERT ... ON DUPLICATE KEY UPDATE</code> is supported for MySQL-oriented ingestion, along with insert-from-select paths.</p>
+INSERT INTO invoices (invoice_id, customer_id, issued_on, amount)
+VALUES (1002, 42, DATE '2026-07-08', 80.00)
+ON DUPLICATE KEY UPDATE amount = VALUES(amount);
+
+INSERT INTO invoices SET customer_id = 7, issued_on = CURRENT_DATE, amount = 10.00;`} />
+  <ul>
+    <li>On a unique table, an <code>INSERT</code> whose column list leaves some columns out is a partial update when the key already exists: the listed columns change and the others keep their values.</li>
+    <li><code>REPLACE INTO</code> replaces the whole row, so columns it leaves out take their defaults.</li>
+    <li><code>INSERT ... ON DUPLICATE KEY UPDATE</code>, <code>INSERT ... SET</code>, and insert-from-select are supported. <code>DEFAULT</code> works as a value in <code>VALUES</code>, <code>SET</code>, and <code>UPDATE</code>.</li>
+  </ul>
 
   <h2 id="update-and-delete">Update and delete</h2>
   <CodeBlock language="sql" code={`UPDATE invoices
 SET amount = amount * 1.02,
-    memo = 'adjusted'
+    note = 'adjusted'
 WHERE issued_on < DATE '2026-07-01';
 
+UPDATE invoices i JOIN customers c ON c.customer_id = i.customer_id
+SET i.region = c.region;
+
 DELETE FROM invoices
-WHERE customer_id = 42 AND amount = 0;`} />
-  <p>Update expressions may reference existing columns, scalar functions, session variables, and scalar subqueries. Deletes create tombstones for persisted segments and remove matching memtable rows; compaction later folds tombstones away.</p>
+WHERE customer_id IN (SELECT customer_id FROM churned);`} />
+  <p>Update expressions may reference existing columns, scalar functions, session variables, scalar subqueries, and joined tables. Deletes create tombstones for persisted segments and remove matching memtable rows; compaction later folds tombstones away. Each <code>UPDATE</code> or <code>DELETE</code> commits once, and readers never see part of it. A statement that stages more than 64 MB of change commits in 64 MB chunks.</p>
 
   <h2 id="copy">COPY streaming</h2>
   <p>The PostgreSQL wire supports <code>COPY table [(columns)] FROM STDIN</code> and <code>COPY ... TO STDOUT</code> in text format.</p>
@@ -66,10 +94,14 @@ COPY invoices TO STDOUT WITH (FORMAT TEXT);`} />
   <CodeBlock language="sql" code={`CREATE VIEW open_invoices AS
 SELECT * FROM invoices WHERE amount > 0;
 
-CREATE TEMP TABLE current_batch AS
-SELECT * FROM invoices WHERE issued_on >= DATE '2026-07-01';
+CREATE MATERIALIZED VIEW customer_totals AS
+SELECT customer_id, SUM(amount) AS total FROM invoices GROUP BY customer_id;
+
+REFRESH MATERIALIZED VIEW customer_totals;
+
+CREATE TEMPORARY TABLE current_batch (invoice_id BIGINT, amount DECIMAL(18, 2));
 
 DROP VIEW open_invoices;`} />
-  <p>Plain views store a reusable query definition. Temporary tables belong to the session namespace and disappear with the session. Materialized-view metadata exists, but treat refresh behavior as preview functionality and verify it against the current release before operational use.</p>
+  <p>A plain view stores its query and expands inline wherever it is read. A materialized view stores its result as a table. <code>REFRESH MATERIALIZED VIEW</code> recomputes it and swaps the new result in only once the query succeeds; nothing refreshes it automatically. Temporary tables belong to the session namespace and disappear with the session.</p>
   <PageLinks previous={{ label: 'Connect a client', href: '/connect/' }} next={{ label: 'Query data', href: '/sql/queries/' }} />
 </DocsLayout>
