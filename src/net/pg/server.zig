@@ -1237,6 +1237,7 @@ fn needsTempNamespace(op: ir.Op) bool {
             .create_table => |ct| ct.is_temp,
             else => false,
         },
+        .create_table_as => |c| c.is_temp,
         else => false,
     };
 }
@@ -1296,4 +1297,13 @@ test "applyDatabase fails on unknown database" {
     var session = try SessionState.init(allocator, c, 2);
     defer session.deinit();
     try std.testing.expectError(error.DatabaseNotFound, applyDatabase(c, &session, "ghost"));
+}
+
+test "a temporary CTAS opens the session's temp namespace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const temp_ctas = try sql.parse(arena.allocator(), "CREATE TEMPORARY TABLE picked AS SELECT 1 AS id");
+    try std.testing.expect(needsTempNamespace(temp_ctas.*));
+    const ctas = try sql.parse(arena.allocator(), "CREATE TABLE kept AS SELECT 1 AS id");
+    try std.testing.expect(!needsTempNamespace(ctas.*));
 }
