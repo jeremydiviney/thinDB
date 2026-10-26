@@ -11,10 +11,13 @@
 //! free pushes the block onto a free-list (no `munmap`), and the next scan's
 //! alloc pops it (no `mmap`) — a double win on the common back-to-back path.
 //!
-//! Scope: only allocations in `[min_class, max_class]` with alignment ≤
+//! Scope: only allocations in `[min_class, max_large_class]` with alignment ≤
 //! `max_align` are pooled. Smaller allocations pass straight through (the
-//! backing allocator already pools those cheaply); larger ones are too rare and
-//! big to retain. The free-list decision uses the same `(len, alignment)`
+//! backing allocator already pools those cheaply). Up to 64 MiB the classes
+//! are powers of two; past it they step by a quarter of their power of two, so
+//! a statement's one-off multi-hundred-MiB result array is recycled too (each
+//! fresh mapping of one faults in every page it touches) without reserving
+//! nearly twice its size. The free-list decision uses the same `(len, alignment)`
 //! predicate on alloc and free, so a block is always classified identically both
 //! ways. Retained bytes are capped. A free past the cap first evicts idle
 //! blocks of classes allocated from less recently than its own, so the retained
@@ -48,12 +51,15 @@ const SpinLock = struct {
     }
 };
 
-/// Pooled allocations span `[1<<min_log2, 1<<max_log2]` bytes. 64 KiB covers the
-/// mmap-threshold boundary (glibc/CRT route allocations past ~128 KiB to the
-/// kernel; 64 KiB is a safe floor) and 64 MiB caps a single retained block.
+/// Power-of-two classes span `[1<<min_log2, 1<<max_log2]` bytes. 64 KiB covers
+/// the mmap-threshold boundary (glibc/CRT route allocations past ~128 KiB to
+/// the kernel; 64 KiB is a safe floor). Quarter-step classes continue from
+/// there to `1<<max_large_log2`.
 const min_log2: u6 = 16; // 64 KiB
 const max_log2: u6 = 26; // 64 MiB
-const class_count: usize = max_log2 - min_log2 + 1;
+const max_large_log2: u6 = 31; // 2 GiB
+const pow2_class_count: usize = max_log2 - min_log2 + 1;
+const class_count: usize = pow2_class_count + (max_large_log2 - max_log2) * 4;
 
 /// Blocks are over-aligned to a cache line so a pooled block satisfies any
 /// request with alignment ≤ this; requests above it bypass the pool.
@@ -232,12 +238,19 @@ pub const Pool = struct {
         if (@intFromEnum(alignment) > max_align_log2) return null;
         const need_log2 = std.math.log2_int_ceil(usize, len);
         if (need_log2 < min_log2) return null;
-        if (need_log2 > max_log2) return null;
-        return need_log2 - min_log2;
+        if (need_log2 <= max_log2) return need_log2 - min_log2;
+        if (need_log2 > max_large_log2) return null;
+        const base_log2 = need_log2 - 1;
+        const quarter = @as(usize, 1) << @intCast(base_log2 - 2);
+        const steps = (len - (@as(usize, 1) << @intCast(base_log2)) + quarter - 1) / quarter;
+        return pow2_class_count + (base_log2 - max_log2) * 4 + steps - 1;
     }
 
     fn classSize(idx: usize) usize {
-        return @as(usize, 1) << @intCast(min_log2 + idx);
+        if (idx < pow2_class_count) return @as(usize, 1) << @intCast(min_log2 + idx);
+        const large = idx - pow2_class_count;
+        const base_log2 = max_log2 + large / 4;
+        return (@as(usize, 1) << @intCast(base_log2)) + (large % 4 + 1) * (@as(usize, 1) << @intCast(base_log2 - 2));
     }
 
     fn allocImpl(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -268,9 +281,10 @@ pub const Pool = struct {
             return self.backing.rawFree(buf, alignment, ret_addr);
         const sz = classSize(idx);
         // Retain unless it would push us past the cap — then evict (the block was
-        // minted class-sized + max-aligned, so free it exactly that way).
+        // minted class-sized + max-aligned, so free it exactly that way). A block
+        // larger than the cap can never stay, so it evicts nothing else first.
         const prior = self.retained_bytes.load(.monotonic);
-        if (prior + sz > self.cap_bytes and
+        if (sz > self.cap_bytes or prior + sz > self.cap_bytes and
             !self.evictStaleClasses(idx, prior + sz - self.cap_bytes))
         {
             _ = self.evictions.fetchAdd(1, .monotonic);
@@ -443,9 +457,60 @@ test "sub-threshold and over-size allocations bypass the pool cleanly" {
 
     const small = try a.alloc(u8, 1024); // < 64 KiB → backing
     a.free(small);
-    const huge = try a.alloc(u8, (1 << 27) + 7); // > 64 MiB → backing
-    a.free(huge);
     try std.testing.expectEqual(@as(usize, 0), pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(?usize, null), Pool.classOf((1 << max_large_log2) + 1, .@"1"));
+    try std.testing.expectEqual(@as(?usize, null), Pool.classOf(1 << 20, .fromByteUnits(128)));
+}
+
+test "past 64 MiB the classes step by a quarter of their power of two" {
+    const mib: usize = 1 << 20;
+    const cases = .{
+        .{ .len = 64 * mib, .size = 64 * mib },
+        .{ .len = 64 * mib + 1, .size = 80 * mib },
+        .{ .len = 128 * mib, .size = 128 * mib },
+        .{ .len = 128 * mib + 1, .size = 160 * mib },
+        .{ .len = 711 * mib, .size = 768 * mib },
+        .{ .len = 2048 * mib, .size = 2048 * mib },
+    };
+    inline for (cases) |c| {
+        const idx = Pool.classOf(c.len, .@"1").?;
+        try std.testing.expectEqual(@as(usize, c.size), Pool.classSize(idx));
+    }
+    try std.testing.expectEqual(class_count - 1, Pool.classOf(1 << max_large_log2, .@"1").?);
+    var prev: usize = 0;
+    for (0..class_count) |idx| {
+        try std.testing.expect(Pool.classSize(idx) > prev);
+        try std.testing.expectEqual(idx, Pool.classOf(Pool.classSize(idx), .@"1").?);
+        prev = Pool.classSize(idx);
+    }
+}
+
+test "a quarter-step block recycles like a power-of-two one" {
+    var pool = Pool.init(std.testing.allocator, default_cap_bytes);
+    defer pool.drain();
+    const a = pool.allocator();
+
+    const b1 = try a.alloc(u8, (64 << 20) + 4096);
+    b1[b1.len - 1] = 1;
+    const p1 = b1.ptr;
+    a.free(b1);
+    try std.testing.expectEqual(@as(usize, 80 << 20), pool.retained_bytes.load(.monotonic));
+    const b2 = try a.alloc(u8, 79 << 20);
+    try std.testing.expectEqual(p1, b2.ptr);
+    a.free(b2);
+}
+
+test "a block larger than the cap goes back without evicting the idle blocks" {
+    var pool = Pool.init(std.testing.allocator, 1 << 20);
+    defer pool.drain();
+    const a = pool.allocator();
+
+    const idle = try a.alloc(u8, 256 << 10);
+    a.free(idle);
+    const big = try a.alloc(u8, 2 << 20);
+    a.free(big);
+    try std.testing.expectEqual(@as(usize, 256 << 10), pool.retained_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), pool.evictions.load(.monotonic));
 }
 
 test "retention cap evicts instead of growing without bound" {
@@ -628,7 +693,8 @@ test "footprint is the class block for pooled requests and the length otherwise"
     const byte: std.mem.Alignment = .@"1";
     try std.testing.expectEqual(@as(usize, 128 * 1024), footprint(a, 100 * 1024, byte));
     try std.testing.expectEqual(@as(usize, 1024), footprint(a, 1024, byte));
-    try std.testing.expectEqual(@as(usize, (1 << 27) + 7), footprint(a, (1 << 27) + 7, byte));
+    try std.testing.expectEqual(@as(usize, 160 << 20), footprint(a, (1 << 27) + 7, byte));
+    try std.testing.expectEqual(@as(usize, (3 << 30)), footprint(a, 3 << 30, byte));
     try std.testing.expectEqual(@as(usize, 100 * 1024), footprint(std.testing.allocator, 100 * 1024, byte));
 }
 
