@@ -3858,6 +3858,7 @@ fn needsTempNamespace(op: ir.Op) bool {
             .create_table => |ct| ct.is_temp,
             else => false,
         },
+        .create_table_as => |c| c.is_temp,
         else => false,
     };
 }
@@ -4330,6 +4331,38 @@ test "a batch runs every statement, SETs and transaction verbs included" {
     defer allocator.free(bodies);
     var saw_count = false;
     for (bodies) |body| saw_count = saw_count or std.mem.eql(u8, body, "\x013");
+    try std.testing.expect(saw_count);
+}
+
+test "a session's first temporary table can be a CTAS" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = try Catalog.open(allocator, io, tmp.dir, .{});
+    defer c.close();
+    _ = try c.createDatabase("main");
+    var session = try SessionState.init(allocator, c, 1);
+    defer session.deinit();
+    session.client_caps = handshake.CLIENT_PROTOCOL_41;
+    var profiler = MysqlProfiler.init(io, 1, false);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TABLE src (id INT)", &profiler);
+    try handleQuery(allocator, &out.writer, c, &session, "INSERT INTO src VALUES (1), (2)", &profiler);
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "CREATE TEMPORARY TABLE picked AS SELECT id FROM src", &profiler);
+    const ctas_bodies = try testPacketBodies(allocator, out.written());
+    defer allocator.free(ctas_bodies);
+    for (ctas_bodies) |body| try std.testing.expect(body.len == 0 or body[0] != 0xff);
+
+    out.clearRetainingCapacity();
+    try handleQuery(allocator, &out.writer, c, &session, "SELECT COUNT(*) FROM picked", &profiler);
+    const bodies = try testPacketBodies(allocator, out.written());
+    defer allocator.free(bodies);
+    var saw_count = false;
+    for (bodies) |body| saw_count = saw_count or std.mem.eql(u8, body, "\x012");
     try std.testing.expect(saw_count);
 }
 
