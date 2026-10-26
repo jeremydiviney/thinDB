@@ -2505,24 +2505,25 @@ pub const Aggregate = struct {
     /// value back into its matching `AccState` variant. Lets the emit paths keep
     /// passing a `[]AccState` to `appendGroupRow` / `topkEntry` unchanged.
     fn readGroupState(self: *Aggregate, gid: u32) []AccState {
+        for (self.state_scratch, 0..) |*dst, ai| dst.* = self.groupCell(ai, gid);
+        return self.state_scratch;
+    }
+
+    fn groupCell(self: *Aggregate, ai: usize, gid: u32) AccState {
         const g: usize = gid;
-        const out = self.state_scratch;
-        for (self.agg_cols, out, 0..) |col, *dst, ai| {
-            dst.* = switch (col) {
-                .count => |s| .{ .count = s[g] },
-                .sum_int => |s| .{ .sum_int = s[g] },
-                .sum_float => |s| .{ .sum_float = s[g] },
-                .avg => |s| .{ .avg = s[g] },
-                .min_int => |s| .{ .min_int = s[g] },
-                .max_int => |s| .{ .max_int = s[g] },
-                .min_float => |s| .{ .min_float = s[g] },
-                .max_float => |s| .{ .max_float = s[g] },
-                .max_by_narrow => |s| self.wrapMaxByNarrow(ai, s[g]),
-                .value_narrow => |s| self.wrapValueNarrow(ai, s[g]),
-                .other => |s| s[g],
-            };
-        }
-        return out;
+        return switch (self.agg_cols[ai]) {
+            .count => |s| .{ .count = s[g] },
+            .sum_int => |s| .{ .sum_int = s[g] },
+            .sum_float => |s| .{ .sum_float = s[g] },
+            .avg => |s| .{ .avg = s[g] },
+            .min_int => |s| .{ .min_int = s[g] },
+            .max_int => |s| .{ .max_int = s[g] },
+            .min_float => |s| .{ .min_float = s[g] },
+            .max_float => |s| .{ .max_float = s[g] },
+            .max_by_narrow => |s| self.wrapMaxByNarrow(ai, s[g]),
+            .value_narrow => |s| self.wrapValueNarrow(ai, s[g]),
+            .other => |s| s[g],
+        };
     }
 
     /// Widen a narrow MAX_BY cell back into the `.max_by` AccState the emit
@@ -2783,10 +2784,73 @@ pub const Aggregate = struct {
         // early, skipping the (string-heavy) row reconstruction for the rest.
         const stop: u32 = if (self.emit_limit) |cap| @min(cap, self.n_groups) else self.n_groups;
         try self.reserveGroupedOutput(stop);
+        // An aggregation that saw no rows never sized its cell columns.
+        if (stop == 0) return;
+        var gid: u32 = 0;
+        while (gid < stop) : (gid += 1) try self.appendGroupKeyRow(gid);
+        for (0..self.aggs.len) |ai| try self.appendAggColumn(ai, stop);
+    }
+
+    /// Emit aggregate `ai` for groups `[0, stop)` in one pass over its cell
+    /// column. Widening every cell of every aggregate to an `AccState` and
+    /// appending it through the type switches of `appendAccToColumn`, row by
+    /// row, cost a wide GROUP BY more than its accumulation did; a narrow
+    /// cell kind now writes its output column directly.
+    fn appendAggColumn(self: *Aggregate, ai: usize, stop: u32) !void {
+        const out_idx = self.group_col_indices.len + ai;
+        const col = &self.output_columns[out_idx];
+        const out_type = self.output_schema[out_idx].type;
+        if (self.cd[ai] == null and try self.appendNarrowColumn(ai, col, out_type, stop)) return;
         var gid: u32 = 0;
         while (gid < stop) : (gid += 1) {
-            try self.appendGroupRow(gid, self.readGroupState(gid));
+            const cd_count: ?u64 = if (self.cd[ai]) |c| c.counts.items[gid] else null;
+            try appendAccToColumn(self.allocator, self.aggs[ai], self.groupCell(ai, gid), col, self.aggInputType(ai), out_type, cd_count);
         }
+    }
+
+    /// The direct column write for a narrow cell kind, mirroring what
+    /// `appendAccToColumn` appends for it; false when the kind or its
+    /// output type has no direct write.
+    fn appendNarrowColumn(self: *Aggregate, ai: usize, col: *ColumnStore, out_type: Type, n: usize) !bool {
+        const a = self.allocator;
+        switch (self.agg_cols[ai]) {
+            .count => |s| try appendColumnRun(i64, a, col, &col.data.bigint, s[0..n], CountResult{}),
+            .sum_int => |s| switch (out_type) {
+                .largeint => try appendColumnRun(i128, a, col, &col.data.largeint, s[0..n], SumIntResult{}),
+                .decimal128 => try appendColumnRun(i128, a, col, &col.data.decimal128, s[0..n], SumIntResult{}),
+                else => try appendColumnRun(i64, a, col, &col.data.bigint, s[0..n], SumIntResult{}),
+            },
+            .sum_float => |s| try appendColumnRun(f64, a, col, &col.data.double, s[0..n], SumFloatResult{}),
+            .avg => |s| try appendColumnRun(f64, a, col, &col.data.double, s[0..n], AvgResult{}),
+            .min_int, .max_int => |s| return appendIntColumn(a, col, out_type, s[0..n], OptionalResult{}),
+            .min_float, .max_float => |s| switch (out_type) {
+                .float => try appendColumnRun(f32, a, col, &col.data.float, s[0..n], OptionalResult{}),
+                .double => try appendColumnRun(f64, a, col, &col.data.double, s[0..n], OptionalResult{}),
+                else => return false,
+            },
+            .max_by_narrow => |s| {
+                // The row path appends a narrow BOOLEAN payload as `bits != 0`.
+                if (out_type == .boolean) return false;
+                const up_schema = self.upstream.outputSchema();
+                if (byKeyOnly(self.aggs[ai].func)) {
+                    if (std.meta.activeTag(up_schema[self.agg_key_indices[ai].?].type) != std.meta.activeTag(out_type)) return false;
+                    return appendIntColumn(a, col, out_type, s[0..n], MaxByKeyResult{});
+                }
+                const value_t = up_schema[self.agg_col_indices[ai].?].type;
+                if (value_t.isString() and out_type.isString()) return appendTextColumn(a, col, s[0..n], MaxByTextResult{});
+                if (std.meta.activeTag(value_t) != std.meta.activeTag(out_type)) return false;
+                return appendIntColumn(a, col, out_type, s[0..n], MaxByScalarResult{});
+            },
+            .value_narrow => |s| {
+                if (out_type == .boolean) return false;
+                const value_t = self.upstream.outputSchema()[self.agg_col_indices[ai].?].type;
+                if (value_t.isString() and out_type.isString()) return appendTextColumn(a, col, s[0..n], ValueTextResult{});
+                if (std.meta.activeTag(value_t) != std.meta.activeTag(out_type)) return false;
+                return appendIntColumn(a, col, out_type, s[0..n], ValueScalarResult{});
+            },
+            .other => return false,
+        }
+        return true;
     }
 
     /// Reserve each output column's rows for `groups` emitted groups, and a
@@ -2809,6 +2873,15 @@ pub const Aggregate = struct {
     /// reconstructed from `gkeys_int[gid]` (integer path) or `gkeys[gid]`
     /// (byte path) — both produce identical output columns.
     fn appendGroupRow(self: *Aggregate, gid: u32, state: []AccState) !void {
+        try self.appendGroupKeyRow(gid);
+        for (self.aggs, 0..) |a, ai| {
+            const out_idx = self.group_col_indices.len + ai;
+            const cd_count: ?u64 = if (self.cd[ai]) |c| c.counts.items[gid] else null;
+            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.aggInputType(ai), self.output_schema[out_idx].type, cd_count);
+        }
+    }
+
+    fn appendGroupKeyRow(self: *Aggregate, gid: u32) !void {
         if (self.coded_key) |ck| {
             // Phase 4.2: the stored key is the 4 code-bytes; decode the global
             // code back to its string via the query dictionary.
@@ -2827,12 +2900,6 @@ pub const Aggregate = struct {
             }
         } else {
             try appendGroupKey(self.allocator, self.gkeys.items[gid], self.group_col_indices, self.upstream.outputSchema(), self.output_columns[0..self.group_col_indices.len]);
-        }
-
-        for (self.aggs, 0..) |a, ai| {
-            const out_idx = self.group_col_indices.len + ai;
-            const cd_count: ?u64 = if (self.cd[ai]) |c| c.counts.items[gid] else null;
-            try appendAccToColumn(self.allocator, a, state[ai], &self.output_columns[out_idx], self.aggInputType(ai), self.output_schema[out_idx].type, cd_count);
         }
     }
 
@@ -4940,6 +5007,144 @@ fn distinctRun(comptime T: type, values: []T) !struct { sum: T, count: u64 } {
     }
     return .{ .sum = sum, .count = count };
 }
+
+/// Append one result per cell to `list`, the fixed-width data of `col`, in a
+/// single pass. `result.of(T, cell)` is the cell's value, null for SQL NULL:
+/// stored as the 0 placeholder with its validity bit cleared, as
+/// `appendNullPlaceholder` and `appendValidBit` leave it on the row path.
+fn appendColumnRun(comptime T: type, allocator: Allocator, col: *ColumnStore, list: *std.ArrayList(T), cells: anytype, result: anytype) !void {
+    const row0 = list.items.len;
+    try list.ensureUnusedCapacity(allocator, cells.len);
+    try col.appendValidityRange(allocator, row0, null, cells.len);
+    const validity: []u8 = if (col.nulls) |nb| nb.items else &.{};
+    for (list.addManyAsSliceAssumeCapacity(cells.len), cells, row0..) |*dst, cell, row| {
+        if (result.of(T, cell)) |v| {
+            dst.* = v;
+        } else {
+            dst.* = 0;
+            if (validity.len != 0) validity[row >> 3] &= ~(@as(u8, 1) << @intCast(row & 7));
+        }
+    }
+}
+
+/// `appendColumnRun` for a result that widens into an i64 (`bits`), into
+/// the column of `out_type`; false for a type the row path writes otherwise.
+fn appendIntColumn(allocator: Allocator, col: *ColumnStore, out_type: Type, cells: anytype, result: anytype) !bool {
+    const narrowed: Narrowed(@TypeOf(result)) = .{ .inner = result };
+    switch (out_type) {
+        .int => try appendColumnRun(i32, allocator, col, &col.data.int, cells, narrowed),
+        .bigint => try appendColumnRun(i64, allocator, col, &col.data.bigint, cells, narrowed),
+        .boolean => try appendColumnRun(u8, allocator, col, &col.data.boolean, cells, narrowed),
+        .date => try appendColumnRun(i32, allocator, col, &col.data.date, cells, narrowed),
+        .datetime => try appendColumnRun(i64, allocator, col, &col.data.datetime, cells, narrowed),
+        .tinyint => try appendColumnRun(i8, allocator, col, &col.data.tinyint, cells, narrowed),
+        .smallint => try appendColumnRun(i16, allocator, col, &col.data.smallint, cells, narrowed),
+        .decimal64 => try appendColumnRun(i64, allocator, col, &col.data.decimal64, cells, narrowed),
+        else => return false,
+    }
+    return true;
+}
+
+fn Narrowed(comptime R: type) type {
+    return struct {
+        inner: R,
+        fn of(self: @This(), comptime T: type, cell: anytype) ?T {
+            return @intCast(self.inner.bits(cell) orelse return null);
+        }
+    };
+}
+
+/// The string twin of `appendColumnRun`; NULL appends the empty placeholder.
+fn appendTextColumn(allocator: Allocator, col: *ColumnStore, cells: anytype, result: anytype) !bool {
+    const ss = switch (col.data) {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| ss,
+        else => return false,
+    };
+    var bytes: usize = 0;
+    for (cells) |cell| if (result.text(cell)) |t| {
+        bytes += t.len;
+    };
+    try ss.bytes.ensureUnusedCapacity(allocator, bytes);
+    const row0 = col.rowCount();
+    try col.appendValidityRange(allocator, row0, null, cells.len);
+    const validity: []u8 = if (col.nulls) |nb| nb.items else &.{};
+    for (cells, row0..) |cell, row| {
+        if (result.text(cell)) |t| {
+            try ss.appendValue(allocator, t);
+        } else {
+            try ss.appendValue(allocator, "");
+            if (validity.len != 0) validity[row >> 3] &= ~(@as(u8, 1) << @intCast(row & 7));
+        }
+    }
+    return true;
+}
+
+const CountResult = struct {
+    fn of(_: CountResult, comptime T: type, c: u64) ?T {
+        return @intCast(c);
+    }
+};
+
+/// DESIGN.md §3.4: an integer SUM wraps to BIGINT.
+const SumIntResult = struct {
+    fn of(_: SumIntResult, comptime T: type, c: SumIntAcc) ?T {
+        if (!c.seen) return null;
+        return if (T == i128) c.v else @truncate(c.v);
+    }
+};
+
+const SumFloatResult = struct {
+    fn of(_: SumFloatResult, comptime T: type, c: SumFloatAcc) ?T {
+        return if (c.seen) c.v else null;
+    }
+};
+
+const AvgResult = struct {
+    fn of(_: AvgResult, comptime T: type, c: AvgAcc) ?T {
+        if (c.count == 0) return null;
+        return c.sum / @as(f64, @floatFromInt(c.count)) / c.scale_div;
+    }
+};
+
+const OptionalResult = struct {
+    fn of(_: OptionalResult, comptime T: type, c: ?f64) ?T {
+        const v = c orelse return null;
+        return if (T == f32) @floatCast(v) else v;
+    }
+    fn bits(_: OptionalResult, c: ?i64) ?i64 {
+        return c;
+    }
+};
+
+const MaxByKeyResult = struct {
+    fn bits(_: MaxByKeyResult, c: MaxByNarrow) ?i64 {
+        return if (c.seen) c.key else null;
+    }
+};
+
+const MaxByScalarResult = struct {
+    fn bits(_: MaxByScalarResult, c: MaxByNarrow) ?i64 {
+        return if (c.seen and !c.val_null) c.val.int else null;
+    }
+};
+
+const MaxByTextResult = struct {
+    fn text(_: MaxByTextResult, c: MaxByNarrow) ?[]const u8 {
+        return if (c.seen and !c.val_null) c.val.str[0..c.len] else null;
+    }
+};
+
+const ValueScalarResult = struct {
+    fn bits(_: ValueScalarResult, c: ValueNarrow) ?i64 {
+        return if (c.seen) c.val.int else null;
+    }
+};
+
+const ValueTextResult = struct {
+    fn text(_: ValueTextResult, c: ValueNarrow) ?[]const u8 {
+        return if (c.seen) c.val.str[0..c.len] else null;
+    }
+};
 
 pub fn appendAccToColumn(
     allocator: Allocator,
