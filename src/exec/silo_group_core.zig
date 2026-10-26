@@ -3475,7 +3475,7 @@ fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.A
     for (buckets, 0..) |*b, i| cum[i + 1] = cum[i] + b.states.len;
     const total = cum[buckets.len];
     if (total == 0) return;
-    try out.ensureUnusedCapacity(allocator, total);
+    try out.ensureTotalCapacityPrecise(allocator, out.items.len + total);
     const dst = out.items.ptr[out.items.len .. out.items.len + total];
     out.items.len += total;
     const workers: usize = @max(1, @min(n_workers, total / ALL_GROUPS_FILL_ROWS_PER_WORKER));

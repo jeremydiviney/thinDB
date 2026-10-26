@@ -32,6 +32,19 @@ pub fn nowTicks() i64 {
     return c;
 }
 
+/// Page faults the whole process has taken so far (minor + major). Process-
+/// wide on purpose: a statement's faults land on its worker threads too.
+pub fn processFaults() u64 {
+    if (builtin.os.tag == .linux) {
+        const ru = std.posix.getrusage(std.posix.rusage.SELF);
+        return @intCast(ru.minflt + ru.majflt);
+    }
+    if (builtin.os.tag != .windows) return 0;
+    var vm: win.PROCESS.VM_COUNTERS = undefined;
+    const rc = win.ntdll.NtQueryInformationProcess(win.current_process, .VmCounters, &vm, @sizeOf(win.PROCESS.VM_COUNTERS), null);
+    return if (rc == .SUCCESS) vm.PageFaultCount else 0;
+}
+
 fn freq() i64 {
     if (builtin.os.tag == .linux) return std.time.ns_per_s;
     if (builtin.os.tag != .windows) return 1;
@@ -67,6 +80,8 @@ pub inline fn add(name: []const u8, ticks: u64) void {
 pub fn reset() void {
     count = 0;
     cte_child_ticks = 0;
+    cte_child_faults = 0;
+    query_faults0 = if (enabled) processFaults() else 0;
     self_count = 0;
     while (!inst_mutex.tryLock()) std.atomic.spinLoopHint();
     inst_map.clearRetainingCapacity();
@@ -241,6 +256,7 @@ pub fn dumpSelf(label: []const u8) void {
         std.debug.print("[self]   {s: <44} {d: >9.2} ms  {d: >5.1}%  ({d} calls)\n", .{ shortOpName(s.name), ms, pct, s.calls });
     }
     std.debug.print("[self]   {s: <44} {d: >9.2} ms  100.0%\n", .{ "TOTAL (connection-thread wall)", @as(f64, @floatFromInt(total)) * 1000.0 / hz });
+    std.debug.print("[self]   {s: <44} {d: >9}\n", .{ "page faults (process-wide)", processFaults() -| query_faults0 });
     dumpDeinit();
 }
 
@@ -260,14 +276,19 @@ pub fn addCteChildTicks(ticks: u64) void {
     cte_child_ticks +%= ticks;
 }
 
+threadlocal var cte_child_faults: u64 = 0;
+threadlocal var query_faults0: u64 = 0;
+
 const SlotSnap = struct {
     names: [48][]const u8 = undefined,
     ticks: [48]u64 = undefined,
     n: usize = 0,
+    faults: u64 = 0,
+    child_faults: u64 = 0,
 };
 
 pub fn snapSlots() SlotSnap {
-    var s: SlotSnap = .{ .n = count };
+    var s: SlotSnap = .{ .n = count, .faults = processFaults(), .child_faults = cte_child_faults };
     for (0..count) |i| {
         s.names[i] = slots[i].name;
         s.ticks[i] = slots[i].ticks;
@@ -287,7 +308,10 @@ pub fn dumpStageDelta(stage_id: usize, name: []const u8, rows: u64, self_ticks: 
     const wall_ms = @as(f64, @floatFromInt(@max(wall_ticks, 0))) * 1000.0 / hz;
     const setup_ms = @as(f64, @floatFromInt(@max(setup_ticks, 0))) * 1000.0 / hz;
     const teardown_ms = @as(f64, @floatFromInt(@max(teardown_ticks, 0))) * 1000.0 / hz;
-    std.debug.print("[cte] stage#{d: <3} {s: <40} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock)\n", .{ stage_id, name, rows, setup_ms, self_ms, teardown_ms, wall_ms });
+    const faults_wall = processFaults() -| before.faults;
+    const faults_self = faults_wall -| (cte_child_faults -| before.child_faults);
+    cte_child_faults +%= faults_self;
+    std.debug.print("[cte] stage#{d: <3} {s: <40} rows={d: <9} setup={d: >7.2}ms execute={d: >8.2}ms teardown={d: >6.2}ms  (wall={d: >8.2}ms, all wall-clock) faults={d} (wall {d})\n", .{ stage_id, name, rows, setup_ms, self_ms, teardown_ms, wall_ms, faults_self, faults_wall });
     for (slots[0..count]) |s| {
         var prev: u64 = 0;
         for (0..before.n) |j| {

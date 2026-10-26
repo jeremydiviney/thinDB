@@ -1120,8 +1120,11 @@ const EmitRanges = struct {
         return .{ .allocator = op.allocator, .worker_alloc = worker_alloc, .jobs = jobs, .threads = threads };
     }
 
+    /// The retaining pool: a multi-million-group emit fills hundreds of MiB
+    /// of range columns and late-materialized keys, and fresh heap pages for
+    /// them fault in again on every run.
     fn workerAllocator(op: *GroupTopNPipeline) !Allocator {
-        return exec.memory.trackedBackend(std.heap.c_allocator, exec.memory.accountantOf(op.allocator));
+        return exec.memory.workerAllocator(exec.memory.accountantOf(op.allocator), std.heap.c_allocator);
     }
 
     fn initRangeCols(worker_alloc: Allocator, schema: []const Column) ![]ColumnStore {
