@@ -8,16 +8,18 @@
 //!
 //! This bench strips all confounders: it opens `.clickbench-db`, pulls every
 //! non-empty Referer into one flat in-memory buffer (UNTIMED setup — decode +
-//! decompress happens here, off the clock), then runs the exact same Pike-VM
-//! `replaceAllScratch` loop the operator runs, single-threaded and at 2/4/8
-//! threads, timing ONLY the regex. The result is raw regex throughput on the
-//! real URL distribution + its thread scaling — no query engine in the way.
+//! decompress happens here, off the clock), checks `findWith` against the
+//! Pike VM on every row, then times the Pike VM alone, `findWith`, and the
+//! exact `replaceAllScratch` loop the operator runs, at 1 and 12 threads,
+//! timing ONLY the regex. The result is raw regex throughput on the real URL
+//! distribution + its thread scaling — no query engine in the way.
 //!
 //! Timing uses the Windows perf counter directly (this project routes clocks
 //! through Io; std.time exposes only constants — see util/prof.zig).
 //!
-//! Run:  zig build regexreal -Doptimize=ReleaseFast
-//!   (stop thindb-server first if it holds .clickbench-db exclusively)
+//! Run:  zig build regexreal -Doptimize=ReleaseFast -- [cache-file]
+//!   (the first run reads .clickbench-db, so stop thindb-server first if it
+//!   holds it; later runs with the same cache file never open it)
 
 const std = @import("std");
 const win = std.os.windows;
@@ -96,7 +98,12 @@ const Job = struct {
     hi: usize,
     checksum: *usize,
     cpu: usize,
+    mode: Mode,
 };
+
+/// `replace` is the operator's kernel; `find` and `find_vm` time one
+/// search per row through `findWith` and the Pike VM alone.
+const Mode = enum { replace, find, find_vm };
 
 fn worker(job: Job) void {
     _ = SetThreadAffinityMask(GetCurrentThread(), @as(usize, 1) << @intCast(job.cpu));
@@ -104,14 +111,51 @@ fn worker(job: Job) void {
     defer re.deinit();
     var scratch = regex.Scratch.init(std.heap.page_allocator);
     defer scratch.deinit();
+    var slots: [4]?usize = undefined;
     var cs: usize = 0;
     var i = job.lo;
     while (i < job.hi) : (i += 1) {
         const url = job.data[job.offsets[i]..job.offsets[i + 1]];
-        const out = re.replaceAllScratch(url, TEMPLATE, &scratch) catch break;
-        cs +%= out.len;
+        switch (job.mode) {
+            .replace => {
+                const out = re.replaceAllScratch(url, TEMPLATE, &scratch) catch break;
+                cs +%= out.len;
+            },
+            .find, .find_vm => {
+                const found = (if (job.mode == .find)
+                    re.findWith(&scratch, url, 0, &slots)
+                else
+                    re.findWithVm(&scratch, url, 0, &slots)) catch break;
+                if (found) cs +%= slots[3].? - slots[2].?;
+            },
+        }
     }
     job.checksum.* = cs;
+}
+
+/// Rows where `findWith` and the Pike VM disagree on match or captures.
+fn countEngineMismatches(data: []const u8, offsets: []const usize) !usize {
+    var re = try regex.Regex.compile(std.heap.page_allocator, PATTERN);
+    defer re.deinit();
+    var s_new = regex.Scratch.init(std.heap.page_allocator);
+    defer s_new.deinit();
+    var s_vm = regex.Scratch.init(std.heap.page_allocator);
+    defer s_vm.deinit();
+    var a: [4]?usize = undefined;
+    var b: [4]?usize = undefined;
+    var mismatches: usize = 0;
+    for (0..offsets.len - 1) |i| {
+        const url = data[offsets[i]..offsets[i + 1]];
+        @memset(&a, null);
+        @memset(&b, null);
+        const fa = try re.findWith(&s_new, url, 0, &a);
+        const fb = try re.findWithVm(&s_vm, url, 0, &b);
+        if (fa != fb or !std.mem.eql(?usize, &a, &b)) {
+            if (mismatches == 0) std.debug.print("[regex-real] first mismatch at row {d}\n", .{i});
+            mismatches += 1;
+        }
+    }
+    return mismatches;
 }
 
 fn findRefererTable(allocator: std.mem.Allocator, catalog: anytype) !*thindb.api.Table {
@@ -148,101 +192,142 @@ fn findRefererTable(allocator: std.mem.Allocator, catalog: anytype) !*thindb.api
     return error.NotFound;
 }
 
+/// Flat column: every non-empty value back-to-back, plus n+1 offsets.
+const Column = struct {
+    data: std.ArrayListUnmanaged(u8) = .empty,
+    offsets: std.ArrayListUnmanaged(usize) = .empty,
+
+    fn deinit(self: *Column, allocator: std.mem.Allocator) void {
+        self.data.deinit(allocator);
+        self.offsets.deinit(allocator);
+    }
+};
+
+fn loadFromDb(allocator: std.mem.Allocator, io: std.Io, col: *Column) !void {
+    var data_root = try std.Io.Dir.cwd().createDirPathOpen(io, ".clickbench-db", .{});
+    defer data_root.close(io);
+    const catalog = try thindb.Catalog.open(allocator, io, data_root, .{});
+    defer catalog.close();
+    const table = try findRefererTable(allocator, catalog);
+
+    var total_rows: u64 = 0;
+    for (table.manifest.segments.items) |s| total_rows += s.row_count;
+    std.debug.print("[regex-real] {s}: {d} total rows; loading non-empty into RAM (untimed)...\n", .{ COLUMN, total_rows });
+    try col.data.ensureTotalCapacity(allocator, @intCast(total_rows * 48));
+    try col.offsets.ensureTotalCapacity(allocator, @intCast(total_rows + 1));
+    try col.offsets.append(allocator, 0);
+
+    var q = try thindb.exec.Scan.createWithProjection(allocator, table, null, &.{COLUMN});
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        const sv = switch (batch.values[0].data) {
+            .varchar, .string, .char => |s| s,
+            else => return error.UnexpectedType,
+        };
+        var r: usize = 0;
+        while (r < batch.row_count) : (r += 1) {
+            const bytes = sv.rowBytes(r);
+            if (bytes.len == 0) continue;
+            try col.data.appendSlice(allocator, bytes);
+            try col.offsets.append(allocator, col.data.items.len);
+        }
+    }
+}
+
+// Cache layout: n_urls u64, byte count u64, offsets (n_urls+1) × u64, bytes.
+fn writeCache(io: std.Io, path: []const u8, col: *const Column) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    const head = [2]u64{ col.offsets.items.len - 1, col.data.items.len };
+    try file.writePositionalAll(io, std.mem.sliceAsBytes(&head), 0);
+    const off_bytes = std.mem.sliceAsBytes(col.offsets.items);
+    try file.writePositionalAll(io, off_bytes, 16);
+    try file.writePositionalAll(io, col.data.items, 16 + off_bytes.len);
+}
+
+fn readCache(allocator: std.mem.Allocator, io: std.Io, path: []const u8, col: *Column) !bool {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close(io);
+    var head: [2]u64 = undefined;
+    if (try file.readPositionalAll(io, std.mem.sliceAsBytes(&head), 0) != 16) return error.UnexpectedEof;
+    try col.offsets.resize(allocator, @intCast(head[0] + 1));
+    try col.data.resize(allocator, @intCast(head[1]));
+    const off_bytes = std.mem.sliceAsBytes(col.offsets.items);
+    if (try file.readPositionalAll(io, off_bytes, 16) != off_bytes.len) return error.UnexpectedEof;
+    if (try file.readPositionalAll(io, col.data.items, 16 + off_bytes.len) != col.data.items.len) return error.UnexpectedEof;
+    return true;
+}
+
+/// Usage: regex_real [cache-file]. With a cache file that exists, the
+/// column loads from it and `.clickbench-db` is never opened, so a server
+/// may keep running on it; otherwise the column is read from the database
+/// and, given a path, written there for the next run.
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const freq = perfFreq();
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const cache_path: ?[]const u8 = if (args.len > 1) args[1] else null;
 
-    const cwd = std.Io.Dir.cwd();
-    var data_root = try cwd.createDirPathOpen(io, ".clickbench-db", .{});
-    defer data_root.close(io);
-
-    const catalog = try thindb.Catalog.open(allocator, io, data_root, .{});
-    defer catalog.close();
-
-    const table = try findRefererTable(allocator, catalog);
-
-    var total_rows: u64 = 0;
-    for (table.manifest.segments.items) |s| total_rows += s.row_count;
-    std.debug.print("[regex-real] {s}: {d} total rows; loading non-empty into RAM (untimed)...\n", .{ COLUMN, total_rows });
-
-    // Flat buffer: all non-empty Referer bytes back-to-back + an offsets array.
-    var data: std.ArrayListUnmanaged(u8) = .empty;
-    defer data.deinit(allocator);
-    var offsets: std.ArrayListUnmanaged(usize) = .empty;
-    defer offsets.deinit(allocator);
-    try data.ensureTotalCapacity(allocator, @intCast(total_rows * 48));
-    try offsets.ensureTotalCapacity(allocator, @intCast(total_rows + 1));
-    try offsets.append(allocator, 0);
-
+    var col: Column = .{};
+    defer col.deinit(allocator);
     const load_t0 = nowTicks();
-    var q = try thindb.exec.Scan.createWithProjection(allocator, table, null, &.{COLUMN});
-    defer q.deinit();
-    var scanned: u64 = 0;
-    while (try q.next()) |batch| {
-        const sv = switch (batch.values[0].data) {
-            .varchar, .string, .char => |s| s,
-            else => return error.UnexpectedType,
-        };
-        const n = batch.row_count;
-        var r: usize = 0;
-        while (r < n) : (r += 1) {
-            const bytes = sv.rowBytes(r);
-            if (bytes.len == 0) continue;
-            try data.appendSlice(allocator, bytes);
-            try offsets.append(allocator, data.items.len);
-        }
-        scanned += n;
+    const cached = if (cache_path) |p| try readCache(allocator, io, p, &col) else false;
+    if (!cached) {
+        try loadFromDb(allocator, io, &col);
+        if (cache_path) |p| try writeCache(io, p, &col);
     }
     const load_ms = ticksToMs(nowTicks() - load_t0, freq);
 
-    const n_urls = offsets.items.len - 1;
-    const total_bytes = data.items.len;
+    const data_slice = col.data.items;
+    const off_slice = col.offsets.items;
+    const n_urls = off_slice.len - 1;
+    const total_bytes = data_slice.len;
     std.debug.print(
-        "[regex-real] loaded {d} non-empty urls ({d} scanned), {d:.2} GB, avg {d:.1} B/url, load {d:.0} ms\n",
-        .{ n_urls, scanned, @as(f64, @floatFromInt(total_bytes)) / 1e9, @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(n_urls)), load_ms },
+        "[regex-real] {d} non-empty urls, {d:.2} GB, avg {d:.1} B/url, load {d:.0} ms ({s})\n",
+        .{ n_urls, @as(f64, @floatFromInt(total_bytes)) / 1e9, @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(n_urls)), load_ms, if (cached) "cache" else "db" },
     );
 
-    const data_slice = data.items;
-    const off_slice = offsets.items;
+    const mismatches = try countEngineMismatches(data_slice, off_slice);
+    std.debug.print("[regex-real] findWith vs Pike VM: {d} mismatching rows\n", .{mismatches});
 
     const cpus = try cpuOrder(allocator);
     defer allocator.free(cpus);
-    std.debug.print("[regex-real] pinning: {d} physical cores; thread t -> distinct core for first {d} threads\n", .{ cpus.len / 2, cpus.len / 2 });
 
-    inline for (.{ 1, 2, 4, 8, 12, 16, 20, 24, 28, 32 }) |dop| {
-        var checksums: [dop]usize = [_]usize{0} ** dop;
-        var threads: [dop]std.Thread = undefined;
-        const t0 = nowTicks();
-        var t: usize = 0;
-        while (t < dop) : (t += 1) {
-            const lo = t * n_urls / dop;
-            const hi = (t + 1) * n_urls / dop;
-            threads[t] = try std.Thread.spawn(.{}, worker, .{Job{
-                .data = data_slice,
-                .offsets = off_slice,
-                .lo = lo,
-                .hi = hi,
-                .checksum = &checksums[t],
-                .cpu = cpus[t % cpus.len],
-            }});
+    inline for (.{ Mode.find_vm, Mode.find, Mode.replace }) |mode| {
+        inline for (.{ 1, 12 }) |dop| {
+            var checksums: [dop]usize = [_]usize{0} ** dop;
+            var threads: [dop]std.Thread = undefined;
+            const t0 = nowTicks();
+            var t: usize = 0;
+            while (t < dop) : (t += 1) {
+                threads[t] = try std.Thread.spawn(.{}, worker, .{Job{
+                    .data = data_slice,
+                    .offsets = off_slice,
+                    .lo = t * n_urls / dop,
+                    .hi = (t + 1) * n_urls / dop,
+                    .checksum = &checksums[t],
+                    .cpu = cpus[t % cpus.len],
+                    .mode = mode,
+                }});
+            }
+            t = 0;
+            while (t < dop) : (t += 1) threads[t].join();
+            const ms = ticksToMs(nowTicks() - t0, freq);
+
+            var cs_total: usize = 0;
+            for (checksums) |c| cs_total +%= c;
+            const ns_per_url = ms * 1e6 / @as(f64, @floatFromInt(n_urls));
+            std.debug.print(
+                "[regex-real] {s:>8} DOP={d:>2}: {d:>7.0} ms | {d:>6.1} ns/url (x DOP = {d:.1}) | cs={d}\n",
+                .{ @tagName(mode), dop, ms, ns_per_url, ns_per_url * @as(f64, @floatFromInt(dop)), cs_total },
+            );
         }
-        t = 0;
-        while (t < dop) : (t += 1) threads[t].join();
-        const ms = ticksToMs(nowTicks() - t0, freq);
-
-        var cs_total: usize = 0;
-        for (checksums) |c| cs_total +%= c;
-        const secs = ms / 1000.0;
-        const mbps = @as(f64, @floatFromInt(total_bytes)) / 1e6 / secs;
-        const murls = @as(f64, @floatFromInt(n_urls)) / 1e6 / secs;
-        const us_per_url = ms * 1000.0 / @as(f64, @floatFromInt(n_urls));
-        std.debug.print(
-            "[regex-real] DOP={d}: {d:.0} ms | {d:.0} MB/s | {d:.1} M urls/s | {d:.3} us/url | cs={d}\n",
-            .{ dop, ms, mbps, murls, us_per_url, cs_total },
-        );
     }
     return 0;
 }
