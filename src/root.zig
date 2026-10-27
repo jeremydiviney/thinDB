@@ -3,6 +3,10 @@
 
 const std = @import("std");
 
+comptime {
+    _ = @import("memset");
+}
+
 pub const version = "0.1.0-dev";
 
 pub const types = @import("types.zig");
