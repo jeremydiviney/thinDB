@@ -17,7 +17,8 @@
 //! Timing uses the Windows perf counter directly (this project routes clocks
 //! through Io; std.time exposes only constants — see util/prof.zig).
 //!
-//! Run:  zig build regexreal -Doptimize=ReleaseFast -- [cache-file]
+//! Run:  zig build regexreal -Doptimize=ReleaseFast -- [cache-file] [quick]
+//!   (`quick` skips the engine cross-check and the Pike VM timings)
 //!   (the first run reads .clickbench-db, so stop thindb-server first if it
 //!   holds it; later runs with the same cache file never open it)
 
@@ -273,6 +274,7 @@ pub fn main(init: std.process.Init) !u8 {
     const freq = perfFreq();
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const cache_path: ?[]const u8 = if (args.len > 1) args[1] else null;
+    const quick = args.len > 2 and std.mem.eql(u8, args[2], "quick");
 
     var col: Column = .{};
     defer col.deinit(allocator);
@@ -293,14 +295,16 @@ pub fn main(init: std.process.Init) !u8 {
         .{ n_urls, @as(f64, @floatFromInt(total_bytes)) / 1e9, @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(n_urls)), load_ms, if (cached) "cache" else "db" },
     );
 
-    const mismatches = try countEngineMismatches(data_slice, off_slice);
-    std.debug.print("[regex-real] findWith vs Pike VM: {d} mismatching rows\n", .{mismatches});
+    if (!quick) {
+        const mismatches = try countEngineMismatches(data_slice, off_slice);
+        std.debug.print("[regex-real] findWith vs Pike VM: {d} mismatching rows\n", .{mismatches});
+    }
 
     const cpus = try cpuOrder(allocator);
     defer allocator.free(cpus);
 
     inline for (.{ Mode.find_vm, Mode.find, Mode.replace }) |mode| {
-        inline for (.{ 1, 12 }) |dop| {
+        inline for (.{ 1, 12 }) |dop| if (!(quick and mode == .find_vm)) {
             var checksums: [dop]usize = [_]usize{0} ** dop;
             var threads: [dop]std.Thread = undefined;
             const t0 = nowTicks();
@@ -327,7 +331,7 @@ pub fn main(init: std.process.Init) !u8 {
                 "[regex-real] {s:>8} DOP={d:>2}: {d:>7.0} ms | {d:>6.1} ns/url (x DOP = {d:.1}) | cs={d}\n",
                 .{ @tagName(mode), dop, ms, ns_per_url, ns_per_url * @as(f64, @floatFromInt(dop)), cs_total },
             );
-        }
+        };
     }
     return 0;
 }
