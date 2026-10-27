@@ -798,21 +798,30 @@ fn runHarness(
     // toggle additionally forces an integer-key query down the same path for
     // cross-checking against the exact integer-packed result.
     const force_hash = shape.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null;
-    // Weighted run collapse: decomposable programs (COUNT(*) / SUM / AVG /
-    // MIN / MAX) ship (key, weight, pre-folded inputs) staged rows — the scan
-    // emitter folds a run of adjacent-equal keys (the table's physical order
-    // clusters them) into ONE row carrying the run's partial aggregates.
-    // Declined for COUNT(col)/DISTINCT/string aggs (need per-row data), for
-    // an input column shared by two aggregates (one staged value can't be
-    // both a run-sum and a run-min), and for a non-count aggregate at state
-    // slot 0 (the lane's kernel pass can't express it — mirrors its
-    // `kernelizable` check).
+    // Weighted collapse: decomposable programs (COUNT(*) / SUM / AVG / MIN /
+    // MAX, string MIN / MAX included) ship (key, weight, pre-folded inputs)
+    // staged rows — the scan emitter folds rows of a key already staged in
+    // its chunk (a run of adjacent-equal keys, or a repeat its fold index
+    // finds) into ONE row carrying the key's partial aggregates.
+    // Declined for COUNT(col)/DISTINCT (need per-row data), for an input
+    // column shared by two aggregates (one staged value can't be both a
+    // run-sum and a run-min), and for a non-count aggregate at state slot 0
+    // (the lane's kernel pass can't express it — mirrors its `kernelizable`
+    // check).
     const weight_mode = blk: {
         if (shape.aggregate_program.len == 0) break :blk false;
-        if (shape.string_aggregate_inputs.len != 0 or distinct_slot_count != 0) break :blk false;
+        if (distinct_slot_count != 0) break :blk false;
         var input_used = [_]bool{false} ** 16;
+        var str_input_used = [_]bool{false} ** group_str_columns_buf.len;
         for (shape.aggregate_program) |agg| {
-            if (agg.is_distinct or agg.is_string or agg.is_udf) break :blk false;
+            if (agg.is_distinct or agg.is_udf) break :blk false;
+            if (agg.is_string) {
+                if (agg.is_concat or (agg.op != .min and agg.op != .max)) break :blk false;
+                const si = agg.str_input_index;
+                if (si >= shape.string_aggregate_inputs.len or str_input_used[si]) break :blk false;
+                str_input_used[si] = true;
+                continue;
+            }
             switch (agg.op) {
                 .count_star => {},
                 .sum, .avg, .min, .max => {
@@ -832,12 +841,17 @@ fn runHarness(
         for (input_used[0..shape.aggregate_inputs.len]) |u| {
             if (!u) break :blk false;
         }
+        for (str_input_used[0..shape.string_aggregate_inputs.len]) |u| {
+            if (!u) break :blk false;
+        }
         // COUNT-only collapse is nearly free (a 4-byte weight) and ships
         // unconditionally. Payload-carrying collapse widens every staged
         // column to 8 bytes, so on keys that DON'T arrive in runs it is pure
         // staging inflation (measured: Q31/Q32-class +15-20%) — require
-        // storage-proven run structure on every key column first.
-        if (shape.aggregate_inputs.len != 0 and
+        // storage-proven run structure on every key column first. A string
+        // extreme's staged bytes dwarf that widening, and the fold index
+        // collapses repeats that never form runs, so it ships regardless.
+        if (shape.aggregate_inputs.len != 0 and shape.string_aggregate_inputs.len == 0 and
             !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len])) break :blk false;
         break :blk true;
     };

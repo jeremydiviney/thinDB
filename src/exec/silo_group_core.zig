@@ -1284,6 +1284,20 @@ const WorkerParts = struct {
     flat_offsets: []u32 = &.{},
     flat_next: []u32 = &.{},
     raw_active_rows: RawRows = .{},
+    /// Weighted layouts: staged-row index of the active raw chunk by key
+    /// hash, so a key that repeats anywhere in the chunk folds into its one
+    /// staged row instead of only an adjacent repeat. Only a hint: an entry
+    /// is used when it is below the chunk's length and its key matches, so
+    /// entries left from earlier chunks are harmless and a miss just stages
+    /// a new row.
+    fold_slots: []u32 = &.{},
+    fold_shift: u6 = 63,
+    /// Fold-index probes and hits since the active chunk was last published;
+    /// a chunk whose probes mostly missed turns the probe off for the rest of
+    /// the query.
+    fold_probes: u64 = 0,
+    fold_hits: u64 = 0,
+    fold_off: bool = false,
     worker_index: usize = 0,
     raw_scan_lane: usize = 0,
     scanned_count: u64 = 0,
@@ -1359,6 +1373,7 @@ const WorkerParts = struct {
         self.flat_raw_rows.deinit(allocator);
         self.flat_bucket_ids.deinit(allocator);
         self.raw_active_rows.deinit(allocator);
+        if (self.fold_slots.len > 0) allocator.free(self.fold_slots);
         if (self.flat_counts.len > 0) allocator.free(self.flat_counts);
         if (self.flat_offsets.len > 0) allocator.free(self.flat_offsets);
         if (self.flat_next.len > 0) allocator.free(self.flat_next);
@@ -1392,6 +1407,23 @@ const WorkerParts = struct {
             self.flat_next = try allocator.alloc(u32, bucket_count);
             @memset(self.flat_next, 0);
         }
+    }
+
+    // Twice the chunk's rows in slots, so a full chunk's distinct keys rarely
+    // collide. A reused workspace keeps its slots but not the last query's
+    // on/off verdict.
+    fn prepareFoldIndex(self: *WorkerParts, allocator: Allocator, raw_chunk_rows: usize) !void {
+        const want = try std.math.ceilPowerOfTwo(usize, @max(raw_chunk_rows * 2, 64));
+        if (self.fold_slots.len != want) {
+            const slots = try allocator.alloc(u32, want);
+            if (self.fold_slots.len > 0) allocator.free(self.fold_slots);
+            self.fold_slots = slots;
+            self.fold_shift = @intCast(64 - @as(u7, std.math.log2_int(usize, want)));
+        }
+        @memset(self.fold_slots, std.math.maxInt(u32));
+        self.fold_probes = 0;
+        self.fold_hits = 0;
+        self.fold_off = false;
     }
 };
 
@@ -3842,7 +3874,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         if (part.nullable) keys_nullable = true;
     }
 
-    if (layout.has_weight and !layout.has_rowref and !keys_nullable) runs_blk: {
+    if (layout.has_weight and !layout.has_rowref and !keys_nullable and !layout.has_str_payload) runs_blk: {
         const rb = batch.runs orelse break :runs_blk;
         var key_runs_buf: [MAX_GENERIC_GROUP_KEYS]thindb.exec.RunsColumn = undefined;
         for (layout.key_columns, 0..) |part, i| {
@@ -3867,8 +3899,9 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     }
 
     // Nullable numeric inputs also stay per-row: the fast key kernels append
-    // payload bytes with no validity-lane write.
-    if (!layout.has_rowref and !keys_nullable and !inputs_nullable) {
+    // payload bytes with no validity-lane write. Their weighted forms collapse
+    // numeric runs only; string extremes fold in the per-row loop.
+    if (!layout.has_rowref and !keys_nullable and !inputs_nullable and !(layout.has_weight and layout.has_str_payload)) {
         if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, str_nulls, raw_chunk_rows, profile)) return;
     }
 
@@ -3882,9 +3915,12 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
 
     const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
+    var probes: u64 = 0;
+    var hits: u64 = 0;
     var r: usize = 0;
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
+        const use_fold = layout.has_weight and !parts.fold_off and parts.fold_slots.len != 0;
         // The row loop is duplicated on the (per-batch constant) validity
         // flag so the non-nullable copy carries zero per-row validity code —
         // this loop runs once per scanned row on every staged GROUP BY.
@@ -3912,21 +3948,32 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             else
                 try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
-            // Weighted collapse (decomposable programs): an adjacent-equal key
-            // folds into the last staged row instead of appending — the run
-            // ships as ONE (key, weight, partials) row. The creating row's
-            // rowref is kept (any row of the run has the same key values).
+            // Weighted collapse (decomposable programs): a key already staged
+            // in the chunk — the adjacent row, or one the fold index finds —
+            // folds into that row instead of appending, so the chunk ships
+            // ONE (key, weight, partials) row per key. The creating row's
+            // rowref is kept (any row of the key has the same key values).
             // (The weight gate declines nullable inputs, so this branch only
             // lives in the non-nullable copy.)
             if (layout.has_weight) {
                 if (idx > 0 and active.keyAt(idx - 1) == key) {
-                    active.weightAll()[idx - 1] += 1;
-                    weightFoldRange(active, weight_specs, idx - 1, r, r + 1, false);
+                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, idx - 1, r);
                     accepted += 1;
                     continue;
                 }
+                if (use_fold) {
+                    const held = foldIndexProbe(parts, active, key, idx);
+                    probes += 1;
+                    if (held < idx and active.weightAll()[held] < std.math.maxInt(u32)) {
+                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, held, r);
+                        hits += 1;
+                        accepted += 1;
+                        continue;
+                    }
+                }
                 active.weightAll()[idx] = 1;
                 weightFoldRange(active, weight_specs, idx, r, r + 1, true);
+                if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
@@ -3940,8 +3987,19 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.len_rows = idx + 1;
             accepted += 1;
         }
-        if (active.len() == raw_chunk_rows) try publishActiveRawRows(parts, shared, raw_chunk_rows);
+        // A folding chunk can take rows indefinitely; a string extreme that
+        // keeps improving keeps appending bytes, so those bytes also close it.
+        const full = active.len() == raw_chunk_rows or
+            (layout.has_weight and str_views.len != 0 and active.str.bytes.items.len >= FOLD_CHUNK_STR_BYTES);
+        if (full) {
+            noteFoldChunk(parts, probes, hits);
+            probes = 0;
+            hits = 0;
+            try publishActiveRawRows(parts, shared, raw_chunk_rows);
+        }
     }
+    parts.fold_probes += probes;
+    parts.fold_hits += hits;
     parts.scanned_count += batch.row_count;
     parts.row_count += accepted;
     if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
@@ -4395,6 +4453,58 @@ inline fn weightSrcFloat(view: thindb.storage.ColumnView, r: usize) f64 {
         inline .float, .double => |s| @floatCast(s[r]),
         else => 0,
     };
+}
+
+// Bytes past which a weighted chunk with string extremes publishes before it
+// fills: an unfilled chunk of few keys would otherwise keep every improving
+// extreme's bytes until the scan ends.
+const FOLD_CHUNK_STR_BYTES: usize = 8 << 20;
+
+// The staged row the fold index holds for `key`, or `idx` after pointing the
+// key's slot at `idx`, the row the caller stages next.
+inline fn foldIndexProbe(parts: *WorkerParts, active: *const RawRows, key: u128, idx: usize) usize {
+    const mixed: u64 = @truncate(key ^ (key >> 64));
+    const slot = &parts.fold_slots[@intCast((mixed *% 0x9E3779B97F4A7C15) >> parts.fold_shift)];
+    const held = slot.*;
+    if (held < idx and active.keyAt(held) == key) return held;
+    slot.* = @intCast(idx);
+    return idx;
+}
+
+// A hit saves staging, shipping and grouping a row, several times a probe's
+// cost; a chunk whose probes hit under 1/8 of the time didn't earn them back
+// (adjacent repeats fold without probing), so the worker stops probing.
+fn noteFoldChunk(parts: *WorkerParts, probes: u64, hits: u64) void {
+    const chunk_probes = parts.fold_probes + probes;
+    const chunk_hits = parts.fold_hits + hits;
+    parts.fold_probes = 0;
+    parts.fold_hits = 0;
+    if (chunk_hits * 8 < chunk_probes) parts.fold_off = true;
+}
+
+inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
+    active.weightAll()[dst] += 1;
+    weightFoldRange(active, specs, dst, src, src + 1, false);
+    if (str_views.len != 0) try weightFoldStr(active, allocator, aggregates, str_views, str_nulls, dst, src);
+}
+
+// Fold source row `src`'s string extremes into staged row `dst`. A NULL input
+// changes nothing and a staged NULL takes the first valid value; a replaced
+// value's bytes stay in the chunk's store until the chunk recycles.
+fn weightFoldStr(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
+    const k = str_views.len;
+    for (aggregates) |agg| {
+        if (!agg.is_string) continue;
+        const c = agg.str_input_index;
+        if (!thindb.storage.column.isValidBit(str_nulls[c], src)) continue;
+        const b = str_views[c].rowBytes(src);
+        if (!active.str.isNull(k, dst, c)) {
+            const cmp = json_binary.columnOrder(agg.is_json, b, active.str.get(k, dst, c));
+            const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
+            if (!is_better) continue;
+        }
+        try active.str.append(allocator, k, dst, c, b);
+    }
 }
 
 // Fold source rows [r0, r1) into staged row `idx`: reduce the range in a
@@ -6983,15 +7093,16 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (use_raw_group) {
             try parts[i].ensureWideBucketScratch(allocator, bucket_count);
             try parts[i].raw_active_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, raw_chunk_rows);
+            if (cfg.group_rows_layout.has_weight) try parts[i].prepareFoldIndex(allocator, raw_chunk_rows);
             const stage_scratch_rows = if (cfg.shared_stage_builders) raw_chunk_rows * @max(@as(usize, 1), @min(raw_batch_chunks, MAX_RAW_BATCH_CHUNKS)) else raw_chunk_rows;
             try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
         // Weighted integer-key programs consume RLE run headers directly (the
-        // run-native emitter); hashed-key layouts pack from digests, where the
-        // sidecar has no consumer.
-        scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref;
+        // run-native emitter); hashed-key layouts pack from digests and string
+        // extremes fold per row, so neither has a consumer for the sidecar.
+        scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref and !cfg.group_rows_layout.has_str_payload;
         {
             var sq = thindb.exec.makeQuery(scan_allocator, scans[i]);
             drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(cfg.derived, cfg.udf_registry) catch |e| {
