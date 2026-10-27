@@ -3743,6 +3743,12 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
 // buffering costs several times the hash itself on short parts — this runs
 // once per scanned row.
 fn hashGenericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storage.ColumnView, key_digests: []const ?[]const u128, row: usize) u128 {
+    // A lone non-NULL string key's digest already identifies it; digesting
+    // it again would only cost two more hashes per row.
+    if (layout.key_columns.len == 1 and !layout.key_columns[0].nullable) switch (key_views[0].data) {
+        .string, .varchar, .char, .json, .nested, .bitmap => |sv| return if (key_digests[0]) |ds| ds[row] else thindb.exec.stringKeyDigest(sv.rowBytes(row)),
+        else => {},
+    };
     var buf: [MAX_GENERIC_GROUP_KEYS * (1 + @sizeOf(u128))]u8 = undefined;
     var len: usize = 0;
     for (layout.key_columns, 0..) |part, i| {
