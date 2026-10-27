@@ -539,6 +539,39 @@ fn singleByte(inst: Inst) ?u8 {
     return null;
 }
 
+/// Bytes on which the program from `pc` can take its first step at a
+/// position inside the input, or null when that also depends on something
+/// besides the byte there (a reachable match, `^`, `\b`, `\B`). It may be a
+/// superset: it only rules out alternatives that are bound to fail.
+fn firstBytes(allocator: Allocator, prog: []const Inst, pc: u32, multiline: bool) Error!?CharClass {
+    const seen = try allocator.alloc(bool, prog.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+    var stack: std.ArrayListUnmanaged(u32) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, pc);
+
+    var set: CharClass = .{};
+    while (stack.pop()) |at| {
+        if (seen[at]) continue;
+        seen[at] = true;
+        switch (prog[at]) {
+            .jmp => |t| try stack.append(allocator, t),
+            .split => |s| {
+                try stack.append(allocator, s.a);
+                try stack.append(allocator, s.b);
+            },
+            .save => try stack.append(allocator, at + 1),
+            .class => |cc| for (&set.bits, cc.bits) |*x, y| {
+                x.* |= y;
+            },
+            .eol => if (multiline) set.add('\n'),
+            .match, .bol, .word_boundary, .not_word_boundary => return null,
+        }
+    }
+    return set;
+}
+
 const BtStep = struct {
     /// This pc's row in the visited set. Null when pc is entered only by
     /// falling through from pc-1: its pair is then explored exactly when
@@ -548,6 +581,13 @@ const BtStep = struct {
     /// matched as one literal compare; 0 when prog[pc] is not one.
     lit_len: u32,
     star: StarScan,
+    /// For a split that is not a star: the `BtPlan.guards` entry holding
+    /// the bytes its second branch can begin with inside the input, or
+    /// null when that branch must always be kept.
+    alt_guard: ?u32,
+    /// For a star: false when its continuation cannot begin on a byte of
+    /// the star's class, so no position inside a crossed run is retried.
+    star_tail: bool,
 };
 
 /// What the backtracker precomputes per program.
@@ -556,9 +596,10 @@ const BtPlan = struct {
     /// `lit_bytes[pc]` is the byte the single-byte class at pc matches, so
     /// a literal run is `lit_bytes[pc..][0..lit_len]`.
     lit_bytes: []u8,
+    guards: []CharClass,
     rows: u32,
 
-    fn init(allocator: Allocator, prog: []const Inst) Error!BtPlan {
+    fn init(allocator: Allocator, prog: []const Inst, multiline: bool) Error!BtPlan {
         const is_target = try allocator.alloc(bool, prog.len);
         defer allocator.free(is_target);
         @memset(is_target, false);
@@ -577,11 +618,29 @@ const BtPlan = struct {
         const lit_bytes = try allocator.alloc(u8, prog.len);
         errdefer allocator.free(lit_bytes);
 
+        var guards: std.ArrayListUnmanaged(CharClass) = .empty;
+        errdefer guards.deinit(allocator);
         var rows: u32 = 0;
         for (steps, 0..) |*step, pc| {
             step.row = if (is_target[pc]) rows else null;
             if (is_target[pc]) rows += 1;
             step.star = starScanAt(prog, pc);
+            step.alt_guard = null;
+            step.star_tail = true;
+            const s = switch (prog[pc]) {
+                .split => |s| s,
+                else => continue,
+            };
+            const first = try firstBytes(allocator, prog, s.b, multiline) orelse continue;
+            if (step.star == .none) {
+                step.alt_guard = @intCast(guards.items.len);
+                try guards.append(allocator, first);
+            } else {
+                const body = prog[pc + 1].class;
+                var overlap: u8 = 0;
+                for (first.bits, body.bits) |x, y| overlap |= x & y;
+                step.star_tail = overlap != 0;
+            }
         }
         var pc = prog.len;
         while (pc > 0) {
@@ -593,12 +652,13 @@ const BtPlan = struct {
                 break :blk 1 + if (extends) steps[pc + 1].lit_len else 0;
             };
         }
-        return .{ .steps = steps, .lit_bytes = lit_bytes, .rows = rows };
+        return .{ .steps = steps, .lit_bytes = lit_bytes, .guards = try guards.toOwnedSlice(allocator), .rows = rows };
     }
 
     fn deinit(self: BtPlan, allocator: Allocator) void {
         allocator.free(self.steps);
         allocator.free(self.lit_bytes);
+        allocator.free(self.guards);
     }
 };
 
@@ -642,13 +702,24 @@ fn findAnyByte(input: []const u8, from: usize, bytes: []const u8) usize {
     return input.len;
 }
 
-/// The backtracker pushes a job every few steps, so the common case must
-/// not cost a call: `append` compiles out of line.
-inline fn pushJob(scratch: *Scratch, job: BtJob) Error!void {
-    if (scratch.bt_jobs.items.len == scratch.bt_jobs.capacity) {
-        try scratch.bt_jobs.ensureUnusedCapacity(scratch.backing, 1);
+/// The backtracker's pending jobs. It pushes one every few steps, so the
+/// stack lives in locals rather than behind the scratch pointer, where every
+/// store through `caps` or `visited` would force its length back to memory.
+const JobStack = struct {
+    buf: []BtJob,
+    len: usize = 0,
+
+    inline fn push(self: *JobStack, scratch: *Scratch, job: BtJob) Error!void {
+        if (self.len == self.buf.len) self.buf = try growJobs(scratch, self.len);
+        self.buf[self.len] = job;
+        self.len += 1;
     }
-    scratch.bt_jobs.appendAssumeCapacity(job);
+};
+
+fn growJobs(scratch: *Scratch, len: usize) Error![]BtJob {
+    scratch.bt_jobs.items.len = len;
+    try scratch.bt_jobs.ensureUnusedCapacity(scratch.backing, 1);
+    return scratch.bt_jobs.allocatedSlice();
 }
 
 /// Equality for the few bytes of a literal run, where `std.mem.eql`'s
@@ -788,12 +859,14 @@ const Thread = struct { pc: u32, caps: []?usize };
 /// visited-rows × window product goes to the Pike VM.
 const BACKTRACK_MAX_BITS: usize = 256 * 1024;
 
+/// Positions are u32 to keep a job at 16 bytes; `findBacktrack` leaves
+/// longer inputs to the Pike VM.
 const BtJob = union(enum) {
-    explore: struct { pc: u32, pos: usize },
-    restore: struct { slot: u32, old: ?usize },
+    explore: struct { pc: u32, pos: u32 },
+    restore: struct { slot: u32, old: ?u32 },
     /// Continuation `pc` of a crossed greedy star, still to be tried at
     /// positions `hi` down to `lo`.
-    star_tail: struct { pc: u32, lo: usize, hi: usize },
+    star_tail: struct { pc: u32, lo: u32, hi: u32 },
 };
 
 /// Reusable matcher scratch. Construct one per batch and pass it to every
@@ -835,7 +908,12 @@ pub const Scratch = struct {
     /// the captures of the path being explored.
     bt_visited: []u64 = &.{},
     bt_jobs: std.ArrayListUnmanaged(BtJob) = .empty,
-    bt_caps: []?usize = &.{},
+    bt_caps: []?u32 = &.{},
+    /// How often the search without a memo ran out of budget for the
+    /// program at `bt_prog`, out of `bt_tries` attempts.
+    bt_prog: usize = 0,
+    bt_tries: u64 = 0,
+    bt_overruns: u64 = 0,
 
     pub fn init(backing: Allocator) Scratch {
         return .{ .backing = backing, .arena = std.heap.ArenaAllocator.init(backing) };
@@ -854,6 +932,19 @@ pub const Scratch = struct {
         self.backing.free(self.bt_visited);
         self.bt_jobs.deinit(self.backing);
         self.backing.free(self.bt_caps);
+    }
+
+    /// Whether to start `prog`'s backtracking search without a memo: yes
+    /// until 64 tries show more than one in eight running out of budget.
+    fn tryUnmemoized(self: *Scratch, prog: []const Inst) bool {
+        if (self.bt_prog != @intFromPtr(prog.ptr)) {
+            self.bt_prog = @intFromPtr(prog.ptr);
+            self.bt_tries = 0;
+            self.bt_overruns = 0;
+        }
+        if (self.bt_tries >= 64 and self.bt_overruns * 8 > self.bt_tries) return false;
+        self.bt_tries += 1;
+        return true;
     }
 
     /// Grow `visited`/`seed` to fit this program, and guard `gen` against
@@ -967,7 +1058,7 @@ pub const Regex = struct {
             try computePrefilter(allocator, prog);
         errdefer allocator.free(prefilter_bytes);
 
-        const bt = try BtPlan.init(allocator, prog);
+        const bt = try BtPlan.init(allocator, prog, options.multiline);
 
         return .{
             .prog = prog,
@@ -1040,19 +1131,35 @@ pub const Regex = struct {
         return self.findWithImpl(true, scratch, input, start, out_slots);
     }
 
-    /// Leftmost-first search by depth-first backtracking that explores each
-    /// (pc, position) pair at most once. The first path to reach a pair is
-    /// its highest-priority one, and a pair reached again has already
-    /// failed, so the result equals the Pike VM's without its per-byte
-    /// thread lists and capture copies. Start positions share the visited
-    /// set for the same reason. Null when the visited set would exceed
-    /// `BACKTRACK_MAX_BITS`; the caller then runs the Pike VM.
+    /// Leftmost-first search by depth-first backtracking. The first path to
+    /// reach a match is the highest-priority one, so the result equals the
+    /// Pike VM's without its per-byte thread lists and capture copies.
+    ///
+    /// It first runs without a memo under a work budget linear in the
+    /// window, which most values finish well inside with no visited set to
+    /// clear or consult. Past the budget it reruns exploring each (pc,
+    /// position) pair at most once: a pair reached again has already
+    /// failed, and start positions share the visited set for the same
+    /// reason. Null when that visited set would exceed `BACKTRACK_MAX_BITS`;
+    /// the caller then runs the Pike VM.
     fn findBacktrack(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!?bool {
         if (self.anchored_start and start > 0 and !self.multiline) return false;
+        if (input.len > std.math.maxInt(u32)) return null;
         const width = input.len - start + 1;
+        if (scratch.bt_caps.len < self.n_slots) {
+            scratch.bt_caps = try scratch.backing.realloc(scratch.bt_caps, self.n_slots);
+        }
+        const caps = scratch.bt_caps[0..self.n_slots];
+
+        if (scratch.tryUnmemoized(self.prog)) {
+            @memset(caps, null);
+            var budget = 4 * width + 2 * self.prog.len;
+            if (try self.backtrackStarts(false, scratch, input, start, width, &budget, out_slots)) |found| return found;
+            scratch.bt_overruns += 1;
+        }
+
         const n_bits = @as(usize, self.bt.rows) * width;
         if (n_bits > BACKTRACK_MAX_BITS) return null;
-
         const n_words = (n_bits + 63) / 64;
         if (scratch.bt_visited.len < n_words) {
             const grown = @min(BACKTRACK_MAX_BITS / 64, @max(n_words, 2 * scratch.bt_visited.len));
@@ -1060,15 +1167,14 @@ pub const Regex = struct {
             scratch.bt_visited = &.{};
             scratch.bt_visited = try scratch.backing.alloc(u64, grown);
         }
-        if (scratch.bt_caps.len < self.n_slots) {
-            scratch.bt_caps = try scratch.backing.realloc(scratch.bt_caps, self.n_slots);
-        }
         @memset(scratch.bt_visited[0..n_words], 0);
-        // Every save is undone on backtrack, so a failed start leaves the
-        // captures all-null for the next one.
-        @memset(scratch.bt_caps[0..self.n_slots], null);
-        scratch.bt_jobs.clearRetainingCapacity();
+        @memset(caps, null);
+        var unbounded: usize = 0;
+        return try self.backtrackStarts(true, scratch, input, start, width, &unbounded, out_slots);
+    }
 
+    /// Null when the search without a memo ran out of `budget`.
+    fn backtrackStarts(self: *const Regex, comptime memo: bool, scratch: *Scratch, input: []const u8, start: usize, width: usize, budget: *usize, out_slots: []?usize) Error!?bool {
         var sp = start;
         while (sp <= input.len) : (sp += 1) {
             if (self.anchored_start and sp > 0 and !(self.multiline and input[sp - 1] == '\n')) {
@@ -1078,46 +1184,69 @@ pub const Regex = struct {
             } else if (self.prefilter_bytes.len > 0 and sp < input.len) {
                 sp = self.nextCandidate(input, sp);
             }
-            if (try self.backtrackFrom(scratch, input, start, width, sp, out_slots)) return true;
+            switch (try self.backtrackFrom(memo, scratch, input, start, width, sp, budget, out_slots)) {
+                .matched => return true,
+                .failed => {},
+                .over_budget => return null,
+            }
         }
         return false;
     }
 
-    fn backtrackFrom(self: *const Regex, scratch: *Scratch, input: []const u8, base: usize, width: usize, sp: usize, out_slots: []?usize) Error!bool {
+    const BtOutcome = enum { matched, failed, over_budget };
+
+    fn backtrackFrom(self: *const Regex, comptime memo: bool, scratch: *Scratch, input: []const u8, base: usize, width: usize, sp: usize, budget: *usize, out_slots: []?usize) Error!BtOutcome {
         const prog = self.prog;
         const steps = self.bt.steps;
         const visited = scratch.bt_visited;
         const caps = scratch.bt_caps[0..self.n_slots];
-        const jobs = &scratch.bt_jobs;
-        try pushJob(scratch, .{ .explore = .{ .pc = 0, .pos = sp } });
-        while (jobs.items.len > 0) {
+        var work = budget.*;
+        defer budget.* = work;
+        var jobs: JobStack = .{ .buf = scratch.bt_jobs.allocatedSlice() };
+        // Pending explore and star_tail jobs. While there are none a save
+        // needs no restore: failing back past it ends this start position,
+        // whose captures are then cleared for the next.
+        var alts: usize = 1;
+        var unrestored = false;
+        try jobs.push(scratch, .{ .explore = .{ .pc = 0, .pos = @intCast(sp) } });
+        while (jobs.len > 0) {
             var pc: u32 = undefined;
             var pos: usize = undefined;
-            switch (jobs.items[jobs.items.len - 1]) {
+            switch (jobs.buf[jobs.len - 1]) {
                 .restore => |r| {
                     caps[r.slot] = r.old;
-                    _ = jobs.pop();
+                    jobs.len -= 1;
                     continue;
                 },
                 .explore => |e| {
                     pc = e.pc;
                     pos = e.pos;
-                    _ = jobs.pop();
+                    jobs.len -= 1;
+                    alts -= 1;
                 },
                 .star_tail => |*t| {
                     pc = t.pc;
                     pos = t.hi;
-                    if (t.hi > t.lo) t.hi -= 1 else _ = jobs.pop();
+                    if (t.hi > t.lo) {
+                        t.hi -= 1;
+                    } else {
+                        jobs.len -= 1;
+                        alts -= 1;
+                    }
                 },
             }
             while (true) {
+                if (!memo) {
+                    if (work == 0) return .over_budget;
+                    work -= 1;
+                }
                 const step = &steps[pc];
-                if (step.row) |row| {
+                if (memo) if (step.row) |row| {
                     const bit = @as(usize, row) * width + (pos - base);
                     const mask = @as(u64, 1) << @intCast(bit & 63);
                     if (visited[bit >> 6] & mask != 0) break;
                     visited[bit >> 6] |= mask;
-                }
+                };
                 switch (prog[pc]) {
                     .class => |*cc| {
                         const n = step.lit_len;
@@ -1132,38 +1261,55 @@ pub const Regex = struct {
                         }
                     },
                     .match => {
-                        @memcpy(out_slots[0..self.n_slots], caps);
-                        jobs.clearRetainingCapacity();
-                        return true;
+                        for (out_slots[0..self.n_slots], caps) |*out, cap| {
+                            if (cap) |c| out.* = c else out.* = null;
+                        }
+                        return .matched;
                     },
                     .jmp => |t| pc = t,
                     .split => |s| switch (step.star) {
                         .none => {
-                            try pushJob(scratch, .{ .explore = .{ .pc = s.b, .pos = pos } });
+                            const doomed = if (step.alt_guard) |g|
+                                pos < input.len and !self.bt.guards[g].contains(input[pos])
+                            else
+                                false;
+                            if (!doomed) {
+                                try jobs.push(scratch, .{ .explore = .{ .pc = s.b, .pos = @intCast(pos) } });
+                                alts += 1;
+                            }
                             pc = s.a;
                         },
                         else => |scan| {
-                            // Cross the run of class bytes in one scan. The loop
-                            // head's pairs over the run are marked visited as the
-                            // byte-by-byte walk would; it stops early at a pair
-                            // an earlier path already explored. The continuation
-                            // is then tried from the run's far end back to `pos`.
-                            // A star's split is its jmp's target, so it has a row.
-                            const bit = @as(usize, step.row.?) * width + (pos - base);
+                            // Cross the run of class bytes in one scan; the
+                            // continuation is then tried from the run's far end
+                            // back to `pos`. With the memo, the loop head's pairs
+                            // over the run are marked visited as the byte-by-byte
+                            // walk would, and the run stops early at a pair an
+                            // earlier path already explored. A star's split is
+                            // its jmp's target, so it has a row.
                             const end = starRunEnd(scan, &prog[pc + 1].class, input, pos);
                             var top = end;
-                            if (end > pos) {
+                            if (memo and end > pos) {
+                                const bit = @as(usize, step.row.?) * width + (pos - base);
                                 if (bitsFirstSet(visited, bit + 1, bit + (end - pos) + 1)) |hit| top = pos + (hit - bit) - 1;
                                 bitsSetRange(visited, bit + 1, bit + (top - pos) + 1);
                             }
-                            if (top > pos) try pushJob(scratch, .{ .star_tail = .{ .pc = s.b, .lo = pos, .hi = top - 1 } });
+                            if (!memo) work -|= end - pos;
+                            if (step.star_tail and top > pos) {
+                                try jobs.push(scratch, .{ .star_tail = .{ .pc = s.b, .lo = @intCast(pos), .hi = @intCast(top - 1) } });
+                                alts += 1;
+                            }
                             pc = s.b;
                             pos = top;
                         },
                     },
                     .save => |slot| {
-                        try pushJob(scratch, .{ .restore = .{ .slot = slot, .old = caps[slot] } });
-                        caps[slot] = pos;
+                        if (alts > 0) {
+                            try jobs.push(scratch, .{ .restore = .{ .slot = slot, .old = caps[slot] } });
+                        } else {
+                            unrestored = true;
+                        }
+                        caps[slot] = @intCast(pos);
                         pc += 1;
                     },
                     .bol => {
@@ -1183,7 +1329,8 @@ pub const Regex = struct {
                 }
             }
         }
-        return false;
+        if (unrestored) @memset(caps, null);
+        return .failed;
     }
 
     /// DFA-side of `matchesWith`: null when the DFA can't answer (pattern
@@ -2378,6 +2525,11 @@ test "regex: backtracker equals reference matcher (fuzz)" {
         "\\B.\\B",
         "(a*)(a*)(a*)",
         "^(.*?)(.*)$",
+        "^ab?c?(?:ww\\.)?([^/]+)/.*$",
+        "^(?:wd)?([^/]*)(/.*)?$",
+        "(?:x|xy)?z?([^ ]+) ",
+        "a?(b?)c?\\.",
+        "([^.]*)\\.([^.]*)$",
     };
     const option_sets = [_]Options{
         .{},
@@ -2388,12 +2540,16 @@ test "regex: backtracker equals reference matcher (fuzz)" {
     var prng = std.Random.DefaultPrng.init(0xBAC7_2026);
     const rnd = prng.random();
     var buf: [40]u8 = undefined;
+    var searches: u64 = 0;
+    var overruns: u64 = 0;
 
     for (option_sets) |options| for (patterns) |pat| {
         var re = try Regex.compileWith(std.testing.allocator, pat, options);
         defer re.deinit();
         var s_bt = Scratch.init(std.testing.allocator);
         defer s_bt.deinit();
+        var s_memo = Scratch.init(std.testing.allocator);
+        defer s_memo.deinit();
         var s_ref = Scratch.init(std.testing.allocator);
         defer s_ref.deinit();
         const slots_bt = try std.testing.allocator.alloc(?usize, re.n_slots);
@@ -2409,15 +2565,28 @@ test "regex: backtracker equals reference matcher (fuzz)" {
 
             var start: usize = 0;
             while (start <= len) : (start += 1) {
-                @memset(slots_bt, null);
                 @memset(slots_ref, null);
-                const bt = (try re.findBacktrack(&s_bt, input, start, slots_bt)).?;
                 const ref = try re.findWithImpl(false, &s_ref, input, start, slots_ref);
-                try std.testing.expectEqual(ref, bt);
-                if (ref) try std.testing.expectEqualSlices(?usize, slots_ref, slots_bt);
+                // `s_bt` always starts without the memo; `s_memo` is held
+                // to the memoized search alone.
+                s_bt.bt_tries = 0;
+                s_bt.bt_overruns = 0;
+                s_memo.bt_prog = @intFromPtr(re.prog.ptr);
+                s_memo.bt_tries = 64;
+                s_memo.bt_overruns = 64;
+                for ([_]*Scratch{ &s_bt, &s_memo }) |s| {
+                    @memset(slots_bt, null);
+                    const bt = (try re.findBacktrack(s, input, start, slots_bt)).?;
+                    try std.testing.expectEqual(ref, bt);
+                    if (ref) try std.testing.expectEqualSlices(?usize, slots_ref, slots_bt);
+                }
+                searches += 1;
+                overruns += s_bt.bt_overruns;
             }
         }
     };
+    // Both ways the search without a memo ends were exercised.
+    try std.testing.expect(overruns > 0 and overruns < searches);
 }
 
 test "regex: findAnyByte finds the first of several bytes at every offset" {
@@ -2445,6 +2614,9 @@ test "regex: backtracker defers oversized windows to the Pike VM" {
     defer re.deinit();
     var scratch = Scratch.init(std.testing.allocator);
     defer scratch.deinit();
+    scratch.bt_prog = @intFromPtr(re.prog.ptr);
+    scratch.bt_tries = 64;
+    scratch.bt_overruns = 64;
     const big = try std.testing.allocator.alloc(u8, BACKTRACK_MAX_BITS / re.bt.rows + 1);
     defer std.testing.allocator.free(big);
     @memset(big, 'a');
@@ -2454,6 +2626,22 @@ test "regex: backtracker defers oversized windows to the Pike VM" {
     try std.testing.expect(try re.findWith(&scratch, big, 0, &slots));
     try std.testing.expectEqual(@as(?usize, 0), slots[0]);
     try std.testing.expectEqual(@as(?usize, big.len), slots[1]);
+}
+
+test "regex: backtracker without a memo takes oversized windows it finishes in budget" {
+    var re = try Regex.compile(std.testing.allocator, "^([^/]+)/(.*)$");
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const big = try std.testing.allocator.alloc(u8, BACKTRACK_MAX_BITS / re.bt.rows + 1);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'a');
+    big[big.len / 2] = '/';
+    var slots: [6]?usize = undefined;
+    try std.testing.expectEqual(@as(?bool, true), try re.findBacktrack(&scratch, big, 0, &slots));
+    try std.testing.expectEqual(@as(?usize, big.len / 2), slots[3]);
+    try std.testing.expectEqual(@as(?usize, big.len), slots[5]);
+    try std.testing.expectEqual(@as(u64, 0), scratch.bt_overruns);
 }
 
 // Diagnostic micro-benchmark: isolate Pike-VM regex throughput from the query
