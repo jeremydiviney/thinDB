@@ -1088,6 +1088,107 @@ test "string pipeline memory: parallel extrema preserve nulls, bytes, ties and p
     }
 }
 
+test "V2 weighted staging folds non-adjacent repeats with string extremes at DOP 1 and DOP 4" {
+    // Four rows in five go to three hot keys, so a chunk's repeats are rarely
+    // adjacent. `few` has too few keys to ever fill a chunk (its MIN inputs
+    // strictly decrease, so every row appends bytes until the string-byte cap
+    // publishes it), `many` fills chunks that fold, `cyclic` fills one with no
+    // folds at all (switching the probe off), and `sk` is `many` as a string.
+    const a = std.testing.allocator;
+    const n = 49_152;
+    const lo_len = 512;
+    const Row = struct { id: i64, few: i32, many: i32, cyclic: i32, sk: []const u8, v: i32, w: i32, lo_s: ?[]const u8, hi_s: ?[]const u8 };
+    const Expected = struct { count: i64 = 0, sum_v: i64 = 0, max_w: i32 = std.math.minInt(i32), lo: ?[]const u8 = null, hi: ?[]const u8 = null };
+    const rows = try a.alloc(Row, n);
+    defer a.free(rows);
+    const lo_bytes = try a.alloc(u8, n * lo_len);
+    defer a.free(lo_bytes);
+    const text_bytes = try a.alloc(u8, n * 16);
+    defer a.free(text_bytes);
+    for (rows, 0..) |*row, i| {
+        const hot = i % 5 != 0;
+        const lo = lo_bytes[i * lo_len ..][0..lo_len];
+        @memset(lo, 'p');
+        _ = try std.fmt.bufPrint(lo[0..10], "{d:0>10}", .{n - i});
+        const many: i32 = if (hot) @intCast(i % 3) else @intCast(100 + (i / 5) % 12_000);
+        const few: i32 = if (hot) @intCast(i % 3) else @intCast(100 + (i / 5) % 2_000);
+        const all_null = few == 100;
+        row.* = .{
+            .id = @intCast(i),
+            .few = few,
+            .many = many,
+            .cyclic = @intCast(i % 9_001),
+            .sk = try std.fmt.bufPrint(text_bytes[i * 16 ..][0..8], "k{d}", .{many}),
+            .v = @intCast(i % 1_000),
+            .w = @intCast((i * 31) % 9_973),
+            .lo_s = if (all_null or i % 13 == 0) null else lo,
+            .hi_s = if (all_null or i % 17 == 0) null else if (i % 23 == 0) "" else try std.fmt.bufPrint(text_bytes[i * 16 + 8 ..][0..8], "{d}", .{(i * 7_919) % 10_007}),
+        };
+    }
+    const key_columns = .{ "few", "many", "cyclic", "sk" };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("folds", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },                     .{ .name = "few", .type = .int },
+                .{ .name = "many", .type = .int },                      .{ .name = "cyclic", .type = .int },
+                .{ .name = "sk", .type = .string },                     .{ .name = "v", .type = .int },
+                .{ .name = "w", .type = .int },                         .{ .name = "lo_s", .type = .string, .nullable = true },
+                .{ .name = "hi_s", .type = .string, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 4096 });
+        try table.insert(rows);
+        try table.flush();
+        inline for (key_columns) |key| {
+            const is_text = comptime std.mem.eql(u8, key, "sk");
+            var expected: std.AutoHashMapUnmanaged(i32, Expected) = .empty;
+            defer expected.deinit(a);
+            for (rows) |row| {
+                const e = try expected.getOrPut(a, if (is_text) row.many else @field(row, key));
+                if (!e.found_existing) e.value_ptr.* = .{};
+                e.value_ptr.count += 1;
+                e.value_ptr.sum_v += row.v;
+                e.value_ptr.max_w = @max(e.value_ptr.max_w, row.w);
+                if (row.lo_s) |s| {
+                    if (e.value_ptr.lo == null or std.mem.order(u8, s, e.value_ptr.lo.?) == .lt) e.value_ptr.lo = s;
+                }
+                if (row.hi_s) |s| {
+                    if (e.value_ptr.hi == null or std.mem.order(u8, s, e.value_ptr.hi.?) == .gt) e.value_ptr.hi = s;
+                }
+            }
+            const sql = "SELECT " ++ key ++ ", COUNT(*), SUM(v), MAX(w), MIN(lo_s), MAX(hi_s) FROM folds GROUP BY " ++ key;
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+            try expectPlanRunsGroupTopN(a, db, sql);
+            var q = try runSql(a, db, sql);
+            defer q.deinit();
+            var seen: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const k: i32 = if (is_text)
+                        try std.fmt.parseInt(i32, batch.values[0].data.string.rowBytes(r)[1..], 10)
+                    else
+                        batch.values[0].data.int[r];
+                    const e = expected.get(k) orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(e.count, batch.values[1].data.bigint[r]);
+                    try std.testing.expectEqual(e.sum_v, batch.values[2].data.bigint[r]);
+                    try std.testing.expectEqual(e.max_w, batch.values[3].data.int[r]);
+                    for ([_]?[]const u8{ e.lo, e.hi }, 4..) |want, ci| {
+                        try std.testing.expectEqual(want != null, batch.values[ci].isValid(r));
+                        if (want) |s| try std.testing.expectEqualStrings(s, batch.values[ci].data.string.rowBytes(r));
+                    }
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, expected.count()), seen);
+        }
+    }
+}
+
 /// The first column of `sql`'s rows as text.
 fn firstColumnText(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]?[]u8 {
     var q = try helpers.runSqlCtx(allocator, db, sql);
