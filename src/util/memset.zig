@@ -19,9 +19,13 @@ comptime {
 const Chunk = @Vector(32, u8);
 const Half = @Vector(16, u8);
 
-fn memset(dest: ?[*]u8, c: u8, len: usize) callconv(.c) ?[*]u8 {
+// `fill` is C's `int`: Apple's arm64 ABI has the callee trust that a narrow
+// argument arrives extended, so taking `u8` would multiply the caller's
+// sign-extended upper bits into the fill pattern.
+fn memset(dest: ?[*]u8, fill: c_int, len: usize) callconv(.c) ?[*]u8 {
     @setRuntimeSafety(false);
     const d = dest orelse return dest;
+    const c: u8 = @truncate(@as(c_uint, @bitCast(fill)));
     // Below one chunk, two overlapping stores of the widest fitting size
     // cover any length without a loop.
     if (len < 4) {
@@ -53,13 +57,16 @@ inline fn store(comptime T: type, p: [*]u8, value: T) void {
 
 test "memset fills every length and alignment exactly" {
     var buf: [200]u8 = undefined;
-    for (0..8) |offset| {
-        for (0..150) |len| {
-            @memset(&buf, 0xAA);
-            _ = memset(buf[offset..].ptr, 0x5C, len);
-            for (buf, 0..) |b, i| {
-                const inside = i >= offset and i < offset + len;
-                try std.testing.expectEqual(@as(u8, if (inside) 0x5C else 0xAA), b);
+    const fills = .{ .{ .arg = 0x5C, .byte = 0x5C }, .{ .arg = -1, .byte = 0xFF }, .{ .arg = -0x7F, .byte = 0x81 }, .{ .arg = 0x1A5C, .byte = 0x5C } };
+    inline for (fills) |f| {
+        for (0..8) |offset| {
+            for (0..150) |len| {
+                @memset(&buf, 0xAA);
+                _ = memset(buf[offset..].ptr, f.arg, len);
+                for (buf, 0..) |b, i| {
+                    const inside = i >= offset and i < offset + len;
+                    try std.testing.expectEqual(@as(u8, if (inside) f.byte else 0xAA), b);
+                }
             }
         }
     }
