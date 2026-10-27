@@ -722,6 +722,14 @@ fn growJobs(scratch: *Scratch, len: usize) Error![]BtJob {
     return scratch.bt_jobs.allocatedSlice();
 }
 
+/// Written slot by slot: building each `?usize` whole goes through a stack
+/// temporary whose reload stalls store forwarding.
+inline fn copyCaps(out: []?usize, caps: []const ?u32) void {
+    for (out, caps) |*o, cap| {
+        if (cap) |c| o.* = c else o.* = null;
+    }
+}
+
 /// Equality for the few bytes of a literal run, where `std.mem.eql`'s
 /// out-of-line vector routine costs more than the compare.
 inline fn bytesEqual(a: []const u8, b: []const u8) bool {
@@ -1208,7 +1216,15 @@ pub const Regex = struct {
         // whose captures are then cleared for the next.
         var alts: usize = 1;
         var unrestored = false;
-        try jobs.push(scratch, .{ .explore = .{ .pc = 0, .pos = @intCast(sp) } });
+        // An anchored program opens with `save 0; ^`, and `backtrackStarts`
+        // starts it only where `^` holds, so the search enters past both.
+        var entry: u32 = 0;
+        if (self.anchored_start) {
+            entry = 2;
+            caps[0] = @intCast(sp);
+            unrestored = true;
+        }
+        try jobs.push(scratch, .{ .explore = .{ .pc = entry, .pos = @intCast(sp) } });
         while (jobs.len > 0) {
             var pc: u32 = undefined;
             var pos: usize = undefined;
@@ -1261,9 +1277,7 @@ pub const Regex = struct {
                         }
                     },
                     .match => {
-                        for (out_slots[0..self.n_slots], caps) |*out, cap| {
-                            if (cap) |c| out.* = c else out.* = null;
-                        }
+                        copyCaps(out_slots[0..self.n_slots], caps);
                         return .matched;
                     },
                     .jmp => |t| pc = t,
@@ -1304,6 +1318,12 @@ pub const Regex = struct {
                         },
                     },
                     .save => |slot| {
+                        // `save 1` is the program's last step before `match`.
+                        if (slot == 1) {
+                            caps[1] = @intCast(pos);
+                            copyCaps(out_slots[0..self.n_slots], caps);
+                            return .matched;
+                        }
                         if (alts > 0) {
                             try jobs.push(scratch, .{ .restore = .{ .slot = slot, .old = caps[slot] } });
                         } else {
@@ -1666,7 +1686,8 @@ pub const Regex = struct {
             // An empty match consumes nothing, so the character it sits
             // before is copied here, not left for the next match to skip.
             if (m_end == m_start) try out.appendSlice(allocator, input[m_end..@min(pos, input.len)]);
-            if (seen == occurrence) break;
+            // An anchored pattern matches only at the text's start.
+            if (seen == occurrence or (self.anchored_start and !self.multiline)) break;
         }
         if (pos < input.len) try out.appendSlice(allocator, input[pos..]);
         return out.items;

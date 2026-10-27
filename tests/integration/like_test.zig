@@ -148,6 +148,41 @@ test "REGEXP functions read each row's own pattern, replacement and match type" 
     }
 }
 
+test "REGEXP functions read a constant argument once for every row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE rc (id BIGINT PRIMARY KEY, s VARCHAR(16), p VARCHAR(16), r VARCHAR(8), m VARCHAR(4))");
+    try exec(allocator, db,
+        \\INSERT INTO rc VALUES (1, 'abc', 'b', '-', 'c'), (2, 'xyz', 'y', '+', 'c'), (3, 'xyz', 'q', '-', 'c'),
+        \\  (4, 'XYZ', 'y', '*', 'i'), (5, 'abc', NULL, '-', 'c'), (6, 'aBc', 'b', NULL, NULL), (7, 'abcb', 'b', '=', 'c')
+    );
+    const all_null = [_]?[]const u8{null} ** 7;
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', '-') FROM rc ORDER BY id", &.{ "a-c", "xyz", "xyz", "XYZ", "a-c", "aBc", "a-c-" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', r) FROM rc ORDER BY id", &.{ "a-c", "xyz", "xyz", "XYZ", "a-c", null, "a=c=" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE('abc', p, r) FROM rc ORDER BY id", &.{ "a-c", "abc", "abc", "abc", null, null, "a=c" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'B', '_', 1, 0, 'i') FROM rc ORDER BY id", &.{ "a_c", "xyz", "xyz", "XYZ", "a_c", "a_c", "a_c_" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, '^(a)', '<\\1>') FROM rc ORDER BY id", &.{ "<a>bc", "xyz", "xyz", "XYZ", "<a>bc", "<a>Bc", "<a>bcb" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, CONCAT('b', ''), LOWER('X')) FROM rc ORDER BY id", &.{ "axc", "xyz", "xyz", "XYZ", "axc", "aBc", "axcx" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, NULL, '-') FROM rc ORDER BY id", &all_null);
+    try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_LIKE(s, 'y') AS CHAR) FROM rc ORDER BY id", &.{ "0", "1", "1", "0", "0", "0", "0" });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_LIKE(s, 'Y', m) AS CHAR) FROM rc ORDER BY id", &.{ "0", "0", "0", "1", "0", null, "0" });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_LIKE(s, p, 'i') AS CHAR) FROM rc ORDER BY id", &.{ "1", "1", "0", "1", null, "1", "1" });
+    try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_INSTR(s, 'b', 1, 2) AS CHAR) FROM rc ORDER BY id", &.{ "0", "0", "0", "0", "0", "0", "4" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_SUBSTR(s, '[a-z]', 2) FROM rc ORDER BY id", &.{ "b", "y", "y", null, "b", "c", "b" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_SUBSTR(s, 'b', NULL) FROM rc ORDER BY id", &all_null);
+    try helpers.expectTexts(allocator, db, "SELECT CAST(REGEXP_COUNT(s, 'b') AS CHAR) FROM rc ORDER BY id", &.{ "1", "0", "0", "0", "1", "0", "2" });
+    try helpers.expectTexts(allocator, db, "SELECT REGEXP_EXTRACT(s, '([a-z])([a-z])', 2) FROM rc ORDER BY id", &.{ "b", "y", "y", "", "b", "", "b" });
+    try std.testing.expectError(error.RegexInvalidPattern, exec(allocator, db, "SELECT REGEXP_REPLACE(s, '(a', '-') FROM rc"));
+    // An anchored pattern matches only once, at the start or, multiline,
+    // at each line's start.
+    try helpers.expectText(allocator, db, "SELECT REGEXP_REPLACE('aaa', '^a', 'X')", "Xaa");
+    try helpers.expectText(allocator, db, "SELECT REGEXP_REPLACE('aaa', '^a', 'X', 1, 2)", "aaa");
+    try helpers.expectText(allocator, db, "SELECT REGEXP_REPLACE('a\na', '^a', 'X', 1, 0, 'm')", "X\nX");
+}
+
 test "REGEXP_COUNT, REGEXP_EXTRACT and REGEXP_EXTRACT_ALL count and cut out every match" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

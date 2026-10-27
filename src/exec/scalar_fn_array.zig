@@ -747,7 +747,7 @@ fn regexpExtractAllKernel(allocator: Allocator, arg_types: []const Type, out_typ
     _ = out_type;
     var b = try ArrayBuilder.init(allocator, .string);
     defer b.deinit(allocator);
-    var call = string.RegexCall.init(allocator, args[1], null);
+    var call = string.RegexCall.init(allocator, string.RegexArgs.init(args, rows), null);
     defer call.deinit();
     const text = common.stringViewOf(args[0]);
     for (0..rows) |r| {
