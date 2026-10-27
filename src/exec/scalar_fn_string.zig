@@ -34,42 +34,124 @@ const predicate = @import("predicate.zig");
 pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, if (args.len > 5) 5 else null);
     defer call.deinit();
     const replacements = stringViewOf(args[2]);
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    // Borrowed from the scratch's reused output buffer; appendValue copies
+    // it into the column store, so no free per row.
+    var replaced: []const u8 = "";
     for (0..row_count) |i| {
         const re = try call.at(i);
-        if (re == null or !allValid(args, i)) {
+        if (re == null or !a.allValid(i)) {
             try stringStoreOf(out).appendValue(allocator, "");
             try out.appendValidBit(allocator, base + i, false);
             continue;
         }
-        const s = sv.rowBytes(i);
-        const start = if (args.len > 3) try regexStart(s, args[3].data.bigint[i], 1) else 0;
-        // Occurrence 0 replaces every match; MySQL reads a negative one as 1.
-        const occurrence: usize = if (args.len > 4) switch (args[4].data.bigint[i]) {
-            std.math.minInt(i64)...-1 => 1,
-            else => |n| @intCast(n),
-        } else 0;
-        // `replaced` is borrowed from the scratch's reused output buffer;
-        // appendValue copies it into the column store, so no free per row.
-        const replaced = try re.?.replaceScratch(s, replacements.rowBytes(i), &call.scratch, start, occurrence);
+        const s = sv.rowBytes(a.rowOf(0, i));
+        if (!repeat.check(s)) {
+            const start = if (args.len > 3) try regexStart(s, a.bigint(3, i), 1) else 0;
+            // Occurrence 0 replaces every match; MySQL reads a negative one as 1.
+            const occurrence: usize = if (args.len > 4) switch (a.bigint(4, i)) {
+                std.math.minInt(i64)...-1 => 1,
+                else => |n| @intCast(n),
+            } else 0;
+            replaced = try re.?.replaceScratch(s, replacements.rowBytes(a.rowOf(2, i)), &call.scratch, start, occurrence);
+        }
         try stringStoreOf(out).appendValue(allocator, replaced);
         try out.appendValidBit(allocator, base + i, true);
     }
 }
 
+/// The arguments of a REGEXP_* call. Those REGEXP_* functions take a
+/// constant argument as one row for all (`ScalarFn.broadcast_args`), so
+/// argument `arg` of row `row` is at row `rowOf(arg, row)`.
+pub const RegexArgs = struct {
+    views: []const ColumnView,
+    /// Bit `arg` is set when argument `arg` is one row for all.
+    once: u8 = 0,
+    /// Bit `arg` is set when argument `arg` varies and may be NULL.
+    nullable: u8 = 0,
+    /// A constant argument is NULL, so every row's result is.
+    once_null: bool = false,
+
+    pub fn init(views: []const ColumnView, row_count: usize) RegexArgs {
+        var a: RegexArgs = .{ .views = views };
+        for (views, 0..) |v, arg| {
+            const bit = @as(u8, 1) << @intCast(arg);
+            if (v.rowCount() < row_count) {
+                a.once |= bit;
+                if (!v.isValid(0)) a.once_null = true;
+            } else if (v.nulls != null) {
+                a.nullable |= bit;
+            }
+        }
+        return a;
+    }
+
+    /// Every argument but the text (argument 0) is one row for all.
+    fn onlyTextVaries(self: RegexArgs) bool {
+        return self.once | 1 == (@as(u8, 1) << @intCast(self.views.len)) - 1;
+    }
+
+    fn isOnce(self: RegexArgs, arg: usize) bool {
+        return self.once >> @intCast(arg) & 1 != 0;
+    }
+
+    fn rowOf(self: RegexArgs, arg: usize, row: usize) usize {
+        return if (self.isOnce(arg)) 0 else row;
+    }
+
+    fn bigint(self: RegexArgs, arg: usize, row: usize) i64 {
+        return self.views[arg].data.bigint[self.rowOf(arg, row)];
+    }
+
+    fn allValid(self: RegexArgs, row: usize) bool {
+        if (self.once_null) return false;
+        var nullable = self.nullable;
+        while (nullable != 0) : (nullable &= nullable - 1) {
+            if (!self.views[@ctz(nullable)].isValid(row)) return false;
+        }
+        return true;
+    }
+};
+
+/// The text of the last row a REGEXP_* kernel computed, when the text is
+/// the only argument that varies. Adjacent rows often hold the same value
+/// (a table's sort order clusters them), and such a row's result is the
+/// last one's.
+const RepeatedText = struct {
+    on: bool,
+    last: ?[]const u8 = null,
+
+    fn init(a: RegexArgs) RepeatedText {
+        return .{ .on = a.onlyTextVaries() };
+    }
+
+    /// Whether `text` is the last computed row's; if not, it becomes it.
+    fn check(self: *RepeatedText, text: []const u8) bool {
+        if (!self.on) return false;
+        if (self.last) |last| if (std.mem.eql(u8, last, text)) return true;
+        self.last = text;
+        return false;
+    }
+};
+
 /// The patterns of a REGEXP_* call's rows and the matcher state they
 /// share: the visited array, thread lists, capture arena, and slot buffers
 /// all persist between rows, so applying one pattern to a whole batch
-/// allocates ~nothing per row. Each row may give its own pattern and match
-/// type. The last pair compiled is kept, so a constant pattern compiles
-/// once per batch, and a column of them once per change.
+/// allocates ~nothing per row. Each row may give its own pattern (argument
+/// 1) and match type. The last pair compiled is kept, so a column of
+/// patterns compiles once per change, and a constant one once per batch.
 pub const RegexCall = struct {
     allocator: Allocator,
-    patterns: ColumnView,
-    match_types: ?ColumnView,
+    args: RegexArgs,
+    match_type_arg: ?usize,
+    /// The pattern and match type are each one row for all, so the pattern
+    /// compiled for one row serves them all.
+    fixed: bool,
     compiled: ?Compiled = null,
     scratch: regex.Scratch,
 
@@ -80,8 +162,9 @@ pub const RegexCall = struct {
         match_type: []u8,
     };
 
-    pub fn init(allocator: Allocator, patterns: ColumnView, match_types: ?ColumnView) RegexCall {
-        return .{ .allocator = allocator, .patterns = patterns, .match_types = match_types, .scratch = regex.Scratch.init(allocator) };
+    pub fn init(allocator: Allocator, args: RegexArgs, match_type_arg: ?usize) RegexCall {
+        const fixed = args.isOnce(1) and if (match_type_arg) |m| args.isOnce(m) else true;
+        return .{ .allocator = allocator, .args = args, .match_type_arg = match_type_arg, .fixed = fixed, .scratch = regex.Scratch.init(allocator) };
     }
 
     pub fn deinit(self: *RegexCall) void {
@@ -102,12 +185,17 @@ pub const RegexCall = struct {
     /// NULL. Compiled even when the row's other arguments are NULL, so a
     /// malformed pattern fails the call as it does in MySQL.
     pub fn at(self: *RegexCall, row: usize) !?*regex.Regex {
-        if (!self.patterns.isValid(row)) return null;
-        const pattern = stringViewOf(self.patterns).rowBytes(row);
+        if (self.fixed) if (self.compiled) |*c| return &c.re;
+        const patterns = self.args.views[1];
+        const pattern_row = self.args.rowOf(1, row);
+        if (!patterns.isValid(pattern_row)) return null;
+        const pattern = stringViewOf(patterns).rowBytes(pattern_row);
         var match_type: []const u8 = "";
-        if (self.match_types) |m| {
-            if (!m.isValid(row)) return null;
-            match_type = stringViewOf(m).rowBytes(row);
+        if (self.match_type_arg) |m| {
+            const match_types = self.args.views[m];
+            const type_row = self.args.rowOf(m, row);
+            if (!match_types.isValid(type_row)) return null;
+            match_type = stringViewOf(match_types).rowBytes(type_row);
         }
         if (self.compiled) |*c| {
             if (std.mem.eql(u8, c.pattern, pattern) and std.mem.eql(u8, c.match_type, match_type)) return &c.re;
@@ -1323,14 +1411,18 @@ pub fn likeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnSt
 pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], if (args.len > 2) args[2] else null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, if (args.len > 2) 2 else null);
     defer call.deinit();
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    var matched = false;
     for (0..row_count) |i| {
         const re = try call.at(i);
-        const valid = re != null and allValid(args, i);
-        const ok = valid and try re.?.matchesWith(&call.scratch, sv.rowBytes(i), 0);
-        try out.data.boolean.append(allocator, @intFromBool(ok));
+        const valid = re != null and a.allValid(i);
+        const s = sv.rowBytes(a.rowOf(0, i));
+        if (valid and !repeat.check(s)) matched = try re.?.matchesWith(&call.scratch, s, 0);
+        try out.data.boolean.append(allocator, @intFromBool(valid and matched));
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
@@ -1342,25 +1434,31 @@ pub fn regexpLikeKernel(allocator: Allocator, args: []const ColumnView, out: *Co
 pub fn regexpInstrKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     if (row_count == 0) return;
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], if (args.len > 5) args[5] else null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, if (args.len > 5) 5 else null);
     defer call.deinit();
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    var position: i64 = 0;
     for (0..row_count) |i| {
-        const valid = try call.at(i) != null and allValid(args, i);
-        try out.data.bigint.append(allocator, if (valid) try regexpInstrRow(&call, args, sv.rowBytes(i), i) else 0);
+        const valid = try call.at(i) != null and a.allValid(i);
+        const s = sv.rowBytes(a.rowOf(0, i));
+        if (valid and !repeat.check(s)) position = try regexpInstrRow(&call, a, s, i);
+        try out.data.bigint.append(allocator, if (valid) position else 0);
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
 
-fn regexpInstrRow(call: *RegexCall, args: []const ColumnView, s: []const u8, row: usize) !i64 {
-    const return_end = if (args.len > 4) switch (args[4].data.bigint[row]) {
+fn regexpInstrRow(call: *RegexCall, a: RegexArgs, s: []const u8, row: usize) !i64 {
+    const args = a.views;
+    const return_end = if (args.len > 4) switch (a.bigint(4, row)) {
         0 => false,
         1 => true,
         else => return error.RegexInvalidReturnOption,
     } else false;
     // MySQL skips the position check for an empty subject.
-    const start = if (args.len > 2 and s.len > 0) try regexStart(s, args[2].data.bigint[row], 0) else 0;
-    const occurrence: usize = if (args.len > 3) @intCast(@max(args[3].data.bigint[row], 1)) else 1;
+    const start = if (args.len > 2 and s.len > 0) try regexStart(s, a.bigint(2, row), 0) else 0;
+    const occurrence: usize = if (args.len > 3) @intCast(@max(a.bigint(3, row), 1)) else 1;
     const bounds = try call.nth(s, start, occurrence) orelse return 0;
     const at = if (return_end) bounds[1] else bounds[0];
     return @intCast(charCount(s[0..at]) + 1);
@@ -1373,18 +1471,23 @@ pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *
     if (row_count == 0) return;
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], if (args.len > 4) args[4] else null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, if (args.len > 4) 4 else null);
     defer call.deinit();
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    var bounds: ?[2]usize = null;
     for (0..row_count) |i| {
-        const src = sv.rowBytes(i);
-        const bounds: ?[2]usize = if (try call.at(i) != null and allValid(args, i)) blk: {
-            const start = if (args.len > 2) try regexStart(src, args[2].data.bigint[i], 1) else 0;
-            const occurrence: usize = if (args.len > 3) @intCast(@max(args[3].data.bigint[i], 1)) else 1;
-            break :blk try call.nth(src, start, occurrence);
-        } else null;
-        try ss.appendValue(allocator, if (bounds) |b| src[b[0]..b[1]] else "");
-        try out.appendValidBit(allocator, base + i, bounds != null);
+        const src = sv.rowBytes(a.rowOf(0, i));
+        const valid = try call.at(i) != null and a.allValid(i);
+        if (valid and !repeat.check(src)) {
+            const start = if (args.len > 2) try regexStart(src, a.bigint(2, i), 1) else 0;
+            const occurrence: usize = if (args.len > 3) @intCast(@max(a.bigint(3, i), 1)) else 1;
+            bounds = try call.nth(src, start, occurrence);
+        }
+        const found = if (valid) bounds else null;
+        try ss.appendValue(allocator, if (found) |b| src[b[0]..b[1]] else "");
+        try out.appendValidBit(allocator, base + i, found != null);
     }
 }
 
@@ -1392,17 +1495,21 @@ pub fn regexpSubstrKernel(allocator: Allocator, args: []const ColumnView, out: *
 /// search resuming where the last match ended.
 pub fn regexpCountKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, null);
     defer call.deinit();
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    var count: i64 = 0;
     for (0..row_count) |i| {
-        const valid = try call.at(i) != null and args[0].isValid(i);
-        var count: i64 = 0;
-        if (valid) {
+        const valid = try call.at(i) != null and args[0].isValid(a.rowOf(0, i));
+        const s = sv.rowBytes(a.rowOf(0, i));
+        if (valid and !repeat.check(s)) {
+            count = 0;
             var pos: usize = 0;
-            while (try call.next(sv.rowBytes(i), &pos)) |_| count += 1;
+            while (try call.next(s, &pos)) |_| count += 1;
         }
-        try out.data.bigint.append(allocator, count);
+        try out.data.bigint.append(allocator, if (valid) count else 0);
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
@@ -1412,18 +1519,23 @@ pub fn regexpCountKernel(allocator: Allocator, args: []const ColumnView, out: *C
 pub fn regexpExtractKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const ss = stringStoreOf(out);
     const base = out.data.rowCount();
-    var call = RegexCall.init(allocator, args[1], null);
+    const a = RegexArgs.init(args, row_count);
+    var call = RegexCall.init(allocator, a, null);
     defer call.deinit();
     const sv = stringViewOf(args[0]);
+    var repeat = RepeatedText.init(a);
+    // A repeat reuses the group cut from the last computed row's text,
+    // which has the same bytes.
+    var text: []const u8 = "";
     for (0..row_count) |i| {
-        const valid = try call.at(i) != null and allValid(args, i);
-        var text: []const u8 = "";
-        if (valid) {
-            const s = sv.rowBytes(i);
+        const valid = try call.at(i) != null and a.allValid(i);
+        const s = sv.rowBytes(a.rowOf(0, i));
+        if (valid and !repeat.check(s)) {
+            text = "";
             var pos: usize = 0;
-            if (try call.next(s, &pos)) |slots| text = regexGroup(s, slots, args[2].data.bigint[i]) orelse "";
+            if (try call.next(s, &pos)) |slots| text = regexGroup(s, slots, a.bigint(2, i)) orelse "";
         }
-        try ss.appendValue(allocator, text);
+        try ss.appendValue(allocator, if (valid) text else "");
         try out.appendValidBit(allocator, base + i, valid);
     }
 }
