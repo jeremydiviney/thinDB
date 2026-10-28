@@ -2173,9 +2173,10 @@ test "group completion waits for a delayed partial before collecting top rows an
     var top = try TopSet.init(allocator, offset + 10);
     defer top.deinit(allocator);
     try collectOwnedTop(&shared, 0, 1, &top, &ticks, false);
-    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
+    try top.sortBestFirst(allocator);
     try std.testing.expectEqual(@as(usize, offset + 10), top.len);
-    for (top.items[offset..top.len], 0..) |row, i| {
+    for (offset..top.len, 0..) |rank, i| {
+        const row = top.rowAt(rank);
         try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
         try std.testing.expectEqual(@as(u64, group_count - offset - i), row.count);
     }
@@ -3770,39 +3771,54 @@ fn ownTopRowStr(row: *TopRow, allocator: Allocator) !void {
     }
 }
 
-fn better(a: TopRow, b: TopRow) bool {
-    if (a.count != b.count) return a.count > b.count;
-    return a.key < b.key;
-}
-
-fn worse(a: TopRow, b: TopRow) bool {
-    if (a.count != b.count) return a.count < b.count;
-    return a.key > b.key;
-}
-
 // Bounded top-K set, sized at runtime from the query's LIMIT+OFFSET. Kept as
 // a binary heap rooted at the WORST retained row, so the common case — a
 // candidate that doesn't make the cut — is a single comparison against the
 // root, and a replacement costs O(log k) instead of the O(k) worst-rescan the
-// old fixed-10 array paid.
+// old fixed-10 array paid. The heap and the final sort move 32-byte ranks,
+// not rows: a TopRow carries every aggregate slot inline (over 200 bytes),
+// and at OFFSET-sized k moving rows took most of a small query's time.
 const TopSet = struct {
     items: []TopRow = &.{},
+    ranks: []Rank = &.{},
     len: usize = 0,
 
+    const Rank = struct {
+        key: u128,
+        count: u64,
+        slot: u32,
+
+        fn of(row: TopRow, slot: usize) Rank {
+            return .{ .key = row.key, .count = row.count, .slot = @intCast(slot) };
+        }
+
+        fn better(a: Rank, b: Rank) bool {
+            if (a.count != b.count) return a.count > b.count;
+            return a.key < b.key;
+        }
+
+        fn before(_: void, a: Rank, b: Rank) bool {
+            return better(a, b);
+        }
+    };
+
     fn init(allocator: Allocator, k: usize) !TopSet {
-        return .{ .items = try allocator.alloc(TopRow, k) };
+        const items = try allocator.alloc(TopRow, k);
+        errdefer allocator.free(items);
+        return .{ .items = items, .ranks = try allocator.alloc(Rank, k) };
     }
 
     fn deinit(self: *TopSet, allocator: Allocator) void {
         allocator.free(self.items);
+        allocator.free(self.ranks);
         self.* = .{};
     }
 
     fn consider_state(self: *TopSet, state: StateRef) void {
         if (self.items.len == 0) return;
         if (self.len == self.items.len) {
-            const worst_row = self.items[0];
-            if (state.head.count < worst_row.count or (state.head.count == worst_row.count and state.head.key >= worst_row.key)) return;
+            const worst = self.ranks[0];
+            if (state.head.count < worst.count or (state.head.count == worst.count and state.head.key >= worst.key)) return;
         }
         self.consider(topRowFromState(state));
     }
@@ -3811,34 +3827,44 @@ const TopSet = struct {
         if (self.len < self.items.len) {
             var i = self.len;
             self.items[i] = cand;
+            self.ranks[i] = Rank.of(cand, i);
             self.len += 1;
             while (i > 0) {
                 const parent = (i - 1) / 2;
-                if (!worse(self.items[i], self.items[parent])) break;
-                std.mem.swap(TopRow, &self.items[i], &self.items[parent]);
+                if (!Rank.better(self.ranks[parent], self.ranks[i])) break;
+                std.mem.swap(Rank, &self.ranks[i], &self.ranks[parent]);
                 i = parent;
             }
             return;
         }
-        if (self.items.len == 0 or !better(cand, self.items[0])) return;
-        self.items[0] = cand;
+        if (self.items.len == 0) return;
+        const rank = Rank.of(cand, self.ranks[0].slot);
+        if (!Rank.better(rank, self.ranks[0])) return;
+        self.items[rank.slot] = cand;
+        self.ranks[0] = rank;
         var i: usize = 0;
         while (true) {
             const left = 2 * i + 1;
             const right = left + 1;
             var w = i;
-            if (left < self.len and worse(self.items[left], self.items[w])) w = left;
-            if (right < self.len and worse(self.items[right], self.items[w])) w = right;
+            if (left < self.len and Rank.better(self.ranks[w], self.ranks[left])) w = left;
+            if (right < self.len and Rank.better(self.ranks[w], self.ranks[right])) w = right;
             if (w == i) break;
-            std.mem.swap(TopRow, &self.items[i], &self.items[w]);
+            std.mem.swap(Rank, &self.ranks[i], &self.ranks[w]);
             i = w;
         }
     }
-};
 
-fn topLess(_: void, a: TopRow, b: TopRow) bool {
-    return better(a, b);
-}
+    /// Order the ranks best first. Call it after the last `consider`: the set
+    /// is no longer a heap. `rowAt(i)` is then the i-th best row.
+    fn sortBestFirst(self: *TopSet, allocator: Allocator) !void {
+        try thindb.exec.memory.sort(Rank, self.ranks[0..self.len], {}, allocator, Rank.before);
+    }
+
+    fn rowAt(self: *const TopSet, i: usize) TopRow {
+        return self.items[self.ranks[i].slot];
+    }
+};
 
 fn totalRows(snap: Scan.Snapshot) u64 {
     var n: u64 = snap.memtable_row_count;
@@ -7514,7 +7540,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             top.consider(candidate);
         }
     }
-    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
+    try top.sortBestFirst(allocator);
     const final_merge_ticks = platform.nowTicks() - final_t0;
     const total_ticks = platform.nowTicks() - total_t0;
     const function_ticks = platform.nowTicks() - function_t0;
@@ -7567,8 +7593,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             // The merged top-N rows borrow each survivor's bucket str bytes (and
             // already carry finalized UDAF slots from collectOwnedTop); re-dup
             // the str bytes into the result allocator so they survive teardown.
-            for (top.items[0..top.len]) |cand| {
-                var row = cand;
+            for (0..top.len) |rank_index| {
+                var row = top.rowAt(rank_index);
                 if (has_str_out) try ownTopRowStr(&row, allocator);
                 try out.append(allocator, row);
             }
