@@ -5425,3 +5425,129 @@ test "scan: a key bound passes every row of the best values and drops most other
         };
     }
 }
+
+// `s` is "hit" at k = 9, 29 and 30 and "x" elsewhere, and `n` is 5 at k = 9
+// and 0 or 10 elsewhere, over ten 4-row row groups: no zone map can rule a
+// row group out of `s LIKE '%hit%'` or `n = 5`, only the memo of row groups a
+// predicate matched nothing of can skip them.
+const MemoRow = struct { k: i64, s: []const u8, n: i32 };
+
+fn memoRows(rows: []MemoRow, first_k: i64) void {
+    for (rows, 0..) |*row, i| {
+        const k = first_k + @as(i64, @intCast(i));
+        const hit = k == 9 or k == 29 or k == 30;
+        row.* = .{ .k = k, .s = if (hit) "hit" else "x", .n = if (k == 9) 5 else if (@rem(k, 2) == 0) 0 else 10 };
+    }
+}
+
+fn openMemoTable(allocator: std.mem.Allocator, dir: std.Io.Dir, predicate_memo: bool) !struct { db: *api.Database, t: *api.Table } {
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "s", .type = .{ .varchar = 8 } }, .{ .name = "n", .type = .int } },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, std.testing.io, dir, .{ .row_group_size = 4, .predicate_memo = predicate_memo });
+    errdefer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .row_group_size = 4 });
+    var rows: [40]MemoRow = undefined;
+    memoRows(&rows, 0);
+    try t.insert(rows[0..20]);
+    try t.flush();
+    try t.insert(rows[20..]);
+    try t.flush();
+    return .{ .db = db, .t = t };
+}
+
+/// The `k` values `expr` keeps, and the row groups its scan decoded.
+fn memoScan(allocator: std.mem.Allocator, t: *api.Table, expr: PredicateExpr, out: *std.ArrayList(i64)) !u64 {
+    out.clearRetainingCapacity();
+    var base = try scan(allocator, t);
+    const scan_op = exec.queryAs(exec.Scan, base).?;
+    var q = try base.filter(expr);
+    defer q.deinit();
+    return drainKeys(allocator, &q, scan_op, out);
+}
+
+test "scan: a row group a predicate matched nothing of is skipped on the next scan" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opened = try openMemoTable(allocator, tmp.dir, true);
+    defer opened.db.close();
+    const t = opened.t;
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    const hit: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%hit%" } };
+
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+    // Column names resolve case-insensitively, and so match the same memo.
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, .{ .like = .{ .col = "S", .pattern = "%hit%" } }, &keys));
+    // Another predicate has a memo of its own.
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, .{ .like = .{ .col = "s", .pattern = "%hi%" } }, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+
+    // An AND with a memoized arm skips that arm's row groups on its first
+    // scan, whatever the other arm.
+    const k_any: PredicateExpr = .{ .leaf = .{ .col = "k", .op = .gte, .val = .{ .bigint = 0 } } };
+    const hit_and_any = [_]PredicateExpr{ k_any, hit };
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, .{ .@"and" = &hit_and_any }, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+
+    // `n = 5` runs first in this AND, over every row, and alone empties all
+    // row groups but k = 9's: a later scan of `n = 5` by itself skips them.
+    const five: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 5 } } };
+    const five_and_x = [_]PredicateExpr{ .{ .like = .{ .col = "s", .pattern = "%x%" } }, five };
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, .{ .@"and" = &five_and_x }, &keys));
+    try std.testing.expectEqual(@as(usize, 0), keys.items.len);
+    try std.testing.expectEqual(@as(u64, 1), try memoScan(allocator, t, five, &keys));
+    try std.testing.expectEqualSlices(i64, &.{9}, keys.items);
+
+    // Deleting k = 9 leaves its row group matching nothing visible, but an
+    // older snapshot could still see the row, so that row group stays read.
+    try std.testing.expectEqual(@as(usize, 1), try t.delete(.{ .col = "k", .op = .eq, .val = .{ .bigint = 9 } }));
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 29, 30 }, keys.items);
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 29, 30 }, keys.items);
+    // A tombstone doesn't stop a row group none of whose stored rows match
+    // from being noted.
+    try std.testing.expectEqual(@as(usize, 1), try t.delete(.{ .col = "k", .op = .eq, .val = .{ .bigint = 0 } }));
+    const hi_t: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%it%" } };
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, hi_t, &keys));
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, hi_t, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 29, 30 }, keys.items);
+
+    // Compaction writes new segments, which start with no memo.
+    try t.compact();
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 29, 30 }, keys.items);
+    try std.testing.expectEqual(@as(u64, 2), try memoScan(allocator, t, hit, &keys));
+
+    // TRUNCATE starts a new table generation: the old memo says nothing of
+    // the new rows, here a hit in every row group.
+    try t.truncate();
+    var rows: [40]MemoRow = undefined;
+    memoRows(&rows, 0);
+    for (&rows) |*row| row.s = "hit";
+    try t.insert(&rows);
+    try t.flush();
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, hit, &keys));
+    try std.testing.expectEqual(@as(usize, 40), keys.items.len);
+}
+
+test "scan: with the predicate memo off every scan reads every row group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opened = try openMemoTable(allocator, tmp.dir, false);
+    defer opened.db.close();
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    const hit: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%hit%" } };
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, opened.t, hit, &keys));
+    try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, opened.t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+}

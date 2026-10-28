@@ -151,6 +151,13 @@ pub const Config = struct {
     /// value (e.g. 1) is the way to effectively turn it off.
     cache_size_bytes: usize = 0,
 
+    /// Remember, per row group, the scan predicates that matched none of its
+    /// stored rows, so a later scan with the same predicate (or with one AND
+    /// arm of it) skips that row group unread. Takes 1/1024 of the block
+    /// cache budget. Only the Catalog-minted cache honors it; a caller-provided
+    /// `block_cache` keeps its own setting.
+    predicate_memo: bool = true,
+
     /// Background-compactor threshold. When a table has at least this many
     /// live segments and the background compactor sweep runs, it triggers
     /// a compaction. 0 disables the count-based trigger. Default 8 — a

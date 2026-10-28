@@ -74,6 +74,7 @@ fn subView(v: ColumnView, off: usize, n: usize) ColumnView {
 const predicate = @import("predicate.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
+const getenv = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 const PredicateOp = predicate.PredicateOp;
 const filter_mod = @import("filter.zig");
 
@@ -499,6 +500,14 @@ pub const Scan = struct {
     /// rules out, and row groups whose stats it rules out are skipped. Other
     /// paths emit those rows; the consumer ranks what it gets either way.
     key_bound: ?KeyBound = null,
+    /// What the predicate-miss memo looks up and notes for `fused_filter`,
+    /// taken at the first filtered `next()`; null until then and again
+    /// whenever the filter changes.
+    filter_memo: ?FilterMemo = null,
+    /// Set by the filter paths for the row group `filterRowGroup` just
+    /// evaluated: which digest of `filter_memo` matched none of its stored
+    /// rows, before tombstones or the key bound took any out.
+    rg_unmatched: Unmatched = .none,
     /// Scratch row-mask, grown on demand for the largest row group seen.
     /// Reused across `next()` calls; freed in `deinit`.
     mask_buf: []bool = &.{},
@@ -599,6 +608,9 @@ pub const Scan = struct {
     /// Row groups the block-sourced guided filter evaluated (a subset of
     /// `rgs_scanned`; the rest went through the decode-then-filter paths).
     rgs_guided: u64 = 0,
+    /// Row groups the predicate-miss memo skipped (counted in
+    /// `rgs_considered`, not in `rgs_scanned`).
+    rgs_memo_skipped: u64 = 0,
     rows_scanned: u64 = 0,
 
     /// Tight scan-kernel accounting (--profile-ops): ticks spent in the per-row-
@@ -1542,6 +1554,7 @@ pub const Scan = struct {
         // no-op.
         var coerced = expr;
         try predicate.validateExpr(&coerced, self.table.schema.columns);
+        self.filter_memo = null;
         if (self.fused_filter != null) {
             if (!try self.conjoinFusedFilter(coerced)) return false;
             try self.extractPruneHints(coerced);
@@ -1564,6 +1577,7 @@ pub const Scan = struct {
         const expr = src.fused_filter orelse return true;
         if (self.out_phys.len == 0) return false;
         self.fused_filter = expr;
+        self.filter_memo = null;
         try self.setupFilterEval(expr);
         return true;
     }
@@ -2950,6 +2964,8 @@ pub const Scan = struct {
     /// — so downstream sees no borrowed cache memory.
     fn nextFiltered(self: *Scan) !?Batch {
         const expr = self.fused_filter orelse PredicateExpr{ .always = true };
+        if (self.filter_memo == null) self.filter_memo = self.buildFilterMemo();
+        const memo = &self.filter_memo.?;
 
         if (self.pending_rows.len > 0) {
             // The loop below is what moves off a segment, so the pending row
@@ -2987,6 +3003,11 @@ pub const Scan = struct {
                 self.cur_rg_idx += 1;
                 continue;
             }
+            if (self.memoSaysUnmatched(memo, seg, self.cur_rg_idx)) {
+                self.rgs_memo_skipped += 1;
+                self.cur_rg_idx += 1;
+                continue;
+            }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
 
@@ -2995,7 +3016,9 @@ pub const Scan = struct {
             const this_rg = self.cur_rg_idx;
             self.cur_rg_idx += 1;
 
+            self.rg_unmatched = .none;
             const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
+            self.noteUnmatched(memo, seg, this_rg);
             if (matched == 0) continue;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths };
@@ -3141,6 +3164,8 @@ pub const Scan = struct {
                 const n_groups = self.groupSetArms(.@"and", children, &groups);
                 var last: ?SetArmLookup = null;
                 var filled = false;
+                var steps: usize = 0;
+                var first_alone = false;
                 // Empty-mask early exit: conjuncts arrive selectivity-
                 // ordered, so the leading leaf often kills the whole row
                 // group — stop borrowing/evaluating the remaining columns'
@@ -3163,17 +3188,24 @@ pub const Scan = struct {
                             };
                         }
                         if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, act, dest)) return null;
+                        if (steps == 0) first_alone = true;
                     }
                     if (filled) simd.combineMaskInto(.@"and", mask[0..rg_count], dest);
                     live = std.mem.indexOfScalar(bool, mask[0..rg_count], true) != null;
                     filled = true;
+                    steps += 1;
                 }
+                // The first step ran over every stored row: when it alone
+                // emptied the mask, that arm matches none of them by itself.
+                if (!live) self.rg_unmatched = if (steps == 1 and first_alone) .first_arm else .whole;
             },
             else => return null,
         }
         self.rgs_guided += 1;
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
+        const narrowed = tomb_mask != null or self.key_bound != null;
+        if (expr != .@"and" and narrowed and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..rg_count], true) == null) self.rg_unmatched = .whole;
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
@@ -3183,7 +3215,10 @@ pub const Scan = struct {
         var matched: usize = 0;
         for (mask[0..rg_count]) |m| matched += @intFromBool(m);
         if (exec.prof.enabled) exec.prof.add("scan.mask_count", @intCast(@max(0, exec.prof.nowTicks() - _tcnt)));
-        if (matched == 0) return @as(usize, 0);
+        if (matched == 0) {
+            if (expr != .@"and" and !narrowed) self.rg_unmatched = .whole;
+            return @as(usize, 0);
+        }
 
         const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const emitted = try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
@@ -4190,6 +4225,7 @@ pub const Scan = struct {
         self.filtered_coded = null;
         self.filtered_hashed = null;
         self.filtered_lengths = null;
+        if (matched == 0) self.rg_unmatched = .whole;
         return matched;
     }
 
@@ -4879,12 +4915,15 @@ pub const Scan = struct {
         const mask = try self.ensureMask(n);
         const batch = Batch{ .schema = eval_schema, .values = eval_views, .row_count = n };
         try predicate.evaluateExprGuided(self.allocator, expr, eval_schema, batch, mask, null);
+        const segment_rg = loc == .segment;
         if (tomb_mask) |tm| {
+            if (segment_rg and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..n], true) == null) self.rg_unmatched = .whole;
             for (mask[0..n], tm) |*m, keep| m.* = m.* and keep;
         }
         var matched: usize = 0;
         for (mask[0..n]) |m| matched += @intFromBool(m);
         if (matched == 0) {
+            if (segment_rg and tomb_mask == null) self.rg_unmatched = .whole;
             self.filtered_coded = null;
             self.filtered_hashed = null;
             self.filtered_lengths = null;
@@ -4973,6 +5012,77 @@ pub const Scan = struct {
         self.filtered_hashed = hash_slots;
         self.filtered_lengths = length_slots;
         return matched;
+    }
+
+    /// The predicate-miss memo's view of `fused_filter`: a row group the
+    /// whole filter, or any one AND arm of it, matched no stored row of can
+    /// yield no survivor, whatever snapshot reads it (tombstones only hide
+    /// rows). Arms are looked up so a query reuses what another query with a
+    /// shared arm learned; an arm is only noted when the guided AND evaluated
+    /// it alone over every row of the row group.
+    const FilterMemo = struct {
+        /// The whole filter; null when part of it has no digest.
+        whole: ?u128 = null,
+        /// The filter's first AND arm, when it has several.
+        first_arm: ?u128 = null,
+        /// The filter's flattened AND arms that have digests, when it has
+        /// several (`predicate.conjunctDigests`).
+        arms: [MEMO_MAX_ARMS]u128 = undefined,
+        n_arms: usize = 0,
+    };
+    const MEMO_MAX_ARMS = 16;
+    const Unmatched = enum { none, whole, first_arm };
+
+    fn buildFilterMemo(self: *const Scan) FilterMemo {
+        var memo: FilterMemo = .{};
+        const expr = self.fused_filter orelse return memo;
+        if (!self.table.cache.predicate_memo.enabled or memoSwitchedOff()) return memo;
+        memo.whole = predicate.digest(expr);
+        switch (expr) {
+            .@"and" => |arms| if (arms.len >= 2) {
+                memo.first_arm = predicate.digest(arms[0]);
+                memo.n_arms = predicate.conjunctDigests(expr, &memo.arms);
+            },
+            else => {},
+        }
+        return memo;
+    }
+
+    /// The bench hot-switch: `SET THINDB_NO_PREDICATE_MEMO = 1` turns the
+    /// memo off for the next queries, `= 0` back on.
+    fn memoSwitchedOff() bool {
+        const v = getenv("THINDB_NO_PREDICATE_MEMO") orelse return false;
+        return v[0] != '0';
+    }
+
+    /// Whether a row group the whole filter left empty would be noted, so the
+    /// paths that must scan the mask to find out only do it then.
+    fn memoNotes(self: *const Scan) bool {
+        const memo = self.filter_memo orelse return false;
+        return memo.whole != null;
+    }
+
+    fn memoSaysUnmatched(self: *Scan, memo: *const FilterMemo, seg: *const storage.ReadSegment, rg_idx: usize) bool {
+        const pm = &self.table.cache.predicate_memo;
+        if (memo.whole) |d| if (pm.contains(self.memoKey(seg, rg_idx, d))) return true;
+        for (memo.arms[0..memo.n_arms]) |d| if (pm.contains(self.memoKey(seg, rg_idx, d))) return true;
+        return false;
+    }
+
+    fn noteUnmatched(self: *Scan, memo: *const FilterMemo, seg: *const storage.ReadSegment, rg_idx: usize) void {
+        const pm = &self.table.cache.predicate_memo;
+        if (self.rg_unmatched == .none) return;
+        if (memo.whole) |d| pm.insert(self.memoKey(seg, rg_idx, d));
+        if (self.rg_unmatched == .first_arm) if (memo.first_arm) |d| pm.insert(self.memoKey(seg, rg_idx, d));
+    }
+
+    /// The memo key for "`digest`'s predicate matched no stored row of this
+    /// row group", scoped like the cache's blocks to the table generation and
+    /// segment.
+    fn memoKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, digest: u128) u128 {
+        const scope = [_]u128{ digest, self.table.cache_uid, seg.info.segment_id, rg_idx };
+        const bytes = std.mem.sliceAsBytes(&scope);
+        return @as(u128, std.hash.Wyhash.hash(0x51ED_2701, bytes)) << 64 | std.hash.Wyhash.hash(0x0B5E_55ED, bytes);
     }
 
     fn rowGroupHasTombstones(self: *const Scan, rg_first: u32, rg_count: u32) bool {

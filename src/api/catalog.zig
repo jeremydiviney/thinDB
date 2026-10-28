@@ -164,6 +164,7 @@ pub const Catalog = struct {
         if (cfg.block_cache == null) {
             const bc = try allocator.create(storage.cache.Cache);
             bc.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            bc.predicate_memo.enabled = cfg.predicate_memo;
             owned_block_cache = bc;
             cfg.block_cache = bc;
         }
