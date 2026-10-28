@@ -34,6 +34,7 @@ const ColumnStore = engine.ColumnStore;
 const exec = @import("exec.zig");
 const parallel = @import("../util/parallel.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
+const simd = @import("../util/simd.zig");
 const Query = exec.Query;
 
 const Batch = exec.Batch;
@@ -3959,7 +3960,7 @@ pub fn compareCellsOp(left: ColumnView, lrow: u32, right: ColumnView, rrow: u32,
         .char => |sv| return cmpBytesOp(sv.rowBytes(lrow), right.data.char.rowBytes(rrow), op),
         .json => |sv| return orderOp(json_binary.compare(sv.rowBytes(lrow), right.data.json.rowBytes(rrow)), op),
         .nested => |sv| return orderOp(nested.order(sv.rowBytes(lrow), right.data.nested.rowBytes(rrow)), op),
-        .bitmap => |sv| return orderOp(std.mem.order(u8, sv.rowBytes(lrow), right.data.bitmap.rowBytes(rrow)), op),
+        .bitmap => |sv| return orderOp(simd.orderBytes(sv.rowBytes(lrow), right.data.bitmap.rowBytes(rrow)), op),
     }
 }
 
@@ -3975,7 +3976,7 @@ fn cmpOp(comptime T: type, a: T, b: T, op: predicate.PredicateOp) bool {
 }
 
 fn cmpBytesOp(a: []const u8, b: []const u8, op: predicate.PredicateOp) bool {
-    return orderOp(std.mem.order(u8, a, b), op);
+    return orderOp(simd.orderBytes(a, b), op);
 }
 
 fn orderOp(ord: std.math.Order, op: predicate.PredicateOp) bool {

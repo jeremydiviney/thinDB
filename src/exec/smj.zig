@@ -47,6 +47,7 @@ const join_mod = @import("join.zig");
 const Spec = join_mod.Spec;
 
 const cell_io = @import("cell_io.zig");
+const simd = @import("../util/simd.zig");
 
 const output_batch_rows: usize = 1024;
 
@@ -499,7 +500,7 @@ pub const SortMergeJoin = struct {
         while (self.left_cursor < self.left_perm.len and self.right_cursor < self.right_perm.len) {
             const lkey = self.left_keys_bytes[self.left_cursor];
             const rkey = self.right_keys_bytes[self.right_cursor];
-            switch (std.mem.order(u8, lkey, rkey)) {
+            switch (simd.orderBytes(lkey, rkey)) {
                 .lt => {
                     if (preserve_left) {
                         try self.emitLeftOnlyRow(self.left_perm[self.left_cursor]);
@@ -819,7 +820,7 @@ fn sortByKeys(perm: []u32, keys: [][]const u8) void {
         keys: [][]const u8,
 
         pub fn lessThan(self: @This(), a: usize, b: usize) bool {
-            return std.mem.order(u8, self.keys[a], self.keys[b]) == .lt;
+            return simd.orderBytes(self.keys[a], self.keys[b]) == .lt;
         }
         pub fn swap(self: @This(), a: usize, b: usize) void {
             std.mem.swap(u32, &self.perm[a], &self.perm[b]);

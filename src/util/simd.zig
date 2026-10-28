@@ -76,6 +76,26 @@ pub fn maxOf(comptime T: type, data: []const T) T {
     return reduceExtreme(T, data, false);
 }
 
+/// Lexicographic byte order, as `std.mem.order(u8, a, b)`, eight bytes per
+/// step: strings compared for MIN/MAX, ORDER BY, merges and range filters
+/// often share prefixes (URLs of one site), which the byte loop walks one byte
+/// at a time. Words, not full vectors: most comparisons differ within the
+/// first few words, and an unaligned 32-byte load pulls a second cache line
+/// about half the time — a net loss on memory-bound string MIN/MAX folds.
+pub fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const wa = std.mem.readInt(u64, a[i..][0..8], .big);
+        const wb = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (wa != wb) return std.math.order(wa, wb);
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return std.math.order(a[i], b[i]);
+    }
+    return std.math.order(a.len, b.len);
+}
+
 pub const CmpOp = enum { eq, neq, lt, lte, gt, gte };
 
 /// Elementwise `mask[i] = (data[i] <op> want)`, vectorized. `mask` must be
@@ -227,6 +247,26 @@ pub fn andNotMaskInto(dst: []bool, keep: ?[]const bool, drop: []const bool) void
             out[i..][0..N].* = dv ^ ones;
         }
         while (i < out.len) : (i += 1) out[i] = d[i] ^ 1;
+    }
+}
+
+test "simd: orderBytes matches std.mem.order at every difference position and length" {
+    var a: [100]u8 = undefined;
+    var b: [100]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @intCast(32 + i % 90);
+    for (0..a.len + 1) |len_a| {
+        for ([_]usize{ 0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 99, 100 }) |len_b| {
+            if (len_b > a.len) continue;
+            @memcpy(&b, &a);
+            try std.testing.expectEqual(std.mem.order(u8, a[0..len_a], b[0..len_b]), orderBytes(a[0..len_a], b[0..len_b]));
+            for (0..@min(len_a, len_b)) |d| {
+                @memcpy(&b, &a);
+                inline for (.{ 1, 0x80, 0xff }) |delta| {
+                    b[d] = a[d] +% delta;
+                    try std.testing.expectEqual(std.mem.order(u8, a[0..len_a], b[0..len_b]), orderBytes(a[0..len_a], b[0..len_b]));
+                }
+            }
+        }
     }
 }
 

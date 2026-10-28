@@ -33,6 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const common = @import("scalar_fn_common.zig");
+const simd = @import("../util/simd.zig");
 
 pub const Tag = enum(u8) {
     null = 0,
@@ -841,7 +842,7 @@ pub fn compare(a: []const u8, b: []const u8) std.math.Order {
 /// JSON, bytewise for text. Inline, so a comptime-known `json` leaves one
 /// branch in the caller's loop.
 pub inline fn columnOrder(json: bool, a: []const u8, b: []const u8) std.math.Order {
-    return if (json) compare(a, b) else std.mem.order(u8, a, b);
+    return if (json) compare(a, b) else simd.orderBytes(a, b);
 }
 
 pub fn compareOperands(a: Operand, b: Operand) std.math.Order {
