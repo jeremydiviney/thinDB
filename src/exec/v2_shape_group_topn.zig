@@ -23,6 +23,8 @@ const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
 const json_binary = @import("json_binary.zig");
 const udf_mod = @import("../udf.zig");
+const predicate = @import("predicate.zig");
+const parallel_scan = @import("parallel_scan.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
@@ -628,7 +630,13 @@ const GroupTopNPipeline = struct {
             self.allocator.free(snapshot.segments);
         }
         var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
-        ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = self.offered_sets.items };
+        var pick_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer pick_arena.deinit();
+        const offered_sets = if (try pickKeySets(pick_arena.allocator(), exec.memory.accountantOf(self.allocator), table, snapshot, self.request, self.plan)) |picked|
+            try std.mem.concat(pick_arena.allocator(), exec.InSet, &.{ self.offered_sets.items, picked })
+        else
+            self.offered_sets.items;
+        ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = offered_sets };
         ctx.order_keys = self.order_keys;
         ctx.prefix_keys = self.prefix_keys;
         var rows = try runGroupTopNStage(&ctx);
@@ -822,6 +830,131 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
     if (ctx.request.order_specs.len != 0) return 0;
     if (ctx.request.limit == 0) return 0;
     return ctx.request.limit + ctx.request.offset;
+}
+
+// Rows the key pick reads looking for its groups, and the leading rows it
+// judges the picked keys' share on; past a 1/PICK_SHARE_DENOMINATOR share the
+// filtered aggregation saves little over the plain one.
+const PICK_MAX_ROWS: usize = 1 << 20;
+const PICK_SAMPLE_ROWS: usize = 1 << 16;
+const PICK_SHARE_DENOMINATOR: usize = 8;
+
+// Without ORDER BY or HAVING, any LIMIT+OFFSET groups answer the query, and a
+// filter on group-key columns keeps or drops whole groups, so the groups it
+// keeps aggregate exactly. The first LIMIT+OFFSET distinct keys in scan order
+// are such groups: a short serial read finds them, and each key column's set
+// of their values, offered as a row filter, lets the aggregation fold only
+// those keys' rows instead of every group. Keys computed by an expression get
+// no set; distinct base-column values already make distinct groups. Null when
+// the shape doesn't qualify, the table has too few groups, or the picked keys
+// cover too much of the sample to be worth filtering on.
+fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant, table: *api.Table, snapshot: Scan.Snapshot, request: Request, plan: ShapePlan) !?[]const exec.InSet {
+    if (request.order_specs.len != 0 or request.having_filter != null or request.limit == 0) return null;
+    const keep = request.limit + request.offset;
+    if (keep > Scan.ROW_SET_ZONEMAP_MAX) return null;
+
+    var cols: [MAX_GROUP_KEYS][]const u8 = undefined;
+    var col_count: usize = 0;
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (findDerived(plan.derived, part.name) != null) continue;
+        cols[col_count] = part.name;
+        col_count += 1;
+    }
+    if (col_count == 0) return null;
+
+    const scan = try Scan.allocWithProjectionLoc(allocator, table, accountant, cols[0..col_count], false, snapshot);
+    defer scan.deinit();
+    if (request.where_filter) |where| {
+        if (!try scan.tryFuseFilter(where)) return null;
+    }
+
+    var tuples: std.StringHashMapUnmanaged(void) = .empty;
+    var values: [MAX_GROUP_KEYS]std.StringHashMapUnmanaged(types.Value) = @splat(.empty);
+    var has_null: [MAX_GROUP_KEYS]bool = @splat(false);
+    var tuple_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    var rows_seen: usize = 0;
+    var rows_matched: usize = 0;
+    scan: while (try scan.next()) |batch| {
+        try exec.memory.checkCancelled(allocator);
+        var views: [MAX_GROUP_KEYS]ColumnView = undefined;
+        for (cols[0..col_count], 0..) |name, k| {
+            views[k] = batch.values[types.findColumn(batch.schema, name) orelse return null];
+        }
+        for (0..batch.row_count) |row| {
+            const picking = tuples.count() < keep;
+            if (!picking and rows_seen >= PICK_SAMPLE_ROWS) break :scan;
+            if (picking and rows_seen >= PICK_MAX_ROWS) return null;
+            rows_seen += 1;
+            tuple_bytes.clearRetainingCapacity();
+            var cells: [MAX_GROUP_KEYS]?types.Value = undefined;
+            var spans: [MAX_GROUP_KEYS][2]usize = undefined;
+            for (views[0..col_count], 0..) |view, k| {
+                cells[k] = null;
+                if (!view.isValid(row)) {
+                    try tuple_bytes.append(allocator, 0);
+                    continue;
+                }
+                const value = parallel_scan.keyCellValue(view, row) orelse return null;
+                try tuple_bytes.append(allocator, 1);
+                spans[k][0] = tuple_bytes.items.len;
+                if (!try appendValueBytes(allocator, &tuple_bytes, value)) return null;
+                spans[k][1] = tuple_bytes.items.len;
+                cells[k] = value;
+            }
+            if (!picking) {
+                if (tuples.contains(tuple_bytes.items)) rows_matched += 1;
+                continue;
+            }
+            rows_matched += 1;
+            const tuple = try tuples.getOrPut(allocator, tuple_bytes.items);
+            if (tuple.found_existing) continue;
+            tuple.key_ptr.* = try allocator.dupe(u8, tuple_bytes.items);
+            for (cells[0..col_count], spans[0..col_count], 0..) |cell, span, k| {
+                const value = cell orelse {
+                    has_null[k] = true;
+                    continue;
+                };
+                const gop = try values[k].getOrPut(allocator, tuple.key_ptr.*[span[0]..span[1]]);
+                if (gop.found_existing) continue;
+                gop.value_ptr.* = switch (value) {
+                    .text => |t| .{ .text = try allocator.dupe(u8, t) },
+                    else => value,
+                };
+            }
+        }
+    }
+    if (tuples.count() < keep) return null;
+    if (rows_matched * PICK_SHARE_DENOMINATOR > rows_seen) return null;
+
+    var sets: std.ArrayListUnmanaged(exec.InSet) = .empty;
+    for (cols[0..col_count], 0..) |name, k| {
+        // A row-filter offer drops NULL rows, so a column with a NULL among
+        // the picked keys can't carry one.
+        if (has_null[k]) continue;
+        const set_values = try allocator.alloc(types.Value, values[k].count());
+        var it = values[k].valueIterator();
+        var i: usize = 0;
+        while (it.next()) |v| : (i += 1) set_values[i] = v.*;
+        try sets.append(allocator, .{ .col = name, .values = set_values, .negate = false, .rows = true });
+    }
+    if (sets.items.len == 0) return null;
+    return sets.items;
+}
+
+/// The bytes that identify a key value, length-prefixed for text so a tuple of
+/// them stays unambiguous; false for a value with no ordered form.
+fn appendValueBytes(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: types.Value) !bool {
+    switch (value) {
+        .text => |t| {
+            try out.appendSlice(allocator, std.mem.asBytes(&@as(u32, @intCast(t.len))));
+            try out.appendSlice(allocator, t);
+        },
+        else => {
+            const ordered = predicate.valueToRangeI128(value) orelse return false;
+            try out.appendSlice(allocator, std.mem.asBytes(&ordered));
+        },
+    }
+    return true;
 }
 
 // Any other ORDER BY ... LIMIT still needs only the best LIMIT+OFFSET groups,
@@ -2551,6 +2684,112 @@ test "hashed-key emit reads rowrefs from the aggregation snapshot" {
     try std.testing.expectEqualStrings("s3", keys.rowBytes(0));
     try std.testing.expectEqualStrings("s7", keys.rowBytes(1));
     try std.testing.expectEqualStrings("s11", keys.rowBytes(2));
+}
+
+fn expectTextSet(set: exec.InSet, col: []const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqualStrings(col, set.col);
+    try std.testing.expect(set.rows and !set.negate);
+    try std.testing.expectEqual(expected.len, set.values.len);
+    for (expected) |want| {
+        const found = for (set.values) |v| {
+            if (std.mem.eql(u8, v.text, want)) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+}
+
+test "key pick offers the first distinct keys in scan order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "u", .type = .bigint, .nullable = true },
+            .{ .name = "s", .type = .{ .varchar = 16 } },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    // 300 groups (u = g / 3, NULL for g = 7; s = "s<g>"), one row per group
+    // per pass: two passes flushed to segments, two left in the memtable.
+    const Row = struct { id: i64, u: ?i64, s: []const u8 };
+    var names: [300][8]u8 = undefined;
+    var rows: [300]Row = undefined;
+    for (0..4) |pass| {
+        for (&rows, &names, 0..) |*row, *name, g| {
+            const s = try std.fmt.bufPrint(name, "s{d}", .{g});
+            row.* = .{ .id = @intCast(pass * 300 + g), .u = if (g == 7) null else @intCast(g / 3), .s = s };
+        }
+        try t.insert(&rows);
+        if (pass < 2) try t.flush();
+    }
+
+    const snapshot = try Scan.captureSnapshotAlloc(t, allocator, null);
+    defer {
+        snapshot.release(t);
+        allocator.free(snapshot.segments);
+    }
+    var plan: ShapePlan = undefined;
+    plan.layout.part_count = 2;
+    plan.layout.parts[0] = .{ .name = "u", .typ = .bigint, .offset_bits = 0, .width_bits = 65, .nullable = true };
+    plan.layout.parts[1] = .{ .name = "s", .typ = .{ .varchar = 16 }, .offset_bits = 0, .width_bits = 0 };
+    plan.derived = &.{};
+    const request: Request = .{
+        .group_cols = &.{ "u", "s" },
+        .aggs = &.{},
+        .order_specs = &.{},
+        .limit = 3,
+        .offset = 0,
+        .where_filter = null,
+        .having_filter = null,
+        .needed = null,
+        .dop = 1,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const first = (try pickKeySets(a, null, t, snapshot, request, plan)).?;
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqualStrings("u", first[0].col);
+    try std.testing.expectEqual(@as(usize, 1), first[0].values.len);
+    try std.testing.expectEqual(@as(i64, 0), first[0].values[0].bigint);
+    try expectTextSet(first[1], "s", &.{ "s0", "s1", "s2" });
+
+    // g = 7 is picked: its NULL u leaves only the s set.
+    var with_offset = request;
+    with_offset.offset = 5;
+    const nulls = (try pickKeySets(a, null, t, snapshot, with_offset, plan)).?;
+    try std.testing.expectEqual(@as(usize, 1), nulls.len);
+    try expectTextSet(nulls[0], "s", &.{ "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7" });
+
+    var filtered = request;
+    filtered.where_filter = .{ .leaf = .{ .col = "id", .op = .gte, .val = .{ .bigint = 150 } } };
+    const later = (try pickKeySets(a, null, t, snapshot, filtered, plan)).?;
+    try expectTextSet(later[1], "s", &.{ "s150", "s151", "s152" });
+
+    // 200 of 300 groups cover two thirds of the rows: no worthwhile filter.
+    var wide = request;
+    wide.limit = 200;
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, wide, plan) == null);
+
+    var one_group = request;
+    one_group.where_filter = .{ .leaf = .{ .col = "s", .op = .eq, .val = .{ .text = "s5" } } };
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, one_group, plan) == null);
+
+    var ordered = request;
+    ordered.order_specs = &.{.{ .col = "u", .desc = false }};
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, ordered, plan) == null);
 }
 
 test "ranked final rows match the row order" {

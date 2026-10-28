@@ -3094,7 +3094,7 @@ const KeyCollect = struct {
 /// A key column's cell as a `Value` whose equality is byte equality, or
 /// null for the types where it isn't (floats, JSON) or that have no `Value`
 /// form here.
-fn keyCellValue(view: ColumnView, row: usize) ?types.Value {
+pub fn keyCellValue(view: ColumnView, row: usize) ?types.Value {
     return switch (view.data) {
         .int => |s| .{ .int = s[row] },
         .bigint => |s| .{ .bigint = s[row] },

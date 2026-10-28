@@ -523,3 +523,75 @@ test "GROUP BY ORDER BY aggregate, string key LIMIT: ties at the cut across fill
     };
     for (cases) |c| try checkRankCase(allocator, db, rows, c);
 }
+
+// Over many groups the aggregate picks its LIMIT+OFFSET groups first and folds
+// only their rows. Each group has a row in two segments and two in the
+// memtable (one of each deleted for groups 2 and 3), so a picked group's count
+// and sum are exact only when every row of it is still found.
+test "GROUP BY ... LIMIT n over many groups: picked groups aggregate every row" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4, .row_group_size = 128 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE w (id BIGINT PRIMARY KEY, u BIGINT, s VARCHAR(16) NOT NULL, v BIGINT NOT NULL)");
+
+    const groups = 500;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    const t = try db.openTable("w", .{});
+    for (0..4) |pass| {
+        sql.clearRetainingCapacity();
+        try sql.appendSlice(allocator, "INSERT INTO w VALUES ");
+        for (0..groups) |g| {
+            if (g != 0) try sql.append(allocator, ',');
+            // Group 1's u is NULL: its key column can't carry a row filter.
+            if (g == 1) {
+                try sql.print(allocator, "({d},NULL,'s{d}',{d})", .{ pass * groups + g, g, g });
+            } else {
+                try sql.print(allocator, "({d},{d},'s{d}',{d})", .{ pass * groups + g, g / 3, g, g });
+            }
+        }
+        try exec(allocator, db, sql.items);
+        if (pass < 2) try t.flush();
+    }
+    try exec(allocator, db, "DELETE FROM w WHERE id = 503 OR id = 1002");
+
+    const Case = struct { sql: []const u8, s: usize, u: ?usize, c: usize, sv: usize, n: usize, min_g: i64 = 0 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT u, s, COUNT(*) AS c, SUM(v) AS sv FROM w GROUP BY u, s LIMIT 5", .u = 0, .s = 1, .c = 2, .sv = 3, .n = 5 },
+        .{ .sql = "SELECT s, u, COUNT(*) AS c, SUM(v) AS sv FROM w WHERE v >= 250 GROUP BY s, u LIMIT 4 OFFSET 2", .s = 0, .u = 1, .c = 2, .sv = 3, .n = 4, .min_g = 250 },
+        .{ .sql = "SELECT s, COUNT(*) AS c, SUM(v) AS sv FROM w GROUP BY s LIMIT 7", .s = 0, .u = null, .c = 1, .sv = 2, .n = 7 },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("case: {s}\n", .{c.sql});
+        const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{c.sql});
+        defer allocator.free(explain_sql);
+        var plan = try resultLines(allocator, db, explain_sql);
+        defer plan.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, plan.items, "V2 group-topN") != null);
+
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        var seen = std.AutoHashMap(i64, void).init(allocator);
+        defer seen.deinit();
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const g = try std.fmt.parseInt(i64, batch.values[c.s].data.varchar.rowBytes(r)[1..], 10);
+                try std.testing.expect(g >= c.min_g);
+                try std.testing.expect(!seen.contains(g));
+                try seen.put(g, {});
+                const count: i64 = if (g == 2 or g == 3) 3 else 4;
+                try std.testing.expectEqual(count, batch.values[c.c].data.bigint[r]);
+                try std.testing.expectEqual(count * g, batch.values[c.sv].data.bigint[r]);
+                if (c.u) |u| {
+                    const view = batch.values[u];
+                    try std.testing.expectEqual(g != 1, view.isValid(r));
+                    if (g != 1) try std.testing.expectEqual(@divTrunc(g, 3), view.data.bigint[r]);
+                }
+            }
+        }
+        try std.testing.expectEqual(c.n, seen.count());
+    }
+}
