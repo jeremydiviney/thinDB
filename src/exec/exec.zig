@@ -1839,6 +1839,7 @@ test {
     _ = v2_group_topn_engine;
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
+    _ = @import("partitioned_distinct.zig");
     _ = @import("concurrent_int_table.zig");
     _ = @import("expand.zig");
 }

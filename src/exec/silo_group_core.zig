@@ -535,9 +535,8 @@ const MAX_GROUP_DISTINCT_SLOTS: usize = 8;
 // (gid in the high 64 bits, the integer value's bit pattern in the low 64) —
 // exact, so no value is stored beyond the u128 key and the distinct count falls
 // out as the number of never-before-seen inserts. The grouped silo folds it under
-// the bucket agg_lock (no synchronization needed); the global aggregate reuses it
-// as a per-lane partial (gid 0) and unions lanes via `mergeInto` at the single-
-// threaded merge layer.
+// the bucket agg_lock (no synchronization needed); the serial global aggregate
+// reuses it with a configured tier.
 // COUNT(DISTINCT) membership set, tiered by key width over the lean
 // open-addressing sets in `group_table`. The fold is cache-miss-bound on a
 // multi-million entry table, so the slot must be no wider than the key actually
@@ -634,50 +633,6 @@ pub const DistinctSet = struct {
             .u64 => |*s| return s.insertNew(@truncate(composite)),
             .u96 => |*s| return s.insertNew(group_table.Key96.fromU128(composite)),
             .u128 => |*s| return s.insertNew(composite),
-        }
-    }
-
-    // Fold another lane's partial set into this one (global aggregate merge).
-    // Both sets share the same tier (configured from the same plan). Reserve the
-    // union upper bound once so no grow fires per inserted key.
-    pub fn mergeInto(self: *DistinctSet, allocator: Allocator, other: *const DistinctSet) !void {
-        switch (self.store) {
-            .u32 => |*s| {
-                const o = &other.store.u32;
-                if (o.has_sentinel) s.has_sentinel = true;
-                try s.ensureFor(allocator, o.count());
-                for (o.slots, 0..) |k, slot_index| {
-                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
-                    if (k != group_table.DistinctU32Set.SENTINEL) s.insert(k);
-                }
-            },
-            .u64 => |*s| {
-                const o = &other.store.u64;
-                if (o.has_sentinel) s.has_sentinel = true;
-                try s.ensureFor(allocator, o.count());
-                for (o.slots, 0..) |k, slot_index| {
-                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
-                    if (k != group_table.DistinctU64Set.SENTINEL) s.insert(k);
-                }
-            },
-            .u96 => |*s| {
-                const o = &other.store.u96;
-                if (o.has_sentinel) s.has_sentinel = true;
-                try s.ensureFor(allocator, o.count());
-                for (o.slots, 0..) |k, slot_index| {
-                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
-                    if (!k.eql(group_table.DistinctU96Set.SENTINEL)) s.insert(k);
-                }
-            },
-            .u128 => |*s| {
-                const o = &other.store.u128;
-                if (o.has_sentinel) s.has_sentinel = true;
-                try s.ensureFor(allocator, o.count());
-                for (o.slots, 0..) |k, slot_index| {
-                    if (slot_index % 4096 == 0) try thindb.exec.memory.checkCancelled(allocator);
-                    if (k != group_table.DistinctU128Set.SENTINEL) s.insert(k);
-                }
-            },
         }
     }
 
