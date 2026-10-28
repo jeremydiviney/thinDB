@@ -513,6 +513,11 @@ fn starScanAt(prog: []const Inst, pc: usize) StarScan {
         .jmp => |t| if (t != pc) return .none,
         else => return .none,
     }
+    return classScan(&cc);
+}
+
+/// How to find the end of a run of `cc` bytes.
+fn classScan(cc: *const CharClass) StarScan {
     var bytes: [4]u8 = undefined;
     var n: u8 = 0;
     for (0..256) |b| {
@@ -763,6 +768,485 @@ fn bitsSetRange(words: []u64, lo: usize, hi: usize) void {
 }
 
 // ---------------------------------------------------------------------------
+// Sequence plan: straight-line patterns matched without the general engine
+// ---------------------------------------------------------------------------
+
+/// Most choice points a `SeqPlan` may hold: each doubles its worst case.
+const SEQ_MAX_CHOICES = 4;
+
+/// Most copies of a fixed-count repeat a `SeqPlan` writes out.
+const SEQ_MAX_UNROLL = 16;
+
+const SeqLiteral = struct {
+    off: u32,
+    len: u32,
+    /// An ASCII letter also matches its other case; the plan stores it
+    /// lower case.
+    fold: bool,
+};
+
+const OptionalMode = enum {
+    /// Present exactly when it matches here: what follows can't begin on
+    /// its first byte, or can't fail.
+    when_matched,
+    /// Lazy, and what follows can't fail.
+    never,
+    /// Tried present first, then absent.
+    greedy_choice,
+    /// Tried absent first, then present.
+    lazy_choice,
+};
+
+const SeqStep = union(enum) {
+    literal: SeqLiteral,
+    /// `min` to `max` bytes of `class` (null = unbounded). What follows
+    /// can't begin on a byte of the class, or can't fail, so the count is
+    /// settled on the spot: as many as the bytes allow, or `min` when
+    /// `shortest`. No later failure is helped by a different count.
+    run: struct { class: CharClass, scan: StarScan, min: u32, max: ?u32, shortest: bool },
+    optional: SeqOptional,
+    save: u32,
+    eol,
+};
+
+/// A fixed-width body that may be absent; capture `slot` spans it when
+/// present. The body is `lead` (possibly empty), then
+/// `SeqPlan.parts[rest..][0..rest_len]`: most bodies are one literal,
+/// which then needs no walk over parts.
+const SeqOptional = struct {
+    lead: SeqLiteral,
+    rest: u32,
+    rest_len: u32,
+    width: u32,
+    slot: ?u32,
+    mode: OptionalMode,
+};
+
+/// A piece of an optional's body.
+const SeqPart = union(enum) {
+    literal: SeqLiteral,
+    /// Exactly `count` bytes of `class`.
+    class: struct { class: CharClass, scan: StarScan, count: u32 },
+};
+
+/// A pattern that is one straight sequence of literals, class runs,
+/// optional fixed-width pieces, captures and a final `$`, optionally
+/// `^`-anchored, with no `\b`, alternation or multiline. Such a pattern
+/// needs no NFA: a run's count is fixed on the spot, and the only
+/// backtracking is between the two branches of a few optional pieces.
+/// Q28's `^https?://(?:www\.)?([^/]+)/.*$` is one.
+const SeqPlan = struct {
+    steps: []SeqStep,
+    parts: []SeqPart,
+    bytes: []u8,
+    anchored: bool,
+
+    /// The plan for `root`, or null when the pattern is not such a
+    /// sequence (the general engine then serves it).
+    fn init(allocator: Allocator, root: *Node, options: Options) Error!?SeqPlan {
+        if (options.multiline) return null;
+        var b: SeqBuilder = .{ .allocator = allocator };
+        defer b.deinit();
+        var nodes: []const *Node = switch (root.*) {
+            .concat => |p| p,
+            else => (&root)[0..1],
+        };
+        const anchored = nodes.len > 0 and nodes[0].* == .bol;
+        if (anchored) nodes = nodes[1..];
+        for (nodes) |n| if (!try b.add(n)) return null;
+        if (!resolveSeq(b.steps.items, b.parts.items, b.bytes.items)) return null;
+        const steps = try b.steps.toOwnedSlice(allocator);
+        errdefer allocator.free(steps);
+        const parts = try b.parts.toOwnedSlice(allocator);
+        errdefer allocator.free(parts);
+        return .{ .steps = steps, .parts = parts, .bytes = try b.bytes.toOwnedSlice(allocator), .anchored = anchored };
+    }
+
+    fn deinit(self: SeqPlan, allocator: Allocator) void {
+        allocator.free(self.steps);
+        allocator.free(self.parts);
+        allocator.free(self.bytes);
+    }
+
+    inline fn literalAt(self: *const SeqPlan, lit: SeqLiteral, input: []const u8, pos: usize) bool {
+        return input.len - pos >= lit.len and self.literalIs(lit, input[pos..][0..lit.len]);
+    }
+
+    inline fn literalIs(self: *const SeqPlan, lit: SeqLiteral, have: []const u8) bool {
+        const want = self.bytes[lit.off..][0..lit.len];
+        if (!lit.fold) return bytesEqual(have, want);
+        for (have, want) |h, w| if (std.ascii.toLower(h) != w) return false;
+        return true;
+    }
+
+    inline fn bodyAt(self: *const SeqPlan, o: *const SeqOptional, input: []const u8, pos: usize) bool {
+        if (input.len - pos < o.width or !self.literalIs(o.lead, input[pos..][0..o.lead.len])) return false;
+        var p = pos + o.lead.len;
+        for (self.parts[o.rest..][0..o.rest_len]) |*part| switch (part.*) {
+            .literal => |lit| {
+                if (!self.literalIs(lit, input[p..][0..lit.len])) return false;
+                p += lit.len;
+            },
+            .class => |*c| {
+                if (starRunEnd(c.scan, &c.class, input[0 .. p + c.count], p) != p + c.count) return false;
+                p += c.count;
+            },
+        };
+        return true;
+    }
+
+    /// End of the match starting at `sp`, with its captures in `slots`, or
+    /// null. With `budgeted`, also null once `work` runs out.
+    fn matchAt(self: *const SeqPlan, comptime budgeted: bool, input: []const u8, sp: usize, slots: []?usize, work: *usize) ?usize {
+        const Choice = struct { step: usize, pos: usize };
+        var choices: [SEQ_MAX_CHOICES]Choice = undefined;
+        var n_choices: usize = 0;
+        var i: usize = 0;
+        var pos = sp;
+        while (i < self.steps.len) {
+            if (budgeted) {
+                if (work.* == 0) return null;
+                work.* -= 1;
+            }
+            const ok = switch (self.steps[i]) {
+                .literal => |lit| blk: {
+                    if (!self.literalAt(lit, input, pos)) break :blk false;
+                    pos += lit.len;
+                    break :blk true;
+                },
+                .run => |*r| blk: {
+                    const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
+                    const end = starRunEnd(r.scan, &r.class, input[0..@min(input.len, limit)], pos);
+                    if (end - pos < r.min) break :blk false;
+                    if (budgeted) work.* -|= end - pos;
+                    pos = end;
+                    break :blk true;
+                },
+                .optional => |*o| blk: {
+                    var present = o.mode != .never and self.bodyAt(o, input, pos);
+                    if (present and (o.mode == .greedy_choice or o.mode == .lazy_choice)) {
+                        choices[n_choices] = .{ .step = i, .pos = pos };
+                        n_choices += 1;
+                        if (o.mode == .lazy_choice) present = false;
+                    }
+                    setOptional(o.slot, slots, pos, if (present) o.width else null);
+                    if (present) pos += o.width;
+                    break :blk true;
+                },
+                .save => |slot| blk: {
+                    slots[slot] = pos;
+                    break :blk true;
+                },
+                .eol => pos == input.len,
+            };
+            if (ok) {
+                i += 1;
+                continue;
+            }
+            // The latest choice point takes its other branch, which is
+            // known to fit: a choice is only recorded where the body
+            // matched.
+            if (n_choices == 0) return null;
+            n_choices -= 1;
+            const c = choices[n_choices];
+            const o = &self.steps[c.step].optional;
+            const present = o.mode == .lazy_choice;
+            setOptional(o.slot, slots, c.pos, if (present) o.width else null);
+            pos = if (present) c.pos + o.width else c.pos;
+            i = c.step + 1;
+        }
+        return pos;
+    }
+
+    inline fn setOptional(slot: ?u32, slots: []?usize, pos: usize, width: ?u32) void {
+        const s = slot orelse return;
+        if (width) |w| {
+            slots[2 * s] = pos;
+            slots[2 * s + 1] = pos + w;
+        } else {
+            slots[2 * s] = null;
+            slots[2 * s + 1] = null;
+        }
+    }
+};
+
+/// Flattens AST nodes into `SeqStep`s; the runs' and optionals' modes are
+/// settled afterwards by `resolveSeq`, once what follows each is known.
+const SeqBuilder = struct {
+    allocator: Allocator,
+    steps: std.ArrayListUnmanaged(SeqStep) = .empty,
+    parts: std.ArrayListUnmanaged(SeqPart) = .empty,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *SeqBuilder) void {
+        self.steps.deinit(self.allocator);
+        self.parts.deinit(self.allocator);
+        self.bytes.deinit(self.allocator);
+    }
+
+    /// False when `n` doesn't fit a sequence plan.
+    fn add(self: *SeqBuilder, n: *const Node) Error!bool {
+        switch (n.*) {
+            .empty => return true,
+            .class => |*cc| {
+                try self.addClass(cc);
+                return true;
+            },
+            .concat => |nodes| {
+                for (nodes) |p| if (!try self.add(p)) return false;
+                return true;
+            },
+            .group => |g| {
+                if (g.slot) |s| try self.steps.append(self.allocator, .{ .save = 2 * s });
+                if (!try self.add(g.node)) return false;
+                if (g.slot) |s| try self.steps.append(self.allocator, .{ .save = 2 * s + 1 });
+                return true;
+            },
+            .eol => {
+                try self.steps.append(self.allocator, .eol);
+                return true;
+            },
+            .repeat => |r| return self.addRepeat(r.node, r.min, r.max, r.greedy),
+            .bol, .alt, .word_boundary, .not_word_boundary => return false,
+        }
+    }
+
+    fn addRepeat(self: *SeqBuilder, body: *const Node, min: u32, max: ?u32, greedy: bool) Error!bool {
+        if (max) |m| if (m < min) return false;
+        if (min == 0 and max == 1) return self.addOptional(body, greedy);
+        if (classOf(body)) |cc| {
+            if (min == max and min <= SEQ_MAX_UNROLL and literalByte(cc) != null) {
+                for (0..min) |_| try self.addClass(cc);
+                return true;
+            }
+            try self.steps.append(self.allocator, .{ .run = .{
+                .class = cc.*,
+                .scan = classScan(cc),
+                .min = min,
+                .max = max,
+                .shortest = !greedy,
+            } });
+            return true;
+        }
+        if (min != max or min > SEQ_MAX_UNROLL or hasCapture(body)) return false;
+        for (0..min) |_| if (!try self.add(body)) return false;
+        return true;
+    }
+
+    fn addOptional(self: *SeqBuilder, body: *const Node, greedy: bool) Error!bool {
+        const inner, const slot = switch (body.*) {
+            .group => |g| .{ g.node, g.slot },
+            else => .{ body, null },
+        };
+        const start = self.parts.items.len;
+        if (!try self.addPart(inner, start)) return false;
+        var width: u32 = 0;
+        for (self.parts.items[start..]) |part| width += switch (part) {
+            .literal => |lit| lit.len,
+            .class => |c| c.count,
+        };
+        if (width == 0) return false;
+        const lead: SeqLiteral = switch (self.parts.items[start]) {
+            .literal => self.parts.orderedRemove(start).literal,
+            .class => .{ .off = 0, .len = 0, .fold = false },
+        };
+        try self.steps.append(self.allocator, .{ .optional = .{
+            .lead = lead,
+            .rest = @intCast(start),
+            .rest_len = @intCast(self.parts.items.len - start),
+            .width = width,
+            .slot = slot,
+            .mode = if (greedy) .greedy_choice else .lazy_choice,
+        } });
+        return true;
+    }
+
+    /// Adds `n` to the optional body that begins at `parts[start]`; false
+    /// when `n` has no fixed width or holds a capture.
+    fn addPart(self: *SeqBuilder, n: *const Node, start: usize) Error!bool {
+        switch (n.*) {
+            .empty => return true,
+            .class => |*cc| {
+                try self.addPartClass(cc, 1, start);
+                return true;
+            },
+            .concat => |nodes| {
+                for (nodes) |p| if (!try self.addPart(p, start)) return false;
+                return true;
+            },
+            .group => |g| return g.slot == null and try self.addPart(g.node, start),
+            .repeat => |r| {
+                if (r.max != r.min or r.min > SEQ_MAX_UNROLL) return false;
+                if (classOf(r.node)) |cc| {
+                    try self.addPartClass(cc, r.min, start);
+                    return true;
+                }
+                for (0..r.min) |_| if (!try self.addPart(r.node, start)) return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn addPartClass(self: *SeqBuilder, cc: *const CharClass, count: u32, start: usize) Error!void {
+        const lb = literalByte(cc) orelse {
+            try self.parts.append(self.allocator, .{ .class = .{ .class = cc.*, .scan = classScan(cc), .count = count } });
+            return;
+        };
+        for (0..count) |_| {
+            if (self.parts.items.len > start) switch (self.parts.items[self.parts.items.len - 1]) {
+                .literal => |*lit| if (try self.extendLiteral(lit, lb)) continue,
+                .class => {},
+            };
+            try self.parts.append(self.allocator, .{ .literal = try self.newLiteral(lb) });
+        }
+    }
+
+    fn addClass(self: *SeqBuilder, cc: *const CharClass) Error!void {
+        const lb = literalByte(cc) orelse {
+            try self.steps.append(self.allocator, .{ .run = .{ .class = cc.*, .scan = classScan(cc), .min = 1, .max = 1, .shortest = false } });
+            return;
+        };
+        if (self.steps.items.len > 0) switch (self.steps.items[self.steps.items.len - 1]) {
+            .literal => |*lit| if (try self.extendLiteral(lit, lb)) return,
+            else => {},
+        };
+        try self.steps.append(self.allocator, .{ .literal = try self.newLiteral(lb) });
+    }
+
+    fn newLiteral(self: *SeqBuilder, lb: LiteralByte) Error!SeqLiteral {
+        try self.bytes.append(self.allocator, lb.byte);
+        return .{ .off = @intCast(self.bytes.items.len - 1), .len = 1, .fold = lb.fold };
+    }
+
+    /// Adds `lb` to `lit`, the literal at the end of `bytes`, unless their
+    /// case folding disagrees: a letter matched in one case can't join a
+    /// literal that folds, and the other way round. A literal of
+    /// non-letters can go either way.
+    fn extendLiteral(self: *SeqBuilder, lit: *SeqLiteral, lb: LiteralByte) Error!bool {
+        if (std.ascii.isAlphabetic(lb.byte) and lb.fold != lit.fold) {
+            for (self.bytes.items[lit.off..][0..lit.len]) |c| if (std.ascii.isAlphabetic(c)) return false;
+            lit.fold = lb.fold;
+        }
+        try self.bytes.append(self.allocator, lb.byte);
+        lit.len += 1;
+        return true;
+    }
+};
+
+const LiteralByte = struct { byte: u8, fold: bool };
+
+/// The byte `cc` stands for in a literal: its one byte, or the lower case
+/// of a letter it holds in both cases (and nothing else).
+fn literalByte(cc: *const CharClass) ?LiteralByte {
+    var count: usize = 0;
+    for (cc.bits) |m| count += @popCount(m);
+    if (count == 0 or count > 2) return null;
+    const first = for (cc.bits, 0..) |m, i| {
+        if (m != 0) break @as(u8, @intCast(i * 8 + @ctz(m)));
+    } else unreachable;
+    if (count == 1) return .{ .byte = first, .fold = false };
+    if (!std.ascii.isUpper(first) or !cc.contains(std.ascii.toLower(first))) return null;
+    return .{ .byte = std.ascii.toLower(first), .fold = true };
+}
+
+/// The class `n` matches one byte of, looking through non-capturing groups.
+fn classOf(n: *const Node) ?*const CharClass {
+    return switch (n.*) {
+        .class => |*cc| cc,
+        .group => |g| if (g.slot == null) classOf(g.node) else null,
+        else => null,
+    };
+}
+
+fn hasCapture(n: *const Node) bool {
+    return switch (n.*) {
+        .group => |g| g.slot != null or hasCapture(g.node),
+        .concat, .alt => |nodes| for (nodes) |p| {
+            if (hasCapture(p)) break true;
+        } else false,
+        .repeat => |r| hasCapture(r.node),
+        else => false,
+    };
+}
+
+/// Settles each run's count and each optional's mode from what follows
+/// it: walking back from the end, the bytes the rest can begin on, and
+/// whether the rest can match empty inside the text (it then can't fail).
+/// False when some run's count would need backtracking, or there are too
+/// many choice points.
+fn resolveSeq(steps: []SeqStep, parts: []const SeqPart, bytes: []const u8) bool {
+    var first: CharClass = .{};
+    var empty = true;
+    var choices: usize = 0;
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        switch (steps[i]) {
+            .literal => |lit| {
+                first = literalFirst(lit, bytes);
+                empty = false;
+            },
+            .run => |*r| {
+                const varies = if (r.max) |m| r.min < m else true;
+                if (varies and !empty) {
+                    if (overlaps(&r.class, &first)) return false;
+                    r.shortest = false;
+                }
+                if (r.max == 0) continue;
+                if (r.min == 0) {
+                    for (&first.bits, r.class.bits) |*x, y| x.* |= y;
+                } else {
+                    first = r.class;
+                    empty = false;
+                }
+            },
+            .optional => |*o| {
+                const bf = bodyFirst(o, parts, bytes);
+                if (empty) {
+                    o.mode = if (o.mode == .greedy_choice) .when_matched else .never;
+                } else if (!overlaps(&bf, &first)) {
+                    o.mode = .when_matched;
+                } else {
+                    choices += 1;
+                }
+                for (&first.bits, bf.bits) |*x, y| x.* |= y;
+            },
+            .save => {},
+            .eol => {
+                first = .{};
+                empty = false;
+            },
+        }
+    }
+    return choices <= SEQ_MAX_CHOICES;
+}
+
+/// The bytes a body of nonzero width can begin on.
+fn bodyFirst(o: *const SeqOptional, parts: []const SeqPart, bytes: []const u8) CharClass {
+    if (o.lead.len > 0) return literalFirst(o.lead, bytes);
+    for (parts[o.rest..][0..o.rest_len]) |part| switch (part) {
+        .literal => |lit| return literalFirst(lit, bytes),
+        .class => |c| if (c.count > 0) return c.class,
+    };
+    return .{};
+}
+
+fn literalFirst(lit: SeqLiteral, bytes: []const u8) CharClass {
+    var cc: CharClass = .{};
+    const b = bytes[lit.off];
+    cc.add(b);
+    if (lit.fold) cc.add(std.ascii.toUpper(b));
+    return cc;
+}
+
+fn overlaps(a: *const CharClass, b: *const CharClass) bool {
+    var any: u8 = 0;
+    for (a.bits, b.bits) |x, y| any |= x & y;
+    return any != 0;
+}
+
+// ---------------------------------------------------------------------------
 // Compiler: AST → flat instruction program
 // ---------------------------------------------------------------------------
 
@@ -877,6 +1361,23 @@ const BtJob = union(enum) {
     star_tail: struct { pc: u32, lo: u32, hi: u32 },
 };
 
+/// How often a search that gives up past a work budget did so for the
+/// program at `prog`, out of `tries` attempts.
+const BudgetedTry = struct {
+    prog: usize = 0,
+    tries: u64 = 0,
+    overruns: u64 = 0,
+
+    /// Whether to try `prog`'s budgeted search: yes until 64 tries show
+    /// more than one in eight running out of budget.
+    fn allow(self: *BudgetedTry, prog: []const Inst) bool {
+        if (self.prog != @intFromPtr(prog.ptr)) self.* = .{ .prog = @intFromPtr(prog.ptr) };
+        if (self.tries >= 64 and self.overruns * 8 > self.tries) return false;
+        self.tries += 1;
+        return true;
+    }
+};
+
 /// Reusable matcher scratch. Construct one per batch and pass it to every
 /// `findWith` / `replaceAllScratch` call: the visited-stamp array, the two
 /// thread lists, the seed buffer, and the per-match capture arena are all
@@ -917,11 +1418,10 @@ pub const Scratch = struct {
     bt_visited: []u64 = &.{},
     bt_jobs: std.ArrayListUnmanaged(BtJob) = .empty,
     bt_caps: []?u32 = &.{},
-    /// How often the search without a memo ran out of budget for the
-    /// program at `bt_prog`, out of `bt_tries` attempts.
-    bt_prog: usize = 0,
-    bt_tries: u64 = 0,
-    bt_overruns: u64 = 0,
+    /// The backtracker's search without a memo.
+    unmemoized: BudgetedTry = .{},
+    /// The unanchored sequence plan's search.
+    sequence: BudgetedTry = .{},
 
     pub fn init(backing: Allocator) Scratch {
         return .{ .backing = backing, .arena = std.heap.ArenaAllocator.init(backing) };
@@ -940,19 +1440,6 @@ pub const Scratch = struct {
         self.backing.free(self.bt_visited);
         self.bt_jobs.deinit(self.backing);
         self.backing.free(self.bt_caps);
-    }
-
-    /// Whether to start `prog`'s backtracking search without a memo: yes
-    /// until 64 tries show more than one in eight running out of budget.
-    fn tryUnmemoized(self: *Scratch, prog: []const Inst) bool {
-        if (self.bt_prog != @intFromPtr(prog.ptr)) {
-            self.bt_prog = @intFromPtr(prog.ptr);
-            self.bt_tries = 0;
-            self.bt_overruns = 0;
-        }
-        if (self.bt_tries >= 64 and self.bt_overruns * 8 > self.bt_tries) return false;
-        self.bt_tries += 1;
-        return true;
     }
 
     /// Grow `visited`/`seed` to fit this program, and guard `gen` against
@@ -1007,6 +1494,9 @@ pub const Regex = struct {
     /// empty, leading assertion, or too many distinct first bytes).
     prefilter_bytes: []const u8,
     bt: BtPlan,
+    /// Set when the pattern is a straight sequence `SeqPlan` matches
+    /// directly, ahead of the general engine.
+    seq: ?SeqPlan,
 
     pub fn compile(allocator: Allocator, pattern: []const u8) Error!Regex {
         return compileWith(allocator, pattern, .{});
@@ -1067,6 +1557,8 @@ pub const Regex = struct {
         errdefer allocator.free(prefilter_bytes);
 
         const bt = try BtPlan.init(allocator, prog, options.multiline);
+        errdefer bt.deinit(allocator);
+        const seq = try SeqPlan.init(allocator, root, options);
 
         return .{
             .prog = prog,
@@ -1078,6 +1570,7 @@ pub const Regex = struct {
             .loopy = loopy,
             .prefilter_bytes = prefilter_bytes,
             .bt = bt,
+            .seq = seq,
         };
     }
 
@@ -1086,6 +1579,7 @@ pub const Regex = struct {
         self.allocator.free(self.loopy);
         self.allocator.free(self.prefilter_bytes);
         self.bt.deinit(self.allocator);
+        if (self.seq) |plan| plan.deinit(self.allocator);
     }
 
     /// Leftmost match at or after `start`. Returns capture slots (slot
@@ -1103,6 +1597,10 @@ pub const Regex = struct {
     /// This is the form the batch kernels use: the visited array, thread
     /// lists, seed buffer, and capture arena all persist between rows.
     pub fn findWith(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize, out_slots: []?usize) Error!bool {
+        if (self.seq) |*plan| if (plan.anchored or scratch.sequence.allow(self.prog)) {
+            if (self.findSequence(plan, input, start, out_slots)) |found| return found;
+            scratch.sequence.overruns += 1;
+        };
         // DFA guard for the Pike VM's pathological shape: an unanchored
         // pattern with no usable first-byte prefilter seeds a thread at EVERY
         // input position. The lazy DFA decides match-existence in one linear
@@ -1125,11 +1623,57 @@ pub const Regex = struct {
     /// The DFA recognizes exactly the VM's language, so the answer is
     /// identical either way.
     pub fn matchesWith(self: *const Regex, scratch: *Scratch, input: []const u8, start: usize) Error!bool {
-        if (try self.dfaMatches(scratch, input, start)) |exists| return exists;
         if (scratch.slots.len < self.n_slots) {
             scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
         }
+        // An anchored plan settles a row in one pass with no budget, ahead
+        // of the DFA; an unanchored one could hand the row on after work
+        // the DFA would not have done.
+        if (self.seq) |*plan| if (plan.anchored) {
+            if (self.findSequence(plan, input, start, scratch.slots[0..self.n_slots])) |found| return found;
+        };
+        if (try self.dfaMatches(scratch, input, start)) |exists| return exists;
         return self.findWithImpl(true, scratch, input, start, scratch.slots[0..self.n_slots]);
+    }
+
+    /// The sequence plan's search; null when an unanchored search ran out
+    /// of budget, leaving the row to the general engine. A failed search
+    /// leaves every slot null rather than a failed attempt's captures.
+    fn findSequence(self: *const Regex, plan: *const SeqPlan, input: []const u8, start: usize, out_slots: []?usize) ?bool {
+        const slots = out_slots[0..self.n_slots];
+        const found = self.searchSequence(plan, input, start, slots);
+        if (found orelse false) return true;
+        @memset(slots, null);
+        return found;
+    }
+
+    fn searchSequence(self: *const Regex, plan: *const SeqPlan, input: []const u8, start: usize, slots: []?usize) ?bool {
+        var work: usize = 0;
+        if (plan.anchored) {
+            if (start > 0) return false;
+            const end = plan.matchAt(false, input, 0, slots, &work) orelse return false;
+            slots[0] = 0;
+            slots[1] = end;
+            return true;
+        }
+        // Retrying every start position is quadratic on a pathological
+        // row, so past a linear budget the row goes to the general engine.
+        work = 4 * (input.len - start + 1) + 16 * plan.steps.len;
+        var sp = start;
+        while (sp <= input.len) : (sp += 1) {
+            if (self.prefilter_bytes.len > 0) {
+                sp = self.nextCandidate(input, sp);
+                // A prefiltered pattern can't match empty.
+                if (sp == input.len) return false;
+            }
+            if (plan.matchAt(true, input, sp, slots, &work)) |end| {
+                slots[0] = sp;
+                slots[1] = end;
+                return true;
+            }
+            if (work == 0) return null;
+        }
+        return false;
     }
 
     /// `findWith` minus the DFA guard and the backtracker: always the Pike
@@ -1159,11 +1703,11 @@ pub const Regex = struct {
         }
         const caps = scratch.bt_caps[0..self.n_slots];
 
-        if (scratch.tryUnmemoized(self.prog)) {
+        if (scratch.unmemoized.allow(self.prog)) {
             @memset(caps, null);
             var budget = 4 * width + 2 * self.prog.len;
             if (try self.backtrackStarts(false, scratch, input, start, width, &budget, out_slots)) |found| return found;
-            scratch.bt_overruns += 1;
+            scratch.unmemoized.overruns += 1;
         }
 
         const n_bits = @as(usize, self.bt.rows) * width;
@@ -2590,11 +3134,8 @@ test "regex: backtracker equals reference matcher (fuzz)" {
                 const ref = try re.findWithImpl(false, &s_ref, input, start, slots_ref);
                 // `s_bt` always starts without the memo; `s_memo` is held
                 // to the memoized search alone.
-                s_bt.bt_tries = 0;
-                s_bt.bt_overruns = 0;
-                s_memo.bt_prog = @intFromPtr(re.prog.ptr);
-                s_memo.bt_tries = 64;
-                s_memo.bt_overruns = 64;
+                s_bt.unmemoized = .{};
+                s_memo.unmemoized = .{ .prog = @intFromPtr(re.prog.ptr), .tries = 64, .overruns = 64 };
                 for ([_]*Scratch{ &s_bt, &s_memo }) |s| {
                     @memset(slots_bt, null);
                     const bt = (try re.findBacktrack(s, input, start, slots_bt)).?;
@@ -2602,12 +3143,155 @@ test "regex: backtracker equals reference matcher (fuzz)" {
                     if (ref) try std.testing.expectEqualSlices(?usize, slots_ref, slots_bt);
                 }
                 searches += 1;
-                overruns += s_bt.bt_overruns;
+                overruns += s_bt.unmemoized.overruns;
             }
         }
     };
     // Both ways the search without a memo ends were exercised.
     try std.testing.expect(overruns > 0 and overruns < searches);
+}
+
+test "regex: sequence plan equals reference matcher (fuzz)" {
+    const planned = [_][]const u8{
+        "^https?://(?:www\\.)?([^/]+)/.*$",
+        "^https?://(?:www\\.)?(?:m\\.)?([^/]+)",
+        "^([^/]+)/(.*)$",
+        "^ab?c?(?:ww\\.)?([^/]+)/.*$",
+        "a?(b?)c?\\.",
+        "([^.]*)\\.([^.]*)$",
+        "x[ab]+y",
+        "[a-z]+[0-9]",
+        "^[^x]*x[^y]*y$",
+        "(\\w+)\\.(\\w+)",
+        "([^ ]*) ([^ ]*)",
+        "a{2,4}",
+        "a*?",
+        "x*",
+        "^$",
+        "$",
+        "^",
+        "",
+        "[^/]+",
+        "a*b",
+        "(a*)(a*)(a*)",
+        "(a+?)",
+        "id=([0-9]+)",
+        "^[a-z]{2}[0-9]{1,3}$",
+        "w\\.com$",
+        "(?:ab){2}c",
+        "colou?r",
+        "a??b",
+        "(?:ab)??a",
+        "(?:ab)?ab",
+        "^(ab)?a",
+        "^(?:wd)?(?:wd)?(wd)?w",
+        "x(?:yz)?(z)?",
+        "^.{3}",
+        "[ab]{0}c",
+        "^https?://(?:www.)?([^/]+)/.*$",
+        "(?:a.)?a",
+        "^(?:[0-9]{2}\\.)?([0-9]+)$",
+        "x([ab])?y",
+        "[ab]?a",
+        "(?:wd.)??w",
+        "(?:(?:ab){2})?c",
+    };
+    const unplanned = [_][]const u8{
+        "(cat|dog)",
+        "^(.*?)(.*)$",
+        "^(.*)/(.*)$",
+        "\\b\\w+\\b",
+        "(a|b)*c",
+        "(ab)+",
+        "a^b",
+        "(?:x/.*)?y",
+        "^(?:a)?(?:a)?(?:a)?(?:a)?(?:a)?a",
+        "(?:a*)?b",
+        "(?:a|b)?c",
+        "(?:(a)b)?c",
+    };
+    const option_sets = [_]Options{
+        .{},
+        .{ .dot_all = true, .case_insensitive = true },
+    };
+    const fragments = [_][]const u8{ "http", "https", "://", "www.", "m.", "/", "ab", "a", "b", "wd", "w", ".", "x", "yz", "z", "id=", "12", " ", "\n", "colour", "c", "AB", "W" };
+    const alphabet = "abc/xyz12. \nwd_AB";
+    var prng = std.Random.DefaultPrng.init(0x5E9_2026);
+    const rnd = prng.random();
+    var buf: [48]u8 = undefined;
+    var compared: u64 = 0;
+    var handed_on: u64 = 0;
+
+    for (unplanned) |pat| {
+        var re = try Regex.compile(std.testing.allocator, pat);
+        defer re.deinit();
+        try std.testing.expect(re.seq == null);
+    }
+    {
+        var re = try Regex.compileWith(std.testing.allocator, planned[0], .{ .multiline = true });
+        defer re.deinit();
+        try std.testing.expect(re.seq == null);
+    }
+
+    for (option_sets) |options| for (planned) |pat| {
+        var re = try Regex.compileWith(std.testing.allocator, pat, options);
+        defer re.deinit();
+        try std.testing.expect(re.seq != null);
+        var s_ref = Scratch.init(std.testing.allocator);
+        defer s_ref.deinit();
+        const slots_seq = try std.testing.allocator.alloc(?usize, re.n_slots);
+        defer std.testing.allocator.free(slots_seq);
+        const slots_ref = try std.testing.allocator.alloc(?usize, re.n_slots);
+        defer std.testing.allocator.free(slots_ref);
+
+        var iter: usize = 0;
+        while (iter < 400) : (iter += 1) {
+            var len: usize = 0;
+            if (iter % 2 == 0) {
+                len = rnd.intRangeAtMost(usize, 0, buf.len);
+                for (buf[0..len]) |*b| b.* = alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)];
+            } else while (true) {
+                const f = fragments[rnd.intRangeLessThan(usize, 0, fragments.len)];
+                if (len + f.len > buf.len or rnd.intRangeLessThan(usize, 0, 8) == 0) break;
+                @memcpy(buf[len..][0..f.len], f);
+                len += f.len;
+            }
+            const input = buf[0..len];
+
+            var start: usize = 0;
+            while (start <= len) : (start += 1) {
+                @memset(slots_ref, null);
+                const ref = try re.findWithImpl(false, &s_ref, input, start, slots_ref);
+                const seq = re.findSequence(&re.seq.?, input, start, slots_seq) orelse {
+                    handed_on += 1;
+                    continue;
+                };
+                try std.testing.expectEqual(ref, seq);
+                if (ref) try std.testing.expectEqualSlices(?usize, slots_ref, slots_seq);
+                compared += 1;
+            }
+        }
+    };
+    // Both ways an unanchored search ends were exercised.
+    try std.testing.expect(handed_on > 0 and compared > 20 * handed_on);
+}
+
+test "regex: an unanchored sequence hands pathological rows to the general engine" {
+    var re = try Regex.compile(std.testing.allocator, "a[a-z]*!");
+    defer re.deinit();
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const row = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(row);
+    @memset(row, 'a');
+    var slots: [2]?usize = undefined;
+    try std.testing.expectEqual(@as(?bool, null), re.findSequence(&re.seq.?, row, 0, &slots));
+    // Rows that keep running out of budget stop trying the plan first.
+    for (0..100) |_| try std.testing.expect(!try re.findWith(&scratch, row, 0, &slots));
+    try std.testing.expectEqual(@as(u64, 64), scratch.sequence.tries);
+    row[row.len - 1] = '!';
+    try std.testing.expect(try re.findWith(&scratch, row, 0, &slots));
+    try std.testing.expectEqual(@as(?usize, 0), slots[0]);
 }
 
 test "regex: findAnyByte finds the first of several bytes at every offset" {
@@ -2635,9 +3319,7 @@ test "regex: backtracker defers oversized windows to the Pike VM" {
     defer re.deinit();
     var scratch = Scratch.init(std.testing.allocator);
     defer scratch.deinit();
-    scratch.bt_prog = @intFromPtr(re.prog.ptr);
-    scratch.bt_tries = 64;
-    scratch.bt_overruns = 64;
+    scratch.unmemoized = .{ .prog = @intFromPtr(re.prog.ptr), .tries = 64, .overruns = 64 };
     const big = try std.testing.allocator.alloc(u8, BACKTRACK_MAX_BITS / re.bt.rows + 1);
     defer std.testing.allocator.free(big);
     @memset(big, 'a');
@@ -2662,7 +3344,7 @@ test "regex: backtracker without a memo takes oversized windows it finishes in b
     try std.testing.expectEqual(@as(?bool, true), try re.findBacktrack(&scratch, big, 0, &slots));
     try std.testing.expectEqual(@as(?usize, big.len / 2), slots[3]);
     try std.testing.expectEqual(@as(?usize, big.len), slots[5]);
-    try std.testing.expectEqual(@as(u64, 0), scratch.bt_overruns);
+    try std.testing.expectEqual(@as(u64, 0), scratch.unmemoized.overruns);
 }
 
 // Diagnostic micro-benchmark: isolate Pike-VM regex throughput from the query
