@@ -252,6 +252,79 @@ const PrunedBounds = struct {
     live: []bool,
 };
 
+/// What a consumer that keeps only the groups led by a string column's `keep`
+/// best values asks of a scan (`Scan.setKeyBound`): `GROUP BY k ... ORDER BY
+/// k LIMIT n`.
+pub const KeyBoundSpec = struct {
+    col: []const u8,
+    desc: bool,
+    keep: usize,
+};
+
+/// The `keep` best distinct values of one string column among the rows a scan
+/// has emitted. A row whose value ranks past the keep-th best so far can't
+/// lead a kept group: the keep-th best over every row is never worse than
+/// over the rows one scan saw. So every row of a kept group still reaches
+/// the consumer, while the rows of most other groups don't. One per scan,
+/// read and written only by the scan's thread.
+pub const KeyBound = struct {
+    phys: usize,
+    desc: bool,
+    keep: usize,
+    /// Best first, distinct; full once `len == keep`.
+    values: [][]u8,
+    len: usize = 0,
+
+    pub fn init(allocator: Allocator, phys: usize, desc: bool, keep: usize) !KeyBound {
+        std.debug.assert(keep > 0);
+        return .{ .phys = phys, .desc = desc, .keep = keep, .values = try allocator.alloc([]u8, keep) };
+    }
+
+    pub fn deinit(self: *KeyBound, allocator: Allocator) void {
+        for (self.values[0..self.len]) |v| allocator.free(v);
+        allocator.free(self.values);
+    }
+
+    fn before(self: *const KeyBound, a: []const u8, b: []const u8) bool {
+        return simd.orderBytes(a, b) == if (self.desc) std.math.Order.gt else std.math.Order.lt;
+    }
+
+    /// The keep-th best value once `keep` are known.
+    pub fn bound(self: *const KeyBound) ?[]const u8 {
+        return if (self.len == self.keep) self.values[self.len - 1] else null;
+    }
+
+    /// Whether a row holding `bytes` may lead a kept group; a value that may
+    /// is recorded.
+    pub fn admit(self: *KeyBound, allocator: Allocator, bytes: []const u8) !bool {
+        if (self.bound()) |b| {
+            if (self.before(b, bytes)) return false;
+        }
+        var lo: usize = 0;
+        var hi: usize = self.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.before(self.values[mid], bytes)) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.len and std.mem.eql(u8, self.values[lo], bytes)) return true;
+        const copy = try allocator.dupe(u8, bytes);
+        if (self.len == self.keep) {
+            self.len -= 1;
+            allocator.free(self.values[self.len]);
+        }
+        std.mem.copyBackwards([]u8, self.values[lo + 1 .. self.len + 1], self.values[lo..self.len]);
+        self.values[lo] = copy;
+        self.len += 1;
+        return true;
+    }
+
+    /// Whether a row group with these footer stats may hold an admissible row.
+    pub fn statsCanMatch(self: *const KeyBound, stats: storage.format.Stats) bool {
+        const b = self.bound() orelse return true;
+        return predicate.statsOverlapPredicateBlankAware(stats, if (self.desc) .gte else .lte, .{ .text = b }, false);
+    }
+};
+
 /// Process-wide FSST digest-fill accounting (--profile-ops). The fill runs on
 /// silo-grid worker threads whose thread-local oprof slots never reach the
 /// connection thread's dump, so these aggregate atomically; the MySQL handler
@@ -422,6 +495,10 @@ pub const Scan = struct {
     /// compacted survivor batch. The expr's backing memory is owned by the
     /// fusing Filter (which outlives this Scan), so the Scan never frees it.
     fused_filter: ?PredicateExpr = null,
+    /// Set by `setKeyBound`: the guided filter path drops rows the bound
+    /// rules out, and row groups whose stats it rules out are skipped. Other
+    /// paths emit those rows; the consumer ranks what it gets either way.
+    key_bound: ?KeyBound = null,
     /// Scratch row-mask, grown on demand for the largest row group seen.
     /// Reused across `next()` calls; freed in `deinit`.
     mask_buf: []bool = &.{},
@@ -1143,6 +1220,22 @@ pub const Scan = struct {
         return true;
     }
 
+    /// Install a `KeyBound` on the column `spec.col`. Qualifies: a
+    /// non-nullable VARCHAR, STRING or CHAR column, ordered bytewise as
+    /// `ORDER BY` orders it. Returns false, installing nothing, otherwise.
+    pub fn setKeyBound(self: *Scan, spec: KeyBoundSpec) !bool {
+        if (self.key_bound != null or spec.keep == 0) return false;
+        const phys = types.findColumn(self.table.schema.columns, spec.col) orelse return false;
+        const col = self.table.schema.columns[phys];
+        if (col.nullable) return false;
+        switch (col.type) {
+            .varchar, .string, .char => {},
+            else => return false,
+        }
+        self.key_bound = try KeyBound.init(self.allocator, phys, spec.desc, spec.keep);
+        return true;
+    }
+
     fn hashColIdx(self: *Scan, name: []const u8) ?usize {
         for (self.out_phys, 0..) |phys, j| {
             const col = self.table.schema.columns[phys];
@@ -1356,6 +1449,7 @@ pub const Scan = struct {
         for (self.runs_l_bufs) |*b| b.deinit(self.allocator);
         if (self.runs_l_bufs.len > 0) self.allocator.free(self.runs_l_bufs);
         if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
+        if (self.key_bound) |*kb| kb.deinit(self.allocator);
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
@@ -2064,6 +2158,9 @@ pub const Scan = struct {
         for (self.in_prunes.items) |hint| {
             if (!setOverlaps(hint.values, rg.stats[hint.col_idx])) return false;
         }
+        if (self.key_bound) |*kb| {
+            if (!kb.statsCanMatch(rg.stats[kb.phys])) return false;
+        }
         return true;
     }
 
@@ -2599,6 +2696,7 @@ pub const Scan = struct {
             if (ff == .always and !ff.always) return null;
             return self.nextFiltered();
         }
+        if (self.key_bound != null) return self.nextFiltered();
 
         // Scan sub-batch experiment: serve the next slice of the already-decoded
         // row group without releasing or re-decoding it.
@@ -2851,7 +2949,7 @@ pub const Scan = struct {
     /// `self.filtered` / `self.views` (fully owned), exactly like the copy path
     /// — so downstream sees no borrowed cache memory.
     fn nextFiltered(self: *Scan) !?Batch {
-        const expr = self.fused_filter.?;
+        const expr = self.fused_filter orelse PredicateExpr{ .always = true };
 
         if (self.pending_rows.len > 0) {
             // The loop below is what moves off a segment, so the pending row
@@ -3020,6 +3118,11 @@ pub const Scan = struct {
         const mask = try self.ensureMask(rg_count);
         const _tp = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         switch (expr) {
+            // A key bound with no WHERE behind it.
+            .always => |keep_all| {
+                if (!keep_all) return null;
+                @memset(mask[0..rg_count], true);
+            },
             .leaf, .like, .not, .in_set, .@"or" => {
                 if (!guidedChildShape(expr)) return null;
                 if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, null, mask[0..rg_count])) return null;
@@ -3074,6 +3177,7 @@ pub const Scan = struct {
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
+        if (self.key_bound != null) try self.applyKeyBound(seg, rg_idx, rg_count, mask[0..rg_count]);
 
         const _tcnt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var matched: usize = 0;
@@ -4509,6 +4613,68 @@ pub const Scan = struct {
     /// Survivor-granular sibling of `fillKeyHashes`: digest just the surviving
     /// rows of one row group's string column — dict block via a per-distinct
     /// digest LUT, raw block via the in-place view, owned decode as fallback.
+    /// Clear the live rows of `mask` that `key_bound` rules out, admitting
+    /// the rest. `mask` already has the WHERE and tombstones applied, so only
+    /// rows the scan emits shape the bound. A value decided once in a row
+    /// group keeps its decision there: a drop stays right as the bound only
+    /// tightens, and a pass only lets through rows the consumer ranks anyway.
+    fn applyKeyBound(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []bool) !void {
+        const kb = &self.key_bound.?;
+        const col = self.table.schema.columns[kb.phys];
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, kb.phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
+
+        if (block.encoding == .dict) {
+            const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
+            const Decision = enum(u8) { unknown, pass, drop };
+            const decided = try self.allocator.alloc(Decision, db.ndv);
+            defer self.allocator.free(decided);
+            @memset(decided, .unknown);
+            for (mask, 0..) |*m, i| {
+                if (!m.*) continue;
+                const code = db.rowCode(i);
+                if (decided[code] == .unknown) decided[code] = if (try kb.admit(self.allocator, db.dictValue(code))) .pass else .drop;
+                m.* = decided[code] == .pass;
+            }
+        } else if (block.encoding == .fsst) {
+            const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
+            var scratch: std.ArrayListUnmanaged(u8) = .empty;
+            defer scratch.deinit(self.allocator);
+            var prev_comp: ?[]const u8 = null;
+            var prev_pass = false;
+            for (mask, 0..) |*m, i| {
+                if (!m.*) continue;
+                const comp = fv.block.rowComp(i);
+                if (prev_comp == null or !std.mem.eql(u8, prev_comp.?, comp)) {
+                    try scratch.resize(self.allocator, storage.fsst.decodedSizeBound(comp.len));
+                    const n = fv.block.table.decodeIntoUnchecked(comp, scratch.items);
+                    prev_pass = try kb.admit(self.allocator, scratch.items[0..n]);
+                    prev_comp = comp;
+                }
+                m.* = prev_pass;
+            }
+        } else if (storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding)) |view| {
+            const sv = switch (view.data) {
+                .varchar, .string, .char => |s| s,
+                else => return error.TypeMismatch,
+            };
+            for (mask, 0..) |*m, i| {
+                if (m.*) m.* = try kb.admit(self.allocator, sv.rowBytes(i));
+            }
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, kb.phys, self.table.cacheRef());
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string, .char => |s| s.view(),
+                else => return error.TypeMismatch,
+            };
+            for (mask, 0..) |*m, i| {
+                if (m.*) m.* = try kb.admit(self.allocator, sv.rowBytes(i));
+            }
+        }
+    }
+
     fn hashSurvivorsFromBlock(
         self: *Scan,
         seg: *storage.ReadSegment,

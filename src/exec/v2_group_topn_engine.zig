@@ -491,6 +491,9 @@ pub const Shape = struct {
     // staged row carries its __rowloc so the real key values are recovered at
     // emit via late materialization. Forces the u128 key lane + rowref region.
     hashed: bool = false,
+    // Rows the ORDER BY ... LIMIT above the core can't keep, dropped in
+    // each worker's scan (see `Scan.setKeyBound`).
+    key_bound: ?exec.KeyBoundSpec = null,
 };
 
 pub const Params = struct {
@@ -979,6 +982,7 @@ fn runHarness(
         .result_all_groups_cap = shape.emit_all_groups_cap,
         .result_emit_filter = shape.emit_filter,
         .result_rank = shape.emit_rank,
+        .key_bound = shape.key_bound,
         .trace_timing = params.trace_timing,
         .workspace = workspace,
         // The arena path frees the whole arena synchronously right after the

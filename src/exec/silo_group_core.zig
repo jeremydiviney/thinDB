@@ -6807,6 +6807,7 @@ pub const RunConfig = struct {
     filter_expr: ?thindb.exec.PredicateExpr = null,
     /// Hints the consumer offered on scan columns, after the filter's own.
     offered_prunes: Scan.OfferedPrunes = .{},
+    key_bound: ?thindb.exec.KeyBoundSpec = null,
     shared_stage_builders: bool = false,
     no_profile: bool = false,
     quiet: bool = false,
@@ -7236,6 +7237,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         _ = try cfg.offered_prunes.apply(scans[i]);
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
+        if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;

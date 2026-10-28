@@ -322,6 +322,26 @@ fn postStepsDefine(steps: []const PostAggStep, name: []const u8) bool {
     return false;
 }
 
+/// Most LIMIT + OFFSET a key bound tracks: each scan keeps that many values.
+const KEY_BOUND_MAX_KEEP: u64 = 4096;
+
+/// The key bound for a post-sorted grouped query: when its ORDER BY leads
+/// with a stored group key, the groups LIMIT + OFFSET keeps all hold one of
+/// that key's first LIMIT + OFFSET values, so rows of other values can be
+/// dropped as they are read. Null when no Filter or HAVING may remove
+/// groups after the core and the key needs no derivation, or the bound
+/// doesn't apply (the scan also declines non-string keys).
+fn postSortKeyBound(plan: GroupTopNPlan, order_specs: []const exec.SortSpec) ?exec.KeyBoundSpec {
+    const limit = plan.limit orelse return null;
+    if (order_specs.len == 0 or postStepsFilter(plan.post_steps)) return null;
+    const keep = limit.n +| limit.offset;
+    if (keep == 0 or keep > KEY_BOUND_MAX_KEEP) return null;
+    const lead = order_specs[0];
+    if (!nameInList(plan.group_by.group_cols, lead.col)) return null;
+    if (nameInDerivedList(plan.derived, lead.col) or postStepsDefine(plan.post_steps, lead.col)) return null;
+    return .{ .col = lead.col, .desc = lead.desc, .keep = @intCast(keep) };
+}
+
 // Updates `q` in place, so the caller's errdefer always holds the whole tree.
 fn applyPostAggSteps(q: *exec.Query, steps: []const PostAggStep, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !void {
     for (steps) |s| q.* = switch (s) {
@@ -729,6 +749,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // A Filter in the post-aggregate chain decides which groups ORDER BY and
     // LIMIT see, so the core emits every group and they wait for the chain.
     if (postStepsFilter(plan.post_steps) and (order_specs.len > 0 or plan.limit != null)) post_sort = true;
+    const key_bound = if (post_sort and eff_having == null) postSortKeyBound(plan, order_specs) else null;
 
     // Algebraic reduction for the grouped core, same as the global path:
     // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
@@ -772,6 +793,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .derived = eff_derived,
         .dop = input.effectiveDop(),
         .udf_registry = input.udf_registry,
+        .key_bound = key_bound,
     };
 
     // Provably-low-cardinality group keys take the direct (scatter-free)
@@ -805,8 +827,11 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         if (affine_post.len > 0) q = try q.computeWithRegistry(affine_post, input.udf_registry);
         try applyPostAggSteps(&q, plan.post_steps, input.udf_registry);
         if (post_sort or having_outside) {
-            if (order_specs.len > 0) q = try q.orderBy(order_specs);
-            if (plan.limit) |l| q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+            if (order_specs.len > 0) {
+                q = if (plan.limit) |l| try q.topN(order_specs, @intCast(l.n), @intCast(l.offset)) else try q.orderBy(order_specs);
+            } else if (plan.limit) |l| {
+                q = try q.limitOffset(@intCast(l.n), @intCast(l.offset));
+            }
         }
         q = try applyOutputProjection(input.allocator, q, eff_out_cols, plan.output_names);
         return q;
