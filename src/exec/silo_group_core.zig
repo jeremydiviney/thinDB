@@ -1410,7 +1410,12 @@ const StateRef = struct {
 
 const PendingCountUpdates = struct {
     const CAPACITY = 16;
-    const MIN_STATE_BYTES = 2 * 1024 * 1024;
+    // Other buckets fold between a bucket's rounds, so its records only stay
+    // cached from round to round while they fit a core's private cache. At
+    // 2 MiB, buckets of 10K-60K groups took the immediate loop and missed on
+    // most updates (16 threads, 512 KiB L2: GROUP BY ClientIP 0.145 -> 0.131 s,
+    // nothing slower).
+    const MIN_STATE_BYTES = 128 * 1024;
     heads: [CAPACITY]*StateHead = undefined,
     counts: [CAPACITY]u64 = undefined,
     len: usize = 0,
