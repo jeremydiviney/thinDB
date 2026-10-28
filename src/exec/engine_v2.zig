@@ -342,6 +342,31 @@ fn postSortKeyBound(plan: GroupTopNPlan, order_specs: []const exec.SortSpec) ?ex
     return .{ .col = lead.col, .desc = lead.desc, .keep = @intCast(keep) };
 }
 
+/// The leading ORDER BY specs a post-sorted grouped query can rank on in the
+/// core: its aggregate outputs, up to the first spec the core can't compare (a
+/// string key, a column computed above the core). The core keeps the groups
+/// within LIMIT + OFFSET on them, ties included, and the post-sort finishes
+/// the order. Null when a post-aggregate Filter may still remove groups.
+fn postSortRankPrefix(plan: GroupTopNPlan, order_specs: []const exec.SortSpec) ?v2_pipeline.GroupTopNPrefixRank {
+    const limit = plan.limit orelse return null;
+    if (postStepsFilter(plan.post_steps)) return null;
+    const keep = limit.n +| limit.offset;
+    if (keep == 0) return null;
+    var n: usize = 0;
+    while (n < order_specs.len and isCoreAggregate(plan, order_specs[n].col)) n += 1;
+    if (n == 0) return null;
+    return .{ .specs = order_specs[0..n], .keep = @intCast(keep) };
+}
+
+fn isCoreAggregate(plan: GroupTopNPlan, name: []const u8) bool {
+    if (nameInList(plan.group_by.group_cols, name)) return false;
+    if (nameInDerivedList(plan.derived, name) or postStepsDefine(plan.post_steps, name)) return false;
+    for (plan.group_by.aggs) |a| {
+        if (types.columnNameEql(a.as, name)) return true;
+    }
+    return false;
+}
+
 // Updates `q` in place, so the caller's errdefer always holds the whole tree.
 fn applyPostAggSteps(q: *exec.Query, steps: []const PostAggStep, udf_registry: ?*const @import("../udf.zig").UdfRegistry) !void {
     for (steps) |s| q.* = switch (s) {
@@ -750,6 +775,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // LIMIT see, so the core emits every group and they wait for the chain.
     if (postStepsFilter(plan.post_steps) and (order_specs.len > 0 or plan.limit != null)) post_sort = true;
     const key_bound = if (post_sort and eff_having == null) postSortKeyBound(plan, order_specs) else null;
+    const prefix_rank = if (post_sort and key_bound == null) postSortRankPrefix(plan, order_specs) else null;
 
     // Algebraic reduction for the grouped core, same as the global path:
     // collapse affine aggregates (SUM/MIN/MAX of a·col+b) onto a shared base set,
@@ -794,6 +820,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .dop = input.effectiveDop(),
         .udf_registry = input.udf_registry,
         .key_bound = key_bound,
+        .prefix_rank = prefix_rank,
     };
 
     // Provably-low-cardinality group keys take the direct (scatter-free)
@@ -804,6 +831,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     var lowcard_request = request;
     if (eff_having != null) {
         lowcard_request.having_filter = null;
+        lowcard_request.prefix_rank = null;
         lowcard_request.order_specs = &.{};
         lowcard_request.limit = 0;
         lowcard_request.offset = 0;
