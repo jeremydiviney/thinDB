@@ -6765,6 +6765,9 @@ pub const RunConfig = struct {
     // where the key bytes only return at emit via rowref late-mat. A scan
     // decline (or a sidecar-less batch) falls back to digesting bytes.
     hash_key_columns: []const []const u8 = &.{},
+    // Columns the derived expressions read only through `octet_length`,
+    // which the worker scans emit as byte lengths (`Batch.byte_lengths`).
+    byte_length_columns: []const []const u8 = &.{},
     stream: bool = false,
     pipe: bool = false,
     pipe_tail: bool = false,
@@ -7232,6 +7235,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         }
         _ = try cfg.offered_prunes.apply(scans[i]);
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
+        for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;

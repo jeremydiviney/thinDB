@@ -255,6 +255,14 @@ pub const AggSpec = struct {
     /// re-summing partial results keeps the partial's type, and MAX_BY's key
     /// column type. `null` ⇒ the canonical type.
     out_type_override: ?Type = null,
+
+    /// Whether the aggregate reads column `name` directly.
+    pub fn readsColumn(self: AggSpec, name: []const u8) bool {
+        if (self.col) |c| if (types.columnNameEql(c, name)) return true;
+        if (self.arg2_col) |c| if (types.columnNameEql(c, name)) return true;
+        for (self.udf_arg_cols) |c| if (types.columnNameEql(c, name)) return true;
+        return false;
+    }
 };
 
 /// One ORDER BY key in a top-k hint: an aggregate output column name + its

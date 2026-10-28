@@ -2304,3 +2304,138 @@ test "V2 lowcard groups nullable integer keys: NULL apart from 0, one NULL group
         }
     }
 }
+
+const OL_GROUPS = 23;
+const OlRow = struct { id: i64, g: i32, u: []const u8, v: []const u8, w: ?[]const u8 };
+// One query's per-row contribution `[a, b, 1]` to its group, null when the
+// WHERE drops the row; `route` is the plan's group operator, if pinned.
+const OlCase = struct { sql: []const u8, route: ?[]const u8, row: *const fn (OlRow) ?[3]i64 };
+
+fn olLen(s: []const u8) i64 {
+    return @intCast(s.len);
+}
+
+// `octet_length` over a column read only through it takes the scan's
+// byte-length sidecar on the lowcard, group-topN and global aggregate routes;
+// every other read of the column (a conditional argument, a CASE, another
+// function, a nullable column) keeps the bytes. All of them must agree with
+// the stored strings across flushed row groups, tombstones and memtable rows.
+test "V2 octet_length reads string lengths without the bytes" {
+    const allocator = std.testing.allocator;
+    const n_rows = 6000;
+    const text = "https://www.example.org/some/longer/path/with-a-tail/" ** 4;
+    const rows = try allocator.alloc(OlRow, n_rows);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{
+        .id = @intCast(i),
+        .g = @intCast((i * 7) % OL_GROUPS),
+        .u = text[0..if (i % 9 == 0) 0 else (i * 31) % 200],
+        .v = text[0 .. (i * 13) % 50],
+        .w = if (i % 7 == 0) null else text[0 .. (i * 3) % 120],
+    };
+    const Fns = struct {
+        fn filtered(r: OlRow) ?[3]i64 {
+            if (r.u.len == 0) return null;
+            return .{ olLen(r.u), olLen(r.v), 1 };
+        }
+        fn nested(r: OlRow) ?[3]i64 {
+            return .{ olLen(r.u) * 2 + 1, olLen(r.v), 1 };
+        }
+        fn conditional(r: OlRow) ?[3]i64 {
+            if (@mod(r.id, 5) == 1) return null;
+            return .{ if (@mod(r.id, 2) == 0) olLen(r.u) else 0, if (@mod(r.id, 3) == 0) olLen(r.v) else 0, 1 };
+        }
+        fn otherRead(r: OlRow) ?[3]i64 {
+            if (r.id <= 7) return null;
+            return .{ olLen(r.u), olLen(r.u), 1 };
+        }
+        fn nullable(r: OlRow) ?[3]i64 {
+            if (r.id <= 3) return null;
+            return .{ if (r.w) |w| olLen(w) else 0, 0, 1 };
+        }
+    };
+    const cases = [_]OlCase{
+        .{ .sql = "SELECT g, SUM(octet_length(u)) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol WHERE u <> '' GROUP BY g", .route = "lowcard", .row = Fns.filtered },
+        .{ .sql = "SELECT g, SUM(octet_length(u) * 2 + 1) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol GROUP BY g", .route = "lowcard", .row = Fns.nested },
+        .{ .sql = "SELECT g, SUM(IF(id % 2 = 0, octet_length(u), 0)) AS a, SUM(CASE WHEN id % 3 = 0 THEN octet_length(v) ELSE 0 END) AS b, COUNT(*) AS n FROM ol WHERE id % 5 <> 1 GROUP BY g", .route = null, .row = Fns.conditional },
+        .{ .sql = "SELECT g, SUM(octet_length(u)) AS a, SUM(octet_length(upper(u))) AS b, COUNT(*) AS n FROM ol WHERE id > 7 GROUP BY g", .route = "lowcard", .row = Fns.otherRead },
+        .{ .sql = "SELECT g, SUM(octet_length(w)) AS a, SUM(0) AS b, COUNT(*) AS n FROM ol WHERE id > 3 GROUP BY g", .route = null, .row = Fns.nullable },
+        // A derived key leaves lowcard for the group-topN grid.
+        .{ .sql = "SELECT g + 0 AS k, SUM(octet_length(u)) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol WHERE u <> '' GROUP BY k", .route = "V2 group-topN", .row = Fns.filtered },
+        .{ .sql = "SELECT g + 0 AS k, SUM(octet_length(u) * 2 + 1) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol GROUP BY k HAVING COUNT(*) > 0", .route = "V2 group-topN", .row = Fns.nested },
+        .{ .sql = "SELECT g + 0 AS k, SUM(IF(id % 2 = 0, octet_length(u), 0)) AS a, SUM(CASE WHEN id % 3 = 0 THEN octet_length(v) ELSE 0 END) AS b, COUNT(*) AS n FROM ol WHERE id % 5 <> 1 GROUP BY k", .route = null, .row = Fns.conditional },
+    };
+    const totals = [_]OlCase{
+        .{ .sql = "SELECT SUM(octet_length(u)) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol WHERE u <> ''", .route = null, .row = Fns.filtered },
+        .{ .sql = "SELECT SUM(octet_length(u) * 2 + 1) AS a, SUM(octet_length(v)) AS b, COUNT(*) AS n FROM ol", .route = null, .row = Fns.nested },
+        .{ .sql = "SELECT SUM(octet_length(u)) AS a, SUM(octet_length(upper(u))) AS b, COUNT(*) AS n FROM ol WHERE id > 7", .route = null, .row = Fns.otherRead },
+    };
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop={d}\n", .{dop});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("ol", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .int },
+                .{ .name = "u", .type = .string },
+                .{ .name = "v", .type = .{ .varchar = 64 } },
+                .{ .name = "w", .type = .string, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 256 });
+
+        const live = try allocator.alloc(bool, n_rows);
+        defer allocator.free(live);
+        try t.insert(rows[0..2500]);
+        try t.flush();
+        try t.insert(rows[2500..5000]);
+        try t.flush();
+        try exec(allocator, db, "DELETE FROM ol WHERE id % 11 = 0 AND id < 1200");
+        try t.insert(rows[5000..]);
+        for (live, 0..) |*keep, i| keep.* = i % 11 != 0 or i >= 1200;
+
+        for (cases) |c| {
+            errdefer std.debug.print("query: {s}\n", .{c.sql});
+            if (c.route) |route| try std.testing.expect(try planContains(allocator, db, c.sql, route));
+            var want = [_][3]i64{.{ 0, 0, 0 }} ** OL_GROUPS;
+            for (rows, live) |r, keep| {
+                if (!keep) continue;
+                const add = c.row(r) orelse continue;
+                for (&want[@intCast(r.g)], add) |*w, a| w.* += a;
+            }
+            var groups: usize = 0;
+            var q = try runSql(allocator, db, c.sql);
+            defer q.deinit();
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const g: usize = @intFromFloat((try cellNumber(batch.values[0], r)).?);
+                    groups += 1;
+                    for (want[g], 1..) |w, ci| {
+                        errdefer std.debug.print("group {d} column {d}\n", .{ g, ci });
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(w)), try cellNumber(batch.values[ci], r));
+                    }
+                }
+            }
+            try std.testing.expectEqual(@as(usize, OL_GROUPS), groups);
+        }
+        for (totals) |c| {
+            errdefer std.debug.print("query: {s}\n", .{c.sql});
+            var want = [3]i64{ 0, 0, 0 };
+            for (rows, live) |r, keep| {
+                if (!keep) continue;
+                const add = c.row(r) orelse continue;
+                for (&want, add) |*w, a| w.* += a;
+            }
+            var q = try runSql(allocator, db, c.sql);
+            defer q.deinit();
+            const batch = (try q.next()).?;
+            try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+            for (want, 0..) |w, ci| try std.testing.expectEqual(@as(?f64, @floatFromInt(w)), try cellNumber(batch.values[ci], 0));
+        }
+    }
+}

@@ -94,6 +94,7 @@ fn openScanSource(
     where_filter: ?PredicateExpr,
     derived: []const compute.Derived,
     hash_cols: []const []const u8,
+    aggs: []const AggSpec,
     snap: ?Scan.Snapshot,
     registry: ?*const udf_mod.UdfRegistry,
 ) !ScanSource {
@@ -108,6 +109,14 @@ fn openScanSource(
     for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
     if (derived.len == 0) {
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
+    }
+    // A column the aggregates read only through `octet_length` arrives as
+    // byte lengths instead of bytes.
+    columns: for (needed) |name| {
+        for (aggs) |a| {
+            if (a.readsColumn(name)) continue :columns;
+        }
+        if (try compute.readsOnlyByteLength(allocator, derived, name)) _ = scan.setByteLengthColumn(name);
     }
     const drive = try compute.Compute.createWithRegistry(allocator, exec.makeQuery(allocator, scan), derived, registry);
     return .{ .scan = scan, .drive = drive };
@@ -1157,7 +1166,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         defer if (probe) |*p| p.deinit();
         var probe_schema: ?[]const Column = null;
         if (request.derived.len > 0) {
-            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, null, request.udf_registry);
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, &.{}, null, request.udf_registry);
             probe_schema = probe.?.schema();
         }
         for (request.aggs, plans) |agg, *p| {
@@ -1291,6 +1300,8 @@ const GlobalAggregate = struct {
     table: *api.Table,
     where_filter: ?PredicateExpr,
     derived: []const compute.Derived,
+    // Borrowed from the request, like `derived`.
+    aggs: []const AggSpec,
     dop: usize,
     plans: []AggPlan,
     needed: []const []const u8,
@@ -1332,6 +1343,7 @@ const GlobalAggregate = struct {
             .table = table,
             .where_filter = request.where_filter,
             .derived = request.derived,
+            .aggs = request.aggs,
             .dop = request.dop,
             .plans = plans,
             .needed = needed,
@@ -1398,7 +1410,7 @@ const GlobalAggregate = struct {
     }
 
     fn openScan(self: *GlobalAggregate, allocator: Allocator, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, snap, self.udf_registry);
+        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, self.aggs, snap, self.udf_registry);
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {

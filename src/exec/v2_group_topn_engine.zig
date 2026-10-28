@@ -920,6 +920,29 @@ fn runHarness(
         }
     }
 
+    // Scan-side byte lengths: a column the derived expressions read only
+    // through `octet_length` (and no key or aggregate reads) arrives as
+    // per-row lengths off the cached block, never as bytes.
+    var length_cols_buf: [16][]const u8 = undefined;
+    var n_length_cols: usize = 0;
+    if (scan_columns) |cols| {
+        if (derived.len > 0) outer: for (cols) |name| {
+            if (n_length_cols == length_cols_buf.len) break;
+            for (shape.group_key_inputs) |input| {
+                if (types.columnNameEql(input.name, name)) continue :outer;
+            }
+            for (shape.aggregate_inputs) |ai| {
+                if (types.columnNameEql(ai.source_name, name)) continue :outer;
+            }
+            for (shape.string_aggregate_inputs) |si| {
+                if (types.columnNameEql(si.source_name, name)) continue :outer;
+            }
+            if (!try exec.compute_op.readsOnlyByteLength(allocator, derived, name)) continue;
+            length_cols_buf[n_length_cols] = name;
+            n_length_cols += 1;
+        };
+    }
+
     try SiloCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
@@ -962,6 +985,7 @@ fn runHarness(
         // run — a detached free racing it would be use-after-free.
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
+        .byte_length_columns = length_cols_buf[0..n_length_cols],
     });
 }
 
