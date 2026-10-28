@@ -1719,7 +1719,7 @@ fn evaluateDayMask(view: ColumnView, p: Predicate, n: usize, out: []bool) !void 
 /// column-vs-literal predicates). NULL handling is the caller's; this is pure
 /// ordering of two present values.
 fn cmpStr(a: []const u8, b: []const u8, op: PredicateOp) bool {
-    return switch (std.mem.order(u8, a, b)) {
+    return switch (simd.orderBytes(a, b)) {
         .lt => op == .lt or op == .lte or op == .neq,
         .eq => op == .eq or op == .lte or op == .gte,
         .gt => op == .gt or op == .gte or op == .neq,
@@ -2009,7 +2009,7 @@ fn cellKeyOrder(view: ColumnView, idx: usize, ref: Value) ?std.math.Order {
             return std.math.order(col[idx], @field(ref, @tagName(tag)));
         },
         .boolean => |col| if (ref == .boolean) std.math.order(@intFromBool(col[idx] != 0), @intFromBool(ref.boolean)) else null,
-        .varchar, .string, .char => |sv| if (ref == .text) std.mem.order(u8, sv.rowBytes(idx), ref.text) else null,
+        .varchar, .string, .char => |sv| if (ref == .text) simd.orderBytes(sv.rowBytes(idx), ref.text) else null,
         .float, .double, .json, .nested, .bitmap => null,
     };
 }
@@ -2646,7 +2646,7 @@ fn scalarOrder(a: Scalar, b: Scalar) ?std.math.Order {
     if (a == .text and b != .text) return textOrder(a.text, b);
     if (b == .text and a != .text) return if (textOrder(b.text, a)) |o| o.invert() else null;
     return switch (a) {
-        .text => |at| std.mem.order(u8, at, b.text),
+        .text => |at| simd.orderBytes(at, b.text),
         .micros => |am| if (b == .micros) std.math.order(am, b.micros) else null,
         .uuid => |au| if (b == .uuid) std.math.order(au, b.uuid) else null,
         .integer, .float, .decimal, .wide => numberOrder(a, b),

@@ -3273,10 +3273,10 @@ pub const Scan = struct {
             const hit = switch (op) {
                 .eq => std.mem.eql(u8, v, literal),
                 .neq => !std.mem.eql(u8, v, literal),
-                .lt => std.mem.order(u8, v, literal) == .lt,
-                .lte => std.mem.order(u8, v, literal) != .gt,
-                .gt => std.mem.order(u8, v, literal) == .gt,
-                .gte => std.mem.order(u8, v, literal) != .lt,
+                .lt => simd.orderBytes(v, literal) == .lt,
+                .lte => simd.orderBytes(v, literal) != .gt,
+                .gt => simd.orderBytes(v, literal) == .gt,
+                .gte => simd.orderBytes(v, literal) != .lt,
             };
             if (hit) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
         }
@@ -3721,10 +3721,10 @@ pub const Scan = struct {
         return switch (op) {
             .eq => std.mem.eql(u8, v, literal),
             .neq => !std.mem.eql(u8, v, literal),
-            .lt => std.mem.order(u8, v, literal) == .lt,
-            .lte => std.mem.order(u8, v, literal) != .gt,
-            .gt => std.mem.order(u8, v, literal) == .gt,
-            .gte => std.mem.order(u8, v, literal) != .lt,
+            .lt => simd.orderBytes(v, literal) == .lt,
+            .lte => simd.orderBytes(v, literal) != .gt,
+            .gt => simd.orderBytes(v, literal) == .gt,
+            .gte => simd.orderBytes(v, literal) != .lt,
         };
     }
 
