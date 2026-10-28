@@ -1581,12 +1581,13 @@ const LowCardGroup = struct {
         defer tiles.deinit(allocator);
 
         // One shared set per int/float/coded COUNT(DISTINCT), which every
-        // worker feeds through its own producer. Declared before the workers
-        // so they are torn down first.
+        // worker feeds through its own producer. A rejected query hands the
+        // sets' reservations back before it returns; a finished one frees
+        // them off the result path.
         const shared = try allocator.alloc(?SharedDistinct, self.n_distinct);
         defer allocator.free(shared);
         @memset(shared, null);
-        defer destroyShared(allocator, shared, n_workers);
+        errdefer destroyShared(allocator, shared, 1, false);
         for (self.aggs) |a| {
             if (a.op != .count_distinct or a.distinct_kind == .string) continue;
             shared[a.distinct_index] = switch (a.tier) {
@@ -1668,6 +1669,7 @@ const LowCardGroup = struct {
         errdefer merged.deinit(allocator);
         try self.mergeScalars(workers, &merged);
         try self.mergeDistinct(workers, n_workers, shared, &merged);
+        destroyShared(allocator, shared, n_workers, true);
         return merged;
     }
 
@@ -1893,11 +1895,11 @@ const LowCardGroup = struct {
     }
 };
 
-// A high-cardinality input's sets run to hundreds of MiB; with an accountant
-// the frees are collected so the query stops being charged here, and detached
-// threads hand the memory back off the result path.
-fn destroyShared(allocator: Allocator, shared: []const ?SharedDistinct, n_threads: usize) void {
-    const deferred = exec.memory.accountantOf(allocator) != null;
+// A high-cardinality input's sets run to hundreds of MiB. With `deferred_frees`
+// and an accountant the frees are collected, so the query stops being charged
+// here, and detached threads hand the memory back off the result path.
+fn destroyShared(allocator: Allocator, shared: []const ?SharedDistinct, n_threads: usize, deferred_frees: bool) void {
+    const deferred = deferred_frees and exec.memory.accountantOf(allocator) != null;
     var frees = exec.memory.DeferredFrees.init(n_threads);
     if (deferred) frees.collect();
     for (shared) |slot| if (slot) |s| switch (s) {
