@@ -734,6 +734,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 SiloCore.EmitFilter{ .ctx = ctx, .pass = havingEmitPass }
             else
                 null,
+            .emit_rank = emitRank(ctx),
             .hashed = ctx.plan.hashed,
         },
         .params = params,
@@ -783,6 +784,15 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
     return ctx.request.limit + ctx.request.offset;
 }
 
+// Any other ORDER BY ... LIMIT still needs only the best LIMIT+OFFSET groups,
+// so the core's all-groups emit ranks them per fill worker in parallel; the
+// final selection then walks those few rows rather than every group.
+fn emitRank(ctx: *ExecutionContext) ?SiloCore.EmitRank {
+    if (canUseCoreCountDescTopN(ctx)) return null;
+    if (ctx.request.order_specs.len == 0 or ctx.request.limit == 0) return null;
+    return .{ .ctx = ctx, .before = rankEmitBefore, .keep = ctx.request.limit +| ctx.request.offset };
+}
+
 fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows {
     if (rows.len == 0) return .{ .allocator = op.allocator };
     if (op.request.order_specs.len == 0) {
@@ -798,11 +808,8 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
 
     const keep = @min(rows.len, op.request.limit + op.request.offset);
     if (keep == 0) return .{ .allocator = op.allocator };
-    // The selection loop below rescans all `keep` candidates on every
-    // replacement — O(replacements × keep), which degenerates exactly when
-    // keep approaches rows.len (a large OFFSET): nearly every row replaces,
-    // and each replacement walks ~keep entries. Sorting everything is
-    // O(n log n) and strictly cheaper there.
+    // Once keep reaches half the rows, selecting them costs about as much as
+    // sorting everything, which needs no second buffer.
     if (keep * 2 >= rows.len) {
         try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
         const start = @min(op.request.offset, rows.len);
@@ -811,24 +818,12 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     }
     var candidates = try op.allocator.alloc(SiloCore.TopRow, keep);
     errdefer op.allocator.free(candidates);
-    var len: usize = 0;
-    var worst_i: usize = 0;
+    var kept: SiloCore.RankedSet = .{ .items = candidates, .ctx = op, .before = finalRowBefore };
     for (rows, 0..) |row, row_index| {
         if (row_index % 1024 == 0) try exec.memory.checkCancelled(op.allocator);
-        if (len < keep) {
-            candidates[len] = row;
-            if (len == 0 or finalRowLess(op, candidates[worst_i], row)) worst_i = len;
-            len += 1;
-            continue;
-        }
-        if (!finalRowLess(op, row, candidates[worst_i])) continue;
-        candidates[worst_i] = row;
-        worst_i = 0;
-        var i: usize = 1;
-        while (i < len) : (i += 1) {
-            if (finalRowLess(op, candidates[worst_i], candidates[i])) worst_i = i;
-        }
+        kept.consider(row);
     }
+    const len = kept.len;
     try exec.memory.sort(SiloCore.TopRow, candidates[0..len], op, op.allocator, finalRowLess);
     const start = @min(op.request.offset, len);
     const end = limitEnd(start, len, op.request.limit);
@@ -843,16 +838,32 @@ fn limitEnd(start: usize, len: usize, limit: usize) usize {
 }
 
 fn finalRowLess(op: *GroupTopNPipeline, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
-    for (op.request.order_specs) |spec| {
-        const cmp = compareOutputValue(op, spec.col, a, b) catch 0;
+    return rowOrderBefore(&op.plan, op.request.order_specs, a, b);
+}
+
+fn finalRowBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    const op: *GroupTopNPipeline = @ptrCast(@alignCast(ctx.?));
+    return finalRowLess(op, a, b);
+}
+
+fn rankEmitBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
+    return rowOrderBefore(&ec.plan, ec.request.order_specs, a, b);
+}
+
+// The result order: the ORDER BY keys, then the group key, so no two groups
+// tie (the core's ranked emit relies on that).
+fn rowOrderBefore(plan: *const ShapePlan, order_specs: []const SortSpec, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    for (order_specs) |spec| {
+        const cmp = compareOutputValue(plan, spec.col, a, b) catch 0;
         if (cmp == 0) continue;
         return if (spec.desc) cmp > 0 else cmp < 0;
     }
     return a.key < b.key;
 }
 
-fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: SiloCore.TopRow, b: SiloCore.TopRow) !i8 {
-    for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
+fn compareOutputValue(plan: *const ShapePlan, name: []const u8, a: SiloCore.TopRow, b: SiloCore.TopRow) !i8 {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
         if (types.columnNameEql(name, part.name)) {
             const a_null = keyPartIsNull(part, a.key);
             const b_null = keyPartIsNull(part, b.key);
@@ -863,7 +874,7 @@ fn compareOutputValue(op: *GroupTopNPipeline, name: []const u8, a: SiloCore.TopR
             return compareI128(keyPartValue(part, a.key), keyPartValue(part, b.key));
         }
     }
-    for (op.plan.aggregates[0..op.plan.aggregate_count]) |agg_plan| {
+    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
         if (types.columnNameEql(name, agg_plan.name)) {
             return compareAggregateValue(agg_plan, a, b);
         }

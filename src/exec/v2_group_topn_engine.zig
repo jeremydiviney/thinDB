@@ -483,6 +483,10 @@ pub const Shape = struct {
     // only HAVING survivors count toward `emit_all_groups_cap`. Null when there
     // is no HAVING.
     emit_filter: ?SiloCore.EmitFilter = null,
+    // The ORDER BY ... LIMIT over the all-groups emit (see SiloCore.EmitRank).
+    // Null when the core's count-desc top-N serves the order or there is no
+    // LIMIT.
+    emit_rank: ?SiloCore.EmitRank = null,
     // The group key is a hash of the key columns (string / >128-bit keys); each
     // staged row carries its __rowloc so the real key values are recovered at
     // emit via late materialization. Forces the u128 key lane + rowref region.
@@ -951,6 +955,7 @@ fn runHarness(
         .result_all_groups = shape.emit_all_groups,
         .result_all_groups_cap = shape.emit_all_groups_cap,
         .result_emit_filter = shape.emit_filter,
+        .result_rank = shape.emit_rank,
         .trace_timing = params.trace_timing,
         .workspace = workspace,
         // The arena path frees the whole arena synchronously right after the
