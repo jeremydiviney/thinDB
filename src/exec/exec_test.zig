@@ -5215,3 +5215,96 @@ test "scan: a pruning set counts only the values the scan's own filter can match
     try std.testing.expectEqual(@as(u64, 1), try drainKeys(allocator, &in_list, in_scan, &keys));
     try std.testing.expectEqualSlices(i64, &.{22}, keys.items);
 }
+
+// The byte-length sidecar gives every row's string length on each scan path:
+// unfiltered and filtered row groups over raw, dict and FSST blocks. A
+// tombstoned row group and the memtable carry the bytes instead, which the
+// consumer measures.
+test "scan: byte-length sidecar matches the stored bytes on every path" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const text = "http://example.com/category/a-long-shared-path-segment/" ** 4;
+    const c_pool = [_][]const u8{ "", "alpha", "beta-longer-value", "z" };
+    const Row = struct { id: i64, u: []const u8, c: []const u8 };
+    const uLen = struct {
+        fn of(id: usize) usize {
+            return if (id % 10 == 0) 0 else (id * 37) % 200;
+        }
+    }.of;
+
+    inline for (.{ types.TableCompression.lz4, types.TableCompression.lz4_fsst }) |compression| {
+        errdefer std.debug.print("compression={s}\n", .{@tagName(compression)});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const schema = types.TableSchema{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "u", .type = .string },
+                .{ .name = "c", .type = .string },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+            .compression = compression,
+        };
+        var db = try api.Database.open(allocator, io, tmp.dir, .{
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(u64),
+        });
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+
+        const n_rows = 4300;
+        const rows = try allocator.alloc(Row, n_rows);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .u = text[0..uLen(i)], .c = c_pool[i % c_pool.len] };
+        try t.insert(rows[0..2000]);
+        try t.flush();
+        try t.insert(rows[2000..4000]);
+        try t.flush();
+        _ = try t.delete(.{ .col = "id", .op = .lt, .val = .{ .bigint = 300 } });
+        try t.insert(rows[4000..]);
+
+        const filters = [_]?PredicateExpr{
+            null,
+            leafExpr("id", .gte, .{ .bigint = 1500 }),
+            leafExpr("u", .neq, .{ .text = "" }),
+        };
+        for (filters, 0..) |filter, fi| {
+            errdefer std.debug.print("filter #{d}\n", .{fi});
+            const s = try exec.Scan.allocWithProjectionLoc(allocator, t, null, &.{ "id", "u", "c" }, false, null);
+            var q = exec.makeQuery(allocator, s);
+            defer q.deinit();
+            if (filter) |f| try std.testing.expect(try s.tryFuseFilter(f));
+            try std.testing.expect(s.setByteLengthColumn("u"));
+            try std.testing.expect(s.setByteLengthColumn("c"));
+            try std.testing.expect(!s.setByteLengthColumn("id"));
+
+            var want_rows: usize = 0;
+            for (300..n_rows) |id| {
+                const keep = if (fi == 0) true else if (fi == 1) id >= 1500 else uLen(id) > 0;
+                want_rows += @intFromBool(keep);
+            }
+            var got_rows: usize = 0;
+            var sidecar_batches: usize = 0;
+            while (try q.next()) |b| {
+                const lens = b.byte_lengths;
+                if (lens != null) sidecar_batches += 1;
+                for (0..b.row_count) |r| {
+                    const id: usize = @intCast(b.values[0].data.bigint[r]);
+                    inline for (.{ 1, 2 }) |j| {
+                        const bytes = b.values[j].data.string.rowBytes(r);
+                        const got = if (lens) |l| blk: {
+                            try std.testing.expectEqual(@as(usize, 0), bytes.len);
+                            break :blk l[j].?[r];
+                        } else bytes.len;
+                        const want = if (j == 1) uLen(id) else c_pool[id % c_pool.len].len;
+                        try std.testing.expectEqual(want, got);
+                    }
+                    got_rows += 1;
+                }
+            }
+            try std.testing.expectEqual(want_rows, got_rows);
+            try std.testing.expect(sidecar_batches > 0);
+        }
+    }
+}

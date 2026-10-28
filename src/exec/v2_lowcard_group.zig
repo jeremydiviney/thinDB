@@ -547,6 +547,19 @@ fn readOnlyBy(allocator: Allocator, derived: []const compute.Derived, aggs: []co
     return true;
 }
 
+// Whether column `name` reaches the aggregates only through `octet_length`
+// in derived inputs, so the scan can emit its byte lengths instead of bytes.
+fn readOnlyAsByteLength(allocator: Allocator, derived: []const compute.Derived, parts: []const KeyPart, aggs: []const AggPlan, name: []const u8) !bool {
+    for (parts) |p| {
+        if (types.columnNameEql(p.name, name)) return false;
+    }
+    for (aggs) |a| {
+        const nm = a.input_name orelse continue;
+        if (types.columnNameEql(nm, name)) return false;
+    }
+    return compute.readsOnlyByteLength(allocator, derived, name);
+}
+
 fn inputType(table: *api.Table, schema: ?[]const Column, name: []const u8) ?Type {
     if (schema) |s| {
         if (types.findColumn(s, name)) |i| return s[i].type;
@@ -624,6 +637,9 @@ fn openScanSource(
         if (a.op == .count_distinct and a.distinct_kind == .coded) _ = scan.setDictCodeColumn(a.input_name.?, distinct_dicts[i].?);
     }
     if (derived.len == 0) return .{ .scan = scan, .drive = drive };
+    for (needed) |name| {
+        if (try readOnlyAsByteLength(allocator, derived, parts, aggs, name)) _ = scan.setByteLengthColumn(name);
+    }
     const derive = try drive.computeWithRegistry(derived, udf_registry);
     return .{ .scan = scan, .drive = drive, .derive = derive };
 }

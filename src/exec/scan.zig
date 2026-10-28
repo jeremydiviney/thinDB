@@ -579,6 +579,17 @@ pub const Scan = struct {
     hash_bufs: []std.ArrayListUnmanaged(u128) = &.{},
     hashed_slots: []?[]const u128 = &.{},
     filtered_hashed: ?[]const ?[]const u128 = null,
+    /// Byte-length emit (`Batch.byte_lengths`): positions whose strings are
+    /// read only through `octet_length`. Lengths come straight off the cached
+    /// block — raw offsets, a per-distinct dict LUT, FSST symbol lengths — and
+    /// the value column is a placeholder, so the string bytes are never
+    /// copied. The unfiltered path over a tombstoned row group or the memtable
+    /// emits the real bytes without the sidecar; consumers measure those.
+    len_cols_by_j: []bool = &.{},
+    n_lengths: usize = 0,
+    len_bufs: []std.ArrayListUnmanaged(u32) = &.{},
+    length_slots: []?[]const u32 = &.{},
+    filtered_lengths: ?[]const ?[]const u32 = null,
     /// RLE run emit (`Batch.runs`): when requested, the unfiltered segment path
     /// attaches each int-family column's run list (widened off the block's RLE
     /// header) alongside the materialized values — a run-aware consumer skips
@@ -1158,6 +1169,49 @@ pub const Scan = struct {
         self.hash_bufs = bufs;
     }
 
+    /// Mark the projected column `name` for byte-length emit
+    /// (`Batch.byte_lengths`). Qualifies: a non-nullable VARCHAR or STRING
+    /// column, whose bytes `octet_length` measures as stored.
+    pub fn setByteLengthColumn(self: *Scan, name: []const u8) bool {
+        const j = for (self.out_phys, 0..) |phys, j| {
+            const col = self.table.schema.columns[phys];
+            if (!@import("../types.zig").columnNameEql(col.name, name)) continue;
+            if (col.nullable) return false;
+            switch (col.type) {
+                .varchar, .string => break j,
+                else => return false,
+            }
+        } else return false;
+        self.ensureLengthArrays() catch return false;
+        if (!self.len_cols_by_j[j]) {
+            self.len_cols_by_j[j] = true;
+            self.n_lengths += 1;
+        }
+        return true;
+    }
+
+    fn ensureLengthArrays(self: *Scan) !void {
+        if (self.len_cols_by_j.len == self.out_phys.len) return;
+        const flags = try self.allocator.alloc(bool, self.out_phys.len);
+        @memset(flags, false);
+        const bufs = self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len) catch |e| {
+            self.allocator.free(flags);
+            return e;
+        };
+        for (bufs) |*b| b.* = .empty;
+        self.len_cols_by_j = flags;
+        self.len_bufs = bufs;
+    }
+
+    fn ensureLengthSlots(self: *Scan) ![]?[]const u32 {
+        if (self.length_slots.len != self.out_phys.len) {
+            if (self.length_slots.len > 0) self.allocator.free(self.length_slots);
+            self.length_slots = try self.allocator.alloc(?[]const u32, self.out_phys.len);
+        }
+        for (self.length_slots) |*s| s.* = null;
+        return self.length_slots;
+    }
+
     fn ensureHashedSlots(self: *Scan) ![]?[]const u128 {
         if (self.hashed_slots.len != self.out_phys.len) {
             if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
@@ -1293,6 +1347,10 @@ pub const Scan = struct {
         if (self.hash_bufs.len > 0) self.allocator.free(self.hash_bufs);
         if (self.hash_cols_by_j.len > 0) self.allocator.free(self.hash_cols_by_j);
         if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
+        for (self.len_bufs) |*b| b.deinit(self.allocator);
+        if (self.len_bufs.len > 0) self.allocator.free(self.len_bufs);
+        if (self.len_cols_by_j.len > 0) self.allocator.free(self.len_cols_by_j);
+        if (self.length_slots.len > 0) self.allocator.free(self.length_slots);
         for (self.runs_v_bufs) |*b| b.deinit(self.allocator);
         if (self.runs_v_bufs.len > 0) self.allocator.free(self.runs_v_bufs);
         for (self.runs_l_bufs) |*b| b.deinit(self.allocator);
@@ -1585,8 +1643,8 @@ pub const Scan = struct {
     pub fn setEmitProjection(self: *Scan, keep: []const []const u8) !void {
         if (self.fused_filter == null or self.emit_loc or self.retired_schema.len != 0) return;
         if (self.phase != .segments or self.rgs_considered != 0 or self.cur_segment != null or self.filtered != null) return;
-        if (self.n_coded != 0 or self.n_hashed != 0 or self.emit_runs) return;
-        if (self.coded_dicts_by_j.len != 0 or self.hash_cols_by_j.len != 0 or self.runs_v_bufs.len != 0) return;
+        if (self.n_coded != 0 or self.n_hashed != 0 or self.n_lengths != 0 or self.emit_runs) return;
+        if (self.coded_dicts_by_j.len != 0 or self.hash_cols_by_j.len != 0 or self.len_cols_by_j.len != 0 or self.runs_v_bufs.len != 0) return;
         const old_w = self.out_phys.len;
         if (self.cached_stats.len != old_w) return;
 
@@ -2384,6 +2442,73 @@ pub const Scan = struct {
         return self.emptyStringColumn(col_type, rg_count);
     }
 
+    /// Fill `len_bufs[j]` with the byte length of each of `rows` (every row
+    /// when null) of one row group's string column, straight off the cached
+    /// block: a dict block measures each distinct value once, an FSST block
+    /// sums symbol lengths, a raw block subtracts offsets. Nothing is copied.
+    fn fillByteLengths(
+        self: *Scan,
+        seg: *storage.ReadSegment,
+        rg_idx: usize,
+        phys: usize,
+        j: usize,
+        rg_count: u32,
+        rows: ?[]const u32,
+    ) ![]const u32 {
+        const col_type = self.table.schema.columns[phys].type;
+        const n = if (rows) |r| r.len else rg_count;
+        try self.len_bufs[j].resize(self.allocator, n);
+        const lens = self.len_bufs[j].items[0..n];
+
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
+
+        if (block.encoding == .dict) {
+            var values = block.bytes;
+            if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            const lut = try self.allocator.alloc(u32, db.ndv);
+            defer self.allocator.free(lut);
+            for (lut, 0..) |*l, c| l.* = @intCast(db.dictValue(@intCast(c)).len);
+            if (rows) |r| {
+                for (r, lens) |row, *l| l.* = lut[db.rowCode(row)];
+            } else {
+                for (lens, 0..) |*l, row| l.* = lut[db.rowCode(row)];
+            }
+        } else if (block.encoding == .fsst) {
+            const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
+            if (rows) |r| {
+                for (r, lens) |row, *l| l.* = @intCast(fv.block.table.decodedLen(fv.block.rowComp(row)));
+            } else {
+                for (lens, 0..) |*l, row| l.* = @intCast(fv.block.table.decodedLen(fv.block.rowComp(row)));
+            }
+        } else if (storage.segment_reader.viewRawColumn(col_type, block.bytes, rg_count, flags, block.encoding)) |view| {
+            const sv = switch (view.data) {
+                .varchar, .string => |s| s,
+                else => return error.TypeMismatch,
+            };
+            measureRows(sv, rows, lens);
+        } else {
+            var owned = try seg.decodeColumnMaybeCached(self.allocator, self.table.schema, rg_idx, phys, self.table.cacheRef());
+            defer owned.deinit(self.allocator);
+            const sv = switch (owned.data) {
+                .varchar, .string => |s| s.view(),
+                else => return error.TypeMismatch,
+            };
+            measureRows(sv, rows, lens);
+        }
+        return lens;
+    }
+
+    fn measureRows(sv: storage.StringView, rows: ?[]const u32, lens: []u32) void {
+        if (rows) |r| {
+            for (r, lens) |row, *l| l.* = sv.offsets[row + 1] - sv.offsets[row];
+        } else {
+            for (lens, sv.offsets[0..lens.len], sv.offsets[1 .. lens.len + 1]) |*l, lo, hi| l.* = hi - lo;
+        }
+    }
+
     /// Emit the next sub-batch of the current (already-decoded) row group:
     /// slice each live `decoded` column to `[sub_off, sub_off+n)` into `views`
     /// and advance the cursor. Only the plain projection path uses this.
@@ -2397,7 +2522,7 @@ pub const Scan = struct {
     /// The consumer must decline before changing its state. Borrowed blocks
     /// remain pinned only during consume; ordinary Batch lifetimes are unchanged.
     pub fn consume_encoded(self: *Scan, consumer: anytype) !bool {
-        if (self.fused_filter != null or self.emit_loc or self.n_coded != 0 or self.n_hashed != 0 or self.out_phys.len == 0) return false;
+        if (self.fused_filter != null or self.emit_loc or self.n_coded != 0 or self.n_hashed != 0 or self.n_lengths != 0 or self.out_phys.len == 0) return false;
         if (self.sub_off < self.sub_count) return false;
         self.releaseBatch();
         while (self.phase == .segments) {
@@ -2560,11 +2685,15 @@ pub const Scan = struct {
             // Key-digest emit is late-mat compatible: the synthesized __rowloc
             // column is exactly how the real key bytes come back at emit.
             const hashing = self.n_hashed > 0 and rg_clean;
+            const measuring = self.n_lengths > 0 and rg_clean;
             for (self.out_phys, 0..) |phys, j| {
                 if (coding and self.coded_dicts_by_j[j] != null) {
                     self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
                 } else if (hashing and self.hash_cols_by_j[j]) {
                     self.decoded[j] = try self.fillKeyHashes(seg, self.cur_rg_idx, phys, rg_count, j);
+                } else if (measuring and self.len_cols_by_j[j]) {
+                    _ = try self.fillByteLengths(seg, self.cur_rg_idx, phys, j, rg_count, null);
+                    self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
                 } else {
                     self.decoded[j] = try seg.decodeColumnMaybeCached(
                         self.allocator,
@@ -2616,6 +2745,14 @@ pub const Scan = struct {
                 }
                 hash_sidecar = slots;
             }
+            var length_sidecar: ?[]const ?[]const u32 = null;
+            if (measuring) {
+                const slots = try self.ensureLengthSlots();
+                for (0..self.out_phys.len) |j| {
+                    if (self.len_cols_by_j[j]) slots[j] = self.len_bufs[j].items[0..rg_count];
+                }
+                length_sidecar = slots;
+            }
             // Sub-batch experiment: emit the row group in `scan_sub_batch`-row
             // slices (plain projection only — not coded/hashed/late-mat, which
             // keep the full batch). The decoded buffers stay live until the
@@ -2623,7 +2760,7 @@ pub const Scan = struct {
             // `emit_runs` also keeps the full row group: the run sidecar is
             // per-RG (a run-aware consumer does near-zero per-row work, so the
             // L2-residency slicing buys nothing there).
-            if (self.sub_batch_rows > 0 and !coding and !hashing and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
+            if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
                 self.sub_off = 0;
                 self.sub_count = rg_count;
                 return self.emitSub();
@@ -2638,6 +2775,7 @@ pub const Scan = struct {
                 .row_count = rg_count,
                 .coded = sidecar,
                 .hashed = hash_sidecar,
+                .byte_lengths = length_sidecar,
                 .runs = runs_sidecar,
             };
         }
@@ -2722,7 +2860,7 @@ pub const Scan = struct {
             const n = try self.materializeNextSlice(self.cur_segment.?, self.mask_buf[0..self.pending_rg_count]);
             if (exec.prof.enabled) self.scan_materialize_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tm));
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths };
         }
 
         while (self.phase == .segments) {
@@ -2762,7 +2900,7 @@ pub const Scan = struct {
             const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             if (matched == 0) continue;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths };
         }
 
         if (self.phase == .memtable) {
@@ -2784,7 +2922,7 @@ pub const Scan = struct {
             };
             if (matched == 0) return null;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
-            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed };
+            return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths };
         }
 
         return null;
@@ -3955,6 +4093,7 @@ pub const Scan = struct {
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tk));
         self.filtered_coded = null;
         self.filtered_hashed = null;
+        self.filtered_lengths = null;
         return matched;
     }
 
@@ -4186,6 +4325,8 @@ pub const Scan = struct {
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
         const hashing = self.n_hashed > 0;
         const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
+        const measuring = self.n_lengths > 0;
+        const length_slots: ?[]?[]const u32 = if (measuring) try self.ensureLengthSlots() else null;
 
         for (self.out_phys, 0..) |phys, j| {
             const col_type = self.table.schema.columns[phys].type;
@@ -4216,6 +4357,14 @@ pub const Scan = struct {
                 try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
+                continue;
+            }
+
+            // Length-only string: measure just the survivors; no byte copy.
+            if (measuring and self.len_cols_by_j[j]) {
+                mat_kind = 2;
+                length_slots.?[j] = try self.fillByteLengths(seg, rg_idx, phys, j, rg_count, rows);
+                try self.fillEmptyStrings(&filtered_cols[j], matched);
                 continue;
             }
 
@@ -4266,6 +4415,7 @@ pub const Scan = struct {
         if (self.emit_loc) try self.appendSurvivorLocs(rows, rg_idx);
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
+        self.filtered_lengths = length_slots;
     }
 
     /// The set rows of `mask` as ascending indices, in a scratch reused across
@@ -4579,6 +4729,7 @@ pub const Scan = struct {
         if (matched == 0) {
             self.filtered_coded = null;
             self.filtered_hashed = null;
+            self.filtered_lengths = null;
             return 0;
         }
 
@@ -4586,6 +4737,8 @@ pub const Scan = struct {
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
         const hashing = self.n_hashed > 0;
         const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
+        const measuring = self.n_lengths > 0;
+        const length_slots: ?[]?[]const u32 = if (measuring) try self.ensureLengthSlots() else null;
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
@@ -4633,6 +4786,22 @@ pub const Scan = struct {
                 hash_slots.?[j] = digests;
                 continue;
             }
+            if (measuring and self.len_cols_by_j[j]) {
+                try self.len_bufs[j].resize(self.allocator, matched);
+                const lens = self.len_bufs[j].items[0..matched];
+                const sv = switch (src.data) {
+                    .varchar, .string => |s| s,
+                    else => return error.TypeMismatch,
+                };
+                var k: usize = 0;
+                for (mask[0..n], 0..) |m, row| if (m) {
+                    lens[k] = @intCast(sv.rowBytes(row).len);
+                    k += 1;
+                };
+                try self.fillEmptyStrings(dst, matched);
+                length_slots.?[j] = lens;
+                continue;
+            }
             try engine.memtable.appendMaskedColumn(self.allocator, src, mask[0..n], dst);
         }
         if (self.emit_loc) {
@@ -4644,6 +4813,7 @@ pub const Scan = struct {
         }
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
+        self.filtered_lengths = length_slots;
         return matched;
     }
 
@@ -4729,6 +4899,7 @@ pub const Scan = struct {
         self.survivor_rows = &.{};
         for (self.code_bufs) |*b| b.clearAndFree(self.allocator);
         for (self.hash_bufs) |*b| b.clearAndFree(self.allocator);
+        for (self.len_bufs) |*b| b.clearAndFree(self.allocator);
         for (self.runs_v_bufs) |*b| b.clearAndFree(self.allocator);
         for (self.runs_l_bufs) |*b| b.clearAndFree(self.allocator);
     }
