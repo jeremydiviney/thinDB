@@ -499,10 +499,10 @@ fn rowVsValue(view: ColumnView, row: u32, val: types.Value) std.math.Order {
         .decimal128 => |v| std.math.order(v[row], val.decimal128),
         .decimal256 => |v| std.math.order(v[row], val.decimal256),
         .uuid => |v| std.math.order(v[row], val.uuid),
-        .varchar, .string, .char => std.mem.order(u8, stringRowBytes(view, @intCast(row)), val.text),
+        .varchar, .string, .char => simd.orderBytes(stringRowBytes(view, @intCast(row)), val.text),
         .json => |sv| json_binary.compare(sv.rowBytes(row), val.text),
         .nested => |sv| nested.order(sv.rowBytes(row), val.text),
-        .bitmap => |sv| std.mem.order(u8, sv.rowBytes(row), val.text),
+        .bitmap => |sv| simd.orderBytes(sv.rowBytes(row), val.text),
     };
 }
 
@@ -941,11 +941,11 @@ const ConcatEntry = struct {
     }
 
     fn valueLess(buf: []const u8, a: ConcatEntry, b: ConcatEntry) bool {
-        return std.mem.order(u8, a.value(buf), b.value(buf)) == .lt;
+        return simd.orderBytes(a.value(buf), b.value(buf)) == .lt;
     }
 
     fn keyLess(buf: []const u8, a: ConcatEntry, b: ConcatEntry) bool {
-        return std.mem.order(u8, a.key(buf), b.key(buf)) == .lt;
+        return simd.orderBytes(a.key(buf), b.key(buf)) == .lt;
     }
 };
 

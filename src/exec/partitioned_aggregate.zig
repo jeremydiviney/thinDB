@@ -47,6 +47,7 @@ const ir = @import("../ir/ir.zig");
 const hll = @import("../util/hll.zig");
 const parallel = @import("../util/parallel.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
+const simd = @import("../util/simd.zig");
 
 const Column = types.Column;
 const ColumnView = storage.ColumnView;
@@ -1125,7 +1126,7 @@ fn testCollectSorted(allocator: Allocator, q: *Query) ![][]u8 {
     }
     std.mem.sort([]u8, lines.items, {}, struct {
         fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.lessThan(u8, a, b);
+            return simd.orderBytes(a, b) == .lt;
         }
     }.lt);
     return lines.toOwnedSlice(allocator);

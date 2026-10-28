@@ -22,6 +22,7 @@ const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
 const json_binary = @import("json_binary.zig");
+const simd = @import("../util/simd.zig");
 const Predicate = predicate.Predicate;
 
 pub const SortSpec = struct {
@@ -95,7 +96,7 @@ fn sortStringPermAsc(allocator: Allocator, perm: []u32, view: storage.StringView
     const Cmp = struct {
         v: storage.StringView,
         pub fn lessThan(c: @This(), a: u32, b: u32) bool {
-            return std.mem.order(u8, c.v.rowBytes(a), c.v.rowBytes(b)) == .lt;
+            return simd.orderBytes(c.v.rowBytes(a), c.v.rowBytes(b)) == .lt;
         }
     };
     try exec.memory.sort(u32, perm, Cmp{ .v = view }, allocator, Cmp.lessThan);
