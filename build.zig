@@ -152,12 +152,22 @@ pub fn build(b: *std.Build) void {
     const memset_tests = b.addTest(.{ .root_module = memsetModule(b, target, optimize), .filters = test_filters });
     const run_memset_tests = runTestStandalone(b, quiet, memset_tests);
 
+    // ---- ClickBench TSV field decoding (bench/clickbench/tsv.zig, pure std) ----
+    const clickbench_tsv_mod = b.createModule(.{
+        .root_source_file = b.path("bench/clickbench/tsv.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const clickbench_tsv_tests = b.addTest(.{ .root_module = clickbench_tsv_mod, .filters = test_filters });
+    const run_clickbench_tsv_tests = runTestStandalone(b, quiet, clickbench_tsv_tests);
+
     const test_step = b.step("test", "Run unit + integration tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
     test_step.dependOn(&run_config_tests.step);
     test_step.dependOn(&run_memset_tests.step);
+    test_step.dependOn(&run_clickbench_tsv_tests.step);
 
     // ---- V2-engine integration tests: tests/integration/v2_group_topn_test.zig ----
     // A focused battery for the grouped V2 handlers, kept as its own step so

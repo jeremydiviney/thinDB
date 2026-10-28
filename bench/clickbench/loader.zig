@@ -11,20 +11,18 @@
 //!   * INT / BIGINT / SMALLINT → `std.fmt.parseInt`
 //!   * DATE  → "YYYY-MM-DD" → days since epoch
 //!   * DATETIME → "YYYY-MM-DD HH:MM:SS" → microseconds since epoch
-//!   * VARCHAR / STRING / CHAR → bytes copied through
+//!   * VARCHAR / STRING / CHAR → bytes, escapes decoded
 //!
 //! The TSV format follows ClickHouse's TabSeparated dialect:
-//! tab between fields, newline between rows, no quoting, `\t`
-//! and `\n` escape sequences in strings. This loader implements
-//! a subset — backslash escapes in strings are passed through
-//! literally for now. If the dataset has escaped tabs in URL/
-//! Referer fields, those rows will look like extra columns
-//! and the row will be rejected.
+//! tab between fields, newline between rows, no quoting, and
+//! backslash escapes in strings (`\t`, `\n`, `\\`, `\'`, ...),
+//! which string fields decode (see tsv.zig).
 
 const std = @import("std");
 const thindb = @import("thindb");
 
 const schema_mod = @import("schema.zig");
+const tsv = @import("tsv.zig");
 
 const Allocator = std.mem.Allocator;
 const ColumnStore = thindb.engine.ColumnStore;
@@ -396,7 +394,12 @@ fn appendField(allocator: Allocator, batch: *Batch, col_idx: usize, field: []con
         .double => try store.data.double.append(allocator, try parseFloatOrZero(f64, field)),
         .date => try store.data.date.append(allocator, try parseDateOrZero(field)),
         .datetime => try store.data.datetime.append(allocator, try parseDateTimeOrZero(field)),
-        .varchar, .string, .char, .json => try store.data.string.appendValue(allocator, field),
+        .varchar, .string, .char, .json => {
+            if (std.mem.indexOfScalar(u8, field, '\\') == null) return store.data.string.appendValue(allocator, field);
+            const decoded = try allocator.alloc(u8, field.len);
+            defer allocator.free(decoded);
+            try store.data.string.appendValue(allocator, tsv.unescapeField(field, decoded));
+        },
         .decimal64, .decimal128, .decimal256, .uuid, .nested, .bitmap => return error.UnsupportedType,
     }
 }
