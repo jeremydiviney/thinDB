@@ -85,6 +85,10 @@ const usage_text =
     \\                          floored at 256 MiB). Accepts raw bytes or a K/M/G suffix (e.g.
     \\                          8G). The LRU evicts the coldest block process-wide; blocks in
     \\                          use are pinned and never evicted.
+    \\  --no-predicate-memo     Don't remember which row groups a scan predicate matched nothing
+    \\                          of (default: on, 1/1024 of --cache-size). With it on, a repeated
+    \\                          predicate, or one sharing an AND arm with an earlier one, skips
+    \\                          those row groups unread.
     \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
     \\                          thindb-server rejects read_csv/read_json/read_parquet and
     \\                          FROM 'file.csv' sources.
@@ -192,6 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
     // must not shed acknowledged rows. --no-wal for disposable bench dirs.
     var enable_wal: bool = true;
     var enable_fsync: bool = true;
+    var predicate_memo: bool = true;
     var idle_timeout_secs: u32 = 0;
     var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
@@ -291,6 +296,10 @@ pub fn main(init: std.process.Init) !u8 {
             enable_fsync = false;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--no-predicate-memo")) {
+            predicate_memo = false;
+            continue;
+        }
         if (try takeU32(arg, "--max-connections", &iter, err_w)) |v| {
             max_connections = v;
             continue;
@@ -375,6 +384,7 @@ pub fn main(init: std.process.Init) !u8 {
         .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
         .memory_budget = memory_budget orelse (thindb.Config{}).memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
+        .predicate_memo = predicate_memo,
         .max_dop = if (max_dop) |v| v else (thindb.Config{}).max_dop,
         .data_root_path = data_dir,
         // Server default is auto (half the cores) rather than the embedded

@@ -1389,6 +1389,13 @@ Three-tier caching, only one of which we explicitly manage:
 
 The LRU cache is bounded by a configurable size (default **2 GB**, set at `Database.open`). Eviction is strict LRU. **Cache entries are never invalidated** — segments are immutable, so cached decoded data is correct forever. When a segment is garbage-collected after compaction, its cache entries become unreachable from new queries and age out naturally.
 
+**Predicate-miss memo.** A scan with a fused WHERE filter remembers the row groups the filter matched none of. A later scan with the same filter skips them without reading or evaluating anything. The memo is a lossy, 4-way set-associative set of 128-bit keys; it takes 1/1024 of the block cache budget and is carved out of it. The key is the digest of `(table generation, segment, row group, predicate digest)`. `predicate.digest` is equal exactly when two predicates select the same rows: column names are case-folded, and AND/OR digest as the multiset of their flattened arms, so arm order and grouping don't matter. It declines subqueries, variables, correlated sets, day comparisons and typed IN-sets, and a compile-time check fails the build when a predicate struct gains a field the digest doesn't hash.
+
+- **What gets noted.** A row group is noted when the filter matched none of its *stored* rows, judged before tombstones or a top-K key bound narrow the mask. Every snapshot sees a subset of the stored rows, so the entry holds for all of them. The memtable is never memoized.
+- **AND arms.** A scan also looks up each of its filter's AND arms, so a query reuses what any query sharing an arm learned. An arm is noted alone only when the guided AND evaluated it first, over every row, and it alone emptied the row group.
+- **Invalidation.** None is needed. Segments are immutable, compaction writes new segment ids, and ALTER, TRUNCATE and XA rollback re-mint the table generation. Dead keys age out as newer keys overwrite their set.
+- **Predictability.** The memo changes no plan and no order of evaluation; it only skips work already proven empty. Query time does depend on history, as with the block cache. `Config.predicate_memo` (`--no-predicate-memo`) turns it off, and `SET THINDB_NO_PREDICATE_MEMO = 1` turns it off per query for benchmarking.
+
 ---
 
 ### 6.5 Keyed pipeline regions
@@ -2237,6 +2244,7 @@ Errors propagate to callers. Outside the XA commit protocol, an error is not a b
 |---|---|---|
 | `path` | (required) | Directory on disk. Created if missing. |
 | `cache_size_bytes` | 2 GB | LRU bound for the decoded row group cache. |
+| `predicate_memo` | true | Remember row groups a scan predicate matched none of (§6.4); takes 1/1024 of the cache budget. |
 | `flush_interval_secs` | 5 | Time-based flush trigger. |
 | `min_time_flush_rows` | 1,000 | Guard against tiny flushes. |
 | `min_time_flush_bytes` | 1 MB | Guard against tiny flushes. |

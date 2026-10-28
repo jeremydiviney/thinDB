@@ -86,6 +86,87 @@ const SpinLock = struct {
     }
 };
 
+/// Lossy set of `Scan` predicate-miss keys ("this predicate matched no stored
+/// row of this row group", keyed by table generation, segment, row group and
+/// predicate digest). Segments are immutable and ALTER/TRUNCATE re-mint the
+/// generation, so a key never goes stale; it is only dead weight once its
+/// segment retires. The slots are 4-way set-associative and allocated on the
+/// first insert: a full set overwrites one of its ways, so the memo never
+/// grows and dead keys age out. 0 marks a free slot, so keys are never 0.
+pub const PredicateMemo = struct {
+    allocator: Allocator,
+    slot_count: usize,
+    slots: std.atomic.Value(?[*]u128) = .init(null),
+    alloc_lock: SpinLock = .{},
+    stripes: [STRIPES]SpinLock = @splat(.{}),
+    /// Off, inserts drop, so lookups never hit (`Config.predicate_memo`).
+    enabled: bool = true,
+
+    const WAYS = 4;
+    const STRIPES = 64;
+    /// The memo takes 1/BUDGET_SHARE of the cache budget.
+    const BUDGET_SHARE = 1024;
+    const MIN_SLOTS = 64 * WAYS;
+
+    /// No slots when the budget's share is under `MIN_SLOTS` (caches under
+    /// 4 MiB): too few to be worth a lookup per row group.
+    fn init(allocator: Allocator, capacity_bytes: usize) PredicateMemo {
+        const want = capacity_bytes / BUDGET_SHARE / @sizeOf(u128);
+        return .{ .allocator = allocator, .slot_count = if (want < MIN_SLOTS) 0 else std.math.floorPowerOfTwo(usize, want) };
+    }
+
+    fn deinit(self: *PredicateMemo) void {
+        if (self.slots.load(.acquire)) |s| self.allocator.free(s[0..self.slot_count]);
+    }
+
+    fn slotBytes(self: *const PredicateMemo) usize {
+        return self.slot_count * @sizeOf(u128);
+    }
+
+    pub fn contains(self: *PredicateMemo, key: u128) bool {
+        const slots = self.slots.load(.acquire) orelse return false;
+        const k = nonZero(key);
+        const set = self.setOf(k);
+        const stripe = &self.stripes[set % STRIPES];
+        stripe.lock();
+        defer stripe.unlock();
+        return std.mem.indexOfScalar(u128, slots[set * WAYS ..][0..WAYS], k) != null;
+    }
+
+    /// Best effort: a memo that cannot allocate its slots stays empty.
+    pub fn insert(self: *PredicateMemo, key: u128) void {
+        if (!self.enabled or self.slot_count == 0) return;
+        const slots = self.slots.load(.acquire) orelse self.allocateSlots() orelse return;
+        const k = nonZero(key);
+        const set = self.setOf(k);
+        const ways = slots[set * WAYS ..][0..WAYS];
+        const stripe = &self.stripes[set % STRIPES];
+        stripe.lock();
+        defer stripe.unlock();
+        if (std.mem.indexOfScalar(u128, ways, k) != null) return;
+        const way = std.mem.indexOfScalar(u128, ways, 0) orelse @as(usize, @intCast((k >> 64) % WAYS));
+        ways[way] = k;
+    }
+
+    fn allocateSlots(self: *PredicateMemo) ?[*]u128 {
+        self.alloc_lock.lock();
+        defer self.alloc_lock.unlock();
+        if (self.slots.load(.acquire)) |s| return s;
+        const s = self.allocator.alloc(u128, self.slot_count) catch return null;
+        @memset(s, 0);
+        self.slots.store(s.ptr, .release);
+        return s.ptr;
+    }
+
+    fn setOf(self: *const PredicateMemo, k: u128) usize {
+        return @as(usize, @truncate(k)) & (self.slot_count / WAYS - 1);
+    }
+
+    fn nonZero(key: u128) u128 {
+        return key | 1;
+    }
+};
+
 // Process-wide cache counters, summed across all tables' caches. Diagnostic
 // only (read by the MySQL handler under `--profile-ops` to print per-query
 // deltas): a spike in `g_misses`/`g_miss_bytes` on a query that was fast in
@@ -148,6 +229,10 @@ pub const Cache = struct {
     misses: u64 = 0,
     evictions: u64 = 0,
 
+    /// Row groups a scan predicate matched no stored row of. Its slots are
+    /// carved out of `capacity_bytes`.
+    predicate_memo: PredicateMemo,
+
     /// 32 ≈ max-dop workers × a few concurrently-expanded string columns; the
     /// pool self-bounds at the 32 largest hot block sizes (~5 MB each on the
     /// 100M ClickBench table → ~160 MB worst case, outside the cache budget).
@@ -168,10 +253,13 @@ pub const Cache = struct {
     };
 
     pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
+        const memo = PredicateMemo.init(allocator, capacity_bytes);
+        const block_bytes = capacity_bytes - memo.slotBytes();
         return .{
             .allocator = allocator,
-            .pool = huge_page.Pool.init(allocator, capacity_bytes),
-            .capacity_bytes = capacity_bytes,
+            .pool = huge_page.Pool.init(allocator, block_bytes),
+            .capacity_bytes = block_bytes,
+            .predicate_memo = memo,
         };
     }
 
@@ -193,6 +281,7 @@ pub const Cache = struct {
             cur = nxt;
         }
         self.map.deinit(self.allocator);
+        self.predicate_memo.deinit();
         for (self.scratch) |s| {
             if (s) |buf| self.allocator.free(buf);
         }
@@ -418,6 +507,41 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expectEqualStrings("hello", e2.bytes);
     try std.testing.expectEqual(@as(u64, 1), c.hits);
     c.release(e2);
+}
+
+test "predicate memo: carved from the budget, lossy per set, off when tiny or disabled" {
+    const allocator = std.testing.allocator;
+    var c: Cache = .init(allocator, 8 << 20);
+    defer c.deinit();
+    const memo = &c.predicate_memo;
+    try std.testing.expectEqual(@as(usize, 512), memo.slot_count);
+    try std.testing.expectEqual((8 << 20) - 512 * @sizeOf(u128), c.capacity_bytes);
+
+    try std.testing.expect(!memo.contains(42));
+    memo.insert(42);
+    memo.insert(42);
+    try std.testing.expect(memo.contains(42));
+    try std.testing.expect(!memo.contains(43 << 64 | 42));
+
+    // Five keys of one set: the set keeps four, so the fifth overwrites one.
+    const sets = memo.slot_count / PredicateMemo.WAYS;
+    var kept: usize = 0;
+    for (1..6) |hi| memo.insert(@as(u128, hi) << 64 | (7 + sets));
+    for (1..6) |hi| kept += @intFromBool(memo.contains(@as(u128, hi) << 64 | (7 + sets)));
+    try std.testing.expectEqual(@as(usize, PredicateMemo.WAYS), kept);
+    try std.testing.expect(memo.contains(@as(u128, 5) << 64 | (7 + sets)));
+    try std.testing.expect(memo.contains(42));
+
+    memo.enabled = false;
+    memo.insert(99);
+    try std.testing.expect(!memo.contains(99));
+
+    var tiny: Cache = .init(allocator, 1 << 20);
+    defer tiny.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tiny.predicate_memo.slot_count);
+    try std.testing.expectEqual(@as(usize, 1 << 20), tiny.capacity_bytes);
+    tiny.predicate_memo.insert(42);
+    try std.testing.expect(!tiny.predicate_memo.contains(42));
 }
 
 test "cache evicts unpinned LRU entries when over budget" {

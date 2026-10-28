@@ -277,6 +277,7 @@ pub const Table = struct {
         const cache_ptr = cfg.block_cache orelse blk: {
             const c = try allocator.create(storage.cache.Cache);
             c.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            c.predicate_memo.enabled = cfg.predicate_memo;
             owned_cache = true;
             break :blk c;
         };
