@@ -21,6 +21,7 @@ const ColumnStore = store.ColumnStore;
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
+const json_binary = @import("json_binary.zig");
 const udf_mod = @import("../udf.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
@@ -79,7 +80,14 @@ pub const Request = struct {
     // groups led by a string key's best values: each scan drops rows that
     // can't lead one (`Scan.setKeyBound`).
     key_bound: ?exec.KeyBoundSpec = null,
+    // Set when the ORDER BY ... LIMIT over this core's output leads with
+    // aggregates but finishes on something the core can't compare (a string
+    // key): the core keeps the groups within the best `keep` on the leading
+    // aggregates, ties at the cut included (see SiloCore.EmitRank.ties).
+    prefix_rank: ?PrefixRank = null,
 };
+
+pub const PrefixRank = struct { specs: []const SortSpec, keep: usize };
 
 const KeyPart = struct {
     name: []const u8,
@@ -201,6 +209,9 @@ const ExecutionContext = struct {
     raw_batch_chunks: usize = DEFAULT_RAW_BATCH_CHUNKS,
     shared_stage_builders: bool = true,
     offered_prunes: Scan.OfferedPrunes = .{},
+    // Borrowed from the pipeline.
+    order_keys: []const OrderKey = &.{},
+    prefix_keys: []const OrderKey = &.{},
     times: StageTimes = .{},
 };
 
@@ -386,6 +397,9 @@ const GroupTopNPipeline = struct {
     output_schema: []Column,
     output_cols: []ColumnStore,
     views: []ColumnView,
+    /// `request.order_specs` and the ranked prefix, resolved against `plan`.
+    order_keys: []const OrderKey,
+    prefix_keys: []const OrderKey,
     owned_needed: ?[]const []const u8 = null,
     emitted: bool = false,
     built: bool = false,
@@ -442,6 +456,11 @@ const GroupTopNPipeline = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        const order_keys = try resolveOrderKeys(allocator, &plan, request.order_specs);
+        errdefer allocator.free(order_keys);
+        const prefix_keys = try resolveOrderKeys(allocator, &plan, if (request.prefix_rank) |p| p.specs else &.{});
+        errdefer allocator.free(prefix_keys);
+
         const rows = tableRows(table);
         return .{
             .allocator = allocator,
@@ -451,6 +470,8 @@ const GroupTopNPipeline = struct {
             .output_schema = output_schema,
             .output_cols = output_cols,
             .views = views,
+            .order_keys = order_keys,
+            .prefix_keys = prefix_keys,
             .owned_needed = owned_needed,
             .upper_rows = if (request.limit != 0) @min(rows, @as(u64, request.limit)) else rows,
         };
@@ -469,6 +490,8 @@ const GroupTopNPipeline = struct {
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
+        self.allocator.free(self.order_keys);
+        self.allocator.free(self.prefix_keys);
         self.allocator.free(self.output_schema);
         if (self.owned_needed) |n| self.allocator.free(n);
         if (self.plan.scan_base_columns.len > 0) self.allocator.free(self.plan.scan_base_columns);
@@ -553,6 +576,11 @@ const GroupTopNPipeline = struct {
         if (self.request.key_bound) |kb| {
             try out.print(allocator, ", key bound {s} {s} {d}", .{ kb.col, if (kb.desc) "DESC" else "ASC", kb.keep });
         }
+        if (self.request.prefix_rank) |p| {
+            try out.appendSlice(allocator, ", rank prefix");
+            for (p.specs) |spec| try out.print(allocator, " {s} {s}", .{ spec.col, if (spec.desc) "DESC" else "ASC" });
+            try out.print(allocator, " keep {d}", .{p.keep});
+        }
         try out.appendSlice(allocator, ")\n");
         try exec.explainIndent(out, allocator, depth + 1);
         try out.appendSlice(allocator, "Scan ");
@@ -601,6 +629,8 @@ const GroupTopNPipeline = struct {
         }
         var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
         ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = self.offered_sets.items };
+        ctx.order_keys = self.order_keys;
+        ctx.prefix_keys = self.prefix_keys;
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
@@ -798,6 +828,10 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
 // so the core's all-groups emit ranks them per fill worker in parallel; the
 // final selection then walks those few rows rather than every group.
 fn emitRank(ctx: *ExecutionContext) ?SiloCore.EmitRank {
+    if (ctx.request.prefix_rank) |p| {
+        if (p.keep == 0 or !rankableAggregates(ctx.prefix_keys)) return null;
+        return .{ .ctx = ctx, .before = prefixEmitBefore, .keep = p.keep, .ties = true };
+    }
     if (canUseCoreCountDescTopN(ctx)) return null;
     if (ctx.request.order_specs.len == 0 or ctx.request.limit == 0) return null;
     return .{ .ctx = ctx, .before = rankEmitBefore, .keep = ctx.request.limit +| ctx.request.offset };
@@ -848,7 +882,7 @@ fn limitEnd(start: usize, len: usize, limit: usize) usize {
 }
 
 fn finalRowLess(op: *GroupTopNPipeline, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
-    return rowOrderBefore(&op.plan, op.request.order_specs, a, b);
+    return rowOrderBefore(op.order_keys, a, b);
 }
 
 fn finalRowBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
@@ -858,38 +892,83 @@ fn finalRowBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool
 
 fn rankEmitBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
     const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
-    return rowOrderBefore(&ec.plan, ec.request.order_specs, a, b);
+    return rowOrderBefore(ec.order_keys, a, b);
+}
+
+fn prefixEmitBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
+    return keysOrder(ec.prefix_keys, a, b) == .lt;
+}
+
+// Every key is an aggregate the core compares (not a GROUP_CONCAT or UDAF
+// result, which finalize after the emit).
+fn rankableAggregates(keys: []const OrderKey) bool {
+    if (keys.len == 0) return false;
+    for (keys) |*key| switch (key.target) {
+        .part => return false,
+        .aggregate => |*agg_plan| if (agg_plan.is_concat or agg_plan.is_udf) return false,
+    };
+    return true;
+}
+
+// An ORDER BY key resolved once to the key part or aggregate it names, so
+// ranking millions of groups doesn't match column names per comparison.
+const OrderKey = struct {
+    target: union(enum) { part: KeyPart, aggregate: AggregatePlan },
+    desc: bool,
+};
+
+fn resolveOrderKeys(allocator: Allocator, plan: *const ShapePlan, specs: []const SortSpec) ![]OrderKey {
+    const keys = try allocator.alloc(OrderKey, specs.len);
+    errdefer allocator.free(keys);
+    for (specs, keys) |spec, *key| {
+        key.* = .{ .target = try orderTarget(plan, spec.col), .desc = spec.desc };
+    }
+    return keys;
+}
+
+fn orderTarget(plan: *const ShapePlan, name: []const u8) !@FieldType(OrderKey, "target") {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) return .{ .part = part };
+    }
+    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
+        if (types.columnNameEql(name, agg_plan.name)) return .{ .aggregate = agg_plan };
+    }
+    return error.UnsupportedOrderBy;
 }
 
 // The result order: the ORDER BY keys, then the group key, so no two groups
 // tie (the core's ranked emit relies on that).
-fn rowOrderBefore(plan: *const ShapePlan, order_specs: []const SortSpec, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
-    for (order_specs) |spec| {
-        const cmp = compareOutputValue(plan, spec.col, a, b) catch 0;
-        if (cmp == 0) continue;
-        return if (spec.desc) cmp > 0 else cmp < 0;
-    }
-    return a.key < b.key;
+fn rowOrderBefore(keys: []const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    return switch (keysOrder(keys, a, b)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.key < b.key,
+    };
 }
 
-fn compareOutputValue(plan: *const ShapePlan, name: []const u8, a: SiloCore.TopRow, b: SiloCore.TopRow) !i8 {
-    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
-        if (types.columnNameEql(name, part.name)) {
-            const a_null = keyPartIsNull(part, a.key);
-            const b_null = keyPartIsNull(part, b.key);
+inline fn keysOrder(keys: []const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) std.math.Order {
+    for (keys) |*key| {
+        const cmp = compareOrderKey(key, a, b);
+        if (cmp == 0) continue;
+        return if ((cmp < 0) != key.desc) .lt else .gt;
+    }
+    return .eq;
+}
+
+fn compareOrderKey(key: *const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) i8 {
+    switch (key.target) {
+        .part => |*part| {
+            const a_null = keyPartIsNull(part.*, a.key);
+            const b_null = keyPartIsNull(part.*, b.key);
             if (a_null or b_null) {
                 if (a_null and b_null) return 0;
                 return if (a_null) -1 else 1;
             }
-            return compareI128(keyPartValue(part, a.key), keyPartValue(part, b.key));
-        }
+            return compareI128(keyPartValue(part.*, a.key), keyPartValue(part.*, b.key));
+        },
+        .aggregate => |*agg_plan| return compareAggregateValue(agg_plan.*, a, b),
     }
-    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
-        if (types.columnNameEql(name, agg_plan.name)) {
-            return compareAggregateValue(agg_plan, a, b);
-        }
-    }
-    return error.UnsupportedOrderBy;
 }
 
 fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCore.TopRow) i8 {
@@ -900,6 +979,15 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCor
     if (a_null or b_null) {
         if (a_null and b_null) return 0;
         return if (a_null) -1 else 1;
+    }
+    // String MIN/MAX results order the way the fold compared them.
+    if (agg_plan.is_string) {
+        const i = agg_plan.str_state_index;
+        return switch (json_binary.columnOrder(agg_plan.output_type == .json, a.str[i], b.str[i])) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
     }
     const float_input = isFloatPhysical(agg_plan.input_type);
     return switch (agg_plan.func) {
@@ -1861,13 +1949,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
             return traceDecline(request, "order key");
         }
-        // Sorting on a string MIN/MAX, GROUP_CONCAT, or UDAF result isn't wired
-        // through the final top-N comparator yet; such queries order by COUNT
-        // in practice (a UDAF query ordered on its own output declines to the
-        // UdfAggregate operator, which sorts the grouped output generically).
+        // GROUP_CONCAT and UDAF results finalize after the emit, past the final
+        // top-N comparator (a UDAF query ordered on its own output declines to
+        // the UdfAggregate operator, which sorts the grouped output generically).
         for (aggregates[0..request.aggs.len]) |agg_plan| {
-            if ((agg_plan.is_string or agg_plan.is_concat or agg_plan.is_udf) and types.columnNameEql(agg_plan.name, spec.col)) {
-                return traceDecline(request, "order by string/udf aggregate");
+            if ((agg_plan.is_concat or agg_plan.is_udf) and types.columnNameEql(agg_plan.name, spec.col)) {
+                return traceDecline(request, "order by concat/udf aggregate");
             }
         }
     }
