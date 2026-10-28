@@ -194,6 +194,13 @@ pub const Batch = struct {
     /// sidecar, and must fall back to `stringKeyDigest(bytes)` on batches
     /// without one (memtable, tombstoned row group) so keys stay identical.
     hashed: ?[]const ?[]const u128 = null,
+    /// Optional per-column byte-length sidecar. When `byte_lengths[j]` is set,
+    /// column `j` (a non-nullable string read only through `octet_length`)
+    /// arrives as each row's byte length, measured by the scan off the cached
+    /// block; `values[j]` holds a placeholder. A length-aware consumer (the
+    /// Compute's `octet_length`) must use the sidecar, and measures the bytes
+    /// on batches without one (an unfiltered memtable or tombstoned row group).
+    byte_lengths: ?[]const ?[]const u32 = null,
     /// Optional per-column RLE run sidecar. When `runs[j]` is set, column `j`'s
     /// rows arrive as adjacent-equal runs straight off the block's RLE header:
     /// `values_i64[k]` (sign-extended to i64) repeated `lengths[k]` times

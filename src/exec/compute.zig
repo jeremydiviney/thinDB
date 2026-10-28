@@ -39,6 +39,7 @@ const PredicateExpr = predicate_mod.PredicateExpr;
 const scalar_fn = @import("scalar_fn.zig");
 const scalar_common = @import("scalar_fn_common.zig");
 const scalar_decimal = @import("scalar_fn_decimal.zig");
+const scalar_string = @import("scalar_fn_string.zig");
 const ScalarFn = scalar_fn.ScalarFn;
 const simd = @import("../util/simd.zig");
 const udf_mod = @import("../udf.zig");
@@ -101,6 +102,45 @@ pub fn collectColumnRefs(allocator: Allocator, out: *std.ArrayListUnmanaged([]co
 /// Companion to `collectColumnRefs` for the predicate trees inside CASE
 /// conditions (and any other predicate whose columns must be projected).
 pub const collectPredicateColumnRefs = predicate_mod.collectColumnNames;
+
+/// Whether `derived` reads column `name` only as the whole argument of
+/// `octet_length` calls every row reaches: the reads a scan's byte-length
+/// sidecar (`Batch.byte_lengths`) serves in place of the bytes. A CASE, or a
+/// conditional call's later argument, re-runs over a row subset that carries
+/// no sidecar, so a read there doesn't qualify.
+pub fn readsOnlyByteLength(allocator: Allocator, derived: []const Derived, name: []const u8) !bool {
+    for (derived) |d| {
+        if (!try exprReadsOnlyByteLength(allocator, d.expr, name)) return false;
+    }
+    return true;
+}
+
+fn exprReadsOnlyByteLength(allocator: Allocator, e: Expr, name: []const u8) !bool {
+    switch (e) {
+        .col_ref => |nm| return !types.columnNameEql(nm, name),
+        .call => |c| {
+            if (c.args.len == 1 and c.args[0] == .col_ref and
+                std.ascii.eqlIgnoreCase(scalar_fn.canonicalName(c.fn_name), "octet_length")) return true;
+            for (c.args, 0..) |arg, i| {
+                if (!callReadsArgOnEveryRow(c.fn_name, i)) {
+                    if (try exprReadsColumn(allocator, arg, name)) return false;
+                } else if (!try exprReadsOnlyByteLength(allocator, arg, name)) return false;
+            }
+            return true;
+        },
+        else => return !try exprReadsColumn(allocator, e, name),
+    }
+}
+
+fn exprReadsColumn(allocator: Allocator, e: Expr, name: []const u8) !bool {
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer refs.deinit(allocator);
+    try collectColumnRefs(allocator, &refs, e);
+    for (refs.items) |ref| {
+        if (types.columnNameEql(ref, name)) return true;
+    }
+    return false;
+}
 
 /// One argument to a function call inside the resolved expression
 /// tree. Args can be: an upstream column reference, a literal (which
@@ -474,6 +514,13 @@ pub const Compute = struct {
     /// The upstream is the Compute for the earlier entries of the list this
     /// one was created from, so `evalBatch` runs it first.
     layered_on_upstream: bool = false,
+    /// The byte-length sidecar of the batch being evaluated and its values,
+    /// which `octet_length` over a placeholder column reads instead.
+    in_lengths: ?[]const ?[]const u32 = null,
+    in_values: []const ColumnView = &.{},
+    /// The output batch's byte-length sidecar: the input's, for the columns
+    /// passed through. Sized with `views`.
+    out_lengths: []?[]const u32,
 
     pub fn create(
         allocator: Allocator,
@@ -583,6 +630,8 @@ pub const Compute = struct {
         const derived_direct = try allocator.alloc(bool, resolved.len);
         errdefer allocator.free(derived_direct);
         @memset(derived_direct, false);
+        const out_lengths = try allocator.alloc(?[]const u32, output_schema.len);
+        errdefer allocator.free(out_lengths);
 
         const self = try allocator.create(Compute);
         errdefer allocator.destroy(self);
@@ -600,6 +649,7 @@ pub const Compute = struct {
             .derived_ir = derived_ir,
             .udf_registry = udf_registry,
             .layered_on_upstream = layered_on_upstream,
+            .out_lengths = out_lengths,
         };
         return makeQuery(allocator, self);
     }
@@ -653,6 +703,7 @@ pub const Compute = struct {
         for (self.derived) |r| freeResolvedDerived(self.allocator, r);
         self.allocator.free(self.output_schema);
         self.allocator.free(self.views);
+        self.allocator.free(self.out_lengths);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -991,6 +1042,12 @@ pub const Compute = struct {
 
     fn evalLayer(self: *Compute, in: Batch) !Batch {
         const n = in.row_count;
+        self.in_lengths = in.byte_lengths;
+        self.in_values = in.values;
+        defer {
+            self.in_lengths = null;
+            self.in_values = &.{};
+        }
 
         for (self.derived, self.derived_cols, self.derived_direct) |r, *out_col, *direct| {
             out_col.clear();
@@ -1057,10 +1114,20 @@ pub const Compute = struct {
             };
         }
 
+        var out_lengths: ?[]const ?[]const u32 = null;
+        if (in.byte_lengths) |lens| {
+            @memset(self.out_lengths, null);
+            const w = @min(lens.len, self.out_lengths.len);
+            @memcpy(self.out_lengths[0..w], lens[0..w]);
+            for (self.derived_output_indices) |out_idx| self.out_lengths[out_idx] = null;
+            out_lengths = self.out_lengths;
+        }
+
         return Batch{
             .schema = self.output_schema,
             .values = self.views,
             .row_count = n,
+            .byte_lengths = out_lengths,
         };
     }
 
@@ -1080,6 +1147,21 @@ pub const Compute = struct {
             return ensureNarrow(plan.output);
         }
         try self.runCall(plan, in_values, plan.output, n);
+    }
+
+    /// The sidecar lengths `octet_length(col)` reads when the batch carries
+    /// `col` as a placeholder; null when it carries the bytes. A row-subset
+    /// re-run has its own values, which never come with a sidecar.
+    fn byteLengthsOf(self: *const Compute, plan: *const CallPlan, in_values: []const ColumnView) ?[]const u32 {
+        const lens = self.in_lengths orelse return null;
+        if (in_values.ptr != self.in_values.ptr) return null;
+        const kernel = plan.func.kernel orelse return null;
+        if (kernel != &scalar_string.lengthKernel or plan.args.len != 1) return null;
+        const idx = switch (plan.args[0]) {
+            .col => |i| i,
+            else => return null,
+        };
+        return if (idx < lens.len) lens[idx] else null;
     }
 
     /// The one row of a constant call's value, evaluated on first use.
@@ -1126,6 +1208,9 @@ pub const Compute = struct {
             try self.evalLambda(lp, arg_views, in_values, out, n);
         } else if (plan.func.typed_kernel) |tk| {
             try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, out, n);
+        } else if (self.byteLengthsOf(plan, in_values)) |lens| {
+            try out.data.int.ensureUnusedCapacity(self.allocator, lens.len);
+            for (lens) |l| out.data.int.appendAssumeCapacity(@intCast(l));
         } else if (plan.func.kernel) |k| {
             try k(self.allocator, arg_views, out, n);
         } else if (plan.func.udf_kernel) |k| {
@@ -3958,4 +4043,31 @@ test "create frees what it built when any allocation fails" {
     // read as a date, CASE literals and NULLs unified to the result type):
     // a failed replacement must leave the old buffer freeable exactly once.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, createAndRelease, .{});
+}
+
+test "only octet_length reads every row reaches qualify for the byte-length sidecar" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const u = expr_mod.col("u");
+    const len_u = try expr_mod.call(aa, "octet_length", &.{u});
+    const one = expr_mod.lit(.{ .int = 1 });
+    const cond = try expr_mod.call(aa, "=", &.{ expr_mod.col("id"), one });
+    const cases = [_]struct { expr: Expr, ok: bool }{
+        .{ .expr = len_u, .ok = true },
+        .{ .expr = try expr_mod.call(aa, "+", &.{ try expr_mod.call(aa, "*", &.{ len_u, one }), one }), .ok = true },
+        .{ .expr = try expr_mod.call(aa, "coalesce", &.{ len_u, one }), .ok = true },
+        .{ .expr = try expr_mod.call(aa, "octet_length", &.{expr_mod.col("v")}), .ok = true },
+        .{ .expr = try expr_mod.call(aa, "if", &.{ cond, len_u, one }), .ok = false },
+        .{ .expr = try expr_mod.call(aa, "coalesce", &.{ one, len_u }), .ok = false },
+        .{ .expr = try expr_mod.call(aa, "octet_length", &.{try expr_mod.call(aa, "upper", &.{u})}), .ok = false },
+        .{ .expr = try expr_mod.call(aa, "char_length", &.{u}), .ok = false },
+        .{ .expr = u, .ok = false },
+    };
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        const derived = [_]Derived{.{ .name = "d", .expr = c.expr }};
+        try std.testing.expectEqual(c.ok, try readsOnlyByteLength(allocator, &derived, "u"));
+    }
 }
