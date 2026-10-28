@@ -845,20 +845,15 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
         return .{ .allocator = op.allocator, .items = rows[start..end] };
     }
 
-    if (op.request.limit == 0) {
-        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
-        return .{ .allocator = op.allocator, .items = rows };
-    }
+    if (op.request.limit == 0) return rankedFinalRows(op.allocator, op.order_keys, rows, rows.len, 0, 0);
 
     const keep = @min(rows.len, op.request.limit + op.request.offset);
     if (keep == 0) return .{ .allocator = op.allocator };
-    // Once keep reaches half the rows, selecting them costs about as much as
-    // sorting everything, which needs no second buffer.
-    if (keep * 2 >= rows.len) {
-        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
-        const start = @min(op.request.offset, rows.len);
-        const end = limitEnd(start, rows.len, op.request.limit);
-        return .{ .allocator = op.allocator, .items = rows[start..end] };
+    // A heap of rows serves a small cut best: most rows miss it on one
+    // comparison against the root. Past the core's own top-set bound the
+    // replacements dominate, each sifting rows through a heap of keep rows.
+    if (keep > MAX_HEAP_KEEP or keep * 2 >= rows.len) {
+        return rankedFinalRows(op.allocator, op.order_keys, rows, keep, @min(op.request.offset, keep), op.request.limit);
     }
     var candidates = try op.allocator.alloc(SiloCore.TopRow, keep);
     errdefer op.allocator.free(candidates);
@@ -874,6 +869,141 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     const emit_len = end - start;
     if (start != 0 and emit_len != 0) std.mem.copyForwards(SiloCore.TopRow, candidates[0..emit_len], candidates[start..end]);
     return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = candidates };
+}
+
+const MAX_HEAP_KEEP = 65536;
+
+// The best `keep` rows in order, with the page [start, start + limit) of them
+// returned. Orders compact entries, not rows: a TopRow is over 200 bytes, and
+// moving rows through a heap or sort took most of a large-LIMIT query (LIMIT
+// 10 OFFSET 5000000 over 17.6M groups: 67 s). The rows move once at the end.
+fn rankedFinalRows(allocator: Allocator, keys: []const OrderKey, rows: []SiloCore.TopRow, keep: usize, start: usize, limit: usize) !FinalRows {
+    const entries = try allocator.alloc(RankEntry, rows.len);
+    defer allocator.free(entries);
+    var exact = keys.len == 1;
+    for (rows, entries, 0..) |row, *entry, i| {
+        if (i % 1024 == 0) try exec.memory.checkCancelled(allocator);
+        const prefix = orderPrefix(&keys[0], row);
+        exact = exact and prefix.exact;
+        entry.* = .{ .key = row.key, .prefix = prefix.value, .class = prefix.class, .row = @intCast(i) };
+    }
+    const order: RankOrder = .{ .rows = rows, .keys = keys, .prefix_decides = exact };
+    try exec.memory.sortPrefix(RankEntry, entries, keep, &order, allocator, RankOrder.before);
+    const end = limitEnd(start, keep, limit);
+    if (end == start) return .{ .allocator = allocator };
+    if ((end - start) * 2 < rows.len) {
+        const page = try allocator.alloc(SiloCore.TopRow, end - start);
+        for (page, entries[start..end]) |*dst, entry| dst.* = rows[entry.row];
+        return .{ .allocator = allocator, .items = page, .owned = page };
+    }
+    permuteRows(rows, entries);
+    return .{ .allocator = allocator, .items = rows[start..end] };
+}
+
+// Moves every row to its entry's position, following the permutation's cycles
+// so each row moves once. It must run to completion: rows own their string
+// bytes, and a row in flight would be lost or freed twice.
+fn permuteRows(rows: []SiloCore.TopRow, entries: []RankEntry) void {
+    for (0..entries.len) |pos| {
+        if (entries[pos].row == pos) continue;
+        const held = rows[pos];
+        var dst = pos;
+        while (true) {
+            const src: usize = entries[dst].row;
+            entries[dst].row = @intCast(dst);
+            if (src == pos) {
+                rows[dst] = held;
+                break;
+            }
+            rows[dst] = rows[src];
+            dst = src;
+        }
+    }
+}
+
+const RankEntry = struct {
+    key: u128,
+    prefix: u64,
+    row: u32,
+    class: u8,
+};
+
+const RankOrder = struct {
+    rows: []const SiloCore.TopRow,
+    keys: []const OrderKey,
+    // One ORDER BY key and every prefix exact: equal prefixes mean equal keys,
+    // so the group key settles the order without reading the rows.
+    prefix_decides: bool,
+
+    fn before(self: *const RankOrder, a: RankEntry, b: RankEntry) bool {
+        if (a.class != b.class) return a.class < b.class;
+        if (a.prefix != b.prefix) return a.prefix < b.prefix;
+        if (self.prefix_decides) return a.key < b.key;
+        return rowOrderBefore(self.keys, self.rows[a.row], self.rows[b.row]);
+    }
+};
+
+// A row's first ORDER BY key mapped so that (class, value) order agrees with
+// compareOrderKey: NULLs in a class of their own, numbers order-preserving in
+// 64 bits. `exact` means equal (class, value) implies an equal key; a clamped
+// wide integer or a string's leading bytes only bound it.
+const OrderPrefix = struct {
+    class: u8,
+    value: u64,
+    exact: bool = true,
+
+    const NULL: OrderPrefix = .{ .class = 0, .value = 0 };
+    const EQUAL: OrderPrefix = .{ .class = 1, .value = 0 };
+
+    fn ofInt(v: i128) OrderPrefix {
+        const narrow = std.math.cast(i64, v) orelse return .{ .class = 1, .value = if (v < 0) 0 else std.math.maxInt(u64), .exact = false };
+        return .{ .class = 1, .value = @as(u64, @bitCast(narrow)) ^ (1 << 63) };
+    }
+
+    // compareF64 holds -0.0 and 0.0 equal; NaN, which it never orders, sorts
+    // after every number.
+    fn ofFloat(v: f64) OrderPrefix {
+        const canonical: f64 = if (v == 0) 0 else if (std.math.isNan(v)) std.math.nan(f64) else v;
+        const bits: u64 = @bitCast(canonical);
+        return .{ .class = 1, .value = if (bits >> 63 != 0) ~bits else bits | (1 << 63) };
+    }
+
+    fn ofBytes(bytes: []const u8) OrderPrefix {
+        var lead = [_]u8{0} ** 8;
+        const n: usize = @min(bytes.len, 8);
+        @memcpy(lead[0..n], bytes[0..n]);
+        return .{ .class = 1, .value = std.mem.readInt(u64, &lead, .big), .exact = false };
+    }
+
+    fn descending(self: OrderPrefix) OrderPrefix {
+        return .{ .class = 1 - self.class, .value = ~self.value, .exact = self.exact };
+    }
+};
+
+fn orderPrefix(key: *const OrderKey, row: SiloCore.TopRow) OrderPrefix {
+    const ascending: OrderPrefix = switch (key.target) {
+        .part => |*part| if (keyPartIsNull(part.*, row.key)) .NULL else .ofInt(keyPartValue(part.*, row.key)),
+        .aggregate => |*agg_plan| aggregatePrefix(agg_plan.*, row),
+    };
+    return if (key.desc) ascending.descending() else ascending;
+}
+
+fn aggregatePrefix(agg_plan: AggregatePlan, row: SiloCore.TopRow) OrderPrefix {
+    if (aggIsNull(row, agg_plan)) return .NULL;
+    if (agg_plan.is_string) {
+        // JSON orders by value, not by its bytes.
+        if (agg_plan.output_type == .json) return .{ .class = 1, .value = 0, .exact = false };
+        return .ofBytes(row.str[agg_plan.str_state_index]);
+    }
+    const float_input = isFloatPhysical(agg_plan.input_type);
+    return switch (agg_plan.func) {
+        .count => .ofInt(countValue(row, agg_plan)),
+        .sum, .min, .max => if (float_input) .ofFloat(rowStateFloat(row, agg_plan.state_index)) else .ofInt(integerAggValue(row, agg_plan)),
+        .avg => .ofFloat(if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan)),
+        .count_distinct => .ofInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => .ofFloat(welfordValue(row, agg_plan)),
+        else => .EQUAL,
+    };
 }
 
 fn limitEnd(start: usize, len: usize, limit: usize) usize {
@@ -2421,4 +2551,60 @@ test "hashed-key emit reads rowrefs from the aggregation snapshot" {
     try std.testing.expectEqualStrings("s3", keys.rowBytes(0));
     try std.testing.expectEqualStrings("s7", keys.rowBytes(1));
     try std.testing.expectEqualStrings("s11", keys.rowBytes(2));
+}
+
+test "ranked final rows match the row order" {
+    const allocator = std.testing.allocator;
+    const count_plan: AggregatePlan = .{ .name = "c", .func = .count, .input_column_index = null, .input_type = .i64, .state_index = 0, .output_type = .bigint };
+    const sum_plan: AggregatePlan = .{ .name = "s", .func = .sum, .input_column_index = 0, .input_type = .i32, .state_index = 1, .output_type = .bigint, .input_nullable = true, .valid_count_index = 2 };
+    const max_plan: AggregatePlan = .{ .name = "m", .func = .max, .input_column_index = 1, .input_type = .f64, .state_index = 3, .output_type = .double };
+    const str_plan: AggregatePlan = .{ .name = "t", .func = .min, .input_column_index = null, .input_type = .i64, .state_index = 0, .output_type = .string, .is_string = true };
+    const orders = [_][]const OrderKey{
+        &.{.{ .target = .{ .aggregate = count_plan }, .desc = true }},
+        &.{.{ .target = .{ .aggregate = sum_plan }, .desc = false }},
+        &.{.{ .target = .{ .aggregate = max_plan }, .desc = true }},
+        &.{.{ .target = .{ .aggregate = str_plan }, .desc = false }},
+        &.{ .{ .target = .{ .aggregate = sum_plan }, .desc = true }, .{ .target = .{ .aggregate = count_plan }, .desc = false } },
+    };
+    const pages = [_]struct { keep: usize, start: usize, limit: usize }{
+        .{ .keep = 3000, .start = 0, .limit = 0 },
+        .{ .keep = 1700, .start = 1600, .limit = 100 },
+        .{ .keep = 2900, .start = 100, .limit = 2800 },
+        .{ .keep = 10, .start = 0, .limit = 10 },
+        .{ .keep = 60, .start = 60, .limit = 10 },
+    };
+    const words = [_][]const u8{ "", "a", "abcdefgh", "abcdefghi", "abcdefghj", "b" };
+    const floats = [_]f64{ -1.5, -0.0, 0.0, 2.25, 1e300 };
+    var prng = std.Random.DefaultPrng.init(907);
+    const random = prng.random();
+    const n = 3000;
+    const source = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(source);
+    for (source, 0..) |*row, i| {
+        row.* = .{ .key = @intCast(i * 7919 % n), .count = random.uintLessThan(u64, 4) };
+        row.slots[0] = random.intRangeAtMost(i64, -2, 2);
+        row.slots[1] = random.intRangeAtMost(i64, 0, 2);
+        row.slots[2] = @bitCast(floats[random.uintLessThan(usize, floats.len)]);
+        row.str[0] = words[random.uintLessThan(usize, words.len)];
+        row.str_present[0] = random.uintLessThan(u8, 8) != 0;
+    }
+    const expected = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(expected);
+    const rows = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(rows);
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    for (orders) |keys| for (pages) |page| {
+        @memcpy(expected, source);
+        std.sort.pdq(SiloCore.TopRow, expected, keys, rowOrderBefore);
+        @memcpy(rows, source);
+        var got = try rankedFinalRows(allocator, keys, rows, page.keep, page.start, page.limit);
+        defer got.deinit();
+        const end = limitEnd(page.start, page.keep, page.limit);
+        try std.testing.expectEqual(end - page.start, got.items.len);
+        for (expected[page.start..end], got.items) |want, have| try std.testing.expectEqual(want.key, have.key);
+        @memset(seen, false);
+        for (rows) |row| seen[@intCast(row.key)] = true;
+        try std.testing.expect(std.mem.allEqual(bool, seen, true));
+    };
 }

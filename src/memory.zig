@@ -64,6 +64,13 @@ pub fn sort(comptime T: type, items: []T, context: anytype, allocator: std.mem.A
     try @import("util/cancellable_sort.zig").pdq(T, items, context, flag, less);
 }
 
+/// `sort` of only the `prefix` least items, which end up in order at the
+/// front; the rest are left in unspecified order.
+pub fn sortPrefix(comptime T: type, items: []T, prefix: usize, context: anytype, allocator: std.mem.Allocator, comptime less: fn (@TypeOf(context), T, T) bool) error{QueryCancelled}!void {
+    const flag = if (accountantOf(allocator)) |a| a.cancel_flag else null;
+    try @import("util/cancellable_sort.zig").pdqPrefix(T, items, prefix, context, flag, less);
+}
+
 /// The allocator an operator built on `fallback` draws from: the query's
 /// tracked execution allocator, unless `fallback` is already one the query
 /// owns. That keeps its backing — a parallel scan's per-chunk operators stay
