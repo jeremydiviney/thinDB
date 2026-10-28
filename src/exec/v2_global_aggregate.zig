@@ -812,8 +812,8 @@ fn distinctDrainRun(job: *DistinctDrainJob) !void {
     var narrow_spare: NarrowDistinct.Spare = .{};
     var wide_spare: WideDistinct.Spare = .{};
     for (job.shared) |slot| if (slot) |shared| switch (shared) {
-        .narrow => |set| while (try set.drainNext(&narrow_spare)) {},
-        .wide => |set| while (try set.drainNext(&wide_spare)) {},
+        .narrow => |set| while (try set.drainNext(&narrow_spare)) |_| {},
+        .wide => |set| while (try set.drainNext(&wide_spare)) |_| {},
     };
 }
 
@@ -1458,12 +1458,13 @@ const GlobalAggregate = struct {
         n_workers = grant.count;
 
         // COUNT(DISTINCT): one partition-first set per distinct field, which
-        // every lane feeds through its own producer. Declared before the
-        // producers so they are torn down first.
+        // every lane feeds through its own producer. A rejected query hands
+        // the sets' reservations back before it returns; a finished one frees
+        // them off the result path.
         const shared = try self.allocator.alloc(?SharedDistinct, self.plans.len);
         defer self.allocator.free(shared);
         @memset(shared, null);
-        defer self.destroyShared(shared, n_workers);
+        errdefer self.destroyShared(shared, 1, false);
         for (self.plans, shared) |p, *slot| {
             if (p.op != .count_distinct) continue;
             slot.* = if (distinctTier(p.dkind) == .u64)
@@ -1576,15 +1577,16 @@ const GlobalAggregate = struct {
             };
             merged.distinct_counts[i] = count + @intFromBool(merged.has_blank[i]);
         };
+        self.destroyShared(shared, n_workers, true);
         return merged;
     }
 
     // A high-cardinality field's sets run to hundreds of MiB, and freeing them
-    // took 10-20 ms on the result path. With an accountant the frees are
-    // collected, so the query stops being charged here, and detached threads
-    // hand the memory back.
-    fn destroyShared(self: *GlobalAggregate, shared: []const ?SharedDistinct, n_threads: usize) void {
-        const deferred = exec.memory.accountantOf(self.allocator) != null;
+    // took 10-20 ms on the result path. With `deferred_frees` and an
+    // accountant the frees are collected, so the query stops being charged
+    // here, and detached threads hand the memory back.
+    fn destroyShared(self: *GlobalAggregate, shared: []const ?SharedDistinct, n_threads: usize, deferred_frees: bool) void {
+        const deferred = deferred_frees and exec.memory.accountantOf(self.allocator) != null;
         var frees = exec.memory.DeferredFrees.init(n_threads);
         if (deferred) frees.collect();
         for (shared) |slot| if (slot) |s| switch (s) {
