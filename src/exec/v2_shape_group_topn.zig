@@ -75,6 +75,10 @@ pub const Request = struct {
     // Resolves UDAF aggregate names → callback entries. Null when the query has
     // no UDAFs (the silo declines any `.udf` agg it sees in that case).
     udf_registry: ?*const udf_mod.UdfRegistry = null,
+    // Set when an ORDER BY ... LIMIT over this core's output keeps only the
+    // groups led by a string key's best values: each scan drops rows that
+    // can't lead one (`Scan.setKeyBound`).
+    key_bound: ?exec.KeyBoundSpec = null,
 };
 
 const KeyPart = struct {
@@ -544,7 +548,12 @@ const GroupTopNPipeline = struct {
     }
 
     pub fn explain(self: *GroupTopNPipeline, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
-        try exec.explainLine(out, allocator, depth, "HashAggregate (V2 group-topN: route/fold/order/limit)");
+        try exec.explainIndent(out, allocator, depth);
+        try out.appendSlice(allocator, "HashAggregate (V2 group-topN: route/fold/order/limit");
+        if (self.request.key_bound) |kb| {
+            try out.print(allocator, ", key bound {s} {s} {d}", .{ kb.col, if (kb.desc) "DESC" else "ASC", kb.keep });
+        }
+        try out.appendSlice(allocator, ")\n");
         try exec.explainIndent(out, allocator, depth + 1);
         try out.appendSlice(allocator, "Scan ");
         try out.appendSlice(allocator, self.table.name);
@@ -736,6 +745,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 null,
             .emit_rank = emitRank(ctx),
             .hashed = ctx.plan.hashed,
+            .key_bound = ctx.request.key_bound,
         },
         .params = params,
         .scan_columns = scan_columns,

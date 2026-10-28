@@ -1942,8 +1942,20 @@ fn checkHvCase(allocator: std.mem.Allocator, db: *thindb.Database, stats: []cons
             try got.append(allocator, row);
         }
     }
-    if (c.order_col == null) sortHv(got.items, null, false);
-    try std.testing.expectEqualSlices(HvOut, want.items[start..end], got.items);
+    const order_col = c.order_col orelse {
+        sortHv(got.items, null, false);
+        return std.testing.expectEqualSlices(HvOut, want.items[start..end], got.items);
+    };
+    // Groups tied on the ORDER BY value may come back in any order, so a
+    // page cut through a tie can hold any of the tied groups.
+    try std.testing.expectEqual(end - start, got.items.len);
+    for (got.items, want.items[start..end], 0..) |g, w, i| {
+        try std.testing.expectEqual(w[order_col], g[order_col]);
+        for (want.items) |cand| {
+            if (std.meta.eql(cand, g)) break;
+        } else return error.TestUnexpectedResult;
+        for (got.items[0..i]) |prev| try std.testing.expect(!std.meta.eql(prev, g));
+    }
 }
 
 test "V2 group routes keep HAVING with post-aggregate expressions in any order (issue #375)" {

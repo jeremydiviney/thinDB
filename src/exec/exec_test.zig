@@ -5308,3 +5308,120 @@ test "scan: byte-length sidecar matches the stored bytes on every path" {
         }
     }
 }
+
+test "key bound keeps the best distinct values seen" {
+    const allocator = std.testing.allocator;
+    const KeyBound = @import("scan.zig").KeyBound;
+
+    var asc = try KeyBound.init(allocator, 0, false, 3);
+    defer asc.deinit(allocator);
+    const asc_steps = .{ .{ "m", true }, .{ "c", true }, .{ "x", true }, .{ "c", true }, .{ "a", true }, .{ "b", true }, .{ "z", false }, .{ "c", true }, .{ "d", false } };
+    inline for (asc_steps) |step| try std.testing.expectEqual(step[1], try asc.admit(allocator, step[0]));
+    try std.testing.expectEqualStrings("c", asc.bound().?);
+
+    var desc = try KeyBound.init(allocator, 0, true, 2);
+    defer desc.deinit(allocator);
+    try std.testing.expectEqual(@as(?[]const u8, null), desc.bound());
+    const desc_steps = .{ .{ "b", true }, .{ "", true }, .{ "c", true }, .{ "", false }, .{ "bb", true }, .{ "b", false } };
+    inline for (desc_steps) |step| try std.testing.expectEqual(step[1], try desc.admit(allocator, step[0]));
+    try std.testing.expectEqualStrings("bb", desc.bound().?);
+}
+
+// A key bound lets through every row holding one of the column's `keep`
+// best values among the rows the scan emits, over raw, dict and FSST blocks,
+// with a WHERE, tombstones and the memtable, and drops rows of most others.
+test "scan: a key bound passes every row of the best values and drops most others" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const Row = struct { id: i64, s: []const u8, d: []const u8 };
+    const d_pool = [_][]const u8{ "", "apple", "banana", "cherry", "date" };
+    const n_rows = 6000;
+    const dead_below = 400;
+
+    const s_values = try allocator.alloc([]u8, n_rows);
+    defer {
+        for (s_values) |v| allocator.free(v);
+        allocator.free(s_values);
+    }
+    for (s_values, 0..) |*v, i| v.* = try std.fmt.allocPrint(allocator, "v{d}", .{(i * 7919) % 2500});
+
+    inline for (.{ types.TableCompression.lz4, types.TableCompression.lz4_fsst }) |compression| {
+        errdefer std.debug.print("compression={s}\n", .{@tagName(compression)});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const schema = types.TableSchema{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "s", .type = .string },
+                .{ .name = "d", .type = .string },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+            .compression = compression,
+        };
+        var db = try api.Database.open(allocator, io, tmp.dir, .{
+            .auto_flush_rows = std.math.maxInt(u64),
+            .auto_flush_bytes = std.math.maxInt(u64),
+        });
+        defer db.close();
+        const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 256 });
+
+        const rows = try allocator.alloc(Row, n_rows);
+        defer allocator.free(rows);
+        for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .s = s_values[i], .d = d_pool[(i * 13) % d_pool.len] };
+        try t.insert(rows[0..2500]);
+        try t.flush();
+        try t.insert(rows[2500..5000]);
+        try t.flush();
+        _ = try t.delete(.{ .col = "id", .op = .lt, .val = .{ .bigint = dead_below } });
+        try t.insert(rows[5000..]);
+
+        const filters = [_]?PredicateExpr{ null, leafExpr("id", .gte, .{ .bigint = 1000 }) };
+        for ([_][]const u8{ "s", "d" }) |col| for ([_]bool{ false, true }) |desc| for ([_]usize{ 1, 3, 40 }) |keep| for (filters, 0..) |filter, fi| {
+            errdefer std.debug.print("col={s} desc={} keep={d} filter #{d}\n", .{ col, desc, keep, fi });
+            const s = try exec.Scan.allocWithProjectionLoc(allocator, t, null, &.{ "id", col }, false, null);
+            var q = exec.makeQuery(allocator, s);
+            defer q.deinit();
+            if (filter) |f| try std.testing.expect(try s.tryFuseFilter(f));
+            try std.testing.expect(try s.setKeyBound(.{ .col = col, .desc = desc, .keep = keep }));
+
+            var live: std.ArrayList([]const u8) = .empty;
+            defer live.deinit(allocator);
+            for (rows) |r| {
+                if (r.id < dead_below or (fi == 1 and r.id < 1000)) continue;
+                try live.append(allocator, if (col[0] == 's') r.s else r.d);
+            }
+            const Order = struct {
+                fn lt(want_desc: bool, a: []const u8, b: []const u8) bool {
+                    return if (want_desc) std.mem.order(u8, a, b) == .gt else std.mem.order(u8, a, b) == .lt;
+                }
+            };
+            std.mem.sort([]const u8, live.items, desc, Order.lt);
+            var distinct: usize = 0;
+            var cut: []const u8 = live.items[0];
+            for (live.items, 0..) |v, i| {
+                if (i == 0 or !std.mem.eql(u8, v, live.items[i - 1])) {
+                    if (distinct == keep) break;
+                    distinct += 1;
+                    cut = v;
+                }
+            }
+
+            var emitted: usize = 0;
+            var kept_rows: usize = 0;
+            var want_kept: usize = 0;
+            for (live.items) |v| want_kept += @intFromBool(!Order.lt(desc, cut, v));
+            while (try q.next()) |b| {
+                for (0..b.row_count) |r| {
+                    const id = b.values[0].data.bigint[r];
+                    try std.testing.expect(id >= dead_below and (fi == 0 or id >= 1000));
+                    const v = b.values[1].data.string.rowBytes(r);
+                    kept_rows += @intFromBool(!Order.lt(desc, cut, v));
+                    emitted += 1;
+                }
+            }
+            try std.testing.expectEqual(want_kept, kept_rows);
+            if (col[0] == 's') try std.testing.expect(emitted * 4 < live.items.len);
+        };
+    }
+}
