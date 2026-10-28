@@ -13,12 +13,12 @@
 //!   - Scalar aggregates (COUNT/SUM/AVG/MIN/MAX): a single-threaded fold of
 //!     n_workers small tables — trivially cheap at this cardinality.
 //!   - COUNT(DISTINCT): per-worker partial sets overlap heavily across
-//!     workers, so a serial union would re-dedup tens of millions of entries
-//!     (the bottleneck the global path eliminated). Each worker therefore
-//!     scatters its (key, value) composites into P = n_workers sub-sets by
-//!     key-hash (Lemire multiply-shift — same partition in every worker), and
-//!     the merge runs ONE THREAD PER PARTITION over disjoint key sets, bumping
-//!     per-group counts on first sighting. Partition counts sum exactly.
+//!     workers, so a union of them would insert most entries twice. Every
+//!     worker instead pushes its (key, value) composites into one shared
+//!     partition-first set (partitioned_distinct.zig), which builds each
+//!     partition while it is cache-sized and inserts each composite once. The
+//!     merge drains the partitions across threads and counts each composite
+//!     toward its group key; partitions are disjoint, so counts sum exactly.
 //!
 //! Routing: the planner admits a query only when the combined group-key
 //! cardinality has a provable-enough upper bound — the saturating PRODUCT of
@@ -52,9 +52,9 @@
 //!
 //! COUNT(DISTINCT) takes integer, float (canonical bits), and string inputs.
 //! A string input that is itself codeable rides the same dict machinery as a
-//! 32-bit value; any other string keys an exact (gid, bytes) set per
-//! partition, scattered by a hash of (packed key, value digest) so the merge
-//! stays one thread per partition. A derived (row-local) aggregate input is
+//! 32-bit value; any other string keys an exact (gid, bytes) set per worker
+//! partition, scattered by a hash of (packed key, value digest), and the merge
+//! runs one thread per partition, bumping per-group counts on first sighting. A derived (row-local) aggregate input is
 //! evaluated per batch by a Compute layered on the worker's scan batch, so the
 //! scan's code sidecars still reach the key columns.
 
@@ -81,6 +81,7 @@ const SiloCore = exec.silo_group_core;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const group_table = exec.group_table;
+const partitioned_distinct = @import("partitioned_distinct.zig");
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -94,6 +95,19 @@ const GroupTable = group_table.IntKeyMemsetTable(64 + MAX_KEYS);
 const DistinctSet = SiloCore.DistinctSet;
 const DistinctStrSet = group_table.DistinctStrSet;
 const CountSlotTable = group_table.CountSlotTable;
+const NarrowDistinct = partitioned_distinct.PartitionedDistinct(u64);
+const WideDistinct = partitioned_distinct.PartitionedDistinct(u128);
+
+// A non-string COUNT(DISTINCT)'s shared set and one worker's producer into
+// it, keyed at the composite's tier width.
+const SharedDistinct = union(enum) {
+    narrow: *NarrowDistinct,
+    wide: *WideDistinct,
+};
+const DistinctProducer = union(enum) {
+    narrow: NarrowDistinct.Producer,
+    wide: WideDistinct.Producer,
+};
 
 const MAX_KEYS: usize = 8;
 const MAX_AGGS: usize = 16;
@@ -190,19 +204,6 @@ fn columnNullable(table: *api.Table, name: []const u8) bool {
 inline fn truncBits(x: u64, bits: u8) u64 {
     if (bits >= 64) return x;
     return x & ((@as(u64, 1) << @intCast(bits)) - 1);
-}
-
-// Same partitioning as the global path: Lemire multiply-shift on the
-// tier-sized hash, so a composite lands in the same partition in every worker
-// and the set's low-bit bucketing stays independent of the split.
-inline fn distinctPartition(tier: DistinctSet.Tier, key: u128, parts: usize) usize {
-    const h: u64 = switch (tier) {
-        .u32 => group_table.mix64(@as(u64, @as(u32, @truncate(key)))),
-        .u64 => group_table.mix64(@truncate(key)),
-        .u96 => group_table.Key96.fromU128(key).hash(),
-        .u128 => group_table.hashU128(key),
-    };
-    return @intCast((@as(u128, h) *% @as(u128, parts)) >> 64);
 }
 
 // Same partition in every worker for a string distinct: the packed key and the
@@ -636,9 +637,10 @@ const WState = struct {
     counts: std.ArrayListUnmanaged(u64) = .empty,
     slots: std.ArrayListUnmanaged(i128) = .empty,
     ns: std.ArrayListUnmanaged(u64) = .empty,
-    // n_distinct × parts membership sets, indexed [d * parts + partition]:
-    // `dsets` for int/float/coded inputs, `ssets` for string inputs.
-    dsets: []DistinctSet = &.{},
+    // Per distinct aggregate d: `producers[d]` feeds the shared set of an
+    // int/float/coded input; a string input's n_distinct × parts sets are
+    // `ssets`, indexed [d * parts + partition].
+    producers: []?DistinctProducer = &.{},
     ssets: []DistinctStrSet = &.{},
     // gid → merged gid, filled after the scalar merge for the string merge.
     mgid_of: []u32 = &.{},
@@ -656,27 +658,24 @@ const WState = struct {
     key_memos: [MAX_KEYS]?GlobalDict.Memo = @splat(null),
     distinct_memos: [MAX_AGGS]?GlobalDict.Memo = @splat(null),
 
-    fn init(allocator: Allocator, expected_groups: usize, aggs: []const AggPlan, n_distinct: u16, dop_parts: usize) !WState {
+    fn init(allocator: Allocator, expected_groups: usize, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
         errdefer self.table.deinit(allocator);
-        const n_sets = @as(usize, n_distinct) * dop_parts;
-        const dsets = try allocator.alloc(DistinctSet, n_sets);
-        errdefer allocator.free(dsets);
-        @memset(dsets, .{});
-        for (aggs) |a| {
-            if (a.op != .count_distinct) continue;
-            for (dsets[@as(usize, a.distinct_index) * dop_parts ..][0..dop_parts]) |*d| d.configure(a.tier);
-        }
-        const ssets = try allocator.alloc(DistinctStrSet, n_sets);
+        const producers = try allocator.alloc(?DistinctProducer, shared.len);
+        errdefer allocator.free(producers);
+        for (producers, shared) |*producer, slot| producer.* = if (slot) |s| switch (s) {
+            .narrow => |set| .{ .narrow = .{ .shared = set } },
+            .wide => |set| .{ .wide = .{ .shared = set } },
+        } else null;
+        const ssets = try allocator.alloc(DistinctStrSet, shared.len * dop_parts);
         @memset(ssets, .{});
-        self.dsets = dsets;
+        self.producers = producers;
         self.ssets = ssets;
         return self;
     }
 
     fn deinit(self: *WState, allocator: Allocator, scratch_allocator: Allocator) void {
-        for (self.dsets) |*d| d.deinit(allocator);
-        if (self.dsets.len > 0) allocator.free(self.dsets);
+        if (self.producers.len > 0) allocator.free(self.producers);
         for (self.ssets) |*d| d.deinit(allocator);
         if (self.ssets.len > 0) allocator.free(self.ssets);
         if (self.mgid_of.len > 0) allocator.free(self.mgid_of);
@@ -905,11 +904,11 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
                 // The distinct kernels key by the packed key alone (tryBuild
                 // keeps them to keys that fit it).
                 if (wide) return error.UnsupportedQueryShape;
-                const at = @as(usize, a.distinct_index) * w.dop_parts;
+                const d: usize = a.distinct_index;
                 switch (a.distinct_kind) {
-                    .int, .float => try foldDistinctKernel(allocator, view, keys, st.dsets[at..][0..w.dop_parts], w.dop_parts, a.value_bits, a.tier),
-                    .coded => try foldDistinctCoded(w, view, if (batch.coded) |sc| sc[ci] else null, i, keys, st.dsets[at..][0..w.dop_parts], a.tier),
-                    .string => try foldDistinctStrKernel(allocator, view, keys, gids, st.ssets[at..][0..w.dop_parts]),
+                    .int, .float => try foldDistinctKernel(view, keys, &st.producers[d].?, a.value_bits),
+                    .coded => try foldDistinctCoded(w, view, if (batch.coded) |sc| sc[ci] else null, i, keys, &st.producers[d].?),
+                    .string => try foldDistinctStrKernel(allocator, view, keys, gids, st.ssets[d * w.dop_parts ..][0..w.dop_parts]),
                 }
             },
         }
@@ -1103,58 +1102,38 @@ fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, gids: []const u32, 
     }
 }
 
-// COUNT(DISTINCT) fold: scatter composites into the partition sub-sets with a
-// look-ahead prefetch — the set probe is the cache-miss bottleneck, and the
-// composite for row r+K is computable up front (packed key + value, no group
-// probe needed), so the misses of independent rows overlap. A grow between a
-// prefetch and its insert only wastes that one hint.
-fn foldDistinctKernel(
-    allocator: Allocator,
-    view: ColumnView,
-    keys: []const u64,
-    dsets: []DistinctSet,
-    parts_n: usize,
-    value_bits: u8,
-    tier: DistinctSet.Tier,
-) !void {
+fn foldDistinctKernel(view: ColumnView, keys: []const u64, producer: *DistinctProducer, value_bits: u8) !void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64, .float, .double => |s| {
-            try foldDistinctValues(@TypeOf(s[0]), allocator, s, view, keys, dsets, parts_n, value_bits, tier);
+            try foldDistinctValues(@TypeOf(s[0]), s, view, keys, producer, value_bits);
         },
         else => {},
     }
 }
 
+// Physical order clusters repeated (key, value) pairs into adjacent runs, and
+// only a run's first composite can be new, so only run starts are pushed.
 fn foldDistinctValues(
     comptime T: type,
-    allocator: Allocator,
     vals: []const T,
     view: ColumnView,
     keys: []const u64,
-    dsets: []DistinctSet,
-    parts_n: usize,
+    producer: *DistinctProducer,
     value_bits: u8,
-    tier: DistinctSet.Tier,
 ) !void {
-    const n = keys.len;
-    var prev_comp: u128 = 0;
-    var have_prev = false;
-    var r: usize = 0;
-    while (r < n) : (r += 1) {
-        if (!view.isValid(r)) continue;
-        const pf = r + PREFETCH_DIST_DISTINCT;
-        if (pf < n and view.isValid(pf)) {
-            const c_pf = compositeOf(keys[pf], distinctValueBits(T, vals[pf]), value_bits);
-            dsets[distinctPartition(tier, c_pf, parts_n)].prefetchKey(c_pf);
-        }
-        const comp = compositeOf(keys[r], distinctValueBits(T, vals[r]), value_bits);
-        // Physical order clusters repeated (key, value) pairs into
-        // adjacent runs; an identical composite can't be new — skip
-        // the cache-missing set probe.
-        if (have_prev and comp == prev_comp) continue;
-        prev_comp = comp;
-        have_prev = true;
-        _ = try dsets[distinctPartition(tier, comp, parts_n)].insertIsNew(allocator, comp);
+    switch (producer.*) {
+        inline else => |*prod| {
+            var prev_comp: u128 = 0;
+            var have_prev = false;
+            for (keys, 0..) |key, r| {
+                if (!view.isValid(r)) continue;
+                const comp = compositeOf(key, distinctValueBits(T, vals[r]), value_bits);
+                if (have_prev and comp == prev_comp) continue;
+                prev_comp = comp;
+                have_prev = true;
+                try prod.push(@truncate(comp));
+            }
+        },
     }
 }
 
@@ -1177,8 +1156,7 @@ fn foldDistinctCoded(
     sidecar: ?exec.CodedColumn,
     agg_i: usize,
     keys: []const u64,
-    dsets: []DistinctSet,
-    tier: DistinctSet.Tier,
+    producer: *DistinctProducer,
 ) !void {
     const n = keys.len;
     const codes: []const u32 = if (sidecar) |cc| cc.codes[0..n] else blk: {
@@ -1194,7 +1172,7 @@ fn foldDistinctCoded(
         }
         break :blk out;
     };
-    try foldDistinctValues(u32, w.allocator, codes, view, keys, dsets, w.dop_parts, 32, tier);
+    try foldDistinctValues(u32, codes, view, keys, producer, 32);
 }
 
 // String COUNT(DISTINCT) by bytes: each (worker gid, value) pair lands in the
@@ -1257,18 +1235,19 @@ inline fn setSlotF64(slot: *i128, v: f64) void {
     slot.* = @bitCast(@as(u128, @as(u64, @bitCast(v))));
 }
 
-// One partition of the cross-worker distinct merge: for each distinct
-// aggregate, union column `part` of every worker into a fresh set; a first
-// sighting bumps the owning group's count in this job's private key→count
-// table. Partitions are disjoint by key-hash, so no locks and counts sum.
+// One thread of the distinct merge. For each distinct aggregate it bumps group
+// counts in its private key→count table: a shared set's partitions are claimed
+// until none are left and each composite counts toward its key; a string
+// input's worker partition `part` is unioned across workers, counting first
+// sightings. Partitions are disjoint, so no locks and counts sum.
 const PartMergeJob = struct {
     part: usize,
     dop_parts: usize,
     workers: []Worker,
     aggs: []const AggPlan,
-    n_distinct: u16,
+    shared: []const ?SharedDistinct,
+    n_groups: usize,
     allocator: Allocator,
-    cpu: ?usize,
     counts: []CountSlotTable,
     // merged gid → packed key: a string set holds worker gids, which each
     // worker's `mgid_of` lifts to merged gids before the union.
@@ -1293,53 +1272,26 @@ fn partMergeRun(job: *PartMergeJob) !void {
             try mergeStrPartition(job, d);
             continue;
         }
-        var out: DistinctSet = .{};
-        out.configure(a.tier);
-        defer out.deinit(job.allocator);
-        var total: usize = 0;
-        for (job.workers) |*w| total += @intCast(w.state.dsets[d * job.dop_parts + job.part].count());
-        if (total == 0) continue;
-        try out.ensureForBatch(job.allocator, total);
-        const cnt = &job.counts[d];
-        for (job.workers) |*w| {
-            try mergeSetInto(job.allocator, &out, &w.state.dsets[d * job.dop_parts + job.part], cnt, a.value_bits);
+        switch (job.shared[d].?) {
+            inline else => |set| try countSharedPartitions(job, set, &job.counts[d], a.value_bits),
         }
     }
 }
 
-// Union `src` into `out`, bumping `cnt[key]` for each first-ever composite
-// (key = composite >> value_bits). Iterates the tier's raw slots; the one
-// composite equal to the tier sentinel is carried by `has_sentinel` and
-// re-materializes as the all-ones composite, whose key bits extract the same.
-fn mergeSetInto(allocator: Allocator, out: *DistinctSet, src: *const DistinctSet, cnt: *CountSlotTable, value_bits: u8) !void {
-    switch (src.store) {
-        .u32 => |s| {
-            for (s.slots) |k| {
-                if (k != group_table.DistinctU32Set.SENTINEL) try mergeOne(allocator, out, @as(u128, k), cnt, value_bits);
-            }
-            if (s.has_sentinel) try mergeOne(allocator, out, @as(u128, group_table.DistinctU32Set.SENTINEL), cnt, value_bits);
-        },
-        .u64 => |s| {
-            for (s.slots) |k| {
-                if (k != group_table.DistinctU64Set.SENTINEL) try mergeOne(allocator, out, @as(u128, k), cnt, value_bits);
-            }
-            if (s.has_sentinel) try mergeOne(allocator, out, @as(u128, group_table.DistinctU64Set.SENTINEL), cnt, value_bits);
-        },
-        .u96 => |s| {
-            for (s.slots) |k| {
-                if (!k.eql(group_table.DistinctU96Set.SENTINEL)) {
-                    const comp = @as(u128, k.w0) | (@as(u128, k.w1) << 32) | (@as(u128, k.w2) << 64);
-                    try mergeOne(allocator, out, comp, cnt, value_bits);
-                }
-            }
-            if (s.has_sentinel) try mergeOne(allocator, out, (@as(u128, 1) << 96) - 1, cnt, value_bits);
-        },
-        .u128 => |s| {
-            for (s.slots) |k| {
-                if (k != group_table.DistinctU128Set.SENTINEL) try mergeOne(allocator, out, k, cnt, value_bits);
-            }
-            if (s.has_sentinel) try mergeOne(allocator, out, group_table.DistinctU128Set.SENTINEL, cnt, value_bits);
-        },
+// Every producer has finished, so each claimed partition is final once
+// drained. The one composite equal to the set's sentinel is carried by
+// `has_sentinel`; its key bits extract like any other composite's.
+fn countSharedPartitions(job: *PartMergeJob, shared: anytype, cnt: *CountSlotTable, value_bits: u8) !void {
+    const Shared = @TypeOf(shared.*);
+    const shift: u7 = @intCast(value_bits);
+    var spare: Shared.Spare = .{};
+    while (try shared.drainNext(&spare)) |set| {
+        if (set.count() == 0) continue;
+        try cnt.ensureFor(job.allocator, @min(set.count(), job.n_groups -| cnt.len));
+        for (set.slots) |k| {
+            if (k != Shared.Set.SENTINEL) cnt.insert(@truncate(@as(u128, k) >> shift));
+        }
+        if (set.has_sentinel) cnt.insert(@truncate(@as(u128, Shared.Set.SENTINEL) >> shift));
     }
 }
 
@@ -1387,13 +1339,6 @@ fn mergeStrPartition(job: *PartMergeJob, d: usize) !void {
                 cnt.insert(@intCast(job.merged_keys[mgid]));
             }
         }
-    }
-}
-
-inline fn mergeOne(allocator: Allocator, out: *DistinctSet, composite: u128, cnt: *CountSlotTable, value_bits: u8) !void {
-    if (out.insertNewBatch(composite)) {
-        try cnt.ensureFor(allocator, 1);
-        cnt.insert(@truncate(composite >> @intCast(value_bits)));
     }
 }
 
@@ -1550,7 +1495,7 @@ const LowCardGroup = struct {
 
     pub fn explain(self: *LowCardGroup, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         try exec.explainIndent(out, allocator, depth);
-        try out.appendSlice(allocator, "HashAggregate (V2 lowcard direct: private-fold/partition-merge");
+        try out.appendSlice(allocator, "HashAggregate (V2 lowcard direct: private-fold/partition-first distinct");
         var sep: []const u8 = "; distinct ";
         for (self.aggs) |a| {
             if (a.op != .count_distinct) continue;
@@ -1635,6 +1580,21 @@ const LowCardGroup = struct {
         var tiles = try RowGroupTiles.init(allocator, total_rgs, surviving_mask, n_workers, TILE_RGS);
         defer tiles.deinit(allocator);
 
+        // One shared set per int/float/coded COUNT(DISTINCT), which every
+        // worker feeds through its own producer. Declared before the workers
+        // so they are torn down first.
+        const shared = try allocator.alloc(?SharedDistinct, self.n_distinct);
+        defer allocator.free(shared);
+        @memset(shared, null);
+        defer destroyShared(allocator, shared, n_workers);
+        for (self.aggs) |a| {
+            if (a.op != .count_distinct or a.distinct_kind == .string) continue;
+            shared[a.distinct_index] = switch (a.tier) {
+                .u32, .u64 => .{ .narrow = try NarrowDistinct.create(allocator) },
+                .u96, .u128 => .{ .wide = try WideDistinct.create(allocator) },
+            };
+        }
+
         const workers = try allocator.alloc(Worker, n_workers);
         defer allocator.free(workers);
         var built: usize = 0;
@@ -1666,7 +1626,7 @@ const LowCardGroup = struct {
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .source = source,
-                .state = try WState.init(allocator, @intCast(self.est_groups), self.aggs, self.n_distinct, n_workers),
+                .state = try WState.init(allocator, @intCast(self.est_groups), shared, n_workers),
                 .parts = self.parts[0..self.part_count],
                 .dicts = self.dicts,
                 .distinct_dicts = self.distinct_dicts,
@@ -1707,7 +1667,7 @@ const LowCardGroup = struct {
         var merged: Merged = .{ .table = try GroupTable.init(allocator, @intCast(self.est_groups)) };
         errdefer merged.deinit(allocator);
         try self.mergeScalars(workers, &merged);
-        try self.mergeDistinct(workers, n_workers, layout.order, &merged);
+        try self.mergeDistinct(workers, n_workers, shared, &merged);
         return merged;
     }
 
@@ -1774,13 +1734,16 @@ const LowCardGroup = struct {
         }
     }
 
-    fn mergeDistinct(self: *LowCardGroup, workers: []Worker, n_workers: usize, cpus: []const usize, merged: *Merged) !void {
+    fn mergeDistinct(self: *LowCardGroup, workers: []Worker, n_workers: usize, shared: []const ?SharedDistinct, merged: *Merged) !void {
         const allocator = self.allocator;
         if (self.n_distinct == 0) return;
         const n_groups = merged.counts.items.len;
         merged.dcounts = try allocator.alloc(u64, n_groups * self.n_distinct);
         @memset(merged.dcounts, 0);
         if (n_groups == 0) return;
+        for (workers) |*w| for (w.state.producers) |*slot| if (slot.*) |*producer| switch (producer.*) {
+            inline else => |*prod| prod.finish(),
+        };
 
         const jobs = try allocator.alloc(PartMergeJob, n_workers);
         defer allocator.free(jobs);
@@ -1796,9 +1759,9 @@ const LowCardGroup = struct {
                 .dop_parts = n_workers,
                 .workers = workers,
                 .aggs = self.aggs,
-                .n_distinct = self.n_distinct,
+                .shared = shared,
+                .n_groups = n_groups,
                 .allocator = allocator,
-                .cpu = if (cpus.len == 0) null else cpus[p % cpus.len],
                 .counts = count_tables[p * self.n_distinct ..][0..self.n_distinct],
                 .merged_keys = merged.keys.items,
             };
@@ -1929,6 +1892,21 @@ const LowCardGroup = struct {
         }
     }
 };
+
+// A high-cardinality input's sets run to hundreds of MiB; with an accountant
+// the frees are collected so the query stops being charged here, and detached
+// threads hand the memory back off the result path.
+fn destroyShared(allocator: Allocator, shared: []const ?SharedDistinct, n_threads: usize) void {
+    const deferred = exec.memory.accountantOf(allocator) != null;
+    var frees = exec.memory.DeferredFrees.init(n_threads);
+    if (deferred) frees.collect();
+    for (shared) |slot| if (slot) |s| switch (s) {
+        inline else => |set| set.destroy(),
+    };
+    if (!deferred) return;
+    frees.stop();
+    frees.releaseDetached();
+}
 
 fn addDistinctCount(merged: *Merged, n_distinct: u16, d: usize, key: u64, count: u64) !void {
     const probe = merged.table.getOrPut(GroupTable.hashKey(key), key);

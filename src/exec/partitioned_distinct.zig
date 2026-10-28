@@ -204,14 +204,14 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             return !drained_any;
         }
 
-        /// Drain the next partition once every producer has finished; false
-        /// when none are left. Any number of threads may call it, each with
-        /// its own `spare`.
-        pub fn drainNext(self: *Self, spare: *Spare) !bool {
+        /// Drain the next partition once every producer has finished and
+        /// return its now-final set; null when none are left. Any number of
+        /// threads may call it, each with its own `spare`.
+        pub fn drainNext(self: *Self, spare: *Spare) !?*const Set {
             const p = self.final_cursor.fetchAdd(1, .monotonic);
-            if (p >= PARTITIONS) return false;
+            if (p >= PARTITIONS) return null;
             _ = try self.drain(p, spare);
-            return true;
+            return &self.partitions[p].set;
         }
 
         pub fn count(self: *const Self) u64 {
@@ -327,7 +327,7 @@ test "partitioned distinct counts exactly through budget drains" {
         try reference.put(std.math.maxInt(Key), {});
         for (&producers) |*p| p.finish();
         var spare: PD.Spare = .{};
-        while (try pd.drainNext(&spare)) {}
+        while (try pd.drainNext(&spare)) |_| {}
         try std.testing.expectEqual(@as(u64, reference.count()), pd.count());
     }
 }
@@ -349,7 +349,7 @@ test "partitioned distinct is exact with concurrent producers and drains" {
             while (shared.drainNext(&spare) catch |e| {
                 err.* = e;
                 return;
-            }) {}
+            }) |_| {}
         }
     };
     // Four overlapping ranges of 50_000 starting 20_000 apart: 110_000 values.
