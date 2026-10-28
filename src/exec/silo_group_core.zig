@@ -6619,7 +6619,10 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
 
 pub const RunConfig = struct {
     dop: usize,
+    // The default bucket count, which a run expecting many groups raises (see
+    // bucketCountForGroups) unless `bucket_count_set` pins it.
     bucket_count: usize,
+    bucket_count_set: bool = false,
     // The view of the table the run reads. The caller captures it under the
     // table's shared ddl_lock and keeps both until it has resolved the rowrefs
     // the run returns, which index this snapshot's segments and memtable.
@@ -6724,7 +6727,7 @@ fn estimateGroupCountFromStats(stats: thindb.exec.PipelineStats, schema: []const
     return @min(est, @max(stats.upper_rows, 1));
 }
 
-fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec, generic_key_width: GroupKeyWidth, generic_has_filter: bool) usize {
+fn expectedTotalGroups(total_rows: u64, stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec, generic_key_width: GroupKeyWidth, generic_has_filter: bool) u64 {
     const conservative_total = @max(@as(u64, 16), total_rows / 4);
     const generic_key_count = key_columns.len;
     const estimated_total = estimateGroupCountFromStats(stats, schema, key_columns) orelse conservative_total;
@@ -6737,7 +6740,7 @@ fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.e
     // input also bounds the speculative reservation; real groups can grow
     // beyond every hint without changing the aggregation algorithm.
     const filtered_init_cap: u64 = 2 * 1024 * 1024;
-    const total_groups = if (generic_wide_no_filter)
+    return if (generic_wide_no_filter)
         total_rows
     else if (no_filter_near_unique)
         estimated_total
@@ -6745,8 +6748,27 @@ fn expectedGroupsPerBucket(total_rows: u64, bucket_count: usize, stats: thindb.e
         @min(@min(estimated_total, conservative_total), filtered_init_cap)
     else
         @min(estimated_total, conservative_total);
+}
+
+fn expectedGroupsPerBucket(total_groups: u64, bucket_count: usize) usize {
     const per_bucket = (total_groups + @as(u64, @intCast(bucket_count)) - 1) / @as(u64, @intCast(bucket_count));
     return @intCast(@max(@as(u64, 16), per_bucket));
+}
+
+// Each bucket's group table is probed at random, so past roughly
+// GROUPS_PER_BUCKET groups its probes leave the core's cache. More buckets keep
+// the tables small, but each adds a route block per worker to the scatter, so
+// the count grows from the default only as the expected groups demand.
+// Measured on 100M ClickBench rows at 16 workers: WatchID,ClientIP (100M
+// groups) 1.25 s at 256 buckets, 1.06 s at 1024; URL (18M groups) lost 3% at
+// 1024 and 12% at 2048.
+const GROUPS_PER_BUCKET: u64 = 100_000;
+const MAX_AUTO_BUCKETS: usize = 1024;
+
+fn bucketCountForGroups(default_count: usize, total_groups: u64) usize {
+    if (default_count >= MAX_AUTO_BUCKETS) return default_count;
+    const wanted = std.math.ceilPowerOfTwo(u64, @max(@as(u64, 1), total_groups / GROUPS_PER_BUCKET)) catch MAX_AUTO_BUCKETS;
+    return @intCast(std.math.clamp(wanted, default_count, MAX_AUTO_BUCKETS));
 }
 
 fn chooseGridChunkRows(cfg_chunk_rows: usize, chunk_rows_set: bool) usize {
@@ -6860,15 +6882,18 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // Partitioning only pays when workers fold buckets in parallel; a lone
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
+    const total_groups = expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null);
     const bucket_count = if (serial_fold)
         1
     else if (small_input)
         @min(cfg.bucket_count, @max(@as(usize, 4), n_workers))
+    else if (cfg.bucket_count_set)
+        cfg.bucket_count
     else
-        cfg.bucket_count;
+        bucketCountForGroups(cfg.bucket_count, total_groups);
     const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
 
-    const expected_groups_per_bucket = expectedGroupsPerBucket(total, bucket_count, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null);
+    const expected_groups_per_bucket = expectedGroupsPerBucket(total_groups, bucket_count);
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else

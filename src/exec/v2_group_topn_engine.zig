@@ -492,6 +492,7 @@ pub const Shape = struct {
 pub const Params = struct {
     dop: usize = DEFAULT_DOP,
     bucket_count: usize = DEFAULT_BUCKET_COUNT,
+    bucket_count_set: bool = false,
     scan_tile_rgs: usize = DEFAULT_SCAN_TILE_RGS,
     route_block_rows: usize = DEFAULT_ROUTE_BLOCK_ROWS,
     group_lease_buckets: usize = DEFAULT_GROUP_LEASE_BUCKETS,
@@ -557,6 +558,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
     return .{
         .dop = @max(@as(usize, 1), default_dop),
         .bucket_count = @max(@as(usize, 1), envUsize("THINDB_V2_BUCKET_COUNT", DEFAULT_BUCKET_COUNT)),
+        .bucket_count_set = getenv("THINDB_V2_BUCKET_COUNT") != null,
         .scan_tile_rgs = @max(@as(usize, 1), envUsize("THINDB_V2_SCAN_TILE_RGS", DEFAULT_SCAN_TILE_RGS)),
         .route_block_rows = @max(@as(usize, 1), envUsize("THINDB_V2_ROUTE_BLOCK_ROWS", DEFAULT_ROUTE_BLOCK_ROWS)),
         .group_lease_buckets = @max(@as(usize, 1), envUsize("THINDB_V2_GROUP_LEASE_BUCKETS", DEFAULT_GROUP_LEASE_BUCKETS)),
@@ -917,6 +919,7 @@ fn runHarness(
     try SiloCore.runSiloGrid(allocator, table, cpus, .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
+        .bucket_count_set = params.bucket_count_set,
         .snapshot = snapshot,
         .silo_grid = true,
         .scan_filter = true,
