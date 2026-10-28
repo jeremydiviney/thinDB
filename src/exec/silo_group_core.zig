@@ -1410,7 +1410,12 @@ const StateRef = struct {
 
 const PendingCountUpdates = struct {
     const CAPACITY = 16;
-    const MIN_STATE_BYTES = 2 * 1024 * 1024;
+    // Other buckets fold between a bucket's rounds, so its records only stay
+    // cached from round to round while they fit a core's private cache. At
+    // 2 MiB, buckets of 10K-60K groups took the immediate loop and missed on
+    // most updates (16 threads, 512 KiB L2: GROUP BY ClientIP 0.145 -> 0.131 s,
+    // nothing slower).
+    const MIN_STATE_BYTES = 128 * 1024;
     heads: [CAPACITY]*StateHead = undefined,
     counts: [CAPACITY]u64 = undefined,
     len: usize = 0,
@@ -2173,9 +2178,10 @@ test "group completion waits for a delayed partial before collecting top rows an
     var top = try TopSet.init(allocator, offset + 10);
     defer top.deinit(allocator);
     try collectOwnedTop(&shared, 0, 1, &top, &ticks, false);
-    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
+    try top.sortBestFirst(allocator);
     try std.testing.expectEqual(@as(usize, offset + 10), top.len);
-    for (top.items[offset..top.len], 0..) |row, i| {
+    for (offset..top.len, 0..) |rank, i| {
+        const row = top.rowAt(rank);
         try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
         try std.testing.expectEqual(@as(u64, group_count - offset - i), row.count);
     }
@@ -3449,15 +3455,21 @@ pub const EmitFilter = struct {
 };
 
 // The caller's final ORDER BY for an all-groups emit followed by a LIMIT the
-// in-core count-desc top-N can't serve. `before` must be a total order (ties
-// broken on the group key), so the overall best `keep` groups are among the
-// best `keep` of any partition of the groups, and the emit returns only those
-// of each fill worker's bucket range. The caller (the pipeline) owns the
-// context and still takes its final top rows from what the emit returns.
+// in-core count-desc top-N can't serve. Unless `ties` is set, `before` must be
+// a total order (ties broken on the group key), so the overall best `keep`
+// groups are among the best `keep` of any partition of the groups, and the
+// emit returns only those of each fill worker's bucket range. The caller (the
+// pipeline) owns the context and still takes its final top rows from what the
+// emit returns.
 pub const EmitRank = struct {
     ctx: ?*anyopaque,
     before: *const fn (?*anyopaque, TopRow, TopRow) bool,
     keep: usize,
+    // `before` orders only a prefix of the result order (the rest needs key
+    // bytes the core doesn't hold), so groups may tie on it. The emit then
+    // returns every group no worse than the keep-th best, ties at the cut
+    // included, for the caller to finish the order on.
+    ties: bool = false,
 };
 
 const ALL_GROUPS_FILL_ROWS_PER_WORKER: usize = 65536;
@@ -3538,11 +3550,13 @@ fn fillAllGroupRows(buckets: []PipeBucket, dst: []TopRow) void {
     std.debug.assert(pos == dst.len);
 }
 
-/// Numeric ranked result (no string/UDAF payload, no cap): up to `n_workers`
+/// Ranked result (no UDAF or GROUP_CONCAT payload, no cap): up to `n_workers`
 /// threads each keep the best `rank.keep` groups of a disjoint bucket range
 /// that pass `filter`, so only workers × keep rows reach the caller's final
-/// selection, which would otherwise walk every group on one thread.
-fn emitRankedGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.ArrayListUnmanaged(TopRow), n_workers: usize, filter: ?EmitFilter, rank: EmitRank) !void {
+/// selection, which would otherwise walk every group on one thread. With
+/// `rank.ties` those rows only fix the cut, and a second sweep returns every
+/// group no worse than it.
+fn emitRankedGroups(allocator: Allocator, buckets: []PipeBucket, out: *std.ArrayListUnmanaged(TopRow), n_workers: usize, filter: ?EmitFilter, rank: EmitRank, comptime with_str: bool) !void {
     const cum = try bucketGroupOffsets(allocator, buckets);
     defer allocator.free(cum);
     const total = cum[buckets.len];
@@ -3560,18 +3574,68 @@ fn emitRankedGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *st
         jobs_ready += 1;
         b_start = b_end;
     }
-    if (workers <= 1) {
-        rankedFillWorker(&jobs[0]);
-    } else {
-        const threads = try allocator.alloc(?std.Thread, workers);
-        defer allocator.free(threads);
-        for (jobs, threads) |*job, *t| {
-            t.* = std.Thread.spawn(.{}, rankedFillWorker, .{job}) catch null;
-            if (t.* == null) rankedFillWorker(job);
+    try runRankedJobs(allocator, jobs, rankedFillWorker, with_str);
+    var kept: usize = 0;
+    for (jobs) |job| kept += job.set.len;
+    // Under `keep` rows kept means every worker kept all of its groups.
+    if (!rank.ties or kept < rank.keep) {
+        try out.ensureUnusedCapacity(allocator, kept);
+        for (jobs) |job| {
+            for (job.set.items[0..job.set.len]) |row| try appendRankedRow(allocator, out, row, with_str);
         }
-        for (threads) |t| if (t) |th| th.join();
+        return;
     }
-    for (jobs) |*job| try out.appendSlice(allocator, job.set.items[0..job.set.len]);
+
+    // The cut is the keep-th best kept row. A group strictly before it was
+    // kept by its worker (else that worker alone kept `keep` rows before it,
+    // and the cut would be better still); a group tied with it may have lost
+    // its worker's tie, so the sweep below takes every group no worse.
+    const cut_items = try allocator.alloc(TopRow, rank.keep);
+    defer allocator.free(cut_items);
+    var best: RankedSet = .{ .items = cut_items, .ctx = rank.ctx, .before = rank.before };
+    for (jobs) |job| {
+        for (job.set.items[0..job.set.len]) |row| best.consider(row);
+    }
+    for (jobs) |*job| job.cut = best.items[0];
+    try runRankedJobs(allocator, jobs, rankedCutCountWorker, with_str);
+    var cut_total: usize = 0;
+    for (jobs) |job| cut_total += job.cut_count;
+    const cut_rows = try allocator.alloc(TopRow, cut_total);
+    defer allocator.free(cut_rows);
+    var at: usize = 0;
+    for (jobs) |*job| {
+        job.cut_dst = cut_rows[at .. at + job.cut_count];
+        at += job.cut_count;
+    }
+    try runRankedJobs(allocator, jobs, rankedCutFillWorker, with_str);
+    try out.ensureUnusedCapacity(allocator, cut_total);
+    for (cut_rows) |row| try appendRankedRow(allocator, out, row, with_str);
+}
+
+// Ranked rows borrow their bucket's string bytes; the result owns its copies.
+fn appendRankedRow(allocator: Allocator, out: *std.ArrayListUnmanaged(TopRow), row: TopRow, comptime with_str: bool) !void {
+    var owned = row;
+    if (with_str) try ownTopRowStr(&owned, allocator);
+    out.appendAssumeCapacity(owned);
+}
+
+fn runRankedJobs(allocator: Allocator, jobs: []RankedFillJob, comptime work: anytype, comptime with_str: bool) !void {
+    const run = struct {
+        fn run(job: *RankedFillJob) void {
+            work(job, with_str);
+        }
+    }.run;
+    if (jobs.len <= 1) {
+        for (jobs) |*job| run(job);
+        return;
+    }
+    const threads = try allocator.alloc(?std.Thread, jobs.len);
+    defer allocator.free(threads);
+    for (jobs, threads) |*job, *t| {
+        t.* = std.Thread.spawn(.{}, run, .{job}) catch null;
+        if (t.* == null) run(job);
+    }
+    for (threads) |t| if (t) |th| th.join();
 }
 
 // Ranking pays while each fill worker keeps under half the groups of its
@@ -3582,17 +3646,63 @@ fn rankPays(keep: usize, total_groups: u64, n_workers: usize) bool {
     return (keep *| 2) *| fillWorkerCount(n_workers, total) < total;
 }
 
-const RankedFillJob = struct { buckets: []PipeBucket, filter: ?EmitFilter, set: RankedSet };
+const RankedFillJob = struct {
+    buckets: []PipeBucket,
+    filter: ?EmitFilter,
+    set: RankedSet,
+    // The tie sweep: groups no worse than `cut`, counted, then copied.
+    cut: TopRow = .{ .key = 0 },
+    cut_count: usize = 0,
+    cut_dst: []TopRow = &.{},
 
-fn rankedFillWorker(job: *RankedFillJob) void {
+    // Inline and unwrapped: these run once per group, and a TopRow is a few
+    // hundred bytes to copy.
+    inline fn rowAt(bucket: *PipeBucket, gid: usize, comptime with_str: bool) TopRow {
+        const ref = bucket.states.ref(gid);
+        return if (with_str) topRowFromStateStr(ref, bucket.str_states.items[gid]) else topRowFromState(ref);
+    }
+
+    inline fn passes(job: *const RankedFillJob, r: TopRow) bool {
+        const f = job.filter orelse return true;
+        return f.pass(f.ctx, r);
+    }
+
+    inline fn withinCut(job: *const RankedFillJob, r: TopRow) bool {
+        return job.passes(r) and !job.set.before(job.set.ctx, job.cut, r);
+    }
+};
+
+fn rankedFillWorker(job: *RankedFillJob, comptime with_str: bool) void {
     for (job.buckets) |*bucket| {
         var gid: usize = 0;
         while (gid < bucket.states.len) : (gid += 1) {
-            const row = topRowFromState(bucket.states.ref(gid));
-            if (job.filter) |f| if (!f.pass(f.ctx, row)) continue;
-            job.set.consider(row);
+            const r = RankedFillJob.rowAt(bucket, gid, with_str);
+            if (job.passes(r)) job.set.consider(r);
         }
     }
+}
+
+fn rankedCutCountWorker(job: *RankedFillJob, comptime with_str: bool) void {
+    for (job.buckets) |*bucket| {
+        var gid: usize = 0;
+        while (gid < bucket.states.len) : (gid += 1) {
+            if (job.withinCut(RankedFillJob.rowAt(bucket, gid, with_str))) job.cut_count += 1;
+        }
+    }
+}
+
+fn rankedCutFillWorker(job: *RankedFillJob, comptime with_str: bool) void {
+    var pos: usize = 0;
+    for (job.buckets) |*bucket| {
+        var gid: usize = 0;
+        while (gid < bucket.states.len) : (gid += 1) {
+            const r = RankedFillJob.rowAt(bucket, gid, with_str);
+            if (!job.withinCut(r)) continue;
+            job.cut_dst[pos] = r;
+            pos += 1;
+        }
+    }
+    std.debug.assert(pos == job.cut_dst.len);
 }
 
 /// The best `items.len` rows under `before` (see EmitRank), kept like TopSet
@@ -3666,39 +3776,54 @@ fn ownTopRowStr(row: *TopRow, allocator: Allocator) !void {
     }
 }
 
-fn better(a: TopRow, b: TopRow) bool {
-    if (a.count != b.count) return a.count > b.count;
-    return a.key < b.key;
-}
-
-fn worse(a: TopRow, b: TopRow) bool {
-    if (a.count != b.count) return a.count < b.count;
-    return a.key > b.key;
-}
-
 // Bounded top-K set, sized at runtime from the query's LIMIT+OFFSET. Kept as
 // a binary heap rooted at the WORST retained row, so the common case — a
 // candidate that doesn't make the cut — is a single comparison against the
 // root, and a replacement costs O(log k) instead of the O(k) worst-rescan the
-// old fixed-10 array paid.
+// old fixed-10 array paid. The heap and the final sort move 32-byte ranks,
+// not rows: a TopRow carries every aggregate slot inline (over 200 bytes),
+// and at OFFSET-sized k moving rows took most of a small query's time.
 const TopSet = struct {
     items: []TopRow = &.{},
+    ranks: []Rank = &.{},
     len: usize = 0,
 
+    const Rank = struct {
+        key: u128,
+        count: u64,
+        slot: u32,
+
+        fn of(row: TopRow, slot: usize) Rank {
+            return .{ .key = row.key, .count = row.count, .slot = @intCast(slot) };
+        }
+
+        fn better(a: Rank, b: Rank) bool {
+            if (a.count != b.count) return a.count > b.count;
+            return a.key < b.key;
+        }
+
+        fn before(_: void, a: Rank, b: Rank) bool {
+            return better(a, b);
+        }
+    };
+
     fn init(allocator: Allocator, k: usize) !TopSet {
-        return .{ .items = try allocator.alloc(TopRow, k) };
+        const items = try allocator.alloc(TopRow, k);
+        errdefer allocator.free(items);
+        return .{ .items = items, .ranks = try allocator.alloc(Rank, k) };
     }
 
     fn deinit(self: *TopSet, allocator: Allocator) void {
         allocator.free(self.items);
+        allocator.free(self.ranks);
         self.* = .{};
     }
 
     fn consider_state(self: *TopSet, state: StateRef) void {
         if (self.items.len == 0) return;
         if (self.len == self.items.len) {
-            const worst_row = self.items[0];
-            if (state.head.count < worst_row.count or (state.head.count == worst_row.count and state.head.key >= worst_row.key)) return;
+            const worst = self.ranks[0];
+            if (state.head.count < worst.count or (state.head.count == worst.count and state.head.key >= worst.key)) return;
         }
         self.consider(topRowFromState(state));
     }
@@ -3707,34 +3832,44 @@ const TopSet = struct {
         if (self.len < self.items.len) {
             var i = self.len;
             self.items[i] = cand;
+            self.ranks[i] = Rank.of(cand, i);
             self.len += 1;
             while (i > 0) {
                 const parent = (i - 1) / 2;
-                if (!worse(self.items[i], self.items[parent])) break;
-                std.mem.swap(TopRow, &self.items[i], &self.items[parent]);
+                if (!Rank.better(self.ranks[parent], self.ranks[i])) break;
+                std.mem.swap(Rank, &self.ranks[i], &self.ranks[parent]);
                 i = parent;
             }
             return;
         }
-        if (self.items.len == 0 or !better(cand, self.items[0])) return;
-        self.items[0] = cand;
+        if (self.items.len == 0) return;
+        const rank = Rank.of(cand, self.ranks[0].slot);
+        if (!Rank.better(rank, self.ranks[0])) return;
+        self.items[rank.slot] = cand;
+        self.ranks[0] = rank;
         var i: usize = 0;
         while (true) {
             const left = 2 * i + 1;
             const right = left + 1;
             var w = i;
-            if (left < self.len and worse(self.items[left], self.items[w])) w = left;
-            if (right < self.len and worse(self.items[right], self.items[w])) w = right;
+            if (left < self.len and Rank.better(self.ranks[w], self.ranks[left])) w = left;
+            if (right < self.len and Rank.better(self.ranks[w], self.ranks[right])) w = right;
             if (w == i) break;
-            std.mem.swap(TopRow, &self.items[i], &self.items[w]);
+            std.mem.swap(Rank, &self.ranks[i], &self.ranks[w]);
             i = w;
         }
     }
-};
 
-fn topLess(_: void, a: TopRow, b: TopRow) bool {
-    return better(a, b);
-}
+    /// Order the ranks best first. Call it after the last `consider`: the set
+    /// is no longer a heap. `rowAt(i)` is then the i-th best row.
+    fn sortBestFirst(self: *TopSet, allocator: Allocator) !void {
+        try thindb.exec.memory.sort(Rank, self.ranks[0..self.len], {}, allocator, Rank.before);
+    }
+
+    fn rowAt(self: *const TopSet, i: usize) TopRow {
+        return self.items[self.ranks[i].slot];
+    }
+};
 
 fn totalRows(snap: Scan.Snapshot) u64 {
     var n: u64 = snap.memtable_row_count;
@@ -7410,7 +7545,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             top.consider(candidate);
         }
     }
-    try thindb.exec.memory.sort(TopRow, top.items[0..top.len], {}, allocator, topLess);
+    try top.sortBestFirst(allocator);
     const final_merge_ticks = platform.nowTicks() - final_t0;
     const total_ticks = platform.nowTicks() - total_t0;
     const function_ticks = platform.nowTicks() - function_t0;
@@ -7423,9 +7558,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             const cap = cfg.result_all_groups_cap;
             const filter = cfg.result_emit_filter;
             const numeric = !has_str_out and !has_udf_out and cap == 0;
-            const rank: ?EmitRank = if (cfg.result_rank) |r| (if (numeric and rankPays(r.keep, group_count, n_workers)) r else null) else null;
+            // String MIN/MAX results rank from the bucket's bytes; UDAF and
+            // GROUP_CONCAT results finalize per group, so they emit every group.
+            const rankable = !has_udf_out and !cfg.group_rows_layout.has_concat and cap == 0;
+            const rank: ?EmitRank = if (cfg.result_rank) |r| (if (rankable and rankPays(r.keep, group_count, n_workers)) r else null) else null;
             const numeric_uncapped = numeric and filter == null and rank == null;
-            if (rank) |r| try emitRankedGroupsNumeric(allocator, buckets, out, n_workers, filter, r);
+            if (rank) |r| {
+                if (has_str_out) try emitRankedGroups(allocator, buckets, out, n_workers, filter, r, true) else try emitRankedGroups(allocator, buckets, out, n_workers, filter, r, false);
+            }
             if (numeric_uncapped) try emitAllGroupsNumeric(allocator, buckets, out, n_workers);
             emit_all: for (buckets) |*bucket| {
                 if (numeric_uncapped or rank != null) break;
@@ -7458,8 +7598,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             // The merged top-N rows borrow each survivor's bucket str bytes (and
             // already carry finalized UDAF slots from collectOwnedTop); re-dup
             // the str bytes into the result allocator so they survive teardown.
-            for (top.items[0..top.len]) |cand| {
-                var row = cand;
+            for (0..top.len) |rank_index| {
+                var row = top.rowAt(rank_index);
                 if (has_str_out) try ownTopRowStr(&row, allocator);
                 try out.append(allocator, row);
             }

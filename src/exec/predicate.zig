@@ -216,6 +216,164 @@ pub const ColColPred = struct {
     right: []const u8,
 };
 
+/// A 128-bit digest of `expr`, equal for two predicates exactly when they
+/// select the same rows of the same stored values. AND and OR digest as the
+/// multiset of their arms with nested arms of the same connective flattened
+/// in, so arm order and grouping never split a digest. Null when `expr` holds
+/// a variant whose rows this cannot pin down: an unresolved subquery or
+/// variable, a correlated set, a day comparison, or an IN-list carrying a
+/// subquery's column type. Column names hash case-folded, as they resolve.
+/// Past `digest_budget` nodes and set values it declines too, which bounds
+/// its cost per call.
+pub fn digest(expr: PredicateExpr) ?u128 {
+    var budget: usize = digest_budget;
+    return nodeDigest(expr, &budget);
+}
+
+/// The digests of `expr`'s top-level AND arms (nested ANDs flattened; `expr`
+/// itself when it is no AND), in order, written to `out` until it is full.
+/// Arms `digest` declines are left out. Returns how many were written.
+pub fn conjunctDigests(expr: PredicateExpr, out: []u128) usize {
+    var n: usize = 0;
+    collectConjunctDigests(expr, out, &n);
+    return n;
+}
+
+fn collectConjunctDigests(expr: PredicateExpr, out: []u128, n: *usize) void {
+    switch (expr) {
+        .@"and" => |arms| for (arms) |arm| collectConjunctDigests(arm, out, n),
+        else => if (n.* < out.len) if (digest(expr)) |d| {
+            out[n.*] = d;
+            n.* += 1;
+        },
+    }
+}
+
+const digest_budget = 4096;
+
+// `Digest` hashes every field of these. A field it skipped could let two
+// predicates that select different rows share one digest, so a new field
+// stops the build until the digest takes it in.
+comptime {
+    for (.{ .{ Predicate, 5 }, .{ LikePred, 2 }, .{ ColColPred, 3 }, .{ InSet, 5 } }) |known| {
+        if (@typeInfo(known[0]).@"struct".fields.len != known[1])
+            @compileError(@typeName(known[0]) ++ " changed: hash the new field in predicate.Digest, then update its count here");
+    }
+    for (@typeInfo(Value).@"union".fields) |f| switch (@typeInfo(f.type)) {
+        .int, .float, .bool => {},
+        else => if (!std.mem.eql(u8, f.name, "text"))
+            @compileError("Value." ++ f.name ++ " is no plain number: teach predicate.Digest.value to hash it"),
+    };
+}
+
+fn nodeDigest(expr: PredicateExpr, budget: *usize) ?u128 {
+    if (budget.* == 0) return null;
+    budget.* -= 1;
+    var d: Digest = .{};
+    d.int(@intFromEnum(std.meta.activeTag(expr)));
+    switch (expr) {
+        .leaf, .text_as_number => |p| d.leaf(p),
+        .leaf_col_col => |c| {
+            d.column(c.left);
+            d.int(@intFromEnum(c.op));
+            d.column(c.right);
+        },
+        .is_null, .is_not_null => |c| d.column(c),
+        .like => |l| {
+            d.column(l.col);
+            d.text(l.pattern);
+        },
+        .@"and", .@"or" => |arms| {
+            var sum: ArmSum = .{};
+            if (!sum.add(std.meta.activeTag(expr), arms, budget)) return null;
+            if (sum.count == 1) return sum.sum;
+            d.int(sum.count);
+            d.int(sum.sum);
+        },
+        .not => |c| d.int(nodeDigest(c.*, budget) orelse return null),
+        .in_set, .text_as_number_set => |s| {
+            if (s.value_type != null or s.values.len > budget.*) return null;
+            budget.* -= s.values.len;
+            d.column(s.col);
+            d.int(@intFromBool(s.negate));
+            d.int(@intFromBool(s.rows));
+            d.int(@as(u64, s.values.len));
+            for (s.values) |v| d.value(v);
+        },
+        .always => |b| d.int(@intFromBool(b)),
+        .unknown => {},
+        .day_leaf, .scalar_subquery, .exists_subquery, .in_subquery, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var => return null,
+    }
+    return d.final();
+}
+
+/// Wrapping sum of a connective's arm digests: addition commutes, so the
+/// sum is the same in any arm order.
+const ArmSum = struct {
+    sum: u128 = 0,
+    count: u64 = 0,
+
+    fn add(self: *ArmSum, connective: std.meta.Tag(PredicateExpr), arms: []const PredicateExpr, budget: *usize) bool {
+        for (arms) |arm| {
+            const same_connective: ?[]const PredicateExpr = switch (arm) {
+                .@"and", .@"or" => |inner| if (std.meta.activeTag(arm) == connective) inner else null,
+                else => null,
+            };
+            if (same_connective) |inner| {
+                if (!self.add(connective, inner, budget)) return false;
+                continue;
+            }
+            self.sum +%= nodeDigest(arm, budget) orelse return false;
+            self.count += 1;
+        }
+        return true;
+    }
+};
+
+const Digest = struct {
+    lo: std.hash.Wyhash = .init(0x9E37_79B9_7F4A_7C15),
+    hi: std.hash.Wyhash = .init(0xC2B2_AE3D_27D4_EB4F),
+
+    fn final(self: *Digest) u128 {
+        return @as(u128, self.hi.final()) << 64 | self.lo.final();
+    }
+
+    fn bytes(self: *Digest, b: []const u8) void {
+        self.lo.update(b);
+        self.hi.update(b);
+    }
+
+    fn int(self: *Digest, v: anytype) void {
+        self.bytes(std.mem.asBytes(&v));
+    }
+
+    fn text(self: *Digest, s: []const u8) void {
+        self.int(@as(u64, s.len));
+        self.bytes(s);
+    }
+
+    fn column(self: *Digest, name: []const u8) void {
+        self.int(@as(u64, name.len));
+        for (name) |c| self.int(std.ascii.toLower(c));
+    }
+
+    fn value(self: *Digest, v: Value) void {
+        self.int(@intFromEnum(std.meta.activeTag(v)));
+        switch (v) {
+            .text => |t| self.text(t),
+            inline else => |x| self.int(x),
+        }
+    }
+
+    fn leaf(self: *Digest, p: Predicate) void {
+        self.column(p.col);
+        self.int(@intFromEnum(p.op));
+        self.value(p.val);
+        self.int(@intFromBool(p.from_statement));
+        self.int(@intFromBool(p.as_boolean));
+    }
+};
+
 /// Whether the predicate references column `name`. CONSERVATIVE: unresolved
 /// or opaque variants (subqueries, correlated sets) answer TRUE — callers
 /// use this to prove a pushdown is safe, so "don't know" must mean "yes".
@@ -1395,11 +1553,19 @@ pub const LikePlan = struct {
                 if (start < pos or !std.mem.eql(u8, text[start..], seg)) return false;
                 pos = text.len;
             } else {
-                const found = findSubstring(text, pos, seg) orelse return false;
+                const found = simd.indexOfSubstringPos(text, pos, seg) orelse return false;
                 pos = found + seg.len;
             }
         }
         return true;
+    }
+
+    /// The segment every match holds at no fixed position: the first, unless
+    /// the pattern is anchored at the start (or has no segment, or needs the
+    /// general matcher).
+    pub fn floatingSegment(self: *const LikePlan) ?[]const u8 {
+        if (self.general or self.empty or self.nseg == 0 or self.anchored_start) return null;
+        return self.segs[0];
     }
 };
 
@@ -1424,23 +1590,73 @@ pub fn compileLike(pattern: []const u8) LikePlan {
     return plan;
 }
 
-/// Find `needle` in `haystack` at or after `start`. Seeds on the first byte
-/// via `indexOfScalarPos` (a vectorized memchr) and confirms the rest with
-/// `eql` — no per-call skip-table setup, which matters when this runs once per
-/// row over millions of rows. Returns the match offset, or null.
-fn findSubstring(haystack: []const u8, start: usize, needle: []const u8) ?usize {
-    if (needle.len == 0) return start;
-    if (needle.len > haystack.len) return null;
-    if (needle.len == 1) return std.mem.indexOfScalarPos(u8, haystack, start, needle[0]);
-    const last = haystack.len - needle.len;
-    var i = start;
-    while (i <= last) {
-        const p = std.mem.indexOfScalarPos(u8, haystack, i, needle[0]) orelse return null;
-        if (p > last) return null;
-        if (std.mem.eql(u8, haystack[p + 1 ..][0 .. needle.len - 1], needle[1..])) return p;
-        i = p + 1;
+/// `mask[i] = (row i [NOT] LIKE plan)` over string rows [0, n): false for a
+/// NULL row and for one `active` already eliminated. A pattern whose first
+/// segment floats (`%seg...`) finds that segment's hits in one search over
+/// the rows' concatenated bytes when most rows are live, and matches the full
+/// pattern only in the rows those hits land in: no per-row search setup, and
+/// the vector steps run straight across row boundaries.
+pub fn likeRows(view: ColumnView, sv: storage.StringView, plan: *const LikePlan, negate: bool, n: usize, mask: []bool, active: ?[]const bool) void {
+    if (plan.floatingSegment()) |seg| {
+        if (mostlyActive(active, n)) {
+            markRowsContaining(sv, n, seg, mask);
+            const decided = plan.nseg == 1 and !plan.anchored_end;
+            for (0..n) |i| {
+                const live = (if (active) |a| a[i] else true) and view.isValid(i);
+                const hit = mask[i] and (decided or plan.match(sv.rowBytes(i)));
+                mask[i] = live and hit != negate;
+            }
+            return;
+        }
     }
-    return null;
+    for (0..n) |i| {
+        const live = (if (active) |a| a[i] else true) and view.isValid(i);
+        mask[i] = live and plan.match(sv.rowBytes(i)) != negate;
+    }
+}
+
+// The whole-block search reads every row's bytes, dead or alive. Under three
+// quarters alive, the extra reads cost more than the per-row setup saved
+// (a `SearchPhrase <> ''`-filtered Title LIKE measured 2% slower at a quarter).
+fn mostlyActive(active: ?[]const bool, n: usize) bool {
+    const a = active orelse return true;
+    var alive: usize = 0;
+    for (a[0..n]) |b| alive += @intFromBool(b);
+    return alive * 4 >= n * 3;
+}
+
+/// `mask[i]` = row i holds `seg`, for rows [0, n): each hit in the rows'
+/// concatenated bytes is credited to the row whose span holds it whole, and
+/// the search resumes at the next row.
+fn markRowsContaining(sv: storage.StringView, n: usize, seg: []const u8, mask: []bool) void {
+    @memset(mask[0..n], false);
+    if (n == 0) return;
+    const offsets = sv.offsets[0 .. n + 1];
+    const bytes = sv.bytes[0..offsets[n]];
+    var pos: usize = offsets[0];
+    var row: usize = 0;
+    while (simd.indexOfSubstringPos(bytes, pos, seg)) |hit| {
+        row = rowHolding(offsets, row, hit);
+        const row_end = offsets[row + 1];
+        if (hit + seg.len <= row_end) {
+            mask[row] = true;
+            pos = row_end;
+        } else {
+            pos = hit + 1;
+        }
+    }
+}
+
+// The row holding byte `at`: the last row from `from` on that starts at or
+// before it. Requires offsets[from] <= at < offsets[last].
+fn rowHolding(offsets: []const u32, from: usize, at: usize) usize {
+    var lo = from;
+    var hi = offsets.len - 1;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (offsets[mid] <= at) lo = mid else hi = mid;
+    }
+    return lo;
 }
 
 /// Evaluate a full boolean predicate over a Batch (typed columns +
@@ -2902,13 +3118,7 @@ pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: [
     // Compile the pattern once per batch, then match each row against the plan.
     const plan = compileLike(pattern);
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
-            if (active) |act| {
-                for (0..n) |i| mask[i] = act[i] and view.isValid(i) and plan.match(sv.rowBytes(i));
-            } else {
-                for (0..n) |i| mask[i] = view.isValid(i) and plan.match(sv.rowBytes(i));
-            }
-        },
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| likeRows(view, sv, &plan, false, n, mask, active),
         else => return Error.UnsupportedOperatorForType,
     }
 }
@@ -3706,4 +3916,101 @@ test "validateExpr raises on a constant no date reads, and drops it from a set" 
     var set: PredicateExpr = .{ .in_set = .{ .col = "d", .values = &values, .negate = false, .value_type = .string } };
     try validateExpr(&set, &schema);
     try t.expectEqualSlices(Value, &.{.{ .date = 20722 }}, set.in_set.values);
+}
+
+test "likeRows: the whole-block segment search agrees with the per-row matcher" {
+    var prng = std.Random.DefaultPrng.init(0x11ce);
+    const rand = prng.random();
+    const n = 300;
+    var bytes: [n * 12]u8 = undefined;
+    var offsets: [n + 1]u32 = undefined;
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    var dense: [n]bool = undefined;
+    var sparse: [n]bool = undefined;
+    var mask: [n]bool = undefined;
+    // A short alphabet and short rows put hits everywhere, including across
+    // row boundaries and in empty rows' neighbours.
+    const patterns = [_][]const u8{ "%ab%", "%abc%", "%a%", "%ab%c%", "%ab", "%cab%ba", "ab%", "%%", "_b%", "%abcab%" };
+    for (0..20) |_| {
+        var at: u32 = 0;
+        for (0..n) |i| {
+            offsets[i] = at;
+            const len = rand.uintLessThan(u32, 13);
+            for (bytes[at..][0..len]) |*b| b.* = "abc"[rand.uintLessThan(usize, 3)];
+            at += len;
+        }
+        offsets[n] = at;
+        rand.bytes(&nulls);
+        for (&dense, &sparse) |*d, *s| {
+            d.* = rand.uintLessThan(u8, 10) != 0;
+            s.* = rand.uintLessThan(u8, 10) == 0;
+        }
+        const sv: storage.StringView = .{ .offsets = &offsets, .bytes = bytes[0..at] };
+        for ([_]?[]const u8{ null, &nulls }) |bitmap| {
+            const view: ColumnView = .{ .data = .{ .varchar = sv }, .nulls = bitmap };
+            for (patterns) |pattern| {
+                const plan = compileLike(pattern);
+                for ([_]?[]const bool{ null, &dense, &sparse }) |active| {
+                    for ([_]bool{ false, true }) |negate| {
+                        for ([_]usize{ 0, 1, 37, n }) |rows| {
+                            likeRows(view, sv, &plan, negate, rows, &mask, active);
+                            for (0..rows) |i| {
+                                const live = (if (active) |a| a[i] else true) and view.isValid(i);
+                                const want = live and like_pattern.match(sv.rowBytes(i), pattern) != negate;
+                                try std.testing.expectEqual(want, mask[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "digest: equal exactly for predicates that select the same rows" {
+    const testing = std.testing;
+    const like: PredicateExpr = .{ .like = .{ .col = "url", .pattern = "%google%" } };
+    const ne: PredicateExpr = .{ .leaf = .{ .col = "phrase", .op = .neq, .val = .{ .text = "" } } };
+    const gt: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .gt, .val = .{ .int = 3 } } };
+    const both = [_]PredicateExpr{ like, ne };
+    const both_upper = [_]PredicateExpr{ .{ .like = .{ .col = "URL", .pattern = "%google%" } }, .{ .leaf = .{ .col = "Phrase", .op = .neq, .val = .{ .text = "" } } } };
+    const swapped = [_]PredicateExpr{ ne, like };
+    const d = digest(.{ .@"and" = &both }).?;
+    try testing.expectEqual(d, digest(.{ .@"and" = &both_upper }).?);
+    try testing.expectEqual(d, digest(.{ .@"and" = &swapped }).?);
+    try testing.expect(d != digest(.{ .@"or" = &both }).?);
+    try testing.expectEqual(digest(.{ .@"or" = &both }).?, digest(.{ .@"or" = &swapped }).?);
+
+    const three = [_]PredicateExpr{ like, ne, gt };
+    const tail = [_]PredicateExpr{ ne, gt };
+    const grouped = [_]PredicateExpr{ like, .{ .@"and" = &tail } };
+    const or_inside = [_]PredicateExpr{ like, .{ .@"or" = &tail } };
+    try testing.expectEqual(digest(.{ .@"and" = &three }).?, digest(.{ .@"and" = &grouped }).?);
+    try testing.expect(digest(.{ .@"and" = &three }).? != digest(.{ .@"and" = &or_inside }).?);
+    try testing.expect(d != digest(.{ .@"and" = &three }).?);
+    try testing.expectEqual(digest(like).?, digest(.{ .@"and" = &.{like} }).?);
+    try testing.expect(digest(.{ .@"and" = &.{} }).? != digest(.{ .@"or" = &.{} }).?);
+
+    try testing.expect(digest(like).? != digest(.{ .like = .{ .col = "url", .pattern = "%google" } }).?);
+    try testing.expect(digest(.{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 1 } } }).? != digest(.{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .bigint = 1 } } }).?);
+    try testing.expect(digest(like).? != digest(.{ .not = &like }).?);
+    try testing.expect(digest(.{ .in_set = .{ .col = "n", .values = &.{.{ .int = 1 }}, .negate = false } }).? != digest(.{ .in_set = .{ .col = "n", .values = &.{.{ .int = 1 }}, .negate = false, .rows = true } }).?);
+
+    try testing.expectEqual(@as(?u128, null), digest(.{ .leaf_var = .{ .col = "n", .op = .eq, .var_name = "v" } }));
+    const with_var = [_]PredicateExpr{ like, .{ .leaf_var = .{ .col = "n", .op = .eq, .var_name = "v" } } };
+    try testing.expectEqual(@as(?u128, null), digest(.{ .@"and" = &with_var }));
+    try testing.expectEqual(@as(?u128, null), digest(.{ .in_set = .{ .col = "n", .values = &.{.{ .int = 1 }}, .negate = false, .value_type = .int } }));
+    var many: [digest_budget]Value = undefined;
+    @memset(&many, .{ .int = 7 });
+    try testing.expectEqual(@as(?u128, null), digest(.{ .in_set = .{ .col = "n", .values = &many, .negate = false } }));
+
+    var arms: [4]u128 = undefined;
+    try testing.expectEqual(@as(usize, 1), conjunctDigests(.{ .@"and" = &with_var }, &arms));
+    try testing.expectEqual(digest(like).?, arms[0]);
+    try testing.expectEqual(@as(usize, 3), conjunctDigests(.{ .@"and" = &grouped }, &arms));
+    try testing.expectEqualSlices(u128, &.{ digest(like).?, digest(ne).?, digest(gt).? }, arms[0..3]);
+    try testing.expectEqual(@as(usize, 2), conjunctDigests(.{ .@"and" = &grouped }, arms[0..2]));
+    try testing.expectEqual(@as(usize, 2), conjunctDigests(.{ .@"and" = &or_inside }, &arms));
+    try testing.expectEqual(digest(.{ .@"or" = &tail }).?, arms[1]);
+    try testing.expectEqual(@as(usize, 1), conjunctDigests(like, &arms));
 }

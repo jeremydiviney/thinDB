@@ -35,7 +35,22 @@ pub fn pdq(
     comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
 ) error{QueryCancelled}!void {
     if (flag == null) return std.sort.pdq(T, items, context, lessThanFn);
-    var check = Check{ .flag = flag.? };
+    return pdqPrefix(T, items, items.len, context, flag, lessThanFn);
+}
+
+/// Puts the `prefix` least items, in order, at the front of `items`; the rest
+/// end up in unspecified order. Ranges that start at or past `prefix` are
+/// never partitioned further, so the cost is about a partition pass over the
+/// rest plus a sort of the prefix.
+pub fn pdqPrefix(
+    comptime T: type,
+    items: []T,
+    prefix: usize,
+    context: anytype,
+    flag: ?*const std.atomic.Value(bool),
+    comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
+) error{QueryCancelled}!void {
+    var check = Check{ .flag = flag };
     try check.poll();
     const Context = struct {
         items: []T,
@@ -50,7 +65,7 @@ pub fn pdq(
             return mem.swap(T, &ctx.items[a], &ctx.items[b]);
         }
     };
-    try pdqContext(0, items.len, Context{ .items = items, .sub_ctx = context, .check = &check });
+    try pdqContext(0, items.len, prefix, Context{ .items = items, .sub_ctx = context, .check = &check });
     try check.poll();
 }
 
@@ -60,7 +75,7 @@ const Hint = enum {
     unknown,
 };
 
-pub fn pdqContext(a: usize, b: usize, context: anytype) error{QueryCancelled}!void {
+pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{QueryCancelled}!void {
     const max_insertion = 24;
 
     const max_limit = std.math.floorPowerOfTwo(usize, b - a) + 1;
@@ -78,6 +93,7 @@ pub fn pdqContext(a: usize, b: usize, context: anytype) error{QueryCancelled}!vo
 
         while (true) {
             try context.check.step();
+            if (range.a >= need) break;
             const len = range.b - range.a;
 
             if (len <= max_insertion) {
@@ -329,10 +345,10 @@ fn reverseRange(a: usize, b: usize, context: anytype) error{QueryCancelled}!void
 }
 
 const Check = struct {
-    flag: *const std.atomic.Value(bool),
+    flag: ?*const std.atomic.Value(bool),
     remaining: usize = 1024,
     fn poll(self: *Check) error{QueryCancelled}!void {
-        if (self.flag.load(.acquire)) return error.QueryCancelled;
+        if (self.flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     }
     fn step(self: *Check) error{QueryCancelled}!void {
         self.remaining -= 1;
@@ -392,6 +408,31 @@ test "cancellation sort matches standard ordering across patterns" {
             try pdq(u32, values, {}, &flag, std.sort.asc(u32));
             try std.testing.expectEqualSlices(u32, expected, values);
         }
+    }
+}
+
+test "prefix sort orders the least items and keeps every item" {
+    const alloc = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(4421);
+    for ([_]usize{ 0, 1, 25, 1024, 4097 }) |n| {
+        const values = try alloc.alloc(u32, n);
+        defer alloc.free(values);
+        const expected = try alloc.alloc(u32, n);
+        defer alloc.free(expected);
+        for ([_]usize{ 0, @min(1, n), n / 3, n -| 1, n }) |prefix| for (0..4) |pattern| {
+            for (values, 0..) |*v, i| v.* = switch (pattern) {
+                0 => random.random().int(u32),
+                1 => @intCast(n - i),
+                2 => @intCast(i % 7),
+                else => @intCast(@min(i, n - i)),
+            };
+            @memcpy(expected, values);
+            std.sort.pdq(u32, expected, {}, std.sort.asc(u32));
+            try pdqPrefix(u32, values, prefix, {}, null, std.sort.asc(u32));
+            try std.testing.expectEqualSlices(u32, expected[0..prefix], values[0..prefix]);
+            std.sort.pdq(u32, values, {}, std.sort.asc(u32));
+            try std.testing.expectEqualSlices(u32, expected, values);
+        };
     }
 }
 

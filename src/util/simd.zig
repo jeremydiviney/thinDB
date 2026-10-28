@@ -96,6 +96,55 @@ pub fn orderBytes(a: []const u8, b: []const u8) std.math.Order {
     return std.math.order(a.len, b.len);
 }
 
+/// First index at or after `start` where `needle` occurs in `haystack`, or
+/// null. Each vector step tests a vector's worth of candidate starts on the
+/// needle's first AND last byte, so a byte that is common in the text (a 'g'
+/// in URLs) only costs a full compare where the last byte also lines up.
+/// Haystacks shorter than one vector of starts take a scalar loop.
+pub fn indexOfSubstringPos(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    const n = needle.len;
+    if (n == 0) return if (start <= haystack.len) start else null;
+    if (n == 1) return std.mem.indexOfScalarPos(u8, haystack, start, needle[0]);
+    if (start >= haystack.len or haystack.len - start < n) return null;
+    const last_start = haystack.len - n;
+    const N = comptime lanes(u8);
+    const Mask = std.meta.Int(.unsigned, N);
+    const all: Mask = ~@as(Mask, 0);
+    var i = start;
+    while (i + N - 1 <= last_start) : (i += N) {
+        if (substringStep(N, haystack, i, needle, all)) |k| return i + k;
+    }
+    if (i > last_start) return null;
+    if (last_start + 1 >= start + N) {
+        // One step ending at the last start covers the tail; its first
+        // `i - j` starts were already tested.
+        const j = last_start + 1 - N;
+        const fresh = all << @intCast(i - j);
+        if (substringStep(N, haystack, j, needle, fresh)) |k| return j + k;
+        return null;
+    }
+    while (i <= last_start) : (i += 1) {
+        if (haystack[i] == needle[0] and haystack[i + n - 1] == needle[n - 1] and
+            std.mem.eql(u8, haystack[i + 1 .. i + n - 1], needle[1 .. n - 1])) return i;
+    }
+    return null;
+}
+
+inline fn substringStep(comptime N: comptime_int, haystack: []const u8, at: usize, needle: []const u8, keep: std.meta.Int(.unsigned, N)) ?usize {
+    const Mask = std.meta.Int(.unsigned, N);
+    const n = needle.len;
+    const firsts: @Vector(N, u8) = haystack[at..][0..N].*;
+    const lasts: @Vector(N, u8) = haystack[at + n - 1 ..][0..N].*;
+    const first: @Vector(N, u8) = @splat(needle[0]);
+    const last: @Vector(N, u8) = @splat(needle[n - 1]);
+    var bits = @as(Mask, @bitCast(firsts == first)) & @as(Mask, @bitCast(lasts == last)) & keep;
+    while (bits != 0) : (bits &= bits - 1) {
+        const k = @ctz(bits);
+        if (std.mem.eql(u8, haystack[at + k + 1 ..][0 .. n - 2], needle[1 .. n - 1])) return k;
+    }
+    return null;
+}
+
 pub const CmpOp = enum { eq, neq, lt, lte, gt, gte };
 
 /// Elementwise `mask[i] = (data[i] <op> want)`, vectorized. `mask` must be
@@ -470,4 +519,26 @@ test "simd: sumFloat matches scalar within tolerance" {
         scalar += v.*;
     }
     try std.testing.expectApproxEqRel(scalar, sumFloat(f64, buf), 1e-9);
+}
+
+test "simd: indexOfSubstringPos matches std.mem.indexOfPos at every start" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var hay: [300]u8 = undefined;
+    var needle: [12]u8 = undefined;
+    // A three-letter alphabet makes first/last-byte hits frequent, so the
+    // verify path, overlapping tail step and scalar loop all see matches.
+    for ([_]usize{ 0, 1, 2, 5, 15, 16, 31, 32, 33, 47, 63, 64, 65, 100, 300 }) |len| {
+        for (1..needle.len + 1) |nlen| {
+            for (0..8) |_| {
+                for (hay[0..len]) |*b| b.* = "abc"[random.uintLessThan(usize, 3)];
+                for (needle[0..nlen]) |*b| b.* = "abc"[random.uintLessThan(usize, 3)];
+                for (0..len + 2) |start| {
+                    const want = if (start <= len) std.mem.indexOfPos(u8, hay[0..len], start, needle[0..nlen]) else null;
+                    try std.testing.expectEqual(want, indexOfSubstringPos(hay[0..len], start, needle[0..nlen]));
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(?usize, 1), indexOfSubstringPos("abcabc", 1, ""));
 }

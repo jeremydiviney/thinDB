@@ -21,7 +21,10 @@ const ColumnStore = store.ColumnStore;
 const exec = @import("exec.zig");
 const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
+const json_binary = @import("json_binary.zig");
 const udf_mod = @import("../udf.zig");
+const predicate = @import("predicate.zig");
+const parallel_scan = @import("parallel_scan.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
@@ -79,7 +82,14 @@ pub const Request = struct {
     // groups led by a string key's best values: each scan drops rows that
     // can't lead one (`Scan.setKeyBound`).
     key_bound: ?exec.KeyBoundSpec = null,
+    // Set when the ORDER BY ... LIMIT over this core's output leads with
+    // aggregates but finishes on something the core can't compare (a string
+    // key): the core keeps the groups within the best `keep` on the leading
+    // aggregates, ties at the cut included (see SiloCore.EmitRank.ties).
+    prefix_rank: ?PrefixRank = null,
 };
+
+pub const PrefixRank = struct { specs: []const SortSpec, keep: usize };
 
 const KeyPart = struct {
     name: []const u8,
@@ -201,6 +211,9 @@ const ExecutionContext = struct {
     raw_batch_chunks: usize = DEFAULT_RAW_BATCH_CHUNKS,
     shared_stage_builders: bool = true,
     offered_prunes: Scan.OfferedPrunes = .{},
+    // Borrowed from the pipeline.
+    order_keys: []const OrderKey = &.{},
+    prefix_keys: []const OrderKey = &.{},
     times: StageTimes = .{},
 };
 
@@ -386,6 +399,9 @@ const GroupTopNPipeline = struct {
     output_schema: []Column,
     output_cols: []ColumnStore,
     views: []ColumnView,
+    /// `request.order_specs` and the ranked prefix, resolved against `plan`.
+    order_keys: []const OrderKey,
+    prefix_keys: []const OrderKey,
     owned_needed: ?[]const []const u8 = null,
     emitted: bool = false,
     built: bool = false,
@@ -442,6 +458,11 @@ const GroupTopNPipeline = struct {
         const views = try allocator.alloc(ColumnView, output_schema.len);
         errdefer allocator.free(views);
 
+        const order_keys = try resolveOrderKeys(allocator, &plan, request.order_specs);
+        errdefer allocator.free(order_keys);
+        const prefix_keys = try resolveOrderKeys(allocator, &plan, if (request.prefix_rank) |p| p.specs else &.{});
+        errdefer allocator.free(prefix_keys);
+
         const rows = tableRows(table);
         return .{
             .allocator = allocator,
@@ -451,6 +472,8 @@ const GroupTopNPipeline = struct {
             .output_schema = output_schema,
             .output_cols = output_cols,
             .views = views,
+            .order_keys = order_keys,
+            .prefix_keys = prefix_keys,
             .owned_needed = owned_needed,
             .upper_rows = if (request.limit != 0) @min(rows, @as(u64, request.limit)) else rows,
         };
@@ -469,6 +492,8 @@ const GroupTopNPipeline = struct {
         for (self.output_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
+        self.allocator.free(self.order_keys);
+        self.allocator.free(self.prefix_keys);
         self.allocator.free(self.output_schema);
         if (self.owned_needed) |n| self.allocator.free(n);
         if (self.plan.scan_base_columns.len > 0) self.allocator.free(self.plan.scan_base_columns);
@@ -553,6 +578,11 @@ const GroupTopNPipeline = struct {
         if (self.request.key_bound) |kb| {
             try out.print(allocator, ", key bound {s} {s} {d}", .{ kb.col, if (kb.desc) "DESC" else "ASC", kb.keep });
         }
+        if (self.request.prefix_rank) |p| {
+            try out.appendSlice(allocator, ", rank prefix");
+            for (p.specs) |spec| try out.print(allocator, " {s} {s}", .{ spec.col, if (spec.desc) "DESC" else "ASC" });
+            try out.print(allocator, " keep {d}", .{p.keep});
+        }
         try out.appendSlice(allocator, ")\n");
         try exec.explainIndent(out, allocator, depth + 1);
         try out.appendSlice(allocator, "Scan ");
@@ -600,7 +630,15 @@ const GroupTopNPipeline = struct {
             self.allocator.free(snapshot.segments);
         }
         var ctx = try prepareExecution(self.allocator, table, snapshot, self.request, self.plan);
-        ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = self.offered_sets.items };
+        var pick_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer pick_arena.deinit();
+        const offered_sets = if (try pickKeySets(pick_arena.allocator(), exec.memory.accountantOf(self.allocator), table, snapshot, self.request, self.plan)) |picked|
+            try std.mem.concat(pick_arena.allocator(), exec.InSet, &.{ self.offered_sets.items, picked })
+        else
+            self.offered_sets.items;
+        ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = offered_sets };
+        ctx.order_keys = self.order_keys;
+        ctx.prefix_keys = self.prefix_keys;
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
@@ -794,10 +832,139 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
     return ctx.request.limit + ctx.request.offset;
 }
 
+// Rows the key pick reads looking for its groups, and the leading rows it
+// judges the picked keys' share on; past a 1/PICK_SHARE_DENOMINATOR share the
+// filtered aggregation saves little over the plain one.
+const PICK_MAX_ROWS: usize = 1 << 20;
+const PICK_SAMPLE_ROWS: usize = 1 << 16;
+const PICK_SHARE_DENOMINATOR: usize = 8;
+
+// Without ORDER BY or HAVING, any LIMIT+OFFSET groups answer the query, and a
+// filter on group-key columns keeps or drops whole groups, so the groups it
+// keeps aggregate exactly. The first LIMIT+OFFSET distinct keys in scan order
+// are such groups: a short serial read finds them, and each key column's set
+// of their values, offered as a row filter, lets the aggregation fold only
+// those keys' rows instead of every group. Keys computed by an expression get
+// no set; distinct base-column values already make distinct groups. Null when
+// the shape doesn't qualify, the table has too few groups, or the picked keys
+// cover too much of the sample to be worth filtering on.
+fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant, table: *api.Table, snapshot: Scan.Snapshot, request: Request, plan: ShapePlan) !?[]const exec.InSet {
+    if (request.order_specs.len != 0 or request.having_filter != null or request.limit == 0) return null;
+    const keep = request.limit + request.offset;
+    if (keep > Scan.ROW_SET_ZONEMAP_MAX) return null;
+
+    var cols: [MAX_GROUP_KEYS][]const u8 = undefined;
+    var col_count: usize = 0;
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (findDerived(plan.derived, part.name) != null) continue;
+        cols[col_count] = part.name;
+        col_count += 1;
+    }
+    if (col_count == 0) return null;
+
+    const scan = try Scan.allocWithProjectionLoc(allocator, table, accountant, cols[0..col_count], false, snapshot);
+    defer scan.deinit();
+    if (request.where_filter) |where| {
+        if (!try scan.tryFuseFilter(where)) return null;
+    }
+
+    var tuples: std.StringHashMapUnmanaged(void) = .empty;
+    var values: [MAX_GROUP_KEYS]std.StringHashMapUnmanaged(types.Value) = @splat(.empty);
+    var has_null: [MAX_GROUP_KEYS]bool = @splat(false);
+    var tuple_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    var rows_seen: usize = 0;
+    var rows_matched: usize = 0;
+    scan: while (try scan.next()) |batch| {
+        try exec.memory.checkCancelled(allocator);
+        var views: [MAX_GROUP_KEYS]ColumnView = undefined;
+        for (cols[0..col_count], 0..) |name, k| {
+            views[k] = batch.values[types.findColumn(batch.schema, name) orelse return null];
+        }
+        for (0..batch.row_count) |row| {
+            const picking = tuples.count() < keep;
+            if (!picking and rows_seen >= PICK_SAMPLE_ROWS) break :scan;
+            if (picking and rows_seen >= PICK_MAX_ROWS) return null;
+            rows_seen += 1;
+            tuple_bytes.clearRetainingCapacity();
+            var cells: [MAX_GROUP_KEYS]?types.Value = undefined;
+            var spans: [MAX_GROUP_KEYS][2]usize = undefined;
+            for (views[0..col_count], 0..) |view, k| {
+                cells[k] = null;
+                if (!view.isValid(row)) {
+                    try tuple_bytes.append(allocator, 0);
+                    continue;
+                }
+                const value = parallel_scan.keyCellValue(view, row) orelse return null;
+                try tuple_bytes.append(allocator, 1);
+                spans[k][0] = tuple_bytes.items.len;
+                if (!try appendValueBytes(allocator, &tuple_bytes, value)) return null;
+                spans[k][1] = tuple_bytes.items.len;
+                cells[k] = value;
+            }
+            if (!picking) {
+                if (tuples.contains(tuple_bytes.items)) rows_matched += 1;
+                continue;
+            }
+            rows_matched += 1;
+            const tuple = try tuples.getOrPut(allocator, tuple_bytes.items);
+            if (tuple.found_existing) continue;
+            tuple.key_ptr.* = try allocator.dupe(u8, tuple_bytes.items);
+            for (cells[0..col_count], spans[0..col_count], 0..) |cell, span, k| {
+                const value = cell orelse {
+                    has_null[k] = true;
+                    continue;
+                };
+                const gop = try values[k].getOrPut(allocator, tuple.key_ptr.*[span[0]..span[1]]);
+                if (gop.found_existing) continue;
+                gop.value_ptr.* = switch (value) {
+                    .text => |t| .{ .text = try allocator.dupe(u8, t) },
+                    else => value,
+                };
+            }
+        }
+    }
+    if (tuples.count() < keep) return null;
+    if (rows_matched * PICK_SHARE_DENOMINATOR > rows_seen) return null;
+
+    var sets: std.ArrayListUnmanaged(exec.InSet) = .empty;
+    for (cols[0..col_count], 0..) |name, k| {
+        // A row-filter offer drops NULL rows, so a column with a NULL among
+        // the picked keys can't carry one.
+        if (has_null[k]) continue;
+        const set_values = try allocator.alloc(types.Value, values[k].count());
+        var it = values[k].valueIterator();
+        var i: usize = 0;
+        while (it.next()) |v| : (i += 1) set_values[i] = v.*;
+        try sets.append(allocator, .{ .col = name, .values = set_values, .negate = false, .rows = true });
+    }
+    if (sets.items.len == 0) return null;
+    return sets.items;
+}
+
+/// The bytes that identify a key value, length-prefixed for text so a tuple of
+/// them stays unambiguous; false for a value with no ordered form.
+fn appendValueBytes(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), value: types.Value) !bool {
+    switch (value) {
+        .text => |t| {
+            try out.appendSlice(allocator, std.mem.asBytes(&@as(u32, @intCast(t.len))));
+            try out.appendSlice(allocator, t);
+        },
+        else => {
+            const ordered = predicate.valueToRangeI128(value) orelse return false;
+            try out.appendSlice(allocator, std.mem.asBytes(&ordered));
+        },
+    }
+    return true;
+}
+
 // Any other ORDER BY ... LIMIT still needs only the best LIMIT+OFFSET groups,
 // so the core's all-groups emit ranks them per fill worker in parallel; the
 // final selection then walks those few rows rather than every group.
 fn emitRank(ctx: *ExecutionContext) ?SiloCore.EmitRank {
+    if (ctx.request.prefix_rank) |p| {
+        if (p.keep == 0 or !rankableAggregates(ctx.prefix_keys)) return null;
+        return .{ .ctx = ctx, .before = prefixEmitBefore, .keep = p.keep, .ties = true };
+    }
     if (canUseCoreCountDescTopN(ctx)) return null;
     if (ctx.request.order_specs.len == 0 or ctx.request.limit == 0) return null;
     return .{ .ctx = ctx, .before = rankEmitBefore, .keep = ctx.request.limit +| ctx.request.offset };
@@ -811,20 +978,15 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
         return .{ .allocator = op.allocator, .items = rows[start..end] };
     }
 
-    if (op.request.limit == 0) {
-        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
-        return .{ .allocator = op.allocator, .items = rows };
-    }
+    if (op.request.limit == 0) return rankedFinalRows(op.allocator, op.order_keys, rows, rows.len, 0, 0);
 
     const keep = @min(rows.len, op.request.limit + op.request.offset);
     if (keep == 0) return .{ .allocator = op.allocator };
-    // Once keep reaches half the rows, selecting them costs about as much as
-    // sorting everything, which needs no second buffer.
-    if (keep * 2 >= rows.len) {
-        try exec.memory.sort(SiloCore.TopRow, rows, op, op.allocator, finalRowLess);
-        const start = @min(op.request.offset, rows.len);
-        const end = limitEnd(start, rows.len, op.request.limit);
-        return .{ .allocator = op.allocator, .items = rows[start..end] };
+    // A heap of rows serves a small cut best: most rows miss it on one
+    // comparison against the root. Past the core's own top-set bound the
+    // replacements dominate, each sifting rows through a heap of keep rows.
+    if (keep > MAX_HEAP_KEEP or keep * 2 >= rows.len) {
+        return rankedFinalRows(op.allocator, op.order_keys, rows, keep, @min(op.request.offset, keep), op.request.limit);
     }
     var candidates = try op.allocator.alloc(SiloCore.TopRow, keep);
     errdefer op.allocator.free(candidates);
@@ -842,13 +1004,148 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
     return .{ .allocator = op.allocator, .items = candidates[0..emit_len], .owned = candidates };
 }
 
+const MAX_HEAP_KEEP = 65536;
+
+// The best `keep` rows in order, with the page [start, start + limit) of them
+// returned. Orders compact entries, not rows: a TopRow is over 200 bytes, and
+// moving rows through a heap or sort took most of a large-LIMIT query (LIMIT
+// 10 OFFSET 5000000 over 17.6M groups: 67 s). The rows move once at the end.
+fn rankedFinalRows(allocator: Allocator, keys: []const OrderKey, rows: []SiloCore.TopRow, keep: usize, start: usize, limit: usize) !FinalRows {
+    const entries = try allocator.alloc(RankEntry, rows.len);
+    defer allocator.free(entries);
+    var exact = keys.len == 1;
+    for (rows, entries, 0..) |row, *entry, i| {
+        if (i % 1024 == 0) try exec.memory.checkCancelled(allocator);
+        const prefix = orderPrefix(&keys[0], row);
+        exact = exact and prefix.exact;
+        entry.* = .{ .key = row.key, .prefix = prefix.value, .class = prefix.class, .row = @intCast(i) };
+    }
+    const order: RankOrder = .{ .rows = rows, .keys = keys, .prefix_decides = exact };
+    try exec.memory.sortPrefix(RankEntry, entries, keep, &order, allocator, RankOrder.before);
+    const end = limitEnd(start, keep, limit);
+    if (end == start) return .{ .allocator = allocator };
+    if ((end - start) * 2 < rows.len) {
+        const page = try allocator.alloc(SiloCore.TopRow, end - start);
+        for (page, entries[start..end]) |*dst, entry| dst.* = rows[entry.row];
+        return .{ .allocator = allocator, .items = page, .owned = page };
+    }
+    permuteRows(rows, entries);
+    return .{ .allocator = allocator, .items = rows[start..end] };
+}
+
+// Moves every row to its entry's position, following the permutation's cycles
+// so each row moves once. It must run to completion: rows own their string
+// bytes, and a row in flight would be lost or freed twice.
+fn permuteRows(rows: []SiloCore.TopRow, entries: []RankEntry) void {
+    for (0..entries.len) |pos| {
+        if (entries[pos].row == pos) continue;
+        const held = rows[pos];
+        var dst = pos;
+        while (true) {
+            const src: usize = entries[dst].row;
+            entries[dst].row = @intCast(dst);
+            if (src == pos) {
+                rows[dst] = held;
+                break;
+            }
+            rows[dst] = rows[src];
+            dst = src;
+        }
+    }
+}
+
+const RankEntry = struct {
+    key: u128,
+    prefix: u64,
+    row: u32,
+    class: u8,
+};
+
+const RankOrder = struct {
+    rows: []const SiloCore.TopRow,
+    keys: []const OrderKey,
+    // One ORDER BY key and every prefix exact: equal prefixes mean equal keys,
+    // so the group key settles the order without reading the rows.
+    prefix_decides: bool,
+
+    fn before(self: *const RankOrder, a: RankEntry, b: RankEntry) bool {
+        if (a.class != b.class) return a.class < b.class;
+        if (a.prefix != b.prefix) return a.prefix < b.prefix;
+        if (self.prefix_decides) return a.key < b.key;
+        return rowOrderBefore(self.keys, self.rows[a.row], self.rows[b.row]);
+    }
+};
+
+// A row's first ORDER BY key mapped so that (class, value) order agrees with
+// compareOrderKey: NULLs in a class of their own, numbers order-preserving in
+// 64 bits. `exact` means equal (class, value) implies an equal key; a clamped
+// wide integer or a string's leading bytes only bound it.
+const OrderPrefix = struct {
+    class: u8,
+    value: u64,
+    exact: bool = true,
+
+    const NULL: OrderPrefix = .{ .class = 0, .value = 0 };
+    const EQUAL: OrderPrefix = .{ .class = 1, .value = 0 };
+
+    fn ofInt(v: i128) OrderPrefix {
+        const narrow = std.math.cast(i64, v) orelse return .{ .class = 1, .value = if (v < 0) 0 else std.math.maxInt(u64), .exact = false };
+        return .{ .class = 1, .value = @as(u64, @bitCast(narrow)) ^ (1 << 63) };
+    }
+
+    // compareF64 holds -0.0 and 0.0 equal; NaN, which it never orders, sorts
+    // after every number.
+    fn ofFloat(v: f64) OrderPrefix {
+        const canonical: f64 = if (v == 0) 0 else if (std.math.isNan(v)) std.math.nan(f64) else v;
+        const bits: u64 = @bitCast(canonical);
+        return .{ .class = 1, .value = if (bits >> 63 != 0) ~bits else bits | (1 << 63) };
+    }
+
+    fn ofBytes(bytes: []const u8) OrderPrefix {
+        var lead = [_]u8{0} ** 8;
+        const n: usize = @min(bytes.len, 8);
+        @memcpy(lead[0..n], bytes[0..n]);
+        return .{ .class = 1, .value = std.mem.readInt(u64, &lead, .big), .exact = false };
+    }
+
+    fn descending(self: OrderPrefix) OrderPrefix {
+        return .{ .class = 1 - self.class, .value = ~self.value, .exact = self.exact };
+    }
+};
+
+fn orderPrefix(key: *const OrderKey, row: SiloCore.TopRow) OrderPrefix {
+    const ascending: OrderPrefix = switch (key.target) {
+        .part => |*part| if (keyPartIsNull(part.*, row.key)) .NULL else .ofInt(keyPartValue(part.*, row.key)),
+        .aggregate => |*agg_plan| aggregatePrefix(agg_plan.*, row),
+    };
+    return if (key.desc) ascending.descending() else ascending;
+}
+
+fn aggregatePrefix(agg_plan: AggregatePlan, row: SiloCore.TopRow) OrderPrefix {
+    if (aggIsNull(row, agg_plan)) return .NULL;
+    if (agg_plan.is_string) {
+        // JSON orders by value, not by its bytes.
+        if (agg_plan.output_type == .json) return .{ .class = 1, .value = 0, .exact = false };
+        return .ofBytes(row.str[agg_plan.str_state_index]);
+    }
+    const float_input = isFloatPhysical(agg_plan.input_type);
+    return switch (agg_plan.func) {
+        .count => .ofInt(countValue(row, agg_plan)),
+        .sum, .min, .max => if (float_input) .ofFloat(rowStateFloat(row, agg_plan.state_index)) else .ofInt(integerAggValue(row, agg_plan)),
+        .avg => .ofFloat(if (float_input) avgFloatValue(row, agg_plan) else avgValue(row, agg_plan)),
+        .count_distinct => .ofInt(rowStateValue(row, agg_plan.state_index, agg_plan.wide)),
+        .stddev_pop, .stddev_samp, .var_pop, .var_samp => .ofFloat(welfordValue(row, agg_plan)),
+        else => .EQUAL,
+    };
+}
+
 fn limitEnd(start: usize, len: usize, limit: usize) usize {
     if (limit == 0) return len;
     return @min(len, start + limit);
 }
 
 fn finalRowLess(op: *GroupTopNPipeline, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
-    return rowOrderBefore(&op.plan, op.request.order_specs, a, b);
+    return rowOrderBefore(op.order_keys, a, b);
 }
 
 fn finalRowBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
@@ -858,38 +1155,83 @@ fn finalRowBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool
 
 fn rankEmitBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
     const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
-    return rowOrderBefore(&ec.plan, ec.request.order_specs, a, b);
+    return rowOrderBefore(ec.order_keys, a, b);
+}
+
+fn prefixEmitBefore(ctx: ?*anyopaque, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
+    return keysOrder(ec.prefix_keys, a, b) == .lt;
+}
+
+// Every key is an aggregate the core compares (not a GROUP_CONCAT or UDAF
+// result, which finalize after the emit).
+fn rankableAggregates(keys: []const OrderKey) bool {
+    if (keys.len == 0) return false;
+    for (keys) |*key| switch (key.target) {
+        .part => return false,
+        .aggregate => |*agg_plan| if (agg_plan.is_concat or agg_plan.is_udf) return false,
+    };
+    return true;
+}
+
+// An ORDER BY key resolved once to the key part or aggregate it names, so
+// ranking millions of groups doesn't match column names per comparison.
+const OrderKey = struct {
+    target: union(enum) { part: KeyPart, aggregate: AggregatePlan },
+    desc: bool,
+};
+
+fn resolveOrderKeys(allocator: Allocator, plan: *const ShapePlan, specs: []const SortSpec) ![]OrderKey {
+    const keys = try allocator.alloc(OrderKey, specs.len);
+    errdefer allocator.free(keys);
+    for (specs, keys) |spec, *key| {
+        key.* = .{ .target = try orderTarget(plan, spec.col), .desc = spec.desc };
+    }
+    return keys;
+}
+
+fn orderTarget(plan: *const ShapePlan, name: []const u8) !@FieldType(OrderKey, "target") {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) return .{ .part = part };
+    }
+    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
+        if (types.columnNameEql(name, agg_plan.name)) return .{ .aggregate = agg_plan };
+    }
+    return error.UnsupportedOrderBy;
 }
 
 // The result order: the ORDER BY keys, then the group key, so no two groups
 // tie (the core's ranked emit relies on that).
-fn rowOrderBefore(plan: *const ShapePlan, order_specs: []const SortSpec, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
-    for (order_specs) |spec| {
-        const cmp = compareOutputValue(plan, spec.col, a, b) catch 0;
-        if (cmp == 0) continue;
-        return if (spec.desc) cmp > 0 else cmp < 0;
-    }
-    return a.key < b.key;
+fn rowOrderBefore(keys: []const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) bool {
+    return switch (keysOrder(keys, a, b)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.key < b.key,
+    };
 }
 
-fn compareOutputValue(plan: *const ShapePlan, name: []const u8, a: SiloCore.TopRow, b: SiloCore.TopRow) !i8 {
-    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
-        if (types.columnNameEql(name, part.name)) {
-            const a_null = keyPartIsNull(part, a.key);
-            const b_null = keyPartIsNull(part, b.key);
+inline fn keysOrder(keys: []const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) std.math.Order {
+    for (keys) |*key| {
+        const cmp = compareOrderKey(key, a, b);
+        if (cmp == 0) continue;
+        return if ((cmp < 0) != key.desc) .lt else .gt;
+    }
+    return .eq;
+}
+
+fn compareOrderKey(key: *const OrderKey, a: SiloCore.TopRow, b: SiloCore.TopRow) i8 {
+    switch (key.target) {
+        .part => |*part| {
+            const a_null = keyPartIsNull(part.*, a.key);
+            const b_null = keyPartIsNull(part.*, b.key);
             if (a_null or b_null) {
                 if (a_null and b_null) return 0;
                 return if (a_null) -1 else 1;
             }
-            return compareI128(keyPartValue(part, a.key), keyPartValue(part, b.key));
-        }
+            return compareI128(keyPartValue(part.*, a.key), keyPartValue(part.*, b.key));
+        },
+        .aggregate => |*agg_plan| return compareAggregateValue(agg_plan.*, a, b),
     }
-    for (plan.aggregates[0..plan.aggregate_count]) |agg_plan| {
-        if (types.columnNameEql(name, agg_plan.name)) {
-            return compareAggregateValue(agg_plan, a, b);
-        }
-    }
-    return error.UnsupportedOrderBy;
 }
 
 fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCore.TopRow) i8 {
@@ -900,6 +1242,15 @@ fn compareAggregateValue(agg_plan: AggregatePlan, a: SiloCore.TopRow, b: SiloCor
     if (a_null or b_null) {
         if (a_null and b_null) return 0;
         return if (a_null) -1 else 1;
+    }
+    // String MIN/MAX results order the way the fold compared them.
+    if (agg_plan.is_string) {
+        const i = agg_plan.str_state_index;
+        return switch (json_binary.columnOrder(agg_plan.output_type == .json, a.str[i], b.str[i])) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
     }
     const float_input = isFloatPhysical(agg_plan.input_type);
     return switch (agg_plan.func) {
@@ -1861,13 +2212,12 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
         if (!outputColumnExists(parts[0..request.group_cols.len], aggregates[0..request.aggs.len], spec.col)) {
             return traceDecline(request, "order key");
         }
-        // Sorting on a string MIN/MAX, GROUP_CONCAT, or UDAF result isn't wired
-        // through the final top-N comparator yet; such queries order by COUNT
-        // in practice (a UDAF query ordered on its own output declines to the
-        // UdfAggregate operator, which sorts the grouped output generically).
+        // GROUP_CONCAT and UDAF results finalize after the emit, past the final
+        // top-N comparator (a UDAF query ordered on its own output declines to
+        // the UdfAggregate operator, which sorts the grouped output generically).
         for (aggregates[0..request.aggs.len]) |agg_plan| {
-            if ((agg_plan.is_string or agg_plan.is_concat or agg_plan.is_udf) and types.columnNameEql(agg_plan.name, spec.col)) {
-                return traceDecline(request, "order by string/udf aggregate");
+            if ((agg_plan.is_concat or agg_plan.is_udf) and types.columnNameEql(agg_plan.name, spec.col)) {
+                return traceDecline(request, "order by concat/udf aggregate");
             }
         }
     }
@@ -2334,4 +2684,166 @@ test "hashed-key emit reads rowrefs from the aggregation snapshot" {
     try std.testing.expectEqualStrings("s3", keys.rowBytes(0));
     try std.testing.expectEqualStrings("s7", keys.rowBytes(1));
     try std.testing.expectEqualStrings("s11", keys.rowBytes(2));
+}
+
+fn expectTextSet(set: exec.InSet, col: []const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqualStrings(col, set.col);
+    try std.testing.expect(set.rows and !set.negate);
+    try std.testing.expectEqual(expected.len, set.values.len);
+    for (expected) |want| {
+        const found = for (set.values) |v| {
+            if (std.mem.eql(u8, v.text, want)) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+}
+
+test "key pick offers the first distinct keys in scan order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "u", .type = .bigint, .nullable = true },
+            .{ .name = "s", .type = .{ .varchar = 16 } },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+
+    // 300 groups (u = g / 3, NULL for g = 7; s = "s<g>"), one row per group
+    // per pass: two passes flushed to segments, two left in the memtable.
+    const Row = struct { id: i64, u: ?i64, s: []const u8 };
+    var names: [300][8]u8 = undefined;
+    var rows: [300]Row = undefined;
+    for (0..4) |pass| {
+        for (&rows, &names, 0..) |*row, *name, g| {
+            const s = try std.fmt.bufPrint(name, "s{d}", .{g});
+            row.* = .{ .id = @intCast(pass * 300 + g), .u = if (g == 7) null else @intCast(g / 3), .s = s };
+        }
+        try t.insert(&rows);
+        if (pass < 2) try t.flush();
+    }
+
+    const snapshot = try Scan.captureSnapshotAlloc(t, allocator, null);
+    defer {
+        snapshot.release(t);
+        allocator.free(snapshot.segments);
+    }
+    var plan: ShapePlan = undefined;
+    plan.layout.part_count = 2;
+    plan.layout.parts[0] = .{ .name = "u", .typ = .bigint, .offset_bits = 0, .width_bits = 65, .nullable = true };
+    plan.layout.parts[1] = .{ .name = "s", .typ = .{ .varchar = 16 }, .offset_bits = 0, .width_bits = 0 };
+    plan.derived = &.{};
+    const request: Request = .{
+        .group_cols = &.{ "u", "s" },
+        .aggs = &.{},
+        .order_specs = &.{},
+        .limit = 3,
+        .offset = 0,
+        .where_filter = null,
+        .having_filter = null,
+        .needed = null,
+        .dop = 1,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const first = (try pickKeySets(a, null, t, snapshot, request, plan)).?;
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expectEqualStrings("u", first[0].col);
+    try std.testing.expectEqual(@as(usize, 1), first[0].values.len);
+    try std.testing.expectEqual(@as(i64, 0), first[0].values[0].bigint);
+    try expectTextSet(first[1], "s", &.{ "s0", "s1", "s2" });
+
+    // g = 7 is picked: its NULL u leaves only the s set.
+    var with_offset = request;
+    with_offset.offset = 5;
+    const nulls = (try pickKeySets(a, null, t, snapshot, with_offset, plan)).?;
+    try std.testing.expectEqual(@as(usize, 1), nulls.len);
+    try expectTextSet(nulls[0], "s", &.{ "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7" });
+
+    var filtered = request;
+    filtered.where_filter = .{ .leaf = .{ .col = "id", .op = .gte, .val = .{ .bigint = 150 } } };
+    const later = (try pickKeySets(a, null, t, snapshot, filtered, plan)).?;
+    try expectTextSet(later[1], "s", &.{ "s150", "s151", "s152" });
+
+    // 200 of 300 groups cover two thirds of the rows: no worthwhile filter.
+    var wide = request;
+    wide.limit = 200;
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, wide, plan) == null);
+
+    var one_group = request;
+    one_group.where_filter = .{ .leaf = .{ .col = "s", .op = .eq, .val = .{ .text = "s5" } } };
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, one_group, plan) == null);
+
+    var ordered = request;
+    ordered.order_specs = &.{.{ .col = "u", .desc = false }};
+    try std.testing.expect(try pickKeySets(a, null, t, snapshot, ordered, plan) == null);
+}
+
+test "ranked final rows match the row order" {
+    const allocator = std.testing.allocator;
+    const count_plan: AggregatePlan = .{ .name = "c", .func = .count, .input_column_index = null, .input_type = .i64, .state_index = 0, .output_type = .bigint };
+    const sum_plan: AggregatePlan = .{ .name = "s", .func = .sum, .input_column_index = 0, .input_type = .i32, .state_index = 1, .output_type = .bigint, .input_nullable = true, .valid_count_index = 2 };
+    const max_plan: AggregatePlan = .{ .name = "m", .func = .max, .input_column_index = 1, .input_type = .f64, .state_index = 3, .output_type = .double };
+    const str_plan: AggregatePlan = .{ .name = "t", .func = .min, .input_column_index = null, .input_type = .i64, .state_index = 0, .output_type = .string, .is_string = true };
+    const orders = [_][]const OrderKey{
+        &.{.{ .target = .{ .aggregate = count_plan }, .desc = true }},
+        &.{.{ .target = .{ .aggregate = sum_plan }, .desc = false }},
+        &.{.{ .target = .{ .aggregate = max_plan }, .desc = true }},
+        &.{.{ .target = .{ .aggregate = str_plan }, .desc = false }},
+        &.{ .{ .target = .{ .aggregate = sum_plan }, .desc = true }, .{ .target = .{ .aggregate = count_plan }, .desc = false } },
+    };
+    const pages = [_]struct { keep: usize, start: usize, limit: usize }{
+        .{ .keep = 3000, .start = 0, .limit = 0 },
+        .{ .keep = 1700, .start = 1600, .limit = 100 },
+        .{ .keep = 2900, .start = 100, .limit = 2800 },
+        .{ .keep = 10, .start = 0, .limit = 10 },
+        .{ .keep = 60, .start = 60, .limit = 10 },
+    };
+    const words = [_][]const u8{ "", "a", "abcdefgh", "abcdefghi", "abcdefghj", "b" };
+    const floats = [_]f64{ -1.5, -0.0, 0.0, 2.25, 1e300 };
+    var prng = std.Random.DefaultPrng.init(907);
+    const random = prng.random();
+    const n = 3000;
+    const source = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(source);
+    for (source, 0..) |*row, i| {
+        row.* = .{ .key = @intCast(i * 7919 % n), .count = random.uintLessThan(u64, 4) };
+        row.slots[0] = random.intRangeAtMost(i64, -2, 2);
+        row.slots[1] = random.intRangeAtMost(i64, 0, 2);
+        row.slots[2] = @bitCast(floats[random.uintLessThan(usize, floats.len)]);
+        row.str[0] = words[random.uintLessThan(usize, words.len)];
+        row.str_present[0] = random.uintLessThan(u8, 8) != 0;
+    }
+    const expected = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(expected);
+    const rows = try allocator.alloc(SiloCore.TopRow, n);
+    defer allocator.free(rows);
+    const seen = try allocator.alloc(bool, n);
+    defer allocator.free(seen);
+    for (orders) |keys| for (pages) |page| {
+        @memcpy(expected, source);
+        std.sort.pdq(SiloCore.TopRow, expected, keys, rowOrderBefore);
+        @memcpy(rows, source);
+        var got = try rankedFinalRows(allocator, keys, rows, page.keep, page.start, page.limit);
+        defer got.deinit();
+        const end = limitEnd(page.start, page.keep, page.limit);
+        try std.testing.expectEqual(end - page.start, got.items.len);
+        for (expected[page.start..end], got.items) |want, have| try std.testing.expectEqual(want.key, have.key);
+        @memset(seen, false);
+        for (rows) |row| seen[@intCast(row.key)] = true;
+        try std.testing.expect(std.mem.allEqual(bool, seen, true));
+    };
 }

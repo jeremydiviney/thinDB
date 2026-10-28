@@ -12,6 +12,7 @@ const v2_group_topn = @import("v2_shape_group_topn.zig");
 const v2_lowcard_group = @import("v2_lowcard_group.zig");
 
 pub const GroupTopNRequest = v2_group_topn.Request;
+pub const GroupTopNPrefixRank = v2_group_topn.PrefixRank;
 
 pub fn tryBuildGroupTopN(
     allocator: std.mem.Allocator,
