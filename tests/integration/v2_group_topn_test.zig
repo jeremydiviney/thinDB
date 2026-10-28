@@ -1384,6 +1384,75 @@ test "V2 group-topN: nullable and BIGINT aggregates agree at DOP 1 and DOP 4" {
     }
 }
 
+fn collectNumberRows(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![][2]?f64 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList([2]?f64) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| try out.append(allocator, .{ try cellNumber(batch.values[0], r), try cellNumber(batch.values[1], r) });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "V2 group-topN: ranked emit returns the full sort's page across fill workers, with ties and HAVING" {
+    // Past 2 × 65536 groups the core's emit ranks groups on several fill
+    // workers, while each keeps under half of its range's groups; past that it
+    // emits every group for the final heap selection, and from LIMIT+OFFSET at
+    // half the groups for a full sort. All must yield the same page, ties in
+    // the ORDER BY key included (they break on the group key).
+    const allocator = std.testing.allocator;
+    const group_count = 140_009;
+    const Row = struct { id: i64, g: i64, v: i32 };
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(allocator);
+    for (0..group_count) |k| {
+        for (0..1 + k % 3) |j| {
+            try rows.append(allocator, .{
+                .id = @intCast(rows.items.len),
+                .g = @as(i64, @intCast(k)) * 1_000_003,
+                .v = @intCast((k * 31 + j * 7) % 17),
+            });
+        }
+    }
+    const cases = .{
+        .{ "SELECT g, MIN(v) AS m FROM rank_rows GROUP BY g ORDER BY m DESC", 10, 3 },
+        .{ "SELECT g, SUM(v) AS s FROM rank_rows GROUP BY g HAVING COUNT(*) > 1 ORDER BY s", 20, 0 },
+        .{ "SELECT g, COUNT(*) AS c FROM rank_rows GROUP BY g ORDER BY c, g DESC", 7, 11 },
+        .{ "SELECT g, AVG(v) AS a FROM rank_rows GROUP BY g ORDER BY a DESC, g", 5, 0 },
+        .{ "SELECT g, SUM(v) AS s FROM rank_rows GROUP BY g ORDER BY s DESC, g", 40, 39_990 },
+    };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("rank_rows", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "g", .type = .bigint },
+                .{ .name = "v", .type = .int },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"} });
+        try t.insert(rows.items);
+        try t.flush();
+        inline for (cases) |case| {
+            const page_sql = std.fmt.comptimePrint("{s} LIMIT {d} OFFSET {d}", .{ case[0], case[1], case[2] });
+            const full_sql = std.fmt.comptimePrint("{s} LIMIT {d}", .{ case[0], group_count });
+            errdefer std.debug.print("dop={d} query: {s}\n", .{ dop, page_sql });
+            try expectPlanRunsGroupTopN(allocator, db, page_sql);
+            const page = try collectNumberRows(allocator, db, page_sql);
+            defer allocator.free(page);
+            const full = try collectNumberRows(allocator, db, full_sql);
+            defer allocator.free(full);
+            try std.testing.expectEqual(@as(usize, case[1]), page.len);
+            try std.testing.expectEqualSlices([2]?f64, full[case[2] .. case[2] + case[1]], page);
+        }
+    }
+}
+
 // One (group, value) membership for the grouped COUNT(DISTINCT) reference: a
 // string value in `str`, a numeric one's canonical bits in `num`.
 const RefPair = struct {

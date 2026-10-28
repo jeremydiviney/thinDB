@@ -3448,7 +3448,42 @@ pub const EmitFilter = struct {
     pass: *const fn (?*anyopaque, TopRow) bool,
 };
 
+// The caller's final ORDER BY for an all-groups emit followed by a LIMIT the
+// in-core count-desc top-N can't serve. `before` must be a total order (ties
+// broken on the group key), so the overall best `keep` groups are among the
+// best `keep` of any partition of the groups, and the emit returns only those
+// of each fill worker's bucket range. The caller (the pipeline) owns the
+// context and still takes its final top rows from what the emit returns.
+pub const EmitRank = struct {
+    ctx: ?*anyopaque,
+    before: *const fn (?*anyopaque, TopRow, TopRow) bool,
+    keep: usize,
+};
+
 const ALL_GROUPS_FILL_ROWS_PER_WORKER: usize = 65536;
+
+fn bucketGroupOffsets(allocator: Allocator, buckets: []PipeBucket) ![]usize {
+    const cum = try allocator.alloc(usize, buckets.len + 1);
+    cum[0] = 0;
+    for (buckets, 0..) |*b, i| cum[i + 1] = cum[i] + b.states.len;
+    return cum;
+}
+
+fn fillWorkerCount(n_workers: usize, total_groups: usize) usize {
+    return @max(1, @min(n_workers, total_groups / ALL_GROUPS_FILL_ROWS_PER_WORKER));
+}
+
+// Ends fill worker `w` (1-based) of `workers` where the running group total
+// `cum` reaches its equal share, so each worker's bucket range holds about the
+// same number of groups.
+fn bucketRangeEnd(cum: []const usize, b_start: usize, w: usize, workers: usize) usize {
+    const bucket_count = cum.len - 1;
+    if (w == workers) return bucket_count;
+    const target = cum[bucket_count] * w / workers;
+    var b_end = b_start;
+    while (b_end < bucket_count and cum[b_end] < target) b_end += 1;
+    return b_end;
+}
 
 /// Numeric all-groups result (no string/UDAF payload, no cap, no HAVING
 /// filter): one append sized to the group total, filled from the bucket
@@ -3456,16 +3491,14 @@ const ALL_GROUPS_FILL_ROWS_PER_WORKER: usize = 65536;
 /// per-row `append` this replaces spent most of a multi-million-group emit
 /// on one thread, growing the list and copying 200-byte rows.
 fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.ArrayListUnmanaged(TopRow), n_workers: usize) !void {
-    const cum = try allocator.alloc(usize, buckets.len + 1);
+    const cum = try bucketGroupOffsets(allocator, buckets);
     defer allocator.free(cum);
-    cum[0] = 0;
-    for (buckets, 0..) |*b, i| cum[i + 1] = cum[i] + b.states.len;
     const total = cum[buckets.len];
     if (total == 0) return;
     try out.ensureTotalCapacityPrecise(allocator, out.items.len + total);
     const dst = out.items.ptr[out.items.len .. out.items.len + total];
     out.items.len += total;
-    const workers: usize = @max(1, @min(n_workers, total / ALL_GROUPS_FILL_ROWS_PER_WORKER));
+    const workers = fillWorkerCount(n_workers, total);
     if (workers <= 1) {
         fillAllGroupRows(buckets, dst);
         return;
@@ -3476,13 +3509,7 @@ fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.A
     defer allocator.free(threads);
     var b_start: usize = 0;
     for (jobs, 1..) |*job, w| {
-        var b_end = b_start;
-        if (w == workers) {
-            b_end = buckets.len;
-        } else {
-            const target = total * w / workers;
-            while (b_end < buckets.len and cum[b_end] < target) b_end += 1;
-        }
+        const b_end = bucketRangeEnd(cum, b_start, w, workers);
         job.* = .{ .buckets = buckets[b_start..b_end], .dst = dst[cum[b_start]..cum[b_end]] };
         b_start = b_end;
     }
@@ -3510,6 +3537,105 @@ fn fillAllGroupRows(buckets: []PipeBucket, dst: []TopRow) void {
     }
     std.debug.assert(pos == dst.len);
 }
+
+/// Numeric ranked result (no string/UDAF payload, no cap): up to `n_workers`
+/// threads each keep the best `rank.keep` groups of a disjoint bucket range
+/// that pass `filter`, so only workers × keep rows reach the caller's final
+/// selection, which would otherwise walk every group on one thread.
+fn emitRankedGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.ArrayListUnmanaged(TopRow), n_workers: usize, filter: ?EmitFilter, rank: EmitRank) !void {
+    const cum = try bucketGroupOffsets(allocator, buckets);
+    defer allocator.free(cum);
+    const total = cum[buckets.len];
+    if (total == 0 or rank.keep == 0) return;
+    const workers = fillWorkerCount(n_workers, total);
+    const jobs = try allocator.alloc(RankedFillJob, workers);
+    defer allocator.free(jobs);
+    var jobs_ready: usize = 0;
+    defer for (jobs[0..jobs_ready]) |*job| allocator.free(job.set.items);
+    var b_start: usize = 0;
+    for (jobs, 1..) |*job, w| {
+        const b_end = bucketRangeEnd(cum, b_start, w, workers);
+        const items = try allocator.alloc(TopRow, @min(rank.keep, cum[b_end] - cum[b_start]));
+        job.* = .{ .buckets = buckets[b_start..b_end], .filter = filter, .set = .{ .items = items, .ctx = rank.ctx, .before = rank.before } };
+        jobs_ready += 1;
+        b_start = b_end;
+    }
+    if (workers <= 1) {
+        rankedFillWorker(&jobs[0]);
+    } else {
+        const threads = try allocator.alloc(?std.Thread, workers);
+        defer allocator.free(threads);
+        for (jobs, threads) |*job, *t| {
+            t.* = std.Thread.spawn(.{}, rankedFillWorker, .{job}) catch null;
+            if (t.* == null) rankedFillWorker(job);
+        }
+        for (threads) |t| if (t) |th| th.join();
+    }
+    for (jobs) |*job| try out.appendSlice(allocator, job.set.items[0..job.set.len]);
+}
+
+// Ranking pays while each fill worker keeps under half the groups of its
+// bucket range. Past that its set holds nearly every group it walks, the rows
+// returned are about all the groups, and the sets only add a second copy.
+fn rankPays(keep: usize, total_groups: u64, n_workers: usize) bool {
+    const total: usize = @intCast(total_groups);
+    return (keep *| 2) *| fillWorkerCount(n_workers, total) < total;
+}
+
+const RankedFillJob = struct { buckets: []PipeBucket, filter: ?EmitFilter, set: RankedSet };
+
+fn rankedFillWorker(job: *RankedFillJob) void {
+    for (job.buckets) |*bucket| {
+        var gid: usize = 0;
+        while (gid < bucket.states.len) : (gid += 1) {
+            const row = topRowFromState(bucket.states.ref(gid));
+            if (job.filter) |f| if (!f.pass(f.ctx, row)) continue;
+            job.set.consider(row);
+        }
+    }
+}
+
+/// The best `items.len` rows under `before` (see EmitRank), kept like TopSet
+/// as a heap rooted at the worst retained row: a row that misses the cut costs
+/// one comparison, a replacement O(log items.len).
+pub const RankedSet = struct {
+    items: []TopRow,
+    len: usize = 0,
+    ctx: ?*anyopaque,
+    before: *const fn (?*anyopaque, TopRow, TopRow) bool,
+
+    fn worse(self: *const RankedSet, a: TopRow, b: TopRow) bool {
+        return self.before(self.ctx, b, a);
+    }
+
+    pub fn consider(self: *RankedSet, cand: TopRow) void {
+        if (self.len < self.items.len) {
+            var i = self.len;
+            self.items[i] = cand;
+            self.len += 1;
+            while (i > 0) {
+                const parent = (i - 1) / 2;
+                if (!self.worse(self.items[i], self.items[parent])) break;
+                std.mem.swap(TopRow, &self.items[i], &self.items[parent]);
+                i = parent;
+            }
+            return;
+        }
+        if (self.items.len == 0 or !self.before(self.ctx, cand, self.items[0])) return;
+        self.items[0] = cand;
+        var i: usize = 0;
+        while (true) {
+            const left = 2 * i + 1;
+            const right = left + 1;
+            var w = i;
+            if (left < self.len and self.worse(self.items[left], self.items[w])) w = left;
+            if (right < self.len and self.worse(self.items[right], self.items[w])) w = right;
+            if (w == i) break;
+            std.mem.swap(TopRow, &self.items[i], &self.items[w]);
+            i = w;
+        }
+    }
+};
 
 inline fn topRowFromState(ref: StateRef) TopRow {
     var row: TopRow = .{
@@ -6689,6 +6815,8 @@ pub const RunConfig = struct {
     // Per-group predicate applied during the all-groups emit (HAVING for a
     // capped unordered LIMIT). Only passing groups count toward the cap.
     result_emit_filter: ?EmitFilter = null,
+    // The caller's ORDER BY ... LIMIT over the all-groups emit; see EmitRank.
+    result_rank: ?EmitRank = null,
     trace_timing: bool = false,
     workspace: ?*SiloGridWorkspace = null,
 };
@@ -7263,10 +7391,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (cfg.result_all_groups) {
             const cap = cfg.result_all_groups_cap;
             const filter = cfg.result_emit_filter;
-            const numeric_uncapped = !has_str_out and !has_udf_out and cap == 0 and filter == null;
+            const numeric = !has_str_out and !has_udf_out and cap == 0;
+            const rank: ?EmitRank = if (cfg.result_rank) |r| (if (numeric and rankPays(r.keep, group_count, n_workers)) r else null) else null;
+            const numeric_uncapped = numeric and filter == null and rank == null;
+            if (rank) |r| try emitRankedGroupsNumeric(allocator, buckets, out, n_workers, filter, r);
             if (numeric_uncapped) try emitAllGroupsNumeric(allocator, buckets, out, n_workers);
             emit_all: for (buckets) |*bucket| {
-                if (numeric_uncapped) break;
+                if (numeric_uncapped or rank != null) break;
                 if (cap != 0 and out.items.len >= cap) break;
                 if (has_str_out or has_udf_out) {
                     const has_concat_out = cfg.group_rows_layout.has_concat;
