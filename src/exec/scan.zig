@@ -3973,15 +3973,7 @@ pub const Scan = struct {
                 else => return false,
             };
             const plan = predicate.compileLike(lp.pattern);
-            for (0..rg_count) |i| {
-                if (active) |a| {
-                    if (!a[i]) {
-                        out[i] = false;
-                        continue;
-                    }
-                }
-                out[i] = view.isValid(i) and (plan.match(sv.rowBytes(i)) != negate);
-            }
+            predicate.likeRows(view, sv, &plan, negate, rg_count, out, active);
             return true;
         }
         return false;

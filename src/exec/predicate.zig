@@ -1395,11 +1395,19 @@ pub const LikePlan = struct {
                 if (start < pos or !std.mem.eql(u8, text[start..], seg)) return false;
                 pos = text.len;
             } else {
-                const found = findSubstring(text, pos, seg) orelse return false;
+                const found = simd.indexOfSubstringPos(text, pos, seg) orelse return false;
                 pos = found + seg.len;
             }
         }
         return true;
+    }
+
+    /// The segment every match holds at no fixed position: the first, unless
+    /// the pattern is anchored at the start (or has no segment, or needs the
+    /// general matcher).
+    pub fn floatingSegment(self: *const LikePlan) ?[]const u8 {
+        if (self.general or self.empty or self.nseg == 0 or self.anchored_start) return null;
+        return self.segs[0];
     }
 };
 
@@ -1424,23 +1432,73 @@ pub fn compileLike(pattern: []const u8) LikePlan {
     return plan;
 }
 
-/// Find `needle` in `haystack` at or after `start`. Seeds on the first byte
-/// via `indexOfScalarPos` (a vectorized memchr) and confirms the rest with
-/// `eql` — no per-call skip-table setup, which matters when this runs once per
-/// row over millions of rows. Returns the match offset, or null.
-fn findSubstring(haystack: []const u8, start: usize, needle: []const u8) ?usize {
-    if (needle.len == 0) return start;
-    if (needle.len > haystack.len) return null;
-    if (needle.len == 1) return std.mem.indexOfScalarPos(u8, haystack, start, needle[0]);
-    const last = haystack.len - needle.len;
-    var i = start;
-    while (i <= last) {
-        const p = std.mem.indexOfScalarPos(u8, haystack, i, needle[0]) orelse return null;
-        if (p > last) return null;
-        if (std.mem.eql(u8, haystack[p + 1 ..][0 .. needle.len - 1], needle[1..])) return p;
-        i = p + 1;
+/// `mask[i] = (row i [NOT] LIKE plan)` over string rows [0, n): false for a
+/// NULL row and for one `active` already eliminated. A pattern whose first
+/// segment floats (`%seg...`) finds that segment's hits in one search over
+/// the rows' concatenated bytes when most rows are live, and matches the full
+/// pattern only in the rows those hits land in: no per-row search setup, and
+/// the vector steps run straight across row boundaries.
+pub fn likeRows(view: ColumnView, sv: storage.StringView, plan: *const LikePlan, negate: bool, n: usize, mask: []bool, active: ?[]const bool) void {
+    if (plan.floatingSegment()) |seg| {
+        if (mostlyActive(active, n)) {
+            markRowsContaining(sv, n, seg, mask);
+            const decided = plan.nseg == 1 and !plan.anchored_end;
+            for (0..n) |i| {
+                const live = (if (active) |a| a[i] else true) and view.isValid(i);
+                const hit = mask[i] and (decided or plan.match(sv.rowBytes(i)));
+                mask[i] = live and hit != negate;
+            }
+            return;
+        }
     }
-    return null;
+    for (0..n) |i| {
+        const live = (if (active) |a| a[i] else true) and view.isValid(i);
+        mask[i] = live and plan.match(sv.rowBytes(i)) != negate;
+    }
+}
+
+// The whole-block search reads every row's bytes, dead or alive. Under three
+// quarters alive, the extra reads cost more than the per-row setup saved
+// (a `SearchPhrase <> ''`-filtered Title LIKE measured 2% slower at a quarter).
+fn mostlyActive(active: ?[]const bool, n: usize) bool {
+    const a = active orelse return true;
+    var alive: usize = 0;
+    for (a[0..n]) |b| alive += @intFromBool(b);
+    return alive * 4 >= n * 3;
+}
+
+/// `mask[i]` = row i holds `seg`, for rows [0, n): each hit in the rows'
+/// concatenated bytes is credited to the row whose span holds it whole, and
+/// the search resumes at the next row.
+fn markRowsContaining(sv: storage.StringView, n: usize, seg: []const u8, mask: []bool) void {
+    @memset(mask[0..n], false);
+    if (n == 0) return;
+    const offsets = sv.offsets[0 .. n + 1];
+    const bytes = sv.bytes[0..offsets[n]];
+    var pos: usize = offsets[0];
+    var row: usize = 0;
+    while (simd.indexOfSubstringPos(bytes, pos, seg)) |hit| {
+        row = rowHolding(offsets, row, hit);
+        const row_end = offsets[row + 1];
+        if (hit + seg.len <= row_end) {
+            mask[row] = true;
+            pos = row_end;
+        } else {
+            pos = hit + 1;
+        }
+    }
+}
+
+// The row holding byte `at`: the last row from `from` on that starts at or
+// before it. Requires offsets[from] <= at < offsets[last].
+fn rowHolding(offsets: []const u32, from: usize, at: usize) usize {
+    var lo = from;
+    var hi = offsets.len - 1;
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (offsets[mid] <= at) lo = mid else hi = mid;
+    }
+    return lo;
 }
 
 /// Evaluate a full boolean predicate over a Batch (typed columns +
@@ -2902,13 +2960,7 @@ pub fn evaluateLikeMask(view: ColumnView, pattern: []const u8, n: usize, mask: [
     // Compile the pattern once per batch, then match each row against the plan.
     const plan = compileLike(pattern);
     switch (view.data) {
-        .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
-            if (active) |act| {
-                for (0..n) |i| mask[i] = act[i] and view.isValid(i) and plan.match(sv.rowBytes(i));
-            } else {
-                for (0..n) |i| mask[i] = view.isValid(i) and plan.match(sv.rowBytes(i));
-            }
-        },
+        .varchar, .string, .char, .json, .nested, .bitmap => |sv| likeRows(view, sv, &plan, false, n, mask, active),
         else => return Error.UnsupportedOperatorForType,
     }
 }
@@ -3706,4 +3758,53 @@ test "validateExpr raises on a constant no date reads, and drops it from a set" 
     var set: PredicateExpr = .{ .in_set = .{ .col = "d", .values = &values, .negate = false, .value_type = .string } };
     try validateExpr(&set, &schema);
     try t.expectEqualSlices(Value, &.{.{ .date = 20722 }}, set.in_set.values);
+}
+
+test "likeRows: the whole-block segment search agrees with the per-row matcher" {
+    var prng = std.Random.DefaultPrng.init(0x11ce);
+    const rand = prng.random();
+    const n = 300;
+    var bytes: [n * 12]u8 = undefined;
+    var offsets: [n + 1]u32 = undefined;
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    var dense: [n]bool = undefined;
+    var sparse: [n]bool = undefined;
+    var mask: [n]bool = undefined;
+    // A short alphabet and short rows put hits everywhere, including across
+    // row boundaries and in empty rows' neighbours.
+    const patterns = [_][]const u8{ "%ab%", "%abc%", "%a%", "%ab%c%", "%ab", "%cab%ba", "ab%", "%%", "_b%", "%abcab%" };
+    for (0..20) |_| {
+        var at: u32 = 0;
+        for (0..n) |i| {
+            offsets[i] = at;
+            const len = rand.uintLessThan(u32, 13);
+            for (bytes[at..][0..len]) |*b| b.* = "abc"[rand.uintLessThan(usize, 3)];
+            at += len;
+        }
+        offsets[n] = at;
+        rand.bytes(&nulls);
+        for (&dense, &sparse) |*d, *s| {
+            d.* = rand.uintLessThan(u8, 10) != 0;
+            s.* = rand.uintLessThan(u8, 10) == 0;
+        }
+        const sv: storage.StringView = .{ .offsets = &offsets, .bytes = bytes[0..at] };
+        for ([_]?[]const u8{ null, &nulls }) |bitmap| {
+            const view: ColumnView = .{ .data = .{ .varchar = sv }, .nulls = bitmap };
+            for (patterns) |pattern| {
+                const plan = compileLike(pattern);
+                for ([_]?[]const bool{ null, &dense, &sparse }) |active| {
+                    for ([_]bool{ false, true }) |negate| {
+                        for ([_]usize{ 0, 1, 37, n }) |rows| {
+                            likeRows(view, sv, &plan, negate, rows, &mask, active);
+                            for (0..rows) |i| {
+                                const live = (if (active) |a| a[i] else true) and view.isValid(i);
+                                const want = live and like_pattern.match(sv.rowBytes(i), pattern) != negate;
+                                try std.testing.expectEqual(want, mask[i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
