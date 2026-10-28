@@ -1338,8 +1338,11 @@ subject to the ordinary allocation budget. These programs use reclaimable
 workspace allocation even when the diagnostic arena-workspace option is set.
 
 Count-only grouped programs use immediate updates while a bucket's live state
-is below 2 MiB. Larger live states prefetch existing accumulator records and hold
-up to sixteen pending count increments per worker's batch in stack storage. This
+is below 128 KiB, small enough to stay in a core's private cache through a fold
+round. Other buckets fold between a bucket's rounds, so a larger bucket's records
+are usually evicted by its next round. Larger live states prefetch existing
+accumulator records and hold up to sixteen pending count increments per worker's
+batch in stack storage. This
 physical-kernel choice uses actual live bytes and preserves the query plan. The
 batch reserves state capacity before probing, so these record addresses remain
 valid until every pending increment is applied. New groups initialize their
