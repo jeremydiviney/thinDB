@@ -1053,7 +1053,7 @@ test "a NOT IN subquery whose WHERE reads only the outer row runs once, not over
     defer tmp.cleanup();
     // Paired with every outer value, the subquery's rows would be 6M, far
     // past the budget; run once, they are 2,000.
-    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .query_memory_budget = 16 << 20 });
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .memory_budget = 16 << 20 });
     defer db.close();
     try exec(allocator, db, "CREATE TABLE g0 (c0 INT, c1 VARCHAR(20))");
     try exec(allocator, db, "CREATE TABLE g1 (c0 INT, c1 VARCHAR(20))");

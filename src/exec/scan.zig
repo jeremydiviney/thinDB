@@ -732,8 +732,8 @@ pub const Scan = struct {
         }
     };
 
-    /// Standalone scan: mints + owns its own accountant from the table's
-    /// configured budget. Used by the raw builder API and tests.
+    /// Standalone scan: mints + owns its own accountant on the table's
+    /// memory pool. Used by the raw builder API and tests.
     pub fn create(allocator: Allocator, table: *Table) !Query {
         return createWithAccountant(allocator, table, null);
     }
@@ -1026,14 +1026,14 @@ pub const Scan = struct {
         const memtable_row_count = snap.memtable_row_count;
 
         // Use the injected query-scoped accountant when present. Otherwise
-        // mint our own from the table's configured budget (heap-allocated
-        // so all operators in the pipeline share it via a pointer) and own
-        // its lifetime.
+        // mint our own on the table's memory pool (heap-allocated so all
+        // operators in the pipeline share it via a pointer) and own its
+        // lifetime.
         var owned_accountant: ?*exec.memory.MemoryAccountant = statement_accountant;
         var owns_accountant = false;
-        if (owned_accountant == null and (table.query_memory_budget > 0 or table.memory_pool != null)) {
+        if (owned_accountant == null) {
             const acc = try allocator.create(exec.memory.MemoryAccountant);
-            acc.* = exec.memory.MemoryAccountant.initWithPool(table.query_memory_budget, table.memory_pool);
+            acc.* = exec.memory.MemoryAccountant.init(table.memory_pool);
             acc.trackAllocations(table.allocator);
             acc.retainGate(table.statement_gate) catch |err| {
                 allocator.destroy(acc);
@@ -5036,7 +5036,7 @@ pub const Scan = struct {
     fn buildFilterMemo(self: *const Scan) FilterMemo {
         var memo: FilterMemo = .{};
         const expr = self.fused_filter orelse return memo;
-        if (!self.table.cache.predicate_memo.enabled or memoSwitchedOff()) return memo;
+        if (self.table.cache.predicate_memo.slot_count == 0 or memoSwitchedOff()) return memo;
         memo.whole = predicate.digest(expr);
         switch (expr) {
             .@"and" => |arms| if (arms.len >= 2) {

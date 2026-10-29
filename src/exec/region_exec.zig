@@ -6400,8 +6400,9 @@ test "region pool: repeated runs reuse cleared state; cap evicts at release" {
     var result = try RegionResult.init(alloc, prog.output_schema, 4);
     defer result.deinit();
 
+    var memory_pool = exec.memory.MemoryPool.init(128 << 20);
     for (0..2) |_| {
-        var account = exec.memory.MemoryAccountant.init(128 << 20);
+        var account = exec.memory.MemoryAccountant.init(&memory_pool);
         account.trackAllocations(alloc);
         try pool.beginAccounting(&account);
         defer if (pool.tracker.?.active != null) pool.endAccounting();

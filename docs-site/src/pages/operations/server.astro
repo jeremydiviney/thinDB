@@ -31,9 +31,7 @@ const headings = [
   --max-connections 256 \
   --idle-timeout-secs 1800 \
   --max-dop 8 \
-  --memory-budget 16G \
-  --query-memory-budget 4G \
-  --cache-size 8G`} />
+  --memory-budget 16G`} />
   <p>Pass bytes directly or use <code>K</code>, <code>M</code>, and <code>G</code> suffixes where supported. The data directory is created if absent.</p>
 
   <h2 id="config-file">Configuration file</h2>
@@ -45,9 +43,7 @@ mysql-port = 13310
 pg-port = 0
 native-port = 0
 mysql-password = change-me       # read into memory, never in ps
-cache-size = 12G
-memory-budget = 8G
-query-memory-budget = 4294967296 # raw bytes only (no suffix)
+memory-budget = 16G
 max-dop = 16
 no-wal = false
 no-fsync = false`} />
@@ -81,13 +77,13 @@ no-fsync = false`} />
   </tbody></table></div>
   <p>Both are for disposable data directories whose data can be reimported, such as benchmarks. The server log states at startup whether fsync is on. See <a href={withBase('/operations/storage/#durability')}>Storage and durability</a>.</p>
 
-  <h2 id="memory">Memory budgets</h2>
+  <h2 id="memory">Memory budget</h2>
   <div class="table-scroll"><table><thead><tr><th>Flag</th><th>Automatic behavior</th><th>Controls</th></tr></thead><tbody>
-    <tr><td><code>--query-memory-budget B</code></td><td>Approximately 25% of usable RAM, floor 256 MiB.</td><td>One query's blocking operators.</td></tr>
-    <tr><td><code>--memory-budget B</code></td><td>Approximately 50% of usable RAM, floor 256 MiB.</td><td>Shared reservations across concurrent queries.</td></tr>
-    <tr><td><code>--cache-size B</code></td><td>Approximately 35% of usable RAM, floor 256 MiB.</td><td>One global decompressed block buffer pool shared by every table.</td></tr>
+    <tr><td><code>--memory-budget B</code></td><td>Approximately 65% of usable RAM, floor 256 MiB.</td><td>The one budget for running queries, the decompressed block cache shared by every table, its predicate memo, and idle scratch buffers.</td></tr>
+    <tr><td><code>--min-cache-size B</code></td><td>A tenth of the budget.</td><td>The least of the budget the block cache keeps; queries can never take it.</td></tr>
+    <tr><td><code>--predicate-memo-size B</code></td><td>1/1024 of the budget.</td><td>Memo of row groups a scan predicate matched nothing of; <code>0</code> turns it off.</td></tr>
   </tbody></table></div>
-  <p>Sorts, hash group-by, hash-join build sides, sort-merge buffers, and materialization reserve query memory. The decompressed block cache is a separate bucket. A tracked budget of <code>0</code> disables that tracker. Usable RAM is physical memory capped by the process's cgroup limit, so a container limit or a systemd <code>MemoryMax</code> sizes the automatic budgets.</p>
+  <p>Sorts, hash group-by, hash-join build sides, sort-merge buffers, and materialization reserve query memory. Queries together may take everything but the cache's minimum and the memo; the block cache grows into whatever they leave and gives it back, coldest blocks first, as they grow. No query has a ceiling of its own. Usable RAM is physical memory capped by the process's cgroup limit, so a container limit or a systemd <code>MemoryMax</code> sizes the automatic budget.</p>
   <Callout type="warning" title="No spill"><p>Blocking operators do not spill to disk. A query that cannot fit its estimated or actual budget fails with <code>MemoryBudgetExceeded</code> instead of silently degrading.</p></Callout>
 
   <h2 id="parallelism-and-compaction">Parallelism and compaction</h2>

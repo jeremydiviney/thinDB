@@ -48,8 +48,7 @@ services:
     command: >
       bash -c "cp /bin_ro/thindb-server /tmp/thindb-server && chmod +x /tmp/thindb-server &&
       exec /tmp/thindb-server --data-dir /data --bind 0.0.0.0 --mysql-port 13310
-      --pg-port 0 --native-port 0 --cache-size 1G --memory-budget 2G
-      --query-memory-budget 1073741824 --max-dop 4"
+      --pg-port 0 --native-port 0 --memory-budget 2G --max-dop 4"
     ports:
       - "13399:13310"
     volumes:

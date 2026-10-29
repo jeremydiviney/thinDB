@@ -57,8 +57,8 @@ def start(archive, output, data, dop, profile, nodelay=None, trace_joins=False):
     if available < 28 * 2**30:
         raise RuntimeError('Less than 28 GiB available for unchanged 20 GiB ceiling and 8 GiB headroom')
     args = [str(binary), '--data-dir', str(data), '--bind', '127.0.0.1', '--mysql-port', '13311',
-            '--pg-port', '0', '--native-port', '0', '--max-dop', str(dop), '--cache-size', '2G',
-            '--memory-budget', '16G', '--query-memory-budget', '16G', '--no-compaction']
+            '--pg-port', '0', '--native-port', '0', '--max-dop', str(dop),
+            '--memory-budget', '16G', '--no-compaction']
     if profile:
         args += ['--profile-ops']
     service = ['sudo', '-n', 'systemd-run', '--unit=' + UNIT, '--uid=ubuntu', '--collect',

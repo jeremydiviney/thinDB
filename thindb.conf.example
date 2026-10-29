@@ -22,10 +22,10 @@ native-port = 0
 # pg-password = change-me
 
 # --- memory (accept a K/M/G suffix; omit for the RAM-fraction auto-default) ---
-cache-size = 12G
-memory-budget = 8G
-# query-memory-budget takes RAW BYTES only (no suffix): 4G = 4294967296
-query-memory-budget = 4294967296
+# One budget for queries, the block cache and its predicate memo.
+memory-budget = 16G
+# min-cache-size = 1600M      # default: a tenth of the budget
+# predicate-memo-size = 16M   # default: 1/1024 of the budget; 0 = off
 
 # --- execution ---
 max-dop = 16

@@ -24,16 +24,12 @@ const Probe = struct {
     }
 };
 
-test "cancellation propagates through eager CTEs and blocking SQL paths with budgets disabled" {
+test "cancellation propagates through eager CTEs and blocking SQL paths" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db = try api.Database.open(a, io, tmp.dir, .{
-        .query_memory_budget = 0,
-        .memory_budget = 0,
-        .max_dop = 2,
-    });
+    const db = try api.Database.open(a, io, tmp.dir, .{ .max_dop = 2 });
     defer db.close();
     var probe = Probe{};
     try db.registerScalarUdf(.{

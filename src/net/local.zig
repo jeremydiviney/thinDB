@@ -1191,21 +1191,16 @@ pub const CompileCtx = struct {
         return g;
     }
 
-    /// The query-scoped accountant, created on first use from the
-    /// Database's resolved per-query budget and the Catalog's shared
-    /// cross-query pool. Returns null only when both are disabled
-    /// (budget 0, no pool).
-    pub fn queryAccountant(self: *CompileCtx) !?*exec.memory.MemoryAccountant {
+    /// The query-scoped accountant on the Catalog's memory pool, created on
+    /// first use.
+    pub fn queryAccountant(self: *CompileCtx) !*exec.memory.MemoryAccountant {
         if (self.accountant) |a| return a;
-        const pool = self.catalog.config.memory_pool;
-        const budget = thindb_api.autoQueryBudgetBytes(self.catalog.config.query_memory_budget, pool != null);
-        if (budget == 0 and pool == null and self.cancel_flag == null) return null;
         const snapshots = try self.catalog.allocator.create(exec.Scan.StatementSnapshots);
         errdefer self.catalog.allocator.destroy(snapshots);
         snapshots.* = .{ .gpa = self.catalog.allocator };
         const acc = try self.catalog.allocator.create(exec.memory.MemoryAccountant);
         errdefer self.catalog.allocator.destroy(acc);
-        acc.* = exec.memory.MemoryAccountant.initWithPool(budget, pool);
+        acc.* = exec.memory.MemoryAccountant.init(self.catalog.config.memory_pool.?);
         acc.cancel_flag = self.cancel_flag;
         acc.table_snapshots = snapshots;
         acc.connection_id = self.connection_id;

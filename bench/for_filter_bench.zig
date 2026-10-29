@@ -64,7 +64,7 @@ pub fn run(allocator: Allocator, io: Io) !void {
     var dir = try freshDir(io, ".bench-data/for_filter");
     defer dir.close(io);
 
-    var db = try thindb.Database.open(allocator, io, dir, .{ .cache_size_bytes = CACHE_BYTES });
+    var db = try thindb.Database.open(allocator, io, dir, .{ .memory_budget = CACHE_BYTES });
     defer db.close();
     const t = try db.table("t", schema, options);
 

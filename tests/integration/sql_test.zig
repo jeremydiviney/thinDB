@@ -1863,7 +1863,7 @@ test "sql: ORDER BY ... LIMIT stays within a tight memory budget (Top-N)" {
     // Include operator metadata in the budget; a full sort still needs more
     // than the ceiling while the bounded result fits.
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 64 * 1024,
+        .memory_budget = 64 * 1024,
         .row_group_size = 128,
     });
     defer db.close();
@@ -3515,7 +3515,7 @@ test "sql: a materialized CTE is charged against the memory budget" {
     defer tmp.cleanup();
     // The ceiling includes setup as well as retained row buffers.
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 64 * 1024,
+        .memory_budget = 64 * 1024,
         .row_group_size = 128,
     });
     defer db.close();
@@ -3632,7 +3632,6 @@ fn runRollforward(allocator: std.mem.Allocator, budget: usize) !RollforwardRun {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = budget,
         .memory_budget = budget,
         .auto_flush_secs = 0,
         .max_dop = 4,
@@ -3735,7 +3734,6 @@ fn runStageChain(allocator: std.mem.Allocator, rows: usize, depth: usize, rejoin
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = 4,
@@ -3813,7 +3811,6 @@ test "sql: a GROUP BY whose first key fixes the second sizes for its groups, not
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = 1,
@@ -3869,7 +3866,6 @@ test "sql: a borrowed stage over a few rows of a large table holds those rows, n
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-            .query_memory_budget = 1 << 30,
             .memory_budget = 1 << 30,
             .auto_flush_secs = 0,
             .max_dop = dop,
@@ -3926,7 +3922,6 @@ test "sql: blocking paths release all actual capacity at teardown" {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-                .query_memory_budget = 64 << 20,
                 .memory_pool = &pool,
                 .row_group_size = 8,
             });
@@ -5037,7 +5032,6 @@ test "sql: a GROUP BY buffers only the columns its keys and aggregates read" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = 4,
@@ -5090,7 +5084,6 @@ fn runBigints(allocator: std.mem.Allocator, db: anytype, sql: []const u8, out: *
 
 fn openWide(allocator: std.mem.Allocator, dir: std.Io.Dir, row_group_size: usize, max_dop: usize, rows: usize) !*thindb.Database {
     const db = try thindb.Database.open(allocator, std.testing.io, dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = max_dop,

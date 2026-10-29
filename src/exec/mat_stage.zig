@@ -1757,8 +1757,9 @@ test "stage captures pipeline stats and tightens them after the run" {
 test "a tracked stage result stops counting against the budget when its last reader finishes" {
     const a = std.testing.allocator;
     const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    var memory_pool = exec.memory.MemoryPool.init(64 << 20);
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.init(64 << 20);
+    account.* = exec.memory.MemoryAccountant.init(&memory_pool);
     account.trackAllocations(a);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();

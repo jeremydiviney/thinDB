@@ -74,27 +74,18 @@ const usage_text =
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
     \\  --memory-budget B       The server's one memory budget (default: auto, ~65% of usable RAM,
-    \\                          floored at 256 MiB). Running queries, the block cache, its
-    \\                          predicate memo and idle scratch buffers all share it: queries
-    \\                          may take all but a tenth (the cache's floor), and the cache
-    \\                          grows into whatever they leave. Accepts raw bytes or a K/M/G
-    \\                          suffix. 0 disables the shared budget (the cache and each query
-    \\                          then get budgets of their own).
-    \\  --query-memory-budget B Per-query memory ceiling inside --memory-budget (default: none,
-    \\                          a query may use what the shared budget gives queries; ~25% of
-    \\                          usable RAM with --memory-budget 0). Also gates the hash-vs-sort
-    \\                          GROUP BY decision. Accepts raw bytes or a K/M/G suffix. 0
-    \\                          disables tracking.
-    \\  --cache-size B          Ceiling of the GLOBAL decompressed-block cache, shared by every
-    \\                          table across all databases (default: auto, the whole
-    \\                          --memory-budget; ~35% of usable RAM with --memory-budget 0).
-    \\                          Accepts raw bytes or a K/M/G suffix (e.g. 8G). The LRU evicts
-    \\                          the coldest block process-wide; blocks in use are pinned and
-    \\                          never evicted.
-    \\  --no-predicate-memo     Don't remember which row groups a scan predicate matched nothing
-    \\                          of (default: on, 1/1024 of the cache's ceiling). With it on, a
-    \\                          repeated predicate, or one sharing an AND arm with an earlier
-    \\                          one, skips those row groups unread.
+    \\                          floored at 256 MiB). Running queries, the block cache of every
+    \\                          table, its predicate memo and idle scratch buffers all share it:
+    \\                          queries may take all but the cache's minimum and the memo, and
+    \\                          the cache grows into whatever they leave, evicting the coldest
+    \\                          block process-wide. Accepts raw bytes or a K/M/G suffix.
+    \\  --min-cache-size B      The least of --memory-budget the block cache keeps; queries can
+    \\                          never take it (default: a tenth of the budget). Accepts raw bytes
+    \\                          or a K/M/G suffix.
+    \\  --predicate-memo-size B Size of the memo of row groups a scan predicate matched nothing of,
+    \\                          taken from --memory-budget (default: 1/1024 of the budget; 0
+    \\                          turns it off). A repeated predicate, or one sharing an AND arm
+    \\                          with an earlier one, skips those row groups unread.
     \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
     \\                          thindb-server rejects read_csv/read_json/read_parquet and
     \\                          FROM 'file.csv' sources.
@@ -202,11 +193,10 @@ pub fn main(init: std.process.Init) !u8 {
     // must not shed acknowledged rows. --no-wal for disposable bench dirs.
     var enable_wal: bool = true;
     var enable_fsync: bool = true;
-    var predicate_memo: bool = true;
     var idle_timeout_secs: u32 = 0;
-    var query_memory_budget: ?usize = null;
     var memory_budget: ?usize = null;
-    var cache_size_bytes: ?usize = null;
+    var min_cache_bytes: ?usize = null;
+    var predicate_memo_bytes: ?usize = null;
     var max_dop: ?u32 = null;
     var compact_threads: ?u32 = null;
     var file_root: ?[]const u8 = null;
@@ -302,10 +292,6 @@ pub fn main(init: std.process.Init) !u8 {
             enable_fsync = false;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--no-predicate-memo")) {
-            predicate_memo = false;
-            continue;
-        }
         if (try takeU32(arg, "--max-connections", &iter, err_w)) |v| {
             max_connections = v;
             continue;
@@ -322,14 +308,6 @@ pub fn main(init: std.process.Init) !u8 {
             compact_threads = v;
             continue;
         }
-        if (try takeValue(arg, "--query-memory-budget", &iter, err_w)) |v| {
-            query_memory_budget = parseSize(v) catch {
-                try err_w.print("thindb-server: invalid --query-memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
-                try err_w.flush();
-                return 1;
-            };
-            continue;
-        }
         if (try takeValue(arg, "--memory-budget", &iter, err_w)) |v| {
             memory_budget = parseSize(v) catch {
                 try err_w.print("thindb-server: invalid --memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
@@ -338,9 +316,17 @@ pub fn main(init: std.process.Init) !u8 {
             };
             continue;
         }
-        if (try takeValue(arg, "--cache-size", &iter, err_w)) |v| {
-            cache_size_bytes = parseSize(v) catch {
-                try err_w.print("thindb-server: invalid --cache-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
+        if (try takeValue(arg, "--min-cache-size", &iter, err_w)) |v| {
+            min_cache_bytes = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --min-cache-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
+        if (try takeValue(arg, "--predicate-memo-size", &iter, err_w)) |v| {
+            predicate_memo_bytes = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --predicate-memo-size: {s} (use bytes, or a K/M/G suffix)\n", .{v});
                 try err_w.flush();
                 return 1;
             };
@@ -387,10 +373,9 @@ pub fn main(init: std.process.Init) !u8 {
     const cfg: thindb.Config = .{
         .max_connections = max_connections,
         .idle_timeout_secs = idle_timeout_secs,
-        .query_memory_budget = query_memory_budget orelse (thindb.Config{}).query_memory_budget,
-        .memory_budget = memory_budget orelse (thindb.Config{}).memory_budget,
-        .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
-        .predicate_memo = predicate_memo,
+        .memory_budget = memory_budget,
+        .min_cache_bytes = min_cache_bytes,
+        .predicate_memo_bytes = predicate_memo_bytes,
         .max_dop = if (max_dop) |v| v else thindb.hardwareThreadCount(),
         .data_root_path = data_dir,
         // Server default is auto (half the cores) rather than the embedded
@@ -403,6 +388,14 @@ pub fn main(init: std.process.Init) !u8 {
         // whole segments (2026-10-24).
         .sync_mode = if (enable_fsync) .per_flush else .none,
     };
+    const sizes = thindb.memorySizes(cfg);
+    if (sizes.min_cache +| sizes.predicate_memo >= sizes.budget) {
+        try err_w.print("thindb-server: --min-cache-size ({d} MiB) and --predicate-memo-size ({d} MiB) leave queries none of --memory-budget ({d} MiB)\n", .{
+            sizes.min_cache >> 20, sizes.predicate_memo >> 20, sizes.budget >> 20,
+        });
+        try err_w.flush();
+        return 1;
+    }
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
         try err_w.flush();
@@ -645,7 +638,7 @@ const HeapReleaseCtx = struct {
     io: Io,
 
     fn run(self: *HeapReleaseCtx) void {
-        const pool = self.catalog.config.memory_pool orelse return;
+        const pool = self.catalog.config.memory_pool.?;
         const poll: Io.Duration = .fromMilliseconds(5000);
         var idle: thindb.memory.IdleRelease = .{ .quiet_checks_needed = 6 };
         while (!stop_flag.load(.acquire)) {
@@ -728,8 +721,6 @@ fn parseBind(bind: []const u8, port: u16) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(bind, port);
 }
 
-/// Parse a byte size: a plain integer, or an integer with a single binary
-/// suffix `K`/`M`/`G` (×1024, ×1024², ×1024³). Case-insensitive on the suffix.
 /// The resolved budgets, so a container operator can see at a glance that
 /// the "auto" sizes came from the cgroup limit rather than the host's RAM.
 fn printMemoryBanner(out_w: anytype, cfg: thindb.Config) !void {
@@ -742,25 +733,17 @@ fn printMemoryBanner(out_w: anytype, cfg: thindb.Config) !void {
     } else {
         try out_w.print("  memory:   usable unknown", .{});
     }
-    const query_budget = thindb.autoQueryBudgetBytes(cfg.query_memory_budget, cfg.memory_pool != null);
-    const cache = cfg.block_cache.?;
-    const pool = cfg.memory_pool orelse {
-        try out_w.print(", cache {d} MiB, query budget {d} MiB, no shared budget\n", .{ cache.capacity_bytes / mib, query_budget / mib });
-        return;
-    };
-    try out_w.print(", budget {d} MiB: queries up to {d} MiB", .{ pool.budget / mib, pool.statementLimit() / mib });
-    if (query_budget != 0) try out_w.print(" (each up to {d} MiB)", .{query_budget / mib});
-    if (cache.shared != pool) {
-        try out_w.print(", cache {d} MiB of its own\n", .{cache.capacity_bytes / mib});
-        return;
-    }
-    try out_w.print(", block cache {d} MiB up to {d} MiB, predicate memo {d} MiB\n", .{
+    const pool = cfg.memory_pool.?;
+    try out_w.print(", budget {d} MiB: queries up to {d} MiB, block cache at least {d} MiB, predicate memo {d} MiB\n", .{
+        pool.budget / mib,
+        pool.statementLimit() / mib,
         pool.cache_floor.load(.monotonic) / mib,
-        cache.capacity_bytes / mib,
         pool.memo_bytes.load(.monotonic) / mib,
     });
 }
 
+/// Parse a byte size: a plain integer, or an integer with a single binary
+/// suffix `K`/`M`/`G` (×1024, ×1024², ×1024³). Case-insensitive on the suffix.
 fn parseSize(s: []const u8) !usize {
     if (s.len == 0) return error.Empty;
     const last = s[s.len - 1];

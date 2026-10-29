@@ -52,7 +52,7 @@ test "tables across databases and schemas share one global block cache" {
     try std.testing.expectEqual(t1.cache, t2.cache);
     try std.testing.expectEqual(t1.cache, t3.cache);
     try std.testing.expectEqual(t1.cache, t4.cache);
-    try std.testing.expect(!t1.owned_cache);
+    try std.testing.expectEqual(t1.cache, t1.memory_pool.cache.?);
     // ...with distinct per-table key namespaces.
     try std.testing.expect(t1.cache_uid != t2.cache_uid);
     try std.testing.expect(t2.cache_uid != t3.cache_uid);
@@ -712,7 +712,9 @@ test "streaming merge: dict-eligible string column round-trips" {
     defer seg.deinit();
 
     // The color column's first block is dict-encoded (low global NDV).
-    var cache = storage.cache.Cache.init(allocator, 1 << 20);
+    var controller = exec.memory.MemoryPool.init(1 << 20);
+    var cache = storage.cache.Cache.init(allocator, &controller, 0);
+    controller.shareCache(&cache, controller.budget);
     defer cache.deinit();
     const tc = storage.cache.TableCache{ .cache = &cache, .table_uid = 0 };
     var block = try seg.borrowColumnBlock(allocator, 0, 1, tc);

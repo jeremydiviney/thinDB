@@ -52,15 +52,15 @@ pub const Catalog = struct {
     /// is rare; no dedicated lock).
     zig_fns: std.ArrayList(zigfn.ZigFnHandle) = .empty,
     databases: std.StringHashMap(*Database),
-    /// The shared cross-query memory pool, when this Catalog minted it from
+    /// The memory controller, when this Catalog minted it from
     /// `Config.memory_budget` (vs. adopting a caller-provided one, which the
     /// caller owns). Destroyed last in `close` — every query's accountant
     /// holds a pointer into it.
     owned_pool: ?*memory.MemoryPool = null,
-    /// The shared decompressed-block cache, when this Catalog minted it from
-    /// `Config.cache_size_bytes` (vs. adopting a caller-provided one, which
-    /// the caller owns). One global budget across every table; destroyed in
-    /// `close` after all databases (and their tables) are gone.
+    /// The decompressed-block cache under the controller, when this Catalog
+    /// minted it (vs. adopting the one a caller-provided pool holds). One
+    /// cache across every table; destroyed in `close` after all databases
+    /// (and their tables) are gone.
     owned_block_cache: ?*storage.cache.Cache = null,
     /// True when the Catalog allocator-owns its struct (the user called
     /// `Catalog.open` and gets a `*Catalog`). False when the Catalog is
@@ -138,38 +138,35 @@ pub const Catalog = struct {
         temp_namespace.sweepStaleTempDirs(io, root_dir);
         storage.retryTransientWindowsRefusal(io, Io.Dir.deleteTree, .{ root_dir, io, database_drop_dir_name }) catch {};
 
-        // The shared cross-query memory pool. A caller-provided pool (multi-
-        // Catalog processes sharing one budget) is adopted as-is; otherwise
-        // one is minted from the resolved budget and owned here. The pointer
-        // rides in the Config copy handed to every Database and Table below.
+        // The memory controller. A caller-provided pool (multi-Catalog
+        // processes sharing one budget) is adopted as-is; otherwise one is
+        // minted from the resolved budget and owned here. The pointer rides
+        // in the Config copy handed to every Database and Table below.
         var cfg = config;
         var owned_pool: ?*memory.MemoryPool = null;
-        if (cfg.memory_pool == null) {
-            const pool_budget = api.autoMemoryBudgetBytes(cfg.memory_budget);
-            if (pool_budget > 0) {
-                const pool = try allocator.create(memory.MemoryPool);
-                pool.* = memory.MemoryPool.init(pool_budget);
-                if (api.totalMemoryBytes()) |usable| pool.limit = usable;
-                owned_pool = pool;
-                cfg.memory_pool = pool;
-            }
-        }
+        const pool = cfg.memory_pool orelse minted: {
+            const p = try allocator.create(memory.MemoryPool);
+            p.* = memory.MemoryPool.init(api.memorySizes(config).budget);
+            if (api.totalMemoryBytes()) |usable| p.limit = usable;
+            owned_pool = p;
+            break :minted p;
+        };
+        cfg.memory_pool = pool;
         errdefer if (owned_pool) |p| allocator.destroy(p);
 
-        // The shared decompressed-block cache — same ownership pattern as the
-        // pool: adopt a caller-provided cache as-is, else mint one. Every
-        // Table opened under this Catalog draws from it, so eviction is
-        // oldest-block-first across all tables. The pool's first cache shares
-        // its budget; any other keeps a budget of its own.
+        // The decompressed-block cache under the controller's budget: the
+        // one a caller-provided pool already holds, else one minted and owned
+        // here. Every Table opened under this Catalog draws from it, so
+        // eviction is oldest-block-first across all tables.
         var owned_block_cache: ?*storage.cache.Cache = null;
-        if (cfg.block_cache == null) {
-            const sharing: ?*memory.MemoryPool = if (cfg.memory_pool) |p| (if (p.cache == null) p else null) else null;
+        if (pool.cache == null) {
+            var sized = config;
+            sized.memory_budget = pool.budget;
+            const sizes = api.memorySizes(sized);
             const bc = try allocator.create(storage.cache.Cache);
-            bc.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes, if (sharing) |p| p.budget else null));
-            bc.predicate_memo.enabled = cfg.predicate_memo;
-            if (sharing) |p| p.shareCache(bc);
+            bc.* = storage.cache.Cache.init(allocator, pool, sizes.predicate_memo);
+            pool.shareCache(bc, sizes.min_cache);
             owned_block_cache = bc;
-            cfg.block_cache = bc;
         }
         errdefer if (owned_block_cache) |bc| {
             bc.deinit();

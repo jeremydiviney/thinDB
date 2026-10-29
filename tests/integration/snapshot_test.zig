@@ -307,7 +307,7 @@ test "snapshot: scans of a table in one statement share its snapshot" {
 
     var snapshots: thindb.exec.Scan.StatementSnapshots = .{ .gpa = allocator };
     defer snapshots.deinit();
-    var acc = thindb.exec.memory.MemoryAccountant.initWithPool(0, null);
+    var acc = thindb.exec.memory.MemoryAccountant.init(o.t.memory_pool);
     acc.table_snapshots = &snapshots;
 
     var first = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);
@@ -337,7 +337,7 @@ test "snapshot: a statement's later scan takes a fresh snapshot once a compactio
 
     var snapshots: thindb.exec.Scan.StatementSnapshots = .{ .gpa = allocator };
     defer snapshots.deinit();
-    var acc = thindb.exec.memory.MemoryAccountant.initWithPool(0, null);
+    var acc = thindb.exec.memory.MemoryAccountant.init(o.t.memory_pool);
     acc.table_snapshots = &snapshots;
     {
         var first = try thindb.exec.scanWithAccountant(allocator, o.t, &acc);

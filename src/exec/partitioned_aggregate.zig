@@ -460,7 +460,7 @@ pub const PartitionedAggregate = struct {
             .views = views,
             .sorted_stream = core == .sort,
             .core = core,
-            .round_bytes = roundBytes(if (up.accountant()) |a| a.budget else null),
+            .round_bytes = roundBytes(if (up.accountant()) |a| a.pool.statementLimit() else null),
             // The key hash spreads the groups evenly over the partitions.
             .core_groups = if (expected_groups > 0) expected_groups / n_parts + @intFromBool(expected_groups % n_parts != 0) else null,
         };
@@ -1741,9 +1741,9 @@ test "PartitionedAggregate over many odd-sized batches of strings, JSON and NULL
     try testing.expectEqual(input.rows, total);
 }
 
-fn testTrackedAccountant(a: Allocator, budget: usize) !*exec.memory.MemoryAccountant {
+fn testTrackedAccountant(a: Allocator, pool: *exec.memory.MemoryPool) !*exec.memory.MemoryAccountant {
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(budget, null);
+    account.* = exec.memory.MemoryAccountant.init(pool);
     account.trackAllocations(a);
     return account;
 }
@@ -1761,7 +1761,8 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
     // Each partition runs one serial aggregate, whose state is sized for a
     // window of new groups however few groups there are.
     const serial_peak = blk: {
-        const account = try testTrackedAccountant(a, 1 << 40);
+        var memory_pool = exec.memory.MemoryPool.init(1 << 40);
+        const account = try testTrackedAccountant(a, &memory_pool);
         defer account.releaseOwner(a);
         const tracked = try account.executionAllocator();
         var all_views: [mixed_schema.len]ColumnView = undefined;
@@ -1774,7 +1775,9 @@ test "PartitionedAggregate charges about the raw input bytes and frees the input
         break :blk account.peak_bytes;
     };
 
-    const account = try testTrackedAccountant(a, 1 << 40);
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
+
+    const account = try testTrackedAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
@@ -1823,7 +1826,8 @@ fn testHashCorePeak(
     group_estimate: u64,
     expected: []const []u8,
 ) !usize {
-    const account = try testTrackedAccountant(a, budget);
+    var memory_pool = exec.memory.MemoryPool.init(budget);
+    const account = try testTrackedAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;
@@ -1907,7 +1911,8 @@ test "PartitionedAggregate keeps buffering once the first round's keys look near
 
     // Rounds of half the input would start halfway, but the sort core the
     // unique keys call for needs each partition whole.
-    const account = try testTrackedAccountant(a, 8 * raw);
+    var memory_pool = exec.memory.MemoryPool.init(8 * raw);
+    const account = try testTrackedAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     var batch_views: [mixed_schema.len]ColumnView = undefined;

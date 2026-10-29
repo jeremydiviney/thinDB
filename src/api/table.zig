@@ -45,9 +45,6 @@ pub const Table = struct {
     /// This table generation's namespace in `cache`. Re-minted (invalidating
     /// every cached block in O(1)) on TRUNCATE and ALTER.
     cache_uid: u64,
-    /// Set when no shared cache was in the Config (direct `Table.open`, no
-    /// Catalog — tests) and this table minted a private one to free at close.
-    owned_cache: bool = false,
 
     /// Opened-segment cache: parsed footers + tombstone state, shared across
     /// queries and scan workers (footer parse is ~ms; segments are immutable).
@@ -61,14 +58,10 @@ pub const Table = struct {
     auto_flush_min_rows: u64,
     auto_flush_min_bytes: usize,
 
-    /// Per-query memory ceiling for blocking operators. 0 = unlimited
-    /// (no tracking). Copied from Config.query_memory_budget at open.
-    query_memory_budget: usize,
-
-    /// The Catalog's shared cross-query memory pool (null = none). Self-
-    /// minted scan accountants draw from it so raw-builder pipelines are
-    /// pool-constrained like SQL-compiled ones. Copied from Config at open.
-    memory_pool: ?*exec.memory.MemoryPool,
+    /// The Catalog's memory controller. Self-minted scan accountants draw
+    /// from it so raw-builder pipelines are budgeted like SQL-compiled ones.
+    /// Copied from Config at open.
+    memory_pool: *exec.memory.MemoryPool,
 
     /// Encoder threads for compaction merges (resolved from
     /// Config.compact_threads at open; ≥1).
@@ -273,18 +266,10 @@ pub const Table = struct {
             order_key_indices[i] = schema.columnIndex(k) orelse return Error.SchemaMismatch;
         }
 
-        var owned_cache = false;
-        const cache_ptr = cfg.block_cache orelse blk: {
-            const c = try allocator.create(storage.cache.Cache);
-            c.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes, null));
-            c.predicate_memo.enabled = cfg.predicate_memo;
-            owned_cache = true;
-            break :blk c;
-        };
-        errdefer if (owned_cache) {
-            cache_ptr.deinit();
-            allocator.destroy(cache_ptr);
-        };
+        // Tables open under a Catalog, which put the pool and its cache in
+        // `cfg` (`Catalog.openInPlace`).
+        const memory_pool = cfg.memory_pool.?;
+        const cache_ptr = memory_pool.cache.?;
 
         const self = try allocator.create(Table);
         errdefer allocator.destroy(self);
@@ -301,14 +286,12 @@ pub const Table = struct {
             .order_key_indices = order_key_indices,
             .cache = cache_ptr,
             .cache_uid = storage.cache.newTableUid(),
-            .owned_cache = owned_cache,
             .auto_flush_bytes = cfg.auto_flush_bytes,
             .auto_flush_rows = cfg.auto_flush_rows,
             .auto_flush_secs = cfg.auto_flush_secs,
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
-            .query_memory_budget = api.autoQueryBudgetBytes(cfg.query_memory_budget, cfg.memory_pool != null),
-            .memory_pool = cfg.memory_pool,
+            .memory_pool = memory_pool,
             .compact_threads = api.resolveCompactThreads(allocator, cfg.compact_threads),
             .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,
@@ -362,12 +345,7 @@ pub const Table = struct {
         self.upsert_idx.deinit(allocator);
         if (self.upsert_idx_arena) |*a| a.deinit();
         self.seg_handles.deinit(allocator);
-        if (self.owned_cache) {
-            self.cache.deinit();
-            allocator.destroy(self.cache);
-        } else {
-            self.cache.purgeTable(self.cache_uid);
-        }
+        self.cache.purgeTable(self.cache_uid);
         // Drop the Table's reference. If scans pinned a snapshot, the
         // memtable stays alive until the last reader releases it.
         self.memtable.release();

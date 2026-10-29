@@ -625,7 +625,7 @@ test "region cache yields idle programs to the shared pool, oldest first, and ke
     try std.testing.expect(cache.checkout(0) == null);
     try std.testing.expectEqual(2 * each, shared.idleBytes());
 
-    var statement = exec.memory.MemoryAccountant.initWithPool(256 * mib, &shared);
+    var statement = exec.memory.MemoryAccountant.init(&shared);
     try statement.reserve(.sort, 255 * mib);
     defer statement.release(.sort, 255 * mib);
     try std.testing.expectEqual(@as(usize, 0), shared.idleBytes());
