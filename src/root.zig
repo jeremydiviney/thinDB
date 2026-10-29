@@ -43,6 +43,7 @@ pub const DbSchema = api.Schema;
 pub const Table = api.Table;
 pub const Config = api.Config;
 pub const totalMemoryBytes = api.totalMemoryBytes;
+pub const hardwareThreadCount = api.hardwareThreadCount;
 pub const autoCacheSizeBytes = api.autoCacheSizeBytes;
 pub const autoQueryBudgetBytes = api.autoQueryBudgetBytes;
 pub const autoMemoryBudgetBytes = api.autoMemoryBudgetBytes;

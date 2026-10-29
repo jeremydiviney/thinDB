@@ -145,28 +145,17 @@ fn setLinuxAffinity(mask: u64) void {
     );
 }
 
-/// Cores this process can actually keep busy, for sizing a statement's
-/// fan-outs (CoreScheduler.workerBudget). Unlike `detect`, not capped at 64
-/// logical CPUs. Physical cores among the CPUs in the affinity set (Linux:
-/// unique (package, core) pairs, so a cpuset-confined container counts its
-/// own cores, not the host's), further capped by a cgroup v2 CPU quota
-/// (`cpu.max`) — a quota-limited container sees every host CPU in its
-/// affinity set but is throttled to the quota.
-pub fn allowedPhysicalCoreCount(allocator: std.mem.Allocator) usize {
-    const cores = switch (builtin.os.tag) {
-        .linux => linuxAllowedPhysicalCoreCount(allocator) orelse physicalCoreCount(allocator),
-        else => physicalCoreCount(allocator),
-    };
-    const quota = cgroupCpuQuotaCores() orelse return cores;
-    return @max(1, @min(cores, quota));
-}
-
-fn linuxAllowedPhysicalCoreCount(allocator: std.mem.Allocator) ?usize {
-    if (builtin.os.tag != .linux) return null;
-    var set = [_]u8{0} ** 128;
-    const rc = std.os.linux.syscall3(.sched_getaffinity, 0, set.len, @intFromPtr(&set));
-    if (std.os.linux.errno(rc) != .SUCCESS) return null;
-    return linuxPhysicalCoreCountIn(allocator, &set) catch null;
+/// Hardware threads this process can actually keep busy, for sizing a
+/// statement's fan-outs (CoreScheduler.workerBudget) and the server's default
+/// DOP. Unlike `detect`, not capped at 64 logical CPUs. The logical CPUs in
+/// the affinity set (Linux; a cpuset-confined container counts its own CPUs,
+/// not the host's), further capped by a cgroup v2 CPU quota (`cpu.max`) — a
+/// quota-limited container sees every host CPU in its affinity set but is
+/// throttled to the quota.
+pub fn allowedHardwareThreadCount() usize {
+    const threads = @max(1, std.Thread.getCpuCount() catch 1);
+    const quota = cgroupCpuQuotaCores() orelse return threads;
+    return @max(1, @min(threads, quota));
 }
 
 /// Smallest `cpu.max` quota along the process's cgroup v2 path, in whole
@@ -198,16 +187,11 @@ fn cpuMaxCores(text: []const u8) ?usize {
     return @intCast(@max(1, (quota + period - 1) / period));
 }
 
+/// Unique (package, core) pairs across the sysfs CPU entries. CPUs are
+/// iterated until the first missing `cpuN` directory (kernel keeps them
+/// contiguous); an entry whose topology files are unreadable (offline CPU) is
+/// skipped rather than treated as the end.
 fn linuxPhysicalCoreCount(allocator: std.mem.Allocator) !usize {
-    return linuxPhysicalCoreCountIn(allocator, null);
-}
-
-/// Unique (package, core) pairs across the sysfs CPU entries, only those in
-/// `allowed` (a `cpu_set_t`) when given. CPUs are iterated until the first
-/// missing `cpuN` directory (kernel keeps them contiguous); an entry whose
-/// topology files are unreadable (offline CPU) is skipped rather than
-/// treated as the end.
-fn linuxPhysicalCoreCountIn(allocator: std.mem.Allocator, allowed: ?*const [128]u8) !usize {
     if (builtin.os.tag != .linux) return error.QueryFailed;
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(allocator);
@@ -218,9 +202,6 @@ fn linuxPhysicalCoreCountIn(allocator: std.mem.Allocator, allowed: ?*const [128]
         const dir = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}", .{cpu}) catch unreachable;
         const dir_fd = linuxOpenReadonly(dir, true) orelse break;
         _ = std.os.linux.close(dir_fd);
-        if (allowed) |set| {
-            if (cpu >= set.len * 8 or set[cpu / 8] & (@as(u8, 1) << @intCast(cpu % 8)) == 0) continue;
-        }
 
         const core_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}) catch unreachable;
         const core_id = readSysfsInt(core_path) orelse continue;
@@ -484,10 +465,10 @@ test "cpuMaxCores reads a cgroup v2 CPU quota in whole cores" {
     try std.testing.expectEqual(@as(?usize, null), cpuMaxCores(""));
 }
 
-test "allowedPhysicalCoreCount is within the physical core count" {
-    const allowed = allowedPhysicalCoreCount(std.testing.allocator);
+test "allowedHardwareThreadCount is within the logical CPU count" {
+    const allowed = allowedHardwareThreadCount();
     try std.testing.expect(allowed >= 1);
-    try std.testing.expect(allowed <= physicalCoreCount(std.testing.allocator));
+    try std.testing.expect(allowed <= (std.Thread.getCpuCount() catch 1));
 }
 
 test "totalMemoryBytes reports usable memory" {

@@ -311,6 +311,13 @@ pub fn physicalCoreCount(allocator: std.mem.Allocator) usize {
     return @import("../util/affinity.zig").physicalCoreCount(allocator);
 }
 
+/// Hardware threads the process may use (its CPU affinity set, capped by a
+/// cgroup CPU quota): the standalone server's default `max_dop`. Embedded
+/// callers keep `Config.max_dop`'s serial default.
+pub fn hardwareThreadCount() usize {
+    return @import("../util/affinity.zig").allowedHardwareThreadCount();
+}
+
 /// Memory the process may actually use: physical RAM, or the container's
 /// cgroup limit when that is smaller. What every "auto" budget is sized from.
 pub fn totalMemoryBytes() ?u64 {
