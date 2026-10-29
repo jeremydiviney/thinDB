@@ -4023,18 +4023,19 @@ fn aggInputViewBytes(view: thindb.storage.ColumnView, pt: GroupColumnType) ?[]co
     };
 }
 
-fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, row_weights: ?RowWeights, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+/// `hashed_ids` carries every row's identity (batchIdentities) when the
+/// layout's key is hashed.
+fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, row_weights: ?RowWeights, hashed_ids: ?[]const u128, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
     if (shared.generic_filter_required and !skip_filter_check) return error.UnsupportedOperatorForType;
     const layout = shared.group_rows_layout;
+    if (layout.hashed_key != (hashed_ids != null)) return error.UnsupportedOperatorForType;
     if (layout.key_columns.len == 0 or layout.key_columns.len > MAX_GENERIC_GROUP_KEYS) return error.UnsupportedOperatorForType;
     if (parts.raw_active_rows.capacity() == 0) parts.raw_active_rows = try acquireRawRows(shared, raw_chunk_rows, &parts.raw_recycle_lock_ticks);
 
     var key_views_buf: [MAX_GENERIC_GROUP_KEYS]thindb.storage.ColumnView = undefined;
-    var key_digests_buf: [MAX_GENERIC_GROUP_KEYS]?[]const u128 = undefined;
     for (layout.key_columns, 0..) |part, i| {
         const ci = batch.columnIndex(part.name) orelse return error.ColumnNotFound;
         key_views_buf[i] = batch.values[ci];
-        key_digests_buf[i] = if (batch.hashed) |hs| hs[ci] else null;
     }
     if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
 
@@ -4153,10 +4154,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             // so the weighted-collapse branch lives only in the other copy.
             std.debug.assert(!layout.has_weight);
             while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-                const key = if (layout.hashed_key)
-                    hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
-                else
-                    try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+                const key = if (hashed_ids) |ids| ids[r] else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
                 const idx = active.len();
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
@@ -4167,10 +4165,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 accepted += 1;
             }
         } else while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-            const key = if (layout.hashed_key)
-                hashGenericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], key_digests_buf[0..layout.key_columns.len], r)
-            else
-                try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+            const key = if (hashed_ids) |ids| ids[r] else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             // Weighted collapse (decomposable programs): a key already staged
             // in the chunk — the adjacent row, or one the fold index finds —
@@ -4926,8 +4921,8 @@ fn foldActiveRawRows(parts: *WorkerParts, shared: *PipeShared, scratch: *GroupSc
     parts.published_chunks += 1;
 }
 
-fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, weights: ?RowWeights, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
-    return appendBatchRawChunksGeneric(parts, shared, batch, weights, raw_chunk_rows, profile, skip_filter_check);
+fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, weights: ?RowWeights, hashed_ids: ?[]const u128, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+    return appendBatchRawChunksGeneric(parts, shared, batch, weights, hashed_ids, raw_chunk_rows, profile, skip_filter_check);
 }
 
 fn initGroupStateCountSumAvg(states: *StateSlab, key: u128, sum_acc: i64, avg_acc: i64, run_len: u64) u32 {
@@ -6890,11 +6885,13 @@ const BatchKeys = struct {
     }
 };
 
-/// One grid worker's buffers for a count-sketch pass: the batch's group
-/// identities, the kept spans of run-encoded keys, and the rows a filter
-/// pass keeps.
+/// One grid worker's buffers for a batch's group identities (and their key
+/// lanes), and for a count-sketch pass: the kept spans of run-encoded keys,
+/// and the rows (and identities) a filter pass keeps.
 const SketchScratch = struct {
     ids: std.ArrayListUnmanaged(u128) = .empty,
+    lanes: std.ArrayListUnmanaged(u128) = .empty,
+    kept_ids: std.ArrayListUnmanaged(u128) = .empty,
     mask: std.ArrayListUnmanaged(bool) = .empty,
     weights: std.ArrayListUnmanaged(u32) = .empty,
     span_lengths: std.ArrayListUnmanaged(u32) = .empty,
@@ -6906,6 +6903,8 @@ const SketchScratch = struct {
 
     fn deinit(self: *SketchScratch, allocator: Allocator) void {
         self.ids.deinit(allocator);
+        self.lanes.deinit(allocator);
+        self.kept_ids.deinit(allocator);
         self.mask.deinit(allocator);
         self.weights.deinit(allocator);
         self.span_lengths.deinit(allocator);
@@ -7051,9 +7050,140 @@ fn sketchRuns(job: SiloGridJob, pass: CountSketchPass, row_count: usize, key_run
     }
 }
 
+/// Rows per chunk of hashedIdentities' key lanes, so a chunk's lanes stay
+/// cache-resident between the fill and the digest pass.
+const IDENTITY_LANE_ROWS: usize = 1024;
+
+/// Rows `lo..lo + lane.len` of a non-NULL key column as
+/// hashGenericKeyFromViews' parts: a string's digest (the sidecar's, when
+/// the scan sent one), an integer's bits, or 0 for a type pairing
+/// readGenericKeyBits rejects.
+fn keyLane(view: ColumnView, digests: ?[]const u128, typ: thindb.types.Type, lo: usize, lane: []u128) []const u128 {
+    switch (view.data) {
+        .string, .varchar, .char, .json, .nested, .bitmap => |sv| {
+            if (digests) |ds| return ds[lo..][0..lane.len];
+            for (lane, lo..) |*p, r| p.* = thindb.exec.stringKeyDigest(sv.rowBytes(r));
+        },
+        inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vals| {
+            if (readGenericKeyBits(view, typ, lo)) |_| {
+                const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(vals[0])));
+                for (lane, vals[lo..][0..lane.len]) |*p, v| p.* = @as(Bits, @bitCast(v));
+            } else |_| @memset(lane, 0);
+        },
+        else => @memset(lane, 0),
+    }
+    return lane;
+}
+
+/// Every row's hashed group identity, as hashGenericKeyFromViews digests it
+/// row by row: each key column fills a lane of parts with its type switch
+/// out of the row loop, then each row digests its fixed-width parts. A
+/// nullable key column's validity tags vary the parts' layout per row, so
+/// those layouts digest row by row.
+fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const BatchKeys, lanes: *std.ArrayListUnmanaged(u128), out: []u128) !void {
+    const k = keys.len;
+    for (layout.key_columns) |part| {
+        if (!part.nullable) continue;
+        for (out, 0..) |*id, r| id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+        return;
+    }
+    // A lone string key's digest is its identity, not a part to digest.
+    if (k == 1) switch (keys.views[0].data) {
+        .string, .varchar, .char, .json, .nested, .bitmap => {
+            const ids = keyLane(keys.views[0], keys.digests[0], layout.key_columns[0].typ, 0, out);
+            if (ids.ptr != out.ptr) @memcpy(out, ids);
+            return;
+        },
+        else => {},
+    };
+    try lanes.resize(allocator, k * IDENTITY_LANE_ROWS);
+    var src: [MAX_GENERIC_GROUP_KEYS][]const u128 = undefined;
+    var lo: usize = 0;
+    while (lo < out.len) : (lo += IDENTITY_LANE_ROWS) {
+        const chunk = out[lo..@min(out.len, lo + IDENTITY_LANE_ROWS)];
+        for (layout.key_columns, 0..) |part, i| {
+            src[i] = keyLane(keys.views[i], keys.digests[i], part.typ, lo, lanes.items[i * IDENTITY_LANE_ROWS ..][0..chunk.len]);
+        }
+        switch (k) {
+            inline 1...MAX_GENERIC_GROUP_KEYS => |kk| for (chunk, 0..) |*id, j| {
+                var parts: [kk]u128 = undefined;
+                inline for (0..kk) |i| parts[i] = src[i][j];
+                id.* = thindb.exec.keyPartsDigest(kk, parts);
+            },
+            else => return error.UnsupportedOperatorForType,
+        }
+    }
+}
+
+test "hashed identities filled by column match hashGenericKeyFromViews row by row" {
+    const allocator = std.testing.allocator;
+    const n = 2 * IDENTITY_LANE_ROWS + 452;
+    var prng = std.Random.DefaultPrng.init(0x1d3a);
+    const random = prng.random();
+
+    const users = try allocator.alloc(i64, n);
+    defer allocator.free(users);
+    const minutes = try allocator.alloc(i32, n);
+    defer allocator.free(minutes);
+    const ratios = try allocator.alloc(f64, n);
+    defer allocator.free(ratios);
+    const offsets = try allocator.alloc(u32, n + 1);
+    defer allocator.free(offsets);
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(allocator);
+    const phrases = [_][]const u8{ "", "a", "thin", "columnar analytics", "x" ** 40 };
+    offsets[0] = 0;
+    for (0..n) |r| {
+        users[r] = random.intRangeAtMost(i64, -3, 3);
+        minutes[r] = random.intRangeAtMost(i32, 0, 59);
+        ratios[r] = random.float(f64);
+        try bytes.appendSlice(allocator, phrases[random.uintLessThan(usize, phrases.len)]);
+        offsets[r + 1] = @intCast(bytes.items.len);
+    }
+    const sv: StringView = .{ .offsets = offsets, .bytes = bytes.items };
+    const digests = try allocator.alloc(u128, n);
+    defer allocator.free(digests);
+    for (digests, 0..) |*d, r| d.* = thindb.exec.stringKeyDigest(sv.rowBytes(r));
+    var nulls: [(n + 7) / 8]u8 = undefined;
+    random.bytes(&nulls);
+
+    const user: ColumnView = .{ .data = .{ .bigint = users } };
+    const minute: ColumnView = .{ .data = .{ .int = minutes } };
+    const phrase: ColumnView = .{ .data = .{ .string = sv } };
+    const Key = struct { view: ColumnView, typ: thindb.types.Type, nullable: bool = false, digests: bool = false };
+    const cases = .{
+        .{Key{ .view = phrase, .typ = .string }},
+        .{Key{ .view = phrase, .typ = .string, .digests = true }},
+        .{ Key{ .view = user, .typ = .bigint }, Key{ .view = phrase, .typ = .string } },
+        .{ Key{ .view = user, .typ = .bigint }, Key{ .view = phrase, .typ = .string, .digests = true } },
+        .{ Key{ .view = user, .typ = .bigint }, Key{ .view = minute, .typ = .int }, Key{ .view = phrase, .typ = .string, .digests = true } },
+        // Pairings readGenericKeyBits rejects key as part 0.
+        .{ Key{ .view = minute, .typ = .bigint }, Key{ .view = .{ .data = .{ .double = ratios } }, .typ = .double }, Key{ .view = phrase, .typ = .string } },
+        .{ Key{ .view = phrase, .typ = .string }, Key{ .view = .{ .data = .{ .bigint = users }, .nulls = &nulls }, .typ = .bigint, .nullable = true } },
+    };
+    var lanes: std.ArrayListUnmanaged(u128) = .empty;
+    defer lanes.deinit(allocator);
+    const out = try allocator.alloc(u128, n);
+    defer allocator.free(out);
+    inline for (cases) |case| {
+        var specs: [case.len]GroupKeyColumnSpec = undefined;
+        var keys: BatchKeys = .{ .len = case.len };
+        inline for (case, 0..) |key, i| {
+            specs[i] = .{ .name = "", .typ = key.typ, .offset_bits = 0, .width_bits = 0, .nullable = key.nullable };
+            keys.views[i] = key.view;
+            keys.digests[i] = if (key.digests) digests else null;
+        }
+        const layout: GroupRowsLayout = .{ .key_columns = &specs, .hashed_key = true };
+        try hashedIdentities(allocator, layout, &keys, &lanes, out);
+        for (out, 0..) |id, r| {
+            try std.testing.expectEqual(hashGenericKeyFromViews(layout, keys.views[0..case.len], keys.digests[0..case.len], r), id);
+        }
+    }
+}
+
 /// Every row's group identity, as genericKeyFromViews and
-/// hashGenericKeyFromViews key it row by row. Packed keys fill column by
-/// column, so each loop reads one typed slice.
+/// hashGenericKeyFromViews key it row by row, filled column by column so
+/// each loop reads one typed slice.
 fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) ![]const u128 {
     const layout = job.shared.group_rows_layout;
     const keys = try BatchKeys.init(layout, batch);
@@ -7065,7 +7195,7 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
     try ids.resize(allocator, n);
     const out = ids.items;
     if (layout.hashed_key) {
-        for (out, 0..) |*id, r| id.* = hashGenericKeyFromViews(layout, keys.views[0..keys.len], keys.digests[0..keys.len], r);
+        try hashedIdentities(allocator, layout, &keys, &job.sketch_scratch.lanes, out);
         return out;
     }
     @memset(out, 0);
@@ -7104,10 +7234,12 @@ fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weight
     }
 }
 
-/// A batch bound for the grid, with its rows' repeat counts when collapsed.
+/// A batch bound for the grid, with its rows' repeat counts when collapsed
+/// and, for a hashed key, the identities the sketch already digested.
 const KeptRows = struct {
     batch: thindb.Batch,
     weights: ?RowWeights,
+    ids: ?[]const u128 = null,
 };
 
 /// The rows of `batch` whose groups the sketch keeps, compacted (with their
@@ -7122,8 +7254,20 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
         m.* = sketch.keeps(id);
         kept += @intFromBool(m.*);
     }
-    if (kept == batch.row_count) return .{ .batch = batch, .weights = weights };
+    const hashed = job.shared.group_rows_layout.hashed_key;
+    if (kept == batch.row_count) return .{ .batch = batch, .weights = weights, .ids = if (hashed) ids else null };
     if (kept == 0) return null;
+
+    const kept_ids: ?[]const u128 = if (hashed) blk: {
+        try scratch.kept_ids.resize(allocator, kept);
+        var j: usize = 0;
+        for (mask, ids) |m, id| {
+            if (!m) continue;
+            scratch.kept_ids.items[j] = id;
+            j += 1;
+        }
+        break :blk scratch.kept_ids.items;
+    } else null;
 
     const kept_weights: ?RowWeights = if (weights) |w| blk: {
         try scratch.weights.resize(allocator, kept);
@@ -7168,6 +7312,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             .hashed = if (batch.hashed != null) scratch.hashed else null,
         },
         .weights = kept_weights,
+        .ids = kept_ids,
     };
 }
 
@@ -7211,7 +7356,8 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
             },
             .filter => (try keptRows(job, job.scan.allocator, pass.sketch, scanned, weights)) orelse continue,
         } else .{ .batch = scanned, .weights = weights };
-        try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, job.raw_chunk_rows, job.profile, job.filter_fused);
+        const hashed_ids = if (layout.hashed_key) kept.ids orelse try batchIdentities(job, job.scan.allocator, kept.batch) else null;
+        try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, hashed_ids, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
 
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {

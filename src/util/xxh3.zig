@@ -54,6 +54,17 @@ pub fn hash128(seed: u64, input: []const u8) u128 {
     return @as(u128, halves.high) << 64 | halves.low;
 }
 
+/// `hash128` of `parts` laid end to end in native byte order, its length
+/// known at compile time: a fixed-width composite key digests per row with
+/// no length dispatch.
+pub fn hash128Parts(seed: u64, comptime k: usize, parts: [k]u128) u128 {
+    comptime std.debug.assert(k >= 1 and k <= 8);
+    var bytes: [16 * k]u8 = undefined;
+    inline for (parts, 0..) |p, i| bytes[i * 16 ..][0..16].* = @bitCast(p);
+    const halves = if (k == 1) upTo16(seed, &bytes, &default_secret) else upTo128(seed, &bytes, &default_secret);
+    return @as(u128, halves.high) << 64 | halves.low;
+}
+
 const Halves = struct { low: u64, high: u64 };
 
 fn read32(bytes: []const u8, at: usize) u64 {
@@ -237,6 +248,21 @@ test "XXH3-128 matches StarRocks across every input-length path" {
         .{ ab8 ** 375, -68405818285202680017503919040926716798 },
     };
     inline for (cases) |c| try std.testing.expectEqual(@as(i128, c[1]), @as(i128, @bitCast(hash128(0, c[0]))));
+}
+
+test "XXH3-128 over fixed-width parts matches the concatenated bytes" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    inline for (1..9) |k| {
+        for (0..64) |_| {
+            var parts: [k]u128 = undefined;
+            for (&parts) |*p| p.* = random.int(u128);
+            const bytes: [16 * k]u8 = @bitCast(parts);
+            inline for (.{ 0, 0x9E3779B185EBCA87 }) |seed| {
+                try std.testing.expectEqual(hash128(seed, &bytes), hash128Parts(seed, k, parts));
+            }
+        }
+    }
 }
 
 test "XXH3-128's low half is XXH3-64 where the specification says so" {
