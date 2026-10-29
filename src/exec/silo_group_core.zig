@@ -6516,6 +6516,91 @@ fn flushSharedStageBuilders(
     return flushed;
 }
 
+/// Each staged row's bucket, and the rows each bucket receives.
+fn stageBucketIds(comptime key_width: GroupKeyWidth, chunks: []const RawChunk, bucket_ids: []u16, counts: []u32) void {
+    @memset(counts, 0);
+    switch (std.math.isPowerOfTwo(counts.len)) {
+        inline else => |pow2| {
+            var row_idx: usize = 0;
+            for (chunks) |chunk| {
+                const rows = chunk.rows;
+                const n = rows.len();
+                const keys = switch (key_width) {
+                    .u32 => rows.keyU32All(),
+                    .u64 => rows.keyU64All(),
+                    .u96 => rows.keyU96LoAll(),
+                    .u128 => rows.keyU128All(),
+                };
+                const key_hi: []const u32 = if (key_width == .u96) rows.keyU96HiAll() else &.{};
+                for (bucket_ids[row_idx..][0..n], 0..) |*id, r| {
+                    const key = groupKeyAt(key_width, keys, key_hi, r);
+                    const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
+                    const b = if (pow2) @as(usize, @truncate(h)) & (counts.len - 1) else bucketIndexHash(h, counts.len);
+                    id.* = @intCast(b);
+                    counts[b] += 1;
+                }
+                row_idx += n;
+            }
+        },
+    }
+}
+
+/// One fixed-width lane of a staged row slab.
+const StageLane = union(enum) {
+    /// The whole key, or a 96-bit key's low 64 bits.
+    key_lo,
+    key_hi,
+    column: usize,
+    rowref,
+    weight,
+    valid: usize,
+
+    fn bytes(self: StageLane, rows: RawRows) []u8 {
+        return switch (self) {
+            .key_lo => switch (rows.layout.key_width) {
+                .u32 => std.mem.sliceAsBytes(rows.keyU32All()),
+                .u64 => std.mem.sliceAsBytes(rows.keyU64All()),
+                .u96 => std.mem.sliceAsBytes(rows.keyU96LoAll()),
+                .u128 => std.mem.sliceAsBytes(rows.keyU128All()),
+            },
+            .key_hi => std.mem.sliceAsBytes(rows.keyU96HiAll()),
+            .column => |c| rows.columnByteSlab(c),
+            .rowref => std.mem.sliceAsBytes(rows.rowrefAll()),
+            .weight => std.mem.sliceAsBytes(rows.weightAll()),
+            .valid => |v| rows.validAll(v),
+        };
+    }
+};
+
+/// Scatters one lane of the staged chunks into `flat`, each row to the next
+/// slot of its bucket's run. A typed loop per lane keeps one write stream per
+/// bucket and no per-row dispatch on the key width or a column's size.
+fn scatterStageLane(flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) !void {
+    switch (lane.bytes(flat).len / flat.capacity()) {
+        1 => scatterStageRuns(u8, flat, chunks, bucket_ids, offsets, next, lane),
+        2 => scatterStageRuns(u16, flat, chunks, bucket_ids, offsets, next, lane),
+        4 => scatterStageRuns(u32, flat, chunks, bucket_ids, offsets, next, lane),
+        8 => scatterStageRuns(u64, flat, chunks, bucket_ids, offsets, next, lane),
+        16 => scatterStageRuns(u128, flat, chunks, bucket_ids, offsets, next, lane),
+        else => return error.UnsupportedOperatorForType,
+    }
+}
+
+fn scatterStageRuns(comptime T: type, flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) void {
+    const dst: []T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(flat)));
+    @memcpy(next, offsets);
+    var row_idx: usize = 0;
+    for (chunks) |chunk| {
+        const n = chunk.rows.len();
+        const src: []const T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(chunk.rows)));
+        for (src[0..n], bucket_ids[row_idx..][0..n]) |v, b| {
+            dst[next[b]] = v;
+            next[b] += 1;
+        }
+        row_idx += n;
+    }
+}
+
 fn drainRawDedicatedStageSharedBuilders(
     allocator: Allocator,
     shared: *PipeShared,
@@ -6570,116 +6655,55 @@ fn drainRawDedicatedStageSharedBuilders(
 
         try local.flat_raw_rows.resize(allocator, shared.group_rows_layout, total_rows);
         try local.flat_bucket_ids.resize(allocator, total_rows);
-        const flat_has_str = shared.group_rows_layout.has_str_payload;
-        const flat_str_cols = shared.group_rows_layout.str_columns.len;
-        if (flat_has_str) local.flat_raw_rows.str.clear();
+        const layout = shared.group_rows_layout;
+        if (layout.has_str_payload) local.flat_raw_rows.str.clear();
 
         const stage_t0 = if (profile) platform.nowTicks() else 0;
-        @memset(local.flat_counts[0..bucket_count], 0);
-        var row_idx: usize = 0;
-        i = 0;
-        while (i < popped_total) : (i += 1) {
-            var r: usize = 0;
-            while (r < raw_chunks[i].rows.len()) : (r += 1) {
-                const b = rawRowBucketIndex(raw_chunks[i].rows, r, bucket_count);
-                local.flat_bucket_ids.items[row_idx] = @intCast(b);
-                local.flat_counts[b] += 1;
-                row_idx += 1;
-            }
+        const chunks = raw_chunks[0..popped_total];
+        const bucket_ids = local.flat_bucket_ids.items[0..total_rows];
+        const counts = local.flat_counts[0..bucket_count];
+        const offsets = local.flat_offsets[0..bucket_count];
+        const next = local.flat_next[0..bucket_count];
+        switch (layout.key_width) {
+            inline else => |kw| stageBucketIds(kw, chunks, bucket_ids, counts),
         }
-
         var offset: u32 = 0;
-        var b: usize = 0;
-        while (b < bucket_count) : (b += 1) {
-            local.flat_offsets[b] = offset;
-            local.flat_next[b] = offset;
-            offset += local.flat_counts[b];
+        for (counts, offsets) |n, *run_start| {
+            run_start.* = offset;
+            offset += n;
         }
 
-        row_idx = 0;
-        const ncols = shared.group_rows_layout.columns.len;
-        var flat_slabs: [MAX_GROUP_PAYLOAD_COLUMNS][]u8 = undefined;
-        var col_elt: [MAX_GROUP_PAYLOAD_COLUMNS]usize = undefined;
-        for (0..ncols) |c| {
-            flat_slabs[c] = local.flat_raw_rows.columnByteSlab(c);
-            col_elt[c] = groupColumnSize(shared.group_rows_layout.columns[c].physical_type);
-        }
-        const has_rowref = shared.group_rows_layout.has_rowref;
-        const has_weight = shared.group_rows_layout.has_weight;
-        const flat_rowref: []i64 = if (has_rowref) local.flat_raw_rows.rowrefAll() else &.{};
-        const flat_weight: []u32 = if (has_weight) local.flat_raw_rows.weightAll() else &.{};
-        const n_valid = nullableInputCount(shared.group_rows_layout);
-        var flat_valid: [MAX_GROUP_PAYLOAD_COLUMNS][]u8 = undefined;
-        for (0..n_valid) |v| flat_valid[v] = local.flat_raw_rows.validAll(v);
-        switch (local.flat_raw_rows.layout.key_width) {
-            inline else => |kw| {
-                const flat = local.flat_raw_rows;
-                i = 0;
-                while (i < popped_total) : (i += 1) {
-                    const src = raw_chunks[i].rows;
-                    var src_slabs: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
-                    for (0..ncols) |c| src_slabs[c] = src.columnByteSlab(c);
-                    const src_rowref: []const i64 = if (has_rowref) src.rowrefAll() else &.{};
-                    const src_weight: []const u32 = if (has_weight) src.weightAll() else &.{};
-                    var src_valid: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
-                    for (0..n_valid) |v| src_valid[v] = src.validAll(v);
-                    const chunk_rows_n = src.len();
-                    var r: usize = 0;
-                    // Scatter loop duplicated on the (per-drain constant)
-                    // validity count: the no-validity copy — every row of
-                    // every staged chunk passes through here — carries zero
-                    // per-row validity code.
-                    if (n_valid == 0) {
-                        while (r < chunk_rows_n) : (r += 1) {
-                            const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
-                            const pos = local.flat_next[bucket_idx];
-                            flat.copyKeyFrom(kw, pos, src, r);
-                            var c: usize = 0;
-                            while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
-                            if (has_rowref) flat_rowref[pos] = src_rowref[r];
-                            if (has_weight) flat_weight[pos] = src_weight[r];
-                            if (flat_has_str) {
-                                var sc: usize = 0;
-                                while (sc < flat_str_cols) : (sc += 1) {
-                                    if (src.str.isNull(flat_str_cols, r, sc)) {
-                                        local.flat_raw_rows.str.appendNull(flat_str_cols, pos, sc);
-                                    } else {
-                                        try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
-                                    }
-                                }
-                            }
-                            local.flat_next[bucket_idx] = pos + 1;
-                            row_idx += 1;
+        const flat = local.flat_raw_rows;
+        try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .key_lo);
+        if (layout.key_width == .u96) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .key_hi);
+        for (0..layout.columns.len) |c| try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .{ .column = c });
+        if (layout.has_rowref) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .rowref);
+        if (layout.has_weight) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .weight);
+        for (0..nullableInputCount(layout)) |v| try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .{ .valid = v });
+        if (layout.has_str_payload) {
+            const k = layout.str_columns.len;
+            @memcpy(next, offsets);
+            var row_idx: usize = 0;
+            for (chunks) |chunk| {
+                const src = chunk.rows;
+                for (bucket_ids[row_idx..][0..src.len()], 0..) |b, r| {
+                    const pos = next[b];
+                    next[b] = pos + 1;
+                    for (0..k) |sc| {
+                        if (src.str.isNull(k, r, sc)) {
+                            local.flat_raw_rows.str.appendNull(k, pos, sc);
+                        } else {
+                            try local.flat_raw_rows.str.append(allocator, k, pos, sc, src.str.get(k, r, sc));
                         }
-                    } else while (r < chunk_rows_n) : (r += 1) {
-                        const bucket_idx: usize = local.flat_bucket_ids.items[row_idx];
-                        const pos = local.flat_next[bucket_idx];
-                        flat.copyKeyFrom(kw, pos, src, r);
-                        var c: usize = 0;
-                        while (c < ncols) : (c += 1) copyElem(flat_slabs[c], src_slabs[c], col_elt[c], pos, r);
-                        if (has_rowref) flat_rowref[pos] = src_rowref[r];
-                        if (has_weight) flat_weight[pos] = src_weight[r];
-                        for (0..n_valid) |v| flat_valid[v][pos] = src_valid[v][r];
-                        if (flat_has_str) {
-                            var sc: usize = 0;
-                            while (sc < flat_str_cols) : (sc += 1) {
-                                if (src.str.isNull(flat_str_cols, r, sc)) {
-                                    local.flat_raw_rows.str.appendNull(flat_str_cols, pos, sc);
-                                } else {
-                                    try local.flat_raw_rows.str.append(allocator, flat_str_cols, pos, sc, src.str.get(flat_str_cols, r, sc));
-                                }
-                            }
-                        }
-                        local.flat_next[bucket_idx] = pos + 1;
-                        row_idx += 1;
                     }
                 }
-            },
+                row_idx += src.len();
+            }
         }
         if (profile) local.raw_stage_ticks += platform.nowTicks() - stage_t0;
 
         const append_t0 = if (profile) platform.nowTicks() else 0;
-        b = 0;
+        var b: usize = 0;
         while (b < bucket_count) : (b += 1) {
             const count: usize = local.flat_counts[b];
             if (count == 0) continue;
