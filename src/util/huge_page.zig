@@ -35,11 +35,17 @@
 //!     class's next region is carved best-fit from them. Freed ranges stay
 //!     committed, so the evict/insert churn of a scan larger than the cache
 //!     reuses resident pages without OS calls or faults.
-//!   - Memory is committed only where a region first reaches untouched arena,
-//!     and regions are carved lowest-address first, so the committed bytes are
-//!     a prefix of the arena and never exceed it. A request no free extent fits
-//!     (fragmentation, or pinned blocks holding the cache over capacity) is
-//!     served by the backing allocator and freed back there.
+//!   - Each huge page is committed when a region first covers it and stays
+//!     committed until `trim` gives it back: `trim` decommits free extents, so
+//!     a cache that shrinks for the shared memory budget returns real memory
+//!     (DESIGN §8.3). A request no free extent fits (fragmentation, or pinned
+//!     blocks holding the cache over capacity) is served by the backing
+//!     allocator and freed back there.
+//!   - Evicting in LRU order leaves free cells scattered across a class's
+//!     slabs, few of which empty. A compaction pass drains the sparsest slabs
+//!     whose blocks the fuller ones have free cells for: the cache moves those
+//!     blocks (`relocation`), and the slabs they leave empty go to the free
+//!     extents for `trim`.
 //! Sub-MIN_BLOCK requests (entry-metadata-sized buffers never reach here, but
 //! headers/odd sizes might) fall through to the backing allocator unchanged.
 //!
@@ -104,6 +110,9 @@ const Region = struct {
     partial_prev: ?*Region = null,
     partial_next: ?*Region = null,
     in_partial: bool = false,
+    /// A compaction pass is emptying this slab: it stays off its class's
+    /// partial list, so no allocation refills the cells its blocks leave.
+    draining: bool = false,
 
     fn isFull(self: *const Region) bool {
         return self.free == null and self.carved == self.cells;
@@ -152,9 +161,9 @@ fn trackFallback(old_len: usize, new_len: usize) void {
 /// What an allocation needs done after the pool lock is dropped.
 const Plan = union(enum) {
     block: [*]u8,
-    /// Commit `region` from arena offset `from` to its end, then hand out its
-    /// first cell.
-    commit: struct { region: *Region, from: usize },
+    /// Commit arena offsets `from..to` inside `region`, `newly` bytes of
+    /// which were uncommitted, then hand out its first cell.
+    commit: struct { region: *Region, from: usize, to: usize, newly: usize },
     /// Serve the block from the backing allocator.
     fallback,
 };
@@ -165,25 +174,29 @@ pub const Pool = struct {
     /// Empty when the OS refused the reservation; every block then comes from
     /// the backing allocator. Fixed after `init`, so reading it needs no lock.
     arena: []align(MIN_BLOCK) u8 = &.{},
-    /// Bytes from the arena's start counted as committed (the commit itself
-    /// may still be in flight on the thread that carved them).
+    /// Bytes of the arena counted as committed (a commit may still be in
+    /// flight on the thread that carved them). Written under `lock`; read
+    /// without it through `committedBytes`.
     committed: usize = 0,
+    /// Which huge pages of the arena are committed.
+    page_committed: std.DynamicBitSetUnmanaged = .{},
     /// The region holding each huge page of the arena, null while free.
     owners: []?*Region = &.{},
     /// Free ranges of the arena, sorted by offset, no two adjacent. There is
-    /// at most one more than the regions and retired ranges between them, and
-    /// its capacity is kept that high so freeing a region never allocates.
+    /// at most one more than the regions, retired ranges and ranges out for
+    /// a `trim` between them, and its capacity is kept that high so freeing a
+    /// region never allocates.
     free_extents: std.ArrayListUnmanaged(Extent) = .empty,
+    /// Regions, plus the free ranges a `trim` has taken out to decommit.
     region_count: usize = 0,
-    /// Ranges whose commit failed, out of circulation for good, and their
-    /// bytes (inside `committed` but never resident).
+    /// Ranges whose commit failed, out of circulation for good.
     retired_count: usize = 0,
-    retired_bytes: usize = 0,
     /// Head of each class's partial list: slabs with at least one free cell.
     /// Few distinct sizes (~36), so a hashmap of list heads is cheap and avoids
     /// size-class index arithmetic. Entries are never removed.
     partial: std.AutoHashMapUnmanaged(usize, ?*Region) = .empty,
-    /// Bytes of the arena held by regions.
+    /// Bytes of the arena held by regions. Written under `lock`; read
+    /// without it through `carvedBytes`.
     carved_bytes: usize = 0,
 
     /// `capacity` is the cache's live-byte budget. The arena is a quarter
@@ -199,13 +212,20 @@ pub const Pool = struct {
             return self;
         };
         @memset(owners, null);
+        var page_committed = std.DynamicBitSetUnmanaged.initEmpty(backing, len / HUGE_PAGE) catch {
+            backing.free(owners);
+            osRelease(arena);
+            return self;
+        };
         self.free_extents.append(backing, .{ .off = 0, .len = len }) catch {
+            page_committed.deinit(backing);
             backing.free(owners);
             osRelease(arena);
             return self;
         };
         self.arena = arena;
         self.owners = owners;
+        self.page_committed = page_committed;
         return self;
     }
 
@@ -215,13 +235,43 @@ pub const Pool = struct {
             if (r.base == self.arena.ptr + i * HUGE_PAGE) self.backing.destroy(r);
         }
         if (self.arena.len > 0) {
-            _ = g_slab_bytes.fetchSub(self.committed - self.retired_bytes, .monotonic);
+            _ = g_slab_bytes.fetchSub(self.committed, .monotonic);
             osRelease(self.arena);
         }
         self.backing.free(self.owners);
+        self.page_committed.deinit(self.backing);
         self.free_extents.deinit(self.backing);
         self.partial.deinit(self.backing);
         self.* = undefined;
+    }
+
+    /// Bytes of the arena committed now; safe without the lock.
+    pub fn committedBytes(self: *const Pool) usize {
+        return @atomicLoad(usize, &self.committed, .monotonic);
+    }
+
+    /// Bytes of the arena held by regions now; safe without the lock. What
+    /// they hold beyond their live cells is the pool's overhead.
+    pub fn carvedBytes(self: *const Pool) usize {
+        return @atomicLoad(usize, &self.carved_bytes, .monotonic);
+    }
+
+    /// True when `p` points into the arena (a block the pool's pages hold, not
+    /// one the backing allocator served).
+    pub fn holds(self: *const Pool, p: [*]const u8) bool {
+        return self.inArena(p);
+    }
+
+    /// Caller holds `lock`.
+    fn addCommitted(self: *Pool, delta: isize) void {
+        const now: usize = @intCast(@as(isize, @intCast(self.committed)) + delta);
+        @atomicStore(usize, &self.committed, now, .monotonic);
+    }
+
+    /// Caller holds `lock`.
+    fn addCarved(self: *Pool, delta: isize) void {
+        const now: usize = @intCast(@as(isize, @intCast(self.carved_bytes)) + delta);
+        @atomicStore(usize, &self.carved_bytes, now, .monotonic);
     }
 
     pub fn allocator(self: *Pool) Allocator {
@@ -243,7 +293,7 @@ pub const Pool = struct {
             self.lock.unlock();
             switch (plan) {
                 .block => |p| return p,
-                .commit => |c| if (self.finishCommit(c.region, c.from)) |p| return p,
+                .commit => |c| if (self.finishCommit(c.region, c.from, c.to, c.newly)) |p| return p,
                 .fallback => {},
             }
         }
@@ -280,7 +330,7 @@ pub const Pool = struct {
         trackFallback(mem.len, 0);
     }
 
-    fn inArena(self: *const Pool, p: [*]u8) bool {
+    fn inArena(self: *const Pool, p: [*]const u8) bool {
         const addr = @intFromPtr(p);
         const start = @intFromPtr(self.arena.ptr);
         return addr >= start and addr - start < self.arena.len;
@@ -325,36 +375,69 @@ pub const Pool = struct {
         };
         @memset(self.owners[off / HUGE_PAGE ..][0 .. region_len / HUGE_PAGE], region);
         self.region_count += 1;
-        self.carved_bytes += region_len;
-        if (off + region_len > self.committed) {
-            const from = @max(off, self.committed);
-            self.committed = off + region_len;
-            return .{ .commit = .{ .region = region, .from = from } };
+        self.addCarved(@intCast(region_len));
+        if (self.markCommitted(off / HUGE_PAGE, (off + region_len) / HUGE_PAGE)) |span| {
+            return .{ .commit = .{ .region = region, .from = span.first * HUGE_PAGE, .to = span.end * HUGE_PAGE, .newly = span.newly } };
         }
         if (!region.isFull()) self.pushPartial(region);
         return .{ .block = region.base };
     }
 
+    const PageSpan = struct { first: usize, end: usize, newly: usize };
+
+    /// Marks the uncommitted pages of `first..end` committed and returns the
+    /// span from the first to the last of them, which the caller commits
+    /// (re-committing a committed page between them is harmless). Null when
+    /// every page is already committed. Caller holds `lock`.
+    fn markCommitted(self: *Pool, first: usize, end: usize) ?PageSpan {
+        var span: ?PageSpan = null;
+        var newly: usize = 0;
+        for (first..end) |page| {
+            if (self.page_committed.isSet(page)) continue;
+            self.page_committed.set(page);
+            newly += 1;
+            if (span) |*sp| sp.end = page + 1 else span = .{ .first = page, .end = page + 1, .newly = 0 };
+        }
+        self.addCommitted(@intCast(newly * HUGE_PAGE));
+        if (span) |*sp| sp.newly = newly * HUGE_PAGE;
+        return span;
+    }
+
+    /// Unmarks every committed page of `first..end`; returns their bytes.
+    /// Caller holds `lock`.
+    fn unmarkCommitted(self: *Pool, first: usize, end: usize) usize {
+        var cleared: usize = 0;
+        for (first..end) |page| {
+            if (!self.page_committed.isSet(page)) continue;
+            self.page_committed.unset(page);
+            cleared += HUGE_PAGE;
+        }
+        self.addCommitted(-@as(isize, @intCast(cleared)));
+        return cleared;
+    }
+
     /// The lock-free half of a `.commit` plan. Until the region is listed as
     /// partial, its first cell is the only way into it, so no other thread
     /// touches the range being committed. Null when the OS refuses the commit.
-    fn finishCommit(self: *Pool, region: *Region, from: usize) ?[*]u8 {
+    fn finishCommit(self: *Pool, region: *Region, from: usize, to: usize, newly: usize) ?[*]u8 {
         const off = @intFromPtr(region.base) - @intFromPtr(self.arena.ptr);
-        const end = off + region.len;
-        if (!osCommit(self.arena[from..end])) {
-            // Other threads may already count arena above this range as
-            // committed, so it can't return to the free extents.
+        if (!osCommit(self.arena[from..to])) {
+            // The OS is out of memory or commit; keep the range out of
+            // circulation rather than retry it on every allocation.
+            osDecommit(self.arena[off..][0..region.len]);
             self.lock.lock();
+            const was_committed = self.unmarkCommitted(off / HUGE_PAGE, (off + region.len) / HUGE_PAGE);
             @memset(self.owners[off / HUGE_PAGE ..][0 .. region.len / HUGE_PAGE], null);
             self.region_count -= 1;
             self.retired_count += 1;
-            self.retired_bytes += end - from;
-            self.carved_bytes -= region.len;
+            self.addCarved(-@as(isize, @intCast(region.len)));
             self.lock.unlock();
+            // The pages this plan marked never reached g_slab_bytes.
+            _ = g_slab_bytes.fetchSub(was_committed - newly, .monotonic);
             self.backing.destroy(region);
             return null;
         }
-        _ = g_slab_bytes.fetchAdd(end - from, .monotonic);
+        _ = g_slab_bytes.fetchAdd(newly, .monotonic);
         if (!region.isFull()) {
             self.lock.lock();
             self.pushPartial(region);
@@ -384,14 +467,14 @@ pub const Pool = struct {
         const node: *Node = @ptrCast(@alignCast(p));
         node.next = region.free;
         region.free = node;
-        if (!region.in_partial) self.pushPartial(region);
+        if (!region.in_partial and !region.draining) self.pushPartial(region);
     }
 
     fn releaseRegion(self: *Pool, region: *Region) void {
         const off = @intFromPtr(region.base) - @intFromPtr(self.arena.ptr);
         @memset(self.owners[off / HUGE_PAGE ..][0 .. region.len / HUGE_PAGE], null);
         self.region_count -= 1;
-        self.carved_bytes -= region.len;
+        self.addCarved(-@as(isize, @intCast(region.len)));
         self.giveExtent(off, region.len);
         self.backing.destroy(region);
     }
@@ -460,6 +543,149 @@ pub const Pool = struct {
             self.free_extents.insertAssumeCapacity(i, .{ .off = off, .len = len });
         }
     }
+
+    /// Decommit committed pages of the free extents until about `want` bytes
+    /// have gone back to the OS (whole huge pages, so it can overshoot by
+    /// one); returns the bytes decommitted. Live blocks are untouched. Each
+    /// run of pages leaves the free extents while the OS call runs outside
+    /// the lock, so allocations meanwhile carve elsewhere or fall back.
+    pub fn trim(self: *Pool, want: usize) usize {
+        if (self.arena.len == 0) return 0;
+        var released: usize = 0;
+        while (released < want) {
+            self.lock.lock();
+            const run = self.takeCommittedRun(want - released);
+            self.lock.unlock();
+            const r = run orelse break;
+            osDecommit(self.arena[r.off..][0..r.len]);
+            self.lock.lock();
+            _ = self.unmarkCommitted(r.off / HUGE_PAGE, (r.off + r.len) / HUGE_PAGE);
+            self.region_count -= 1;
+            self.giveExtent(r.off, r.len);
+            self.lock.unlock();
+            _ = g_slab_bytes.fetchSub(r.len, .monotonic);
+            released += r.len;
+        }
+        return released;
+    }
+
+    /// Starts a compaction pass toward freeing about `want` bytes of slabs.
+    /// Evicting blocks in LRU order leaves free cells scattered across a
+    /// class's slabs, and a slab's pages go back only once it is empty; so in
+    /// each class the sparsest slabs whose blocks fit in the free cells of
+    /// the fuller ones are drained, and `relocation` gives their blocks cells
+    /// elsewhere. False when no slab qualifies; otherwise the caller ends the
+    /// pass with `endCompaction`.
+    pub fn beginCompaction(self: *Pool, want: usize) bool {
+        if (self.arena.len == 0) return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        var slabs: std.ArrayListUnmanaged(*Region) = .empty;
+        defer slabs.deinit(self.backing);
+        var drained: usize = 0;
+        var heads = self.partial.valueIterator();
+        while (heads.next()) |head| {
+            if (drained >= want) break;
+            slabs.clearRetainingCapacity();
+            var cur = head.*;
+            while (cur) |slab| : (cur = slab.partial_next) {
+                slabs.append(self.backing, slab) catch return drained > 0;
+            }
+            std.mem.sort(*Region, slabs.items, {}, fullerFirst);
+            var moving: usize = 0;
+            for (slabs.items) |slab| moving += slab.live;
+            var room: usize = 0;
+            var kept: usize = 0;
+            while (kept < slabs.items.len and moving > room) : (kept += 1) {
+                moving -= slabs.items[kept].live;
+                room += slabs.items[kept].cells - slabs.items[kept].live;
+            }
+            var sparsest = slabs.items.len;
+            while (sparsest > kept and drained < want) {
+                sparsest -= 1;
+                const slab = slabs.items[sparsest];
+                self.unlinkPartial(slab);
+                slab.draining = true;
+                drained += slab.len;
+            }
+        }
+        return drained > 0;
+    }
+
+    fn fullerFirst(_: void, a: *const Region, b: *const Region) bool {
+        if (a.live != b.live) return a.live > b.live;
+        return @intFromPtr(a.base) < @intFromPtr(b.base);
+    }
+
+    /// During a compaction pass, a free cell in a fuller slab for the block
+    /// at `p` when p's slab is draining; null otherwise. The caller copies the
+    /// block into it and frees `p`, or frees the cell to leave the block be.
+    pub fn relocation(self: *Pool, p: [*]u8) ?[*]u8 {
+        if (!self.inArena(p)) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const from = self.regionAt(p).?;
+        if (!from.draining) return null;
+        const into = self.partial.get(from.cell).? orelse return null;
+        const cell = takeCell(into);
+        if (into.isFull()) self.unlinkPartial(into);
+        return cell;
+    }
+
+    /// Ends a compaction pass: a slab that kept blocks (pinned, or still
+    /// being filled) goes back on its partial list.
+    pub fn endCompaction(self: *Pool) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.owners, 0..) |owner, page| {
+            const region = owner orelse continue;
+            if (region.base != self.arena.ptr + page * HUGE_PAGE or !region.draining) continue;
+            region.draining = false;
+            self.pushPartial(region);
+        }
+    }
+
+    /// Takes the first run of committed pages, at most `want` rounded up to a
+    /// huge page, out of the free extents, counted like a region until
+    /// `trim` gives it back. Null when no free extent holds a committed page
+    /// or the extent list can't grow for the split. Caller holds `lock`.
+    fn takeCommittedRun(self: *Pool, want: usize) ?Extent {
+        const max_pages = want / HUGE_PAGE + @intFromBool(want % HUGE_PAGE != 0);
+        for (self.free_extents.items, 0..) |e, i| {
+            const first_page = e.off / HUGE_PAGE;
+            const end_page = (e.off + e.len) / HUGE_PAGE;
+            var start = first_page;
+            while (start < end_page and !self.page_committed.isSet(start)) start += 1;
+            if (start == end_page) continue;
+            var end = start;
+            while (end < end_page and end - start < max_pages and self.page_committed.isSet(end)) end += 1;
+            self.free_extents.ensureTotalCapacity(self.backing, self.region_count + self.retired_count + 3) catch return null;
+            const run: Extent = .{ .off = start * HUGE_PAGE, .len = (end - start) * HUGE_PAGE };
+            self.cutExtent(i, run);
+            self.region_count += 1;
+            return run;
+        }
+        return null;
+    }
+
+    /// Removes `run`, which lies inside free extent `i`, from the free list.
+    /// Caller holds `lock` and has ensured room for one more extent.
+    fn cutExtent(self: *Pool, i: usize, run: Extent) void {
+        const e = &self.free_extents.items[i];
+        const e_end = e.off + e.len;
+        const run_end = run.off + run.len;
+        if (run.off == e.off and run_end == e_end) {
+            _ = self.free_extents.orderedRemove(i);
+        } else if (run.off == e.off) {
+            e.off = run_end;
+            e.len = e_end - run_end;
+        } else if (run_end == e_end) {
+            e.len = run.off - e.off;
+        } else {
+            e.len = run.off - e.off;
+            self.free_extents.insertAssumeCapacity(i + 1, .{ .off = run_end, .len = e_end - run_end });
+        }
+    }
 };
 
 // ---- OS arena ----------------------------------------------------------------
@@ -486,6 +712,25 @@ fn osCommit(range: []u8) bool {
     };
 }
 
+/// Give `range` of the arena back to the OS, leaving it reserved as before
+/// its first commit, so `osCommit` can bring it back. Best-effort.
+fn osDecommit(range: []u8) void {
+    switch (builtin.os.tag) {
+        .windows => {
+            _ = VirtualUnlock(range.ptr, range.len);
+            _ = VirtualFree(range.ptr, range.len, MEM_DECOMMIT);
+        },
+        .linux => {
+            const linux = std.os.linux;
+            _ = linux.munlock(range.ptr, range.len);
+            _ = linux.madvise(range.ptr, range.len, linux.MADV.DONTNEED);
+            _ = linux.mprotect(range.ptr, range.len, .{});
+        },
+        .macos => std.posix.madvise(@alignCast(range.ptr), range.len, std.posix.MADV.DONTNEED) catch {},
+        else => {},
+    }
+}
+
 fn osRelease(arena: []align(MIN_BLOCK) u8) void {
     switch (builtin.os.tag) {
         .windows => {
@@ -504,12 +749,14 @@ const win = std.os.windows;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+const MEM_DECOMMIT: u32 = 0x4000;
 const MEM_RELEASE: u32 = 0x8000;
 const PAGE_READWRITE: u32 = 0x04;
 
 extern "kernel32" fn VirtualAlloc(addr: ?*anyopaque, size: usize, alloc_type: u32, protect: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn VirtualFree(addr: *anyopaque, size: usize, free_type: u32) callconv(.winapi) win.BOOL;
 extern "kernel32" fn VirtualLock(addr: *anyopaque, size: usize) callconv(.winapi) win.BOOL;
+extern "kernel32" fn VirtualUnlock(addr: *anyopaque, size: usize) callconv(.winapi) win.BOOL;
 extern "kernel32" fn SetProcessWorkingSetSizeEx(process: win.HANDLE, min: usize, max: usize, flags: u32) callconv(.winapi) win.BOOL;
 extern "kernel32" fn GetCurrentProcess() callconv(.winapi) win.HANDLE;
 
@@ -745,6 +992,127 @@ test "threads churning blocks past the arena keep their bytes and stay inside it
     try std.testing.expect(pool.committed <= pool.arena.len);
     try std.testing.expectEqual(@as(usize, 0), pool.carved_bytes);
     try std.testing.expectEqual(@as(usize, 1), pool.free_extents.items.len);
+}
+
+test "trim decommits free pages only, and a later region commits them again" {
+    var pool = Pool.init(std.testing.allocator, 64 << 20);
+    defer pool.deinit();
+    const a = pool.allocator();
+    const slab_before = g_slab_bytes.load(.monotonic);
+
+    const big = try a.alignedAlloc(u8, .@"16", 7 << 20);
+    const keep = try a.alignedAlloc(u8, .@"16", 64 * 1024);
+    defer a.free(keep);
+    @memset(keep, 0xC3);
+    const big_ptr = big.ptr;
+    a.free(big);
+    try std.testing.expectEqual(@as(usize, 10 << 20), pool.committed);
+
+    // Whole huge pages: 3 MiB asked takes two pages.
+    try std.testing.expectEqual(@as(usize, 4 << 20), pool.trim(3 << 20));
+    try std.testing.expectEqual(@as(usize, 6 << 20), pool.committed);
+    try std.testing.expectEqual(@as(usize, 4 << 20), pool.trim(64 << 20));
+    try std.testing.expectEqual(@as(usize, 2 << 20), pool.committed);
+    try std.testing.expectEqual(@as(usize, 0), pool.trim(1));
+    try std.testing.expectEqual(slab_before + (2 << 20), g_slab_bytes.load(.monotonic));
+    for (keep) |byte| try std.testing.expectEqual(@as(u8, 0xC3), byte);
+
+    const again = try a.alignedAlloc(u8, .@"16", 7 << 20);
+    defer a.free(again);
+    @memset(again, 0x5A);
+    try std.testing.expectEqual(big_ptr, again.ptr);
+    try std.testing.expectEqual(@as(usize, 10 << 20), pool.committed);
+    try std.testing.expectEqual(slab_before + (10 << 20), g_slab_bytes.load(.monotonic));
+}
+
+test "trim racing threads that churn blocks never touches a live block" {
+    var pool = Pool.init(std.testing.allocator, 48 << 20);
+    defer pool.deinit();
+
+    const Churn = struct {
+        fn run(p: *Pool, seed: u64, failed: *std.atomic.Value(bool)) void {
+            const a = p.allocator();
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rand = prng.random();
+            var held: [6]?[]align(16) u8 = @splat(null);
+            for (0..400) |step| {
+                const slot = rand.uintLessThan(usize, held.len);
+                if (held[slot]) |b| {
+                    const stamp = std.mem.readInt(u64, b[0..8], .little);
+                    if (std.mem.readInt(u64, b[b.len - 8 ..][0..8], .little) != stamp) failed.store(true, .monotonic);
+                    a.free(b);
+                    held[slot] = null;
+                }
+                const len = if (step % 3 == 0)
+                    rand.intRangeAtMost(usize, 5 << 20, 9 << 20)
+                else
+                    rand.intRangeAtMost(usize, MIN_BLOCK, 1 << 20);
+                const b = a.alignedAlloc(u8, .@"16", len) catch {
+                    failed.store(true, .monotonic);
+                    return;
+                };
+                const stamp = seed << 32 | step;
+                std.mem.writeInt(u64, b[0..8], stamp, .little);
+                std.mem.writeInt(u64, b[b.len - 8 ..][0..8], stamp, .little);
+                held[slot] = b;
+            }
+            for (held) |h| if (h) |b| a.free(b);
+        }
+        fn trimmer(p: *Pool, stop: *std.atomic.Value(bool)) void {
+            while (!stop.load(.monotonic)) _ = p.trim(8 << 20);
+        }
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    var stop = std.atomic.Value(bool).init(false);
+    const trimmer = try std.Thread.spawn(.{}, Churn.trimmer, .{ &pool, &stop });
+    var threads: [3]std.Thread = undefined;
+    for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Churn.run, .{ &pool, i + 1, &failed });
+    for (threads) |t| t.join();
+    stop.store(true, .monotonic);
+    trimmer.join();
+    try std.testing.expect(!failed.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), pool.carved_bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.free_extents.items.len);
+    _ = pool.trim(std.math.maxInt(usize));
+    try std.testing.expectEqual(@as(usize, 0), pool.committed);
+}
+
+test "compaction drains a sparse slab into a fuller one's free cells, only when they fit" {
+    var pool = Pool.init(std.testing.allocator, 64 << 20);
+    defer pool.deinit();
+    if (pool.arena.len == 0) return error.SkipZigTest;
+    const a = pool.allocator();
+    const mib: usize = 1 << 20;
+
+    // Two slabs of eight 1 MiB cells.
+    var blocks: [16][]align(16) u8 = undefined;
+    for (&blocks, 0..) |*b, i| {
+        b.* = try a.alignedAlloc(u8, .@"16", mib);
+        @memset(b.*, @intCast(i));
+    }
+    // Six and five blocks left: the first slab's two free cells can't take
+    // the second's five.
+    for ([_]usize{ 0, 1, 8, 9, 10 }) |i| a.free(blocks[i]);
+    try std.testing.expect(!pool.beginCompaction(1));
+    for ([_]usize{ 11, 12, 13 }) |i| a.free(blocks[i]);
+    try std.testing.expectEqual(16 * mib, pool.carvedBytes());
+
+    try std.testing.expect(pool.beginCompaction(1));
+    try std.testing.expectEqual(@as(?[*]u8, null), pool.relocation(blocks[2].ptr));
+    for ([_]usize{ 14, 15 }) |i| {
+        const moved: []align(16) u8 = @alignCast(pool.relocation(blocks[i].ptr).?[0..mib]);
+        @memcpy(moved, blocks[i]);
+        a.free(blocks[i]);
+        blocks[i] = moved;
+    }
+    pool.endCompaction();
+    try std.testing.expectEqual(8 * mib, pool.carvedBytes());
+    try std.testing.expectEqual(8 * mib, pool.trim(std.math.maxInt(usize)));
+    for ([_]usize{ 2, 3, 4, 5, 6, 7, 14, 15 }) |i| {
+        for (blocks[i]) |byte| try std.testing.expectEqual(@as(u8, @intCast(i)), byte);
+        a.free(blocks[i]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.carvedBytes());
 }
 
 test "resize stays in place only within the block's cell" {

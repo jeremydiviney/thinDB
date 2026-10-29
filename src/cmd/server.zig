@@ -73,23 +73,28 @@ const usage_text =
     \\                          hardware threads that concurrent queries share.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
-    \\  --query-memory-budget B Per-query memory budget (default: auto, ~25% of usable RAM,
-    \\                          floored at 256 MiB; also gates the hash-vs-sort GROUP BY
-    \\                          decision). Accepts raw bytes or a K/M/G suffix. Separate bucket
-    \\                          from --cache-size. 0 disables tracking.
-    \\  --memory-budget B       Process-shared query-memory pool ALL queries draw from, so
-    \\                          concurrent queries can't sum past the box (default: auto, ~50% of
-    \\                          usable RAM, floored at 256 MiB). Accepts raw bytes or a K/M/G
-    \\                          suffix. 0 disables the shared pool (per-query budgets still apply).
-    \\  --cache-size B          GLOBAL decompressed-block buffer-pool budget, shared by every
-    \\                          table across all databases (default: auto, ~35% of usable RAM,
-    \\                          floored at 256 MiB). Accepts raw bytes or a K/M/G suffix (e.g.
-    \\                          8G). The LRU evicts the coldest block process-wide; blocks in
-    \\                          use are pinned and never evicted.
+    \\  --memory-budget B       The server's one memory budget (default: auto, ~65% of usable RAM,
+    \\                          floored at 256 MiB). Running queries, the block cache, its
+    \\                          predicate memo and idle scratch buffers all share it: queries
+    \\                          may take all but a tenth (the cache's floor), and the cache
+    \\                          grows into whatever they leave. Accepts raw bytes or a K/M/G
+    \\                          suffix. 0 disables the shared budget (the cache and each query
+    \\                          then get budgets of their own).
+    \\  --query-memory-budget B Per-query memory ceiling inside --memory-budget (default: none,
+    \\                          a query may use what the shared budget gives queries; ~25% of
+    \\                          usable RAM with --memory-budget 0). Also gates the hash-vs-sort
+    \\                          GROUP BY decision. Accepts raw bytes or a K/M/G suffix. 0
+    \\                          disables tracking.
+    \\  --cache-size B          Ceiling of the GLOBAL decompressed-block cache, shared by every
+    \\                          table across all databases (default: auto, the whole
+    \\                          --memory-budget; ~35% of usable RAM with --memory-budget 0).
+    \\                          Accepts raw bytes or a K/M/G suffix (e.g. 8G). The LRU evicts
+    \\                          the coldest block process-wide; blocks in use are pinned and
+    \\                          never evicted.
     \\  --no-predicate-memo     Don't remember which row groups a scan predicate matched nothing
-    \\                          of (default: on, 1/1024 of --cache-size). With it on, a repeated
-    \\                          predicate, or one sharing an AND arm with an earlier one, skips
-    \\                          those row groups unread.
+    \\                          of (default: on, 1/1024 of the cache's ceiling). With it on, a
+    \\                          repeated predicate, or one sharing an AND arm with an earlier
+    \\                          one, skips those row groups unread.
     \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
     \\                          thindb-server rejects read_csv/read_json/read_parquet and
     \\                          FROM 'file.csv' sources.
@@ -427,7 +432,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (enable_fsync) "fsync on" else "fsync OFF (--no-fsync): an OS crash can lose acked writes",
     });
     try out_w.print("  threads:  max-dop {d}, hardware threads {d}\n", .{ cfg.max_dop, thindb.hardwareThreadCount() });
-    try printMemoryBanner(out_w, cfg);
+    try printMemoryBanner(out_w, catalog.config);
 
     var listeners: [3]Listener = undefined;
     var n_listeners: usize = 0;
@@ -657,10 +662,13 @@ const HeapReleaseCtx = struct {
             const elapsed_ms = @divTrunc(Io.Clock.awake.now(self.io).nanoseconds - start_ns, std.time.ns_per_ms);
             const mib = 1024 * 1024;
             const after = released.after;
-            std.debug.print("[mem-release] server idle: resident {d} MiB -> {d} MiB in {d} ms (free heap {d} MiB); now block cache {d} MiB, idle pools {d} MiB, accounted {d} MiB, unaccounted {d} MiB\n", .{
-                released.before / mib,                     after.resident / mib,      elapsed_ms,
-                (released.before -| after.resident) / mib, after.cache / mib,         after.retained / mib,
-                after.accounted / mib,                     after.unaccounted() / mib,
+            const usage = pool.usage();
+            std.debug.print("[mem-release] server idle: resident {d} MiB -> {d} MiB in {d} ms (free heap {d} MiB); now statements {d} MiB, block cache {d} MiB, predicate memo {d} MiB, scratch {d} MiB, region programs {d} MiB, unaccounted {d} MiB\n", .{
+                released.before / mib,            after.resident / mib,
+                elapsed_ms,                       (released.before -| after.resident) / mib,
+                usage.get(.statement) / mib,      usage.get(.block_cache) / mib,
+                usage.get(.predicate_memo) / mib, usage.get(.scratch) / mib,
+                usage.get(.region_program) / mib, after.unaccounted() / mib,
             });
         }
     }
@@ -734,10 +742,22 @@ fn printMemoryBanner(out_w: anytype, cfg: thindb.Config) !void {
     } else {
         try out_w.print("  memory:   usable unknown", .{});
     }
-    try out_w.print(", cache {d} MiB, query budget {d} MiB, shared budget {d} MiB\n", .{
-        thindb.autoCacheSizeBytes(cfg.cache_size_bytes) / mib,
-        thindb.autoQueryBudgetBytes(cfg.query_memory_budget) / mib,
-        thindb.autoMemoryBudgetBytes(cfg.memory_budget) / mib,
+    const query_budget = thindb.autoQueryBudgetBytes(cfg.query_memory_budget, cfg.memory_pool != null);
+    const cache = cfg.block_cache.?;
+    const pool = cfg.memory_pool orelse {
+        try out_w.print(", cache {d} MiB, query budget {d} MiB, no shared budget\n", .{ cache.capacity_bytes / mib, query_budget / mib });
+        return;
+    };
+    try out_w.print(", budget {d} MiB: queries up to {d} MiB", .{ pool.budget / mib, pool.statementLimit() / mib });
+    if (query_budget != 0) try out_w.print(" (each up to {d} MiB)", .{query_budget / mib});
+    if (cache.shared != pool) {
+        try out_w.print(", cache {d} MiB of its own\n", .{cache.capacity_bytes / mib});
+        return;
+    }
+    try out_w.print(", block cache {d} MiB up to {d} MiB, predicate memo {d} MiB\n", .{
+        pool.cache_floor.load(.monotonic) / mib,
+        cache.capacity_bytes / mib,
+        pool.memo_bytes.load(.monotonic) / mib,
     });
 }
 

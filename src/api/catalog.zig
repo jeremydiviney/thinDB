@@ -157,14 +157,17 @@ pub const Catalog = struct {
         errdefer if (owned_pool) |p| allocator.destroy(p);
 
         // The shared decompressed-block cache — same ownership pattern as the
-        // pool: adopt a caller-provided cache as-is, else mint one from the
-        // resolved GLOBAL budget. Every Table opened under this Catalog draws
-        // from it, so eviction is oldest-block-first across all tables.
+        // pool: adopt a caller-provided cache as-is, else mint one. Every
+        // Table opened under this Catalog draws from it, so eviction is
+        // oldest-block-first across all tables. The pool's first cache shares
+        // its budget; any other keeps a budget of its own.
         var owned_block_cache: ?*storage.cache.Cache = null;
         if (cfg.block_cache == null) {
+            const sharing: ?*memory.MemoryPool = if (cfg.memory_pool) |p| (if (p.cache == null) p else null) else null;
             const bc = try allocator.create(storage.cache.Cache);
-            bc.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            bc.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes, if (sharing) |p| p.budget else null));
             bc.predicate_memo.enabled = cfg.predicate_memo;
+            if (sharing) |p| p.shareCache(bc);
             owned_block_cache = bc;
             cfg.block_cache = bc;
         }

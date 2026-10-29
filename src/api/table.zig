@@ -276,7 +276,7 @@ pub const Table = struct {
         var owned_cache = false;
         const cache_ptr = cfg.block_cache orelse blk: {
             const c = try allocator.create(storage.cache.Cache);
-            c.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes));
+            c.* = storage.cache.Cache.init(allocator, api.autoCacheSizeBytes(cfg.cache_size_bytes, null));
             c.predicate_memo.enabled = cfg.predicate_memo;
             owned_cache = true;
             break :blk c;
@@ -307,7 +307,7 @@ pub const Table = struct {
             .auto_flush_secs = cfg.auto_flush_secs,
             .auto_flush_min_rows = cfg.auto_flush_min_rows,
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
-            .query_memory_budget = api.autoQueryBudgetBytes(cfg.query_memory_budget),
+            .query_memory_budget = api.autoQueryBudgetBytes(cfg.query_memory_budget, cfg.memory_pool != null),
             .memory_pool = cfg.memory_pool,
             .compact_threads = api.resolveCompactThreads(allocator, cfg.compact_threads),
             .sync_mode = cfg.sync_mode,

@@ -7,10 +7,15 @@
 //! the cache is ever held compressed. A cache hit still pays a cheap decode
 //! step but skips the block decompress.
 //!
-//! Bounded by total cached bytes (`capacity_bytes`). The cache does NOT assume
-//! the dataset fits in memory: when over budget it evicts unpinned LRU entries,
-//! and if every entry down to budget is currently pinned it temporarily exceeds
-//! capacity rather than free a block someone is reading.
+//! Bounded by total cached bytes: `capacity_bytes`, or, when the cache shares
+//! a memory controller's budget (`MemoryPool.shareCache`), what that budget
+//! leaves after statements and idle memory, never under the controller's
+//! floor or over `capacity_bytes` (`MemoryPool.cacheTarget`). A shared
+//! cache also gives memory back when the controller asks (`reclaim`). The
+//! cache does NOT assume the dataset fits in memory: when over budget it
+//! evicts unpinned LRU entries, and if every entry down to budget is currently
+//! pinned it temporarily exceeds capacity rather than free a block someone is
+//! reading.
 //!
 //! ## Concurrency
 //! Thread-per-connection servers share the one cache across every connection
@@ -42,6 +47,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 const huge_page = @import("../util/huge_page.zig");
+const memory = @import("../memory.zig");
 
 pub const Key = struct {
     /// Table-generation namespace (see the Coherence section above). 0 in
@@ -119,7 +125,7 @@ pub const PredicateMemo = struct {
         if (self.slots.load(.acquire)) |s| self.allocator.free(s[0..self.slot_count]);
     }
 
-    fn slotBytes(self: *const PredicateMemo) usize {
+    pub fn slotBytes(self: *const PredicateMemo) usize {
         return self.slot_count * @sizeOf(u128);
     }
 
@@ -203,8 +209,23 @@ pub const Cache = struct {
     /// blocks pass straight through to `allocator`, so the cache's unit tests
     /// (tiny payloads) behave exactly as before.
     pool: huge_page.Pool,
+    /// The most bytes of blocks the cache holds: its budget, or the ceiling
+    /// over a shared budget's `cacheTarget`.
     capacity_bytes: usize,
+    /// Bytes of the blocks held, each counted at its cell size. Written under
+    /// `mutex`; `footprint` reads it without.
     current_bytes: usize = 0,
+    /// The part of `current_bytes` the pool's arena holds; the rest came from
+    /// its backing allocator. Written under `mutex`.
+    arena_bytes: usize = 0,
+    /// The memory controller whose budget the cache shares, null when
+    /// `capacity_bytes` is its budget. Set by `MemoryPool.shareCache`.
+    shared: ?*memory.MemoryPool = null,
+    /// Bytes inserted since the cache last balanced its shared budget.
+    /// Guarded by `mutex`.
+    unbalanced_bytes: usize = 0,
+    /// Bytes of the scratch buffers, pooled or checked out.
+    scratch_bytes: std.atomic.Value(usize) = .init(0),
 
     map: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
     /// Doubly-linked LRU list. Head = most recently used; tail = LRU (next evict).
@@ -271,6 +292,7 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
+        if (self.shared) |pool| pool.unshareCache(self);
         _ = g_cache_bytes.fetchSub(self.current_bytes, .monotonic);
         const block_alloc = self.pool.allocator();
         var cur = self.head;
@@ -309,7 +331,9 @@ pub const Cache = struct {
         }
         self.scratch_lock.unlock();
         const rounded = std.mem.alignForward(usize, @max(min_len, 1), 1 << 20);
-        return self.allocator.alignedAlloc(u8, .@"16", rounded);
+        const buf = try self.allocator.alignedAlloc(u8, .@"16", rounded);
+        _ = self.scratch_bytes.fetchAdd(buf.len, .monotonic);
+        return buf;
     }
 
     /// Return a buffer from `acquireScratch` to the pool. Fills an empty slot,
@@ -330,10 +354,15 @@ pub const Cache = struct {
             const evicted = self.scratch[smallest.?].?;
             self.scratch[smallest.?] = buf;
             self.scratch_lock.unlock();
-            self.allocator.free(evicted);
+            self.freeScratch(evicted);
             return;
         }
         self.scratch_lock.unlock();
+        self.freeScratch(buf);
+    }
+
+    fn freeScratch(self: *Cache, buf: []align(16) u8) void {
+        _ = self.scratch_bytes.fetchSub(buf.len, .monotonic);
         self.allocator.free(buf);
     }
 
@@ -363,6 +392,20 @@ pub const Cache = struct {
     /// instead. On allocation failure the entry is not stored and `bytes` is left
     /// for the caller to free. Caller MUST `release`.
     pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
+        const inserted = try self.insertPinnedLocked(key, bytes, encoding);
+        if (inserted.balance) |pool| pool.balance();
+        return inserted.entry;
+    }
+
+    const Inserted = struct {
+        entry: *Entry,
+        /// The shared budget, when the cache grew a step since it last
+        /// balanced; balanced once `mutex` is free, since a balance may
+        /// reclaim from this cache.
+        balance: ?*memory.MemoryPool = null,
+    };
+
+    fn insertPinnedLocked(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !Inserted {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -371,7 +414,7 @@ pub const Cache = struct {
             existing.pins += 1;
             self.touch(existing);
             self.hits += 1;
-            return existing;
+            return .{ .entry = existing };
         }
 
         const entry = try self.allocator.create(Entry);
@@ -388,15 +431,129 @@ pub const Cache = struct {
         try self.map.put(self.allocator, key, entry);
 
         self.linkHead(entry);
-        // Account the resident cell, not the logical payload, so `capacity_bytes`
+        // Account the resident cell, not the logical payload, so the capacity
         // bounds the pool's actual footprint (slab cells round up by class).
         // `miss_bytes` stays logical — it measures bytes decompressed per miss.
-        const resident = huge_page.cellSize(bytes.len);
-        self.current_bytes += resident;
+        const resident = self.countBlock(bytes, true);
         _ = g_miss_bytes.fetchAdd(bytes.len, .monotonic);
-        _ = g_cache_bytes.fetchAdd(resident, .monotonic);
-        self.evictUnpinnedToCapacity();
-        return entry;
+        self.evictUnpinned(self.capacity(), 0);
+        const pool = self.shared orelse return .{ .entry = entry };
+        self.unbalanced_bytes += resident;
+        if (self.unbalanced_bytes < pool.balanceStep()) return .{ .entry = entry };
+        self.unbalanced_bytes = 0;
+        return .{ .entry = entry, .balance = pool };
+    }
+
+    /// The bytes of blocks the cache may hold now. Caller holds `mutex`.
+    fn capacity(self: *Cache) usize {
+        const pool = self.shared orelse return self.capacity_bytes;
+        return pool.cacheTarget(self.capacity_bytes);
+    }
+
+    /// Adds a block's cell to the byte counts, or takes it off them, and
+    /// returns the cell's bytes. Caller holds `mutex`.
+    fn countBlock(self: *Cache, bytes: []align(16) u8, added: bool) usize {
+        const cell = huge_page.cellSize(bytes.len);
+        const arena_cell = if (self.pool.holds(bytes.ptr)) cell else 0;
+        if (added) {
+            @atomicStore(usize, &self.current_bytes, self.current_bytes + cell, .monotonic);
+            @atomicStore(usize, &self.arena_bytes, self.arena_bytes + arena_cell, .monotonic);
+            _ = g_cache_bytes.fetchAdd(cell, .monotonic);
+        } else {
+            @atomicStore(usize, &self.current_bytes, self.current_bytes - cell, .monotonic);
+            @atomicStore(usize, &self.arena_bytes, self.arena_bytes - arena_cell, .monotonic);
+            _ = g_cache_bytes.fetchSub(cell, .monotonic);
+        }
+        return cell;
+    }
+
+    /// Bytes the cache holds against a shared budget: the arena's committed
+    /// pages, the blocks from outside the arena and the scratch buffers.
+    pub fn footprint(self: *const Cache) usize {
+        const outside = @atomicLoad(usize, &self.current_bytes, .monotonic) -| @atomicLoad(usize, &self.arena_bytes, .monotonic);
+        return self.pool.committedBytes() +| outside +| self.scratch_bytes.load(.monotonic);
+    }
+
+    /// What the cache holds beyond its blocks' cells and its free pages: the
+    /// unused cells of the arena's regions, and the scratch buffers. Evicting
+    /// a block leaves its cell unused until its region empties, so a shared
+    /// cache counts this apart from its blocks or it would evict to cover it.
+    pub fn overhead(self: *const Cache) usize {
+        return self.pool.carvedBytes() -| @atomicLoad(usize, &self.arena_bytes, .monotonic) +| self.scratch_bytes.load(.monotonic);
+    }
+
+    /// Gives back up to about `want` bytes of arena pages without losing a
+    /// block: free pages are decommitted, and when they fall short, blocks
+    /// move out of sparse slabs so those empty too. Returns the bytes given
+    /// back.
+    pub fn releaseFreePages(self: *Cache, want: usize) usize {
+        const given = self.pool.trim(want);
+        if (given >= want) return given;
+        self.compact(want - given);
+        return given + self.pool.trim(want - given);
+    }
+
+    /// Moves unpinned blocks out of the slabs a compaction pass drains, into
+    /// free cells of fuller slabs, until about `want` bytes of slabs are
+    /// empty. A block is copied with the mutex dropped and a pin held, so it
+    /// stays put; a reader that pins it meanwhile may be reading the old
+    /// bytes, so then the copy is dropped instead. A hit relinks the block
+    /// being copied at the head and ends the walk, hence the second pass.
+    fn compact(self: *Cache, want: usize) void {
+        if (!self.pool.beginCompaction(want)) return;
+        defer self.pool.endCompaction();
+        const goal = self.pool.carvedBytes() -| want;
+        const block_alloc = self.pool.allocator();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var passes: usize = 0;
+        while (passes < 2 and self.pool.carvedBytes() > goal) : (passes += 1) {
+            var cursor = self.tail;
+            while (cursor) |entry| : (cursor = entry.prev) {
+                if (self.pool.carvedBytes() <= goal) break;
+                if (entry.pins != 0) continue;
+                const into = self.pool.relocation(entry.bytes.ptr) orelse continue;
+                const moved: []align(16) u8 = @alignCast(into[0..entry.bytes.len]);
+                entry.pins += 1;
+                self.mutex.unlock();
+                @memcpy(moved, entry.bytes);
+                self.mutex.lock();
+                entry.pins -= 1;
+                if (entry.pins == 0) {
+                    block_alloc.free(entry.bytes);
+                    entry.bytes = moved;
+                } else {
+                    block_alloc.free(moved);
+                }
+            }
+        }
+    }
+
+    /// Gives a shared budget about `want` bytes: unpinned blocks go, least
+    /// recently used first, and the arena pages they empty go back to the OS,
+    /// until the footprint has shrunk by `want` or the next block would take
+    /// the cache under `floor` bytes. Returns the bytes the footprint shrank
+    /// by. An arena block's pages go back once its slab is empty, which
+    /// `releaseFreePages` brings about by moving the blocks evictions leave
+    /// in sparse slabs; past twice `want` evicted, the rest waits for the
+    /// next balance.
+    pub fn reclaim(self: *Cache, want: usize, floor: usize) usize {
+        var given: usize = 0;
+        var evicted: usize = 0;
+        while (given < want and evicted < want *| 2) {
+            self.mutex.lock();
+            const before = self.current_bytes;
+            const outside_before = self.current_bytes - self.arena_bytes;
+            self.evictUnpinned(self.current_bytes -| (want - given), floor);
+            const gone = before - self.current_bytes;
+            const outside_freed = outside_before - (self.current_bytes - self.arena_bytes);
+            self.mutex.unlock();
+            if (gone == 0) break;
+            evicted += gone;
+            given += outside_freed;
+            given += self.releaseFreePages(want -| given);
+        }
+        return given;
     }
 
     /// Drop one pin previously taken by `acquire`/`insertPinned`. Thread-safe.
@@ -407,22 +564,22 @@ pub const Cache = struct {
         entry.pins -= 1;
     }
 
-    /// Evict unpinned entries from the LRU end until within budget. Pinned
-    /// entries are skipped, never freed — so a dataset larger than the cache
-    /// (or a moment where the whole tail is in use) temporarily exceeds
+    /// Evict unpinned entries from the LRU end until `target` bytes are left,
+    /// stopping where the next one would leave fewer than `floor`. Pinned
+    /// entries are skipped, never freed — so a dataset larger than the
+    /// cache (or a moment where the whole tail is in use) temporarily exceeds
     /// capacity rather than freeing a block a reader still holds. Caller holds
     /// `mutex`.
-    fn evictUnpinnedToCapacity(self: *Cache) void {
+    fn evictUnpinned(self: *Cache, target: usize, floor: usize) void {
         var victim = self.tail;
-        while (self.current_bytes > self.capacity_bytes) {
+        while (self.current_bytes > target) {
             const v = victim orelse break;
             const prev = v.prev;
             if (v.pins == 0) {
+                if (self.current_bytes - huge_page.cellSize(v.bytes.len) < floor) break;
                 self.unlink(v);
                 _ = self.map.remove(v.key);
-                const resident = huge_page.cellSize(v.bytes.len);
-                self.current_bytes -= resident;
-                _ = g_cache_bytes.fetchSub(resident, .monotonic);
+                _ = self.countBlock(v.bytes, false);
                 self.pool.allocator().free(v.bytes);
                 self.allocator.destroy(v);
                 self.evictions += 1;
@@ -446,9 +603,7 @@ pub const Cache = struct {
             if (e.key.table_uid == table_uid and e.pins == 0) {
                 self.unlink(e);
                 _ = self.map.remove(e.key);
-                const resident = huge_page.cellSize(e.bytes.len);
-                self.current_bytes -= resident;
-                _ = g_cache_bytes.fetchSub(resident, .monotonic);
+                _ = self.countBlock(e.bytes, false);
                 self.pool.allocator().free(e.bytes);
                 self.allocator.destroy(e);
             }
@@ -664,6 +819,79 @@ test "purgeTable frees one table's unpinned entries, leaves other tables and pin
     c.release(pinned);
     c.purgeTable(5);
     try std.testing.expect(c.acquire(dead_pinned) == null);
+}
+
+fn putBlock(c: *Cache, index: usize, len: usize) !void {
+    const bytes = try c.blockAllocator().alignedAlloc(u8, .@"16", len);
+    try put(c, .{ .segment_id = 1, .row_group_idx = @intCast(index), .column_idx = 0 }, bytes);
+}
+
+test "cache footprint counts arena pages, outside blocks and scratch; reclaim stops at twice its ask and at the floor" {
+    const allocator = std.testing.allocator;
+    const mib: usize = 1 << 20;
+    var c: Cache = .init(allocator, 64 * mib);
+    defer c.deinit();
+    if (c.pool.arena.len == 0) return error.SkipZigTest;
+    // Two slabs of eight 1 MiB cells, then a block from outside the arena.
+    for (0..16) |i| try putBlock(&c, i, mib);
+    try put(&c, .{ .segment_id = 2, .row_group_idx = 0, .column_idx = 0 }, try adup(allocator, "small"));
+    try std.testing.expectEqual(16 * mib + 5, c.current_bytes);
+    try std.testing.expectEqual(16 * mib, c.arena_bytes);
+    try std.testing.expectEqual(16 * mib + 5, c.footprint());
+    try std.testing.expectEqual(@as(usize, 0), c.overhead());
+    c.releaseScratch(try c.acquireScratch(mib + 1));
+    try std.testing.expectEqual(18 * mib + 5, c.footprint());
+    try std.testing.expectEqual(2 * mib, c.overhead());
+
+    // Six of the first slab's blocks go and none of its pages: it still
+    // holds two.
+    try std.testing.expectEqual(@as(usize, 0), c.reclaim(3 * mib, 0));
+    try std.testing.expectEqual(10 * mib + 5, c.current_bytes);
+    try std.testing.expectEqual(8 * mib, c.overhead());
+    // Two more empty it, and a huge page of it goes back.
+    try std.testing.expectEqual(2 * mib, c.reclaim(2 * mib, 0));
+    try std.testing.expectEqual(16 * mib + 5, c.footprint());
+    try std.testing.expectEqual(6 * mib, c.releaseFreePages(std.math.maxInt(usize)));
+    try std.testing.expectEqual(10 * mib + 5, c.footprint());
+
+    // Asked for everything, the cache stops before the block that would take
+    // it under the floor.
+    try std.testing.expectEqual(@as(usize, 0), c.reclaim(64 * mib, 4 * mib));
+    try std.testing.expectEqual(4 * mib + 5, c.current_bytes);
+    try std.testing.expectEqual(@as(u64, 12), c.evictions);
+}
+
+test "freeing pages moves a sparse slab's blocks into a fuller one, losing none and leaving pinned ones be" {
+    const allocator = std.testing.allocator;
+    const mib: usize = 1 << 20;
+    var c: Cache = .init(allocator, 64 * mib);
+    defer c.deinit();
+    if (c.pool.arena.len == 0) return error.SkipZigTest;
+    // Two slabs of eight 1 MiB cells, block i filled with byte i. Purging
+    // table 2 leaves the first slab six blocks and the second two.
+    for (0..16) |i| {
+        const bytes = try c.blockAllocator().alignedAlloc(u8, .@"16", mib);
+        @memset(bytes, @intCast(i));
+        const purged = i < 2 or (i >= 8 and i < 14);
+        try put(&c, .{ .table_uid = if (purged) 2 else 1, .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0 }, bytes);
+    }
+    c.purgeTable(2);
+    try std.testing.expectEqual(8 * mib, c.current_bytes);
+    try std.testing.expectEqual(16 * mib, c.footprint());
+    const evictions = c.evictions;
+
+    const held = c.acquire(.{ .table_uid = 1, .segment_id = 1, .row_group_idx = 15, .column_idx = 0 }).?;
+    try std.testing.expectEqual(@as(usize, 0), c.releaseFreePages(8 * mib));
+    c.release(held);
+    try std.testing.expectEqual(8 * mib, c.releaseFreePages(8 * mib));
+    try std.testing.expectEqual(8 * mib, c.footprint());
+    try std.testing.expectEqual(@as(usize, 0), c.overhead());
+    try std.testing.expectEqual(evictions, c.evictions);
+    for ([_]u32{ 2, 3, 4, 5, 6, 7, 14, 15 }) |i| {
+        const entry = c.acquire(.{ .table_uid = 1, .segment_id = 1, .row_group_idx = i, .column_idx = 0 }).?;
+        defer c.release(entry);
+        for (entry.bytes) |byte| try std.testing.expectEqual(@as(u8, @intCast(i)), byte);
+    }
 }
 
 // ---------------------------------------------------------------------------

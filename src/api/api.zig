@@ -142,19 +142,24 @@ pub const Config = struct {
     auto_flush_min_rows: u64 = 1,
     auto_flush_min_bytes: usize = 0,
 
-    /// GLOBAL LRU cache budget for decompressed column blocks — one budget
+    /// GLOBAL LRU cache capacity for decompressed column blocks — one cache
     /// shared by every table (across all databases/schemas) of the Catalog,
-    /// evicting the coldest block process-wide. The special value `0` means
-    /// "auto" — resolved at open time to ~35% of physical RAM (floored at
-    /// 256 MiB) by `autoCacheSizeBytes`. Set an explicit non-zero value to pin
-    /// the budget; there is no separate "disable cache" — a tiny explicit
-    /// value (e.g. 1) is the way to effectively turn it off.
+    /// evicting the coldest block process-wide. Under a shared memory pool
+    /// the cache lives inside the pool's budget: it grows into what
+    /// statements and idle memory leave, never under a tenth of the budget,
+    /// and this is only its ceiling. The special value `0` means "auto",
+    /// resolved at open time by `autoCacheSizeBytes`: the whole pool budget,
+    /// or ~35% of physical RAM (floored at 256 MiB) for a cache without a
+    /// pool. Set an explicit non-zero value to pin the ceiling; there is no
+    /// separate "disable cache" — a tiny explicit value (e.g. 1) is the way
+    /// to effectively turn it off.
     cache_size_bytes: usize = 0,
 
     /// Remember, per row group, the scan predicates that matched none of its
     /// stored rows, so a later scan with the same predicate (or with one AND
     /// arm of it) skips that row group unread. Takes 1/1024 of the block
-    /// cache budget. Only the Catalog-minted cache honors it; a caller-provided
+    /// cache's capacity, charged to the shared memory pool when the cache
+    /// shares one. Only the Catalog-minted cache honors it; a caller-provided
     /// `block_cache` keeps its own setting.
     predicate_memo: bool = true,
 
@@ -223,23 +228,26 @@ pub const Config = struct {
     /// every query either runs entirely within `query_memory_budget`
     /// or fails fast with a clear error — never silently degrades.
     ///
-    /// Default `auto_query_budget` → resolved at open to ~25% of physical RAM
-    /// by `autoQueryBudgetBytes`. High-cardinality GROUP BY / large sorts on
+    /// Default `auto_query_budget` → resolved at open by
+    /// `autoQueryBudgetBytes`: no per-query ceiling under a shared memory
+    /// pool, whose statement share then bounds each query; ~25% of physical
+    /// RAM without one. High-cardinality GROUP BY / large sorts on
     /// hundred-million-row tables hold their whole hash table or buffer at once
     /// (eviction can't shrink the single peak), so the budget has to clear that
-    /// peak; a RAM fraction scales it to the box. Independent of the decoded-
-    /// block cache (a separate bucket — see `cache_size_bytes`). An explicit
-    /// non-zero value pins the budget; `0` disables tracking. A real fix for the
-    /// GROUP BY ceiling (spill-to-disk) is future work.
+    /// peak. An explicit non-zero value pins a per-query ceiling under the
+    /// pool's; `0` disables tracking. A real fix for the GROUP BY ceiling
+    /// (spill-to-disk) is future work.
     query_memory_budget: usize = auto_query_budget,
 
-    /// Process-shared query-memory budget: ONE pool every query's blocking-
-    /// operator reservations draw from, so concurrent queries can't sum past
-    /// the box even when each is under its per-query ceiling. Resolved at
-    /// Catalog open by `autoMemoryBudgetBytes`: the `auto_memory_budget`
-    /// default → ~50% of physical RAM (floored at 256 MiB); an explicit
-    /// value pins it; `0` disables the shared pool (per-query ceilings still
-    /// apply). Independent of the decoded-block cache bucket.
+    /// The process's one memory budget (`MemoryPool`): every query's
+    /// reservations, the block cache, its predicate memo and idle scratch
+    /// pools share it, so concurrent queries and the cache can't sum past the
+    /// box. Statements may take all of it but the cache's floor (a tenth) and
+    /// the memo; the cache grows into the rest. Resolved at Catalog open by
+    /// `autoMemoryBudgetBytes`: the `auto_memory_budget` default → ~65% of
+    /// physical RAM (floored at 256 MiB); an explicit value pins it; `0`
+    /// disables the shared pool (the cache and per-query ceilings then keep
+    /// budgets of their own).
     memory_budget: usize = auto_memory_budget,
 
     /// The shared pool itself. Normally null in user-built Configs — the
@@ -324,16 +332,20 @@ pub fn totalMemoryBytes() ?u64 {
     return @import("../util/affinity.zig").totalMemoryBytes();
 }
 
-/// Resolve the GLOBAL decompressed-block cache budget (one cache shared by
-/// every table of the Catalog). A non-zero `configured` is honored verbatim;
-/// `0` means "auto" — ~35% of usable RAM (physical, or the container's cgroup
-/// limit when that is smaller), floored at 256 MiB so small machines still get
-/// a usable pool. The LRU fills lazily and evicts to this
-/// bound, so a large auto budget on a big box costs nothing until the
-/// workload's hot set actually grows into it. Falls back to the floor if the
-/// OS can't report total memory.
-pub fn autoCacheSizeBytes(configured: usize) usize {
+/// Resolve the GLOBAL decompressed-block cache capacity (one cache shared by
+/// every table of the Catalog). A non-zero `configured` is honored verbatim.
+/// `0` means "auto": a cache that shares the memory pool's budget
+/// (`shared_budget`) may grow into all of it, as far as statements and idle
+/// memory leave room (`MemoryPool.cacheTarget`); a cache with a budget of its
+/// own gets ~35% of usable RAM (physical, or the container's cgroup limit
+/// when that is smaller), floored at 256 MiB so small machines still get a
+/// usable pool. The LRU fills lazily and evicts to this bound, so a large
+/// auto budget on a big box costs nothing until the workload's hot set
+/// actually grows into it. Falls back to the floor if the OS can't report
+/// total memory.
+pub fn autoCacheSizeBytes(configured: usize, shared_budget: ?usize) usize {
     if (configured != 0) return configured;
+    if (shared_budget) |budget| return budget;
     const floor: u64 = 256 * 1024 * 1024;
     const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
     // 35% of system memory (not 50%): a larger decompressed-block cache stops
@@ -350,11 +362,14 @@ pub fn autoCacheSizeBytes(configured: usize) usize {
 pub const auto_query_budget: usize = std.math.maxInt(usize);
 
 /// Resolve the per-query memory budget. The `auto_query_budget` sentinel (the
-/// `Config` default) means "auto" — ~25% of usable RAM, floored at 256 MiB.
+/// `Config` default) means "auto": under a shared memory pool (`pooled`), `0`
+/// — no per-query ceiling, so one statement may take everything the pool
+/// gives statements; without one, ~25% of usable RAM, floored at 256 MiB.
 /// Any other value (including `0` = disable tracking) is honored verbatim.
 /// Falls back to the floor if the OS can't report total memory.
-pub fn autoQueryBudgetBytes(configured: usize) usize {
+pub fn autoQueryBudgetBytes(configured: usize, pooled: bool) usize {
     if (configured != auto_query_budget) return configured;
+    if (pooled) return 0;
     const floor: u64 = 256 * 1024 * 1024;
     const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
     return @intCast(@max(total / 4, floor));
@@ -365,14 +380,16 @@ pub fn autoQueryBudgetBytes(configured: usize) usize {
 pub const auto_memory_budget: usize = std.math.maxInt(usize);
 
 /// Resolve the process-shared memory-pool budget. The sentinel default →
-/// ~50% of usable RAM, floored at 256 MiB; `0` = no shared pool; any
-/// other value verbatim. Sits alongside the ~35% block cache: together
-/// they bound the process's two growth buckets below the box.
+/// ~65% of usable RAM, floored at 256 MiB; `0` = no shared pool; any
+/// other value verbatim. Statements, the block cache, its predicate memo
+/// and idle pools all fit in it; the rest of the box is left for what no
+/// budget accounts (memtables, segment metadata, allocator overhead) and the
+/// OS page cache.
 pub fn autoMemoryBudgetBytes(configured: usize) usize {
     if (configured != auto_memory_budget) return configured;
     const floor: u64 = 256 * 1024 * 1024;
     const total = @import("../util/affinity.zig").totalMemoryBytes() orelse return @intCast(floor);
-    return @intCast(@max(total / 2, floor));
+    return @intCast(@max(total * 65 / 100, floor));
 }
 
 pub const TableOptions = struct {

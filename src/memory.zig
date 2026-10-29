@@ -1,14 +1,16 @@
-//! Per-query execution allocation accounting and cooperative cancellation.
+//! Per-query execution allocation accounting, the process's memory
+//! controller, and cooperative cancellation.
 //!
 //! Physical operators and worker allocators share one thread-safe ledger. It
 //! charges live requested capacities (a pooled scratch block at its whole size
 //! class) to per-query/shared limits; planner row estimates do not enforce
 //! those limits. Output stays charged until released. Retained pool storage
 //! attaches to the current borrower; while idle it is charged to nobody, has
-//! its own retention cap, and yields to live demand: live plus idle bytes
-//! stay within the shared budget (`MemoryPool.yieldIdle`).
+//! its own retention cap, and yields to live demand. The shared budget
+//! (`MemoryPool`) covers live statements, idle pools, the block cache and its
+//! predicate memo together (`MemoryPool.balance`).
 //! General-allocator metadata, rounding and freelists, database
-//! metadata, parser/wire buffers and source cache are separate costs; the
+//! metadata, parser/wire buffers and memtables are separate costs; the
 //! watchdog (`MemoryAccountant.watch`) reports when they grow large.
 //!
 //! Query ownership can retire before asynchronous frees finish. The ledger and
@@ -135,8 +137,10 @@ pub const MemorySnapshot = struct {
     }
 };
 
-fn cacheBytes() u64 {
-    return @max(huge_page.g_slab_bytes.load(.monotonic) + huge_page.g_fallback_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic));
+fn cacheBytes(pool: ?*const MemoryPool) u64 {
+    const blocks = @max(huge_page.g_slab_bytes.load(.monotonic) + huge_page.g_fallback_bytes.load(.monotonic), block_cache.g_cache_bytes.load(.monotonic));
+    const p = pool orelse return blocks;
+    return blocks + p.memo_bytes.load(.monotonic);
 }
 
 /// Unaccounted memory that earns a watchdog line: 2 GiB, or a quarter of the
@@ -156,12 +160,30 @@ fn watchStep(budget: usize) usize {
     return std.math.clamp(budget / 16, min_step, max_step);
 }
 
+/// What memory under a `MemoryPool` budget is for (`MemoryPool.usage`).
+pub const Kind = enum {
+    /// Live memory of running statements, charged by their accountants.
+    statement,
+    /// The shared block cache: its blocks, the arena pages that hold them,
+    /// and its scratch buffers.
+    block_cache,
+    /// The shared block cache's predicate memo slots.
+    predicate_memo,
+    /// The scratch pool's free blocks.
+    scratch,
+    /// Cached region programs' buffers while no statement runs them.
+    region_program,
+};
+
+pub const Usage = std.EnumArray(Kind, usize);
+
 /// Memory a subsystem keeps warm between uses and gives back when asked: the
 /// scratch pool's free lists, a cached region program's buffers. Idle bytes
 /// are charged to no statement; a block a statement takes out of a source
 /// leaves the idle count and enters that statement's charge. A source
 /// registers with the `MemoryPool` whose budget its memory shares.
 pub const IdleSource = struct {
+    kind: Kind,
     idle_bytes_fn: *const fn (source: *IdleSource) usize,
     /// Release up to `want` idle bytes, least valuable first, and return how
     /// many are on their way back to the allocator. Runs on whichever thread
@@ -185,22 +207,34 @@ fn idleSlack(budget: usize) usize {
     return watchStep(budget);
 }
 
-/// Process-shared memory pool: one budget every query's accountant draws
-/// from, so CONCURRENT queries can't sum past the box even when each is
-/// individually under its per-query ceiling. Owned by the Catalog (one per
-/// server process / embedded Catalog); thread-safe — queries reserve from
-/// their own connection threads.
+/// The share of the budget the shared block cache always keeps: a tenth, so
+/// statements that take the rest still leave the scans a working set.
+const CACHE_FLOOR_SHARE = 10;
+
+/// The process's memory controller: one budget for everything the process
+/// commits memory to on purpose — running statements, the block cache and
+/// its predicate memo, idle scratch and region-program buffers (`Kind`).
+/// Owned by the Catalog (one per server process / embedded Catalog);
+/// thread-safe — queries reserve from their own connection threads.
 ///
-/// The budget also bounds the idle memory of the sources registered here:
-/// live bytes plus idle bytes stay within it, checked where a statement
-/// starts, grows by a sampling step, or is refused (`yieldIdle`). Admission
-/// compares live bytes only, so idle memory never refuses a reservation; it
-/// is given back instead.
+/// Statements come first: between them they may hold everything but the
+/// cache floor and the memo (`statementLimit`), each also under its own
+/// per-query ceiling when it has one, so concurrent queries can't sum past
+/// the box. Idle memory is charged to nobody and never refuses a
+/// reservation. The shared block cache grows into what is left
+/// (`cacheTarget`) and never shrinks under its floor.
 ///
-/// No budget bounds the cache's slabs, the allocator's free pages or memory
-/// nothing accounts for, so the pool also watches the process against its
-/// usable memory (`limit`): past `reliefLine` idle memory and free heap pages
-/// go back, and a statement that grows while the process is still at
+/// Statement, idle, memo and cache bytes together stay within the budget,
+/// checked where a statement starts, grows by a sampling step or is
+/// refused, and where the cache grows a step (`balance`). Past the budget,
+/// memory goes back cheapest to rebuild first: the cache's free pages (its
+/// blocks compacted out of sparse slabs if need be), the idle sources, then
+/// the cache's least recently used blocks.
+///
+/// No budget bounds the allocator's free pages or memory nothing accounts
+/// for, so the pool also watches the process against its usable memory
+/// (`limit`): past `reliefLine` the same order gives memory back, then free
+/// heap pages go, and a statement that grows while the process is still at
 /// `residentCeiling` is refused (`MemoryAccountant.sampleGrowth`).
 pub const MemoryPool = struct {
     budget: usize,
@@ -216,11 +250,25 @@ pub const MemoryPool = struct {
     /// The process scratch pool's free lists, the first idle source of every
     /// pool. The scratch pool is one per process: two pools in one process
     /// each count it and each may reclaim from it.
-    scratch: IdleSource = .{ .idle_bytes_fn = scratchIdleBytes, .reclaim_fn = scratchReclaim },
+    scratch: IdleSource = .{ .kind = .scratch, .idle_bytes_fn = scratchIdleBytes, .reclaim_fn = scratchReclaim },
     /// Guards the registered sources, the list behind `scratch.next`.
     idle_lock: std.atomic.Mutex = .unlocked,
-    /// Held by the one thread giving idle memory back.
+    /// Held by the one thread balancing the budget.
     yield_lock: std.atomic.Mutex = .unlocked,
+    /// The block cache that shares the budget (`shareCache`); null when the
+    /// cache has a budget of its own. Guarded by `share_lock`.
+    cache: ?*block_cache.Cache = null,
+    /// Bytes no statement can take, kept for the shared cache's blocks.
+    cache_floor: std.atomic.Value(usize) = .init(0),
+    /// The shared cache's predicate memo slots, charged whole from the start.
+    memo_bytes: std.atomic.Value(usize) = .init(0),
+    /// What the shared cache leaves for the registered idle sources and for
+    /// its own overhead, as the last balance read them (`cacheTarget`).
+    cache_reserve: std.atomic.Value(usize) = .init(0),
+    /// Held by whoever reads or reclaims from `cache`, so the cache can't
+    /// leave meanwhile. Taken after `yield_lock` and before the cache's own
+    /// mutex.
+    share_lock: std.atomic.Mutex = .unlocked,
     /// The unaccounted bytes the last watchdog line reported; 0 before the
     /// first line and once the gap has fallen back under the threshold.
     watch_gap: std.atomic.Value(u64) = .init(0),
@@ -260,7 +308,11 @@ pub const MemoryPool = struct {
     }
 
     pub fn idleBytes(self: *MemoryPool) usize {
-        var total = self.scratch.idle_bytes_fn(&self.scratch);
+        return self.scratch.idle_bytes_fn(&self.scratch) +| self.registeredIdleBytes();
+    }
+
+    fn registeredIdleBytes(self: *MemoryPool) usize {
+        var total: usize = 0;
         self.lockIdle();
         defer self.idle_lock.unlock();
         var source = self.scratch.next;
@@ -268,39 +320,148 @@ pub const MemoryPool = struct {
         return total;
     }
 
-    /// When live plus idle bytes have passed the budget, idle sources give
-    /// back the excess plus `idleSlack`: the scratch pool first, whose blocks
-    /// cost a page fault to mint again, then the registered sources. A thread
-    /// that finds another one already reclaiming leaves it to that thread.
-    /// The scratch pool's frees run outside `idle_lock` — its source is
-    /// embedded and never unregisters — so a long release holds up neither a
-    /// reading of `idleBytes` nor a closing database.
-    pub fn yieldIdle(self: *MemoryPool) void {
+    fn lockShare(self: *MemoryPool) void {
+        while (!self.share_lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Puts `cache` under the budget: its floor is a tenth of the budget, at
+    /// most its capacity, and its predicate memo is charged whole. One cache
+    /// per pool, shared before any statement draws from the pool. The cache
+    /// leaves through `unshareCache` before it goes.
+    pub fn shareCache(self: *MemoryPool, cache: *block_cache.Cache) void {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        std.debug.assert(self.cache == null);
+        self.cache_floor.store(@min(self.budget / CACHE_FLOOR_SHARE, cache.capacity_bytes), .monotonic);
+        self.memo_bytes.store(cache.predicate_memo.slotBytes(), .monotonic);
+        self.cache = cache;
+        cache.shared = self;
+    }
+
+    /// On return no balance reads or reclaims from `cache`, and none will.
+    pub fn unshareCache(self: *MemoryPool, cache: *block_cache.Cache) void {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        if (self.cache != cache) return;
+        self.cache = null;
+        self.cache_floor.store(0, .monotonic);
+        self.memo_bytes.store(0, .monotonic);
+        self.cache_reserve.store(0, .monotonic);
+        cache.shared = null;
+    }
+
+    /// What live statements may hold between them: the budget less the
+    /// shared cache's floor and memo.
+    pub fn statementLimit(self: *const MemoryPool) usize {
+        return self.budget -| self.cache_floor.load(.monotonic) -| self.memo_bytes.load(.monotonic);
+    }
+
+    /// Bytes of blocks the shared cache may hold now: what the budget leaves
+    /// after live statements, the memo, the scratch pool's free blocks and
+    /// `cache_reserve`, at least the floor and at most `ceiling`. Lock-free,
+    /// for the cache's insert path. The registered sources and the cache's
+    /// overhead count as the last balance read them, so between balances
+    /// the cache can pass the budget by what they grew since; the next
+    /// balance takes it back.
+    pub fn cacheTarget(self: *MemoryPool, ceiling: usize) usize {
+        const taken = self.inUse() +| self.memo_bytes.load(.monotonic) +|
+            self.scratch.idle_bytes_fn(&self.scratch) +| self.cache_reserve.load(.monotonic);
+        return @min(@max(self.budget -| taken, self.cache_floor.load(.monotonic)), ceiling);
+    }
+
+    /// Bytes the shared cache may grow by between two of its balances.
+    pub fn balanceStep(self: *const MemoryPool) usize {
+        return watchStep(self.budget);
+    }
+
+    /// When statement, idle, memo and cache bytes have passed the budget,
+    /// gives the excess back (`rebalanceLocked`). A thread that finds another
+    /// one already balancing leaves it to that thread. The scratch pool's
+    /// frees run outside `idle_lock` — its source is embedded and never
+    /// unregisters — so a long release holds up neither a reading of
+    /// `idleBytes` nor a closing database.
+    pub fn balance(self: *MemoryPool) void {
         if (self.budget == std.math.maxInt(usize)) return;
         if (!self.yield_lock.tryLock()) return;
         defer self.yield_lock.unlock();
-        _ = self.reclaimIdleLocked(0);
+        _ = self.rebalanceLocked(0);
     }
 
-    /// Gives back what live plus idle bytes exceed the budget by, or
-    /// `pressure` bytes when that is more, plus `idleSlack`. Returns the bytes
-    /// given back. Caller holds `yield_lock`.
-    fn reclaimIdleLocked(self: *MemoryPool, pressure: u64) usize {
+    /// Gives back what statement, idle, memo and cache bytes exceed the
+    /// budget by, or `pressure` bytes when that is more: first the cache's
+    /// free pages, which hold nothing, emptying sparse slabs by moving their
+    /// blocks when the free pages fall short; then idle sources, the excess plus
+    /// `idleSlack`, the scratch pool before the registered sources; last the
+    /// cache's least recently used blocks, the excess only and never under
+    /// its floor. Returns the bytes given back. Caller holds `yield_lock`.
+    fn rebalanceLocked(self: *MemoryPool, pressure: u64) usize {
+        defer self.noteCacheReserve();
         const idle = self.idleBytes();
-        const excess = @max((self.inUse() +| idle) -| self.budget, pressure);
+        const held = self.inUse() +| self.memo_bytes.load(.monotonic) +| idle +| self.cacheFootprint();
+        const excess: usize = @max(held -| self.budget, pressure);
         if (excess == 0) return 0;
-        const asked: usize = @min(idle, excess +| idleSlack(self.budget));
-        var want = asked;
-        want -|= self.scratch.reclaim_fn(&self.scratch, want);
-        if (want == 0) return asked;
+        var given = self.cacheFreePages(excess);
+        if (given < excess) given +|= self.reclaimIdle(@min(idle, excess - given +| idleSlack(self.budget)));
+        if (given < excess) given +|= self.cacheEvict(excess - given);
+        return given;
+    }
+
+    /// Asks the idle sources for `want` bytes, the scratch pool first, whose
+    /// blocks cost a page fault to mint again. Returns the bytes given.
+    fn reclaimIdle(self: *MemoryPool, want: usize) usize {
+        var left = want;
+        left -|= self.scratch.reclaim_fn(&self.scratch, left);
+        if (left == 0) return want;
         self.lockIdle();
         defer self.idle_lock.unlock();
         var source = self.scratch.next;
         while (source) |s| : (source = s.next) {
-            want -|= s.reclaim_fn(s, want);
-            if (want == 0) break;
+            left -|= s.reclaim_fn(s, left);
+            if (left == 0) break;
         }
-        return asked - want;
+        return want - left;
+    }
+
+    fn cacheFootprint(self: *MemoryPool) usize {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        const cache = self.cache orelse return 0;
+        return cache.footprint();
+    }
+
+    fn cacheFreePages(self: *MemoryPool, want: usize) usize {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        const cache = self.cache orelse return 0;
+        return cache.releaseFreePages(want);
+    }
+
+    fn cacheEvict(self: *MemoryPool, want: usize) usize {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        const cache = self.cache orelse return 0;
+        return cache.reclaim(want, self.cache_floor.load(.monotonic));
+    }
+
+    fn noteCacheReserve(self: *MemoryPool) void {
+        self.lockShare();
+        defer self.share_lock.unlock();
+        const cache = self.cache orelse return;
+        self.cache_reserve.store(self.registeredIdleBytes() +| cache.overhead(), .monotonic);
+    }
+
+    /// The bytes each kind of memory under the budget holds now.
+    pub fn usage(self: *MemoryPool) Usage {
+        var u = Usage.initFill(0);
+        u.set(.statement, self.inUse());
+        u.set(.block_cache, self.cacheFootprint());
+        u.set(.predicate_memo, self.memo_bytes.load(.monotonic));
+        u.set(.scratch, self.scratch.idle_bytes_fn(&self.scratch));
+        self.lockIdle();
+        defer self.idle_lock.unlock();
+        var source = self.scratch.next;
+        while (source) |s| : (source = s.next) u.getPtr(s.kind).* +|= s.idle_bytes_fn(s);
+        return u;
     }
 
     /// Resident memory a growing statement may not pass: the limit less a
@@ -317,10 +478,11 @@ pub const MemoryPool = struct {
     }
 
     /// Brings resident memory back under `reliefLine` once it has passed
-    /// it: idle pools give back the overshoot, then, while the process is
-    /// still over, the general allocator's free pages go back to the system.
-    /// Waits for a thread already giving memory back, whose work may be
-    /// enough. Returns resident memory afterwards.
+    /// it: the cache's free pages, idle pools and the cache's blocks above
+    /// its floor give back the overshoot (`rebalanceLocked`), then, while the
+    /// process is still over, the general allocator's free pages go back to
+    /// the system. Waits for a thread already giving memory back, whose work
+    /// may be enough. Returns resident memory afterwards.
     pub fn relieve(self: *MemoryPool, resident: u64) u64 {
         const line = self.reliefLine();
         if (resident < line) return resident;
@@ -328,7 +490,7 @@ pub const MemoryPool = struct {
         defer self.yield_lock.unlock();
         const before = affinity.processResidentBytes() orelse resident;
         if (before < line) return before;
-        const idle_given = self.reclaimIdleLocked(before - line);
+        const idle_given = self.rebalanceLocked(before - line);
         var now = affinity.processResidentBytes() orelse before;
         const after_idle = now;
         if (now >= line and now >= self.relief_resident +| watchStep(self.budget)) {
@@ -337,7 +499,7 @@ pub const MemoryPool = struct {
         }
         const mib = 1024 * 1024;
         std.debug.print(
-            "[mem-relief] resident {d} MiB passed the relief line {d} MiB (limit {d} MiB): idle pools gave back {d} MiB, free heap {d} MiB; resident now {d} MiB\n",
+            "[mem-relief] resident {d} MiB passed the relief line {d} MiB (limit {d} MiB): idle pools and block cache gave back {d} MiB, free heap {d} MiB; resident now {d} MiB\n",
             .{ before / mib, line / mib, self.limit / mib, idle_given / mib, (after_idle -| now) / mib, now / mib },
         );
         return now;
@@ -365,13 +527,15 @@ pub const MemoryPool = struct {
         }
     }
 
-    /// Atomically grab `bytes` from the pool; false when the pool can't
-    /// cover it (no partial state). CAS loop — contention is per blocking-
-    /// operator allocation, not per row, so it's never hot.
+    /// Atomically grab `bytes` from the pool; false when the statements'
+    /// share (`statementLimit`) can't cover it (no partial state). CAS loop —
+    /// contention is per blocking-operator allocation, not per row, so it's
+    /// never hot.
     pub fn tryReserve(self: *MemoryPool, bytes: usize) bool {
+        const limit = self.statementLimit();
         var cur = self.used.load(.monotonic);
         while (true) {
-            if (bytes > self.budget - cur) return false;
+            if (bytes > limit -| cur) return false;
             const new = cur + bytes;
             cur = self.used.cmpxchgWeak(cur, new, .monotonic, .monotonic) orelse {
                 _ = self.charge_peak.fetchMax(new, .monotonic);
@@ -407,7 +571,7 @@ pub const MemoryPool = struct {
     }
 
     pub fn snapshot(self: *MemoryPool, resident: u64) MemorySnapshot {
-        return .{ .resident = resident, .cache = cacheBytes(), .retained = self.idleBytes(), .accounted = self.inUse() };
+        return .{ .resident = resident, .cache = cacheBytes(self), .retained = self.idleBytes(), .accounted = self.inUse() };
     }
 };
 
@@ -496,6 +660,9 @@ pub const MemoryAccountant = struct {
     statement_id: u64 = 0,
     /// The wire connection running the statement (the PROCESSLIST / KILL id).
     connection_id: ?u32 = null,
+    /// Accounted growth between watchdog samples: `watchStep` of the budget
+    /// that bounds the statement, its own or else its pool's.
+    watch_step: usize,
     /// Accounted level whose crossing takes the next watchdog sample.
     watch_next_bytes: usize = 0,
     watch_logged: std.atomic.Value(bool) = .init(false),
@@ -591,7 +758,7 @@ pub const MemoryAccountant = struct {
     }
 
     fn balanceIdle(self: *MemoryAccountant) void {
-        if (self.pool) |p| p.yieldIdle();
+        if (self.pool) |p| p.balance();
     }
 
     pub fn releaseAllocation(self: *MemoryAccountant, bytes: usize) void {
@@ -620,7 +787,7 @@ pub const MemoryAccountant = struct {
     /// sampled level and mint that much again unseen. Caller holds
     /// `reservation_lock`.
     fn rearmWatch(self: *MemoryAccountant) void {
-        self.watch_next_bytes = @min(self.watch_next_bytes, self.current_bytes +| watchStep(self.budget));
+        self.watch_next_bytes = @min(self.watch_next_bytes, self.current_bytes +| self.watch_step);
     }
 
     /// Retired memory is back with its allocator.
@@ -663,7 +830,8 @@ pub const MemoryAccountant = struct {
     }
 
     pub fn init(budget: usize) MemoryAccountant {
-        return .{ .budget = budget, .watch_next_bytes = watchStep(budget) };
+        const step = watchStep(budget);
+        return .{ .budget = budget, .watch_step = step, .watch_next_bytes = step };
     }
 
     /// Per-query accountant drawing from a shared pool. `budget` of 0 means
@@ -674,8 +842,10 @@ pub const MemoryAccountant = struct {
         var account = init(if (budget == 0) std.math.maxInt(usize) else budget);
         account.pool = pool;
         if (pool) |p| {
+            account.watch_step = watchStep(@min(account.budget, p.budget));
+            account.watch_next_bytes = account.watch_step;
             account.statement_id = p.statements.fetchAdd(1, .monotonic) + 1;
-            p.yieldIdle();
+            p.balance();
         }
         return account;
     }
@@ -718,7 +888,7 @@ pub const MemoryAccountant = struct {
         self.peak_bytes = @max(self.peak_bytes, self.current_bytes);
         self.by_source[@intFromEnum(source)] += bytes;
         if (self.current_bytes < self.watch_next_bytes) return false;
-        self.watch_next_bytes = self.current_bytes +| watchStep(self.budget);
+        self.watch_next_bytes = self.current_bytes +| self.watch_step;
         return true;
     }
 
@@ -736,7 +906,7 @@ pub const MemoryAccountant = struct {
     fn reading(self: *MemoryAccountant, resident: u64) MemorySnapshot {
         return .{
             .resident = resident,
-            .cache = cacheBytes(),
+            .cache = cacheBytes(self.pool),
             .retained = if (self.pool) |p| p.idleBytes() else buffer_pool.globalRetainedBytes(),
             .accounted = self.accountedEverywhere(),
         };
@@ -748,7 +918,7 @@ pub const MemoryAccountant = struct {
         self.lock();
         const peak = self.peak_bytes;
         self.reservation_lock.unlock();
-        if (peak >= watchStep(self.budget)) self.watch("statement end");
+        if (peak >= self.watch_step) self.watch("statement end");
         if (!prof.enabled) return;
         const mib = 1024 * 1024;
         std.debug.print("[mem] stmt={d} accounted_peak={d} MiB sampled_resident_peak={d} MiB\n", .{
@@ -829,20 +999,23 @@ pub const MemoryAccountant = struct {
     }
 
     /// Bytes this statement can still reserve: what its own budget has left,
-    /// capped by what the shared pool has free.
+    /// capped by what the statements' share of the pool has free.
     pub fn headroom(self: *MemoryAccountant) usize {
         self.lock();
         defer self.reservation_lock.unlock();
         const own = self.budget - self.current_bytes;
         const pool = self.pool orelse return own;
-        return @min(own, pool.budget -| pool.inUse());
+        return @min(own, pool.statementLimit() -| pool.inUse());
     }
 
     fn logRefusal(self: *MemoryAccountant, failing: Source, want: usize, pool: ?*MemoryPool) void {
         if (self.refusal_logged) return;
         self.refusal_logged = true;
         const mib = 1024 * 1024;
-        std.debug.print(
+        if (self.budget == std.math.maxInt(usize)) std.debug.print(
+            "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would exceed the shared pool (in use {d} MiB)\n",
+            .{ want / mib, @tagName(failing), self.current_bytes / mib },
+        ) else std.debug.print(
             "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would exceed budget {d} MiB (in use {d} MiB)\n",
             .{ want / mib, @tagName(failing), self.budget / mib, self.current_bytes / mib },
         );
@@ -851,8 +1024,8 @@ pub const MemoryAccountant = struct {
             if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ f.name, v / mib });
         }
         if (pool) |p| std.debug.print(
-            "[mem-audit]   shared pool: {d} MiB in use of {d} MiB (other queries hold the rest)\n",
-            .{ p.inUse() / mib, p.budget / mib },
+            "[mem-audit]   shared pool: {d} MiB in use of the statements' {d} MiB (other queries hold the rest)\n",
+            .{ p.inUse() / mib, p.statementLimit() / mib },
         );
     }
 };
@@ -1304,7 +1477,7 @@ test "memory: the resident ceiling is the limit less a sixteenth, relief two sam
 }
 
 const TestIdle = struct {
-    source: IdleSource = .{ .idle_bytes_fn = idleBytes, .reclaim_fn = reclaim },
+    source: IdleSource = .{ .kind = .region_program, .idle_bytes_fn = idleBytes, .reclaim_fn = reclaim },
     idle: usize,
     reclaims: usize = 0,
 
@@ -1354,20 +1527,22 @@ test "memory: a statement that does not fit the budget is refused, and idle memo
     var warm = TestIdle{ .idle = 6 * gib };
     pool.registerIdle(&warm.source);
     defer pool.unregisterIdle(&warm.source);
-    var small: [3]MemoryAccountant = undefined;
+    // Each stays under its sampling step, a sixteenth of the pool.
+    var small: [5]MemoryAccountant = undefined;
     for (&small) |*s| {
         s.* = MemoryAccountant.initWithPool(0, &pool);
-        try s.reserve(.sort, 900 * mib);
+        try std.testing.expectEqual(gib / 2, s.watch_step);
+        try s.reserve(.sort, 500 * mib);
     }
     try std.testing.expectEqual(6 * gib, warm.idle);
     try std.testing.expect(pool.inUse() + pool.idleBytes() > pool.budget);
 
     try std.testing.expectError(Error.MemoryBudgetExceeded, small[0].reserve(.sort, 6 * gib));
-    try std.testing.expectEqual(900 * mib, small[0].current_bytes);
-    try std.testing.expectEqual(2700 * mib, pool.inUse());
-    try std.testing.expectEqual(8 * gib - 2700 * mib - gib / 2, warm.idle);
+    try std.testing.expectEqual(500 * mib, small[0].current_bytes);
+    try std.testing.expectEqual(2500 * mib, pool.inUse());
+    try std.testing.expectEqual(8 * gib - 2500 * mib - gib / 2, warm.idle);
     try std.testing.expectEqual(@as(usize, 1), warm.reclaims);
-    for (&small) |*s| s.release(.sort, 900 * mib);
+    for (&small) |*s| s.release(.sort, 500 * mib);
 }
 
 test "memory: a new statement starts with live plus idle bytes inside the budget" {
@@ -1391,7 +1566,7 @@ test "memory: a new statement starts with live plus idle bytes inside the budget
     pool.unregisterIdle(&older.source);
     try std.testing.expectEqual(@as(usize, 0), pool.idleBytes());
     older.idle = 20 * gib;
-    pool.yieldIdle();
+    pool.balance();
     try std.testing.expectEqual(20 * gib, older.idle);
 }
 
@@ -1576,4 +1751,110 @@ test "memory: shared reservation rejects integer overflow" {
     try std.testing.expect(!pool.tryReserve(8));
     pool.release(std.math.maxInt(usize) - 1);
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
+}
+
+/// Inserts one unpinned `len`-byte block as row group `index` of segment 1.
+fn cacheBlock(cache: *block_cache.Cache, index: usize, len: usize) !void {
+    const bytes = try cache.blockAllocator().alignedAlloc(u8, .@"16", len);
+    cache.release(try cache.insertPinned(.{ .segment_id = 1, .row_group_idx = @intCast(index), .column_idx = 0 }, bytes, .raw));
+}
+
+fn heldBytes(pool: *MemoryPool) usize {
+    return pool.inUse() + pool.memo_bytes.load(.monotonic) + pool.idleBytes() + pool.cacheFootprint();
+}
+
+test "memory: statements take all but the shared cache's floor and memo, and the cache fills what they leave" {
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(100 * mib);
+    var cache = block_cache.Cache.init(std.testing.allocator, pool.budget);
+    defer cache.deinit();
+    if (cache.pool.arena.len == 0) return error.SkipZigTest;
+    pool.shareCache(&cache);
+    const memo = pool.memo_bytes.load(.monotonic);
+    try std.testing.expectEqual(@as(usize, 64 << 10), memo);
+    try std.testing.expectEqual(10 * mib, pool.cache_floor.load(.monotonic));
+    try std.testing.expectEqual(90 * mib - memo, pool.statementLimit());
+
+    for (0..80) |i| try cacheBlock(&cache, i, mib);
+    try std.testing.expectEqual(80 * mib, cache.current_bytes);
+
+    // The statement's first sampling step balances the budget: the cache
+    // gives way.
+    var statement = MemoryAccountant.initWithPool(0, &pool);
+    try std.testing.expectEqual(64 * mib, statement.watch_step);
+    try statement.reserve(.sort, 64 * mib);
+    try std.testing.expect(heldBytes(&pool) <= pool.budget);
+    try std.testing.expect(cache.current_bytes <= 36 * mib);
+    try std.testing.expectEqual(pool.statementLimit() - 64 * mib, statement.headroom());
+    try std.testing.expectError(Error.MemoryBudgetExceeded, statement.reserve(.sort, 26 * mib));
+    try std.testing.expectEqual(64 * mib, pool.inUse());
+
+    for (80..120) |i| try cacheBlock(&cache, i, mib);
+    try std.testing.expect(cache.current_bytes <= pool.cacheTarget(cache.capacity_bytes));
+    pool.balance();
+    try std.testing.expect(heldBytes(&pool) <= pool.budget);
+
+    statement.release(.sort, 64 * mib);
+    for (120..220) |i| try cacheBlock(&cache, i, mib);
+    pool.balance();
+    try std.testing.expect(cache.current_bytes > 80 * mib);
+    try std.testing.expect(heldBytes(&pool) <= pool.budget);
+    const usage = pool.usage();
+    try std.testing.expectEqual(@as(usize, 0), usage.get(.statement));
+    try std.testing.expectEqual(cache.footprint(), usage.get(.block_cache));
+    try std.testing.expectEqual(memo, usage.get(.predicate_memo));
+}
+
+test "memory: idle memory gives way to the shared cache, which keeps its floor under statements" {
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(100 * mib);
+    var cache = block_cache.Cache.init(std.testing.allocator, pool.budget);
+    defer cache.deinit();
+    if (cache.pool.arena.len == 0) return error.SkipZigTest;
+    pool.shareCache(&cache);
+    var warm = TestIdle{ .idle = 95 * mib };
+    pool.registerIdle(&warm.source);
+    defer pool.unregisterIdle(&warm.source);
+    try std.testing.expectEqual(95 * mib, pool.usage().get(.region_program));
+
+    for (0..20) |i| try cacheBlock(&cache, i, mib);
+    pool.balance();
+    try std.testing.expectEqual(20 * mib, cache.current_bytes);
+    try std.testing.expect(warm.idle < 95 * mib);
+    try std.testing.expect(heldBytes(&pool) <= pool.budget);
+
+    var statement = MemoryAccountant.initWithPool(0, &pool);
+    try statement.reserve(.sort, pool.statementLimit());
+    try std.testing.expectEqual(@as(usize, 0), warm.idle);
+    try std.testing.expectEqual(pool.cache_floor.load(.monotonic), cache.current_bytes);
+    statement.release(.sort, pool.statementLimit());
+}
+
+test "memory: past the relief line the shared cache gives back blocks down to its floor" {
+    if (affinity.processResidentBytes() == null) return error.SkipZigTest;
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(100 * mib);
+    var cache = block_cache.Cache.init(std.testing.allocator, pool.budget);
+    defer cache.deinit();
+    if (cache.pool.arena.len == 0) return error.SkipZigTest;
+    pool.shareCache(&cache);
+    for (0..40) |i| try cacheBlock(&cache, i, mib);
+    pool.limit = 1 * mib;
+    _ = pool.relieve(affinity.processResidentBytes().?);
+    try std.testing.expectEqual(pool.cache_floor.load(.monotonic), cache.current_bytes);
+}
+
+test "memory: a cache leaving the pool takes its floor and memo with it" {
+    const mib: usize = 1 << 20;
+    var pool = MemoryPool.init(100 * mib);
+    {
+        var cache = block_cache.Cache.init(std.testing.allocator, pool.budget);
+        defer cache.deinit();
+        pool.shareCache(&cache);
+        try std.testing.expect(pool.statementLimit() < pool.budget);
+        try std.testing.expectEqual(&pool, cache.shared.?);
+    }
+    try std.testing.expect(pool.cache == null);
+    try std.testing.expectEqual(pool.budget, pool.statementLimit());
+    try std.testing.expectEqual(@as(usize, 0), pool.usage().get(.block_cache));
 }
