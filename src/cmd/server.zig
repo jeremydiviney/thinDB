@@ -67,9 +67,10 @@ const usage_text =
     \\                          manifest is fsynced). Without it an OS crash or power loss can
     \\                          lose acked rows and leave tables unreadable — only for
     \\                          disposable bench data dirs where data is reimportable.
-    \\  --max-dop N            Max worker threads per query for the parallel scan leaf (default 1 =
-    \\                          serial). >1 hands row-group ranges to up to N workers; the per-query
-    \\                          count is also bounded by a global ~(cores-1) worker-slot budget.
+    \\  --max-dop N            Max worker threads per query (default: every hardware thread the
+    \\                          process may use, per its CPU affinity and cgroup quota; 1 = serial).
+    \\                          The per-query count is also bounded by a machine-wide budget of
+    \\                          hardware threads that concurrent queries share.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
     \\  --query-memory-budget B Per-query memory budget (default: auto, ~25% of usable RAM,
@@ -385,7 +386,7 @@ pub fn main(init: std.process.Init) !u8 {
         .memory_budget = memory_budget orelse (thindb.Config{}).memory_budget,
         .cache_size_bytes = cache_size_bytes orelse (thindb.Config{}).cache_size_bytes,
         .predicate_memo = predicate_memo,
-        .max_dop = if (max_dop) |v| v else (thindb.Config{}).max_dop,
+        .max_dop = if (max_dop) |v| v else thindb.hardwareThreadCount(),
         .data_root_path = data_dir,
         // Server default is auto (half the cores) rather than the embedded
         // library's serial default — background merges are the server's job.
@@ -425,6 +426,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (enable_wal) "WAL on" else "WAL OFF (--no-wal)",
         if (enable_fsync) "fsync on" else "fsync OFF (--no-fsync): an OS crash can lose acked writes",
     });
+    try out_w.print("  threads:  max-dop {d}, hardware threads {d}\n", .{ cfg.max_dop, thindb.hardwareThreadCount() });
     try printMemoryBanner(out_w, cfg);
 
     var listeners: [3]Listener = undefined;

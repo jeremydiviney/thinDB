@@ -6485,11 +6485,11 @@ test "region pool: a run with little work uses fewer workers on the warm exchang
     defer result.deinit();
 
     // The counts below are the work-based sizing; the machine's fan-out
-    // budget would cap them at the runner's physical cores.
+    // budget would cap them at the runner's hardware threads.
     const sched = core_scheduler.global();
-    const budget_cores = sched.physical_cores;
-    sched.physical_cores = 0;
-    defer sched.physical_cores = budget_cores;
+    const budget_threads = sched.hardware_threads;
+    sched.hardware_threads = 0;
+    defer sched.hardware_threads = budget_threads;
 
     // Broad, selective, broad: each run must see only its own rows, so
     // `clear` has to reach every bucket row the previous run filled.

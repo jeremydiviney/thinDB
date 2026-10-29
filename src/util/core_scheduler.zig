@@ -22,7 +22,7 @@
 //! deadlock: a freed slot is always eventually seen by a waiter's re-poll.
 //!
 //! Fan-out sizing rides the same bookkeeping: `reserveWorkers` grants a
-//! fan-out its thread count from a machine-wide budget of physical cores, so
+//! fan-out its thread count from a machine-wide budget of hardware threads, so
 //! concurrent statements split the machine instead of each spawning its full
 //! DOP onto the same cores. Leases still gate admission; the budget only
 //! sizes.
@@ -144,9 +144,9 @@ pub const CoreScheduler = struct {
     /// so the engine runs with no pinning/throttling. A production escape hatch
     /// and the lever for pinned-vs-unpinned A/B without a rebuild.
     disabled: bool = false,
-    /// Physical cores this process can keep busy (affinity set and CPU quota):
-    /// the fan-out budget. 0 = unknown, fan-outs run unbudgeted.
-    physical_cores: usize = 0,
+    /// Hardware threads this process can keep busy (affinity set and CPU
+    /// quota): the fan-out budget. 0 = unknown, fan-outs run unbudgeted.
+    hardware_threads: usize = 0,
     /// Threads running statement work: one per admitted statement plus every
     /// helper a `reserveWorkers` grant holds.
     busy: usize = 0,
@@ -169,7 +169,7 @@ pub const CoreScheduler = struct {
             .cores = cores,
             .all_mask = topo.all_mask,
             .disabled = getenv("THINDB_NO_PIN") != null,
-            .physical_cores = affinity.allowedPhysicalCoreCount(allocator),
+            .hardware_threads = affinity.allowedHardwareThreadCount(),
             .allocator = allocator,
         };
     }
@@ -189,14 +189,14 @@ pub const CoreScheduler = struct {
     /// Size a fan-out that wants `wanted` threads (the calling thread
     /// included) and hold the helpers against the budget until
     /// `Workers.release`. A statement's thread gets the larger of an equal
-    /// share of the physical cores among admitted statements and what is idle;
-    /// a worker thread's nested fan-out gets only what is idle. SMT siblings
-    /// don't count: a second hardware thread adds little to scan and
-    /// aggregation work bound by memory bandwidth, and costs CPU. A snapshot
-    /// for sizing, never a gate — the count can be anything from 1 up, so
-    /// callers must be correct at any count.
+    /// share of the hardware threads among admitted statements and what is
+    /// idle; a worker thread's nested fan-out gets only what is idle. SMT
+    /// siblings count: on an 8-core, 16-thread c6a, ClickBench ran 9.94 s
+    /// over 16 threads against 10.91 s over the 8 cores. A snapshot for
+    /// sizing, never a gate — the count can be anything from 1 up, so callers
+    /// must be correct at any count.
     pub fn reserveWorkers(self: *CoreScheduler, wanted: usize) Workers {
-        if (wanted <= 1 or self.disabled or self.physical_cores == 0) return .{ .count = @max(wanted, 1) };
+        if (wanted <= 1 or self.disabled or self.hardware_threads == 0) return .{ .count = @max(wanted, 1) };
         self.lock.lock();
         defer self.lock.unlock();
         const n = @min(wanted, self.workerBudget(thread_admitted));
@@ -239,10 +239,10 @@ pub const CoreScheduler = struct {
     /// already counted in `busy` (its statement's admission or its parent's
     /// grant). Caller holds `lock`.
     fn workerBudget(self: *const CoreScheduler, admitted: bool) usize {
-        const cores = self.physical_cores;
-        const idle = cores -| self.busy;
-        const share = if (admitted) std.math.divCeil(usize, cores, @max(self.statements, 1)) catch cores else 1;
-        return @max(1, @min(cores, @max(share, idle + 1)));
+        const threads = self.hardware_threads;
+        const idle = threads -| self.busy;
+        const share = if (admitted) std.math.divCeil(usize, threads, @max(self.statements, 1)) catch threads else 1;
+        return @max(1, @min(threads, @max(share, idle + 1)));
     }
 
     /// Lease one core for the calling thread and pin to it. Blocks (sleep-poll)
@@ -407,8 +407,8 @@ test "capacity full then a freed slot reopens" {
     for (s.cores) |*c| c.leased = 0;
 }
 
-test "worker budget: a lone statement gets every core, concurrent ones split them" {
-    var s: CoreScheduler = .{ .cores = &.{}, .all_mask = 0, .allocator = std.testing.allocator, .physical_cores = 16 };
+test "worker budget: a lone statement gets every hardware thread, concurrent ones split them" {
+    var s: CoreScheduler = .{ .cores = &.{}, .all_mask = 0, .allocator = std.testing.allocator, .hardware_threads = 16 };
     s.statements = 1;
     s.busy = 1;
     try std.testing.expectEqual(@as(usize, 16), s.workerBudget(true));
@@ -419,7 +419,7 @@ test "worker budget: a lone statement gets every core, concurrent ones split the
     s.statements = 3;
     s.busy = 25;
     try std.testing.expectEqual(@as(usize, 6), s.workerBudget(true));
-    // Idle cores beat the share.
+    // Idle threads beat the share.
     s.statements = 2;
     s.busy = 3;
     try std.testing.expectEqual(@as(usize, 14), s.workerBudget(true));
@@ -432,7 +432,7 @@ test "worker budget: a lone statement gets every core, concurrent ones split the
 }
 
 test "reserved workers count against later fan-outs until released" {
-    var s: CoreScheduler = .{ .cores = &.{}, .all_mask = 0, .allocator = std.testing.allocator, .physical_cores = 8 };
+    var s: CoreScheduler = .{ .cores = &.{}, .all_mask = 0, .allocator = std.testing.allocator, .hardware_threads = 8 };
     var a = s.reserveWorkers(32);
     try std.testing.expectEqual(@as(usize, 8), a.count);
     var b = s.reserveWorkers(32);
@@ -449,7 +449,7 @@ test "reserved workers count against later fan-outs until released" {
     try std.testing.expectEqual(@as(usize, 100), d.count);
     d.release();
     s.disabled = false;
-    s.physical_cores = 0;
+    s.hardware_threads = 0;
     var e = s.reserveWorkers(100);
     try std.testing.expectEqual(@as(usize, 100), e.count);
     e.release();
