@@ -133,6 +133,13 @@ test {
 /// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
 const RGS_PER_GRID_WORKER: usize = 2;
 const PREFETCH_DIST_BUCKET: usize = 32;
+// A table smaller than this stays in the core's cache, so a look-ahead
+// prefetch would cost a second key hash per row and hide no miss.
+const PREFETCH_MIN_TABLE_BYTES: usize = 256 * 1024;
+
+inline fn prefetchesSlots(table: anytype) bool {
+    return std.mem.sliceAsBytes(table.slots).len >= PREFETCH_MIN_TABLE_BYTES;
+}
 // Look-ahead distance for the grouped COUNT(DISTINCT) fold: the second pass
 // prefetches the membership-set slot this many rows ahead of the insert, so the
 // (cache-miss-bound) probe latency of independent rows overlaps.
@@ -5344,6 +5351,31 @@ fn aggregateInputValue(agg: GroupAggregateSpec, rows: GroupRows, row_idx: usize)
     return rows.columnIntAt(input_index, row_idx);
 }
 
+/// An integer aggregate-input column, resolved once ahead of a row loop so
+/// the loop reads it without recomputing the slab's column offsets per row.
+const IntColumn = union(enum) {
+    i8: []const i8,
+    i16: []const i16,
+    i32: []const i32,
+    i64: []const i64,
+
+    fn of(rows: GroupRows, column_index: usize) !IntColumn {
+        return switch (rows.layout.columns[column_index].physical_type) {
+            .i8 => .{ .i8 = rows.columnTypedAll(i8, column_index) },
+            .i16 => .{ .i16 = rows.columnTypedAll(i16, column_index) },
+            .i32 => .{ .i32 = rows.columnTypedAll(i32, column_index) },
+            .i64 => .{ .i64 = rows.columnTypedAll(i64, column_index) },
+            .f32, .f64 => error.UnsupportedOperatorForType,
+        };
+    }
+
+    inline fn at(self: IntColumn, row: usize) i64 {
+        return switch (self) {
+            inline else => |values| values[row],
+        };
+    }
+};
+
 inline fn physicalIsFloat(pt: GroupColumnType) bool {
     return pt == .f32 or pt == .f64;
 }
@@ -5678,10 +5710,13 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     // columns and the run's row count in the weight — the register
     // accumulation below is identical; only run_len comes from the weights.
     const weights: []const u32 = if (rows.layout.has_weight) rows.weightAll()[0..row_count] else &.{};
+    const sum_input = try IntColumn.of(rows, program.sum_input_index);
+    const avg_input = try IntColumn.of(rows, program.avg_input_index);
+    const prefetch = prefetchesSlots(table);
     var r: usize = 0;
     while (r < row_count) {
         const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < row_count) {
+        if (prefetch and pf < row_count) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
@@ -5696,8 +5731,8 @@ fn groupChunkRowsDirectKeysCountSumAvg(
         var avg_acc: i64 = 0;
         var rr = r;
         while (rr < run_end) : (rr += 1) {
-            sum_acc += rows.columnIntAt(program.sum_input_index, rr);
-            avg_acc += rows.columnIntAt(program.avg_input_index, rr);
+            sum_acc += sum_input.at(rr);
+            avg_acc += avg_input.at(rr);
         }
         const run_len: u64 = if (weights.len != 0) blk: {
             var s: u64 = 0;
@@ -5718,10 +5753,11 @@ fn groupChunkRowsDirectKeysCountSumAvg(
 
 fn group_count_prefetched(comptime width: GroupKeyWidth, table: anytype, states: *StateSlab, keys: anytype, key_hi: []const u32, n: usize, weights: []const u32, rowrefs: []const i64) void {
     var pending: PendingCountUpdates = .{};
+    const prefetch = prefetchesSlots(table);
     var r: usize = 0;
     while (r < n) {
         const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < n) {
+        if (prefetch and pf < n) {
             const key = groupKeyAt(width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(key))), .{ .rw = .write, .locality = 1 });
         }
@@ -5838,10 +5874,11 @@ fn groupChunkRowsDirectKeys(
     // from the scan emitter; its weight is the row count it stands for.
     const weights: []const u32 = if (rows.layout.has_weight) rows.weightAll()[0..n] else &.{};
 
+    const prefetch = prefetchesSlots(table);
     var r: usize = 0;
     while (r < n) {
         const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < n) {
+        if (prefetch and pf < n) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
@@ -5949,10 +5986,11 @@ fn groupChunkRowsDirectKeysProgram(
     var prev_key: u128 = 0;
     var prev_gid: u32 = 0;
     var have_prev = false;
+    const prefetch = prefetchesSlots(table);
     var r: usize = 0;
     while (r < n) : (r += 1) {
         const pf = r + PREFETCH_DIST_BUCKET;
-        if (pf < n) {
+        if (prefetch and pf < n) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
             @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
