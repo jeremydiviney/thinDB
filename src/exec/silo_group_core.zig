@@ -48,9 +48,8 @@ const group_table = thindb.exec.group_table;
 const GroupTable = group_table.IntKeyMemsetTable(96);
 const WideGroupTable = group_table.IntKeyMemsetTable(128);
 
-/// A bucket's group table, at the slot width its keys need. A packed key past
-/// 96 bits compares on all 128; a hashed key's digest compares on 96 of its
-/// bits, a collision chance of about n²/2^97 that keeps its slot at 16 bytes.
+/// A bucket's group table, at the slot width its keys need. A key wider than
+/// 96 bits, packed or a hashed key's digest, compares on all 128.
 const BucketTable = union(enum) {
     narrow: GroupTable,
     wide: WideGroupTable,
@@ -58,7 +57,7 @@ const BucketTable = union(enum) {
     /// Switches an empty table to the width `layout` needs. A bucket's layout
     /// changes only between queries, after a reset empties its table.
     fn fit(self: *BucketTable, allocator: Allocator, layout: GroupRowsLayout, expected_groups: usize) !void {
-        const wide = layout.key_width == .u128 and !layout.hashed_key;
+        const wide = layout.key_width == .u128;
         if (wide == (self.* == .wide)) return;
         if (self.len() != 0) return error.UnsupportedOperatorForType;
         const initial_groups: usize = @min(expected_groups, PIPE_CHUNK_ROWS);
@@ -1563,6 +1562,29 @@ test "count update pipeline folds exact results below and above the live state t
             try std.testing.expectEqual((@as(u128, 1) << 40) + i, bucket.states.head(i).key);
             try std.testing.expectEqual(@as(u64, 6), bucket.states.head(i).count);
         }
+    }
+}
+
+test "hashed key digests that differ only past bit 96 fold into separate groups" {
+    const allocator = std.testing.allocator;
+    var bucket = try PipeBucket.init(allocator, 16);
+    defer bucket.deinit(allocator);
+    var scratch: GroupScratch = .{};
+    defer scratch.deinit(allocator);
+    var rows: GroupRows = .{};
+    defer rows.deinit(allocator);
+    const layout = GroupRowsLayout{ .key_width = .u128, .hashed_key = true, .has_rowref = true, .columns = &.{}, .aggregates = &.{.{ .op = .count_star, .state_index = 0 }} };
+    const low: u128 = 0x0123_4567_89ab_cdef_0011_2233;
+    try rows.resize(allocator, layout, 6);
+    for (0..6) |i| {
+        rows.setKey(i, low | (@as(u128, i % 2) << 100));
+        rows.rowrefAll()[i] = @intCast(i);
+    }
+    try bucket.fold_rows(allocator, &scratch, rows, 6);
+    try std.testing.expectEqual(@as(usize, 2), bucket.states.len);
+    for (0..2) |i| {
+        const gid = bucket.table.find(low | (@as(u128, i) << 100)) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(u64, 3), bucket.states.head(gid).count);
     }
 }
 
