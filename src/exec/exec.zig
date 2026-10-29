@@ -1769,10 +1769,17 @@ pub const RunsColumn = struct {
 };
 
 /// One column's row-group dictionary for `Batch.block_dicts`: row r's value
-/// is `dict.rowBytes(codes[r])`. The dictionary is sorted and distinct.
+/// is `dict.rowBytes(codes[r])`. The dictionary is sorted and distinct. A
+/// hashed key column (`Batch.hashed`) carries each value's `stringKeyDigest`
+/// in `digests` instead, and `dict` holds no values: the bytes never copy.
 pub const BlockDictColumn = struct {
     codes: []const u32,
     dict: storage.StringView,
+    digests: ?[]const u128 = null,
+
+    pub fn valueCount(self: BlockDictColumn) usize {
+        return if (self.digests) |d| d.len else self.dict.rowCount();
+    }
 };
 
 /// Canonical 128-bit digest of one string group-key column's bytes — the unit
