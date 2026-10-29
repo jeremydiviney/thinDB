@@ -924,13 +924,6 @@ pub const Table = struct {
 
         const sync = self.syncEnabled();
 
-        // Coexisting segments' sketches feed the global dict-eligibility gate.
-        // Safe to reference directly: we hold the table mutex and writeSegment
-        // does not mutate the manifest.
-        const prior = try self.allocator.alloc([]const u8, self.manifest.segments.items.len);
-        defer self.allocator.free(prior);
-        for (self.manifest.segments.items, 0..) |e, i| prior[i] = e.column_sketches;
-
         var info = try storage.writeSegment(
             self.allocator,
             self.io,
@@ -941,7 +934,6 @@ pub const Table = struct {
             self.schema_fingerprint,
             self.row_group_size,
             snapshot.views,
-            prior,
             sync,
             self.compact_threads,
         );

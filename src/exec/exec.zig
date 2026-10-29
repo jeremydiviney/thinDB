@@ -211,6 +211,14 @@ pub const Batch = struct {
     /// path — never memtable or compacted batches. Same per-`next()` lifetime
     /// as `values`. Filled only when the scan's `emit_runs` is requested.
     runs: ?[]const ?RunsColumn = null,
+    /// Optional per-column row-group dictionary sidecar. When
+    /// `block_dicts[j]` is set, column `j` (a non-nullable string) arrives
+    /// as each row's code into its row group's dictionary, which holds every
+    /// distinct value once; `values[j]` holds a placeholder. A dict-aware
+    /// consumer works per distinct value instead of per row, and must use
+    /// `values[j]` on batches without the sidecar (a raw row group, the
+    /// memtable). Same per-`next()` lifetime as `values`.
+    block_dicts: ?[]const ?BlockDictColumn = null,
 
     pub fn columnIndex(self: Batch, name: []const u8) ?usize {
         for (self.schema, 0..) |c, i| {
@@ -1758,6 +1766,13 @@ pub const CodedColumn = global_dict.CodedColumn;
 pub const RunsColumn = struct {
     values_i64: []const i64,
     lengths: []const u32,
+};
+
+/// One column's row-group dictionary for `Batch.block_dicts`: row r's value
+/// is `dict.rowBytes(codes[r])`. The dictionary is sorted and distinct.
+pub const BlockDictColumn = struct {
+    codes: []const u32,
+    dict: storage.StringView,
 };
 
 /// Canonical 128-bit digest of one string group-key column's bytes — the unit

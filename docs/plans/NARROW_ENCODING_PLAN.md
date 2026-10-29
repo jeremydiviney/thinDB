@@ -82,12 +82,11 @@ segment's metadata (`raw | FOR(base,width) | dict(...)`). A query reads any mix:
 - **Crossing the cap is never an error.** A column that drifts high-card just
   produces newer **raw** segments; older **coded** segments stay valid forever
   (immutable + self-describing).
-- **Per-segment + global NDV cap (64K)** is enforced at every segment write
-  (flush *and* compaction): a string column is dict-eligible only when BOTH this
-  segment's NDV and the global NDV (HLL merged across all coexisting segments)
-  are ≤ 64K. The per-block `tryEncodeDict` then applies within eligible columns;
-  high-card columns stay fully raw. (Mid-build abandon remains as the
-  estimate-error safety net near the boundary.)
+- **The dict decision is per block** (see 3.6): every string block tries
+  `tryEncodeDict`, which abandons as soon as the block's NDV passes n/2. A
+  high-card column still dict-encodes each row group whose values repeat (URL,
+  Title, Referer, SearchPhrase on ClickBench), which per-distinct execution
+  turns into fewer evaluations.
 - **Query-merged cardinality** can exceed 64K even if each segment is under it →
   the **query-global code width floats** (u8→u16→u32). On-disk codes stay ≤u16;
   the query-scoped global code is whatever the merge needs.
@@ -184,6 +183,12 @@ gids). The runner doesn't validate values → `zig build test` is the gate.
   back-to-back. 1018 tests green.** *(Lesson: must rebuild `thindb-server` — not just
   the loader — for compaction to use a writer change; a stale server's old-gate
   compactor re-encoded URL.)*
+- [x] 3.6 **Per-block gate replaces 3.5** (branch `perf/rg-string-dicts`): the
+  global gate is gone; `tryEncodeDict` alone decides, abandoning once a block's
+  NDV passes n/2. On 100M ClickBench the dict-aware scan paths no longer pay the
+  3.5 decode cost: storage alone is net neutral on the 43 queries (c6a, hot),
+  data shrinks 12.53 → 10.63 GB, and Q28's per-distinct GROUP BY key
+  evaluation (`GridDictEval`) takes it 1.575 → 0.912 s.
 
 ### Phase 4 — Dictionary-aware execution *(the query wins)*
 **Context:** Phase 3 dict storage is query-NEUTRAL but in fact regressed ClickBench
