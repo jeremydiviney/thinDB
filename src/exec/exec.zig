@@ -1787,6 +1787,12 @@ pub fn stringKeyDigest(bytes: []const u8) u128 {
     return xxh3.hash128(0, bytes);
 }
 
+/// `stringKeyDigest` of `k` 16-byte key parts laid end to end, with the
+/// length dispatch resolved at compile time.
+pub fn keyPartsDigest(comptime k: usize, parts: [k]u128) u128 {
+    return xxh3.hash128Parts(0, k, parts);
+}
+
 pub const sort_op = @import("sort.zig");
 pub const Sort = sort_op.Sort;
 pub const SortSpec = sort_op.SortSpec;
