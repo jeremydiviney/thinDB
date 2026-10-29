@@ -148,6 +148,15 @@ const GRID_SCAN_YIELD_CHUNKS: usize = 16384;
 // parked worker takes to notice a cancel.
 const GRID_IDLE_SPINS: usize = 256;
 const GRID_IDLE_YIELDS: usize = 8;
+// A bucket expected to hold this many groups outgrows the core's cache, so
+// folding rows as they arrive takes a miss per row on its table and states.
+// Such a grid stages every row before folding any; each bucket then folds at
+// once, split by key hash into parts whose tables stay cache-resident.
+const DEFER_FOLD_MIN_GROUPS: usize = 16 * 1024;
+const DEFER_PART_ROWS: usize = 2048;
+const MAX_DEFER_PARTS: usize = 256;
+// Staging every row must fit in this share of the memory budget.
+const DEFER_FOLD_BUDGET_DIVISOR: usize = 4;
 const GRID_PARK_TIMEOUT_NS: u64 = std.time.ns_per_ms;
 const DEFAULT_ROUTE_BLOCK_ROWS: usize = 2048;
 const MAX_ROUTE_BLOCK_ROWS: usize = 2048;
@@ -1316,6 +1325,13 @@ const WorkerParts = struct {
     flat_counts: []u32 = &.{},
     flat_offsets: []u32 = &.{},
     flat_next: []u32 = &.{},
+    /// A deferred bucket fold's chunks, each row's part, the parts, and the
+    /// cache-sized table and transient states each part folds into.
+    defer_chunks: std.ArrayListUnmanaged(GroupChunk) = .empty,
+    defer_part_ids: std.ArrayListUnmanaged(u8) = .empty,
+    defer_parts: std.ArrayListUnmanaged(GroupRows) = .empty,
+    defer_table: ?BucketTable = null,
+    defer_states: StateSlab = .{},
     raw_active_rows: RawRows = .{},
     /// Weighted layouts: staged-row index of the active raw chunk by key
     /// hash, so a key that repeats anywhere in the chunk folds into its one
@@ -1415,6 +1431,7 @@ const WorkerParts = struct {
         if (self.route_counts.len > 0) allocator.free(self.route_counts);
         if (self.route_offsets.len > 0) allocator.free(self.route_offsets);
         self.route_touched.deinit(allocator);
+        self.releaseDeferScratch(allocator);
         self.* = .{};
     }
 
@@ -1425,6 +1442,20 @@ const WorkerParts = struct {
         if (reserve_rows > 0) {
             try self.flat_bucket_ids.ensureTotalCapacity(allocator, reserve_rows);
         }
+    }
+
+    fn releaseDeferScratch(self: *WorkerParts, allocator: Allocator) void {
+        self.defer_chunks.deinit(allocator);
+        self.defer_chunks = .empty;
+        self.defer_part_ids.deinit(allocator);
+        self.defer_part_ids = .empty;
+        for (self.defer_parts.items) |*part| part.deinit(allocator);
+        self.defer_parts.deinit(allocator);
+        self.defer_parts = .empty;
+        if (self.defer_table) |*t| t.deinit(allocator);
+        self.defer_table = null;
+        self.defer_states.deinit(allocator);
+        self.defer_states = .{};
     }
 
     fn ensureWideBucketScratch(self: *WorkerParts, allocator: Allocator, bucket_count: usize) !void {
@@ -2181,6 +2212,29 @@ const PipeShared = struct {
     // worker that releases a lane needs no signal: it re-checks before parking.
     work_epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     parked_workers: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// No bucket folds until every row is staged (see DEFER_FOLD_MIN_GROUPS).
+    defer_fold: bool = false,
+    defer_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    /// Every row sits in a group queue: scans are done, no raw chunk awaits
+    /// a stage pass, and no stage builder holds a tail.
+    fn stage_complete(self: *const PipeShared) bool {
+        // Once every scan is done, nothing new enters the stage, so each
+        // count below stays zero once read as zero.
+        return self.scans_done.load(.acquire) == self.scan_threads and
+            self.outstanding_chunks.load(.acquire) == 0 and
+            self.active_stage_jobs.load(.acquire) == 0 and
+            self.stage_builder_rows.load(.acquire) == 0;
+    }
+
+    /// Whether a deferred grid's buckets may fold. The first worker to see
+    /// staging complete wakes the parked rest.
+    fn deferred_folds_released(self: *PipeShared) bool {
+        if (self.defer_released.load(.acquire)) return true;
+        if (!self.stage_complete()) return false;
+        if (!self.defer_released.swap(true, .acq_rel)) self.signalWork(std.math.maxInt(u32));
+        return true;
+    }
 
     fn grouping_complete(self: *const PipeShared) bool {
         // Closing every producer makes the remaining row count monotone.
@@ -2284,6 +2338,137 @@ test "group completion waits for a delayed partial before collecting top rows an
         const row = top.rowAt(rank);
         try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
         try std.testing.expectEqual(@as(u64, group_count - offset - i), row.count);
+    }
+}
+
+test "a deferred bucket fold matches each group's rows, split into parts or not" {
+    const allocator = std.testing.allocator;
+    // A group's id sits in the key bits a narrower key width would drop.
+    const cases = .{
+        .{ .rows = 1_500, .top_k = 0, .key_width = .u96, .group_shift = 64 },
+        .{ .rows = 1_500, .top_k = 10, .key_width = .u96, .group_shift = 64 },
+        .{ .rows = 40_000, .top_k = 0, .key_width = .u96, .group_shift = 64 },
+        .{ .rows = 40_000, .top_k = 10, .key_width = .u96, .group_shift = 64 },
+        .{ .rows = 40_000, .top_k = 0, .key_width = .u128, .group_shift = 96 },
+        .{ .rows = 40_000, .top_k = 10, .key_width = .u128, .group_shift = 96 },
+    };
+    inline for (cases) |c| {
+        const group_count = c.rows / 3;
+        var buckets = [_]PipeBucket{try PipeBucket.init(allocator, 16)};
+        defer buckets[0].deinit(allocator);
+        var local: WorkerParts = .{};
+        defer local.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var shared = PipeShared{
+            .allocator = allocator,
+            .buckets = &buckets,
+            .bucket_count = 1,
+            .input_rows_per_bucket = c.rows,
+            .scan_threads = 1,
+            .group_rows_layout = .{
+                .key_width = c.key_width,
+                .columns = &.{},
+                .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+                .has_weight = true,
+            },
+            .defer_fold = true,
+        };
+        defer deinitRawQueues(&shared);
+        shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+        shared.raw_scan_queues[0] = .{};
+        shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+        shared.raw_group_queues[0] = .{};
+        shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+        shared.stage_builders[0] = .{};
+
+        // Groups whose keys differ only in their high 32 bits, rows spread over
+        // the input, and weights so a group's count is not its row count.
+        const expected = try allocator.alloc(u64, group_count);
+        defer allocator.free(expected);
+        @memset(expected, 0);
+        var source: RawRows = .{};
+        defer source.deinit(allocator);
+        try source.resize(allocator, shared.group_rows_layout, c.rows);
+        for (0..c.rows) |i| {
+            const g = (i * 7919) % group_count;
+            const weight: u32 = @intCast(i % 3 + 1);
+            source.setKey(i, 5 | (@as(u128, g) << c.group_shift));
+            source.weightAll()[i] = weight;
+            expected[g] += weight;
+        }
+        try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 4096, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+        shared.scans_done.store(1, .release);
+        try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+        try std.testing.expect(try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 4096, 4096, 4, false));
+        try std.testing.expect(!shared.stage_complete());
+        _ = try flushSharedStageBuilders(&shared, &local, false);
+        try std.testing.expect(shared.stage_complete());
+
+        var top = if (c.top_k == 0) TopSet{} else try TopSet.init(allocator, c.top_k);
+        defer top.deinit(allocator);
+        var ticks: i64 = 0;
+        var chunks: u64 = 0;
+        try std.testing.expect(try foldDeferredBucket(&shared, &local, &scratch, 0, &top, &ticks, &chunks, false));
+        try std.testing.expect(shared.grouping_complete());
+        try std.testing.expectEqual(@as(u64, c.rows), buckets[0].row_count);
+
+        if (c.top_k == 0) {
+            try std.testing.expectEqual(@as(usize, group_count), buckets[0].states.len);
+            for (0..group_count) |gid| {
+                const head = buckets[0].states.head(gid);
+                try std.testing.expectEqual(@as(u128, 5), head.key & std.math.maxInt(u64));
+                try std.testing.expectEqual(expected[@intCast(head.key >> c.group_shift)], head.count);
+            }
+        } else {
+            // Top-N states are transient: each group goes to the top set as it folds.
+            try std.testing.expectEqual(@as(usize, 0), buckets[0].states.len);
+            try top.sortBestFirst(allocator);
+            try std.testing.expectEqual(@as(usize, c.top_k), top.len);
+            var prev: ?TopRow = null;
+            for (0..top.len) |rank| {
+                const row = top.rowAt(rank);
+                try std.testing.expectEqual(expected[@intCast(row.key >> c.group_shift)], row.count);
+                if (prev) |p| try std.testing.expect(p.count > row.count or (p.count == row.count and p.key < row.key));
+                prev = row;
+            }
+            // Nothing outside the top set beats its last row.
+            const last = top.rowAt(top.len - 1);
+            for (expected, 0..) |count, g| {
+                const key = 5 | (@as(u128, g) << c.group_shift);
+                if (count > last.count or (count == last.count and key < last.key)) {
+                    var found = false;
+                    for (0..top.len) |rank| found = found or top.rowAt(rank).key == key;
+                    try std.testing.expect(found);
+                }
+            }
+        }
+    }
+}
+
+test "a grid defers its folds only for many groups per bucket and staging within the budget" {
+    // 8-byte staged rows against a 64 MiB budget: up to 2M rows may stage.
+    var pool = thindb.exec.memory.MemoryPool.init(64 * 1024 * 1024);
+    var resources = thindb.exec.memory.MemoryAccountant.init(&pool);
+    const cases = .{
+        .{ .want = true, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 2 * 1024 * 1024, .budget = true, .shape = .plain },
+        .{ .want = false, .staged = false, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .plain },
+        .{ .want = false, .staged = true, .workers = 1, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .plain },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS - 1, .rows = 1_000_000, .budget = true, .shape = .plain },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 2 * 1024 * 1024 + 1, .budget = true, .shape = .plain },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = false, .shape = .plain },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .str_payload },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .distinct },
+    };
+    inline for (cases) |c| {
+        const layout = GroupRowsLayout{
+            .key_width = .u64,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+            .has_str_payload = c.shape == .str_payload,
+            .distinct_slot_count = if (c.shape == .distinct) 1 else 0,
+        };
+        try std.testing.expectEqual(c.want, deferBucketFolds(layout, c.workers, c.staged, c.groups, c.rows, if (c.budget) &resources else null));
     }
 }
 
@@ -6567,6 +6752,8 @@ fn stageBucketIds(comptime key_width: GroupKeyWidth, chunks: []const RawChunk, b
     }
 }
 
+const MAX_STAGE_LANES: usize = 4 + 2 * MAX_GROUP_PAYLOAD_COLUMNS;
+
 /// One fixed-width lane of a staged row slab.
 const StageLane = union(enum) {
     /// The whole key, or a 96-bit key's low 64 bits.
@@ -6577,7 +6764,51 @@ const StageLane = union(enum) {
     weight,
     valid: usize,
 
-    fn bytes(self: StageLane, rows: RawRows) []u8 {
+    /// Every fixed-width lane of `layout`'s rows, in `buf`.
+    fn all(layout: GroupRowsLayout, buf: *[MAX_STAGE_LANES]StageLane) []const StageLane {
+        var n: usize = 0;
+        buf[n] = .key_lo;
+        n += 1;
+        if (layout.key_width == .u96) {
+            buf[n] = .key_hi;
+            n += 1;
+        }
+        for (0..layout.columns.len) |c| {
+            buf[n] = .{ .column = c };
+            n += 1;
+        }
+        if (layout.has_rowref) {
+            buf[n] = .rowref;
+            n += 1;
+        }
+        if (layout.has_weight) {
+            buf[n] = .weight;
+            n += 1;
+        }
+        for (0..nullableInputCount(layout)) |v| {
+            buf[n] = .{ .valid = v };
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    fn width(self: StageLane, layout: GroupRowsLayout) usize {
+        return switch (self) {
+            .key_lo => switch (layout.key_width) {
+                .u32 => @sizeOf(u32),
+                .u64, .u96 => @sizeOf(u64),
+                .u128 => @sizeOf(u128),
+            },
+            .key_hi => @sizeOf(u32),
+            .column => |c| groupColumnSize(layout.columns[c].physical_type),
+            .rowref => @sizeOf(i64),
+            .weight => @sizeOf(u32),
+            .valid => 1,
+        };
+    }
+
+    /// The lane's bytes in `rows`, a RawRows or GroupRows slab.
+    fn bytes(self: StageLane, rows: anytype) []u8 {
         return switch (self) {
             .key_lo => switch (rows.layout.key_width) {
                 .u32 => std.mem.sliceAsBytes(rows.keyU32All()),
@@ -6598,7 +6829,7 @@ const StageLane = union(enum) {
 /// slot of its bucket's run. A typed loop per lane keeps one write stream per
 /// bucket and no per-row dispatch on the key width or a column's size.
 fn scatterStageLane(flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) !void {
-    switch (lane.bytes(flat).len / flat.capacity()) {
+    switch (lane.width(flat.layout)) {
         1 => scatterStageRuns(u8, flat, chunks, bucket_ids, offsets, next, lane),
         2 => scatterStageRuns(u16, flat, chunks, bucket_ids, offsets, next, lane),
         4 => scatterStageRuns(u32, flat, chunks, bucket_ids, offsets, next, lane),
@@ -6695,13 +6926,8 @@ fn drainRawDedicatedStageSharedBuilders(
             offset += n;
         }
 
-        const flat = local.flat_raw_rows;
-        try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .key_lo);
-        if (layout.key_width == .u96) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .key_hi);
-        for (0..layout.columns.len) |c| try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .{ .column = c });
-        if (layout.has_rowref) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .rowref);
-        if (layout.has_weight) try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .weight);
-        for (0..nullableInputCount(layout)) |v| try scatterStageLane(flat, chunks, bucket_ids, offsets, next, .{ .valid = v });
+        var lanes: [MAX_STAGE_LANES]StageLane = undefined;
+        for (StageLane.all(layout, &lanes)) |lane| try scatterStageLane(local.flat_raw_rows, chunks, bucket_ids, offsets, next, lane);
         if (layout.has_str_payload) {
             const k = layout.str_columns.len;
             @memcpy(next, offsets);
@@ -7508,7 +7734,186 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
     marked_scan_done.* = true;
 }
 
+/// The parts a deferred bucket fold of `rows` rows splits into: a power of
+/// two, so a part is the top bits of a key's table hash.
+fn deferPartCount(rows: usize) usize {
+    const want = (rows + DEFER_PART_ROWS - 1) / DEFER_PART_ROWS;
+    return @min(MAX_DEFER_PARTS, std.math.ceilPowerOfTwoAssert(usize, @max(1, want)));
+}
+
+/// Each row's part, and the rows each part receives.
+fn deferPartIds(comptime key_width: GroupKeyWidth, chunks: []const GroupChunk, part_ids: []u8, counts: []u32, part_bits: u6) void {
+    @memset(counts, 0);
+    const Table = if (key_width == .u128) WideGroupTable else GroupTable;
+    const shift: u6 = @intCast(@as(u7, 64) - part_bits);
+    var row_idx: usize = 0;
+    for (chunks) |chunk| {
+        const rows = chunk.rows;
+        const n = rows.len();
+        const keys = switch (key_width) {
+            .u32 => rows.keyU32All(),
+            .u64 => rows.keyU64All(),
+            .u96 => rows.keyU96LoAll(),
+            .u128 => rows.keyU128All(),
+        };
+        const key_hi: []const u32 = if (key_width == .u96) rows.keyU96HiAll() else &.{};
+        for (part_ids[row_idx..][0..n], 0..) |*id, r| {
+            const part: u8 = @intCast(Table.hashKey(groupKeyAt(key_width, keys, key_hi, r)) >> shift);
+            id.* = part;
+            counts[part] += 1;
+        }
+        row_idx += n;
+    }
+}
+
+/// Scatters one lane of a bucket's chunks into its parts, each row to the
+/// next slot of its part.
+fn scatterPartLane(layout: GroupRowsLayout, parts: []GroupRows, chunks: []const GroupChunk, part_ids: []const u8, lane: StageLane) !void {
+    switch (lane.width(layout)) {
+        1 => scatterPartRuns(u8, parts, chunks, part_ids, lane),
+        2 => scatterPartRuns(u16, parts, chunks, part_ids, lane),
+        4 => scatterPartRuns(u32, parts, chunks, part_ids, lane),
+        8 => scatterPartRuns(u64, parts, chunks, part_ids, lane),
+        16 => scatterPartRuns(u128, parts, chunks, part_ids, lane),
+        else => return error.UnsupportedOperatorForType,
+    }
+}
+
+fn scatterPartRuns(comptime T: type, parts: []GroupRows, chunks: []const GroupChunk, part_ids: []const u8, lane: StageLane) void {
+    var dst: [MAX_DEFER_PARTS][*]T = undefined;
+    var next = [_]u32{0} ** MAX_DEFER_PARTS;
+    for (parts, 0..) |part, p| {
+        // A part no row maps to has no slab to point into.
+        if (part.len() == 0) continue;
+        const lane_dst: []T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(part)));
+        dst[p] = lane_dst.ptr;
+    }
+    var row_idx: usize = 0;
+    for (chunks) |chunk| {
+        const n = chunk.rows.len();
+        const src: []const T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(chunk.rows)));
+        for (src[0..n], part_ids[row_idx..][0..n]) |v, p| {
+            dst[p][next[p]] = v;
+            next[p] += 1;
+        }
+        row_idx += n;
+    }
+}
+
+/// Folds every row of one bucket at once, after staging completes (see
+/// DEFER_FOLD_MIN_GROUPS). Each part's groups fold together into the worker's
+/// cache-sized table. A top-N grid takes each group into its top set while
+/// hot; with no COUNT(DISTINCT) sets keyed by group id, the group then needs
+/// no lasting state at all.
+fn foldDeferredBucket(
+    shared: *PipeShared,
+    local: *WorkerParts,
+    scratch: *GroupScratch,
+    lane: usize,
+    top: *TopSet,
+    group_ticks: *i64,
+    chunk_count: *u64,
+    profile: bool,
+) !bool {
+    const allocator = shared.allocator;
+    if (!claimRawQueueLaneExact(shared.raw_group_queues, lane)) return false;
+    local.defer_chunks.clearRetainingCapacity();
+    errdefer for (local.defer_chunks.items) |*chunk| chunk.rows.deinit(allocator);
+    {
+        defer releaseRawQueueLane(shared.raw_group_queues, lane);
+        var popped: [MAX_RAW_BATCH_CHUNKS]GroupChunk = undefined;
+        while (true) {
+            const n = popGroupChunkBatchFromQueue(&shared.raw_group_queues[lane], &popped, MAX_RAW_BATCH_CHUNKS, &local.raw_group_queue_lock_ticks);
+            if (n == 0) break;
+            local.defer_chunks.appendSlice(allocator, popped[0..n]) catch |err| {
+                for (popped[0..n]) |*chunk| chunk.rows.deinit(allocator);
+                return err;
+            };
+        }
+    }
+    const chunks = local.defer_chunks.items;
+    if (chunks.len == 0) {
+        local.sched_group_misses += 1;
+        return false;
+    }
+    _ = shared.active_group_jobs.fetchAdd(1, .release);
+    defer _ = shared.active_group_jobs.fetchSub(1, .release);
+    var total_rows: usize = 0;
+    for (chunks) |chunk| total_rows += chunk.rows.len();
+    defer {
+        _ = shared.stage_outstanding_rows.fetchSub(total_rows, .release);
+        _ = shared.stage_outstanding_chunks.fetchSub(chunks.len, .release);
+    }
+
+    const bucket = &shared.buckets[lane % shared.bucket_count];
+    const lock_t0 = if (profile) platform.nowTicks() else 0;
+    lockSpin(&bucket.agg_lock);
+    defer bucket.agg_lock.unlock();
+    if (profile) local.raw_agg_lock_ticks += platform.nowTicks() - lock_t0;
+    const g0 = if (profile) platform.nowTicks() else 0;
+
+    const layout = shared.group_rows_layout;
+    if (local.defer_table == null) local.defer_table = .{ .narrow = try GroupTable.init(allocator, DEFER_PART_ROWS) };
+    const table = &local.defer_table.?;
+    const transient = top.items.len != 0 and layout.distinct_slot_count == 0;
+    const states = if (transient) &local.defer_states else &bucket.states;
+    const part_count = deferPartCount(total_rows);
+    if (part_count == 1) {
+        try foldDeferredPart(allocator, scratch, bucket, table, states, transient, top, chunks, total_rows);
+    } else {
+        try local.defer_part_ids.resize(allocator, total_rows);
+        const part_ids = local.defer_part_ids.items;
+        var counts: [MAX_DEFER_PARTS]u32 = undefined;
+        switch (layout.key_width) {
+            inline else => |kw| deferPartIds(kw, chunks, part_ids, counts[0..part_count], std.math.log2_int(usize, part_count)),
+        }
+        while (local.defer_parts.items.len < part_count) try local.defer_parts.append(allocator, .{});
+        const parts = local.defer_parts.items[0..part_count];
+        for (parts, counts[0..part_count]) |*part, n| try part.resize(allocator, layout, n);
+        var lanes: [MAX_STAGE_LANES]StageLane = undefined;
+        for (StageLane.all(layout, &lanes)) |stage_lane| try scatterPartLane(layout, parts, chunks, part_ids, stage_lane);
+        for (parts) |part| {
+            if (part.len() == 0) continue;
+            try foldDeferredPart(allocator, scratch, bucket, table, states, transient, top, &.{.{ .rows = part, .owner_worker = 0, .bucket_idx = lane }}, part.len());
+        }
+    }
+    bucket.row_count += total_rows;
+    if (profile) group_ticks.* += platform.nowTicks() - g0;
+
+    // Staging is complete, so nothing will take a recycled slab.
+    for (chunks) |*chunk| chunk.rows.deinit(allocator);
+    chunk_count.* += chunks.len;
+    local.defer_chunks.clearRetainingCapacity();
+    local.sched_group_jobs += 1;
+    if (shared.pending_group_rows.fetchSub(total_rows, .release) == total_rows) shared.signalWork(std.math.maxInt(u32));
+    return true;
+}
+
+/// Folds one part's rows, all of its groups' rows, into the emptied table.
+fn foldDeferredPart(
+    allocator: Allocator,
+    scratch: *GroupScratch,
+    bucket: *PipeBucket,
+    table: *BucketTable,
+    states: *StateSlab,
+    transient: bool,
+    top: *TopSet,
+    chunks: []const GroupChunk,
+    part_rows: usize,
+) !void {
+    table.clearRetainingCapacity();
+    if (transient) states.clearRetainingCapacity();
+    const first_new = states.len;
+    for (chunks) |chunk| {
+        try groupChunkRowsDirect(table, states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), &bucket.str_bank, chunk.rows, part_rows, part_rows, 0, null);
+    }
+    if (top.items.len == 0) return;
+    var gid = first_new;
+    while (gid < states.len) : (gid += 1) top.consider_state(states.ref(gid));
+}
+
 fn runReadyGroup(job: SiloGridJob, scratch: *GroupScratch, lane: usize) !bool {
+    if (job.shared.defer_fold) return foldDeferredBucket(job.shared, job.local, scratch, lane, job.top, job.group_ticks, job.chunks, job.profile);
     if (!claimRawQueueLaneExact(job.shared.raw_group_queues, lane)) return false;
     if (try drainRawDedicatedGroupLane(
         job.shared.allocator,
@@ -7565,7 +7970,8 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
         if (job.raw_group_mode == .staged_final) {
             const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
             const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
-            const group_choice = maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
+            const folds_held = job.shared.defer_fold and !job.shared.deferred_folds_released();
+            const group_choice = if (folds_held) null else maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
             const max_stage_rows = if (stage_choice) |choice| choice.rows else 0;
             const max_group_rows = if (group_choice) |choice| choice.rows else 0;
             const downstream_max_rows = @max(max_stage_rows, max_group_rows);
@@ -7675,7 +8081,26 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
     if (!marked_scan_done) {
         try markGridScanDone(job, &marked_scan_done);
     }
+    // A deferred fold took each group into the top set as it folded.
+    if (job.shared.defer_fold) {
+        job.local.releaseDeferScratch(job.shared.allocator);
+        return;
+    }
     try collectOwnedTop(job.shared, job.worker_index, job.worker_count, job.top, job.top_ticks, job.profile);
+}
+
+/// Whether the grid defers every bucket's fold until all rows are staged (see
+/// DEFER_FOLD_MIN_GROUPS). Staging then holds every input row at once, so it
+/// must fit well within the memory budget. String payloads and per-group
+/// finalized aggregates keep folding as rows arrive. So does COUNT(DISTINCT):
+/// a bucket's distinct members share one (gid, value) set that parts don't
+/// split, so deferring would add the staging copy and keep the set's misses.
+fn deferBucketFolds(layout: GroupRowsLayout, n_workers: usize, staged: bool, expected_groups_per_bucket: usize, input_rows: u64, resources: ?*thindb.exec.memory.MemoryAccountant) bool {
+    if (!staged or n_workers < 2 or expected_groups_per_bucket < DEFER_FOLD_MIN_GROUPS) return false;
+    if (layout.has_str_payload or hasStringResults(layout) or layout.has_concat or layout.has_udf or layout.distinct_slot_count != 0) return false;
+    const accountant = resources orelse return false;
+    const staged_bytes = std.math.mul(u64, input_rows, GroupRows.slabBytes(layout, 1)) catch return false;
+    return staged_bytes <= accountant.pool.budget / DEFER_FOLD_BUDGET_DIVISOR;
 }
 
 pub const RunConfig = struct {
@@ -7997,6 +8422,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const route_block_rows = chooseRouteBlockRows(bucket_count, cfg.route_block_rows, cfg.route_block_rows_set);
 
     const expected_groups_per_bucket = expectedGroupsPerBucket(total_groups, bucket_count);
+    // A filter's selectivity is unknown until the scan, so deferring folds is
+    // judged on the stats' unfiltered bound on the groups. A filter that keeps
+    // few rows leaves a deferred grid little to stage or fold.
+    const defer_groups: u64 = if (cfg.count_sketch != null)
+        total_groups
+    else
+        @max(total_groups, estimateGroupCountFromStats(stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns) orelse total);
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
@@ -8156,6 +8588,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .direct_final_local = direct_final_local,
         .local_parts = parts,
         .shared_scan_buffers = shared_scan_buffers_ptr,
+        .defer_fold = deferBucketFolds(group_rows_layout, n_workers, use_dedicated_raw_stage, expectedGroupsPerBucket(defer_groups, bucket_count), total, resources),
     };
     defer shared.scan_tiles.deinit(allocator);
     raw_queues_moved_to_shared = true;
