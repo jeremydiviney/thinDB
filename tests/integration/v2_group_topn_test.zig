@@ -2596,3 +2596,205 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         try std.testing.expectEqual(@as(usize, 10), rank);
     }
 }
+
+test "V2 group-topN: a string-derived key evaluates once per dictionary value and folds repeats by count" {
+    // 259 pages of 37 domains repeat throughout each row group, so the url
+    // blocks are dictionaries holding each page once; one row in eleven is a
+    // one-off domain the HAVING drops, and one in 97 is blank. `uniq` never
+    // repeats, so its blocks stay raw. A quarter of the rows stay in the
+    // memtable. The filters keep a contiguous run of each dictionary (every
+    // value but the blank first one), a gapped one (minus the d1* pages), and
+    // all of it.
+    const a = std.testing.allocator;
+    const n = 40_000;
+    const Row = struct { id: i64, url: []const u8, uniq: []const u8 };
+    const rows = try a.alloc(Row, n);
+    defer a.free(rows);
+    const hosts = try a.alloc([]const u8, n);
+    defer a.free(hosts);
+    const text = try a.alloc(u8, n * 64);
+    defer a.free(text);
+    var uniq_len_sum: i64 = 0;
+    for (rows, hosts, 0..) |*row, *host, i| {
+        const buf = text[i * 64 ..][0..64];
+        var url: []const u8 = "";
+        host.* = "";
+        if (i % 11 == 0) {
+            url = try std.fmt.bufPrint(buf[0..32], "https://x{d}.org/q", .{i});
+            host.* = url[8 .. url.len - 2];
+        } else if (i % 97 != 0) {
+            url = try std.fmt.bufPrint(buf[0..32], "http://www.d{d}.com/p{d}", .{ i % 37, (i / 37) % 7 });
+            host.* = url[11..std.mem.indexOfScalarPos(u8, url, 11, '/').?];
+        }
+        const uniq = try std.fmt.bufPrint(buf[32..], "https://z.net/{d}", .{i});
+        row.* = .{ .id = @intCast(i), .url = url, .uniq = uniq };
+        uniq_len_sum += @intCast(uniq.len);
+    }
+    const Filter = struct {
+        where: []const u8,
+        fn keeps(comptime where: []const u8, url: []const u8) bool {
+            if (comptime std.mem.eql(u8, where, "WHERE url <> ''")) return url.len > 0;
+            if (comptime std.mem.eql(u8, where, "WHERE url NOT LIKE 'http://www.d1%'")) return !std.mem.startsWith(u8, url, "http://www.d1");
+            return true;
+        }
+    };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("hits", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string }, .{ .name = "uniq", .type = .string } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 4096 });
+        try table.insert(rows[0 .. n / 4 * 3]);
+        try table.flush();
+        try table.insert(rows[n / 4 * 3 ..]);
+
+        inline for (.{ Filter{ .where = "WHERE url <> ''" }, Filter{ .where = "WHERE url NOT LIKE 'http://www.d1%'" }, Filter{ .where = "" } }) |filter| {
+            const Expected = struct { count: i64 = 0, len_sum: i64 = 0, min_url: []const u8 = "" };
+            var expected: std.StringHashMapUnmanaged(Expected) = .empty;
+            defer expected.deinit(a);
+            for (rows, hosts) |row, host| {
+                if (!Filter.keeps(filter.where, row.url)) continue;
+                const e = try expected.getOrPut(a, host);
+                if (!e.found_existing) e.value_ptr.* = .{ .min_url = row.url };
+                e.value_ptr.count += 1;
+                e.value_ptr.len_sum += @intCast(row.url.len);
+                if (std.mem.order(u8, row.url, e.value_ptr.min_url) == .lt) e.value_ptr.min_url = row.url;
+            }
+            var groups: usize = 0;
+            var it = expected.valueIterator();
+            while (it.next()) |e| groups += @intFromBool(e.count > 1);
+
+            const sql = "SELECT REGEXP_REPLACE(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(url)) AS l, COUNT(*) AS c, " ++
+                "MIN(url) FROM hits " ++ filter.where ++ " GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 100";
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+            try expectPlanRunsGroupTopN(a, db, sql);
+            var q = try runSql(a, db, sql);
+            defer q.deinit();
+            var seen: usize = 0;
+            var prev_l: f64 = std.math.inf(f64);
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const e = expected.get(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult;
+                    const l = (try cellNumber(batch.values[1], r)).?;
+                    try std.testing.expect(l <= prev_l);
+                    prev_l = l;
+                    try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(e.len_sum)) / @as(f64, @floatFromInt(e.count)), l, 1e-12);
+                    try std.testing.expectEqual(e.count, batch.values[2].data.bigint[r]);
+                    try std.testing.expectEqualStrings(e.min_url, batch.values[3].data.string.rowBytes(r));
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(groups, seen);
+        }
+
+        const uniq_sql = "SELECT REGEXP_REPLACE(uniq, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*), SUM(length(uniq)), MIN(uniq) FROM hits GROUP BY k ORDER BY 2 DESC LIMIT 5";
+        var uq = try runSql(a, db, uniq_sql);
+        defer uq.deinit();
+        var uniq_rows: usize = 0;
+        while (try uq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqualStrings("z.net", batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, n), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(uniq_len_sum)), try cellNumber(batch.values[2], r));
+                try std.testing.expectEqualStrings("https://z.net/0", batch.values[3].data.string.rowBytes(r));
+                uniq_rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), uniq_rows);
+    }
+}
+
+test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repeat counts" {
+    // Each heavy host is one url repeated in every row group, so each row
+    // group's dictionary collapses it to one row standing for many. Each
+    // medium host spreads over 600 one-off urls, so it collapses to many rows
+    // of one. A sketch counting collapsed rows rather than their weights would
+    // rank the medium hosts above the heavy ones and drop the heavy rows.
+    // Light urls come in adjacent pairs: every row group stays under half
+    // distinct (so its url block is a dictionary), and the groups are many
+    // enough for the sketch to run.
+    const a = std.testing.allocator;
+    const heavy_hosts = 12;
+    const medium_hosts = 20;
+    const medium_rows = 600;
+    const light_pairs = 70_000;
+    const heavy_rows = comptime blk: {
+        var n: usize = 0;
+        for (0..heavy_hosts) |g| n += 3000 - 100 * g;
+        break :blk n;
+    };
+    const units = heavy_rows + medium_hosts * medium_rows + light_pairs;
+    const total = heavy_rows + medium_hosts * medium_rows + 2 * light_pairs;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const unit_urls = try a.alloc([]const u8, units);
+    defer a.free(unit_urls);
+    var u: usize = 0;
+    for (0..heavy_hosts) |g| {
+        const url = try std.fmt.allocPrint(arena.allocator(), "http://heavy{d}.com/", .{g});
+        for (0..3000 - 100 * g) |_| {
+            unit_urls[u] = url;
+            u += 1;
+        }
+    }
+    for (0..medium_hosts) |m| {
+        for (0..medium_rows) |r| {
+            unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://medium{d}.net/{d}", .{ m, r });
+            u += 1;
+        }
+    }
+    const light_start = u;
+    for (0..light_pairs) |l| {
+        unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://light{d}.org/x", .{l});
+        u += 1;
+    }
+
+    const Row = struct { id: i64, url: []const u8 };
+    const rows = try a.alloc(Row, total);
+    defer a.free(rows);
+    // 7919 is prime and doesn't divide `units`, so this visits every unit once.
+    var i: usize = 0;
+    for (0..units) |p| {
+        const unit = (p * 7919) % units;
+        const copies: usize = if (unit >= light_start) 2 else 1;
+        for (0..copies) |_| {
+            rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit] };
+            i += 1;
+        }
+    }
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("hits", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 2048 });
+        try table.insert(rows);
+        try table.flush();
+
+        const sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits GROUP BY k ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+        try expectPlanRunsGroupTopN(a, db, sql);
+        var q = try runSql(a, db, sql);
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * rank)), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+}

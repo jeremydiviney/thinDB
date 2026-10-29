@@ -373,7 +373,6 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
         t.schema_fingerprint,
         65_536,
         snapshot.views,
-        &.{},
         false, // no fsync — measuring compress+write throughput, not durability
         1,
     );

@@ -60,11 +60,6 @@ pub fn writeSegment(
     schema_fingerprint: u64,
     row_group_size: usize,
     columns: []const ColumnView,
-    /// Per-column HLL bytes of every segment that will coexist with this one
-    /// (same layout as `SegmentInfo.column_sketches`). Used only to compute the
-    /// global dict-eligibility cardinality; pass `&.{}` when no global view is
-    /// available (the gate then sees this segment's NDV alone).
-    prior_sketches: []const []const u8,
     sync_on_close: bool,
     /// Worker threads for per-column block encode+compress (same grain as
     /// `MergedSegmentWriter`). 1 = serial; output is byte-identical either way.
@@ -81,30 +76,8 @@ pub fn writeSegment(
         }
     }
 
-    // Per-column HLL over this segment's rows, computed up front: the
-    // dict-eligibility gate below needs the segment-local NDV, and the same
-    // sketches are returned in SegmentInfo (so we compute them once).
     const column_sketches = try computeSketches(allocator, columns, row_count);
     errdefer allocator.free(column_sketches);
-
-    // Dict eligibility (per column): a string column is dictionary-encoded only
-    // when BOTH the segment-local NDV and the global NDV (this segment merged
-    // with every coexisting segment's sketch) are ≤ the cap. Above it the column
-    // stays raw — query-time coding would decline a high-card column anyway, and
-    // per-block dicts would only add decode cost. See docs/plans/NARROW_ENCODING_PLAN.md §2/§3.
-    const dict_eligible = try allocator.alloc(bool, columns.len);
-    defer allocator.free(dict_eligible);
-    for (dict_eligible, 0..) |*elig, ci| {
-        const seg_h = hll.Hll.fromBytes(column_sketches[ci * hll.m .. (ci + 1) * hll.m]);
-        var global = seg_h;
-        for (prior_sketches) |ps| {
-            if (ps.len >= (ci + 1) * hll.m) {
-                const ph = hll.Hll.fromBytes(ps[ci * hll.m .. (ci + 1) * hll.m]);
-                global.merge(&ph);
-            }
-        }
-        elig.* = seg_h.estimate() <= dict_max_global_ndv and global.estimate() <= dict_max_global_ndv;
-    }
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -154,7 +127,6 @@ pub fn writeSegment(
             .allocator = allocator,
             .columns = columns,
             .schema = schema,
-            .dict_eligible = dict_eligible,
             .row_start = row_offset,
             .row_end = row_offset + rows_in_group,
             .blocks = blocks,
@@ -222,43 +194,14 @@ pub fn writeSegment(
     };
 }
 
-/// Compute per-column dict-eligibility from a set of per-column HLL sketches
-/// (same layout as `SegmentInfo.column_sketches`). A column is eligible when
-/// the merged NDV across all `sketches` is at or below `dict_max_global_ndv`.
-/// Caller owns the returned slice.
-///
-/// Used by the streaming merge path, which derives the output's sketch from the
-/// union of the input segments' sketches rather than from a materialized column.
-pub fn dictEligibleFromSketches(
-    allocator: Allocator,
-    column_count: usize,
-    sketches: []const []const u8,
-) ![]bool {
-    const dict_eligible = try allocator.alloc(bool, column_count);
-    errdefer allocator.free(dict_eligible);
-    for (dict_eligible, 0..) |*elig, ci| {
-        var global: hll.Hll = .{};
-        for (sketches) |ps| {
-            if (ps.len >= (ci + 1) * hll.m) {
-                const ph = hll.Hll.fromBytes(ps[ci * hll.m .. (ci + 1) * hll.m]);
-                global.merge(&ph);
-            }
-        }
-        elig.* = global.estimate() <= dict_max_global_ndv;
-    }
-    return dict_eligible;
-}
-
 /// Streaming segment writer for compaction's k-way merge. Unlike `writeSegment`,
 /// which needs every column fully materialized, this accepts sorted row-groups
 /// one at a time so the merge holds at most ~(k input row-groups + one output
 /// row-group + the in-flight `buf`) in memory rather than the whole output.
 ///
-/// `dict_eligible` and `column_sketches` are precomputed by the caller (from the
-/// union of the input segments' sketches — a correct upper bound for dict
-/// eligibility and an acceptable sketch for the merged output) and must outlive
-/// `begin`/`writeRowGroup`. Ownership of `column_sketches` transfers to the
-/// returned `SegmentInfo` at `finish`.
+/// `column_sketches` is precomputed by the caller (the union of the input
+/// segments' sketches — an acceptable sketch for the merged output); ownership
+/// transfers to the returned `SegmentInfo` at `finish`.
 ///
 /// Usage: `begin`, then `writeRowGroup` per sorted row-group (≤ `row_group_size`
 /// rows), then `finish`. On any error before `finish`, call `deinit`.
@@ -268,7 +211,6 @@ pub const MergedSegmentWriter = struct {
     segment_id: u64,
     schema_fingerprint: u64,
     row_group_size: usize,
-    dict_eligible: []const bool,
     column_sketches: []const u8,
     /// Worker threads for per-column block encode+compress inside
     /// `writeRowGroup`. 1 = serial (encode on the calling thread).
@@ -284,7 +226,6 @@ pub const MergedSegmentWriter = struct {
         segment_id: u64,
         schema_fingerprint: u64,
         row_group_size: usize,
-        dict_eligible: []const bool,
         /// Per-column HLL bytes for the merged output (same layout as
         /// `SegmentInfo.column_sketches`). Ownership transfers to `finish`'s
         /// `SegmentInfo`; freed by `deinit` if the writer is torn down first.
@@ -292,7 +233,6 @@ pub const MergedSegmentWriter = struct {
         encode_threads: usize,
     ) !MergedSegmentWriter {
         if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
-        if (dict_eligible.len != schema.columns.len) return format.Error.SchemaMismatch;
 
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -311,7 +251,6 @@ pub const MergedSegmentWriter = struct {
             .segment_id = segment_id,
             .schema_fingerprint = schema_fingerprint,
             .row_group_size = row_group_size,
-            .dict_eligible = dict_eligible,
             .column_sketches = column_sketches,
             .encode_threads = @max(1, encode_threads),
             .buf = buf,
@@ -322,7 +261,7 @@ pub const MergedSegmentWriter = struct {
 
     /// Append one sorted row-group. `columns` is one view per schema column,
     /// each holding the same `rows` (≤ `row_group_size`) rows. Encodes every
-    /// column block (raw / FOR / dict per `dict_eligible`) and records the
+    /// column block (raw / FOR / RLE / dict / FSST) and records the
     /// row-group's stats + offsets — the same per-block path `writeSegment` runs.
     ///
     /// Column blocks encode in parallel across `encode_threads` workers (each
@@ -353,7 +292,6 @@ pub const MergedSegmentWriter = struct {
             .allocator = self.allocator,
             .columns = columns,
             .schema = self.schema,
-            .dict_eligible = self.dict_eligible,
             .row_start = 0,
             .row_end = rows,
             .blocks = blocks,
@@ -457,7 +395,6 @@ const BlockEncodeJob = struct {
     allocator: Allocator,
     columns: []const ColumnView,
     schema: TableSchema,
-    dict_eligible: []const bool,
     row_start: usize,
     row_end: usize,
     blocks: []std.ArrayList(u8),
@@ -510,7 +447,6 @@ const BlockEncodeJob = struct {
                 &self.blocks[ci],
                 view,
                 self.schema.columns[ci].nullable,
-                self.dict_eligible[ci],
                 self.schema.compression,
                 self.row_start,
                 self.row_end,
@@ -552,7 +488,6 @@ fn writeColumnBlock(
     buf: *std.ArrayList(u8),
     view: ColumnView,
     nullable: bool,
-    dict_eligible: bool,
     table_compression: types.TableCompression,
     row_start: usize,
     row_end: usize,
@@ -581,7 +516,7 @@ fn writeColumnBlock(
         .rle
     else if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
         .for_
-    else if (dict_eligible and try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
+    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
         .dict
     else if (table_compression == .lz4_fsst and
         try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, fsst_min_block_bytes, fsst_threads))
@@ -858,11 +793,6 @@ fn forEncode(
 /// most `u16`-wide; a column whose block exceeds this stays raw (mid-build
 /// abandon below avoids paying the full distinct scan for high-card columns).
 const dict_max_ndv: usize = 65536;
-/// Whole-segment / global cardinality cap for dict *eligibility* (distinct from
-/// the per-block `dict_max_ndv` code-width cap). A string column is dict-encoded
-/// only when BOTH this segment's NDV and the global NDV (merged HLL across all
-/// coexisting segments) are at or below this. Above it the column stays raw.
-const dict_max_global_ndv: u64 = 65536;
 /// Skip dict encoding for blob-like columns: a high average value length means
 /// the dict bytes dominate and per-row codes save little. Long-but-low-card
 /// values (URLs) still qualify because the dict stores each long value once.
@@ -914,7 +844,9 @@ fn tryEncodeDict(
         const s = sv.rowBytes(r);
         const gop = try map.getOrPut(allocator, s);
         if (!gop.found_existing) {
-            if (map.count() > dict_max_ndv) return false; // abandon: high-card
+            // NDV ≤ n/2: with more distinct values the codes + dict approach
+            // the raw body, so the encoding can't pay for its dict header.
+            if (map.count() > dict_max_ndv or map.count() * 2 > n) return false;
             gop.value_ptr.* = @intCast(distinct.items.len);
             try distinct.append(allocator, s);
         }
@@ -923,9 +855,6 @@ fn tryEncodeDict(
 
     const k = distinct.items.len;
     if (k == 0) return false; // all-null block: stay raw (degenerate)
-    // NDV ≤ n/2: with more distinct values the codes + dict approach the raw
-    // body, so the encoding can't pay for its dict header.
-    if (k * 2 > n) return false;
 
     // Sort distinct indices by value bytes; build insertion→sorted remap.
     const order = try allocator.alloc(u32, k);

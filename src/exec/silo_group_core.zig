@@ -4023,7 +4023,7 @@ fn aggInputViewBytes(view: thindb.storage.ColumnView, pt: GroupColumnType) ?[]co
     };
 }
 
-fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, row_weights: ?RowWeights, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
     if (shared.generic_filter_required and !skip_filter_check) return error.UnsupportedOperatorForType;
     const layout = shared.group_rows_layout;
     if (layout.key_columns.len == 0 or layout.key_columns.len > MAX_GENERIC_GROUP_KEYS) return error.UnsupportedOperatorForType;
@@ -4098,7 +4098,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         if (part.nullable) keys_nullable = true;
     }
 
-    if (layout.has_weight and !layout.has_rowref and !keys_nullable and !layout.has_str_payload) runs_blk: {
+    if (row_weights == null and layout.has_weight and !layout.has_rowref and !keys_nullable and !layout.has_str_payload) runs_blk: {
         const rb = batch.runs orelse break :runs_blk;
         var key_runs_buf: [MAX_GENERIC_GROUP_KEYS]thindb.exec.RunsColumn = undefined;
         for (layout.key_columns, 0..) |part, i| {
@@ -4125,7 +4125,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     // Nullable numeric inputs also stay per-row: the fast key kernels append
     // payload bytes with no validity-lane write. Their weighted forms collapse
     // numeric runs only; string extremes fold in the per-row loop.
-    if (!layout.has_rowref and !keys_nullable and !inputs_nullable and !(layout.has_weight and layout.has_str_payload)) {
+    if (row_weights == null and !layout.has_rowref and !keys_nullable and !inputs_nullable and !(layout.has_weight and layout.has_str_payload)) {
         if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, str_nulls, raw_chunk_rows, profile)) return;
     }
 
@@ -4180,28 +4180,30 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             // (The weight gate declines nullable inputs, so this branch only
             // lives in the non-nullable copy.)
             if (layout.has_weight) {
-                if (idx > 0 and active.keyAt(idx - 1) == key) {
-                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, idx - 1, r);
-                    accepted += 1;
+                // A collapsed batch's row stands for `w` equal rows.
+                const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
+                if (idx > 0 and active.keyAt(idx - 1) == key and active.weightAll()[idx - 1] <= std.math.maxInt(u32) - w) {
+                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, idx - 1, r, w);
+                    accepted += w;
                     continue;
                 }
                 if (use_fold) {
                     const held = foldIndexProbe(parts, active, key, idx);
                     probes += 1;
-                    if (held < idx and active.weightAll()[held] < std.math.maxInt(u32)) {
-                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, held, r);
+                    if (held < idx and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
+                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, held, r, w);
                         hits += 1;
-                        accepted += 1;
+                        accepted += w;
                         continue;
                     }
                 }
-                active.weightAll()[idx] = 1;
-                weightFoldRange(active, weight_specs, idx, r, r + 1, true);
+                active.weightAll()[idx] = w;
+                weightFoldScaled(active, weight_specs, idx, r, w, true);
                 if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
-                accepted += 1;
+                accepted += w;
                 continue;
             }
             active.setKey(idx, key);
@@ -4224,7 +4226,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     }
     parts.fold_probes += probes;
     parts.fold_hits += hits;
-    parts.scanned_count += batch.row_count;
+    parts.scanned_count += if (row_weights) |rw| rw.input_rows else batch.row_count;
     parts.row_count += accepted;
     if (profile) parts.partition_ticks += platform.nowTicks() - route_t0;
 }
@@ -4706,10 +4708,29 @@ fn noteFoldChunk(parts: *WorkerParts, probes: u64, hits: u64) void {
     if (chunk_hits * 8 < chunk_probes) parts.fold_off = true;
 }
 
-inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
-    active.weightAll()[dst] += 1;
-    weightFoldRange(active, specs, dst, src, src + 1, false);
+inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize, w: u32) !void {
+    active.weightAll()[dst] += w;
+    weightFoldScaled(active, specs, dst, src, w, false);
     if (str_views.len != 0) try weightFoldStr(active, allocator, aggregates, str_views, str_nulls, dst, src);
+}
+
+// Fold source row `src`, standing for `w` equal rows, into staged row `idx`:
+// a sum takes its value `w` times over, an extreme takes it once.
+fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
+    if (w == 1) return weightFoldRange(active, specs, idx, src, src + 1, init);
+    for (specs, 0..) |spec, c| {
+        if (spec.op != .sum) {
+            weightFoldOne(active, spec, c, idx, src, src + 1, init);
+        } else if (spec.is_float) {
+            const col = @as([*]f64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
+            const v = weightSrcFloat(spec.view, src) * @as(f64, @floatFromInt(w));
+            if (init) col[idx] = v else col[idx] += v;
+        } else {
+            const col = @as([*]i64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
+            const v = weightSrcInt(spec.view, src) * @as(i64, w);
+            if (init) col[idx] = v else col[idx] += v;
+        }
+    }
 }
 
 // Fold source row `src`'s string extremes into staged row `dst`. A NULL input
@@ -4905,8 +4926,8 @@ fn foldActiveRawRows(parts: *WorkerParts, shared: *PipeShared, scratch: *GroupSc
     parts.published_chunks += 1;
 }
 
-fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
-    return appendBatchRawChunksGeneric(parts, shared, batch, raw_chunk_rows, profile, skip_filter_check);
+fn appendBatchRawChunks(parts: *WorkerParts, shared: *PipeShared, batch: thindb.Batch, weights: ?RowWeights, raw_chunk_rows: usize, profile: bool, skip_filter_check: bool) !void {
+    return appendBatchRawChunksGeneric(parts, shared, batch, weights, raw_chunk_rows, profile, skip_filter_check);
 }
 
 fn initGroupStateCountSumAvg(states: *StateSlab, key: u128, sum_acc: i64, avg_acc: i64, run_len: u64) u32 {
@@ -6087,6 +6108,151 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
         bucketIndexHash(h, bucket_count);
 }
 
+/// A collapsed batch's repeat counts, one per row, and the rows they cover.
+const RowWeights = struct {
+    counts: []const u32,
+    input_rows: usize,
+};
+
+/// One worker's per-distinct evaluation. A batch whose string column arrives
+/// as row-group dictionary codes (`Batch.block_dicts`) collapses to the
+/// values its rows use, in dictionary order; the derived columns evaluate
+/// once per value, and the grid folds each value by its row count. Any other
+/// batch (a raw row group, the memtable) evaluates per row.
+const GridDictEval = struct {
+    compute: *thindb.exec.Compute,
+    column: usize,
+    loc_column: ?usize,
+    /// Per dictionary code: rows using it, and the first such row.
+    code_rows: std.ArrayListUnmanaged(u32) = .empty,
+    code_first: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per collapsed value: its row count and first row's location, and the
+    /// value bytes when the used codes aren't one contiguous run.
+    weights: std.ArrayListUnmanaged(u32) = .empty,
+    locs: std.ArrayListUnmanaged(i64) = .empty,
+    offsets: std.ArrayListUnmanaged(u32) = .empty,
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    views: []ColumnView = &.{},
+    input_rows: usize = 0,
+    collapsed: bool = false,
+
+    fn deinit(self: *GridDictEval, allocator: Allocator) void {
+        self.code_rows.deinit(allocator);
+        self.code_first.deinit(allocator);
+        self.weights.deinit(allocator);
+        self.locs.deinit(allocator);
+        self.offsets.deinit(allocator);
+        self.bytes.deinit(allocator);
+        if (self.views.len > 0) allocator.free(self.views);
+    }
+
+    fn next(self: *GridDictEval, scan: *Scan, allocator: Allocator) !?thindb.Batch {
+        self.collapsed = false;
+        const raw = (try scan.next()) orelse return null;
+        self.input_rows = raw.row_count;
+        const dicts = raw.block_dicts orelse return try self.compute.evalBatch(raw);
+        const column = dicts[self.column] orelse return try self.compute.evalBatch(raw);
+        const batch = try self.collapse(allocator, raw, column);
+        self.collapsed = true;
+        return try self.compute.evalBatch(batch);
+    }
+
+    fn collapse(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, column: thindb.exec.BlockDictColumn) !thindb.Batch {
+        const dict = column.dict;
+        try self.code_rows.resize(allocator, dict.rowCount());
+        try self.code_first.resize(allocator, dict.rowCount());
+        const code_rows = self.code_rows.items;
+        const code_first = self.code_first.items;
+        @memset(code_rows, 0);
+        for (column.codes, 0..) |c, r| {
+            if (code_rows[c] == 0) code_first[c] = @intCast(r);
+            code_rows[c] += 1;
+        }
+
+        var lo: usize = code_rows.len;
+        var hi: usize = 0;
+        var used: usize = 0;
+        for (code_rows, 0..) |n, c| {
+            if (n == 0) continue;
+            lo = @min(lo, c);
+            hi = c + 1;
+            used += 1;
+        }
+        const row_locs: ?[]const i64 = if (self.loc_column) |lc| raw.values[lc].data.bigint else null;
+        self.weights.clearRetainingCapacity();
+        self.locs.clearRetainingCapacity();
+        try self.weights.ensureTotalCapacity(allocator, used);
+        if (row_locs != null) try self.locs.ensureTotalCapacity(allocator, used);
+        for (code_rows[lo..hi], code_first[lo..hi]) |n, first| {
+            if (n == 0) continue;
+            self.weights.appendAssumeCapacity(n);
+            if (row_locs) |rl| self.locs.appendAssumeCapacity(rl[first]);
+        }
+
+        // A contiguous run of used codes is a slice of the dictionary itself;
+        // a gapped one copies just the used values.
+        var values: storage_mod.StringView = .{ .offsets = dict.offsets[lo .. hi + 1], .bytes = dict.bytes };
+        if (used != hi - lo) {
+            self.offsets.clearRetainingCapacity();
+            self.bytes.clearRetainingCapacity();
+            try self.offsets.ensureTotalCapacity(allocator, used + 1);
+            self.offsets.appendAssumeCapacity(0);
+            for (code_rows[lo..hi], lo..) |n, c| {
+                if (n == 0) continue;
+                try self.bytes.appendSlice(allocator, dict.rowBytes(c));
+                self.offsets.appendAssumeCapacity(@intCast(self.bytes.items.len));
+            }
+            values = .{ .offsets = self.offsets.items, .bytes = self.bytes.items };
+        }
+
+        if (self.views.len != raw.values.len) {
+            if (self.views.len > 0) allocator.free(self.views);
+            self.views = &.{};
+            self.views = try allocator.alloc(ColumnView, raw.values.len);
+        }
+        @memcpy(self.views, raw.values);
+        self.views[self.column] = .{ .data = switch (raw.values[self.column].data) {
+            .varchar => .{ .varchar = values },
+            .string => .{ .string = values },
+            else => return error.TypeMismatch,
+        } };
+        if (self.loc_column) |lc| self.views[lc] = .{ .data = .{ .bigint = self.locs.items } };
+        return .{ .schema = raw.schema, .values = self.views, .row_count = used };
+    }
+
+    fn rowWeights(self: *const GridDictEval) ?RowWeights {
+        if (!self.collapsed) return null;
+        return .{ .counts = self.weights.items, .input_rows = self.input_rows };
+    }
+};
+
+/// The scan column whose row-group dictionary codes drive per-distinct
+/// evaluation, or null when the program can't fold by count. It takes a
+/// weighted program (every aggregate folds a repeated row by its count) with
+/// deterministic derived columns, over a scan reading one non-nullable string
+/// column; the row locations ride along, as any row of a value recovers it.
+/// String expressions, and the string keys they feed, cost far more per row
+/// than counting a row's code.
+fn dictEvalColumn(cfg: RunConfig, scan_schema: []const thindb.types.Column) ?usize {
+    if (!cfg.distinct_eval or cfg.derived.len == 0) return null;
+    const layout = cfg.group_rows_layout;
+    if (!layout.has_weight or layout.has_concat or layout.has_udf) return null;
+    if (cfg.hash_key_columns.len != 0 or cfg.byte_length_columns.len != 0) return null;
+    for (cfg.derived) |d| {
+        if (thindb.exec.compute_op.mayVary(d.expr, cfg.udf_registry)) return null;
+    }
+    var column: ?usize = null;
+    for (scan_schema, 0..) |col, j| {
+        if (types_mod.columnNameEql(col.name, rowloc.col_name)) continue;
+        if (column != null or col.nullable) return null;
+        switch (col.type) {
+            .varchar, .string => column = j,
+            else => return null,
+        }
+    }
+    return column;
+}
+
 const SiloGridJob = struct {
     scan: *Scan,
     // Batch source driven each tile: a Compute-wrapped scan when the shape has
@@ -6094,6 +6260,10 @@ const SiloGridJob = struct {
     // retained for range resets; `drive` produces the batches (with derived
     // columns appended). Points into the harness-owned `drives` array.
     drive: *thindb.exec.Query,
+    // Set when dictionary-coded batches collapse to their distinct values
+    // ahead of the derived columns; it then pulls the scan and evaluates
+    // them itself.
+    distinct: ?*GridDictEval = null,
     local: *WorkerParts,
     shared: *PipeShared,
     seg_start: []const usize,
@@ -6690,6 +6860,7 @@ const BatchKeys = struct {
 const SketchScratch = struct {
     ids: std.ArrayListUnmanaged(u128) = .empty,
     mask: std.ArrayListUnmanaged(bool) = .empty,
+    weights: std.ArrayListUnmanaged(u32) = .empty,
     span_lengths: std.ArrayListUnmanaged(u32) = .empty,
     span_values: [MAX_GENERIC_GROUP_KEYS]std.ArrayListUnmanaged(i64) = @splat(.empty),
     stores: []ColumnStore = &.{},
@@ -6700,6 +6871,7 @@ const SketchScratch = struct {
     fn deinit(self: *SketchScratch, allocator: Allocator) void {
         self.ids.deinit(allocator);
         self.mask.deinit(allocator);
+        self.weights.deinit(allocator);
         self.span_lengths.deinit(allocator);
         for (&self.span_values) |*v| v.deinit(allocator);
         self.deinitColumns(allocator);
@@ -6884,15 +7056,27 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
     return out;
 }
 
-fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch) !void {
+/// A collapsed batch's rows stand for `weights` rows each, so the tally
+/// counts them by weight: the sketch must see the counts the grid will.
+fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weights: ?RowWeights) !void {
     const ids = try batchIdentities(job, job.scan.allocator, batch);
     const counts = sketch.workerCounts(job.worker_index);
-    for (ids) |id| counts[sketch.counter(id)] += 1;
+    if (weights) |w| {
+        for (ids, w.counts[0..ids.len]) |id, n| counts[sketch.counter(id)] += n;
+    } else {
+        for (ids) |id| counts[sketch.counter(id)] += 1;
+    }
 }
 
-/// The rows of `batch` whose groups the sketch keeps, compacted into the
-/// worker's scratch when only some are; null when none are.
-fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, batch: thindb.Batch) !?thindb.Batch {
+/// A batch bound for the grid, with its rows' repeat counts when collapsed.
+const KeptRows = struct {
+    batch: thindb.Batch,
+    weights: ?RowWeights,
+};
+
+/// The rows of `batch` whose groups the sketch keeps, compacted (with their
+/// weights) into the worker's scratch when only some are; null when none are.
+fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, batch: thindb.Batch, weights: ?RowWeights) !?KeptRows {
     const ids = try batchIdentities(job, allocator, batch);
     const scratch = job.sketch_scratch;
     try scratch.mask.resize(allocator, batch.row_count);
@@ -6902,8 +7086,21 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
         m.* = sketch.keeps(id);
         kept += @intFromBool(m.*);
     }
-    if (kept == batch.row_count) return batch;
+    if (kept == batch.row_count) return .{ .batch = batch, .weights = weights };
     if (kept == 0) return null;
+
+    const kept_weights: ?RowWeights = if (weights) |w| blk: {
+        try scratch.weights.resize(allocator, kept);
+        var j: usize = 0;
+        var rows: usize = 0;
+        for (mask, w.counts[0..batch.row_count]) |m, n| {
+            if (!m) continue;
+            scratch.weights.items[j] = n;
+            rows += n;
+            j += 1;
+        }
+        break :blk .{ .counts = scratch.weights.items, .input_rows = rows };
+    } else null;
 
     try scratch.ensureColumns(allocator, batch);
     for (batch.values, 0..) |view, ci| {
@@ -6928,10 +7125,13 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
     // The run sidecar describes the uncompacted rows; consumers fall back
     // to the views without it.
     return .{
-        .schema = batch.schema,
-        .values = scratch.views,
-        .row_count = kept,
-        .hashed = if (batch.hashed != null) scratch.hashed else null,
+        .batch = .{
+            .schema = batch.schema,
+            .values = scratch.views,
+            .row_count = kept,
+            .hashed = if (batch.hashed != null) scratch.hashed else null,
+        },
+        .weights = kept_weights,
     };
 }
 
@@ -6963,18 +7163,19 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
                 continue;
             }
         }
-        const maybe_batch = try job.drive.next();
+        const maybe_batch = if (job.distinct) |gd| try gd.next(job.scan, job.shared.allocator) else try job.drive.next();
         if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const scanned = maybe_batch orelse break;
         job.local.scan_batches += 1;
-        const batch = if (job.shared.count_sketch) |pass| switch (pass.mode) {
+        const weights = if (job.distinct) |gd| gd.rowWeights() else null;
+        const kept: KeptRows = if (job.shared.count_sketch) |pass| switch (pass.mode) {
             .tally => {
-                try tallyRows(job, pass.sketch, scanned);
+                try tallyRows(job, pass.sketch, scanned, weights);
                 continue;
             },
-            .filter => (try keptRows(job, job.scan.allocator, pass.sketch, scanned)) orelse continue,
-        } else scanned;
-        try appendBatchRawChunks(job.local, job.shared, batch, job.raw_chunk_rows, job.profile, job.filter_fused);
+            .filter => (try keptRows(job, job.scan.allocator, pass.sketch, scanned, weights)) orelse continue,
+        } else .{ .batch = scanned, .weights = weights };
+        try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
 
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
@@ -7240,6 +7441,9 @@ pub const RunConfig = struct {
     key_bound: ?thindb.exec.KeyBoundSpec = null,
     count_sketch: ?CountSketchPass = null,
     shared_stage_builders: bool = false,
+    // Collapse each scanned batch to its distinct rows before the derived
+    // columns evaluate, where `dictEvalColumn` allows it.
+    distinct_eval: bool = false,
     no_profile: bool = false,
     quiet: bool = false,
     result_out: ?*std.ArrayListUnmanaged(TopRow) = null,
@@ -7706,6 +7910,35 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;
 
+    var grid_distinct: []GridDictEval = &.{};
+    defer {
+        for (grid_distinct) |*gd| gd.deinit(allocator);
+        if (grid_distinct.len > 0) allocator.free(grid_distinct);
+    }
+    if (n_workers > 0) distinct: {
+        const scan_schema = scans[0].outputSchema();
+        const column = dictEvalColumn(cfg, scan_schema) orelse break :distinct;
+        for (drives) |d| {
+            const compute = thindb.exec.queryAs(thindb.exec.Compute, d) orelse break :distinct;
+            if (compute.chain != null) break :distinct;
+        }
+        // All or none: a marked scan's string rows arrive as placeholders
+        // that only the collapse below reads past.
+        for (scans[0..n_workers]) |sc| {
+            if (sc.blockDictColumnIndex(scan_schema[column].name) == null) break :distinct;
+        }
+        for (scans[0..n_workers]) |sc| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[column].name).?);
+        grid_distinct = try allocator.alloc(GridDictEval, n_workers);
+        const loc_column = for (scan_schema, 0..) |col, j| {
+            if (types_mod.columnNameEql(col.name, rowloc.col_name)) break j;
+        } else null;
+        for (grid_distinct, drives) |*gd, d| gd.* = .{
+            .compute = thindb.exec.queryAs(thindb.exec.Compute, d).?,
+            .column = column,
+            .loc_column = loc_column,
+        };
+    }
+
     var group_ticks = try allocator.alloc(i64, n_workers);
     defer allocator.free(group_ticks);
     @memset(group_ticks, 0);
@@ -7754,6 +7987,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         const job = SiloGridJob{
             .scan = scans[i],
             .drive = &drives[i],
+            .distinct = if (grid_distinct.len > 0) &grid_distinct[i] else null,
             .local = &parts[i],
             .shared = &shared,
             .seg_start = seg_start,

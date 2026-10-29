@@ -685,7 +685,7 @@ test "streaming merge: dict-eligible string column round-trips" {
     const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
 
     const palette = [_][]const u8{ "red", "green", "blue", "magenta" };
-    // Two segments, each ~150 rows of a 4-value palette → low global NDV → the
+    // Two segments, each ~150 rows of a 4-value palette → low NDV → the
     // merged block must be dict-encoded, and every value must round-trip.
     var next_id: i64 = 0;
     var expected_color = std.AutoHashMap(i64, []const u8).init(allocator);
@@ -711,7 +711,7 @@ test "streaming merge: dict-eligible string column round-trips" {
     var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
     defer seg.deinit();
 
-    // The color column's first block is dict-encoded (low global NDV).
+    // The color column's first block is dict-encoded (low NDV).
     var controller = exec.memory.MemoryPool.init(1 << 20);
     var cache = storage.cache.Cache.init(allocator, &controller, 0);
     controller.shareCache(&cache, controller.budget);

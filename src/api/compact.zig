@@ -462,7 +462,6 @@ fn preempted(preempt: ?*const std.atomic.Value(u32)) bool {
 fn streamMerge(
     t: *Table,
     seg_ids: []const u64,
-    prior_sketches: []const []const u8,
     new_seg_id: u64,
     file_name: []const u8,
     sync: bool,
@@ -470,16 +469,11 @@ fn streamMerge(
 ) !?storage.format.SegmentInfo {
     const ncols = t.schema.columns.len;
 
-    // Output dict eligibility + sketch from the union of the input segments'
-    // per-column HLL sketches. The union over-approximates the merged output's
-    // NDV (it can only lose rows to tombstones), so it's a correct upper bound
-    // for the dict gate and an acceptable stored sketch. `prior_sketches`
-    // already includes the inputs' own sketches, so it is the global view.
-    const dict_eligible = try storage.dictEligibleFromSketches(t.allocator, ncols, prior_sketches);
-    defer t.allocator.free(dict_eligible);
-
-    // Ownership of `out_sketches` transfers to the writer at `begin`; until then
-    // it is freed on any early error via this flag-guarded errdefer.
+    // The output's sketch is the union of the input segments' per-column HLL
+    // sketches: it over-approximates the merged NDV (rows only drop to
+    // tombstones), which is acceptable for a stored sketch. Ownership of
+    // `out_sketches` transfers to the writer at `begin`; until then it is
+    // freed on any early error via this flag-guarded errdefer.
     const out_sketches = try unionInputSketches(t, seg_ids, ncols);
     var sketches_owned_here = true;
     errdefer if (sketches_owned_here) t.allocator.free(out_sketches);
@@ -518,7 +512,6 @@ fn streamMerge(
         new_seg_id,
         t.schema_fingerprint,
         t.row_group_size,
-        dict_eligible,
         out_sketches, // ownership transfers to the writer here
         t.compact_threads,
     );
@@ -787,26 +780,6 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64, preempt: ?*const std.atomi
         snapshots[i] = try t.readTombstones(t.allocator, id);
     }
 
-    // Snapshot every current segment's per-column sketch for the global
-    // dict-eligibility gate. Brief lock so a concurrent flush can't realloc the
-    // manifest mid-read; the duped bytes outlive the lock. Passing the inputs'
-    // own sketches too is harmless — the merged output's sketch already covers
-    // their rows, so the HLL union is unchanged.
-    var prior_sketches: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (prior_sketches.items) |p| t.allocator.free(p);
-        prior_sketches.deinit(t.allocator);
-    }
-    {
-        t.mutex.lockUncancelable(t.io);
-        defer t.mutex.unlock(t.io);
-        for (t.manifest.segments.items) |e| {
-            if (e.column_sketches.len > 0) {
-                try prior_sketches.append(t.allocator, try t.allocator.dupe(u8, e.column_sketches));
-            }
-        }
-    }
-
     const sync = t.syncEnabled();
 
     // Write the merged output to a brand-new segment file (unless every
@@ -825,7 +798,7 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64, preempt: ?*const std.atomi
         var name_buf: [32]u8 = undefined;
         const file_name = try Table.segmentFileName(&name_buf, new_seg_id);
 
-        var maybe_info = try streamMerge(t, seg_ids, prior_sketches.items, new_seg_id, file_name, sync, preempt);
+        var maybe_info = try streamMerge(t, seg_ids, new_seg_id, file_name, sync, preempt);
         if (maybe_info) |*info| {
             defer info.deinit(t.allocator);
             // Persist the merged Bloom as the segment's sidecar (#140) —
