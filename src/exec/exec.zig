@@ -746,6 +746,7 @@ pub fn sampleBuffer(sample: *KeySample, buffer: anytype, views: []ColumnView) vo
 }
 
 const hll = @import("../util/hll.zig");
+const xxh3 = @import("../util/xxh3.zig");
 /// A key sample's sketches. The router divides one count by another and
 /// scales the quotient up, so it takes four times the registers of a
 /// column's stored sketch for half the error (about 1.6%); a sample keeps
@@ -1765,9 +1766,10 @@ pub const RunsColumn = struct {
 /// batches without a sidecar. The digest (not the raw bytes) is what feeds a
 /// composite key hash, so per-column digests compose across mixed sources.
 pub fn stringKeyDigest(bytes: []const u8) u128 {
-    const lo = std.hash.Wyhash.hash(0x9E3779B97F4A7C15, bytes);
-    const hi = std.hash.Wyhash.hash(0xD1B54A32D192ED03, bytes);
-    return (@as(u128, hi) << 64) | @as(u128, lo);
+    // One XXH3-128 pass yields both halves; two Wyhash seeds took two passes.
+    // Seed 0 keeps inputs past 240 bytes on the default secret instead of
+    // deriving one per call.
+    return xxh3.hash128(0, bytes);
 }
 
 pub const sort_op = @import("sort.zig");
