@@ -742,7 +742,8 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
     else if (tier96)
         struct { lo: u64, hi: u32, gid: u32 }
     else
-        struct { key: u128, gid: u32 };
+        // Two u64 halves rather than a u128: 24-byte slots instead of 32.
+        struct { lo: u64, hi: u64, gid: u32 };
 
     return struct {
         const Self = @This();
@@ -757,7 +758,7 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
             } else if (tier96) {
                 return .{ .lo = std.math.maxInt(u64), .hi = std.math.maxInt(u32), .gid = EMPTY };
             } else {
-                return .{ .key = std.math.maxInt(u128), .gid = EMPTY };
+                return .{ .lo = std.math.maxInt(u64), .hi = std.math.maxInt(u64), .gid = EMPTY };
             }
         }
 
@@ -783,7 +784,7 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
             } else if (tier96) {
                 return mix64(s.lo ^ mix64(@as(u64, s.hi)));
             } else {
-                return hashU128(s.key);
+                return hashU128(@as(u128, s.hi) << 64 | s.lo);
             }
         }
 
@@ -793,7 +794,7 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
             } else if (tier96) {
                 return .{ .lo = @truncate(key), .hi = @truncate(key >> 64), .gid = gid };
             } else {
-                return .{ .key = key, .gid = gid };
+                return .{ .lo = @truncate(key), .hi = @truncate(key >> 64), .gid = gid };
             }
         }
 
@@ -803,7 +804,7 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
             } else if (tier96) {
                 return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u32, @truncate(key >> 64));
             } else {
-                return s.key == key;
+                return s.lo == @as(u64, @truncate(key)) and s.hi == @as(u64, @truncate(key >> 64));
             }
         }
 
