@@ -2847,3 +2847,54 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
         try std.testing.expectEqual(@as(usize, 10), url_rank);
     }
 }
+
+test "group keys packed past 96 bits keep groups that differ only in their high bits" {
+    const allocator = std.testing.allocator;
+    const Row = struct { id: i64, a: i64, b: i64, c: i32, d: i32 };
+    // Each pair of `b` values, and every `d` value, agrees in the low 96
+    // bits of the packed (a, b) and (a, c, d) keys.
+    const a_vals = [_]i64{ std.math.minInt(i64), -1, 0, std.math.maxInt(i64) };
+    const b_vals = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + (1 << 32), std.math.maxInt(i64), std.math.maxInt(i64) - (1 << 32) };
+    const d_vals = [_]i32{ std.math.minInt(i32), -1, 1, std.math.maxInt(i32) };
+    const n = 100_000;
+    const groups = 16;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop });
+        defer db.close();
+        const t = try db.table("wide_keys", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "a", .type = .bigint },
+                .{ .name = "b", .type = .bigint },
+                .{ .name = "c", .type = .int },
+                .{ .name = "d", .type = .int },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"} });
+        const rows = try allocator.alloc(Row, n);
+        defer allocator.free(rows);
+        for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i), .a = a_vals[i % 4], .b = b_vals[(i / 4) % 4], .c = 7, .d = d_vals[(i / 4) % 4] };
+        try t.insert(rows);
+        try t.flush();
+        inline for (.{
+            .{ "SELECT a, b, COUNT(*) AS n FROM wide_keys GROUP BY a, b", 2 },
+            .{ "SELECT a, b, COUNT(*) AS n FROM wide_keys GROUP BY a, b ORDER BY n DESC LIMIT 100", 2 },
+            .{ "SELECT a, c, d, COUNT(*) AS n FROM wide_keys GROUP BY a, c, d", 3 },
+            .{ "SELECT a, c, d, COUNT(*) AS n, SUM(id) AS s FROM wide_keys GROUP BY a, c, d", 3 },
+        }) |case| {
+            var q = try runSql(allocator, db, case[0]);
+            defer q.deinit();
+            var seen: usize = 0;
+            while (try q.next()) |batch| {
+                for (batch.values[case[1]].data.bigint[0..batch.row_count]) |count| {
+                    try std.testing.expectEqual(@as(i64, n / groups), count);
+                }
+                seen += batch.row_count;
+            }
+            try std.testing.expectEqual(@as(usize, groups), seen);
+        }
+    }
+}
