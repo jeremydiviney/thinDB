@@ -1847,6 +1847,7 @@ test {
     _ = @import("group_table.zig");
     _ = silo_group_core;
     _ = v2_group_topn_engine;
+    _ = @import("count_topk_sketch.zig");
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
     _ = @import("partitioned_distinct.zig");

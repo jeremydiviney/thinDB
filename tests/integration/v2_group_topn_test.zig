@@ -2449,3 +2449,150 @@ test "V2 octet_length reads string lengths without the bytes" {
         }
     }
 }
+
+test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
+    const allocator = std.testing.allocator;
+    const heavy_groups = 12;
+    // Mostly one-row groups, short of the share at which the stats call a
+    // key unique and skip the sketch.
+    const unique_rows = 245_000;
+    const heavy_rows = comptime blk: {
+        var n: usize = 0;
+        for (0..heavy_groups) |g| n += 6000 - 250 * g;
+        break :blk n;
+    };
+    const total = heavy_rows + unique_rows;
+    const Row = struct { id: i64, k: i64, s: []const u8, v: i32 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    const t = try db.table("skewed", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+
+    // Heavy group g holds 6000 - 250g rows; every other row is its own group.
+    // Ids scatter the heavy rows over the row groups.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try allocator.alloc(Row, total);
+    defer allocator.free(rows);
+    var counts = [_]i64{0} ** heavy_groups;
+    var kept_counts = [_]i64{0} ** heavy_groups;
+    var sums = [_]i64{0} ** heavy_groups;
+    var i: usize = 0;
+    for (0..heavy_groups) |g| {
+        for (0..6000 - 250 * g) |_| {
+            const v: i32 = @intCast(i % 7);
+            rows[i] = .{ .id = 0, .k = @intCast(g), .s = try std.fmt.allocPrint(arena.allocator(), "key-{d}", .{g}), .v = v };
+            counts[g] += 1;
+            sums[g] += v;
+            if (v != 3) kept_counts[g] += 1;
+            i += 1;
+        }
+    }
+    for (0..unique_rows) |j| {
+        rows[i] = .{ .id = 0, .k = @intCast(1000 + j), .s = try std.fmt.allocPrint(arena.allocator(), "key-{d}", .{1000 + j}), .v = @intCast(i % 7) };
+        i += 1;
+    }
+    for (rows, 0..) |*r, n| r.id = @intCast((n * 7919) % total);
+    try t.insert(rows);
+    try t.flush();
+
+    {
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c, SUM(v) FROM skewed GROUP BY k ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(sums[rank])), try cellNumber(batch.values[2], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        var order: [heavy_groups]usize = undefined;
+        for (&order, 0..) |*o, g| o.* = g;
+        std.sort.pdq(usize, &order, &kept_counts, struct {
+            fn gt(c: *const [heavy_groups]i64, a: usize, b: usize) bool {
+                return c[a] > c[b];
+            }
+        }.gt);
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c FROM skewed WHERE v <> 3 GROUP BY k ORDER BY c DESC LIMIT 3 OFFSET 4");
+        defer q.deinit();
+        var rank: usize = 4;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(order[rank])), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(kept_counts[order[rank]])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 7), rank);
+    }
+    {
+        // Every group holds one row: the sketch declines and every row is grouped.
+        var q = try runSql(allocator, db, "SELECT id, COUNT(*) AS c FROM skewed GROUP BY id ORDER BY c DESC LIMIT 5");
+        defer q.deinit();
+        var n: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| try std.testing.expectEqual(@as(?f64, 1), try cellNumber(batch.values[1], r));
+            n += batch.row_count;
+        }
+        try std.testing.expectEqual(@as(usize, 5), n);
+    }
+
+    // The same rows in insertion order: each heavy group is one long run, so
+    // its row groups reach the sketch run-encoded.
+    const clustered = try db.table("clustered", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+    for (rows, 0..) |*r, n| r.id = @intCast(n);
+    try clustered.insert(rows);
+    try clustered.flush();
+    {
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c FROM clustered GROUP BY k ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+}

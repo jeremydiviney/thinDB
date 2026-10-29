@@ -16,6 +16,7 @@ const exec = @import("exec.zig");
 const storage = @import("../storage/storage.zig");
 
 const SiloCore = exec.silo_group_core;
+const count_topk_sketch = @import("count_topk_sketch.zig");
 const platform = @import("../util/platform.zig");
 const udf_mod = @import("../udf.zig");
 
@@ -494,6 +495,10 @@ pub const Shape = struct {
     // Rows the ORDER BY ... LIMIT above the core can't keep, dropped in
     // each worker's scan (see `Scan.setKeyBound`).
     key_bound: ?exec.KeyBoundSpec = null,
+    // The core's top-N ranks groups by COUNT(*), so the two-pass sketch
+    // (see count_topk_sketch.zig) may drop the rows of groups too small to
+    // place.
+    count_sketch: bool = false,
 };
 
 pub const Params = struct {
@@ -513,6 +518,7 @@ pub const Params = struct {
     trace_timing: bool = false,
     arena_workspace: bool = false,
     sync_teardown: bool = false,
+    count_sketch: bool = true,
 };
 
 pub const RunRequest = struct {
@@ -579,6 +585,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .trace_timing = build_options.profiling and (getenv("THINDB_V2_PIPELINE_TRACE") != null),
         .arena_workspace = getenv("THINDB_V2_ARENA_WORKSPACE") != null,
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
+        .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
     };
 }
 
@@ -946,7 +953,7 @@ fn runHarness(
         };
     }
 
-    try SiloCore.runSiloGrid(allocator, table, cpus, .{
+    const cfg: SiloCore.RunConfig = .{
         .dop = params.dop,
         .bucket_count = params.bucket_count,
         .bucket_count_set = params.bucket_count_set,
@@ -990,7 +997,74 @@ fn runHarness(
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
         .byte_length_columns = length_cols_buf[0..n_length_cols],
-    });
+    };
+    // The sketch's counters are u32, and a retried filter pass discards
+    // its rows, so string or per-group-allocated states rule it out.
+    const need = shape.limit + shape.offset;
+    if (shape.count_sketch and params.count_sketch and need > 0 and need <= count_topk_sketch.MAX_NEED and
+        snapshotRows(snapshot) <= std.math.maxInt(u32) and !group_rows_layout.has_str_payload and
+        !group_rows_layout.has_concat and !group_rows_layout.has_udf and distinct_slot_count == 0)
+    {
+        if (try runCountSketch(allocator, table, cpus, cfg, need, rows)) return;
+    }
+    try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
+}
+
+fn snapshotRows(snapshot: exec.Scan.Snapshot) u64 {
+    var rows: u64 = snapshot.memtable_row_count;
+    for (snapshot.segments) |entry| rows += entry.row_count;
+    return rows;
+}
+
+/// The two-pass COUNT top-K (see count_topk_sketch.zig) into `rows`. False,
+/// leaving `rows` empty, when the input is too small or its counts too even
+/// for the sketch to pay; the caller then groups every row.
+fn runCountSketch(
+    allocator: Allocator,
+    table: *api.Table,
+    cpus: []const usize,
+    cfg: SiloCore.RunConfig,
+    need: usize,
+    rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
+) !bool {
+    var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
+    defer sketch.deinit(allocator);
+
+    var none: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
+    defer none.deinit(allocator);
+    var tally = cfg;
+    tally.count_sketch = .{ .sketch = &sketch, .mode = .tally };
+    tally.result_out = &none;
+    tally.workspace = null;
+    tally.defer_heavy_teardown = false;
+    try SiloCore.runSiloGrid(allocator, table, cpus, tally);
+    if (!try sketch.settle(allocator, need)) return false;
+
+    var filter = cfg;
+    filter.count_sketch = .{ .sketch = &sketch, .mode = .filter };
+    try SiloCore.runSiloGrid(allocator, table, cpus, filter);
+    const found = rows.items.len;
+    const kth = needthCount(rows.items, need);
+    if (sketch.exact(need, found, kth)) return true;
+
+    rows.clearRetainingCapacity();
+    if (found < need or !sketch.retarget(kth)) return false;
+    try SiloCore.runSiloGrid(allocator, table, cpus, filter);
+    return true;
+}
+
+/// The row count of the need-th best of `rows` (0 when there are fewer).
+fn needthCount(rows: []const SiloCore.TopRow, need: usize) u64 {
+    if (rows.len < need) return 0;
+    var best: [count_topk_sketch.MAX_NEED]u64 = undefined;
+    for (rows[0..need], 0..) |r, i| best[i] = r.count;
+    std.sort.pdq(u64, best[0..need], {}, std.sort.desc(u64));
+    for (rows[need..]) |r| {
+        if (r.count <= best[need - 1]) continue;
+        best[need - 1] = r.count;
+        std.sort.pdq(u64, best[0..need], {}, std.sort.desc(u64));
+    }
+    return best[need - 1];
 }
 
 fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !bool {
