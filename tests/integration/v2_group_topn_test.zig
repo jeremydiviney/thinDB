@@ -2689,6 +2689,38 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
                 }
             }
             try std.testing.expectEqual(groups, seen);
+
+            // The url itself as the key: each dictionary value is one row.
+            var url_counts: std.StringHashMapUnmanaged(i64) = .empty;
+            defer url_counts.deinit(a);
+            for (rows) |row| {
+                if (!Filter.keeps(filter.where, row.url)) continue;
+                const e = try url_counts.getOrPut(a, row.url);
+                if (!e.found_existing) e.value_ptr.* = 0;
+                e.value_ptr.* += 1;
+            }
+            var url_groups: usize = 0;
+            var uit = url_counts.valueIterator();
+            while (uit.next()) |c| url_groups += @intFromBool(c.* > 1);
+
+            const url_sql = "SELECT url, COUNT(*) AS c FROM hits " ++ filter.where ++ " GROUP BY url HAVING COUNT(*) > 1 ORDER BY c DESC LIMIT 1000";
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, url_sql });
+            try expectPlanRunsGroupTopN(a, db, url_sql);
+            var uq = try runSql(a, db, url_sql);
+            defer uq.deinit();
+            var url_seen: usize = 0;
+            var prev_c: i64 = std.math.maxInt(i64);
+            while (try uq.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const want = url_counts.get(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult;
+                    const c = batch.values[1].data.bigint[r];
+                    try std.testing.expectEqual(want, c);
+                    try std.testing.expect(c <= prev_c);
+                    prev_c = c;
+                    url_seen += 1;
+                }
+            }
+            try std.testing.expectEqual(url_groups, url_seen);
         }
 
         const uniq_sql = "SELECT REGEXP_REPLACE(uniq, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*), SUM(length(uniq)), MIN(uniq) FROM hits GROUP BY k ORDER BY 2 DESC LIMIT 5";
@@ -2796,5 +2828,22 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             }
         }
         try std.testing.expectEqual(@as(usize, 10), rank);
+
+        // The url itself as the key, collapsed with no expression to evaluate.
+        const url_sql = "SELECT url, COUNT(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, url_sql });
+        try expectPlanRunsGroupTopN(a, db, url_sql);
+        var uq = try runSql(a, db, url_sql);
+        defer uq.deinit();
+        var url_rank: usize = 0;
+        while (try uq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [24]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "http://heavy{d}.com/", .{url_rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * url_rank)), try cellNumber(batch.values[1], r));
+                url_rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), url_rank);
     }
 }

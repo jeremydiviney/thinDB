@@ -705,13 +705,16 @@ pub const Scan = struct {
         codes: std.ArrayListUnmanaged(u32) = .empty,
         offsets: std.ArrayListUnmanaged(u32) = .empty,
         bytes: std.ArrayListUnmanaged(u8) = .empty,
-        /// The row group whose dictionary `offsets` and `bytes` hold.
+        digests: std.ArrayListUnmanaged(u128) = .empty,
+        /// The row group whose dictionary `offsets` and `bytes`, or
+        /// `digests`, hold.
         held: ?struct { seg_idx: usize, rg_idx: usize } = null,
 
         fn deinit(self: *DictBuf, allocator: Allocator) void {
             self.codes.deinit(allocator);
             self.offsets.deinit(allocator);
             self.bytes.deinit(allocator);
+            self.digests.deinit(allocator);
         }
     };
 
@@ -1352,7 +1355,8 @@ pub const Scan = struct {
 
     /// The projected position of `name` when it can take block-dictionary
     /// emit (`Batch.block_dicts`): a non-nullable VARCHAR or STRING column no
-    /// other sidecar claims.
+    /// coded or length sidecar claims. A hashed key column takes it too: its
+    /// dict blocks emit codes with per-value digests, its other blocks digests.
     pub fn blockDictColumnIndex(self: *const Scan, name: []const u8) ?usize {
         const j = for (self.out_phys, 0..) |phys, j| {
             const col = self.table.schema.columns[phys];
@@ -1364,7 +1368,6 @@ pub const Scan = struct {
             }
         } else return null;
         if (self.coded_dicts_by_j.len > j and self.coded_dicts_by_j[j] != null) return null;
-        if (self.hash_cols_by_j.len > j and self.hash_cols_by_j[j]) return null;
         if (self.len_cols_by_j.len > j and self.len_cols_by_j[j]) return null;
         return j;
     }
@@ -1402,18 +1405,25 @@ pub const Scan = struct {
     }
 
     /// Column `j`'s codes for `rows` (every row when null) of the dict block
-    /// payload `values`, against a copy of the block's dictionary that
-    /// `dict_bufs[j]` keeps for the row group's later sub-batches.
+    /// payload `values`, against a copy of the block's dictionary (a hashed
+    /// key: its values' digests) that `dict_bufs[j]` keeps for the row
+    /// group's later sub-batches.
     fn fillBlockDict(self: *Scan, values: []const u8, rg_idx: usize, j: usize, rg_count: u32, rows: ?[]const u32) !exec.BlockDictColumn {
         const db = storage.segment_reader.dictBlockOf(values, rg_count);
         const buf = &self.dict_bufs[j];
+        const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
         const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
         if (!holds) {
             buf.held = null;
-            try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
-            for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
-            try buf.bytes.resize(self.allocator, db.dict_bytes.len);
-            @memcpy(buf.bytes.items, db.dict_bytes);
+            if (hashed) {
+                try buf.digests.resize(self.allocator, db.ndv);
+                for (buf.digests.items, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            } else {
+                try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
+                for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+                try buf.bytes.resize(self.allocator, db.dict_bytes.len);
+                @memcpy(buf.bytes.items, db.dict_bytes);
+            }
             buf.held = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx };
         }
         const n = if (rows) |r| r.len else rg_count;
@@ -1423,6 +1433,7 @@ pub const Scan = struct {
         } else {
             for (buf.codes.items, 0..) |*c, row| c.* = db.rowCode(row);
         }
+        if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items };
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = buf.offsets.items, .bytes = buf.bytes.items } };
     }
 
@@ -2968,10 +2979,14 @@ pub const Scan = struct {
             var hash_sidecar: ?[]const ?[]const u128 = null;
             if (hashing) {
                 const slots = try self.ensureHashedSlots();
+                var any_hashed = false;
                 for (0..self.out_phys.len) |j| {
-                    if (self.hash_cols_by_j[j]) slots[j] = self.hash_bufs[j].items[0..rg_count];
+                    if (!self.hash_cols_by_j[j]) continue;
+                    if (any_dict and dict_slots.?[j] != null) continue;
+                    slots[j] = self.hash_bufs[j].items[0..rg_count];
+                    any_hashed = true;
                 }
-                hash_sidecar = slots;
+                if (any_hashed) hash_sidecar = slots;
             }
             var length_sidecar: ?[]const ?[]const u32 = null;
             if (measuring) {
@@ -4579,6 +4594,7 @@ pub const Scan = struct {
         const length_slots: ?[]?[]const u32 = if (measuring) try self.ensureLengthSlots() else null;
         const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0) try self.ensureDictSlots() else null;
         var any_dict = false;
+        var any_hashed = false;
 
         for (self.out_phys, 0..) |phys, j| {
             const col_type = self.table.schema.columns[phys].type;
@@ -4589,6 +4605,17 @@ pub const Scan = struct {
                 self.scan_mat_kind_ticks[mat_kind] +%= @intCast(@max(0, exec.prof.nowTicks() - _tc));
                 self.scan_mat_kind_cols[mat_kind] += 1;
             };
+
+            if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
+                var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+                defer block.release(self.allocator, self.table.cacheRef());
+                if (block.encoding != .dict) break :dict;
+                mat_kind = 4;
+                dict_slots.?[j] = try self.fillBlockDict(block.bytes, rg_idx, j, rg_count, rows);
+                any_dict = true;
+                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                continue;
+            }
 
             // Coded group key: translate only the survivors' codes into the code
             // buffer (dict block → LUT, raw block → intern), never expanding the
@@ -4609,6 +4636,7 @@ pub const Scan = struct {
                 try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
+                any_hashed = true;
                 continue;
             }
 
@@ -4634,12 +4662,6 @@ pub const Scan = struct {
 
             if (block.encoding == .dict) {
                 mat_kind = 4;
-                if (dict_slots != null and self.dict_cols_by_j[j]) {
-                    dict_slots.?[j] = try self.fillBlockDict(block.bytes, rg_idx, j, rg_count, rows);
-                    any_dict = true;
-                    try self.fillEmptyStrings(&filtered_cols[j], matched);
-                    continue;
-                }
                 try engine.transform.appendDictRows(self.allocator, block.bytes, rg_count, flags, rows, &filtered_cols[j]);
                 continue;
             }
@@ -4672,7 +4694,7 @@ pub const Scan = struct {
         }
         if (self.emit_loc) try self.appendSurvivorLocs(rows, rg_idx);
         self.filtered_coded = slots;
-        self.filtered_hashed = hash_slots;
+        self.filtered_hashed = if (any_hashed) hash_slots else null;
         self.filtered_lengths = length_slots;
         self.filtered_dicts = if (any_dict) dict_slots else null;
     }
