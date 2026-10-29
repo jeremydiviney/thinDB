@@ -46,6 +46,83 @@ const StringView = storage_mod.StringView;
 const Scan = thindb.exec.Scan;
 const group_table = thindb.exec.group_table;
 const GroupTable = group_table.IntKeyMemsetTable(96);
+const WideGroupTable = group_table.IntKeyMemsetTable(128);
+
+/// A bucket's group table, at the slot width its keys need. A packed key past
+/// 96 bits compares on all 128; a hashed key's digest compares on 96 of its
+/// bits, a collision chance of about n²/2^97 that keeps its slot at 16 bytes.
+const BucketTable = union(enum) {
+    narrow: GroupTable,
+    wide: WideGroupTable,
+
+    /// Switches an empty table to the width `layout` needs. A bucket's layout
+    /// changes only between queries, after a reset empties its table.
+    fn fit(self: *BucketTable, allocator: Allocator, layout: GroupRowsLayout, expected_groups: usize) !void {
+        const wide = layout.key_width == .u128 and !layout.hashed_key;
+        if (wide == (self.* == .wide)) return;
+        if (self.len() != 0) return error.UnsupportedOperatorForType;
+        const initial_groups: usize = @min(expected_groups, PIPE_CHUNK_ROWS);
+        const next: BucketTable = if (wide)
+            .{ .wide = try WideGroupTable.init(allocator, initial_groups) }
+        else
+            .{ .narrow = try GroupTable.init(allocator, initial_groups) };
+        self.deinit(allocator);
+        self.* = next;
+    }
+
+    /// Grows ahead of `n` more rows toward the bucket's observed group
+    /// reservation; true when it grew.
+    fn growFor(self: *BucketTable, allocator: Allocator, n: usize, expected_groups: usize, input_rows: u64, observed_rows: u64) !bool {
+        switch (self.*) {
+            inline else => |*t| {
+                if (!t.needsGrow(n)) return false;
+                t.grow_target = group_table.capacityFor(group_table.observed_group_reservation(expected_groups, input_rows, t.len, observed_rows, n));
+                try t.grow(allocator, n);
+                return true;
+            },
+        }
+    }
+
+    /// The gid of `key`'s group, if it has one.
+    fn find(self: *BucketTable, key: u128) ?u32 {
+        switch (self.*) {
+            inline else => |*t| {
+                const probe = t.getOrPut(@TypeOf(t.*).hashKey(key), key);
+                return if (probe.found) probe.gid else null;
+            },
+        }
+    }
+
+    fn len(self: BucketTable) usize {
+        return switch (self) {
+            inline else => |t| t.len,
+        };
+    }
+
+    fn slotCount(self: BucketTable) usize {
+        return switch (self) {
+            inline else => |t| t.slots.len,
+        };
+    }
+
+    fn slotBytes(self: BucketTable) usize {
+        return switch (self) {
+            inline else => |t| std.mem.sliceAsBytes(t.slots).len,
+        };
+    }
+
+    fn clearRetainingCapacity(self: *BucketTable) void {
+        switch (self.*) {
+            inline else => |*t| t.clearRetainingCapacity(),
+        }
+    }
+
+    fn deinit(self: *BucketTable, allocator: Allocator) void {
+        switch (self.*) {
+            inline else => |*t| t.deinit(allocator),
+        }
+    }
+};
 const TOP_K: usize = 10;
 
 test {
@@ -1749,7 +1826,7 @@ const PipeBucket = struct {
     agg_lock: std.atomic.Mutex = .unlocked,
     chunks: std.ArrayListUnmanaged(PipeChunk) = .empty,
     queued_rows: u64 = 0,
-    table: GroupTable,
+    table: BucketTable,
     expected_groups: usize,
     observed_input_rows: u64 = 0,
     allocation_profile: GroupAllocationProfile = .{},
@@ -1787,7 +1864,7 @@ const PipeBucket = struct {
         // page faults out of the scan/route/group workers' allocation traffic.
         const initial_groups = @min(expected_groups, PIPE_CHUNK_ROWS);
         return .{
-            .table = try GroupTable.init(allocator, initial_groups),
+            .table = .{ .narrow = try GroupTable.init(allocator, initial_groups) },
             .expected_groups = expected_groups,
             .states = .{ .reserve_hint = initial_groups },
             .str_arena = std.heap.ArenaAllocator.init(allocator),
@@ -1814,7 +1891,7 @@ const PipeBucket = struct {
         var scratch: GroupScratch = .{};
         defer scratch.deinit(allocator);
         try bucket.fold_rows(allocator, &scratch, .{}, 1_000_000);
-        try std.testing.expectEqual(group_table.capacityFor(PIPE_CHUNK_ROWS), bucket.table.slots.len);
+        try std.testing.expectEqual(group_table.capacityFor(PIPE_CHUNK_ROWS), bucket.table.slotCount());
         try std.testing.expectEqual(@as(usize, 0), bucket.states.cap);
         try std.testing.expectEqual(@as(u64, 0), bucket.observed_input_rows);
     }
@@ -1864,9 +1941,8 @@ const PipeBucket = struct {
         try std.testing.expectEqual(@as(usize, 65536), bucket.states.len);
         try std.testing.expectEqual(@as(usize, 65536), bucket.states.cap);
         for (0..65536) |key| {
-            const probe = bucket.table.getOrPut(GroupTable.hashKey(key), key);
-            try std.testing.expect(probe.found);
-            try std.testing.expectEqual(@as(u64, 1), bucket.states.head(probe.gid).count);
+            const gid = bucket.table.find(key) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u64, 1), bucket.states.head(gid).count);
         }
     }
 
@@ -1968,15 +2044,14 @@ const PipeBucket = struct {
                         if (count == 0) continue;
                         groups += 1;
                         const packed_key: u128 = if (width == .u96 or width == .u128) @as(u128, key) | (@as(u128, key) << 64) else key;
-                        const probe = bucket.table.getOrPut(GroupTable.hashKey(packed_key), packed_key);
-                        try std.testing.expect(probe.found);
-                        try std.testing.expectEqual(count, bucket.states.head(probe.gid).count);
+                        const gid = bucket.table.find(packed_key) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqual(count, bucket.states.head(gid).count);
                     }
-                    try std.testing.expectEqual(groups, bucket.table.len);
+                    try std.testing.expectEqual(groups, bucket.table.len());
                     try std.testing.expectEqual(groups, bucket.states.len);
                     try std.testing.expectEqual(@as(u64, total_rows * weight), bucket.observed_input_rows);
                     if (distribution == .correlated) {
-                        try std.testing.expect(bucket.table.slots.len <= group_table.capacityFor(PIPE_CHUNK_ROWS));
+                        try std.testing.expect(bucket.table.slotCount() <= group_table.capacityFor(PIPE_CHUNK_ROWS));
                         try std.testing.expect(bucket.states.cap <= PIPE_CHUNK_ROWS);
                     }
                 }
@@ -5201,7 +5276,7 @@ fn aggSlotCount(layout: GroupRowsLayout) usize {
 }
 
 fn groupChunkRowsDirect(
-    table: *GroupTable,
+    table: *BucketTable,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
@@ -5222,11 +5297,8 @@ fn groupChunkRowsDirect(
     if (n == 0) return;
     const allocation_t0 = if (allocation_profile != null) platform.nowTicks() else 0;
     try states.prepare(allocator, aggSlotCount(rows.layout));
-    var reservation: usize = 0;
-    if (table.needsGrow(n)) {
-        reservation = group_table.observed_group_reservation(expected_groups, input_rows, table.len, observed_rows, n);
-        table.grow_target = group_table.capacityFor(reservation);
-        try table.grow(allocator, n);
+    try table.fit(allocator, rows.layout, expected_groups);
+    if (try table.growFor(allocator, n, expected_groups, input_rows, observed_rows)) {
         if (allocation_profile) |profile| profile.table_growths += 1;
     }
     try states.ensureUnusedCapacity(allocator, n);
@@ -5245,18 +5317,22 @@ fn groupChunkRowsDirect(
         if (physicalIsFloat(rows.layout.columns[program.sum_input_index].physical_type) or
             physicalIsFloat(rows.layout.columns[program.avg_input_index].physical_type)) break :blk;
         switch (rows.layout.key_width) {
-            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, table, states, rows.keyU32All()[0..n], &.{}, n, rows, program, rowrefs),
-            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, table, states, rows.keyU64All()[0..n], &.{}, n, rows, program, rowrefs),
-            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, table, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows, program, rowrefs),
-            .u128 => try groupChunkRowsDirectKeysCountSumAvg(.u128, table, states, rows.keyU128All()[0..n], &.{}, n, rows, program, rowrefs),
+            .u32 => try groupChunkRowsDirectKeysCountSumAvg(.u32, &table.narrow, states, rows.keyU32All()[0..n], &.{}, n, rows, program, rowrefs),
+            .u64 => try groupChunkRowsDirectKeysCountSumAvg(.u64, &table.narrow, states, rows.keyU64All()[0..n], &.{}, n, rows, program, rowrefs),
+            .u96 => try groupChunkRowsDirectKeysCountSumAvg(.u96, &table.narrow, states, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows, program, rowrefs),
+            .u128 => switch (table.*) {
+                inline else => |*t| try groupChunkRowsDirectKeysCountSumAvg(.u128, t, states, rows.keyU128All()[0..n], &.{}, n, rows, program, rowrefs),
+            },
         }
         return;
     }
     switch (rows.layout.key_width) {
-        .u32 => try groupChunkRowsDirectKeys(.u32, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u64 => try groupChunkRowsDirectKeys(.u64, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
-        .u96 => try groupChunkRowsDirectKeys(.u96, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
-        .u128 => try groupChunkRowsDirectKeys(.u128, table, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u32 => try groupChunkRowsDirectKeys(.u32, &table.narrow, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU32All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u64 => try groupChunkRowsDirectKeys(.u64, &table.narrow, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU64All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        .u96 => try groupChunkRowsDirectKeys(.u96, &table.narrow, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU96LoAll()[0..n], rows.keyU96HiAll()[0..n], n, rows.layout.aggregates, rows, rowrefs),
+        .u128 => switch (table.*) {
+            inline else => |*t| try groupChunkRowsDirectKeys(.u128, t, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, &scratch.gids, allocator, rows.keyU128All()[0..n], &.{}, n, rows.layout.aggregates, rows, rowrefs),
+        },
     }
 }
 
@@ -5387,7 +5463,7 @@ fn foldGroupUdf(
 // pair bumps that aggregate's running count slot. Called under the bucket agg_lock.
 fn groupChunkRowsDirectKeysCountSumAvg(
     comptime key_width: GroupKeyWidth,
-    table: *GroupTable,
+    table: anytype,
     states: *StateSlab,
     keys: anytype,
     key_hi: []const u32,
@@ -5405,7 +5481,7 @@ fn groupChunkRowsDirectKeysCountSumAvg(
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < row_count) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
-            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+            @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
         // The table is physically ordered, so clustered group keys arrive in
@@ -5426,7 +5502,7 @@ fn groupChunkRowsDirectKeysCountSumAvg(
             for (weights[r..run_end]) |w| s += w;
             break :blk s;
         } else @intCast(run_end - r);
-        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        const probe = table.getOrPut(@TypeOf(table.*).hashKey(key), key);
         if (!probe.found) {
             const new_gid = initGroupStateCountSumAvg(states, key, sum_acc, avg_acc, run_len);
             if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
@@ -5438,14 +5514,14 @@ fn groupChunkRowsDirectKeysCountSumAvg(
     }
 }
 
-fn group_count_prefetched(comptime width: GroupKeyWidth, table: *GroupTable, states: *StateSlab, keys: anytype, key_hi: []const u32, n: usize, weights: []const u32, rowrefs: []const i64) void {
+fn group_count_prefetched(comptime width: GroupKeyWidth, table: anytype, states: *StateSlab, keys: anytype, key_hi: []const u32, n: usize, weights: []const u32, rowrefs: []const i64) void {
     var pending: PendingCountUpdates = .{};
     var r: usize = 0;
     while (r < n) {
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < n) {
             const key = groupKeyAt(width, keys, key_hi, pf);
-            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(key))), .{ .rw = .write, .locality = 1 });
+            @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(key))), .{ .rw = .write, .locality = 1 });
         }
         const key = groupKeyAt(width, keys, key_hi, r);
         var end = r + 1;
@@ -5455,7 +5531,7 @@ fn group_count_prefetched(comptime width: GroupKeyWidth, table: *GroupTable, sta
             for (weights[r..end]) |weight| sum += weight;
             break :blk sum;
         };
-        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        const probe = table.getOrPut(@TypeOf(table.*).hashKey(key), key);
         if (probe.found) {
             pending.append(states.head(probe.gid), count);
         } else {
@@ -5473,7 +5549,7 @@ fn group_count_prefetched(comptime width: GroupKeyWidth, table: *GroupTable, sta
 
 fn groupChunkRowsDirectKeys(
     comptime key_width: GroupKeyWidth,
-    table: *GroupTable,
+    table: anytype,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
@@ -5565,7 +5641,7 @@ fn groupChunkRowsDirectKeys(
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < n) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
-            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+            @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
         // Adjacent-equal run: probe the table once for the whole run; only the
@@ -5580,7 +5656,7 @@ fn groupChunkRowsDirectKeys(
             break :blk s;
         } else @intCast(run_end - r);
 
-        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        const probe = table.getOrPut(@TypeOf(table.*).hashKey(key), key);
         var gid: u32 = probe.gid;
         var tagged: u32 = probe.gid;
         if (!probe.found) {
@@ -5638,7 +5714,7 @@ fn groupChunkRowsDirectKeys(
 // pass can't express.
 fn groupChunkRowsDirectKeysProgram(
     comptime key_width: GroupKeyWidth,
-    table: *GroupTable,
+    table: anytype,
     states: *StateSlab,
     str_states: *std.ArrayListUnmanaged(StrAccRow),
     concat_states: *std.ArrayListUnmanaged(ConcatRow),
@@ -5676,7 +5752,7 @@ fn groupChunkRowsDirectKeysProgram(
         const pf = r + PREFETCH_DIST_BUCKET;
         if (pf < n) {
             const pf_key = groupKeyAt(key_width, keys, key_hi, pf);
-            @prefetch(table.slotAddr(table.bucketOf(GroupTable.hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
+            @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(pf_key))), .{ .rw = .write, .locality = 1 });
         }
 
         const key = groupKeyAt(key_width, keys, key_hi, r);
@@ -5691,7 +5767,7 @@ fn groupChunkRowsDirectKeysProgram(
             if (has_distinct) gids[r] = prev_gid;
             continue;
         }
-        const probe = table.getOrPut(GroupTable.hashKey(key), key);
+        const probe = table.getOrPut(@TypeOf(table.*).hashKey(key), key);
         if (!probe.found) {
             const new_gid = try initGroupStateProgram(states, key, aggregates, rows, r);
             if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
@@ -8224,7 +8300,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         var allocation_ticks: i64 = 0;
         var table_growths: usize = 0;
         for (buckets) |bucket| {
-            hash_bytes += std.mem.sliceAsBytes(bucket.table.slots).len;
+            hash_bytes += bucket.table.slotBytes();
             state_capacity += bucket.states.cap;
             state_bytes += bucket.states.cap * bucket.states.stride;
             allocation_ticks += bucket.allocation_profile.ticks;
