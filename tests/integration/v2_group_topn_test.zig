@@ -2450,6 +2450,153 @@ test "V2 octet_length reads string lengths without the bytes" {
     }
 }
 
+test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
+    const allocator = std.testing.allocator;
+    const heavy_groups = 12;
+    // Mostly one-row groups, short of the share at which the stats call a
+    // key unique and skip the sketch.
+    const unique_rows = 245_000;
+    const heavy_rows = comptime blk: {
+        var n: usize = 0;
+        for (0..heavy_groups) |g| n += 6000 - 250 * g;
+        break :blk n;
+    };
+    const total = heavy_rows + unique_rows;
+    const Row = struct { id: i64, k: i64, s: []const u8, v: i32 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    const t = try db.table("skewed", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+
+    // Heavy group g holds 6000 - 250g rows; every other row is its own group.
+    // Ids scatter the heavy rows over the row groups.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try allocator.alloc(Row, total);
+    defer allocator.free(rows);
+    var counts = [_]i64{0} ** heavy_groups;
+    var kept_counts = [_]i64{0} ** heavy_groups;
+    var sums = [_]i64{0} ** heavy_groups;
+    var i: usize = 0;
+    for (0..heavy_groups) |g| {
+        for (0..6000 - 250 * g) |_| {
+            const v: i32 = @intCast(i % 7);
+            rows[i] = .{ .id = 0, .k = @intCast(g), .s = try std.fmt.allocPrint(arena.allocator(), "key-{d}", .{g}), .v = v };
+            counts[g] += 1;
+            sums[g] += v;
+            if (v != 3) kept_counts[g] += 1;
+            i += 1;
+        }
+    }
+    for (0..unique_rows) |j| {
+        rows[i] = .{ .id = 0, .k = @intCast(1000 + j), .s = try std.fmt.allocPrint(arena.allocator(), "key-{d}", .{1000 + j}), .v = @intCast(i % 7) };
+        i += 1;
+    }
+    for (rows, 0..) |*r, n| r.id = @intCast((n * 7919) % total);
+    try t.insert(rows);
+    try t.flush();
+
+    {
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c, SUM(v) FROM skewed GROUP BY k ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(sums[rank])), try cellNumber(batch.values[2], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        var order: [heavy_groups]usize = undefined;
+        for (&order, 0..) |*o, g| o.* = g;
+        std.sort.pdq(usize, &order, &kept_counts, struct {
+            fn gt(c: *const [heavy_groups]i64, a: usize, b: usize) bool {
+                return c[a] > c[b];
+            }
+        }.gt);
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c FROM skewed WHERE v <> 3 GROUP BY k ORDER BY c DESC LIMIT 3 OFFSET 4");
+        defer q.deinit();
+        var rank: usize = 4;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(order[rank])), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(kept_counts[order[rank]])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 7), rank);
+    }
+    {
+        // Every group holds one row: the sketch declines and every row is grouped.
+        var q = try runSql(allocator, db, "SELECT id, COUNT(*) AS c FROM skewed GROUP BY id ORDER BY c DESC LIMIT 5");
+        defer q.deinit();
+        var n: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| try std.testing.expectEqual(@as(?f64, 1), try cellNumber(batch.values[1], r));
+            n += batch.row_count;
+        }
+        try std.testing.expectEqual(@as(usize, 5), n);
+    }
+
+    // The same rows in insertion order: each heavy group is one long run, so
+    // its row groups reach the sketch run-encoded.
+    const clustered = try db.table("clustered", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+    for (rows, 0..) |*r, n| r.id = @intCast(n);
+    try clustered.insert(rows);
+    try clustered.flush();
+    {
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c FROM clustered GROUP BY k ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+}
+
 test "V2 group-topN: a string-derived key evaluates once per dictionary value and folds repeats by count" {
     // 259 pages of 37 domains repeat throughout each row group, so the url
     // blocks are dictionaries holding each page once; one row in eleven is a
@@ -2558,5 +2705,96 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
             }
         }
         try std.testing.expectEqual(@as(usize, 1), uniq_rows);
+    }
+}
+
+test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repeat counts" {
+    // Each heavy host is one url repeated in every row group, so each row
+    // group's dictionary collapses it to one row standing for many. Each
+    // medium host spreads over 600 one-off urls, so it collapses to many rows
+    // of one. A sketch counting collapsed rows rather than their weights would
+    // rank the medium hosts above the heavy ones and drop the heavy rows.
+    // Light urls come in adjacent pairs: every row group stays under half
+    // distinct (so its url block is a dictionary), and the groups are many
+    // enough for the sketch to run.
+    const a = std.testing.allocator;
+    const heavy_hosts = 12;
+    const medium_hosts = 20;
+    const medium_rows = 600;
+    const light_pairs = 70_000;
+    const heavy_rows = comptime blk: {
+        var n: usize = 0;
+        for (0..heavy_hosts) |g| n += 3000 - 100 * g;
+        break :blk n;
+    };
+    const units = heavy_rows + medium_hosts * medium_rows + light_pairs;
+    const total = heavy_rows + medium_hosts * medium_rows + 2 * light_pairs;
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const unit_urls = try a.alloc([]const u8, units);
+    defer a.free(unit_urls);
+    var u: usize = 0;
+    for (0..heavy_hosts) |g| {
+        const url = try std.fmt.allocPrint(arena.allocator(), "http://heavy{d}.com/", .{g});
+        for (0..3000 - 100 * g) |_| {
+            unit_urls[u] = url;
+            u += 1;
+        }
+    }
+    for (0..medium_hosts) |m| {
+        for (0..medium_rows) |r| {
+            unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://medium{d}.net/{d}", .{ m, r });
+            u += 1;
+        }
+    }
+    const light_start = u;
+    for (0..light_pairs) |l| {
+        unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://light{d}.org/x", .{l});
+        u += 1;
+    }
+
+    const Row = struct { id: i64, url: []const u8 };
+    const rows = try a.alloc(Row, total);
+    defer a.free(rows);
+    // 7919 is prime and doesn't divide `units`, so this visits every unit once.
+    var i: usize = 0;
+    for (0..units) |p| {
+        const unit = (p * 7919) % units;
+        const copies: usize = if (unit >= light_start) 2 else 1;
+        for (0..copies) |_| {
+            rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit] };
+            i += 1;
+        }
+    }
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("hits", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 2048 });
+        try table.insert(rows);
+        try table.flush();
+
+        const sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits GROUP BY k ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+        try expectPlanRunsGroupTopN(a, db, sql);
+        var q = try runSql(a, db, sql);
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * rank)), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
     }
 }

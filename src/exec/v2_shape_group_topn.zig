@@ -784,6 +784,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .emit_rank = emitRank(ctx),
             .hashed = ctx.plan.hashed,
             .key_bound = ctx.request.key_bound,
+            .count_sketch = canUseCoreCountDescTopN(ctx) and ctx.request.key_bound == null,
         },
         .params = params,
         .scan_columns = scan_columns,
