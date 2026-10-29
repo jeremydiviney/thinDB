@@ -15,7 +15,6 @@ const ColumnStore = common.ColumnStore;
 const stringViewOf = common.stringViewOf;
 const stringStoreOf = common.stringStoreOf;
 const daysToYmd = common.daysToYmd;
-const microsToHms = common.microsToHms;
 const daysFromDatetime = common.daysFromDatetime;
 
 const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) anyerror!void;
@@ -25,76 +24,86 @@ const Kernel = *const fn (allocator: Allocator, args: []const ColumnView, out: *
 // for datetime).
 // ---------------------------------------------------------------------------
 
+/// Writes `part(value)` for each row straight into the output's int column,
+/// reserved once, so the row loop carries no per-row capacity check.
+fn extractInts(allocator: Allocator, values: anytype, out: *ColumnStore, row_count: usize, comptime part: anytype) !void {
+    const dst = try out.data.int.addManyAsSlice(allocator, row_count);
+    for (dst, values[0..row_count]) |*d, v| d.* = part(v);
+}
+
+fn yearOfDays(days: i32) i32 {
+    return daysToYmd(days).year;
+}
+
+fn monthOfDays(days: i32) i32 {
+    return daysToYmd(days).month;
+}
+
+fn dayOfDays(days: i32) i32 {
+    return daysToYmd(days).day;
+}
+
+fn yearOfMicros(micros: i64) i32 {
+    return yearOfDays(daysFromDatetime(micros));
+}
+
+fn monthOfMicros(micros: i64) i32 {
+    return monthOfDays(daysFromDatetime(micros));
+}
+
+fn dayOfMicros(micros: i64) i32 {
+    return dayOfDays(daysFromDatetime(micros));
+}
+
+// A day is a whole number of hours, minutes and seconds, so flooring by the
+// unit and wrapping by its count per larger unit yields the time-of-day part
+// before the epoch too, with one division instead of two.
+fn hourOfMicros(micros: i64) i32 {
+    return @intCast(@mod(@divFloor(micros, std.time.us_per_hour), 24));
+}
+
+fn minuteOfMicros(micros: i64) i32 {
+    return @intCast(@mod(@divFloor(micros, std.time.us_per_min), 60));
+}
+
+fn secondOfMicros(micros: i64) i32 {
+    return @intCast(@mod(@divFloor(micros, std.time.us_per_s), 60));
+}
+
 pub fn yearFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.date;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(s[i]).year);
-    }
+    try extractInts(allocator, args[0].data.date, out, row_count, yearOfDays);
 }
 
 pub fn yearFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).year);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, yearOfMicros);
 }
 
 pub fn monthFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.date;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(s[i]).month);
-    }
+    try extractInts(allocator, args[0].data.date, out, row_count, monthOfDays);
 }
 
 pub fn monthFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).month);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, monthOfMicros);
 }
 
 pub fn dayFromDateKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.date;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(s[i]).day);
-    }
+    try extractInts(allocator, args[0].data.date, out, row_count, dayOfDays);
 }
 
 pub fn dayFromDatetimeKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, daysToYmd(daysFromDatetime(s[i])).day);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, dayOfMicros);
 }
 
 pub fn hourKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, microsToHms(s[i]).hour);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, hourOfMicros);
 }
 
 pub fn minuteKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, microsToHms(s[i]).minute);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, minuteOfMicros);
 }
 
 pub fn secondKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
-    const s = args[0].data.datetime;
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, microsToHms(s[i]).second);
-    }
+    try extractInts(allocator, args[0].data.datetime, out, row_count, secondOfMicros);
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,4 +1447,32 @@ test "periods and day numbers follow MySQL, and year 0 StarRocks" {
         try t.expectEqual(@as(?i64, c[3]), dayNumber(common.ymdToDays(c[0], c[1], c[2])));
     }
     try t.expectEqual(@as(?i64, null), dayNumber(common.ymdToDays(-1, 12, 31)));
+}
+
+test "hour, minute and second match the time of day before the epoch and at the i64 extremes" {
+    const us_per_day = std.time.us_per_day;
+    const edges = [_]i64{
+        0,                       1,                    -1,
+        us_per_day - 1,          us_per_day,           -us_per_day,
+        -us_per_day + 1,         59_999_999,           -60_000_001,
+        3_599_999_999,           -3_600_000_000,       1_372_031_447_123_456,
+        -62_135_596_800_000_000, std.math.maxInt(i64), std.math.minInt(i64),
+    };
+    for (edges) |micros| {
+        const hms = common.microsToHms(micros);
+        try std.testing.expectEqual(@as(i32, hms.hour), hourOfMicros(micros));
+        try std.testing.expectEqual(@as(i32, hms.minute), minuteOfMicros(micros));
+        try std.testing.expectEqual(@as(i32, hms.second), secondOfMicros(micros));
+    }
+    var x: u64 = 0x9E3779B97F4A7C15;
+    for (0..10_000) |_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        const micros: i64 = @bitCast(x);
+        const hms = common.microsToHms(micros);
+        try std.testing.expectEqual(@as(i32, hms.hour), hourOfMicros(micros));
+        try std.testing.expectEqual(@as(i32, hms.minute), minuteOfMicros(micros));
+        try std.testing.expectEqual(@as(i32, hms.second), secondOfMicros(micros));
+    }
 }
