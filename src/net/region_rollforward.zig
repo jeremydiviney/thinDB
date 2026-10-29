@@ -316,7 +316,7 @@ const Cache = struct {
     max_retained_bytes: usize,
     /// The idle programs' buffers, as the shared pool sees them: registered
     /// with `shared` so they give way when live queries need the budget.
-    idle: exec.memory.IdleSource = .{ .idle_bytes_fn = idleBytesErased, .reclaim_fn = reclaimErased },
+    idle: exec.memory.IdleSource = .{ .kind = .region_program, .idle_bytes_fn = idleBytesErased, .reclaim_fn = reclaimErased },
     shared: ?*exec.memory.MemoryPool = null,
     /// In-flight background ctx destroys (eviction/invalidation) — a big
     /// pool frees seconds of allocator work, which must never sit on the

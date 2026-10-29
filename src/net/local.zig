@@ -1197,8 +1197,8 @@ pub const CompileCtx = struct {
     /// (budget 0, no pool).
     pub fn queryAccountant(self: *CompileCtx) !?*exec.memory.MemoryAccountant {
         if (self.accountant) |a| return a;
-        const budget = thindb_api.autoQueryBudgetBytes(self.catalog.config.query_memory_budget);
         const pool = self.catalog.config.memory_pool;
+        const budget = thindb_api.autoQueryBudgetBytes(self.catalog.config.query_memory_budget, pool != null);
         if (budget == 0 and pool == null and self.cancel_flag == null) return null;
         const snapshots = try self.catalog.allocator.create(exec.Scan.StatementSnapshots);
         errdefer self.catalog.allocator.destroy(snapshots);
