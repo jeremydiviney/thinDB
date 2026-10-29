@@ -2449,3 +2449,106 @@ test "V2 octet_length reads string lengths without the bytes" {
         }
     }
 }
+
+test "V2 group-topN: a string-derived key evaluates once per distinct input and folds repeats by count" {
+    // 259 pages of 37 domains (v and f follow the page) repeat throughout each
+    // row group, so its batches collapse to their distinct rows; one row in
+    // eleven is a one-off domain the HAVING drops. `uniq` never repeats, so
+    // its batches don't collapse. A quarter of the rows stay in the memtable.
+    const a = std.testing.allocator;
+    const n = 40_000;
+    const Row = struct { id: i64, url: []const u8, uniq: []const u8, v: i32, f: f64 };
+    const Expected = struct { count: i64 = 0, len_sum: i64 = 0, v_sum: i64 = 0, f_sum: f64 = 0, min_url: []const u8 = "" };
+    const rows = try a.alloc(Row, n);
+    defer a.free(rows);
+    const text = try a.alloc(u8, n * 64);
+    defer a.free(text);
+    var expected: std.StringHashMapUnmanaged(Expected) = .empty;
+    defer expected.deinit(a);
+    var uniq_len_sum: i64 = 0;
+    for (rows, 0..) |*row, i| {
+        const buf = text[i * 64 ..][0..64];
+        var url: []const u8 = "";
+        var host: []const u8 = "";
+        if (i % 11 == 0) {
+            url = try std.fmt.bufPrint(buf[0..32], "https://x{d}.org/q", .{i});
+            host = url[8 .. url.len - 2];
+        } else if (i % 97 != 0) {
+            url = try std.fmt.bufPrint(buf[0..32], "http://www.d{d}.com/p{d}", .{ i % 37, (i / 37) % 7 });
+            host = url[11..std.mem.indexOfScalarPos(u8, url, 11, '/').?];
+        }
+        const uniq = try std.fmt.bufPrint(buf[32..], "https://z.net/{d}", .{i});
+        row.* = .{
+            .id = @intCast(i),
+            .url = url,
+            .uniq = uniq,
+            .v = @intCast((i % 37) % 3),
+            .f = @as(f64, @floatFromInt((i / 37) % 7)) * 0.5,
+        };
+        uniq_len_sum += @intCast(uniq.len);
+        if (url.len == 0) continue;
+        const e = try expected.getOrPut(a, host);
+        if (!e.found_existing) e.value_ptr.* = .{ .min_url = url };
+        e.value_ptr.count += 1;
+        e.value_ptr.len_sum += @intCast(url.len);
+        e.value_ptr.v_sum += row.v;
+        e.value_ptr.f_sum += row.f;
+        if (std.mem.order(u8, url, e.value_ptr.min_url) == .lt) e.value_ptr.min_url = url;
+    }
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("hits", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string }, .{ .name = "uniq", .type = .string },
+                .{ .name = "v", .type = .int },     .{ .name = "f", .type = .double },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 4096 });
+        try table.insert(rows[0 .. n / 4 * 3]);
+        try table.flush();
+        try table.insert(rows[n / 4 * 3 ..]);
+
+        const sql = "SELECT REGEXP_REPLACE(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(url)) AS l, COUNT(*) AS c, " ++
+            "MIN(url), SUM(v), SUM(f) FROM hits WHERE url <> '' GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 100";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+        try expectPlanRunsGroupTopN(a, db, sql);
+        var q = try runSql(a, db, sql);
+        defer q.deinit();
+        var seen: usize = 0;
+        var prev_l: f64 = std.math.inf(f64);
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const e = expected.get(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult;
+                const l = (try cellNumber(batch.values[1], r)).?;
+                try std.testing.expect(l <= prev_l);
+                prev_l = l;
+                try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(e.len_sum)) / @as(f64, @floatFromInt(e.count)), l, 1e-12);
+                try std.testing.expectEqual(e.count, batch.values[2].data.bigint[r]);
+                try std.testing.expectEqualStrings(e.min_url, batch.values[3].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(e.v_sum)), try cellNumber(batch.values[4], r));
+                try std.testing.expectEqual(@as(?f64, e.f_sum), try cellNumber(batch.values[5], r));
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 37), seen);
+
+        const uniq_sql = "SELECT REGEXP_REPLACE(uniq, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*), SUM(length(uniq)), MIN(uniq) FROM hits GROUP BY k ORDER BY 2 DESC LIMIT 5";
+        var uq = try runSql(a, db, uniq_sql);
+        defer uq.deinit();
+        var uniq_rows: usize = 0;
+        while (try uq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqualStrings("z.net", batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, n), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(uniq_len_sum)), try cellNumber(batch.values[2], r));
+                try std.testing.expectEqualStrings("https://z.net/0", batch.values[3].data.string.rowBytes(r));
+                uniq_rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), uniq_rows);
+    }
+}

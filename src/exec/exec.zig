@@ -1852,4 +1852,5 @@ test {
     _ = @import("partitioned_distinct.zig");
     _ = @import("concurrent_int_table.zig");
     _ = @import("expand.zig");
+    _ = @import("batch_distinct.zig");
 }
