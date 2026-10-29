@@ -9,7 +9,6 @@ test "memory: SQL budgets cover wide sort and V2 group output allocations" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db = try thindb.Database.open(a, io, tmp.dir, .{
-        .query_memory_budget = 16 * 1024,
         .memory_budget = 16 * 1024,
         .auto_flush_secs = 0,
         .row_group_size = 64,
@@ -1811,7 +1810,7 @@ test "V2 grouped string COUNT(DISTINCT) stays inside the query budget and leaks 
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-            .query_memory_budget = budget,
+            .memory_budget = budget,
             .auto_flush_secs = 0,
             .max_dop = 4,
         });
@@ -2092,7 +2091,6 @@ fn lowcardPeak(allocator: std.mem.Allocator, batch_rows: usize) !usize {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = 1,

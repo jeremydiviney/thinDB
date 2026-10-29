@@ -360,7 +360,7 @@ pub fn inputNeeds(
     sampled: ?u64,
 ) ?PlanNeeds {
     const schema = upstream.outputSchema();
-    const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.budget else null);
+    const round = partitioned_aggregate.roundBytes(if (upstream.accountant()) |a| a.pool.statementLimit() else null);
     const realized = exec.queryAs(RealizedInput, upstream.*) orelse {
         const needs = planNeeds(st, schema, group_cols, aggs, emit_limit, SCAN_BATCH_ROWS, partitions, round, sampled) orelse return null;
         return needs.buffering(bufferedBytes(st, schema));
@@ -1956,7 +1956,8 @@ const RadixRun = struct {
 /// COUNT, SUM and MAX by key over `keys`/`values` with radix sized as the
 /// router sizes it.
 fn testRadixRun(a: Allocator, keys: []const i64, values: []const i64, batch_rows: usize, ndv: ?u32, upper_rows: u64) !RadixRun {
-    const account = try testAccountant(a, 1 << 40);
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
+    const account = try testAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     var src = TestIntSource{
         .keys = keys,
@@ -2089,9 +2090,9 @@ const TestDrained = struct {
     }
 };
 
-fn testAccountant(a: Allocator, budget: usize) !*exec.memory.MemoryAccountant {
+fn testAccountant(a: Allocator, pool: *exec.memory.MemoryPool) !*exec.memory.MemoryAccountant {
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(budget, null);
+    account.* = exec.memory.MemoryAccountant.init(pool);
     account.trackAllocations(a);
     return account;
 }
@@ -2139,7 +2140,8 @@ fn testFreeLines(a: Allocator, lines: [][]u8) void {
 
 test "RealizedInput replays owned chunks with exact stats and frees each once passed" {
     const a = std.testing.allocator;
-    const account = try testAccountant(a, 1 << 40);
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
+    const account = try testAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const owned = try testOwnedChunks(try account.wrapAllocator(a), &.{ 1000, 2000, 3000 });
     const held = account.current_bytes;
@@ -2188,7 +2190,8 @@ const RoutedRun = struct {
 /// chosen plan to completion; `blind` runs the partitioned plan the
 /// budget-blind route picks instead.
 fn testRouteRealized(a: Allocator, budget: usize, partition_dop: usize, blind: bool) !RoutedRun {
-    const account = try testAccountant(a, budget);
+    var memory_pool = exec.memory.MemoryPool.init(budget);
+    const account = try testAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     const worker = try account.wrapAllocator(a);
@@ -2322,7 +2325,9 @@ test "a proven cache-resident key space takes the hash plan, not the partitioned
     defer testFreeLines(a, unknown.lines);
     try std.testing.expectEqual(RoutedPlan.partitioned, unknown.plan);
 
-    const account = try testAccountant(a, 1 << 40);
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
+
+    const account = try testAccountant(a, &memory_pool);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
     const worker = try account.wrapAllocator(a);

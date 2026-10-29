@@ -156,8 +156,8 @@ pub const Error = error{
     /// or .exclude() before the join.
     JoinColumnNameCollision,
     /// A blocking operator (Sort, Aggregate, Join build, SMJ, NLJ)
-    /// would exceed `Config.query_memory_budget` if it kept
-    /// materializing. Aborts mid-build with a clear error rather
+    /// would exceed what `Config.memory_budget` leaves queries if it
+    /// kept materializing. Aborts mid-build with a clear error rather
     /// than letting the underlying allocator OOM the process.
     MemoryBudgetExceeded,
     /// Window operator: shape unsupported in the current implementation
@@ -974,9 +974,9 @@ pub const Query = struct {
         return self.vtable.stats(self.ptr);
     }
 
-    /// Per-query memory accountant. Set up by the bottom-most Scan
-    /// when Table.query_memory_budget > 0. Combinators upstream
-    /// inherit by calling this method on their input.
+    /// Per-query memory accountant. Set up by the bottom-most Scan on
+    /// the table's memory pool. Combinators upstream inherit by calling
+    /// this method on their input.
     fn operatorAllocator(self: Query) !Allocator {
         return memory.executionAllocator(self.allocator, self.accountant());
     }

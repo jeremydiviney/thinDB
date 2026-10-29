@@ -557,7 +557,7 @@ fn runInSubquery(ctx: *CompileCtx, source_opaque: *const anyopaque) !DrainedSet 
         var i: usize = 0;
         while (i < batch.row_count) : (i += 1) {
             if (!view.isValid(i)) continue;
-            if (acct) |a| try a.reserve(.subquery, per_value);
+            try acct.reserve(.subquery, per_value);
             try out.append(aa, try extractKeyValueAt(aa, view, schema[0].type, i));
         }
     }
@@ -625,7 +625,7 @@ fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize, keys_from: ?usize) !D
         for (0..batch.row_count) |i| {
             if (keys_from) |from| keyed: {
                 for (batch.values[from..width]) |view| if (!view.isValid(i)) break :keyed;
-                if (acct) |a| try a.reserve(.subquery, (width - from) * (@sizeOf(Value) + 32));
+                try acct.reserve(.subquery, (width - from) * (@sizeOf(Value) + 32));
                 const key = try aa.alloc(Value, width - from);
                 for (key, batch.values[from..width], schema[from..width]) |*v, view, column| {
                     v.* = try extractKeyValueAt(aa, view, column.type, i);
@@ -636,7 +636,7 @@ fn drainTuples(ctx: *CompileCtx, q: anytype, width: usize, keys_from: ?usize) !D
                 if (!view.isValid(i)) break true;
             } else false;
             if (any_null) continue;
-            if (acct) |a| try a.reserve(.subquery, per_tuple);
+            try acct.reserve(.subquery, per_tuple);
             const tuple = try aa.alloc(Value, width);
             for (tuple, batch.values[0..width], schema[0..width]) |*v, view, column| {
                 v.* = try extractKeyValueAt(aa, view, column.type, i);

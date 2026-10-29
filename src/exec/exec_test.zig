@@ -1324,7 +1324,8 @@ test "parallel scan: the next pull frees the materialized buffer the consumer wa
         // Reserved accounting: the `.materialize` reservation steps down with
         // each pull and reaches zero at the end of the stream.
         {
-            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var acct_pool = exec.memory.MemoryPool.init(64 << 20);
+            var acct = exec.memory.MemoryAccountant.init(&acct_pool);
             var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
             var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
             defer q.deinit();
@@ -1344,7 +1345,8 @@ test "parallel scan: the next pull frees the materialized buffer the consumer wa
         }
         // A consumer that stops early (LIMIT) leaves the rest to deinit.
         {
-            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var acct_pool = exec.memory.MemoryPool.init(64 << 20);
+            var acct = exec.memory.MemoryAccountant.init(&acct_pool);
             {
                 var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
                 var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 150 }));
@@ -1419,7 +1421,8 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
         defer one_wave.deinit(allocator);
         var one_wave_charge: usize = 0;
         {
-            var acct = exec.memory.MemoryAccountant.init(64 << 20);
+            var acct_pool = exec.memory.MemoryPool.init(64 << 20);
+            var acct = exec.memory.MemoryAccountant.init(&acct_pool);
             var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
             const ps = exec.queryAs(exec.ParallelScan, base).?;
             var q = try base.filter(leafExpr("id", .gte, .{ .bigint = 50 }));
@@ -1438,7 +1441,8 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
 
         var waves: std.ArrayList(i64) = .empty;
         defer waves.deinit(allocator);
-        var acct = exec.memory.MemoryAccountant.init(64 << 20);
+        var acct_pool = exec.memory.MemoryPool.init(64 << 20);
+        var acct = exec.memory.MemoryAccountant.init(&acct_pool);
         var base = try exec.ParallelScan.create(allocator, t, &acct, null, dop);
         const ps = exec.queryAs(exec.ParallelScan, base).?;
         // Any chunk with a survivor ends its worker's wave.
@@ -1830,8 +1834,9 @@ test "window: an instance built on a retained allocator leaves the building quer
 
     var retained = memory.BudgetAllocator.init(allocator);
     const pool_alloc = retained.allocator();
+    var memory_pool = memory.MemoryPool.init(1 << 20);
     const account = try allocator.create(memory.MemoryAccountant);
-    account.* = memory.MemoryAccountant.init(1 << 20);
+    account.* = memory.MemoryAccountant.init(&memory_pool);
     account.trackAllocations(allocator);
     var released = false;
     defer if (!released) account.releaseOwner(allocator);
@@ -3158,7 +3163,8 @@ test "topn: one oversized batch holds only the rows it can emit (issue #395)" {
         std.sort.pdq(usize, order, Reference{ .keys = keys, .valid = valid, .desc = desc }, Reference.lessThan);
 
         // Room for the kept rows only, far short of the batch.
-        var acct = exec.memory.MemoryAccountant.init(2 * (limit + offset) * row_bytes);
+        var acct_pool = exec.memory.MemoryPool.init(2 * (limit + offset) * row_bytes);
+        var acct = exec.memory.MemoryAccountant.init(&acct_pool);
         var source = try SingleBatchSource.create(allocator, .{ .schema = &schema, .values = &views, .row_count = n });
         source.resources = &acct;
         var q = try source.topN(&.{ .{ .col = "k", .desc = desc }, .{ .col = "id", .desc = false } }, limit, offset);
@@ -3669,7 +3675,9 @@ test "fused filter: long and mixed IN lists fold into one set lookup per column 
         const file_name = try api.Table.segmentFileName(&name_buf, seg_id);
         var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
         defer seg.deinit();
-        var cache = storage.cache.Cache.init(allocator, 1 << 22);
+        var controller = exec.memory.MemoryPool.init(1 << 22);
+        var cache = storage.cache.Cache.init(allocator, &controller, 0);
+        controller.shareCache(&cache, controller.budget);
         defer cache.deinit();
         const tc = storage.cache.TableCache{ .cache = &cache, .table_uid = 0 };
         const want = [_]storage.format.Encoding{ .for_, .rle, .dict, .fsst, .raw };
@@ -5446,7 +5454,7 @@ fn openMemoTable(allocator: std.mem.Allocator, dir: std.Io.Dir, predicate_memo: 
         .order_key = &.{"k"},
         .unique = false,
     };
-    const db = try api.Database.open(allocator, std.testing.io, dir, .{ .row_group_size = 4, .predicate_memo = predicate_memo });
+    const db = try api.Database.open(allocator, std.testing.io, dir, .{ .row_group_size = 4, .predicate_memo_bytes = if (predicate_memo) null else 0 });
     errdefer db.close();
     const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .row_group_size = 4 });
     var rows: [40]MemoRow = undefined;

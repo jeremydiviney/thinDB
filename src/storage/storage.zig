@@ -6,6 +6,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
+const memory = @import("../memory.zig");
 const TableSchema = types.TableSchema;
 
 pub const format = @import("format.zig");
@@ -333,7 +334,12 @@ test "lz4 string blocks: large raw block is cached decompressed and borrowed in 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
     defer seg.deinit();
 
-    var c = cache.Cache.init(allocator, 1 << 24);
+    var controller = memory.MemoryPool.init(1 << 24);
+
+    var c = cache.Cache.init(allocator, &controller, 0);
+
+    controller.shareCache(&c, controller.budget);
+
     defer c.deinit();
 
     // Borrow through the cache: the block is decompressed once at fill and
@@ -608,7 +614,12 @@ test "borrowed view matches owned decode byte-for-byte (fixed + string)" {
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
     defer seg.deinit();
 
-    var c = cache.Cache.init(allocator, 1 << 20);
+    var controller = memory.MemoryPool.init(1 << 20);
+
+    var c = cache.Cache.init(allocator, &controller, 0);
+
+    controller.shareCache(&c, controller.budget);
+
     defer c.deinit();
 
     const rg_count = seg.info.row_groups[0].row_count;
@@ -802,7 +813,9 @@ fn buildSeqStringCol(a: Allocator, n: usize) !DictCols {
 }
 
 fn blockEncodingOf(allocator: Allocator, seg: *ReadSegment, rg_idx: usize, col_idx: usize) !format.Encoding {
-    var c = cache.Cache.init(allocator, 1 << 20);
+    var controller = memory.MemoryPool.init(1 << 20);
+    var c = cache.Cache.init(allocator, &controller, 0);
+    controller.shareCache(&c, controller.budget);
     defer c.deinit();
     var block = try seg.borrowColumnBlock(allocator, rg_idx, col_idx, .{ .cache = &c, .table_uid = 0 });
     defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
@@ -1029,7 +1042,12 @@ test "dict block stores a lexicographically sorted dictionary" {
     var seg = try readSegment(allocator, io, tmp.dir, "sorted.dat", schema);
     defer seg.deinit();
 
-    var c = cache.Cache.init(allocator, 1 << 20);
+    var controller = memory.MemoryPool.init(1 << 20);
+
+    var c = cache.Cache.init(allocator, &controller, 0);
+
+    controller.shareCache(&c, controller.budget);
+
     defer c.deinit();
     var block = try seg.borrowColumnBlock(allocator, 0, 0, .{ .cache = &c, .table_uid = 0 });
     defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
@@ -1119,7 +1137,12 @@ test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode 
     try std.testing.expectEqual(format.Encoding.dict, try blockEncodingOf(allocator, &seg, 0, 2));
     try std.testing.expectEqual(format.Encoding.fsst, try blockEncodingOf(allocator, &seg, 0, 3));
 
-    var c = cache.Cache.init(allocator, 1 << 24);
+    var controller = memory.MemoryPool.init(1 << 24);
+
+    var c = cache.Cache.init(allocator, &controller, 0);
+
+    controller.shareCache(&c, controller.budget);
+
     defer c.deinit();
     const tc = cache.TableCache{ .cache = &c, .table_uid = 0 };
 

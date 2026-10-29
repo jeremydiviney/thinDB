@@ -438,8 +438,9 @@ const ImprovingShape = enum { grouped, single, sorted };
 /// checks every group's result is its last row's, and returns the
 /// aggregate's accounted peak.
 fn improvingPeak(a: std.mem.Allocator, rows: usize, shape: ImprovingShape) !usize {
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(1 << 40, null);
+    account.* = exec.memory.MemoryAccountant.init(&memory_pool);
     account.trackAllocations(a);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();
@@ -689,8 +690,9 @@ const WideBatchSource = struct {
 /// `keys`; checks every group's COUNT(*) and SUM(v) and returns the
 /// aggregate's accounted peak.
 fn wideBatchPeak(a: std.mem.Allocator, rows: usize, groups: usize, keys: []const []const u8) !usize {
+    var memory_pool = exec.memory.MemoryPool.init(1 << 40);
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(1 << 40, null);
+    account.* = exec.memory.MemoryAccountant.init(&memory_pool);
     account.trackAllocations(a);
     defer account.releaseOwner(a);
     const tracked = try account.executionAllocator();

@@ -2400,7 +2400,7 @@ test "memory: sort over tight budget errors with MemoryBudgetExceeded" {
     defer tmp.cleanup();
 
     var db = try thindb.Database.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 4096,
+        .memory_budget = 4096,
         .auto_flush_rows = std.math.maxInt(u64),
         .auto_flush_bytes = std.math.maxInt(usize),
         .auto_flush_secs = 0,

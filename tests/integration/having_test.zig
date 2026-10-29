@@ -238,7 +238,6 @@ test "HAVING: repeating a SELECT aggregate keeps no second state per group" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{
-        .query_memory_budget = 1 << 30,
         .memory_budget = 1 << 30,
         .auto_flush_secs = 0,
         .max_dop = 1,

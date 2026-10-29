@@ -361,7 +361,7 @@ test "session var: a large array variable is read once by a call, not copied to 
     defer tmp.cleanup();
     // Copied to each of the 5,000 rows, a 100,000-element array is gigabytes,
     // far past the budget.
-    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .query_memory_budget = 64 << 20 });
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .memory_budget = 64 << 20 });
     defer db.close();
     try exec(allocator, db, "CREATE TABLE big (id INT, s VARCHAR(16))");
     try exec(allocator, db, "INSERT INTO big SELECT generate_series, concat('v', generate_series) FROM TABLE(generate_series(1, 5000))");

@@ -2347,18 +2347,20 @@ test "string MIN keeps one copy per group however many rows improve it" {
     }
 }
 
-test "string pipeline memory: recycle allowance leaves room in query and shared budgets" {
-    var pool = thindb.exec.memory.MemoryPool.init(64 * 1024 * 1024);
-    var resources = thindb.exec.memory.MemoryAccountant.initWithPool(32 * 1024 * 1024, &pool);
+test "string pipeline memory: recycle allowance leaves room in the memory budget" {
+    var small = thindb.exec.memory.MemoryPool.init(32 * 1024 * 1024);
+    var resources = thindb.exec.memory.MemoryAccountant.init(&small);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), stringRecycleLimit(&resources));
-    resources.budget = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), stringRecycleLimit(&resources));
+    var large = thindb.exec.memory.MemoryPool.init(64 * 1024 * 1024 * 1024);
+    resources = thindb.exec.memory.MemoryAccountant.init(&large);
+    try std.testing.expectEqual(MAX_STRING_RECYCLE_BYTES, stringRecycleLimit(&resources));
     try std.testing.expectEqual(MAX_STRING_RECYCLE_BYTES, stringRecycleLimit(null));
 }
 
 fn string_stage_failure_fixture(allocator: Allocator, cancelled: bool) !void {
     var cancel = std.atomic.Value(bool).init(cancelled);
-    var resources = thindb.exec.memory.MemoryAccountant.init(1024 * 1024);
+    var memory_pool = thindb.exec.memory.MemoryPool.init(1024 * 1024);
+    var resources = thindb.exec.memory.MemoryAccountant.init(&memory_pool);
     resources.cancel_flag = &cancel;
     var shared = PipeShared{
         .allocator = allocator,
@@ -3068,7 +3070,7 @@ test "heavy teardown stops charging the query before its memory is back" {
     defer gate.deinit();
     var pool = memory.MemoryPool.init(64 << 20);
     const account = try a.create(memory.MemoryAccountant);
-    account.* = memory.MemoryAccountant.initWithPool(64 << 20, &pool);
+    account.* = memory.MemoryAccountant.init(&pool);
     account.trackAllocations(a);
     try account.retainGate(&gate);
     const allocator = try account.executionAllocator();
@@ -3121,10 +3123,7 @@ fn rowBufferBytes(rows: anytype) usize {
 
 fn stringRecycleLimit(resources: ?*const thindb.exec.memory.MemoryAccountant) usize {
     var limit = MAX_STRING_RECYCLE_BYTES;
-    if (resources) |a| {
-        limit = @min(limit, a.budget / 8);
-        if (a.pool) |pool| limit = @min(limit, pool.budget / 8);
-    }
+    if (resources) |a| limit = @min(limit, a.pool.budget / 8);
     return limit;
 }
 

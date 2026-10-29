@@ -7,14 +7,13 @@
 //! the cache is ever held compressed. A cache hit still pays a cheap decode
 //! step but skips the block decompress.
 //!
-//! Bounded by total cached bytes: `capacity_bytes`, or, when the cache shares
-//! a memory controller's budget (`MemoryPool.shareCache`), what that budget
-//! leaves after statements and idle memory, never under the controller's
-//! floor or over `capacity_bytes` (`MemoryPool.cacheTarget`). A shared
-//! cache also gives memory back when the controller asks (`reclaim`). The
-//! cache does NOT assume the dataset fits in memory: when over budget it
-//! evicts unpinned LRU entries, and if every entry down to budget is currently
-//! pinned it temporarily exceeds capacity rather than free a block someone is
+//! Lives under the memory controller's one budget (`memory.MemoryPool`):
+//! the cache holds what that budget leaves after statements and idle memory,
+//! never under the controller's floor (`MemoryPool.cacheTarget`), and gives
+//! memory back when the controller asks (`reclaim`). The cache does NOT
+//! assume the dataset fits in memory: when over budget it evicts unpinned LRU
+//! entries, and if every entry down to budget is currently pinned it
+//! temporarily exceeds its target rather than free a block someone is
 //! reading.
 //!
 //! ## Concurrency
@@ -98,26 +97,24 @@ const SpinLock = struct {
 /// generation, so a key never goes stale; it is only dead weight once its
 /// segment retires. The slots are 4-way set-associative and allocated on the
 /// first insert: a full set overwrites one of its ways, so the memo never
-/// grows and dead keys age out. 0 marks a free slot, so keys are never 0.
+/// grows past its size and dead keys age out. 0 marks a free slot, so keys
+/// are never 0.
 pub const PredicateMemo = struct {
     allocator: Allocator,
     slot_count: usize,
     slots: std.atomic.Value(?[*]u128) = .init(null),
     alloc_lock: SpinLock = .{},
     stripes: [STRIPES]SpinLock = @splat(.{}),
-    /// Off, inserts drop, so lookups never hit (`Config.predicate_memo`).
-    enabled: bool = true,
 
     const WAYS = 4;
     const STRIPES = 64;
-    /// The memo takes 1/BUDGET_SHARE of the cache budget.
-    const BUDGET_SHARE = 1024;
     const MIN_SLOTS = 64 * WAYS;
 
-    /// No slots when the budget's share is under `MIN_SLOTS` (caches under
-    /// 4 MiB): too few to be worth a lookup per row group.
-    fn init(allocator: Allocator, capacity_bytes: usize) PredicateMemo {
-        const want = capacity_bytes / BUDGET_SHARE / @sizeOf(u128);
+    /// The most slots `max_bytes` holds, a power of two; none (the memo is
+    /// off) when that is under `MIN_SLOTS`: too few to be worth a lookup
+    /// per row group.
+    fn init(allocator: Allocator, max_bytes: usize) PredicateMemo {
+        const want = max_bytes / @sizeOf(u128);
         return .{ .allocator = allocator, .slot_count = if (want < MIN_SLOTS) 0 else std.math.floorPowerOfTwo(usize, want) };
     }
 
@@ -141,7 +138,7 @@ pub const PredicateMemo = struct {
 
     /// Best effort: a memo that cannot allocate its slots stays empty.
     pub fn insert(self: *PredicateMemo, key: u128) void {
-        if (!self.enabled or self.slot_count == 0) return;
+        if (self.slot_count == 0) return;
         const slots = self.slots.load(.acquire) orelse self.allocateSlots() orelse return;
         const k = nonZero(key);
         const set = self.setOf(k);
@@ -209,19 +206,15 @@ pub const Cache = struct {
     /// blocks pass straight through to `allocator`, so the cache's unit tests
     /// (tiny payloads) behave exactly as before.
     pool: huge_page.Pool,
-    /// The most bytes of blocks the cache holds: its budget, or the ceiling
-    /// over a shared budget's `cacheTarget`.
-    capacity_bytes: usize,
+    /// The memory controller whose budget the cache lives under.
+    controller: *memory.MemoryPool,
     /// Bytes of the blocks held, each counted at its cell size. Written under
     /// `mutex`; `footprint` reads it without.
     current_bytes: usize = 0,
     /// The part of `current_bytes` the pool's arena holds; the rest came from
     /// its backing allocator. Written under `mutex`.
     arena_bytes: usize = 0,
-    /// The memory controller whose budget the cache shares, null when
-    /// `capacity_bytes` is its budget. Set by `MemoryPool.shareCache`.
-    shared: ?*memory.MemoryPool = null,
-    /// Bytes inserted since the cache last balanced its shared budget.
+    /// Bytes inserted since the cache last balanced the controller's budget.
     /// Guarded by `mutex`.
     unbalanced_bytes: usize = 0,
     /// Bytes of the scratch buffers, pooled or checked out.
@@ -251,7 +244,7 @@ pub const Cache = struct {
     evictions: u64 = 0,
 
     /// Row groups a scan predicate matched no stored row of. Its slots are
-    /// carved out of `capacity_bytes`.
+    /// charged to the controller's budget whole.
     predicate_memo: PredicateMemo,
 
     /// 32 ≈ max-dop workers × a few concurrently-expanded string columns; the
@@ -273,13 +266,16 @@ pub const Cache = struct {
         encoding: format.Encoding = .raw,
     };
 
-    pub fn init(allocator: Allocator, capacity_bytes: usize) Cache {
-        const memo = PredicateMemo.init(allocator, capacity_bytes);
-        const block_bytes = capacity_bytes - memo.slotBytes();
+    /// A cache under `controller`'s budget, with a predicate memo of at most
+    /// `memo_bytes` (0: none). It grows within the budget once the
+    /// controller shares it (`MemoryPool.shareCache`), which also keeps its
+    /// floor and charges its memo.
+    pub fn init(allocator: Allocator, controller: *memory.MemoryPool, memo_bytes: usize) Cache {
+        const memo = PredicateMemo.init(allocator, memo_bytes);
         return .{
             .allocator = allocator,
-            .pool = huge_page.Pool.init(allocator, block_bytes),
-            .capacity_bytes = block_bytes,
+            .pool = huge_page.Pool.init(allocator, controller.budget -| memo.slotBytes()),
+            .controller = controller,
             .predicate_memo = memo,
         };
     }
@@ -292,7 +288,7 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
-        if (self.shared) |pool| pool.unshareCache(self);
+        self.controller.unshareCache(self);
         _ = g_cache_bytes.fetchSub(self.current_bytes, .monotonic);
         const block_alloc = self.pool.allocator();
         var cur = self.head;
@@ -393,16 +389,16 @@ pub const Cache = struct {
     /// for the caller to free. Caller MUST `release`.
     pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
         const inserted = try self.insertPinnedLocked(key, bytes, encoding);
-        if (inserted.balance) |pool| pool.balance();
+        if (inserted.balance) self.controller.balance();
         return inserted.entry;
     }
 
     const Inserted = struct {
         entry: *Entry,
-        /// The shared budget, when the cache grew a step since it last
-        /// balanced; balanced once `mutex` is free, since a balance may
+        /// The cache grew a step since it last balanced the controller's
+        /// budget; balanced once `mutex` is free, since a balance may
         /// reclaim from this cache.
-        balance: ?*memory.MemoryPool = null,
+        balance: bool = false,
     };
 
     fn insertPinnedLocked(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !Inserted {
@@ -436,18 +432,11 @@ pub const Cache = struct {
         // `miss_bytes` stays logical — it measures bytes decompressed per miss.
         const resident = self.countBlock(bytes, true);
         _ = g_miss_bytes.fetchAdd(bytes.len, .monotonic);
-        self.evictUnpinned(self.capacity(), 0);
-        const pool = self.shared orelse return .{ .entry = entry };
+        self.evictUnpinned(self.controller.cacheTarget(), 0);
         self.unbalanced_bytes += resident;
-        if (self.unbalanced_bytes < pool.balanceStep()) return .{ .entry = entry };
+        if (self.unbalanced_bytes < self.controller.balanceStep()) return .{ .entry = entry };
         self.unbalanced_bytes = 0;
-        return .{ .entry = entry, .balance = pool };
-    }
-
-    /// The bytes of blocks the cache may hold now. Caller holds `mutex`.
-    fn capacity(self: *Cache) usize {
-        const pool = self.shared orelse return self.capacity_bytes;
-        return pool.cacheTarget(self.capacity_bytes);
+        return .{ .entry = entry, .balance = true };
     }
 
     /// Adds a block's cell to the byte counts, or takes it off them, and
@@ -467,8 +456,9 @@ pub const Cache = struct {
         return cell;
     }
 
-    /// Bytes the cache holds against a shared budget: the arena's committed
-    /// pages, the blocks from outside the arena and the scratch buffers.
+    /// Bytes the cache holds against the controller's budget: the arena's
+    /// committed pages, the blocks from outside the arena and the scratch
+    /// buffers.
     pub fn footprint(self: *const Cache) usize {
         const outside = @atomicLoad(usize, &self.current_bytes, .monotonic) -| @atomicLoad(usize, &self.arena_bytes, .monotonic);
         return self.pool.committedBytes() +| outside +| self.scratch_bytes.load(.monotonic);
@@ -476,8 +466,8 @@ pub const Cache = struct {
 
     /// What the cache holds beyond its blocks' cells and its free pages: the
     /// unused cells of the arena's regions, and the scratch buffers. Evicting
-    /// a block leaves its cell unused until its region empties, so a shared
-    /// cache counts this apart from its blocks or it would evict to cover it.
+    /// a block leaves its cell unused until its region empties, so the cache
+    /// counts this apart from its blocks or it would evict to cover it.
     pub fn overhead(self: *const Cache) usize {
         return self.pool.carvedBytes() -| @atomicLoad(usize, &self.arena_bytes, .monotonic) +| self.scratch_bytes.load(.monotonic);
     }
@@ -529,7 +519,7 @@ pub const Cache = struct {
         }
     }
 
-    /// Gives a shared budget about `want` bytes: unpinned blocks go, least
+    /// Gives the controller about `want` bytes: unpinned blocks go, least
     /// recently used first, and the arena pages they empty go back to the OS,
     /// until the footprint has shrunk by `want` or the next block would take
     /// the cache under `floor` bytes. Returns the bytes the footprint shrank
@@ -645,9 +635,19 @@ fn adup(allocator: Allocator, s: []const u8) ![]align(16) u8 {
     return b;
 }
 
+/// A cache that keeps all of `controller`'s budget as its floor: the budget
+/// also counts the process's idle scratch memory, which must not shrink the
+/// cache under a test.
+fn shareWhole(c: *Cache, controller: *memory.MemoryPool) void {
+    c.* = .init(std.testing.allocator, controller, 0);
+    controller.shareCache(c, controller.budget);
+}
+
 test "cache acquire/insert round-trip + hit/miss counters" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 1024);
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     const k = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
@@ -664,13 +664,14 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     c.release(e2);
 }
 
-test "predicate memo: carved from the budget, lossy per set, off when tiny or disabled" {
+test "predicate memo: at most its size, lossy per set, off when tiny" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 8 << 20);
+    var controller = memory.MemoryPool.init(8 << 20);
+    var c: Cache = .init(allocator, &controller, 10 << 10);
     defer c.deinit();
     const memo = &c.predicate_memo;
     try std.testing.expectEqual(@as(usize, 512), memo.slot_count);
-    try std.testing.expectEqual((8 << 20) - 512 * @sizeOf(u128), c.capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 8 << 10), memo.slotBytes());
 
     try std.testing.expect(!memo.contains(42));
     memo.insert(42);
@@ -687,21 +688,18 @@ test "predicate memo: carved from the budget, lossy per set, off when tiny or di
     try std.testing.expect(memo.contains(@as(u128, 5) << 64 | (7 + sets)));
     try std.testing.expect(memo.contains(42));
 
-    memo.enabled = false;
-    memo.insert(99);
-    try std.testing.expect(!memo.contains(99));
-
-    var tiny: Cache = .init(allocator, 1 << 20);
+    var tiny: Cache = .init(allocator, &controller, 2 << 10);
     defer tiny.deinit();
     try std.testing.expectEqual(@as(usize, 0), tiny.predicate_memo.slot_count);
-    try std.testing.expectEqual(@as(usize, 1 << 20), tiny.capacity_bytes);
     tiny.predicate_memo.insert(42);
     try std.testing.expect(!tiny.predicate_memo.contains(42));
 }
 
 test "cache evicts unpinned LRU entries when over budget" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 30);
+    var controller = memory.MemoryPool.init(30);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     // Four 10-byte entries, all released so they're evictable; the fourth
@@ -718,7 +716,9 @@ test "cache evicts unpinned LRU entries when over budget" {
 
 test "cache LRU order updated on acquire" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 20);
+    var controller = memory.MemoryPool.init(20);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     const k1 = Key{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
@@ -740,7 +740,9 @@ test "cache LRU order updated on acquire" {
 
 test "cache never evicts a pinned entry, even over budget" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 20);
+    var controller = memory.MemoryPool.init(20);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     // Hold k1 pinned (in-use) the whole time.
@@ -761,7 +763,9 @@ test "cache never evicts a pinned entry, even over budget" {
 
 test "cache insertPinned dedupes a racing duplicate key" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 1024);
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     const k = Key{ .segment_id = 7, .row_group_idx = 2, .column_idx = 3 };
@@ -778,7 +782,9 @@ test "cache insertPinned dedupes a racing duplicate key" {
 
 test "shared cache evicts globally: oldest block goes regardless of table" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 30);
+    var controller = memory.MemoryPool.init(30);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     // Table A inserts two blocks, then table B inserts two. Same (segment, rg,
@@ -799,7 +805,9 @@ test "shared cache evicts globally: oldest block goes regardless of table" {
 
 test "purgeTable frees one table's unpinned entries, leaves other tables and pins" {
     const allocator = std.testing.allocator;
-    var c: Cache = .init(allocator, 1024);
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
 
     const dead_free = Key{ .table_uid = 5, .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
@@ -829,7 +837,9 @@ fn putBlock(c: *Cache, index: usize, len: usize) !void {
 test "cache footprint counts arena pages, outside blocks and scratch; reclaim stops at twice its ask and at the floor" {
     const allocator = std.testing.allocator;
     const mib: usize = 1 << 20;
-    var c: Cache = .init(allocator, 64 * mib);
+    var controller = memory.MemoryPool.init(64 * mib);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
     if (c.pool.arena.len == 0) return error.SkipZigTest;
     // Two slabs of eight 1 MiB cells, then a block from outside the arena.
@@ -862,9 +872,10 @@ test "cache footprint counts arena pages, outside blocks and scratch; reclaim st
 }
 
 test "freeing pages moves a sparse slab's blocks into a fuller one, losing none and leaving pinned ones be" {
-    const allocator = std.testing.allocator;
     const mib: usize = 1 << 20;
-    var c: Cache = .init(allocator, 64 * mib);
+    var controller = memory.MemoryPool.init(64 * mib);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
     defer c.deinit();
     if (c.pool.arena.len == 0) return error.SkipZigTest;
     // Two slabs of eight 1 MiB cells, block i filled with byte i. Purging

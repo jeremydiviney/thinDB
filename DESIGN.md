@@ -1394,7 +1394,7 @@ The LRU cache is bounded by a configurable size (default **2 GB**, set at `Datab
 - **What gets noted.** A row group is noted when the filter matched none of its *stored* rows, judged before tombstones or a top-K key bound narrow the mask. Every snapshot sees a subset of the stored rows, so the entry holds for all of them. The memtable is never memoized.
 - **AND arms.** A scan also looks up each of its filter's AND arms, so a query reuses what any query sharing an arm learned. An arm is noted alone only when the guided AND evaluated it first, over every row, and it alone emptied the row group.
 - **Invalidation.** None is needed. Segments are immutable, compaction writes new segment ids, and ALTER, TRUNCATE and XA rollback re-mint the table generation. Dead keys age out as newer keys overwrite their set.
-- **Predictability.** The memo changes no plan and no order of evaluation; it only skips work already proven empty. Query time does depend on history, as with the block cache. `Config.predicate_memo` (`--no-predicate-memo`) turns it off, and `SET THINDB_NO_PREDICATE_MEMO = 1` turns it off per query for benchmarking.
+- **Predictability.** The memo changes no plan and no order of evaluation; it only skips work already proven empty. Query time does depend on history, as with the block cache. `Config.predicate_memo_bytes = 0` (`--predicate-memo-size 0`) turns it off, and `SET THINDB_NO_PREDICATE_MEMO = 1` turns it off per query for benchmarking.
 
 ---
 
@@ -1941,9 +1941,9 @@ The region exchange is the exception. Each scan worker grows thousands of shard 
 **One memory budget.** The shared pool (`memory.MemoryPool`) is the process's one memory controller. Its budget (`Config.memory_budget`, `--memory-budget`; default 65% of usable memory, the cgroup limit or else physical RAM) covers everything the database holds in memory on purpose: statement reservations, the block cache, the cache's predicate memo and the idle pools. Each is a kind (`memory.Kind`: statement, block cache, predicate memo, scratch, region programs), and `MemoryPool.usage` reports the bytes of each; the server's `[mem-release]` line prints them. Memtables, segment handles, the plan cache and wire buffers stay outside, in the unaccounted remainder.
 
 The budget is divided by priority, not by fixed shares:
-- **Statements** may reserve all of it except the cache's floor and the memo. A reservation past that is refused. Under the pool, `query_memory_budget` defaults to no per-query ceiling; set, it caps each statement inside the statements' share.
-- **The block cache** fills what statements and idle memory leave. Its target is the budget less statements, memo, idle bytes and the cache's own overhead, never under its floor (a tenth of the budget) and never over its ceiling (`cache_size_bytes`, default the whole budget). The insert path evicts to that target from atomics, without taking a pool lock. A floor of a tenth keeps the hot set of small queries warm while one large statement runs.
-- **The predicate memo** (§6.4) is charged whole when its cache joins the pool.
+- **Statements** may reserve all of it except the cache's floor and the memo. A reservation past that is refused. No statement has a ceiling of its own.
+- **The block cache** fills what statements and idle memory leave. Its target is the budget less statements, memo, idle bytes and the cache's own overhead, never under its floor (`min_cache_bytes`, `--min-cache-size`; default a tenth of the budget). The insert path evicts to that target from atomics, without taking a pool lock. The floor keeps the hot set of small queries warm while one large statement runs.
+- **The predicate memo** (§6.4) is charged whole when its cache joins the pool. Its size is `predicate_memo_bytes` (`--predicate-memo-size`; default 1/1024 of the budget).
 - **Idle pools.** Two pools keep memory warm between statements: the scratch pool's free lists (cap: 1/8 of RAM, 64 MiB–8 GiB) and each database's cached region programs (cap: 8 GiB per database). Their idle bytes are charged to no statement. Both register through one interface, `memory.IdleSource` (report idle bytes; give back up to N bytes). Admission compares statement bytes only, so idle memory never causes a refusal and the reservation path does no extra work.
 
 The balance (`MemoryPool.balance`) runs on slow paths: at statement start, each time a statement's accounted bytes rise one sampling step above their lowest level since its last check (the watchdog's step), when a reservation is refused, and after every sampling step of cache inserts. When statements, memo, idle bytes and the cache's footprint have passed the budget, the excess goes back, cheapest first:
@@ -1994,7 +1994,7 @@ const thindb = @import("thindb");
 
 var db = try thindb.Database.open(allocator, .{
     .path = "C:/data/mydb",
-    .cache_size_bytes = 2 * 1024 * 1024 * 1024,
+    .memory_budget = 8 * 1024 * 1024 * 1024,
     .flush_interval_secs = 5,
 });
 defer db.close();
@@ -2258,10 +2258,10 @@ Errors propagate to callers. Outside the XA commit protocol, an error is not a b
 | Field | Default | Notes |
 |---|---|---|
 | `path` | (required) | Directory on disk. Created if missing. |
-| `memory_budget` | 65% of RAM | The one budget for statements, the block cache, its memo and idle pools (§8.3). `0` = none. |
-| `query_memory_budget` | none | Per-statement ceiling inside the memory budget; without a memory budget, 25% of RAM. |
-| `cache_size_bytes` | the memory budget | Ceiling for the decoded row group cache, which fills what statements leave, down to a tenth of the budget. Without a memory budget, a fixed 35% of RAM. |
-| `predicate_memo` | true | Remember row groups a scan predicate matched none of (§6.4); takes 1/1024 of the cache's capacity. |
+| `memory_budget` | 65% of RAM | The one budget for statements, the block cache, its memo and idle pools (§8.3). |
+| `min_cache_bytes` | a tenth of the budget | The least of the budget the decoded row group cache keeps; statements share the rest, and the cache fills what they leave. |
+| `predicate_memo_bytes` | 1/1024 of the budget | Memo of row groups a scan predicate matched none of (§6.4); `0` turns it off. |
+| `memory_pool` | none | A pool to share across catalogs; one is minted from the fields above otherwise. |
 | `flush_interval_secs` | 5 | Time-based flush trigger. |
 | `min_time_flush_rows` | 1,000 | Guard against tiny flushes. |
 | `min_time_flush_bytes` | 1 MB | Guard against tiny flushes. |

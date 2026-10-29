@@ -27,7 +27,7 @@ pub const ParseError = error{InvalidConfigLine} || std.mem.Allocator.Error;
 
 /// CLI switches that take no value. In the file they carry a truthy/falsy
 /// value; only a truthy value emits the bare `--flag`.
-const bool_flags = [_][]const u8{ "no-wal", "no-fsync", "no-compaction", "no-predicate-memo", "profile-ops", "trace-group-by" };
+const bool_flags = [_][]const u8{ "no-wal", "no-fsync", "no-compaction", "profile-ops", "trace-group-by" };
 
 fn isBoolFlag(key: []const u8) bool {
     for (bool_flags) |f| if (std.mem.eql(u8, key, f)) return true;
@@ -88,7 +88,7 @@ test "value settings become --key value token pairs" {
     var out = try parse(a,
         \\mysql-port = 13310
         \\bind = 0.0.0.0
-        \\cache-size = 12G
+        \\memory-budget = 12G
     );
     defer {
         for (out.items) |s| a.free(s);
@@ -99,7 +99,7 @@ test "value settings become --key value token pairs" {
     try std.testing.expectEqualStrings("13310", out.items[1]);
     try std.testing.expectEqualStrings("--bind", out.items[2]);
     try std.testing.expectEqualStrings("0.0.0.0", out.items[3]);
-    try std.testing.expectEqualStrings("--cache-size", out.items[4]);
+    try std.testing.expectEqualStrings("--memory-budget", out.items[4]);
     try std.testing.expectEqualStrings("12G", out.items[5]);
 }
 
@@ -139,7 +139,7 @@ test "boolean flags: truthy emits bare flag, falsy emits nothing" {
 test "quotes are stripped; values may hold spaces and '#'" {
     const a = std.testing.allocator;
     var out = try parse(a,
-        \\cache-size = "12G"
+        \\memory-budget = "12G"
         \\mysql-password = 'p@ss #word with spaces'
     );
     defer {

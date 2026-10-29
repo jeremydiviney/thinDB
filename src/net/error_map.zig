@@ -25,7 +25,7 @@ pub const Category = enum {
     /// A function given an argument outside its domain, such as a negative
     /// or NULL SLEEP duration or a generate_series step of 0.
     wrong_arguments,
-    /// The statement ran past `Config.query_memory_budget`.
+    /// The statement ran past what `Config.memory_budget` leaves queries.
     memory_budget_exceeded,
     /// An allocation failed.
     out_of_memory,

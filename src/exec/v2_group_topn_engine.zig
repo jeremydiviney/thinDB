@@ -1083,7 +1083,7 @@ test "workspace teardown stops charging the query before its memory is back" {
     defer gate.deinit();
     var pool = exec.memory.MemoryPool.init(64 << 20);
     const account = try a.create(exec.memory.MemoryAccountant);
-    account.* = exec.memory.MemoryAccountant.initWithPool(64 << 20, &pool);
+    account.* = exec.memory.MemoryAccountant.init(&pool);
     account.trackAllocations(a);
     try account.retainGate(&gate);
     const allocator = try account.executionAllocator();

@@ -1824,7 +1824,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     combine,
                     g.top_k,
                     g.emit_limit,
-                    input.catalog.config.query_memory_budget,
+                    input.catalog.config.memory_pool.?.statementLimit(),
                     input.effectiveDop(),
                     .partials,
                 );
@@ -1852,7 +1852,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     aggs,
                     g.top_k,
                     g.emit_limit,
-                    input.catalog.config.query_memory_budget,
+                    input.catalog.config.memory_pool.?.statementLimit(),
                     input.effectiveDop(),
                     .estimated,
                 );
@@ -1876,7 +1876,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                     aggs,
                     g.top_k,
                     g.emit_limit,
-                    input.catalog.config.query_memory_budget,
+                    input.catalog.config.memory_pool.?.statementLimit(),
                     input.effectiveDop(),
                     .realized,
                 );
@@ -1889,7 +1889,7 @@ fn buildGenericBlock(input: engine_v2.CompileInput, op: *const ir.Op, map: *Stag
                 aggs,
                 g.top_k,
                 g.emit_limit,
-                input.catalog.config.query_memory_budget,
+                input.catalog.config.memory_pool.?.statementLimit(),
                 input.effectiveDop(),
             );
         },
@@ -2151,7 +2151,7 @@ fn distinctRows(input: engine_v2.CompileInput, unioned: exec.Query) !exec.Query 
             aggs,
             null,
             null,
-            input.catalog.config.query_memory_budget,
+            input.catalog.config.memory_pool.?.statementLimit(),
             input.effectiveDop(),
         );
         break :blk .{ q, names };
@@ -2212,7 +2212,7 @@ fn setOpRows(input: engine_v2.CompileInput, unioned: exec.Query, keep: exec.Pred
             aggs,
             null,
             null,
-            input.catalog.config.query_memory_budget,
+            input.catalog.config.memory_pool.?.statementLimit(),
             input.effectiveDop(),
         );
         break :blk .{ q, names };

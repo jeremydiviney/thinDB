@@ -3727,7 +3727,7 @@ test "mysql wire: runtime errors carry MySQL's codes, and only parse errors are 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog = try thindb.Catalog.open(allocator, io, tmp.dir, .{
-        .query_memory_budget = 64 * 1024,
+        .memory_budget = 64 * 1024,
         .row_group_size = 128,
     });
     defer catalog.close();
