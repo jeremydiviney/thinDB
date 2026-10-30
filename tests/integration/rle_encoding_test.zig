@@ -188,7 +188,8 @@ test "RLE-encoded columns round-trip across multiple segments" {
 // Short runs: run k is 1 + 7k mod 13 rows long, so runs of 1 to 13 rows
 // straddle row-group edges and the 8-row vector width. `v` is a spread 64-bit
 // value per run (FOR can't narrow it, so RLE wins), `g` one of 37 values that
-// changes every run, and `w` a small value for sums.
+// changes every run, `w` a small value for sums, and `x` and `f` small signed
+// values for MIN/MAX.
 const SHORT_ROWS: usize = 3000;
 const SHORT_GROUPS: usize = 37;
 
@@ -212,6 +213,20 @@ fn shortG(k: u64) i64 {
 fn shortW(k: u64) i64 {
     return @intCast(k % 5);
 }
+fn shortX(k: u64) i64 {
+    return @as(i64, @intCast(k % 11)) - 5;
+}
+fn shortF(k: u64) f64 {
+    return @as(f64, @floatFromInt(k % 9)) * 0.25 - 1.0;
+}
+fn shortCell(col: anytype, row: usize) !?f64 {
+    if (!col.isValid(row)) return null;
+    return switch (col.data) {
+        inline .smallint, .int, .bigint, .largeint => |v| @floatFromInt(v[row]),
+        inline .float, .double => |v| @floatCast(v[row]),
+        else => error.TestUnexpectedType,
+    };
+}
 
 test "RLE columns of short runs round-trip and group exactly" {
     const allocator = std.testing.allocator;
@@ -221,16 +236,16 @@ test "RLE columns of short runs round-trip and group exactly" {
 
     const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
     defer db.close();
-    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, g INT NOT NULL, w SMALLINT NOT NULL)");
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, g INT NOT NULL, w SMALLINT NOT NULL, x INT NOT NULL, f DOUBLE NOT NULL)");
     {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "INSERT INTO s VALUES ");
-        var line: [96]u8 = undefined;
+        var line: [128]u8 = undefined;
         for (0..SHORT_ROWS) |i| {
             if (i != 0) try buf.appendSlice(allocator, ", ");
             const k = shortRunOf(i).k;
-            try buf.appendSlice(allocator, try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d})", .{ i, shortV(k), shortG(k), shortW(k) }));
+            try buf.appendSlice(allocator, try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d}, {d}, {d})", .{ i, shortV(k), shortG(k), shortW(k), shortX(k), shortF(k) }));
         }
         try exec(allocator, db, buf.items);
     }
@@ -273,6 +288,40 @@ test "RLE columns of short runs round-trip and group exactly" {
             try std.testing.expectEqual(rows[at], batch.values[1].data.bigint[j]);
             try std.testing.expectEqual(runs[at], batch.values[2].data.bigint[j]);
             try std.testing.expectEqual(sums[at], batch.values[3].data.bigint[j]);
+            at += 1;
+        }
+    }
+    try std.testing.expectEqual(SHORT_GROUPS, at);
+
+    // Per g: SUM/MIN/MAX(x), MIN/MAX(w), SUM/MIN/MAX/COUNT(f).
+    var want: [SHORT_GROUPS][9]?f64 = undefined;
+    for (&want) |*wg| wg.* = .{ 0, null, null, null, null, 0, null, null, 0 };
+    for (0..SHORT_ROWS) |i| {
+        const k = shortRunOf(i).k;
+        const wg = &want[@intCast(k % SHORT_GROUPS)];
+        const x: f64 = @floatFromInt(shortX(k));
+        wg[0].? += x;
+        wg[1] = @min(wg[1] orelse x, x);
+        wg[2] = @max(wg[2] orelse x, x);
+        const w: f64 = @floatFromInt(shortW(k));
+        wg[3] = @min(wg[3] orelse w, w);
+        wg[4] = @max(wg[4] orelse w, w);
+        const f = shortF(k);
+        wg[5].? += f;
+        wg[6] = @min(wg[6] orelse f, f);
+        wg[7] = @max(wg[7] orelse f, f);
+        wg[8].? += 1;
+    }
+    var aq = try runSql(allocator, db, "SELECT g, SUM(x), MIN(x), MAX(x), MIN(w), MAX(w), SUM(f), MIN(f), MAX(f), COUNT(f) FROM s GROUP BY g ORDER BY g");
+    defer aq.deinit();
+    at = 0;
+    while (try aq.next()) |batch| {
+        for (0..batch.row_count) |j| {
+            try std.testing.expectEqual(shortG(at), @as(i64, batch.values[0].data.int[j]));
+            for (want[at], 1..) |wv, c| {
+                errdefer std.debug.print("group {d} column {d}\n", .{ at, c });
+                try std.testing.expectEqual(wv, try shortCell(batch.values[c], j));
+            }
             at += 1;
         }
     }
