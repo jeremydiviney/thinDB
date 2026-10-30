@@ -116,6 +116,21 @@ const BucketTable = union(enum) {
         }
     }
 
+    /// Empties the table for a fold of `rows` rows. A fold reserves a slot per
+    /// row, so a part of a few heavy groups grows the table to its row count;
+    /// a table past twice what `rows` need is replaced by one sized for them,
+    /// so emptying never costs more than the rows it serves.
+    fn resetFor(self: *BucketTable, allocator: Allocator, rows: usize) !void {
+        const groups = @max(rows, DEFER_PART_ROWS);
+        if (self.slotCount() <= 2 * group_table.capacityFor(groups)) return self.clearRetainingCapacity();
+        const next: BucketTable = switch (self.*) {
+            .narrow => .{ .narrow = try GroupTable.init(allocator, groups) },
+            .wide => .{ .wide = try WideGroupTable.init(allocator, groups) },
+        };
+        self.deinit(allocator);
+        self.* = next;
+    }
+
     fn deinit(self: *BucketTable, allocator: Allocator) void {
         switch (self.*) {
             inline else => |*t| t.deinit(allocator),
@@ -126,6 +141,24 @@ const TOP_K: usize = 10;
 
 test {
     std.testing.refAllDecls(PipeBucket);
+}
+
+test "a part table a heavy part grew shrinks back before a small part's fold" {
+    const allocator = std.testing.allocator;
+    var table: BucketTable = .{ .wide = try WideGroupTable.init(allocator, DEFER_PART_ROWS) };
+    defer table.deinit(allocator);
+    const part_slots = table.slotCount();
+
+    _ = try table.growFor(allocator, 100_000, 100_000, 100_000, 0);
+    const heavy_slots = table.slotCount();
+    try std.testing.expect(heavy_slots >= 100_000);
+    try table.resetFor(allocator, 100_000);
+    try std.testing.expectEqual(heavy_slots, table.slotCount());
+
+    try table.resetFor(allocator, 100);
+    try std.testing.expectEqual(part_slots, table.slotCount());
+    try std.testing.expectEqual(@as(usize, 0), table.len());
+    try std.testing.expect(table == .wide);
 }
 
 /// Selective-query right-sizing: one grid worker per this many surviving
@@ -7939,7 +7972,7 @@ fn foldDeferredPart(
     chunks: []const GroupChunk,
     part_rows: usize,
 ) !void {
-    table.clearRetainingCapacity();
+    try table.resetFor(allocator, part_rows);
     if (transient) states.clearRetainingCapacity();
     const first_new = states.len;
     for (chunks) |chunk| {
