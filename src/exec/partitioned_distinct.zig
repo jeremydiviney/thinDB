@@ -21,16 +21,21 @@ const group_table = @import("group_table.zig");
 const CountSlotTable = group_table.CountSlotTable;
 const memory = @import("../memory.zig");
 
-pub const PARTITIONS: usize = 256;
+// Enough partitions that the sets the threads drain at once stay near L2 size
+// for tens of millions of keys: at 256, an 18M-key grouped distinct drained
+// into 2 MB sets from DRAM. At 2048, the producers' open chunks outgrew the
+// cache instead.
+pub const PARTITIONS: usize = 1024;
 const PARTITION_SHIFT: u6 = 64 - @ctz(@as(u64, PARTITIONS));
 const CHUNK_KEYS: usize = 256;
 // Keys the queue may hold before workers drain, however small the final sets
 // are. It slides from the floor toward the ceiling with the share of drained
 // keys that were new: while most are, a longer queue means fewer passes over
-// sets that are still growing; once they are mostly repeats, a short queue
-// keeps its chunks in cache until they drain.
+// sets that are still growing (each pass reloads its set), and a stream of
+// new keys up to the ceiling drains once, at the end; once they are mostly
+// repeats, a short queue keeps its chunks in cache until they drain.
 const QUEUE_FLOOR_KEYS: usize = 1 << 21;
-const QUEUE_CEILING_KEYS: usize = 1 << 24;
+const QUEUE_CEILING_BYTES: usize = 512 << 20;
 const INSERT_PREFETCH: usize = 16;
 // Publishes a producer lets pass without a relieve after one that found
 // nothing worth draining: every partition was empty, small, or taken.
@@ -107,7 +112,7 @@ pub fn PartitionedDistinct(comptime Key: type) type {
         relieve_cursor: std.atomic.Value(usize) = .init(0),
         final_cursor: std.atomic.Value(usize) = .init(0),
         queue_floor: usize = QUEUE_FLOOR_KEYS,
-        queue_ceiling: usize = QUEUE_CEILING_KEYS,
+        queue_ceiling: usize = QUEUE_CEILING_BYTES / @sizeOf(Key),
 
         pub fn create(allocator: Allocator) !*Self {
             const pooled = try memory.workerAllocatorOf(allocator);
