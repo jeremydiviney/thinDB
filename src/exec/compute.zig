@@ -218,6 +218,16 @@ const CallPlan = struct {
     /// Set for `array_map` over a lambda, which evaluates that instead of
     /// a kernel; `args` are then its arrays.
     lambda: ?*LambdaPlan = null,
+    /// The last batch's output has no NULL row although its store is
+    /// nullable, so its view leaves the bitmap off and readers take their
+    /// dense paths.
+    all_valid: bool = false,
+
+    fn outputView(self: *const CallPlan) ColumnView {
+        var v = self.output.view();
+        if (self.all_valid) v.nulls = null;
+        return v;
+    }
 };
 
 /// A lambda's body evaluates as a Compute over a batch of the arrays'
@@ -1114,7 +1124,7 @@ pub const Compute = struct {
             self.views[out_idx] = if (!direct) c.view() else switch (r.kind) {
                 .rename => |rn| in.values[rn.src_idx],
                 .lit_only => |slot| slot.buf.view(),
-                .call => |plan| plan.output.view(),
+                .call => |plan| plan.outputView(),
                 .case => |plan| plan.output.view(),
                 // Only the four kinds above ever set `direct`.
                 .null_only, .fused_scalar => unreachable,
@@ -1149,6 +1159,7 @@ pub const Compute = struct {
         // Output buffer is cleared by the caller for the root; for
         // internal nodes we clear before refilling here.
         if (plan.output_owned) plan.output.clear();
+        plan.all_valid = false;
         // Over no rows the call runs as any other does, so a constant that
         // fails to evaluate fails only where a row reads it.
         if (plan.constant and n > 0) {
@@ -1236,7 +1247,12 @@ pub const Compute = struct {
         // declared schema column is nullable.
         if (out.nulls != null) {
             switch (plan.func.null_strategy) {
-                .propagates => try writePropagatedNulls(self.allocator, out, arg_views, n),
+                .propagates => {
+                    try writePropagatedNulls(self.allocator, out, arg_views, n);
+                    plan.all_valid = for (arg_views) |v| {
+                        if (v.nulls != null) break false;
+                    } else true;
+                },
                 .absorbs => try writeAbsorbedNulls(self.allocator, out, arg_views, n),
                 .zero_divisor => try writeZeroDivisorNulls(self.allocator, out, arg_views, n),
                 .kernel_managed => {}, // kernel already wrote the bitmap
@@ -1497,7 +1513,7 @@ pub const Compute = struct {
             },
             .call => |sub| blk: {
                 try self.evalCall(sub, in_values, n);
-                break :blk sub.output.view();
+                break :blk sub.outputView();
             },
             .case => |sub| blk: {
                 try self.evalCase(sub, in_values, n);
@@ -1562,7 +1578,7 @@ pub const Compute = struct {
             },
             .call => |sub| blk: {
                 try self.evalCall(sub, in_values, n);
-                break :blk sub.output.view();
+                break :blk sub.outputView();
             },
             .case => |sub| blk: {
                 try self.evalCase(sub, in_values, n);
@@ -3952,6 +3968,30 @@ test "a CASE evaluates its own copy of the derived IR after the caller's scratch
     const batch = (try q.next()).?;
     try std.testing.expectEqualStrings("flag", batch.schema[1].name);
     try std.testing.expectEqualSlices(i32, &.{ 0, 1, 0 }, batch.values[1].data.int);
+}
+
+test "a call over a batch without NULLs hands out its value without a bitmap" {
+    // The store is nullable because the input column is, but a batch whose
+    // input carries no bitmap has no NULL anywhere in the call tree, and
+    // readers given a bitmap take their slower per-row paths.
+    const allocator = std.testing.allocator;
+    const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
+    const schema = [_]Column{.{ .name = "a", .type = .smallint, .nullable = true }};
+    const values = [_]i16{ -7, 0, 9 };
+    const inner: Expr = .{ .call = .{ .fn_name = "abs", .args = &.{.{ .col_ref = "a" }} } };
+    const derived = [_]Derived{.{ .name = "m", .expr = .{ .call = .{ .fn_name = "abs", .args = &.{inner} } } }};
+    inline for (.{ @as(?[]const u8, null), @as(?[]const u8, &.{0b111}), @as(?[]const u8, &.{0b101}) }) |bitmap| {
+        const views = [_]storage.ColumnView{.{ .data = .{ .smallint = &values }, .nulls = bitmap }};
+        const source = try SingleBatchSource.create(allocator, .{ .schema = &schema, .values = &views, .row_count = values.len });
+        var q = try Compute.create(allocator, source, &derived);
+        defer q.deinit();
+
+        const batch = (try q.next()).?;
+        try std.testing.expect(batch.schema[1].nullable);
+        try std.testing.expectEqual(bitmap == null, batch.values[1].nulls == null);
+        for (0..values.len) |row| try std.testing.expectEqual(storage.column.isValidBit(bitmap, row), batch.values[1].isValid(row));
+        try std.testing.expectEqual(@as(i64, 9), batch.values[1].data.bigint[2]);
+    }
 }
 
 /// Upstream for the construction-failure tests: `a INT NULL, s VARCHAR NULL`, no rows.
