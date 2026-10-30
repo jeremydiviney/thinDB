@@ -1541,7 +1541,7 @@ const GlobalAggregate = struct {
         {
             const mask = workers[0].source.scan.survivingMask(self.allocator);
             defer if (mask) |m| self.allocator.free(m);
-            tiles = try RowGroupTiles.init(self.allocator, total_rgs, mask, n_workers, TILE_RGS);
+            tiles = try RowGroupTiles.init(self.allocator, total_rgs, mask, n_workers, TILE_RGS, true);
         }
         // All worker scans now hold their own memtable pins.
         snap.release(table);

@@ -1593,7 +1593,7 @@ const LowCardGroup = struct {
         var grant = core_scheduler.reserveWorkers(n_workers);
         defer grant.release();
         n_workers = grant.count;
-        var tiles = try RowGroupTiles.init(allocator, total_rgs, surviving_mask, n_workers, TILE_RGS);
+        var tiles = try RowGroupTiles.init(allocator, total_rgs, surviving_mask, n_workers, TILE_RGS, false);
         defer tiles.deinit(allocator);
 
         // One shared set per int/float/coded COUNT(DISTINCT), which every

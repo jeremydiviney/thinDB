@@ -9116,7 +9116,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .count_sketch = cfg.count_sketch,
         .scan_threads = n_workers,
         .total_scan_rgs = claim_total_rgs,
-        .scan_tiles = try RowGroupTiles.init(allocator, claim_total_rgs, surviving_mask, n_workers, scan_tile_rgs * scan_coalesce_tiles),
+        .scan_tiles = try RowGroupTiles.init(allocator, claim_total_rgs, surviving_mask, n_workers, scan_tile_rgs * scan_coalesce_tiles, true),
         .local_reserve_per_bucket = local_reserve_per_bucket,
         .route_block_rows = route_block_rows,
         .direct_final_local = direct_final_local,
