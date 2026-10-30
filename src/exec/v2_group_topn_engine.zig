@@ -974,11 +974,12 @@ fn runHarness(
     // Scan-side key digests: a string group key consumed only as hashed
     // identity (its bytes come back via rowref late-mat) never materializes —
     // the scan emits per-row `stringKeyDigest` values straight off the cached
-    // block. Excluded when the column is also an aggregate input or read by a
+    // block, and the derived expressions' Compute passes them through.
+    // Excluded when the column is also an aggregate input or read by a
     // derived expression (those need real bytes in the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
-    if (force_hash and derived.len == 0) {
+    if (force_hash) {
         outer: for (shape.group_key_inputs) |input| {
             switch (input.source_type) {
                 .varchar, .string, .char, .json, .nested, .bitmap => {},
@@ -991,6 +992,7 @@ fn runHarness(
                 if (types.columnNameEql(si.source_name, input.name)) continue :outer;
             }
             for (derived) |d| {
+                if (types.columnNameEql(d.name, input.name)) continue :outer;
                 if (derivedReadsColumn(allocator, d, input.name) catch true) continue :outer;
             }
             hash_key_cols_buf[n_hash_keys] = input.name;
@@ -1096,13 +1098,22 @@ fn runCountSketch(
     need: usize,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
+    // A lone string key read only as identity may arrive as row-group
+    // dictionary codes, which a heavy tally counts without hashing.
+    if (cfg.distinct_eval and cfg.derived.len == 0 and cfg.hash_key_columns.len == 1 and cfg.group_rows_layout.key_columns.len == 1) {
+        var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
+        defer heavy.deinit(allocator);
+        if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
+        if (heavy.declined_small) return false;
+    }
+
     var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
     defer sketch.deinit(allocator);
 
     var none: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     defer none.deinit(allocator);
     var tally = cfg;
-    tally.count_sketch = .{ .sketch = &sketch, .mode = .tally };
+    tally.count_sketch = .{ .tally = &sketch };
     tally.result_out = &none;
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
@@ -1110,7 +1121,7 @@ fn runCountSketch(
     if (!try sketch.settle(allocator, need)) return false;
 
     var filter = cfg;
-    filter.count_sketch = .{ .sketch = &sketch, .mode = .filter };
+    filter.count_sketch = .{ .filter = &sketch };
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     const found = rows.items.len;
     const kth = needthCount(rows.items, need);
@@ -1118,6 +1129,35 @@ fn runCountSketch(
 
     rows.clearRetainingCapacity();
     if (found < need or !sketch.retarget(kth)) return false;
+    try SiloCore.runSiloGrid(allocator, table, cpus, filter);
+    return true;
+}
+
+/// The heavy-key COUNT top-K (see HeavyKeys) into `rows`. False, leaving
+/// `rows` empty, when the tally declines or can't settle. Neither pass
+/// digests the key in the scan: the tally hashes only the values a row group
+/// holds many rows of, and the filter pass only those its signatures admit.
+fn runHeavyKeys(
+    allocator: Allocator,
+    table: *api.Table,
+    cpus: []const usize,
+    cfg: SiloCore.RunConfig,
+    heavy: *count_topk_sketch.HeavyKeys,
+) !bool {
+    var none: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
+    defer none.deinit(allocator);
+    var tally = cfg;
+    tally.hash_key_columns = &.{};
+    tally.count_sketch = .{ .heavy_tally = heavy };
+    tally.result_out = &none;
+    tally.workspace = null;
+    tally.defer_heavy_teardown = false;
+    try SiloCore.runSiloGrid(allocator, table, cpus, tally);
+    if (heavy.declined_small or !try heavy.settle(allocator)) return false;
+
+    var filter = cfg;
+    filter.hash_key_columns = &.{};
+    filter.count_sketch = .{ .heavy_filter = heavy };
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     return true;
 }

@@ -14,6 +14,9 @@
 //! search phrases): the filter pass then groups a few percent of the rows.
 //! Near-unique keys spread their rows evenly over the counters, keep nearly
 //! every row, and `settle` declines.
+//!
+//! `HeavyKeys` serves keys that arrive counted per row group (dictionary
+//! codes): its tally hashes only the values a row group holds many rows of.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -130,7 +133,7 @@ pub const CountSketch = struct {
         for (totals) |c| self.rows += c;
 
         var best: [MAX_NEED]u32 = undefined;
-        const kth = kthLargest(totals, best[0..need]);
+        const kth = kthLargest(u32, totals, best[0..need]);
         if (@as(f64, @floatFromInt(kth)) <= collisionCeiling(self.rows, self.bits)) return false;
         self.threshold = @max(1, kth / 2);
 
@@ -173,6 +176,321 @@ pub const CountSketch = struct {
     }
 };
 
+/// Candidates past this many keep too many rows for the filter pass to beat
+/// the counter sketch.
+const MAX_HEAVY_CANDIDATES: usize = 1 << 16;
+
+/// A unit's t - 1 is 1/this of its estimated share of τ, so the units'
+/// slack sums to about τ / this.
+const SLACK_SHARE_DENOM: u64 = 4;
+
+/// A binary-search probe costs about this many rows of the signature
+/// filter: the filter streams every row's bytes, a probe touches one row's.
+const SEARCH_ROWS_PER_PROBE: usize = 8;
+
+/// Exact top-K over units whose keys arrive counted (TPUT: Cao & Wang,
+/// "Efficient top-K query calculation in distributed networks", PODC 2004).
+/// A row group's dictionary codes count its distinct values exactly, so a
+/// tally reports only the values a unit holds at least `t` rows of and
+/// hashes nothing else. A key's reported counts sum to its partial, and
+/// each unit that didn't report it held at most its t - 1 rows of it:
+///
+///     partial(key) <= count(key) <= partial(key) + slack
+///
+/// with `slack` the units' summed t - 1. The need-th best partial τ is then
+/// at most the need-th best count, so a key whose partial + slack falls
+/// short of τ ranks strictly below the top `need`, ties included, and the
+/// filter pass counts only the candidates whose partial + slack reach τ.
+/// Its top `need` is exact; no retry is needed.
+pub const HeavyKeys = struct {
+    need: usize,
+    workers: []Worker,
+    top_keys: []u128,
+    top_counts: []u64,
+    /// Set when the tally declined before scanning for want of input: the
+    /// counter sketch would decline too.
+    declined_small: bool = false,
+    /// After `settle`: the candidate keys, their signatures by open
+    /// addressing (0 marks an empty slot), and the candidates by bytes when
+    /// every candidate's bytes were kept.
+    candidates: std.AutoHashMapUnmanaged(u128, void) = .empty,
+    signatures: []u64 = &.{},
+    signature_bits: u6 = 0,
+    sorted: ?[]Candidate = null,
+
+    pub const Worker = struct {
+        partials: std.AutoHashMapUnmanaged(u128, Partial) = .empty,
+        /// The bytes of the worker's partials' keys that reached
+        /// `KEPT_BYTES_MIN_COUNT` rows.
+        key_bytes: std.heap.ArenaAllocator,
+        /// The keys and counts of the worker's `need` best partials, and
+        /// the slot of the least.
+        top_keys: []u128,
+        top_counts: []u64,
+        top_len: usize = 0,
+        least: usize = 0,
+        slack: u64 = 0,
+        rows: u64 = 0,
+
+        fn findLeast(self: *Worker) void {
+            var least: usize = 0;
+            for (self.top_counts[0..self.top_len], 0..) |c, i| {
+                if (c < self.top_counts[least]) least = i;
+            }
+            self.least = least;
+        }
+
+        fn kth(self: *const Worker) u64 {
+            return if (self.top_len == self.top_counts.len) self.top_counts[self.least] else 0;
+        }
+    };
+
+    const Partial = struct { count: u64, signature: u64, slot: u32, bytes: ?[]const u8 };
+
+    /// A near-unique unit reports every key it holds, so a key's bytes are
+    /// kept once its partial reaches this many rows; a candidate holding
+    /// fewer leaves the filter pass to the signatures.
+    const KEPT_BYTES_MIN_COUNT: u64 = 2;
+    const NO_SLOT = std.math.maxInt(u32);
+
+    pub const Candidate = struct { bytes: []const u8, key: u128 };
+
+    fn candidateBefore(_: void, a: Candidate, b: Candidate) bool {
+        return std.mem.lessThan(u8, a.bytes, b.bytes);
+    }
+
+    pub fn init(allocator: Allocator, need: usize, workers: usize) !HeavyKeys {
+        std.debug.assert(need > 0 and need <= MAX_NEED);
+        const ws = try allocator.alloc(Worker, workers);
+        errdefer allocator.free(ws);
+        const top_keys = try allocator.alloc(u128, workers * need);
+        errdefer allocator.free(top_keys);
+        const top_counts = try allocator.alloc(u64, workers * need);
+        for (ws, 0..) |*w, i| w.* = .{
+            .key_bytes = .init(allocator),
+            .top_keys = top_keys[i * need ..][0..need],
+            .top_counts = top_counts[i * need ..][0..need],
+        };
+        return .{ .need = need, .workers = ws, .top_keys = top_keys, .top_counts = top_counts };
+    }
+
+    pub fn deinit(self: *HeavyKeys, allocator: Allocator) void {
+        for (self.workers) |*w| {
+            w.partials.deinit(allocator);
+            w.key_bytes.deinit();
+        }
+        allocator.free(self.workers);
+        allocator.free(self.top_keys);
+        allocator.free(self.top_counts);
+        self.candidates.deinit(allocator);
+        if (self.signatures.len > 0) allocator.free(self.signatures);
+        if (self.sorted) |sorted| allocator.free(sorted);
+        self.* = undefined;
+    }
+
+    /// The threshold for a unit of `rows` rows whose need-th best key holds
+    /// `unit_kth` of them: t - 1 is a quarter of the lesser of two estimates
+    /// of the unit's share of τ. The unit's own need-th count overshoots it
+    /// where hot keys come and go between units; worker `w`'s need-th best
+    /// partial prorated by rows undershoots it early on, which costs only
+    /// hashing.
+    pub fn unitThreshold(self: *const HeavyKeys, w: usize, rows: u64, unit_kth: u64) u64 {
+        const worker = &self.workers[w];
+        var share = unit_kth;
+        if (worker.rows > 0) share = @min(share, @as(u64, @intCast(@as(u128, worker.kth()) * rows / worker.rows)));
+        return 1 + share / SLACK_SHARE_DENOM;
+    }
+
+    /// Adds a unit's `count` rows of `key`, the digest of `bytes`, to
+    /// worker `w`'s partials. Only worker `w` may call this.
+    pub fn report(self: *HeavyKeys, allocator: Allocator, w: usize, key: u128, bytes: []const u8, count: u64) !void {
+        const worker = &self.workers[w];
+        const gop = try worker.partials.getOrPut(allocator, key);
+        if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .signature = keySignature(bytes), .slot = NO_SLOT, .bytes = null };
+        const p = gop.value_ptr;
+        p.count += count;
+        if (p.bytes == null and p.count >= KEPT_BYTES_MIN_COUNT) p.bytes = try worker.key_bytes.allocator().dupe(u8, bytes);
+        if (p.slot != NO_SLOT) {
+            worker.top_counts[p.slot] = p.count;
+            if (p.slot == worker.least) worker.findLeast();
+            return;
+        }
+        if (worker.top_len < self.need) {
+            p.slot = @intCast(worker.top_len);
+            worker.top_keys[worker.top_len] = key;
+            worker.top_counts[worker.top_len] = p.count;
+            worker.top_len += 1;
+            worker.findLeast();
+            return;
+        }
+        if (p.count <= worker.top_counts[worker.least]) return;
+        // A top key never leaves the partials.
+        worker.partials.getPtr(worker.top_keys[worker.least]).?.slot = NO_SLOT;
+        p.slot = @intCast(worker.least);
+        worker.top_keys[worker.least] = key;
+        worker.top_counts[worker.least] = p.count;
+        worker.findLeast();
+    }
+
+    /// Closes worker `w`'s unit of `rows` rows, which reported every key it
+    /// held `threshold` rows of or more.
+    pub fn endUnit(self: *HeavyKeys, w: usize, rows: u64, threshold: u64) void {
+        self.workers[w].slack += threshold - 1;
+        self.workers[w].rows += rows;
+    }
+
+    /// Merges the workers' partials and picks the candidates. False when the
+    /// slack reaches τ (a key no unit reported might then rank) or the
+    /// candidates are too many to pay.
+    pub fn settle(self: *HeavyKeys, allocator: Allocator) !bool {
+        var slack: u64 = 0;
+        var reported: usize = 0;
+        for (self.workers) |*w| {
+            slack += w.slack;
+            reported += w.partials.count();
+        }
+        var merged: std.AutoHashMapUnmanaged(u128, Partial) = .empty;
+        defer merged.deinit(allocator);
+        try merged.ensureTotalCapacity(allocator, @intCast(reported));
+        for (self.workers) |*w| {
+            var it = w.partials.iterator();
+            while (it.next()) |e| {
+                const gop = merged.getOrPutAssumeCapacity(e.key_ptr.*);
+                if (gop.found_existing) gop.value_ptr.count += e.value_ptr.count else gop.value_ptr.* = e.value_ptr.*;
+            }
+        }
+        const counts = try allocator.alloc(u64, merged.count());
+        defer allocator.free(counts);
+        var i: usize = 0;
+        var values = merged.valueIterator();
+        while (values.next()) |p| : (i += 1) counts[i] = p.count;
+        var best: [MAX_NEED]u64 = undefined;
+        const tau = kthLargest(u64, counts, best[0..self.need]);
+        if (tau <= slack) return false;
+
+        var n: usize = 0;
+        for (counts) |c| n += @intFromBool(c + slack >= tau);
+        if (n > MAX_HEAVY_CANDIDATES) return false;
+        try self.candidates.ensureTotalCapacity(allocator, @intCast(n));
+        self.signature_bits = @intCast(@max(6, std.math.log2_int_ceil(usize, 2 * n)));
+        self.signatures = try allocator.alloc(u64, @as(usize, 1) << self.signature_bits);
+        @memset(self.signatures, 0);
+        const sorted = try allocator.alloc(Candidate, n);
+        var j: usize = 0;
+        var it = merged.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.count + slack < tau) continue;
+            self.candidates.putAssumeCapacity(e.key_ptr.*, {});
+            self.addSignature(e.value_ptr.signature);
+            if (e.value_ptr.bytes) |bytes| {
+                sorted[j] = .{ .bytes = bytes, .key = e.key_ptr.* };
+                j += 1;
+            }
+        }
+        if (j < n) {
+            allocator.free(sorted);
+            return true;
+        }
+        std.sort.pdq(Candidate, sorted, {}, candidateBefore);
+        self.sorted = sorted;
+        return true;
+    }
+
+    /// Whether binary searches for the candidates beat signing every row of
+    /// a batch of `rows` ascending distinct keys.
+    pub fn searchPays(self: *const HeavyKeys, rows: usize) bool {
+        const sorted = self.sorted orelse return false;
+        const probes = sorted.len * (std.math.log2_int_ceil(usize, rows + 1) + 1);
+        return probes * SEARCH_ROWS_PER_PROBE <= rows;
+    }
+
+    /// Marks the rows of `keys` (a `rowBytes` source of `mask.len`
+    /// ascending distinct keys) that are candidates, with their digests in
+    /// `ids`, and returns how many: the sorted candidates' searches each
+    /// start past the last one's row. Only once `searchPays`.
+    pub fn findSorted(self: *const HeavyKeys, keys: anytype, mask: []bool, ids: []u128) usize {
+        @memset(mask, false);
+        var lo: usize = 0;
+        var found: usize = 0;
+        for (self.sorted.?) |c| {
+            var hi = mask.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.lessThan(u8, keys.rowBytes(mid), c.bytes)) lo = mid + 1 else hi = mid;
+            }
+            if (lo == mask.len) break;
+            if (!std.mem.eql(u8, keys.rowBytes(lo), c.bytes)) continue;
+            mask[lo] = true;
+            ids[lo] = c.key;
+            found += 1;
+            lo += 1;
+        }
+        return found;
+    }
+
+    fn addSignature(self: *HeavyKeys, signature: u64) void {
+        const mask = self.signatures.len - 1;
+        var i: usize = @intCast(signature >> @intCast(64 - @as(u7, self.signature_bits)));
+        while (self.signatures[i] != 0) : (i = (i + 1) & mask) {
+            if (self.signatures[i] == signature) return;
+        }
+        self.signatures[i] = signature;
+    }
+
+    /// Whether some candidate signs as `signature`: a key that doesn't is
+    /// no candidate, and needs no digest to tell.
+    pub fn maySign(self: *const HeavyKeys, signature: u64) bool {
+        const mask = self.signatures.len - 1;
+        var i: usize = @intCast(signature >> @intCast(64 - @as(u7, self.signature_bits)));
+        while (true) : (i = (i + 1) & mask) {
+            const s = self.signatures[i];
+            if (s == signature) return true;
+            if (s == 0) return false;
+        }
+    }
+
+    pub fn keeps(self: *const HeavyKeys, key: u128) bool {
+        return self.candidates.contains(key);
+    }
+};
+
+/// A filter on a key's bytes ahead of its digest: its length and its first
+/// and last 8 bytes, mixed. Never 0, the empty signature slot.
+pub fn keySignature(bytes: []const u8) u64 {
+    var head: u64 = 0;
+    var tail: u64 = 0;
+    if (bytes.len >= 8) {
+        head = std.mem.readInt(u64, bytes[0..8], .little);
+        tail = std.mem.readInt(u64, bytes[bytes.len - 8 ..][0..8], .little);
+    } else {
+        var buf: [8]u8 = @splat(0);
+        @memcpy(buf[0..bytes.len], bytes);
+        head = std.mem.readInt(u64, &buf, .little);
+    }
+    var x = head ^ std.math.rotl(u64, tail, 29) ^ (@as(u64, bytes.len) *% 0x9e3779b97f4a7c15);
+    x ^= x >> 32;
+    x *%= 0xd6e8feb86659fd93;
+    x ^= x >> 32;
+    return x | 1;
+}
+
+/// A lower bound within 2x on the need-th largest of `counts` (0 when fewer
+/// than `need` are nonzero): the power of two the need-th largest reaches.
+pub fn approxKth(counts: []const u32, need: usize) u64 {
+    var by_log: [32]u32 = @splat(0);
+    for (counts) |c| {
+        if (c != 0) by_log[std.math.log2_int(u32, c)] += 1;
+    }
+    var seen: usize = 0;
+    var b: usize = by_log.len;
+    while (b > 0) {
+        b -= 1;
+        seen += by_log[b];
+        if (seen >= need) return @as(u64, 1) << @intCast(b);
+    }
+    return 0;
+}
+
 /// About the largest counter `rows` rows of distinct groups reach by
 /// collisions alone: each of the 2^bits counters draws ~Poisson(rows/2^bits)
 /// rows, and the most loaded lands near mean + sqrt(2·mean·ln n), with a
@@ -188,7 +506,7 @@ fn collisionCeiling(rows: u64, bits: u6) f64 {
 
 /// The `best.len`-th largest of `values` (0 when there are fewer), using
 /// `best` as scratch kept in descending order.
-fn kthLargest(values: []const u32, best: []u32) u32 {
+fn kthLargest(comptime T: type, values: []const T, best: []T) T {
     const k = best.len;
     var len: usize = 0;
     for (values) |v| {
@@ -203,10 +521,10 @@ fn kthLargest(values: []const u32, best: []u32) u32 {
 
 test "kthLargest picks the k-th largest value" {
     var best: [3]u32 = undefined;
-    try std.testing.expectEqual(@as(u32, 7), kthLargest(&.{ 5, 9, 1, 7, 8, 2 }, &best));
-    try std.testing.expectEqual(@as(u32, 0), kthLargest(&.{ 4, 6 }, &best));
+    try std.testing.expectEqual(@as(u32, 7), kthLargest(u32, &.{ 5, 9, 1, 7, 8, 2 }, &best));
+    try std.testing.expectEqual(@as(u32, 0), kthLargest(u32, &.{ 4, 6 }, &best));
     var one: [1]u32 = undefined;
-    try std.testing.expectEqual(@as(u32, 9), kthLargest(&.{ 5, 9, 1 }, &one));
+    try std.testing.expectEqual(@as(u32, 9), kthLargest(u32, &.{ 5, 9, 1 }, &one));
 }
 
 test "count sketch keeps the heavy groups and proves the top-k exact" {
@@ -313,4 +631,208 @@ test "retarget lowers the threshold to one past the found k-th count" {
     try std.testing.expectEqual(@as(u64, 400), sketch.threshold);
     try std.testing.expect(sketch.keeps(1) and sketch.keeps(2));
     try std.testing.expect(sketch.exact(2, 2, 399));
+}
+
+test "approxKth bounds the need-th largest count from below within 2x" {
+    try std.testing.expectEqual(@as(u64, 8), approxKth(&.{ 3, 40, 9, 0, 12, 1 }, 3));
+    try std.testing.expectEqual(@as(u64, 32), approxKth(&.{ 3, 40, 9, 0, 12, 1 }, 1));
+    try std.testing.expectEqual(@as(u64, 1), approxKth(&.{ 3, 40, 9, 0, 12, 1 }, 5));
+    try std.testing.expectEqual(@as(u64, 0), approxKth(&.{ 3, 40, 9, 0, 12, 1 }, 6));
+    try std.testing.expectEqual(@as(u64, 0), approxKth(&.{}, 1));
+}
+
+test "keySignature reads short, long and empty keys" {
+    try std.testing.expect(keySignature("") != keySignature("a"));
+    try std.testing.expect(keySignature("abc") != keySignature("abd"));
+    try std.testing.expect(keySignature("http://example.com/a") != keySignature("http://example.com/b"));
+    try std.testing.expect(keySignature("abcdefgh") != keySignature("abcdefghabcdefgh"));
+    try std.testing.expectEqual(keySignature("same bytes here"), keySignature("same bytes here"));
+    for ([_][]const u8{ "", "x", "12345678", "a much longer key than eight bytes" }) |k| try std.testing.expect(keySignature(k) & 1 == 1);
+}
+
+/// Test key k's bytes: "k" and its decimal digits.
+fn testKeyBytes(buf: []u8, key: u128) []const u8 {
+    return std.fmt.bufPrint(buf, "k{d}", .{key}) catch unreachable;
+}
+
+/// Feeds `units` (per unit, each key's row count) through a heavy tally the
+/// way grid workers do: unit u on worker u % workers.
+fn heavyTallyUnits(allocator: Allocator, heavy: *HeavyKeys, units: []const []const [2]u64, workers: usize) !void {
+    var buf: [48]u8 = undefined;
+    const counts = try allocator.alloc(u32, 4096);
+    defer allocator.free(counts);
+    for (units, 0..) |unit, u| {
+        const w = u % workers;
+        var rows: u64 = 0;
+        for (unit, 0..) |kc, i| {
+            counts[i] = @intCast(kc[1]);
+            rows += kc[1];
+        }
+        const t = heavy.unitThreshold(w, rows, approxKth(counts[0..unit.len], heavy.need));
+        for (unit) |kc| {
+            if (kc[1] >= t) try heavy.report(allocator, w, kc[0], testKeyBytes(&buf, kc[0]), kc[1]);
+        }
+        heavy.endUnit(w, rows, t);
+    }
+}
+
+test "heavy keys keep every key that can reach the top and prove the rest can't" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7e47);
+    const random = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 60 units of 1000 keys: keys 0..5 are hot everywhere, keys 6..25 warm
+    // in a third of the units, and the rest one-offs.
+    var totals = std.AutoHashMap(u128, u64).init(allocator);
+    defer totals.deinit();
+    const units = try arena.alloc([]const [2]u64, 60);
+    var next_light: u64 = 1000;
+    for (units, 0..) |*unit, u| {
+        const keys = try arena.alloc([2]u64, 1000);
+        for (keys, 0..) |*kc, i| {
+            kc.* = if (i < 6)
+                .{ i, 40 + 7 * (5 - i) + random.uintLessThan(u64, 5) }
+            else if (i < 26 and u % 3 == i % 3)
+                .{ i, 20 + random.uintLessThan(u64, 30) }
+            else blk: {
+                next_light += 1;
+                break :blk .{ next_light, 1 + random.uintLessThan(u64, 3) };
+            };
+            const gop = try totals.getOrPut(kc[0]);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += kc[1];
+        }
+        unit.* = keys;
+    }
+
+    inline for (.{ @as(usize, 1), @as(usize, 3) }) |workers| {
+        var heavy = try HeavyKeys.init(allocator, 4, workers);
+        defer heavy.deinit(allocator);
+        try heavyTallyUnits(allocator, &heavy, units, workers);
+        try std.testing.expect(try heavy.settle(allocator));
+        try std.testing.expect(heavy.candidates.count() < 100);
+
+        var all: std.ArrayList(u64) = .empty;
+        defer all.deinit(allocator);
+        var it = totals.valueIterator();
+        while (it.next()) |c| try all.append(allocator, c.*);
+        std.sort.pdq(u64, all.items, {}, std.sort.desc(u64));
+        const kth = all.items[3];
+        var buf: [48]u8 = undefined;
+        var kit = totals.iterator();
+        while (kit.next()) |e| {
+            const key = e.key_ptr.*;
+            if (e.value_ptr.* >= kth) try std.testing.expect(heavy.keeps(key));
+            if (heavy.keeps(key)) try std.testing.expect(heavy.maySign(keySignature(testKeyBytes(&buf, key))));
+        }
+        const sorted = heavy.sorted.?;
+        try std.testing.expectEqual(heavy.candidates.count(), sorted.len);
+        for (sorted, 0..) |c, i| {
+            try std.testing.expect(heavy.keeps(c.key));
+            try std.testing.expectEqualStrings(testKeyBytes(&buf, c.key), c.bytes);
+            if (i > 0) try std.testing.expect(std.mem.lessThan(u8, sorted[i - 1].bytes, c.bytes));
+        }
+    }
+}
+
+test "heavy keys decline when the slack reaches the need-th partial" {
+    // Every unit holds 50 fresh keys of 8 rows, one unit per worker: each
+    // worker's lone unit has t = 3, so the four units' slack (8) reaches the
+    // best partial (8), and a key no unit reported could tie it.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const units = try arena.alloc([]const [2]u64, 4);
+    for (units, 0..) |*unit, u| {
+        const keys = try arena.alloc([2]u64, 50);
+        for (keys, 0..) |*kc, i| kc.* = .{ u * 50 + i, 8 };
+        unit.* = keys;
+    }
+    var heavy = try HeavyKeys.init(allocator, 2, 4);
+    defer heavy.deinit(allocator);
+    try heavyTallyUnits(allocator, &heavy, units, 4);
+    try std.testing.expect(!try heavy.settle(allocator));
+}
+
+test "heavy keys track each worker's need-th best partial as keys overtake it" {
+    const allocator = std.testing.allocator;
+    var heavy = try HeavyKeys.init(allocator, 2, 1);
+    defer heavy.deinit(allocator);
+    try heavy.report(allocator, 0, 1, "k1", 10);
+    try std.testing.expectEqual(@as(u64, 0), heavy.workers[0].kth());
+    try heavy.report(allocator, 0, 2, "k2", 5);
+    try std.testing.expectEqual(@as(u64, 5), heavy.workers[0].kth());
+    try heavy.report(allocator, 0, 3, "k3", 7);
+    try std.testing.expectEqual(@as(u64, 7), heavy.workers[0].kth());
+    try heavy.report(allocator, 0, 2, "k2", 6);
+    try std.testing.expectEqual(@as(u64, 10), heavy.workers[0].kth());
+    try heavy.report(allocator, 0, 1, "k1", 1);
+    try std.testing.expectEqual(@as(u64, 11), heavy.workers[0].kth());
+    heavy.endUnit(0, 100, 1);
+    // A 50-row unit's share of the 11-row second best is 5; its own second
+    // best (40) is larger, so t - 1 is a quarter of 5.
+    try std.testing.expectEqual(@as(u64, 2), heavy.unitThreshold(0, 50, 40));
+}
+
+test "heavy keys find the candidates among ascending distinct keys by search" {
+    const allocator = std.testing.allocator;
+    var heavy = try HeavyKeys.init(allocator, 2, 2);
+    defer heavy.deinit(allocator);
+    // Keys "b", "d" and "f" are hot on both workers.
+    const hot = [_][]const u8{ "b", "d", "f" };
+    for (0..2) |w| {
+        for (hot, 0..) |k, i| try heavy.report(allocator, w, 100 + i, k, 50);
+        heavy.endUnit(w, 200, 1);
+    }
+    try std.testing.expect(try heavy.settle(allocator));
+    try std.testing.expectEqual(@as(usize, 3), heavy.sorted.?.len);
+
+    const Keys = struct {
+        values: []const []const u8,
+        fn rowBytes(self: @This(), r: usize) []const u8 {
+            return self.values[r];
+        }
+    };
+    const Case = struct { rows: []const []const u8, want: []const usize };
+    const cases = [_]Case{
+        .{ .rows = &.{ "a", "b", "c", "d", "e", "f", "g" }, .want = &.{ 1, 3, 5 } },
+        .{ .rows = &.{ "c", "d", "e" }, .want = &.{1} },
+        .{ .rows = &.{ "a", "c", "e", "g" }, .want = &.{} },
+        .{ .rows = &.{ "b", "f" }, .want = &.{ 0, 1 } },
+        .{ .rows = &.{}, .want = &.{} },
+    };
+    var mask: [8]bool = undefined;
+    var ids: [8]u128 = undefined;
+    for (cases) |c| {
+        const n_rows = c.rows.len;
+        const found = heavy.findSorted(Keys{ .values = c.rows }, mask[0..n_rows], ids[0..n_rows]);
+        try std.testing.expectEqual(c.want.len, found);
+        var n: usize = 0;
+        for (mask[0..n_rows], 0..) |m, r| {
+            if (!m) continue;
+            try std.testing.expect(n < c.want.len);
+            try std.testing.expectEqual(c.want[n], r);
+            try std.testing.expect(heavy.keeps(ids[r]));
+            n += 1;
+        }
+    }
+    try std.testing.expect(heavy.searchPays(1000));
+    try std.testing.expect(!heavy.searchPays(20));
+}
+
+test "heavy keys search only when every candidate's bytes were kept" {
+    const allocator = std.testing.allocator;
+    var heavy = try HeavyKeys.init(allocator, 1, 1);
+    defer heavy.deinit(allocator);
+    try heavy.report(allocator, 0, 1, "a", 1);
+    try heavy.report(allocator, 0, 2, "b", 1);
+    heavy.endUnit(0, 2, 1);
+    try std.testing.expect(try heavy.settle(allocator));
+    try std.testing.expect(heavy.keeps(1) and heavy.keeps(2));
+    try std.testing.expect(heavy.sorted == null);
+    try std.testing.expect(!heavy.searchPays(1 << 20));
 }
