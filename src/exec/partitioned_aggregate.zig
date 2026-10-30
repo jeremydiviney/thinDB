@@ -888,11 +888,11 @@ pub const PartitionedAggregate = struct {
         var pool = Pool{ .owner = self };
         defer for (self.workers) |*w| w.hashes.deinit(self.worker_alloc);
 
-        var threads: [MAX_PARTS]std.Thread = undefined;
+        var threads: [MAX_PARTS]parallel.Helper = undefined;
         var spawned: usize = 0;
         var grant = core_scheduler.reserveWorkers(self.n_parts);
         while (spawned + 1 < grant.count) {
-            threads[spawned] = std.Thread.spawn(.{}, Pool.workerMain, .{&pool}) catch break;
+            threads[spawned] = parallel.spawn(Pool.workerMain, .{&pool}) catch break;
             spawned += 1;
         }
         // Helpers wait for the first publish before touching `parked`.

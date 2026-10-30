@@ -1356,8 +1356,8 @@ fn digestAll(kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, d
             .end = @intCast(if (w + 1 == workers) n else @as(usize, n) * (w + 1) / workers),
         };
     }
-    var handles: [MAX_DIGEST_WORKERS]?std.Thread = .{null} ** MAX_DIGEST_WORKERS;
-    for (1..workers) |w| handles[w] = std.Thread.spawn(.{}, DigestJob.run, .{&jobs[w]}) catch null;
+    var handles: [MAX_DIGEST_WORKERS]?parallel.Helper = .{null} ** MAX_DIGEST_WORKERS;
+    for (1..workers) |w| handles[w] = parallel.spawn(DigestJob.run, .{&jobs[w]}) catch null;
     jobs[0].run();
     for (1..workers) |w| {
         if (handles[w]) |t| t.join() else jobs[w].run();

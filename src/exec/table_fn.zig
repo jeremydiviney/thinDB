@@ -601,7 +601,7 @@ pub const TableFnExec = struct {
         }
 
         var dp = DrainPar{ .op = self, .arenas = drain_arenas, .stores = input_cols, .owned = owned };
-        var dworkers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var dworkers: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
         var n_dworkers: usize = 0;
         var max_tiles: usize = 1;
         var drain_grant: core_scheduler.Workers = .{};
@@ -627,7 +627,7 @@ pub const TableFnExec = struct {
                 drain_grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, owned.len - 1), max_drain_workers) + 1);
                 const want = drain_grant.count - 1;
                 while (n_dworkers < want) {
-                    dworkers[n_dworkers] = std.Thread.spawn(.{}, DrainPar.worker, .{&dp}) catch break;
+                    dworkers[n_dworkers] = parallel.spawn(DrainPar.worker, .{&dp}) catch break;
                     n_dworkers += 1;
                 }
                 dp.parked.store(n_dworkers, .release);
@@ -893,9 +893,9 @@ pub const TableFnExec = struct {
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
-            var threads: [16]?std.Thread = .{null} ** 16;
+            var threads: [16]?parallel.Helper = .{null} ** 16;
             const want = @min(n_workers, threads.len);
-            for (threads[0..want]) |*th| th.* = std.Thread.spawn(.{}, Ctx.main, .{&ctx}) catch null;
+            for (threads[0..want]) |*th| th.* = parallel.spawn(Ctx.main, .{&ctx}) catch null;
             var spawned: usize = 0;
             for (threads[0..want]) |th| {
                 if (th) |t| {
@@ -1292,11 +1292,11 @@ pub const TableFnExec = struct {
         var next_group = std.atomic.Value(usize).init(0);
         var abort = std.atomic.Value(bool).init(false);
         const batch = claimBatch(groups.len, n_workers);
-        const threads = try a.alloc(?std.Thread, n_workers);
+        const threads = try a.alloc(?parallel.Helper, n_workers);
         defer a.free(threads);
         @memset(threads, null);
         for (workers, threads, 0..) |*w, *th, wid| {
-            th.* = std.Thread.spawn(.{}, Worker.main, .{
+            th.* = parallel.spawn(Worker.main, .{
                 w, @as(u32, @intCast(wid)), groups, segs, &next_group, &abort, batch,
             }) catch null;
         }
@@ -1732,9 +1732,9 @@ pub const TableFnExec = struct {
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
-            var threads: [16]?std.Thread = .{null} ** 16;
+            var threads: [16]?parallel.Helper = .{null} ** 16;
             const want = @min(n_workers, threads.len);
-            for (threads[0..want]) |*th| th.* = std.Thread.spawn(.{}, Ctx.main, .{&ctx}) catch null;
+            for (threads[0..want]) |*th| th.* = parallel.spawn(Ctx.main, .{&ctx}) catch null;
             var spawned: usize = 0;
             for (threads[0..want]) |th| {
                 if (th) |t| {
@@ -1828,11 +1828,11 @@ pub const TableFnExec = struct {
         var next_run = std.atomic.Value(usize).init(0);
         var abort = std.atomic.Value(bool).init(false);
         const batch = claimBatch(runs.len, n_workers);
-        const threads = try self.allocator.alloc(?std.Thread, n_workers);
+        const threads = try self.allocator.alloc(?parallel.Helper, n_workers);
         defer self.allocator.free(threads);
         @memset(threads, null);
         for (workers, threads, 0..) |*w, *th, wid| {
-            th.* = std.Thread.spawn(.{}, Worker.main, .{
+            th.* = parallel.spawn(Worker.main, .{
                 w, @as(u32, @intCast(wid)), runs, segs, &next_run, &abort, batch,
             }) catch null;
             // Spawn failure: this worker's runs are claimed by the others.
@@ -2360,9 +2360,9 @@ pub const TableFnExec = struct {
             // A failed spawn runs the phase inline on this thread — slower,
             // never wrong (each worker index owns a fixed row range).
             fn runPhase(job: *@This(), comptime phase: fn (*@This(), usize) void) void {
-                var threads: [32]?std.Thread = @splat(null);
+                var threads: [32]?parallel.Helper = @splat(null);
                 for (1..job.workers) |w| {
-                    threads[w] = std.Thread.spawn(.{}, phase, .{ job, w }) catch blk: {
+                    threads[w] = parallel.spawn(phase, .{ job, w }) catch blk: {
                         phase(job, w);
                         break :blk null;
                     };

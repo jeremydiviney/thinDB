@@ -26,6 +26,7 @@
 //! empty-input row.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 const exec = @import("exec.zig");
 const ir = @import("../ir/ir.zig");
@@ -226,7 +227,7 @@ pub const ParallelReduceAggregate = struct {
         agg: exec.Query,
         out: ?exec.Batch = null,
         err: ?anyerror = null,
-        thread: ?std.Thread = null,
+        thread: ?parallel.Helper = null,
 
         fn main(w: *Worker) void {
             w.out = w.agg.next() catch |e| blk: {
@@ -335,7 +336,7 @@ pub const ParallelReduceAggregate = struct {
             self.n_built += 1;
         }
         for (self.workers) |*w| {
-            w.thread = std.Thread.spawn(.{}, Worker.main, .{w}) catch blk: {
+            w.thread = parallel.spawn(Worker.main, .{w}) catch blk: {
                 Worker.main(w);
                 break :blk null;
             };

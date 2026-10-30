@@ -59,6 +59,7 @@ const transform = @import("../engine/transform.zig");
 const Derived = @import("compute.zig").Derived;
 const Compute = @import("compute.zig").Compute;
 const core_scheduler = @import("../util/core_scheduler.zig");
+const parallel = @import("../util/parallel.zig");
 const expr_mod = @import("expr.zig");
 const Expr = expr_mod.Expr;
 const ChunkRangeScan = @import("mat_stage.zig").ChunkRangeScan;
@@ -922,7 +923,7 @@ pub const ParallelScan = struct {
     // Round state (touched only on the calling thread, between fork-joins).
     round: []?Batch, // one slot per worker; the batch it produced this round
     werr: []?anyerror, // one slot per worker; error from its next(), if any
-    threads: []std.Thread,
+    threads: []parallel.Helper,
     thread_active: []bool,
     exhausted: []bool, // worker has returned null (done)
     round_cursor: usize, // next round slot to emit; == workers.len ⇒ run a round
@@ -1166,7 +1167,7 @@ pub const ParallelScan = struct {
         errdefer allocator.free(round);
         const werr = try allocator.alloc(?anyerror, n_chunks);
         errdefer allocator.free(werr);
-        const threads = try allocator.alloc(std.Thread, n_chunks);
+        const threads = try allocator.alloc(parallel.Helper, n_chunks);
         errdefer allocator.free(threads);
         const thread_active = try allocator.alloc(bool, n_chunks);
         errdefer allocator.free(thread_active);
@@ -1272,7 +1273,7 @@ pub const ParallelScan = struct {
         errdefer allocator.free(round);
         const werr = try allocator.alloc(?anyerror, n_chunks);
         errdefer allocator.free(werr);
-        const threads = try allocator.alloc(std.Thread, n_chunks);
+        const threads = try allocator.alloc(parallel.Helper, n_chunks);
         errdefer allocator.free(threads);
         const thread_active = try allocator.alloc(bool, n_chunks);
         errdefer allocator.free(thread_active);
@@ -1389,7 +1390,7 @@ pub const ParallelScan = struct {
         errdefer self.allocator.free(round);
         const werr = try self.allocator.alloc(?anyerror, n_chunks);
         errdefer self.allocator.free(werr);
-        const threads = try self.allocator.alloc(std.Thread, n_chunks);
+        const threads = try self.allocator.alloc(parallel.Helper, n_chunks);
         errdefer self.allocator.free(threads);
         const thread_active = try self.allocator.alloc(bool, n_chunks);
         errdefer self.allocator.free(thread_active);
@@ -1674,10 +1675,10 @@ pub const ParallelScan = struct {
         defer self.allocator.free(states);
         for (states) |*st| st.* = .{ .arena = std.heap.ArenaAllocator.init(self.worker_alloc) };
         defer for (states) |*st| st.deinit();
-        const spawned = try self.allocator.alloc(?std.Thread, threads);
+        const spawned = try self.allocator.alloc(?parallel.Helper, threads);
         defer self.allocator.free(spawned);
         @memset(spawned, null);
-        for (1..threads) |t| spawned[t] = std.Thread.spawn(.{}, KeyCollect.run, .{ &collect, &states[t] }) catch null;
+        for (1..threads) |t| spawned[t] = parallel.spawn(KeyCollect.run, .{ &collect, &states[t] }) catch null;
         KeyCollect.run(&collect, &states[0]);
         // A thread that failed to spawn leaves its passes to the others.
         for (spawned[1..]) |th| if (th) |t| t.join();
@@ -2356,7 +2357,7 @@ pub const ParallelScan = struct {
         errdefer self.allocator.free(round);
         const werr = try self.allocator.alloc(?anyerror, keep);
         errdefer self.allocator.free(werr);
-        const threads = try self.allocator.alloc(std.Thread, keep);
+        const threads = try self.allocator.alloc(parallel.Helper, keep);
         errdefer self.allocator.free(threads);
         const thread_active = try self.allocator.alloc(bool, keep);
         errdefer self.allocator.free(thread_active);
@@ -2669,7 +2670,7 @@ pub const ParallelScan = struct {
         if (self.chunk_claims) |c| c.runners = eff;
         var t: usize = 1;
         while (t < eff) : (t += 1) {
-            if (std.Thread.spawn(.{}, stealLoop, .{ self, drainables, ta })) |th| {
+            if (parallel.spawn(stealLoop, .{ self, drainables, ta })) |th| {
                 self.threads[t] = th;
                 self.thread_active[t] = true;
             } else |_| {
@@ -2973,7 +2974,7 @@ pub const ParallelScan = struct {
         self.eff_threads = eff;
         var i: usize = 1;
         while (i < eff) : (i += 1) {
-            if (std.Thread.spawn(.{}, roundWorker, .{self})) |th| {
+            if (parallel.spawn(roundWorker, .{self})) |th| {
                 self.threads[i] = th;
                 self.thread_active[i] = true;
             } else |_| {}
