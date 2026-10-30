@@ -53,6 +53,8 @@ pub const CountSketch = struct {
     threshold: u64 = 0,
     rows: u64 = 0,
     kept_rows: u64 = 0,
+    /// Where the tally records its rows' counters for the filter pass.
+    row_slots: ?RowSlots = null,
 
     pub fn init(allocator: Allocator, bits: u6, workers: usize) !CountSketch {
         std.debug.assert(bits >= 6);
@@ -67,6 +69,7 @@ pub const CountSketch = struct {
         allocator.free(self.counts);
         allocator.free(self.touched);
         if (self.keep.len > 0) allocator.free(self.keep);
+        if (self.row_slots) |*rs| rs.deinit();
         self.* = undefined;
     }
 
@@ -81,13 +84,14 @@ pub const CountSketch = struct {
     }
 
     /// Counts each identity's rows (`weights[i]` of them, else one) into
-    /// `counts`, a worker's counters.
-    pub fn tally(self: *const CountSketch, counts: []u32, ids: []const u128, weights: ?[]const u32) void {
+    /// `counts`, a worker's counters, and writes identity i's counter to
+    /// `slots_out[i]` when given.
+    pub fn tally(self: *const CountSketch, counts: []u32, ids: []const u128, weights: ?[]const u32, slots_out: ?[]u32) void {
         var slots: [TALLY_LANE]u32 = undefined;
         var lo: usize = 0;
         while (lo < ids.len) : (lo += TALLY_LANE) {
             const lane = ids[lo..@min(ids.len, lo + TALLY_LANE)];
-            const lane_slots = slots[0..lane.len];
+            const lane_slots = if (slots_out) |out| out[lo..][0..lane.len] else slots[0..lane.len];
             for (lane, lane_slots) |id, *s| s.* = @intCast(self.counter(id));
             if (weights) |w| {
                 for (lane_slots, w[lo..][0..lane.len], 0..) |s, n, i| {
@@ -173,6 +177,48 @@ pub const CountSketch = struct {
     pub fn exact(self: *const CountSketch, need: usize, found: usize, kth_count: u64) bool {
         if (self.kept_rows == self.rows) return true;
         return found >= need and kth_count + 1 >= self.threshold;
+    }
+};
+
+/// Each row's counter, per row group a tally saw whole, so the filter pass's
+/// scan can drop the rows of the counters it doesn't keep before decoding
+/// them (`Scan.RowSieve`). The filter pass still tests every row it gets.
+pub const RowSlots = struct {
+    allocator: Allocator,
+    /// Per segment of the snapshot, the flat index of its first row group.
+    seg_first: []usize,
+    /// Per flat row group, its rows' counters once a tally records them.
+    rows: []?[]const u32,
+
+    /// Room for the row groups of `segments`, each entry's
+    /// `row_group_count` of them.
+    pub fn init(allocator: Allocator, segments: anytype) !RowSlots {
+        const seg_first = try allocator.alloc(usize, segments.len);
+        errdefer allocator.free(seg_first);
+        var total: usize = 0;
+        for (segments, seg_first) |entry, *first| {
+            first.* = total;
+            total += entry.row_group_count;
+        }
+        const rows = try allocator.alloc(?[]const u32, total);
+        @memset(rows, null);
+        return .{ .allocator = allocator, .seg_first = seg_first, .rows = rows };
+    }
+
+    pub fn deinit(self: *RowSlots) void {
+        for (self.rows) |r| if (r) |slots| self.allocator.free(slots);
+        self.allocator.free(self.rows);
+        self.allocator.free(self.seg_first);
+    }
+
+    /// Room for the `n` counters of segment `seg`'s row group `rg`. Only
+    /// the worker that tallies a row group may record it.
+    pub fn record(self: *RowSlots, seg: usize, rg: usize, n: usize) ![]u32 {
+        const slots = try self.allocator.alloc(u32, n);
+        const at = &self.rows[self.seg_first[seg] + rg];
+        if (at.*) |prior| self.allocator.free(prior);
+        at.* = slots;
+        return slots;
     }
 };
 
@@ -576,8 +622,10 @@ test "tally counts like one increment per identity, by weight when given" {
         w.* = random.intRangeAtMost(u32, 1, 9);
     }
 
-    sketch.tally(sketch.workerCounts(0), ids, null);
-    sketch.tally(sketch.workerCounts(1), ids, weights);
+    const recorded = try allocator.alloc(u32, n);
+    defer allocator.free(recorded);
+    sketch.tally(sketch.workerCounts(0), ids, null, recorded);
+    sketch.tally(sketch.workerCounts(1), ids, weights, null);
     const expected_rows = try allocator.alloc(u32, @as(usize, 1) << sketch.bits);
     defer allocator.free(expected_rows);
     const expected_weighted = try allocator.alloc(u32, expected_rows.len);
@@ -590,8 +638,9 @@ test "tally counts like one increment per identity, by weight when given" {
     }
     try std.testing.expectEqualSlices(u32, expected_rows, sketch.workerCounts(0));
     try std.testing.expectEqualSlices(u32, expected_weighted, sketch.workerCounts(1));
+    for (ids, recorded) |id, slot| try std.testing.expectEqual(sketch.counter(id), slot);
 
-    sketch.tally(sketch.workerCounts(2), ids[0..0], null);
+    sketch.tally(sketch.workerCounts(2), ids[0..0], null, null);
     for (sketch.workerCounts(2)) |c| try std.testing.expectEqual(@as(u32, 0), c);
 }
 
