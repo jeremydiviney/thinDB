@@ -112,7 +112,6 @@ const DistinctProducer = union(enum) {
 const MAX_KEYS: usize = 8;
 const MAX_AGGS: usize = 16;
 const TILE_RGS: usize = 16;
-const PREFETCH_DIST: usize = 32;
 const PREFETCH_DIST_DISTINCT: usize = 24;
 
 // Routing gate. The crossover against the silo is "does one worker's full
@@ -122,6 +121,23 @@ const PREFETCH_DIST_DISTINCT: usize = 24;
 // worker. The byte cap tightens the gate for wide aggregate programs.
 const GATE_GROUPS: u64 = 64 * 1024;
 const GATE_STATE_BYTES: u64 = 4 << 20;
+
+// A lone key part whose values span at most this many slots resolves gids
+// through a per-worker array instead of hashing every run: 1 MB of u32 gids.
+// The span must also stay within a small multiple of the groups, so a few
+// groups spread thinly don't each cost their own cache line.
+const DIRECT_MAX_SPAN: u64 = 1 << 18;
+const DIRECT_SPAN_PER_GROUP: u64 = 64;
+
+// The packed keys a worker's direct gid array covers: key k sits at
+// `(k -% base) & mask` when that is below `span`. Every other key, such as a
+// memtable value outside the segment stats, takes the group table, which
+// stays the source of truth either way.
+const DirectRange = struct {
+    base: u64,
+    mask: u64,
+    span: u32,
+};
 
 const AggOp = enum { count_star, count_col, sum, avg, min, max, count_distinct };
 
@@ -398,6 +414,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     // for the COMBINED key cardinality. Unknown NDV on any key → silo. The
     // probe also proves the WHERE fuses, so the per-worker opens can't fail.
     var est_groups: u64 = 0;
+    var direct: ?DirectRange = null;
     {
         const probe = Scan.allocWithProjectionLoc(allocator, table, null, needed.items, false, null) catch
             return declineFree(allocator, aggs);
@@ -437,6 +454,10 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             }
         }
         est_groups = @max(@min(product, @max(exec.keyTupleBound(st, from_row), 1)), 1);
+        if (request.group_cols.len == 1) {
+            const idx = types.findColumn(probe_schema, request.group_cols[0]).?;
+            direct = directRangeOf(parts[0], st.column_stats[idx], est_groups);
+        }
     }
     const state_stride: u64 = 8 + @as(u64, request.aggs.len) * 24;
     if (est_groups > GATE_GROUPS or est_groups * state_stride > GATE_STATE_BYTES) return declineFree(allocator, aggs);
@@ -475,8 +496,34 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
     errdefer allocator.free(needed_owned);
     const op = try allocator.create(LowCardGroup);
     errdefer allocator.destroy(op);
-    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, needed_owned, dicts, distinct_dicts);
+    op.* = try LowCardGroup.init(allocator, table, request, parts, aggs, n_distinct, @intCast(key_bits), est_groups, direct, needed_owned, dicts, distinct_dicts);
     return exec.makeQuery(allocator, op);
+}
+
+// A coded key's dict codes run from 0 up to its exact distinct count; an
+// integer key's packed values run from its packed minimum, taken modulo the
+// part's width so a negative minimum still counts up. A nullable part packs a
+// validity bit outside the width, so it keeps the group table.
+fn directRangeOf(part: KeyPart, stat: exec.ColStat, est_groups: u64) ?DirectRange {
+    if (part.nullable) return null;
+    const mask: u64 = if (part.width >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(part.width)) - 1;
+    var base: u64 = 0;
+    var span: u64 = 0;
+    if (part.coded) {
+        span = switch (stat.ndv) {
+            .exact => |n| n,
+            .unknown => return null,
+        };
+    } else {
+        const lo = stat.min orelse return null;
+        const hi = stat.max orelse return null;
+        if (lo < std.math.minInt(i64) or hi > std.math.maxInt(i64)) return null;
+        if (hi < lo or hi - lo >= DIRECT_MAX_SPAN) return null;
+        base = truncBits(@bitCast(@as(i64, @intCast(lo))), part.width);
+        span = @intCast(hi - lo + 1);
+    }
+    if (span == 0 or span > DIRECT_MAX_SPAN or span > est_groups * DIRECT_SPAN_PER_GROUP) return null;
+    return .{ .base = base, .mask = mask, .span = @intCast(span) };
 }
 
 fn declineFree(allocator: Allocator, aggs: []AggPlan) ?Query {
@@ -660,25 +707,37 @@ const WState = struct {
     ssets: []DistinctStrSet = &.{},
     // gid → merged gid, filled after the scalar merge for the string merge.
     mgid_of: []u32 = &.{},
-    // Per-batch scratch (reused): each row's packed key and resolved gid, and
-    // where each run of one gid ends, so the per-aggregate kernels run over
-    // dense arrays instead of re-probing or re-finding runs;
+    // Per-batch scratch (reused): each row's packed key, where each run of one
+    // gid ends and that run's gid, so the per-aggregate kernels run over
+    // dense arrays instead of re-probing or re-finding runs; `gids_scratch`
+    // holds every row's gid for the string distinct kernel.
     // `codes_scratch` holds a coded input's codes when a batch lacks the sidecar.
     // `valid_scratch` holds each row's validity byte when it rides the high word.
     // They live on the worker's scratch allocator, the rest on the query's.
     keys_scratch: std.ArrayListUnmanaged(u64) = .empty,
     valid_scratch: std.ArrayListUnmanaged(u8) = .empty,
     gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
+    run_gids_scratch: std.ArrayListUnmanaged(u32) = .empty,
     ends_scratch: std.ArrayListUnmanaged(u32) = .empty,
     codes_scratch: std.ArrayListUnmanaged(u32) = .empty,
     // Intern memos for batches without the code sidecar, one per coded key
     // part / coded COUNT(DISTINCT) input, created on first use.
     key_memos: [MAX_KEYS]?GlobalDict.Memo = @splat(null),
     distinct_memos: [MAX_AGGS]?GlobalDict.Memo = @splat(null),
+    // The gid of each key in `direct_range`, EMPTY until its first run; on
+    // the worker's scratch allocator.
+    direct_range: DirectRange = undefined,
+    direct_gids: []u32 = &.{},
 
-    fn init(allocator: Allocator, expected_groups: usize, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
+    fn init(allocator: Allocator, scratch_allocator: Allocator, expected_groups: usize, direct: ?DirectRange, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
         errdefer self.table.deinit(allocator);
+        if (direct) |range| {
+            self.direct_gids = try scratch_allocator.alloc(u32, range.span);
+            @memset(self.direct_gids, group_table.EMPTY);
+            self.direct_range = range;
+        }
+        errdefer if (self.direct_gids.len > 0) scratch_allocator.free(self.direct_gids);
         const producers = try allocator.alloc(?DistinctProducer, shared.len);
         errdefer allocator.free(producers);
         for (producers, shared) |*producer, slot| producer.* = if (slot) |s| switch (s) {
@@ -700,8 +759,10 @@ const WState = struct {
         self.keys_scratch.deinit(scratch_allocator);
         self.valid_scratch.deinit(scratch_allocator);
         self.gids_scratch.deinit(scratch_allocator);
+        self.run_gids_scratch.deinit(scratch_allocator);
         self.ends_scratch.deinit(scratch_allocator);
         self.codes_scratch.deinit(scratch_allocator);
+        if (self.direct_gids.len > 0) scratch_allocator.free(self.direct_gids);
         for (&self.key_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
         for (&self.distinct_memos) |*slot| if (slot.*) |*memo| memo.deinit(allocator);
         self.counts.deinit(allocator);
@@ -839,10 +900,7 @@ fn packKeysForPart(comptime assign: bool, w: *Worker, batch: Batch, part_i: usiz
                     putKey(assign, k, (truncBits(raw, width) & keep) << shift);
                 }
             } else {
-                for (keys, s[0..keys.len]) |*k, v| {
-                    const raw: u64 = @bitCast(@as(i64, v));
-                    putKey(assign, k, truncBits(raw, width) << shift);
-                }
+                packIntPart(assign, @TypeOf(s[0]), s[0..keys.len], keys, width, shift);
             }
         },
         else => return error.UnsupportedQueryShape,
@@ -851,6 +909,28 @@ fn packKeysForPart(comptime assign: bool, w: *Worker, batch: Batch, part_i: usiz
 
 inline fn putKey(comptime assign: bool, k: *u64, bits: u64) void {
     if (assign) k.* = bits else k.* |= bits;
+}
+
+const PACK_LANES = 8;
+
+// A non-nullable integer part's bits, a vector at a time: the scalar loop
+// stayed scalar in ReleaseFast.
+fn packIntPart(comptime assign: bool, comptime T: type, vals: []const T, keys: []u64, width: u8, shift: u6) void {
+    const mask: u64 = if (width >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
+    const mask_v: @Vector(PACK_LANES, u64) = @splat(mask);
+    const shift_v: @Vector(PACK_LANES, u6) = @splat(shift);
+    var r: usize = 0;
+    while (r + PACK_LANES <= keys.len) : (r += PACK_LANES) {
+        const v: @Vector(PACK_LANES, T) = vals[r..][0..PACK_LANES].*;
+        const raw: @Vector(PACK_LANES, u64) = @bitCast(@as(@Vector(PACK_LANES, i64), v));
+        const bits = (raw & mask_v) << shift_v;
+        const dst = keys[r..][0..PACK_LANES];
+        dst.* = if (assign) bits else dst.* | bits;
+    }
+    for (keys[r..], vals[r..]) |*k, v| {
+        const raw: u64 = @bitCast(@as(i64, v));
+        putKey(assign, k, (raw & mask) << shift);
+    }
 }
 
 // OR a nullable part's validity bit into every non-NULL row: into the packed
@@ -873,10 +953,9 @@ fn memoFor(slot: *?GlobalDict.Memo, dict: *GlobalDict) *GlobalDict.Memo {
 
 // The fold runs in passes so each inner loop is monomorphic: pass 0 packs
 // every row's key column-wise (pure compute, one monomorphic loop per key
-// part), pass 1 probes the group table with a look-ahead prefetch over the
-// packed keys, then each aggregate runs ONE specialized kernel over the dense
-// gid array — the op dispatch and the ValueView tag switch both hoisted out
-// of the row loops.
+// part), pass 1 finds the runs of equal keys and resolves each run's gid,
+// then each aggregate runs ONE specialized kernel over the runs — the op
+// dispatch and the ValueView tag switch both hoisted out of the row loops.
 fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const batch = pair.scan;
     const n = batch.row_count;
@@ -885,17 +964,24 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
 
-    try st.gids_scratch.resize(w.scratch_allocator, n);
-    try st.ends_scratch.resize(w.scratch_allocator, n);
+    try st.run_gids_scratch.resize(w.scratch_allocator, n);
+    try st.ends_scratch.resize(w.scratch_allocator, n + RUN_LANES);
     try st.keys_scratch.resize(w.scratch_allocator, n);
-    const gids = st.gids_scratch.items[0..n];
     const keys = st.keys_scratch.items[0..n];
     const wide = w.key_bits > 64;
     const n_runs = if (wide) wide: {
         try st.valid_scratch.resize(w.scratch_allocator, n);
-        break :wide try groupRows(true, w, batch, keys, st.valid_scratch.items[0..n], gids, st.ends_scratch.items);
-    } else try groupRows(false, w, batch, keys, st.valid_scratch.items[0..0], gids, st.ends_scratch.items);
+        break :wide try groupRows(true, w, batch, keys, st.valid_scratch.items[0..n], st.run_gids_scratch.items, st.ends_scratch.items);
+    } else try groupRows(false, w, batch, keys, st.valid_scratch.items[0..0], st.run_gids_scratch.items, st.ends_scratch.items);
     const ends = st.ends_scratch.items[0..n_runs];
+    const run_gids = st.run_gids_scratch.items[0..n_runs];
+    // Only the string distinct kernel reads a gid per row.
+    const gids: []const u32 = for (w.aggs) |a| {
+        if (a.op == .count_distinct and a.distinct_kind == .string) {
+            try st.gids_scratch.resize(w.scratch_allocator, n);
+            break expandRunGids(st.gids_scratch.items[0..n], ends, run_gids);
+        }
+    } else &.{};
 
     const ns = st.ns.items;
     const slots = st.slots.items;
@@ -906,19 +992,19 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
         const view = if (coded) batch.values[ci] else pair.aggs.values[ci];
         switch (a.op) {
             .count_star => unreachable,
-            .count_col => foldCountCol(view, gids, ends, ns, n_aggs, i),
+            .count_col => foldCountCol(view, run_gids, ends, ns, n_aggs, i),
             .sum, .avg => if (a.is_float)
-                foldSumFloat(view, gids, ends, ns, slots, n_aggs, i)
+                foldSumFloat(view, run_gids, ends, ns, slots, n_aggs, i)
             else
-                foldSumInt(view, gids, ends, ns, slots, n_aggs, i),
+                foldSumInt(view, run_gids, ends, ns, slots, n_aggs, i),
             .min => if (a.is_float)
-                foldExtremeFloat(true, view, gids, ends, ns, slots, n_aggs, i)
+                foldExtremeFloat(true, view, run_gids, ends, ns, slots, n_aggs, i)
             else
-                foldExtremeInt(true, view, gids, ends, ns, slots, n_aggs, i),
+                foldExtremeInt(true, view, run_gids, ends, ns, slots, n_aggs, i),
             .max => if (a.is_float)
-                foldExtremeFloat(false, view, gids, ends, ns, slots, n_aggs, i)
+                foldExtremeFloat(false, view, run_gids, ends, ns, slots, n_aggs, i)
             else
-                foldExtremeInt(false, view, gids, ends, ns, slots, n_aggs, i),
+                foldExtremeInt(false, view, run_gids, ends, ns, slots, n_aggs, i),
             .count_distinct => {
                 // The distinct kernels key by the packed key alone (tryBuild
                 // keeps them to keys that fit it).
@@ -934,13 +1020,14 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     }
 }
 
-// Resolve every row's gid and record where each run of equal keys ends in
-// `ends`; returns the run count.
-fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: []u8, gids: []u32, ends: []u32) !usize {
+// Pack every row's key, then record where each run of equal keys ends in
+// `ends` and each run's gid in `run_gids`; returns the run count. The table
+// is physically ordered, so clustered group keys arrive in runs: one probe
+// and one count bump per run.
+fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: []u8, run_gids: []u32, ends: []u32) !usize {
     const st = &w.state;
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
-    const n = keys.len;
 
     if (wide) @memset(valid, 0);
     for (w.parts, 0..) |p, pi| {
@@ -953,73 +1040,132 @@ fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: 
             packValidity(u64, keys, nulls, @intCast(p.valid_bit));
         }
     }
+    const runs = if (wide) wideRunEnds(keys, valid, ends) else runEnds(keys, ends);
+    if (!wide and st.direct_gids.len > 0) {
+        try resolveRunsDirect(w, keys, ends[0..runs], run_gids[0..runs]);
+        return runs;
+    }
 
-    var runs: usize = 0;
-    var r: usize = 0;
-    while (r < n) {
-        const pf = r + PREFETCH_DIST;
-        if (pf < n) {
+    var lo: usize = 0;
+    for (ends[0..runs], run_gids[0..runs], 0..) |end, *gid, i| {
+        if (i + PREFETCH_RUNS < runs) {
+            const pf = ends[i + PREFETCH_RUNS - 1];
             @prefetch(st.table.slotAddr(st.table.bucketOf(GroupTable.hashKey(tableKey(wide, keys, valid, pf)))), .{ .rw = .write, .locality = 1 });
         }
-        // Adjacent-equal run over the packed keys (the table is physically
-        // ordered, so clustered group keys arrive in runs): one probe and one
-        // count bump for the whole run.
-        const run_end = if (wide) wide: {
-            var end = r + 1;
-            while (end < n and keys[end] == keys[r] and valid[end] == valid[r]) end += 1;
-            break :wide end;
-        } else runEnd(keys, r);
-        const key = tableKey(wide, keys, valid, r);
+        const key = tableKey(wide, keys, valid, lo);
         const hash = GroupTable.hashKey(key);
         const probe = st.table.getOrPut(hash, key);
-        var gid: u32 = probe.gid;
-        if (!probe.found) {
-            gid = @intCast(st.counts.items.len);
-            try st.counts.append(allocator, 0);
-            try st.slots.appendNTimes(allocator, 0, n_aggs);
-            try st.ns.appendNTimes(allocator, 0, n_aggs);
-            // Grown on the miss rather than per batch, so a table holding a
-            // few hundred groups never sizes itself for a whole batch of new
-            // ones. A grow only stales the look-ahead prefetches issued.
-            const slot = if (st.table.needsGrow(1)) blk: {
-                try st.table.grow(allocator, 1);
-                break :blk st.table.getOrPut(hash, key).slot;
-            } else probe.slot;
-            st.table.commit(slot, key, gid);
-        }
-        st.counts.items[gid] += @intCast(run_end - r);
-        fillRun(gids, r, run_end, gid);
-        ends[runs] = @intCast(run_end);
-        runs += 1;
-        r = run_end;
+        gid.* = if (probe.found) probe.gid else try addGroup(st, allocator, n_aggs, hash, key, probe.slot);
+        st.counts.items[gid.*] += end - lo;
+        lo = end;
     }
     return runs;
 }
 
-const RUN_LANES = 8;
-
-// The end of the run of keys equal to `keys[r]`, found a vector at a time:
-// short runs, the common case, then cost no compare-and-branch per row.
-fn runEnd(keys: []const u64, r: usize) usize {
-    const head: @Vector(RUN_LANES, u64) = @splat(keys[r]);
-    var at = r + 1;
-    while (at + RUN_LANES <= keys.len) : (at += RUN_LANES) {
-        const block: @Vector(RUN_LANES, u64) = keys[at..][0..RUN_LANES].*;
-        const differ: u8 = @bitCast(block != head);
-        if (differ != 0) return at + @ctz(differ);
+// The gid of each run of a lone key part with a direct range: one load from
+// the worker's array, and only a key's first run, or a key outside the range,
+// probes the group table.
+fn resolveRunsDirect(w: *Worker, keys: []const u64, ends: []const u32, run_gids: []u32) !void {
+    const st = &w.state;
+    const range = st.direct_range;
+    const direct = st.direct_gids;
+    var lo: usize = 0;
+    for (ends, run_gids) |end, *gid| {
+        const key = keys[lo];
+        const at = (key -% range.base) & range.mask;
+        const in_range = at < direct.len;
+        gid.* = if (in_range and direct[at] != group_table.EMPTY) direct[at] else miss: {
+            const hash = GroupTable.hashKey(key);
+            const probe = st.table.getOrPut(hash, key);
+            const new_gid = if (probe.found) probe.gid else try addGroup(st, w.allocator, w.aggs.len, hash, key, probe.slot);
+            if (in_range) direct[at] = new_gid;
+            break :miss new_gid;
+        };
+        st.counts.items[gid.*] += end - lo;
+        lo = end;
     }
-    while (at < keys.len and keys[at] == keys[r]) at += 1;
-    return at;
 }
 
-// Set `gids[lo..hi]` to `gid`. A short run is one full-width store whose
-// overhang the next run overwrites.
-inline fn fillRun(gids: []u32, lo: usize, hi: usize, gid: u32) void {
-    if (hi - lo <= RUN_LANES and lo + RUN_LANES <= gids.len) {
-        gids[lo..][0..RUN_LANES].* = @splat(gid);
-    } else {
-        @memset(gids[lo..hi], gid);
+// A key's first run: a new gid with zeroed accumulators, committed to the
+// table. The table grows on the miss rather than per batch, so a table
+// holding a few hundred groups never sizes itself for a whole batch of new
+// ones. A grow only stales the look-ahead prefetches issued.
+fn addGroup(st: *WState, allocator: Allocator, n_aggs: usize, hash: u64, key: u128, probe_slot: usize) !u32 {
+    const gid: u32 = @intCast(st.counts.items.len);
+    try st.counts.append(allocator, 0);
+    try st.slots.appendNTimes(allocator, 0, n_aggs);
+    try st.ns.appendNTimes(allocator, 0, n_aggs);
+    const slot = if (st.table.needsGrow(1)) blk: {
+        try st.table.grow(allocator, 1);
+        break :blk st.table.getOrPut(hash, key).slot;
+    } else probe_slot;
+    st.table.commit(slot, key, gid);
+    return gid;
+}
+
+const RUN_LANES = 8;
+const PREFETCH_RUNS = 8;
+
+// For each mask of the lanes that start a run, those lanes' positions,
+// lowest first.
+const RUN_START_LANES: [1 << RUN_LANES][RUN_LANES]u8 = blk: {
+    @setEvalBranchQuota(4 * (1 << RUN_LANES) * RUN_LANES);
+    var table: [1 << RUN_LANES][RUN_LANES]u8 = @splat(@splat(0));
+    for (&table, 0..) |*lanes, mask| {
+        var k: usize = 0;
+        for (0..RUN_LANES) |lane| {
+            if ((mask >> lane) & 1 == 0) continue;
+            lanes[k] = lane;
+            k += 1;
+        }
     }
+    break :blk table;
+};
+
+// Where each run of equal keys ends, every row compared with the one before a
+// vector at a time. A block's run starts are written as one full vector and
+// the count advances by how many there were, so no branch depends on where a
+// run ends: `ends` must hold `RUN_LANES` slots past the row count.
+fn runEnds(keys: []const u64, ends: []u32) usize {
+    const n = keys.len;
+    var runs: usize = 0;
+    var r: usize = 1;
+    while (r + RUN_LANES <= n) : (r += RUN_LANES) {
+        const now: @Vector(RUN_LANES, u64) = keys[r..][0..RUN_LANES].*;
+        const prev: @Vector(RUN_LANES, u64) = keys[r - 1 ..][0..RUN_LANES].*;
+        const starts: u8 = @bitCast(now != prev);
+        const lanes: @Vector(RUN_LANES, u8) = RUN_START_LANES[starts];
+        ends[runs..][0..RUN_LANES].* = @as(@Vector(RUN_LANES, u32), @splat(@intCast(r))) + @as(@Vector(RUN_LANES, u32), lanes);
+        runs += @popCount(starts);
+    }
+    while (r < n) : (r += 1) {
+        if (keys[r] == keys[r - 1]) continue;
+        ends[runs] = @intCast(r);
+        runs += 1;
+    }
+    ends[runs] = @intCast(n);
+    return runs + 1;
+}
+
+fn wideRunEnds(keys: []const u64, valid: []const u8, ends: []u32) usize {
+    var runs: usize = 0;
+    for (1..keys.len) |r| {
+        if (keys[r] == keys[r - 1] and valid[r] == valid[r - 1]) continue;
+        ends[runs] = @intCast(r);
+        runs += 1;
+    }
+    ends[runs] = @intCast(keys.len);
+    return runs + 1;
+}
+
+// Every row's gid, from its run's.
+fn expandRunGids(gids: []u32, ends: []const u32, run_gids: []const u32) []const u32 {
+    var lo: usize = 0;
+    for (ends, run_gids) |end, gid| {
+        @memset(gids[lo..end], gid);
+        lo = end;
+    }
+    return gids;
 }
 
 inline fn tableKey(comptime wide: bool, keys: []const u64, valid: []const u8, r: usize) u128 {
@@ -1030,26 +1176,26 @@ inline fn tableKey(comptime wide: bool, keys: []const u64, valid: []const u8, r:
 // The fold kernels walk the runs `groupRows` found: a run's rows share one
 // gid (clustered keys arrive in runs), accumulate in registers and touch the
 // group's ns/slots entries once. Null rows stay inside the run walk.
-fn foldCountCol(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64, stride: usize, agg_i: usize) void {
+fn foldCountCol(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, stride: usize, agg_i: usize) void {
     var lo: usize = 0;
-    for (ends) |end| {
+    for (ends, run_gids) |end, gid| {
         const hi: usize = end;
         const cnt: u64 = if (view.nulls == null) hi - lo else count: {
             var c: u64 = 0;
             for (lo..hi) |r| c += @intFromBool(view.isValid(r));
             break :count c;
         };
-        if (cnt != 0) ns[@as(usize, gids[lo]) * stride + agg_i] += cnt;
+        if (cnt != 0) ns[@as(usize, gid) * stride + agg_i] += cnt;
         lo = hi;
     }
 }
 
-fn foldSumInt(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldSumInt(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
-            if (view.nulls == null) return foldSumIntDense(@TypeOf(s[0]), s, gids, ends, ns, slots, stride, agg_i);
+            if (view.nulls == null) return foldSumIntDense(@TypeOf(s[0]), s, run_gids, ends, ns, slots, stride, agg_i);
             var lo: usize = 0;
-            for (ends) |end| {
+            for (ends, run_gids) |end, gid| {
                 const hi: usize = end;
                 var acc: i128 = 0;
                 var cnt: u64 = 0;
@@ -1059,7 +1205,7 @@ fn foldSumInt(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64,
                     cnt += 1;
                 }
                 if (cnt != 0) {
-                    const o = @as(usize, gids[lo]) * stride + agg_i;
+                    const o = @as(usize, gid) * stride + agg_i;
                     ns[o] += cnt;
                     slots[o] += acc;
                 }
@@ -1072,25 +1218,25 @@ fn foldSumInt(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64,
 
 // Without NULLs every row counts. A run of values 32 bits wide or less sums
 // in i64: no batch holds the 2^31 rows that could overflow it.
-fn foldSumIntDense(comptime T: type, s: []const T, gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldSumIntDense(comptime T: type, s: []const T, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     const Acc = if (@bitSizeOf(T) <= 32) i64 else i128;
     var lo: usize = 0;
-    for (ends) |end| {
+    for (ends, run_gids) |end, gid| {
         const hi: usize = end;
         var acc: Acc = 0;
         for (s[lo..hi]) |v| acc += v;
-        const o = @as(usize, gids[lo]) * stride + agg_i;
+        const o = @as(usize, gid) * stride + agg_i;
         ns[o] += hi - lo;
         slots[o] += acc;
         lo = hi;
     }
 }
 
-fn foldSumFloat(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldSumFloat(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .float, .double => |s| {
             var lo: usize = 0;
-            for (ends) |end| {
+            for (ends, run_gids) |end, gid| {
                 const hi: usize = end;
                 var acc: f64 = 0;
                 var cnt: u64 = 0;
@@ -1100,7 +1246,7 @@ fn foldSumFloat(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u6
                     cnt += 1;
                 }
                 if (cnt != 0) {
-                    const o = @as(usize, gids[lo]) * stride + agg_i;
+                    const o = @as(usize, gid) * stride + agg_i;
                     ns[o] += cnt;
                     setSlotF64(&slots[o], slotF64(slots[o]) + acc);
                 }
@@ -1111,11 +1257,11 @@ fn foldSumFloat(view: ColumnView, gids: []const u32, ends: []const u32, ns: []u6
     }
 }
 
-fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldExtremeInt(comptime is_min: bool, view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
             var lo: usize = 0;
-            for (ends) |end| {
+            for (ends, run_gids) |end, gid| {
                 const hi: usize = end;
                 var best: i128 = 0;
                 var cnt: u64 = 0;
@@ -1126,7 +1272,7 @@ fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, en
                     cnt += 1;
                 }
                 if (cnt != 0) {
-                    const o = @as(usize, gids[lo]) * stride + agg_i;
+                    const o = @as(usize, gid) * stride + agg_i;
                     const was_empty = ns[o] == 0;
                     ns[o] += cnt;
                     const better = if (is_min) best < slots[o] else best > slots[o];
@@ -1139,11 +1285,11 @@ fn foldExtremeInt(comptime is_min: bool, view: ColumnView, gids: []const u32, en
     }
 }
 
-fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     switch (view.data) {
         inline .float, .double => |s| {
             var lo: usize = 0;
-            for (ends) |end| {
+            for (ends, run_gids) |end, gid| {
                 const hi: usize = end;
                 var best: f64 = 0;
                 var cnt: u64 = 0;
@@ -1154,7 +1300,7 @@ fn foldExtremeFloat(comptime is_min: bool, view: ColumnView, gids: []const u32, 
                     cnt += 1;
                 }
                 if (cnt != 0) {
-                    const o = @as(usize, gids[lo]) * stride + agg_i;
+                    const o = @as(usize, gid) * stride + agg_i;
                     const was_empty = ns[o] == 0;
                     ns[o] += cnt;
                     const better = if (is_min) best < slotF64(slots[o]) else best > slotF64(slots[o]);
@@ -1480,6 +1626,7 @@ const LowCardGroup = struct {
     offset: usize,
     dop: usize,
     est_groups: u64,
+    direct: ?DirectRange,
     needed: []const []const u8,
     output_schema: []Column,
     output_cols: []ColumnStore,
@@ -1497,6 +1644,7 @@ const LowCardGroup = struct {
         n_distinct: u16,
         key_bits: u8,
         est_groups: u64,
+        direct: ?DirectRange,
         needed: []const []const u8,
         dicts: []?*GlobalDict,
         distinct_dicts: []?*GlobalDict,
@@ -1544,6 +1692,7 @@ const LowCardGroup = struct {
             .offset = request.offset,
             .dop = request.dop,
             .est_groups = est_groups,
+            .direct = direct,
             .needed = needed,
             .output_schema = output_schema,
             .output_cols = output_cols,
@@ -1596,6 +1745,7 @@ const LowCardGroup = struct {
             try out.appendSlice(allocator, @tagName(a.distinct_kind));
             sep = ",";
         }
+        if (self.direct != null) try out.appendSlice(allocator, "; gid map");
         try out.appendSlice(allocator, ")\n");
         try exec.explainIndent(out, allocator, depth + 1);
         try out.appendSlice(allocator, "Scan ");
@@ -1720,7 +1870,7 @@ const LowCardGroup = struct {
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .source = source,
-                .state = try WState.init(allocator, @intCast(self.est_groups), shared, n_workers),
+                .state = try WState.init(allocator, scan_allocator, @intCast(self.est_groups), self.direct, shared, n_workers),
                 .parts = self.parts[0..self.part_count],
                 .dicts = self.dicts,
                 .distinct_dicts = self.distinct_dicts,
