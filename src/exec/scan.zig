@@ -712,6 +712,9 @@ pub const Scan = struct {
         /// in place.
         offsets: std.ArrayListUnmanaged(u32) = .empty,
         digests: std.ArrayListUnmanaged(u128) = .empty,
+        /// The consumer reads only the dictionary's values when they all
+        /// occur, so a whole row group skips decoding its codes.
+        entries_only: bool = false,
         block: ?storage.ReadSegment.BorrowedBlock = null,
         /// The row group whose dictionary `block`, and `offsets` or
         /// `digests`, hold.
@@ -1399,6 +1402,13 @@ pub const Scan = struct {
         }
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as read
+    /// only through its dictionary's values: a batch that holds every value
+    /// (`BlockDictColumn.every_value`) comes without codes.
+    pub fn setBlockDictEntriesOnly(self: *Scan, j: usize) void {
+        self.dict_bufs[j].entries_only = true;
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1448,15 +1458,17 @@ pub const Scan = struct {
             buf.held = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx };
         }
         const db = storage.segment_reader.dictBlockOf(buf.block.?.bytes, rg_count);
-        const n = if (rows) |r| r.len else rg_count;
+        const every_value = rows == null;
+        const codes_wanted = !(every_value and buf.entries_only);
+        const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| {
             for (r, buf.codes.items) |row, *c| c.* = db.rowCode(row);
         } else {
             for (buf.codes.items, 0..) |*c, row| c.* = db.rowCode(row);
         }
-        if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items };
-        return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes } };
+        if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
+        return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
     }
 
     /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when

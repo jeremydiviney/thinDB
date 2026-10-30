@@ -1776,6 +1776,11 @@ pub const BlockDictColumn = struct {
     codes: []const u32,
     dict: storage.StringView,
     digests: ?[]const u128 = null,
+    /// Every dictionary value occurs in the batch's rows: the batch is its
+    /// whole row group, whose dictionary is the block's distinct values. A
+    /// consumer that asked for entries only (`Scan.setBlockDictEntriesOnly`)
+    /// then gets no `codes`.
+    every_value: bool = false,
 
     pub fn valueCount(self: BlockDictColumn) usize {
         return if (self.digests) |d| d.len else self.dict.rowCount();
