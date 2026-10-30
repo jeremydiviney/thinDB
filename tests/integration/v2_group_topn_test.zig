@@ -2326,6 +2326,114 @@ test "V2 lowcard groups nullable integer keys: NULL apart from 0, one NULL group
     }
 }
 
+// Single-key lowcard groups through the direct gid map. INT and BIGINT keys
+// run negative, so they sit below the masked base; a DELETE empties the
+// range's lowest key while the segment stats still cover it; memtable rows,
+// with keys past the flushed range, null the int range (no map) and take the
+// string key, with values the flushed dictionary never saw, off lowcard.
+const DkRow = struct { id: i64, k: i32, kb: i64, s: []const u8, w: i32 };
+const DK_STRINGS = [_][]const u8{ "", "east", "north", "south", "west", "a-key-longer-than-sixteen-bytes", "late-1", "late-2", "late-3" };
+const DK_FLUSHED_STRINGS = 6;
+
+fn dkRow(i: usize, flushed: usize) DkRow {
+    const k: i32 = @as(i32, @intCast(i % 9)) - 4;
+    return .{
+        .id = @intCast(i),
+        .k = if (i < flushed) k else k * 3,
+        .kb = @as(i64, k) - 3_000_000_000,
+        .s = DK_STRINGS[if (i < flushed) i % DK_FLUSHED_STRINGS else i % DK_STRINGS.len],
+        .w = @intCast(i % 13),
+    };
+}
+
+fn dkStringIndex(s: []const u8) ?usize {
+    return for (DK_STRINGS, 0..) |d, i| {
+        if (std.mem.eql(u8, d, s)) break i;
+    } else null;
+}
+
+fn dkKey(r: DkRow, comptime key: []const u8) i64 {
+    if (comptime std.mem.eql(u8, key, "k")) return r.k;
+    if (comptime std.mem.eql(u8, key, "kb")) return r.kb;
+    return @intCast(dkStringIndex(r.s).?);
+}
+
+fn checkDk(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const DkRow, live: []const bool, comptime key: []const u8, route: []const u8, map: bool) !void {
+    const sql = "SELECT " ++ key ++ ", COUNT(*) AS n, SUM(w) AS sw, MAX(w) AS mw FROM dk GROUP BY " ++ key;
+    errdefer std.debug.print("route={s} query: {s}\n", .{ route, sql });
+    try std.testing.expect(try planContains(allocator, db, sql, route));
+    try std.testing.expectEqual(map, try planContains(allocator, db, sql, "gid map"));
+    var want: std.AutoHashMapUnmanaged(i64, [3]i64) = .empty;
+    defer want.deinit(allocator);
+    for (rows, live) |r, keep| {
+        if (!keep) continue;
+        const e = try want.getOrPut(allocator, dkKey(r, key));
+        if (!e.found_existing) e.value_ptr.* = .{ 0, 0, 0 };
+        e.value_ptr[0] += 1;
+        e.value_ptr[1] += r.w;
+        e.value_ptr[2] = @max(e.value_ptr[2], r.w);
+    }
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            const k: i64 = if (comptime std.mem.eql(u8, key, "s"))
+                @intCast(dkStringIndex(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult)
+            else
+                @intFromFloat((try cellNumber(batch.values[0], r)) orelse return error.TestUnexpectedResult);
+            errdefer std.debug.print("group {d}\n", .{k});
+            const e = want.fetchRemove(k) orelse return error.TestUnexpectedResult;
+            for (e.value, 1..) |v, ci| try std.testing.expectEqual(@as(?f64, @floatFromInt(v)), try cellNumber(batch.values[ci], r));
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), want.count());
+}
+
+test "V2 lowcard direct gid map: negative keys, emptied keys and memtable keys past the flushed range" {
+    const allocator = std.testing.allocator;
+    const flushed = 3000;
+    var rows: [3400]DkRow = undefined;
+    for (&rows, 0..) |*r, i| r.* = dkRow(i, flushed);
+    var live: [rows.len]bool = undefined;
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop={d}\n", .{dop});
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("dk", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "k", .type = .int },
+                .{ .name = "kb", .type = .bigint },
+                .{ .name = "s", .type = .string },
+                .{ .name = "w", .type = .int },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 256 });
+        try t.insert(rows[0..flushed]);
+        try t.flush();
+        for (&live, 0..) |*keep, i| keep.* = i < flushed;
+        try checkDk(allocator, db, &rows, &live, "k", "lowcard", true);
+        try checkDk(allocator, db, &rows, &live, "kb", "lowcard", true);
+        try checkDk(allocator, db, &rows, &live, "s", "lowcard", true);
+
+        try exec(allocator, db, "DELETE FROM dk WHERE id % 9 = 0 OR id % 7 = 3");
+        for (&live, 0..) |*keep, i| keep.* = i < flushed and i % 9 != 0 and i % 7 != 3;
+        try checkDk(allocator, db, &rows, &live, "k", "lowcard", true);
+        try checkDk(allocator, db, &rows, &live, "kb", "lowcard", true);
+        try checkDk(allocator, db, &rows, &live, "s", "lowcard", true);
+
+        try t.insert(rows[flushed..]);
+        for (&live, 0..) |*keep, i| keep.* = i >= flushed or (i % 9 != 0 and i % 7 != 3);
+        try checkDk(allocator, db, &rows, &live, "k", "lowcard", false);
+        try checkDk(allocator, db, &rows, &live, "kb", "lowcard", false);
+        try checkDk(allocator, db, &rows, &live, "s", "V2 group-topN", false);
+    }
+}
+
 const OL_GROUPS = 23;
 const OlRow = struct { id: i64, g: i32, u: []const u8, v: []const u8, w: ?[]const u8 };
 // One query's per-row contribution `[a, b, 1]` to its group, null when the
