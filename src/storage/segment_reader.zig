@@ -1206,6 +1206,16 @@ pub const DictBlock = struct {
         return self.dict_bytes[a..b];
     }
 
+    /// `offsets_region` as native u32s in place, when the payload happens to
+    /// be u32-aligned on a little-endian host; else null (copy it through
+    /// `format.readU32`).
+    pub fn offsetsInPlace(self: DictBlock) ?[]const u32 {
+        if (comptime builtin.cpu.arch.endian() != .little) return null;
+        if (!std.mem.isAligned(@intFromPtr(self.offsets_region.ptr), @alignOf(u32))) return null;
+        const aligned: []align(@alignOf(u32)) const u8 = @alignCast(self.offsets_region);
+        return std.mem.bytesAsSlice(u32, aligned);
+    }
+
     /// Per-row code (little-endian, `code_width` bytes). Fixed-width reads per
     /// writer width: a runtime-length copy compiles to a memcpy call per row.
     pub fn rowCode(self: DictBlock, row: usize) u32 {

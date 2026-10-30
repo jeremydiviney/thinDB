@@ -690,9 +690,10 @@ pub const Scan = struct {
     runs_slots: []?exec.RunsColumn = &.{},
     /// Block-dictionary emit (`Batch.block_dicts`): positions a dict-aware
     /// consumer takes as row-group dictionary codes. A dict block's rows
-    /// become codes into a copy of its dictionary, kept across the
-    /// sub-batches of one row group; any other block, a tombstoned row group
-    /// on the unfiltered path, and the memtable carry the bytes as usual.
+    /// become codes into its dictionary, viewed in the block, which stays
+    /// pinned across the sub-batches of one row group; any other block, a
+    /// tombstoned row group on the unfiltered path, and the memtable carry
+    /// the bytes as usual.
     dict_cols_by_j: []bool = &.{},
     n_dicts: usize = 0,
     dict_bufs: []DictBuf = &.{},
@@ -703,17 +704,25 @@ pub const Scan = struct {
 
     const DictBuf = struct {
         codes: std.ArrayListUnmanaged(u32) = .empty,
+        /// The dictionary's offsets when the block can't be viewed as u32s
+        /// in place.
         offsets: std.ArrayListUnmanaged(u32) = .empty,
-        bytes: std.ArrayListUnmanaged(u8) = .empty,
         digests: std.ArrayListUnmanaged(u128) = .empty,
-        /// The row group whose dictionary `offsets` and `bytes`, or
+        block: ?storage.ReadSegment.BorrowedBlock = null,
+        /// The row group whose dictionary `block`, and `offsets` or
         /// `digests`, hold.
         held: ?struct { seg_idx: usize, rg_idx: usize } = null,
 
-        fn deinit(self: *DictBuf, allocator: Allocator) void {
+        fn releaseBlock(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
+            self.held = null;
+            if (self.block) |*b| b.release(allocator, cache);
+            self.block = null;
+        }
+
+        fn deinit(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
+            self.releaseBlock(allocator, cache);
             self.codes.deinit(allocator);
             self.offsets.deinit(allocator);
-            self.bytes.deinit(allocator);
             self.digests.deinit(allocator);
         }
     };
@@ -1404,28 +1413,33 @@ pub const Scan = struct {
         return self.dict_slots;
     }
 
-    /// Column `j`'s codes for `rows` (every row when null) of the dict block
-    /// payload `values`, against a copy of the block's dictionary (a hashed
-    /// key: its values' digests) that `dict_bufs[j]` keeps for the row
-    /// group's later sub-batches.
-    fn fillBlockDict(self: *Scan, values: []const u8, rg_idx: usize, j: usize, rg_count: u32, rows: ?[]const u32) !exec.BlockDictColumn {
-        const db = storage.segment_reader.dictBlockOf(values, rg_count);
+    /// Column `j`'s codes for `rows` (every row when null) of row group
+    /// `rg_idx`, against its block's dictionary (a hashed key: its values'
+    /// digests), or null when the block isn't dictionary-coded. `dict_bufs[j]`
+    /// keeps the block pinned for the row group's later sub-batches.
+    fn fillBlockDict(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !?exec.BlockDictColumn {
         const buf = &self.dict_bufs[j];
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
         const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
         if (!holds) {
-            buf.held = null;
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            if (block.encoding != .dict) {
+                block.release(self.allocator, self.table.cacheRef());
+                return null;
+            }
+            buf.releaseBlock(self.allocator, self.table.cacheRef());
+            buf.block = block;
+            const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
             if (hashed) {
                 try buf.digests.resize(self.allocator, db.ndv);
                 for (buf.digests.items, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
-            } else {
+            } else if (db.offsetsInPlace() == null) {
                 try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
                 for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
-                try buf.bytes.resize(self.allocator, db.dict_bytes.len);
-                @memcpy(buf.bytes.items, db.dict_bytes);
             }
             buf.held = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx };
         }
+        const db = storage.segment_reader.dictBlockOf(buf.block.?.bytes, rg_count);
         const n = if (rows) |r| r.len else rg_count;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| {
@@ -1434,7 +1448,7 @@ pub const Scan = struct {
             for (buf.codes.items, 0..) |*c, row| c.* = db.rowCode(row);
         }
         if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items };
-        return .{ .codes = buf.codes.items, .dict = .{ .offsets = buf.offsets.items, .bytes = buf.bytes.items } };
+        return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes } };
     }
 
     /// Fill `runs_slots[j]` for every projected non-nullable int-family column
@@ -1572,7 +1586,7 @@ pub const Scan = struct {
         for (self.runs_l_bufs) |*b| b.deinit(self.allocator);
         if (self.runs_l_bufs.len > 0) self.allocator.free(self.runs_l_bufs);
         if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
-        for (self.dict_bufs) |*b| b.deinit(self.allocator);
+        for (self.dict_bufs) |*b| b.deinit(self.allocator, self.table.cacheRef());
         if (self.dict_bufs.len > 0) self.allocator.free(self.dict_bufs);
         if (self.dict_cols_by_j.len > 0) self.allocator.free(self.dict_cols_by_j);
         if (self.dict_slots.len > 0) self.allocator.free(self.dict_slots);
@@ -2917,10 +2931,7 @@ pub const Scan = struct {
             var any_dict = false;
             for (self.out_phys, 0..) |phys, j| {
                 if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
-                    var block = try seg.borrowColumnBlock(self.allocator, self.cur_rg_idx, phys, self.table.cacheRef());
-                    defer block.release(self.allocator, self.table.cacheRef());
-                    if (block.encoding != .dict) break :dict;
-                    dict_slots.?[j] = try self.fillBlockDict(block.bytes, self.cur_rg_idx, j, rg_count, null);
+                    dict_slots.?[j] = (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) orelse break :dict;
                     any_dict = true;
                     self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
                     decoded_cols += 1;
@@ -4607,11 +4618,8 @@ pub const Scan = struct {
             };
 
             if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
-                var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
-                defer block.release(self.allocator, self.table.cacheRef());
-                if (block.encoding != .dict) break :dict;
+                dict_slots.?[j] = (try self.fillBlockDict(seg, rg_idx, phys, j, rg_count, rows)) orelse break :dict;
                 mat_kind = 4;
-                dict_slots.?[j] = try self.fillBlockDict(block.bytes, rg_idx, j, rg_count, rows);
                 any_dict = true;
                 try self.fillEmptyStrings(&filtered_cols[j], matched);
                 continue;
