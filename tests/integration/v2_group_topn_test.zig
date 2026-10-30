@@ -1093,11 +1093,12 @@ test "V2 weighted staging folds non-adjacent repeats with string extremes at DOP
     // strictly decrease, so every row appends bytes until the string-byte cap
     // publishes it), `many` fills chunks that fold, `cyclic` fills one with no
     // folds at all (switching the probe off), and `sk` is `many` as a string.
+    // Aggregates sharing an input each stage their own copy of it.
     const a = std.testing.allocator;
     const n = 49_152;
     const lo_len = 512;
     const Row = struct { id: i64, few: i32, many: i32, cyclic: i32, sk: []const u8, v: i32, w: i32, lo_s: ?[]const u8, hi_s: ?[]const u8 };
-    const Expected = struct { count: i64 = 0, sum_v: i64 = 0, max_w: i32 = std.math.minInt(i32), lo: ?[]const u8 = null, hi: ?[]const u8 = null };
+    const Expected = struct { count: i64 = 0, sum_v: i64 = 0, min_v: i32 = std.math.maxInt(i32), max_v: i32 = std.math.minInt(i32), max_w: i32 = std.math.minInt(i32), lo: ?[]const u8 = null, hi: ?[]const u8 = null, hi_min: ?[]const u8 = null };
     const rows = try a.alloc(Row, n);
     defer a.free(rows);
     const lo_bytes = try a.alloc(u8, n * lo_len);
@@ -1152,38 +1153,48 @@ test "V2 weighted staging folds non-adjacent repeats with string extremes at DOP
                 if (!e.found_existing) e.value_ptr.* = .{};
                 e.value_ptr.count += 1;
                 e.value_ptr.sum_v += row.v;
+                e.value_ptr.min_v = @min(e.value_ptr.min_v, row.v);
+                e.value_ptr.max_v = @max(e.value_ptr.max_v, row.v);
                 e.value_ptr.max_w = @max(e.value_ptr.max_w, row.w);
                 if (row.lo_s) |s| {
                     if (e.value_ptr.lo == null or std.mem.order(u8, s, e.value_ptr.lo.?) == .lt) e.value_ptr.lo = s;
                 }
                 if (row.hi_s) |s| {
                     if (e.value_ptr.hi == null or std.mem.order(u8, s, e.value_ptr.hi.?) == .gt) e.value_ptr.hi = s;
+                    if (e.value_ptr.hi_min == null or std.mem.order(u8, s, e.value_ptr.hi_min.?) == .lt) e.value_ptr.hi_min = s;
                 }
             }
-            const sql = "SELECT " ++ key ++ ", COUNT(*), SUM(v), MAX(w), MIN(lo_s), MAX(hi_s) FROM folds GROUP BY " ++ key;
-            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
-            try expectPlanRunsGroupTopN(a, db, sql);
-            var q = try runSql(a, db, sql);
-            defer q.deinit();
-            var seen: usize = 0;
-            while (try q.next()) |batch| {
-                for (0..batch.row_count) |r| {
-                    const k: i32 = if (is_text)
-                        try std.fmt.parseInt(i32, batch.values[0].data.string.rowBytes(r)[1..], 10)
-                    else
-                        batch.values[0].data.int[r];
-                    const e = expected.get(k) orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(e.count, batch.values[1].data.bigint[r]);
-                    try std.testing.expectEqual(e.sum_v, batch.values[2].data.bigint[r]);
-                    try std.testing.expectEqual(e.max_w, batch.values[3].data.int[r]);
-                    for ([_]?[]const u8{ e.lo, e.hi }, 4..) |want, ci| {
-                        try std.testing.expectEqual(want != null, batch.values[ci].isValid(r));
-                        if (want) |s| try std.testing.expectEqualStrings(s, batch.values[ci].data.string.rowBytes(r));
+            inline for (.{ false, true }) |shared| {
+                const tail = if (shared) "MIN(hi_s), MAX(hi_s), MIN(v), MAX(v)" else "MIN(lo_s), MAX(hi_s)";
+                const sql = "SELECT " ++ key ++ ", COUNT(*), SUM(v), MAX(w), " ++ tail ++ " FROM folds GROUP BY " ++ key;
+                errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+                try expectPlanRunsGroupTopN(a, db, sql);
+                var q = try runSql(a, db, sql);
+                defer q.deinit();
+                var seen: usize = 0;
+                while (try q.next()) |batch| {
+                    for (0..batch.row_count) |r| {
+                        const k: i32 = if (is_text)
+                            try std.fmt.parseInt(i32, batch.values[0].data.string.rowBytes(r)[1..], 10)
+                        else
+                            batch.values[0].data.int[r];
+                        const e = expected.get(k) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqual(e.count, batch.values[1].data.bigint[r]);
+                        try std.testing.expectEqual(e.sum_v, batch.values[2].data.bigint[r]);
+                        try std.testing.expectEqual(e.max_w, batch.values[3].data.int[r]);
+                        for ([_]?[]const u8{ if (shared) e.hi_min else e.lo, e.hi }, 4..) |want, ci| {
+                            try std.testing.expectEqual(want != null, batch.values[ci].isValid(r));
+                            if (want) |s| try std.testing.expectEqualStrings(s, batch.values[ci].data.string.rowBytes(r));
+                        }
+                        if (shared) {
+                            try std.testing.expectEqual(e.min_v, batch.values[6].data.int[r]);
+                            try std.testing.expectEqual(e.max_v, batch.values[7].data.int[r]);
+                        }
+                        seen += 1;
                     }
-                    seen += 1;
                 }
+                try std.testing.expectEqual(@as(usize, expected.count()), seen);
             }
-            try std.testing.expectEqual(@as(usize, expected.count()), seen);
         }
     }
 }
@@ -2602,12 +2613,14 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
     // blocks are dictionaries holding each page once; one row in eleven is a
     // one-off domain the HAVING drops, and one in 97 is blank. `uniq` never
     // repeats, so its blocks stay raw. A quarter of the rows stay in the
-    // memtable. The filters keep a contiguous run of each dictionary (every
-    // value but the blank first one), a gapped one (minus the d1* pages), and
-    // all of it.
+    // memtable, with only each domain's middle pages: its first and last
+    // pages, its MIN and MAX, come from dictionaries alone. The filters keep
+    // a contiguous run of each dictionary (every value but the blank first
+    // one), a gapped one (minus the d1* pages), and all of it. `w` varies
+    // across a page's rows, so a collapsed row must carry its rows' fold.
     const a = std.testing.allocator;
     const n = 40_000;
-    const Row = struct { id: i64, url: []const u8, uniq: []const u8 };
+    const Row = struct { id: i64, url: []const u8, uniq: []const u8, w: i32 };
     const rows = try a.alloc(Row, n);
     defer a.free(rows);
     const hosts = try a.alloc([]const u8, n);
@@ -2623,11 +2636,12 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
             url = try std.fmt.bufPrint(buf[0..32], "https://x{d}.org/q", .{i});
             host.* = url[8 .. url.len - 2];
         } else if (i % 97 != 0) {
-            url = try std.fmt.bufPrint(buf[0..32], "http://www.d{d}.com/p{d}", .{ i % 37, (i / 37) % 7 });
+            const page = if (i >= n / 4 * 3) 2 + (i / 37) % 3 else (i / 37) % 7;
+            url = try std.fmt.bufPrint(buf[0..32], "http://www.d{d}.com/p{d}", .{ i % 37, page });
             host.* = url[11..std.mem.indexOfScalarPos(u8, url, 11, '/').?];
         }
         const uniq = try std.fmt.bufPrint(buf[32..], "https://z.net/{d}", .{i});
-        row.* = .{ .id = @intCast(i), .url = url, .uniq = uniq };
+        row.* = .{ .id = @intCast(i), .url = url, .uniq = uniq, .w = @intCast((i * 7_919) % 1_009) };
         uniq_len_sum += @intCast(uniq.len);
     }
     const Filter = struct {
@@ -2644,7 +2658,7 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
         const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
         defer db.close();
         const table = try db.table("hits", .{
-            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string }, .{ .name = "uniq", .type = .string } },
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string }, .{ .name = "uniq", .type = .string }, .{ .name = "w", .type = .int } },
             .order_key = &.{"id"},
             .unique = false,
         }, .{ .order_key = &.{"id"}, .row_group_size = 4096 });
@@ -2653,42 +2667,75 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
         try table.insert(rows[n / 4 * 3 ..]);
 
         inline for (.{ Filter{ .where = "WHERE url <> ''" }, Filter{ .where = "WHERE url NOT LIKE 'http://www.d1%'" }, Filter{ .where = "" } }) |filter| {
-            const Expected = struct { count: i64 = 0, len_sum: i64 = 0, min_url: []const u8 = "" };
+            const Expected = struct { count: i64 = 0, len_sum: i64 = 0, min_len: i64 = std.math.maxInt(i64), max_len: i64 = 0, w_sum: i64 = 0, w_min: i32 = std.math.maxInt(i32), w_max: i32 = std.math.minInt(i32), min_url: []const u8 = "", max_url: []const u8 = "" };
             var expected: std.StringHashMapUnmanaged(Expected) = .empty;
             defer expected.deinit(a);
             for (rows, hosts) |row, host| {
                 if (!Filter.keeps(filter.where, row.url)) continue;
                 const e = try expected.getOrPut(a, host);
-                if (!e.found_existing) e.value_ptr.* = .{ .min_url = row.url };
+                if (!e.found_existing) e.value_ptr.* = .{ .min_url = row.url, .max_url = row.url };
                 e.value_ptr.count += 1;
                 e.value_ptr.len_sum += @intCast(row.url.len);
+                e.value_ptr.min_len = @min(e.value_ptr.min_len, @as(i64, @intCast(row.url.len)));
+                e.value_ptr.max_len = @max(e.value_ptr.max_len, @as(i64, @intCast(row.url.len)));
+                e.value_ptr.w_sum += row.w;
+                e.value_ptr.w_min = @min(e.value_ptr.w_min, row.w);
+                e.value_ptr.w_max = @max(e.value_ptr.w_max, row.w);
                 if (std.mem.order(u8, row.url, e.value_ptr.min_url) == .lt) e.value_ptr.min_url = row.url;
+                if (std.mem.order(u8, row.url, e.value_ptr.max_url) == .gt) e.value_ptr.max_url = row.url;
             }
             var groups: usize = 0;
             var it = expected.valueIterator();
             while (it.next()) |e| groups += @intFromBool(e.count > 1);
 
-            const sql = "SELECT REGEXP_REPLACE(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(url)) AS l, COUNT(*) AS c, " ++
-                "MIN(url) FROM hits " ++ filter.where ++ " GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 100";
-            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
-            try expectPlanRunsGroupTopN(a, db, sql);
-            var q = try runSql(a, db, sql);
-            defer q.deinit();
-            var seen: usize = 0;
-            var prev_l: f64 = std.math.inf(f64);
-            while (try q.next()) |batch| {
-                for (0..batch.row_count) |r| {
-                    const e = expected.get(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult;
-                    const l = (try cellNumber(batch.values[1], r)).?;
-                    try std.testing.expect(l <= prev_l);
-                    prev_l = l;
-                    try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(e.len_sum)) / @as(f64, @floatFromInt(e.count)), l, 1e-12);
-                    try std.testing.expectEqual(e.count, batch.values[2].data.bigint[r]);
-                    try std.testing.expectEqualStrings(e.min_url, batch.values[3].data.string.rowBytes(r));
-                    seen += 1;
+            // A dictionary's values reach the staging folds in ascending
+            // order, which settles a MIN early and a MAX late. Two
+            // aggregates over one input each stage their own copy of it, and
+            // a program without string extremes collapses per value too, as
+            // does one with numeric inputs of its own.
+            const Variant = struct { aggs: []const u8, min_url: ?usize = null, max_url: ?usize = null, len_range: ?usize = null, w_sum: ?usize = null, w_avg: ?usize = null, w_min: ?usize = null, w_max: ?usize = null };
+            inline for (.{
+                Variant{ .aggs = ", MIN(url)", .min_url = 3 },
+                Variant{ .aggs = ", MAX(url)", .max_url = 3 },
+                Variant{ .aggs = ", MIN(url), MAX(url)", .min_url = 3, .max_url = 4 },
+                Variant{ .aggs = "" },
+                Variant{ .aggs = ", MIN(length(url)), MAX(length(url))", .len_range = 3 },
+                Variant{ .aggs = ", MIN(url), AVG(w)", .min_url = 3, .w_avg = 4 },
+                Variant{ .aggs = ", MAX(w)", .w_max = 3 },
+                Variant{ .aggs = ", SUM(w), MIN(url)", .w_sum = 3, .min_url = 4 },
+                Variant{ .aggs = ", MIN(w), MAX(url)", .w_min = 3, .max_url = 4 },
+            }) |v| {
+                const sql = "SELECT REGEXP_REPLACE(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(url)) AS l, COUNT(*) AS c" ++
+                    v.aggs ++ " FROM hits " ++ filter.where ++ " GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 100";
+                errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+                try expectPlanRunsGroupTopN(a, db, sql);
+                var q = try runSql(a, db, sql);
+                defer q.deinit();
+                var seen: usize = 0;
+                var prev_l: f64 = std.math.inf(f64);
+                while (try q.next()) |batch| {
+                    for (0..batch.row_count) |r| {
+                        const e = expected.get(batch.values[0].data.string.rowBytes(r)) orelse return error.TestUnexpectedResult;
+                        const l = (try cellNumber(batch.values[1], r)).?;
+                        try std.testing.expect(l <= prev_l);
+                        prev_l = l;
+                        try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(e.len_sum)) / @as(f64, @floatFromInt(e.count)), l, 1e-12);
+                        try std.testing.expectEqual(e.count, batch.values[2].data.bigint[r]);
+                        if (v.min_url) |i| try std.testing.expectEqualStrings(e.min_url, batch.values[i].data.string.rowBytes(r));
+                        if (v.max_url) |i| try std.testing.expectEqualStrings(e.max_url, batch.values[i].data.string.rowBytes(r));
+                        if (v.len_range) |i| {
+                            try std.testing.expectEqual(@as(f64, @floatFromInt(e.min_len)), (try cellNumber(batch.values[i], r)).?);
+                            try std.testing.expectEqual(@as(f64, @floatFromInt(e.max_len)), (try cellNumber(batch.values[i + 1], r)).?);
+                        }
+                        if (v.w_sum) |i| try std.testing.expectEqual(@as(f64, @floatFromInt(e.w_sum)), (try cellNumber(batch.values[i], r)).?);
+                        if (v.w_avg) |i| try std.testing.expectApproxEqRel(@as(f64, @floatFromInt(e.w_sum)) / @as(f64, @floatFromInt(e.count)), (try cellNumber(batch.values[i], r)).?, 1e-12);
+                        if (v.w_min) |i| try std.testing.expectEqual(@as(f64, @floatFromInt(e.w_min)), (try cellNumber(batch.values[i], r)).?);
+                        if (v.w_max) |i| try std.testing.expectEqual(@as(f64, @floatFromInt(e.w_max)), (try cellNumber(batch.values[i], r)).?);
+                        seen += 1;
+                    }
                 }
+                try std.testing.expectEqual(groups, seen);
             }
-            try std.testing.expectEqual(groups, seen);
 
             // The url itself as the key: each dictionary value is one row.
             var url_counts: std.StringHashMapUnmanaged(i64) = .empty;
