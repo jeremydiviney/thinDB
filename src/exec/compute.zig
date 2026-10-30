@@ -3810,24 +3810,21 @@ fn stringRowBytes(view: ColumnView, row: usize) []const u8 {
 /// Append `n` copies of `v` into `buf`. Used by Compute's call path to
 /// materialize a constant-valued column matching the current batch's
 /// row count, so scalar kernels see uniform-width arg slices.
+// A literal refills on every batch of every call that takes it, so it fills
+// in bulk: one reservation, then no capacity check per row.
 fn fillLiteralColumn(allocator: Allocator, buf: *ColumnStore, v: types.Value, n: usize) !void {
-    var i: usize = 0;
     switch (v) {
-        .int => |x| while (i < n) : (i += 1) try buf.data.int.append(allocator, x),
-        .bigint => |x| while (i < n) : (i += 1) try buf.data.bigint.append(allocator, x),
-        .smallint => |x| while (i < n) : (i += 1) try buf.data.smallint.append(allocator, x),
-        .tinyint => |x| while (i < n) : (i += 1) try buf.data.tinyint.append(allocator, x),
-        .largeint => |x| while (i < n) : (i += 1) try buf.data.largeint.append(allocator, x),
-        .float => |x| while (i < n) : (i += 1) try buf.data.float.append(allocator, x),
-        .double => |x| while (i < n) : (i += 1) try buf.data.double.append(allocator, x),
-        .boolean => |x| while (i < n) : (i += 1) try buf.data.boolean.append(allocator, @intFromBool(x)),
-        .text => |s| while (i < n) : (i += 1) try buf.data.string.appendValue(allocator, s),
-        .date => |x| while (i < n) : (i += 1) try buf.data.date.append(allocator, x),
-        .datetime => |x| while (i < n) : (i += 1) try buf.data.datetime.append(allocator, x),
-        .decimal64 => |x| while (i < n) : (i += 1) try buf.data.decimal64.append(allocator, x),
-        .decimal128 => |x| while (i < n) : (i += 1) try buf.data.decimal128.append(allocator, x),
-        .decimal256 => |x| while (i < n) : (i += 1) try buf.data.decimal256.append(allocator, x),
-        .uuid => |x| while (i < n) : (i += 1) try buf.data.uuid.append(allocator, x),
+        .boolean => |x| try buf.data.boolean.appendNTimes(allocator, @intFromBool(x), n),
+        .text => |s| {
+            const strings = &buf.data.string;
+            if (strings.isWide() or strings.bytes.items.len + n * s.len > std.math.maxInt(u32)) {
+                for (0..n) |_| try strings.appendValue(allocator, s);
+            } else {
+                try strings.ensureUnusedValueCapacity(allocator, n, n * s.len);
+                for (0..n) |_| strings.appendValueAssumeCapacity(s);
+            }
+        },
+        inline else => |x, tag| try @field(buf.data, @tagName(tag)).appendNTimes(allocator, x, n),
     }
     try ensureNarrow(buf);
 }
