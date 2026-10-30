@@ -495,10 +495,18 @@ pub const Shape = struct {
     // Rows the ORDER BY ... LIMIT above the core can't keep, dropped in
     // each worker's scan (see `Scan.setKeyBound`).
     key_bound: ?exec.KeyBoundSpec = null,
-    // The core's top-N ranks groups by COUNT(*), so the two-pass sketch
-    // (see count_topk_sketch.zig) may drop the rows of groups too small to
-    // place.
+    // The core's top-N ranks groups by COUNT(*), or by `count_rank`, so the
+    // two-pass sketch (see count_topk_sketch.zig) may drop the rows of groups
+    // too small to place.
     count_sketch: bool = false,
+    count_rank: ?CountRank = null,
+};
+
+/// A count no greater than a group's row count (COUNT(DISTINCT)) that the
+/// result ranks groups by, read from a result row.
+pub const CountRank = struct {
+    ctx: ?*anyopaque,
+    value: *const fn (?*anyopaque, SiloCore.TopRow) u64,
 };
 
 pub const Params = struct {
@@ -1074,9 +1082,9 @@ fn runHarness(
     const need = shape.limit + shape.offset;
     if (shape.count_sketch and params.count_sketch and need > 0 and need <= count_topk_sketch.MAX_NEED and
         snapshotRows(snapshot) <= std.math.maxInt(u32) and !group_rows_layout.has_str_payload and
-        !group_rows_layout.has_concat and !group_rows_layout.has_udf and distinct_slot_count == 0)
+        !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
-        if (try runCountSketch(allocator, table, cpus, cfg, need, rows)) return;
+        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
 }
@@ -1096,6 +1104,7 @@ fn runCountSketch(
     cpus: []const usize,
     cfg: SiloCore.RunConfig,
     need: usize,
+    rank: ?CountRank,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
     // A lone string key read only as identity may arrive as row-group
@@ -1121,13 +1130,13 @@ fn runCountSketch(
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
-    if (!try sketch.settle(allocator, need)) return false;
+    if (!try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return false;
 
     var filter = cfg;
     filter.count_sketch = .{ .filter = &sketch };
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     const found = rows.items.len;
-    const kth = needthCount(rows.items, need);
+    const kth = needthCount(rows.items, need, rank);
     if (sketch.exact(need, found, kth)) return true;
 
     rows.clearRetainingCapacity();
@@ -1172,18 +1181,25 @@ fn runHeavyKeys(
     return true;
 }
 
-/// The row count of the need-th best of `rows` (0 when there are fewer).
-fn needthCount(rows: []const SiloCore.TopRow, need: usize) u64 {
+/// The count, the row count or `rank`'s, of the need-th best of `rows` (0
+/// when there are fewer).
+fn needthCount(rows: []const SiloCore.TopRow, need: usize, rank: ?CountRank) u64 {
     if (rows.len < need) return 0;
     var best: [count_topk_sketch.MAX_NEED]u64 = undefined;
-    for (rows[0..need], 0..) |r, i| best[i] = r.count;
+    for (rows[0..need], 0..) |r, i| best[i] = rankedCount(r, rank);
     std.sort.pdq(u64, best[0..need], {}, std.sort.desc(u64));
     for (rows[need..]) |r| {
-        if (r.count <= best[need - 1]) continue;
-        best[need - 1] = r.count;
+        const count = rankedCount(r, rank);
+        if (count <= best[need - 1]) continue;
+        best[need - 1] = count;
         std.sort.pdq(u64, best[0..need], {}, std.sort.desc(u64));
     }
     return best[need - 1];
+}
+
+fn rankedCount(row: SiloCore.TopRow, rank: ?CountRank) u64 {
+    const r = rank orelse return row.count;
+    return r.value(r.ctx, row);
 }
 
 fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !bool {

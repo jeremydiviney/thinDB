@@ -2678,6 +2678,92 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
     }
 }
 
+test "V2 COUNT(DISTINCT) top-K stays exact when the count sketch drops the small groups" {
+    const allocator = std.testing.allocator;
+    // Twelve groups of 1000+ rows by one user, ten of 600 rows by 300 users,
+    // twelve of 400 down to 389 rows each by its own user, and one-row
+    // groups. The sketch's first threshold keeps the first two kinds, whose
+    // best ten hold 300 users, too few to prove the cut: the retry keeps the
+    // third kind too, and they hold the answer.
+    const unique_rows = 90_000;
+    const Row = struct { id: i64, k: i64, s: []const u8, u: i64 };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var list: std.ArrayListUnmanaged(Row) = .empty;
+    defer list.deinit(allocator);
+    for (0..12) |j| {
+        for (0..1000 + 10 * j) |_| try list.append(allocator, .{ .id = 0, .k = @intCast(j), .s = "", .u = 7 });
+    }
+    for (0..10) |j| {
+        for (0..600) |r| try list.append(allocator, .{ .id = 0, .k = @intCast(100 + j), .s = "", .u = @intCast(j * 1000 + r % 300) });
+    }
+    for (0..12) |j| {
+        for (0..400 - j) |r| try list.append(allocator, .{ .id = 0, .k = @intCast(200 + j), .s = "", .u = @intCast(1_000_000 + j * 1000 + r) });
+    }
+    for (0..unique_rows) |j| try list.append(allocator, .{ .id = 0, .k = @intCast(10_000 + j), .s = "", .u = @intCast(5_000_000 + j) });
+    const rows = list.items;
+    for (rows, 0..) |*r, n| {
+        r.id = @intCast((n * 7919) % rows.len);
+        r.s = try std.fmt.allocPrint(arena.allocator(), "key-{d}", .{r.k});
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    const t = try db.table("visits", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "k", .type = .bigint },
+            .{ .name = "s", .type = .string },
+            .{ .name = "u", .type = .bigint },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+    try t.insert(rows);
+    try t.flush();
+
+    inline for (.{
+        "SELECT k, COUNT(DISTINCT u) AS d FROM visits GROUP BY k ORDER BY d DESC LIMIT 10",
+        "SELECT s, COUNT(DISTINCT u) AS d FROM visits GROUP BY s ORDER BY d DESC LIMIT 10",
+    }) |sql| {
+        errdefer std.debug.print("query: {s}\n", .{sql});
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                if (comptime std.mem.startsWith(u8, sql, "SELECT s")) {
+                    var buf: [16]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{200 + rank}), batch.values[0].data.string.rowBytes(r));
+                } else {
+                    try std.testing.expectEqual(@as(?f64, @floatFromInt(200 + rank)), try cellNumber(batch.values[0], r));
+                }
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(400 - rank)), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        // Ranked by COUNT(*), beside a COUNT(DISTINCT).
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c, COUNT(DISTINCT u) AS d FROM visits GROUP BY k ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const j = 11 - rank;
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(j)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(1000 + 10 * j)), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, 1), try cellNumber(batch.values[2], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+}
+
 test "V2 group-topN: a string-derived key evaluates once per dictionary value and folds repeats by count" {
     // 259 pages of 37 domains repeat throughout each row group, so the url
     // blocks are dictionaries holding each page once; one row in eleven is a
