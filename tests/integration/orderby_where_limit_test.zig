@@ -143,6 +143,9 @@ const wheres = [_][]const u8{
     "WHERE s IN ('k1', 'k3')",
     "WHERE s LIKE 'k%'",
     "WHERE s IS NULL",
+    "WHERE s NOT LIKE '%2'",
+    "WHERE NOT (s = 'k2')",
+    "WHERE s IS NULL OR s = 'k1'",
     // nullable int
     "WHERE v = 3",
     "WHERE v IN (1, 2)",

@@ -427,10 +427,8 @@ pub fn lengthKernel(allocator: Allocator, args: []const ColumnView, out: *Column
 // shorter than its byte length.
 pub fn charLengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, @intCast(charCount(sv.rowBytes(i))));
-    }
+    try out.data.int.ensureUnusedCapacity(allocator, row_count);
+    for (0..row_count) |i| out.data.int.appendAssumeCapacity(@intCast(charCount(sv.rowBytes(i))));
 }
 
 // Every function that takes or returns a position counts UTF-8 characters,
@@ -441,11 +439,27 @@ fn isCharStart(b: u8) bool {
 }
 
 /// Characters in UTF-8 `s`: every byte but a 0b10xxxxxx continuation byte
-/// starts one, so a malformed byte still counts once.
+/// starts one, so a malformed byte still counts once. The chunks are 16
+/// bytes, the baseline vector, and the last one re-reads bytes overlapping
+/// the previous chunk rather than finishing byte by byte.
 fn charCount(s: []const u8) usize {
-    var n: usize = 0;
-    for (s) |b| n += @intFromBool(isCharStart(b));
-    return n;
+    const V = @Vector(16, u8);
+    if (s.len < 16) {
+        var n: usize = 0;
+        for (s) |b| n += @intFromBool(isCharStart(b));
+        return n;
+    }
+    var continuations: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const at = @min(i, s.len - 16);
+        const chunk: V = s[at..][0..16].*;
+        var hits: u16 = @bitCast(chunk & @as(V, @splat(0xC0)) == @as(V, @splat(0x80)));
+        hits &= ~@as(u16, 0) << @intCast(i - at);
+        continuations += @popCount(hits);
+        i = at + 16;
+    }
+    return s.len - continuations;
 }
 
 /// Byte offset where character `k` of `s` starts, or `s.len` when `s`
@@ -2615,5 +2629,18 @@ test "foldBytes vectorized case-fold matches scalar across boundaries and non-al
         var want: [sample.len]u8 = undefined;
         for (sample, &want) |c, *w| w.* = if (to_lower) std.ascii.toLower(c) else std.ascii.toUpper(c);
         try testing.expectEqualSlices(u8, &want, &buf);
+    }
+}
+
+test "charCount counts UTF-8 characters at every length around the vector width" {
+    const testing = std.testing;
+    // Two-, three- and four-byte characters and a stray continuation byte,
+    // so chunk edges fall inside characters and the last chunk overlaps.
+    const sample = "a\u{e9}b\u{20ac}c\u{1f600}d" ++ "\x80" ++ "e\u{e9}\u{e9}fghij\u{20ac}klmnopq\u{1f600}rstuvwxyz0123";
+    for (0..sample.len + 1) |len| {
+        const s = sample[0..len];
+        var want: usize = 0;
+        for (s) |b| want += @intFromBool(isCharStart(b));
+        try testing.expectEqual(want, charCount(s));
     }
 }
