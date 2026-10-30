@@ -8,6 +8,9 @@
 //! survivors sit in one narrow run; fixed tiles over the flat space put that
 //! whole run into one or two tiles and the rest of the fleet idles. The tile
 //! size also shrinks with the work, so every worker the core sized gets claims.
+//! Guided tiles shrink with the work left too, so a run of costly row groups
+//! late in the order can't leave one worker draining a whole tile of them while
+//! the rest idle.
 const std = @import("std");
 
 /// Flat row-group range [lo, hi). The tile whose `hi` equals the claim space's
@@ -25,6 +28,8 @@ pub const RowGroupTiles = struct {
     unit_count: usize = 0,
     total_rgs: usize = 0,
     tile_units: usize = 1,
+    workers: usize = 1,
+    guided: bool = false,
     next: std.atomic.Value(usize) = .init(0),
 
     /// `surviving` is a per-row-group survival mask over the same flat space
@@ -35,8 +40,9 @@ pub const RowGroupTiles = struct {
         surviving: ?[]const bool,
         workers: usize,
         max_tile_rgs: usize,
+        guided: bool,
     ) !RowGroupTiles {
-        var self: RowGroupTiles = .{ .unit_count = total_rgs, .total_rgs = total_rgs };
+        var self: RowGroupTiles = .{ .unit_count = total_rgs, .total_rgs = total_rgs, .workers = @max(workers, 1), .guided = guided };
         if (surviving) |mask| if (mask.len == total_rgs) {
             var n: usize = 0;
             for (mask) |m| n += @intFromBool(m);
@@ -53,7 +59,7 @@ pub const RowGroupTiles = struct {
                 self.unit_count = n;
             }
         };
-        self.tile_units = std.math.clamp(self.unit_count / (@max(workers, 1) * TILES_PER_WORKER), 1, @max(max_tile_rgs, 1));
+        self.tile_units = std.math.clamp(self.unit_count / (self.workers * TILES_PER_WORKER), 1, @max(max_tile_rgs, 1));
         return self;
     }
 
@@ -62,10 +68,16 @@ pub const RowGroupTiles = struct {
         self.survivors = null;
     }
 
+    /// A tile of `tile_units`; a guided one of few enough units to leave
+    /// every worker `TILES_PER_WORKER` claims of what remains, but at least one.
     pub fn claim(self: *RowGroupTiles) ?Tile {
-        const lo = self.next.fetchAdd(self.tile_units, .monotonic);
+        const want = if (self.guided) guided: {
+            const left = self.unit_count -| self.next.load(.monotonic);
+            break :guided std.math.clamp(left / (self.workers * TILES_PER_WORKER), 1, self.tile_units);
+        } else self.tile_units;
+        const lo = self.next.fetchAdd(want, .monotonic);
         if (lo >= self.unit_count) return null;
-        const hi = @min(lo + self.tile_units, self.unit_count);
+        const hi = @min(lo + want, self.unit_count);
         const survivors = self.survivors orelse return .{ .lo = lo, .hi = hi };
         // Pruned groups between two claimed survivors ride the earlier tile;
         // the last tile runs to the end of the flat space for the memtable.
@@ -182,7 +194,7 @@ test "RowGroupTiles cuts a clustered survivor run across every worker" {
     const allocator = std.testing.allocator;
     var mask = [_]bool{false} ** 100;
     for (mask[40..52]) |*m| m.* = true;
-    var tiles = try RowGroupTiles.init(allocator, mask.len, &mask, 6, 16);
+    var tiles = try RowGroupTiles.init(allocator, mask.len, &mask, 6, 16, false);
     defer tiles.deinit(allocator);
     const got = try drainTiles(allocator, &tiles);
     defer allocator.free(got);
@@ -207,7 +219,7 @@ test "RowGroupTiles covers every survivor exactly once and ends at the flat tota
     inline for (cases) |c| {
         var mask: [c.total]bool = undefined;
         for (&mask, 0..) |*m, i| m.* = i % c.stride == 0;
-        var tiles = try RowGroupTiles.init(allocator, c.total, &mask, c.workers, c.max);
+        var tiles = try RowGroupTiles.init(allocator, c.total, &mask, c.workers, c.max, false);
         defer tiles.deinit(allocator);
         const got = try drainTiles(allocator, &tiles);
         defer allocator.free(got);
@@ -229,7 +241,7 @@ test "RowGroupTiles keeps the flat space without pruning, without survivors, or 
     const torn = [_]bool{true} ** 39;
     const masks = [_]?[]const bool{ null, &all, &none, &torn };
     for (masks) |mask| {
-        var tiles = try RowGroupTiles.init(allocator, 40, mask, 4, 16);
+        var tiles = try RowGroupTiles.init(allocator, 40, mask, 4, 16, false);
         defer tiles.deinit(allocator);
         try std.testing.expect(tiles.survivors == null);
         try std.testing.expectEqual(@as(usize, 40), tiles.unit_count);
@@ -239,19 +251,32 @@ test "RowGroupTiles keeps the flat space without pruning, without survivors, or 
 
 test "RowGroupTiles sizes tiles to the work under the cap" {
     const allocator = std.testing.allocator;
-    var big = try RowGroupTiles.init(allocator, 1500, null, 12, 16);
+    var big = try RowGroupTiles.init(allocator, 1500, null, 12, 16, false);
     defer big.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 16), big.tile_units);
-    var small = try RowGroupTiles.init(allocator, 20, null, 10, 16);
+    var small = try RowGroupTiles.init(allocator, 20, null, 10, 16, false);
     defer small.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), small.tile_units);
-    var capped = try RowGroupTiles.init(allocator, 1500, null, 12, 4);
+    var capped = try RowGroupTiles.init(allocator, 1500, null, 12, 4, false);
     defer capped.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 4), capped.tile_units);
-    var empty = try RowGroupTiles.init(allocator, 0, null, 4, 16);
+    var empty = try RowGroupTiles.init(allocator, 0, null, 4, 16, false);
     defer empty.deinit(allocator);
     try std.testing.expect(empty.claim() == null);
     try std.testing.expect(empty.exhausted());
+}
+
+test "RowGroupTiles shrinks claims toward single row groups as the work runs out" {
+    const allocator = std.testing.allocator;
+    var tiles = try RowGroupTiles.init(allocator, 1500, null, 12, 16, true);
+    defer tiles.deinit(allocator);
+    const got = try drainTiles(allocator, &tiles);
+    defer allocator.free(got);
+    try std.testing.expectEqual(@as(usize, 16), got[0].hi - got[0].lo);
+    for (got[1..], got[0 .. got.len - 1]) |t, prev| try std.testing.expect(t.hi - t.lo <= prev.hi - prev.lo);
+    // Under 2 claims per worker of work left, every claim is one row group.
+    for (got[got.len - 24 ..]) |t| try std.testing.expectEqual(@as(usize, 1), t.hi - t.lo);
+    try std.testing.expectEqual(@as(usize, 1500), got[got.len - 1].hi);
 }
 
 test "ChunkClaims give each chunk one contiguous run until the partials collapse" {

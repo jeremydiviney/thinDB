@@ -521,6 +521,9 @@ pub const Compute = struct {
     /// The output batch's byte-length sidecar: the input's, for the columns
     /// passed through. Sized with `views`.
     out_lengths: []?[]const u32,
+    /// The output batch's key-digest sidecar, like `out_lengths`: a hashed
+    /// column no derived entry reads keeps its digests past this operator.
+    out_hashed: []?[]const u128,
 
     pub fn create(
         allocator: Allocator,
@@ -632,6 +635,8 @@ pub const Compute = struct {
         @memset(derived_direct, false);
         const out_lengths = try allocator.alloc(?[]const u32, output_schema.len);
         errdefer allocator.free(out_lengths);
+        const out_hashed = try allocator.alloc(?[]const u128, output_schema.len);
+        errdefer allocator.free(out_hashed);
 
         const self = try allocator.create(Compute);
         errdefer allocator.destroy(self);
@@ -650,6 +655,7 @@ pub const Compute = struct {
             .udf_registry = udf_registry,
             .layered_on_upstream = layered_on_upstream,
             .out_lengths = out_lengths,
+            .out_hashed = out_hashed,
         };
         return makeQuery(allocator, self);
     }
@@ -704,6 +710,7 @@ pub const Compute = struct {
         self.allocator.free(self.output_schema);
         self.allocator.free(self.views);
         self.allocator.free(self.out_lengths);
+        self.allocator.free(self.out_hashed);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -1114,21 +1121,24 @@ pub const Compute = struct {
             };
         }
 
-        var out_lengths: ?[]const ?[]const u32 = null;
-        if (in.byte_lengths) |lens| {
-            @memset(self.out_lengths, null);
-            const w = @min(lens.len, self.out_lengths.len);
-            @memcpy(self.out_lengths[0..w], lens[0..w]);
-            for (self.derived_output_indices) |out_idx| self.out_lengths[out_idx] = null;
-            out_lengths = self.out_lengths;
-        }
-
         return Batch{
             .schema = self.output_schema,
             .values = self.views,
             .row_count = n,
-            .byte_lengths = out_lengths,
+            .byte_lengths = self.passedThrough(u32, in.byte_lengths, self.out_lengths),
+            .hashed = self.passedThrough(u128, in.hashed, self.out_hashed),
         };
+    }
+
+    /// The input's per-column sidecar `in`, copied into `out` with the
+    /// derived positions cleared: what the output batch carries.
+    fn passedThrough(self: *Compute, comptime T: type, in: ?[]const ?[]const T, out: []?[]const T) ?[]const ?[]const T {
+        const sidecar = in orelse return null;
+        @memset(out, null);
+        const w = @min(sidecar.len, out.len);
+        @memcpy(out[0..w], sidecar[0..w]);
+        for (self.derived_output_indices) |out_idx| out[out_idx] = null;
+        return out;
     }
 
     /// Recursively evaluate one CallPlan into its `output` ColumnStore.

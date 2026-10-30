@@ -716,9 +716,13 @@ pub const Scan = struct {
         /// The row group whose dictionary `block`, and `offsets` or
         /// `digests`, hold.
         held: ?struct { seg_idx: usize, rg_idx: usize } = null,
+        /// Set instead of `held` when `block` is a raw string block: its
+        /// row group and the in-place view over it.
+        raw: ?struct { seg_idx: usize, rg_idx: usize, view: ColumnView } = null,
 
         fn releaseBlock(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
             self.held = null;
+            self.raw = null;
             if (self.block) |*b| b.release(allocator, cache);
             self.block = null;
         }
@@ -1453,6 +1457,24 @@ pub const Scan = struct {
         }
         if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items };
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes } };
+    }
+
+    /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when
+    /// it holds raw strings, viewed in place until the column's next block
+    /// replaces it: a dictionary column's raw blocks skip the decode copy,
+    /// as its dictionaries do. False when the block isn't raw.
+    fn holdRawStrings(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32) !bool {
+        const col = self.table.schema.columns[phys];
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, .{ .has_nulls = col.nullable }, block.encoding) orelse {
+            block.release(self.allocator, self.table.cacheRef());
+            return false;
+        };
+        const buf = &self.dict_bufs[j];
+        buf.releaseBlock(self.allocator, self.table.cacheRef());
+        buf.block = block;
+        buf.raw = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx, .view = view };
+        return true;
     }
 
     /// Fill `runs_slots[j]` for every projected non-nullable int-family column
@@ -2954,10 +2976,15 @@ pub const Scan = struct {
             const measuring = self.n_lengths > 0 and rg_clean;
             const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0 and rg_clean) try self.ensureDictSlots() else null;
             var any_dict = false;
+            var any_raw = false;
             for (self.out_phys, 0..) |phys, j| {
                 if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
-                    dict_slots.?[j] = (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) orelse break :dict;
-                    any_dict = true;
+                    if (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) |d| {
+                        dict_slots.?[j] = d;
+                        any_dict = true;
+                    } else if (!(hashing and self.hash_cols_by_j[j]) and try self.holdRawStrings(seg, self.cur_rg_idx, phys, j, rg_count)) {
+                        any_raw = true;
+                    } else break :dict;
                     self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
                     decoded_cols += 1;
                     continue;
@@ -3002,6 +3029,12 @@ pub const Scan = struct {
             if (masked) |out| return out;
 
             for (self.decoded, 0..) |c, i| self.views[i] = c.view();
+            if (any_raw) {
+                for (self.dict_bufs[0..self.out_phys.len], 0..) |b, j| {
+                    const raw = b.raw orelse continue;
+                    if (raw.seg_idx == self.cur_seg_idx and raw.rg_idx == self.cur_rg_idx - 1) self.views[j] = raw.view;
+                }
+            }
             var sidecar: ?[]const ?exec.CodedColumn = null;
             if (coding) {
                 const slots = try self.ensureCodedSlots();
@@ -3039,7 +3072,7 @@ pub const Scan = struct {
             // `emit_runs` also keeps the full row group: the run sidecar is
             // per-RG (a run-aware consumer does near-zero per-row work, so the
             // L2-residency slicing buys nothing there).
-            if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
+            if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !any_raw and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
                 self.sub_off = 0;
                 self.sub_count = rg_count;
                 return self.emitSub();

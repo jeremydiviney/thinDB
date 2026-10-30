@@ -2547,6 +2547,39 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         try std.testing.expectEqual(@as(usize, 10), rank);
     }
     {
+        var q = try runSql(allocator, db, "SELECT k, s, COUNT(*) AS c, SUM(v) FROM skewed GROUP BY k, s ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[1].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[2], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(sums[rank])), try cellNumber(batch.values[3], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
+        // A derived key beside a hashed string key: the string's digests pass
+        // through the derived columns' Compute.
+        var q = try runSql(allocator, db, "SELECT s, k % 1000 AS m, COUNT(*) AS c FROM skewed GROUP BY s, m ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[2], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
+    {
         var order: [heavy_groups]usize = undefined;
         for (&order, 0..) |*o, g| o.* = g;
         std.sort.pdq(usize, &order, &kept_counts, struct {
@@ -2915,6 +2948,161 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             }
         }
         try std.testing.expectEqual(@as(usize, 10), url_rank);
+    }
+}
+
+const HkRow = struct { id: i64, s: []const u8, v: i32 };
+const HkGroup = struct { s: []const u8, count: i64 = 0, sum: i64 = 0 };
+
+fn hkMoreRows(_: void, x: HkGroup, y: HkGroup) bool {
+    if (x.count != y.count) return x.count > y.count;
+    return std.mem.order(u8, x.s, y.s) == .lt;
+}
+
+/// The groups of `rows` by s, most rows first, without those of `skip`.
+fn hkGroups(allocator: std.mem.Allocator, rows: []const HkRow, skip: []const u8) ![]HkGroup {
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
+    defer index.deinit(allocator);
+    var groups: std.ArrayList(HkGroup) = .empty;
+    errdefer groups.deinit(allocator);
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.s, skip)) continue;
+        const gop = try index.getOrPut(allocator, row.s);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = groups.items.len;
+            try groups.append(allocator, .{ .s = row.s });
+        }
+        const g = &groups.items[gop.value_ptr.*];
+        g.count += 1;
+        g.sum += row.v;
+    }
+    const out = try groups.toOwnedSlice(allocator);
+    std.sort.pdq(HkGroup, out, {}, hkMoreRows);
+    return out;
+}
+
+test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned and memtable rows" {
+    // Segment A's row groups are dictionaries: hot urls spread over them
+    // among light urls in adjacent pairs, so each row group stays under half
+    // distinct. Segment B's row groups are near-unique (raw blocks), with a
+    // hot url every 16th row; some of segment C's hot rows are deleted; the
+    // memtable adds more. Hot counts differ, so every ranked page is
+    // tie-free. The light urls alone hold 2 rows each: too many candidates,
+    // so that query falls back to grouping them all.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const hot = 12;
+    const light_pairs = 110_000;
+
+    var hot_urls: [hot][]const u8 = undefined;
+    for (&hot_urls, 0..) |*u, g| u.* = try std.fmt.allocPrint(arena, "http://hot{d}.example/", .{g});
+    var units: std.ArrayList([]const u8) = .empty;
+    for (0..hot) |g| {
+        for (0..2400 - 90 * g) |_| try units.append(arena, hot_urls[g]);
+    }
+    const light_start = units.items.len;
+    for (0..light_pairs) |l| try units.append(arena, try std.fmt.allocPrint(arena, "http://light{d}.example/x", .{l}));
+
+    var seg_a: std.ArrayList(HkRow) = .empty;
+    var id: i64 = 0;
+    // 7919 is prime and doesn't divide the unit count: every unit once.
+    for (0..units.items.len) |p| {
+        const unit = (p * 7919) % units.items.len;
+        const copies: usize = if (unit >= light_start) 2 else 1;
+        for (0..copies) |_| {
+            try seg_a.append(arena, .{ .id = id, .s = units.items[unit], .v = @intCast(@mod(id * 104_729, 1_013)) });
+            id += 1;
+        }
+    }
+    var seg_b: std.ArrayList(HkRow) = .empty;
+    for (0..40_000) |i| {
+        const s = if (i % 16 == 0) hot_urls[(i / 16) % hot] else try std.fmt.allocPrint(arena, "http://uniq{d}.example/", .{i});
+        try seg_b.append(arena, .{ .id = id, .s = s, .v = @intCast(@mod(id * 104_729, 1_013)) });
+        id += 1;
+    }
+    const c_first = id;
+    var seg_c: std.ArrayList(HkRow) = .empty;
+    for (0..3000) |i| {
+        try seg_c.append(arena, .{ .id = id, .s = hot_urls[i % hot], .v = @intCast(@mod(id * 104_729, 1_013)) });
+        id += 1;
+    }
+    const deleted_below = c_first + 1000;
+    var mem: std.ArrayList(HkRow) = .empty;
+    for (0..600) |i| {
+        const s = if (i % 2 == 0) hot_urls[i % hot] else try std.fmt.allocPrint(arena, "http://mem{d}.example/", .{i % 7});
+        try mem.append(arena, .{ .id = id, .s = s, .v = @intCast(@mod(id * 104_729, 1_013)) });
+        id += 1;
+    }
+
+    var live: std.ArrayList(HkRow) = .empty;
+    for ([_][]const HkRow{ seg_a.items, seg_b.items, seg_c.items, mem.items }) |part| {
+        for (part) |row| {
+            if (row.id >= c_first and row.id < deleted_below) continue;
+            try live.append(arena, row);
+        }
+    }
+    const all_groups = try hkGroups(allocator, live.items, "");
+    defer allocator.free(all_groups);
+    const no_hot0 = try hkGroups(allocator, live.items, hot_urls[0]);
+    defer allocator.free(no_hot0);
+    for (0..hot - 1) |i| try std.testing.expect(all_groups[i].count > all_groups[i + 1].count);
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("hk", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string }, .{ .name = "v", .type = .int } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = 1024 });
+        for ([_][]const HkRow{ seg_a.items, seg_b.items, seg_c.items }) |part| {
+            try t.insert(part);
+            try t.flush();
+        }
+        const delete_sql = try std.fmt.allocPrint(allocator, "DELETE FROM hk WHERE id >= {d} AND id < {d}", .{ c_first, deleted_below });
+        defer allocator.free(delete_sql);
+        try exec(allocator, db, delete_sql);
+        try t.insert(mem.items);
+
+        const Case = struct { sql: []const u8, want: []const HkGroup, sum: bool };
+        const cases = [_]Case{
+            .{ .sql = "SELECT s, COUNT(*) AS c FROM hk GROUP BY s ORDER BY c DESC LIMIT 5", .want = all_groups[0..5], .sum = false },
+            .{ .sql = "SELECT s, COUNT(*) AS c, SUM(v) AS t FROM hk WHERE s <> 'http://hot0.example/' GROUP BY s ORDER BY c DESC LIMIT 3 OFFSET 2", .want = no_hot0[2..5], .sum = true },
+        };
+        for (cases) |case| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, case.sql });
+            try expectPlanRunsGroupTopN(allocator, db, case.sql);
+            var q = try runSql(allocator, db, case.sql);
+            defer q.deinit();
+            var rank: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    try std.testing.expectEqualStrings(case.want[rank].s, batch.values[0].data.string.rowBytes(r));
+                    try std.testing.expectEqual(@as(?f64, @floatFromInt(case.want[rank].count)), try cellNumber(batch.values[1], r));
+                    if (case.sum) try std.testing.expectEqual(@as(?f64, @floatFromInt(case.want[rank].sum)), try cellNumber(batch.values[2], r));
+                    rank += 1;
+                }
+            }
+            try std.testing.expectEqual(case.want.len, rank);
+        }
+
+        const flat_sql = "SELECT s, COUNT(*) AS c FROM hk WHERE s LIKE 'http://light%' GROUP BY s ORDER BY c DESC LIMIT 5";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, flat_sql });
+        var q = try runSql(allocator, db, flat_sql);
+        defer q.deinit();
+        var n: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expect(std.mem.startsWith(u8, batch.values[0].data.string.rowBytes(r), "http://light"));
+                try std.testing.expectEqual(@as(?f64, 2), try cellNumber(batch.values[1], r));
+            }
+            n += batch.row_count;
+        }
+        try std.testing.expectEqual(@as(usize, 5), n);
     }
 }
 
