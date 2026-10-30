@@ -4,8 +4,9 @@
 //! interesting boundaries (below min, at min, interior, at max, above max) and
 //! against a brute-force reference computed in the test. The point: the
 //! FOR-domain comparison must give bit-for-bit the same survivors as comparing
-//! the native values. Also covers NULLs, multiple segments, and a stays-raw
-//! column (fallback).
+//! the native values. Also covers NULLs, multiple segments, a stays-raw
+//! column (fallback), and row groups whose stats prove the predicate for
+//! every row, which skip the filter.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -431,4 +432,184 @@ test "guided filter emits a row group's many survivors in sub-batches" {
 
     try checkSlicedFilter(allocator, t, 80, rows);
     try checkSlicedFilter(allocator, t, 20, rows);
+}
+
+// Row groups of `STATS_RG` rows, each holding one `d` value: a range on `d`
+// covers whole row groups, which the stats then prove, next to row groups it
+// cuts. Even row groups hold blank `s`, odd ones none; the first half holds
+// NULL `ns`.
+const STATS_RG: i64 = 256;
+const STATS_ROWS: i64 = 8 * STATS_RG;
+const STATS_DELETED = [_]i64{ 300, 301, 777, 1500 };
+const STATS_MEM_BASE: i64 = 3000;
+const STATS_MEM_ROWS: i64 = 10;
+
+const StatsRow = struct {
+    id: i64,
+    g: i64,
+    d: i64,
+    /// `s` is `'u<s_key>'`, `'m'` when `s_key` is 50, or blank when null.
+    s_key: ?i64,
+    ns_null: bool,
+    v: i64,
+};
+
+fn statsRow(i: i64) StatsRow {
+    const d = @divTrunc(i, STATS_RG);
+    return .{
+        .id = i,
+        .g = @mod(i, 7),
+        .d = d,
+        .s_key = if (@mod(d, 2) == 0 and @mod(i, 3) == 0) null else @mod(i, 50),
+        .ns_null = d < 4 and @mod(i, 5) == 0,
+        .v = i * 3,
+    };
+}
+
+fn statsMemRow(id: i64) StatsRow {
+    return .{ .id = id, .g = @mod(id, 7), .d = 9, .s_key = 50, .ns_null = true, .v = id * 3 };
+}
+
+fn statsLiveRows(allocator: std.mem.Allocator) ![]StatsRow {
+    var rows: std.ArrayList(StatsRow) = .empty;
+    errdefer rows.deinit(allocator);
+    var i: i64 = 0;
+    while (i < STATS_ROWS) : (i += 1) {
+        if (std.mem.indexOfScalar(i64, &STATS_DELETED, i) != null) continue;
+        try rows.append(allocator, statsRow(i));
+    }
+    var id = STATS_MEM_BASE;
+    while (id < STATS_MEM_BASE + STATS_MEM_ROWS) : (id += 1) try rows.append(allocator, statsMemRow(id));
+    return rows.toOwnedSlice(allocator);
+}
+
+fn statsSLen(key: i64) i64 {
+    if (key == 50) return 1;
+    return if (key < 10) 2 else 3;
+}
+
+fn insertStatsRow(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), r: StatsRow) !void {
+    var line: [160]u8 = undefined;
+    var s_buf: [8]u8 = undefined;
+    const s_text = if (r.s_key) |k| (if (k == 50) "m" else try std.fmt.bufPrint(&s_buf, "u{d}", .{k})) else "";
+    var ns_buf: [8]u8 = undefined;
+    const ns_text = if (r.ns_null) "NULL" else try std.fmt.bufPrint(&ns_buf, "'n{d}'", .{@mod(r.id, 11)});
+    try buf.appendSlice(allocator, try std.fmt.bufPrint(&line, "({d}, {d}, {d}, '{s}', {s}, {d})", .{ r.id, r.g, r.d, s_text, ns_text, r.v }));
+}
+
+fn expectIdsWhere(allocator: std.mem.Allocator, db: anytype, sql: []const u8, live: []const StatsRow, keep: *const fn (StatsRow) bool) !void {
+    const got = try helpers.collectBigints(allocator, db, sql);
+    defer allocator.free(got);
+    var want: std.ArrayList(i64) = .empty;
+    defer want.deinit(allocator);
+    for (live) |r| if (keep(r)) try want.append(allocator, r.id);
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try std.testing.expectEqualSlices(i64, want.items, got);
+}
+
+fn statsMidRange(r: StatsRow) bool {
+    return r.d >= 2 and r.d <= 5;
+}
+fn statsNonBlank(r: StatsRow) bool {
+    return r.s_key != null;
+}
+fn statsNsEarly(r: StatsRow) bool {
+    return !r.ns_null and r.d < 6;
+}
+fn statsNotMem(r: StatsRow) bool {
+    return r.d != 9;
+}
+
+test "row groups whose stats prove the filter skip it" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = @intCast(STATS_RG) });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE z (id BIGINT PRIMARY KEY, g INT NOT NULL, d INT NOT NULL, s VARCHAR(16) NOT NULL, ns VARCHAR(16), v BIGINT NOT NULL)");
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "INSERT INTO z (id, g, d, s, ns, v) VALUES ");
+        var i: i64 = 0;
+        while (i < STATS_ROWS) : (i += 1) {
+            if (i > 0) try buf.appendSlice(allocator, ", ");
+            try insertStatsRow(allocator, &buf, statsRow(i));
+        }
+        try exec(allocator, db, buf.items);
+    }
+    const t = try db.openTable("z", .{});
+    try t.flush();
+    try exec(allocator, db, "DELETE FROM z WHERE id IN (300, 301, 777, 1500)");
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "INSERT INTO z (id, g, d, s, ns, v) VALUES ");
+        var id = STATS_MEM_BASE;
+        while (id < STATS_MEM_BASE + STATS_MEM_ROWS) : (id += 1) {
+            if (id > STATS_MEM_BASE) try buf.appendSlice(allocator, ", ");
+            try insertStatsRow(allocator, &buf, statsMemRow(id));
+        }
+        try exec(allocator, db, buf.items);
+    }
+
+    const live = try statsLiveRows(allocator);
+    defer allocator.free(live);
+
+    try expectIdsWhere(allocator, db, "SELECT id FROM z WHERE d >= 2 AND d <= 5 ORDER BY id", live, statsMidRange);
+    try expectIdsWhere(allocator, db, "SELECT id FROM z WHERE s <> '' ORDER BY id", live, statsNonBlank);
+    try expectIdsWhere(allocator, db, "SELECT id FROM z WHERE ns IS NOT NULL AND d < 6 ORDER BY id", live, statsNsEarly);
+    try expectIdsWhere(allocator, db, "SELECT id FROM z WHERE d <> 9 ORDER BY id", live, statsNotMem);
+
+    // Grouped folds over the proven row groups: per g, COUNT(*) and SUM(v)
+    // past d >= 3, then SUM(LENGTH(s)) and COUNT(DISTINCT s) of the non-blank.
+    var counts = [_]i64{0} ** 7;
+    var sums = [_]i64{0} ** 7;
+    var lens = [_]i64{0} ** 7;
+    var seen = [_][51]bool{[_]bool{false} ** 51} ** 7;
+    for (live) |r| {
+        const g: usize = @intCast(r.g);
+        if (r.d >= 3) {
+            counts[g] += 1;
+            sums[g] += r.v;
+        }
+        if (r.s_key) |k| {
+            lens[g] += statsSLen(k);
+            seen[g][@intCast(k)] = true;
+        }
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT g, COUNT(*), SUM(v) FROM z WHERE d >= 3 GROUP BY g ORDER BY g");
+        defer q.deinit();
+        const cells = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(cells);
+        try std.testing.expectEqual(@as(usize, 21), cells.len);
+        for (0..7) |g| {
+            try std.testing.expectEqual(@as(?i64, @intCast(g)), cells[g * 3]);
+            try std.testing.expectEqual(@as(?i64, counts[g]), cells[g * 3 + 1]);
+            try std.testing.expectEqual(@as(?i64, sums[g]), cells[g * 3 + 2]);
+        }
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT g, SUM(LENGTH(s)), COUNT(DISTINCT s) FROM z WHERE s <> '' GROUP BY g ORDER BY g");
+        defer q.deinit();
+        const cells = try helpers.collectIntCells(allocator, &q);
+        defer allocator.free(cells);
+        try std.testing.expectEqual(@as(usize, 21), cells.len);
+        for (0..7) |g| {
+            var distinct: i64 = 0;
+            for (seen[g]) |b| distinct += @intFromBool(b);
+            try std.testing.expectEqual(@as(?i64, @intCast(g)), cells[g * 3]);
+            try std.testing.expectEqual(@as(?i64, lens[g]), cells[g * 3 + 1]);
+            try std.testing.expectEqual(@as(?i64, distinct), cells[g * 3 + 2]);
+        }
+    }
+
+    // Late materialization re-fetches the wide columns by row location.
+    const top = try helpers.collectBigints(allocator, db, "SELECT id, s, ns FROM z WHERE d >= 4 AND d < 9 ORDER BY v DESC LIMIT 5");
+    defer allocator.free(top);
+    try std.testing.expectEqualSlices(i64, &.{ 2047, 2046, 2045, 2044, 2043 }, top);
+    try helpers.expectText(allocator, db, "SELECT s FROM z WHERE d >= 4 AND d < 9 ORDER BY v DESC LIMIT 1", "u47");
 }

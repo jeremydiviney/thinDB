@@ -1791,3 +1791,82 @@ test "aggregate: SELECT DISTINCT dedups a grouped query's rows (issue #342)" {
         }
     }
 }
+
+// Row r of `dd`: d is its row group, s is blank on every fourth row and
+// otherwise one of the nine values its row group holds, overlapping the next
+// group's by four. Row 1001 alone holds 'solo'.
+const DICT_RG: i64 = 128;
+const DICT_ROWS: i64 = 1024;
+const DICT_SOLO: usize = 60;
+
+fn dictDistinctKey(id: i64) ?usize {
+    if (id == 1001) return DICT_SOLO;
+    if (@mod(id, 4) == 0) return null;
+    return @intCast(@divTrunc(id, DICT_RG) * 5 + @mod(id, 9));
+}
+
+test "global COUNT(DISTINCT) over row-group dictionaries counts each referenced value once" {
+    const allocator = std.testing.allocator;
+    const deleted = [_]i64{ 5, 700, 1001 };
+    // Unflushed rows: two new values, one a flushed row group holds, a blank.
+    const mem_rows = .{ .{ 2000, "m0" }, .{ 2001, "m1" }, .{ 2002, "v3" }, .{ 2003, "" } };
+    const mem_keys = [_]?usize{ 61, 62, 3, null };
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = @intCast(DICT_RG), .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        try helpers.exec(allocator, db, "CREATE TABLE dd (id BIGINT PRIMARY KEY, d INT NOT NULL, s VARCHAR(16) NOT NULL)");
+        {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO dd VALUES ");
+            var id: i64 = 0;
+            while (id < DICT_ROWS) : (id += 1) {
+                if (id > 0) try buf.appendSlice(allocator, ", ");
+                var row: [64]u8 = undefined;
+                const d = @divTrunc(id, DICT_RG);
+                const line = if (dictDistinctKey(id)) |k|
+                    (if (k == DICT_SOLO) try std.fmt.bufPrint(&row, "({d}, {d}, 'solo')", .{ id, d }) else try std.fmt.bufPrint(&row, "({d}, {d}, 'v{d}')", .{ id, d, k }))
+                else
+                    try std.fmt.bufPrint(&row, "({d}, {d}, '')", .{ id, d });
+                try buf.appendSlice(allocator, line);
+            }
+            try helpers.exec(allocator, db, buf.items);
+        }
+        try (try db.openTable("dd", .{})).flush();
+        try helpers.exec(allocator, db, "DELETE FROM dd WHERE id IN (5, 700, 1001)");
+        inline for (mem_rows) |m| {
+            var row: [96]u8 = undefined;
+            try helpers.exec(allocator, db, try std.fmt.bufPrint(&row, "INSERT INTO dd VALUES ({d}, 9, '{s}')", .{ m[0], m[1] }));
+        }
+
+        const filters = .{
+            .{ "", 0, false },
+            .{ " WHERE d >= 3", 3, false },
+            .{ " WHERE d >= 3 AND id <> 650", 3, true },
+        };
+        inline for (filters) |f| {
+            var seen = [_]bool{false} ** 64;
+            var blank = false;
+            var id: i64 = 0;
+            while (id < DICT_ROWS) : (id += 1) {
+                if (std.mem.indexOfScalar(i64, &deleted, id) != null) continue;
+                if (@divTrunc(id, DICT_RG) < f[1] or (f[2] and id == 650)) continue;
+                if (dictDistinctKey(id)) |k| seen[k] = true else blank = true;
+            }
+            for (mem_keys) |mk| {
+                if (mk) |k| seen[k] = true else blank = true;
+            }
+            const want: i64 = @intCast(std.mem.count(bool, &seen, &.{true}) + @intFromBool(blank));
+            const sql = "SELECT COUNT(DISTINCT s) FROM dd" ++ f[0];
+            const got = try helpers.collectBigints(allocator, db, sql);
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, &.{want}, got) catch |err| {
+                std.debug.print("dop {d} query: {s}\n", .{ dop, sql });
+                return err;
+            };
+        }
+    }
+}

@@ -34,6 +34,11 @@ const INSERT_PREFETCH: usize = 16;
 // Publishes a producer lets pass without a relieve after one that found
 // nothing worth draining: every partition was empty, small, or taken.
 const RELIEVE_BACKOFF: u32 = 8;
+// Partitions one relieve drains at most. The worker that notices the queue
+// over budget keeps folding after a few drains instead of draining half the
+// queue alone: a long relieve late in the scan left the other workers idle at
+// the join.
+const RELIEVE_MAX_DRAINS: usize = 4;
 // Chunks come from slabs of this many, recycled through spares and freed only
 // with the set: per-chunk frees at teardown, all threads at once, contend on
 // the allocator's shared counters.
@@ -175,8 +180,9 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             }
         }
 
-        // While the queue is over budget, drain partitions until it is back
-        // under half the budget or every partition has been tried. Each relieve
+        // While the queue is over budget, drain up to `RELIEVE_MAX_DRAINS`
+        // partitions, stopping early once it is back under half the budget or
+        // every partition has been tried. Each relieve
         // starts at its own point of the round so concurrent ones spread out,
         // and passes over partitions holding less than an even share of the
         // queue: one refilled since its last drain holds a chunk or two, not
@@ -194,14 +200,14 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             if (queued <= budget) return false;
             const share = queued / PARTITIONS;
             const start = self.relieve_cursor.fetchAdd(PARTITIONS / 16, .monotonic);
-            var drained_any = false;
+            var drains: usize = 0;
             var tried: usize = 0;
-            while (tried < PARTITIONS and self.queued.load(.monotonic) > budget / 2) : (tried += 1) {
+            while (tried < PARTITIONS and drains < RELIEVE_MAX_DRAINS and self.queued.load(.monotonic) > budget / 2) : (tried += 1) {
                 const p = (start + tried) % PARTITIONS;
                 if (self.partitions[p].pending.load(.monotonic) < share) continue;
-                if (try self.drain(p, spare)) drained_any = true;
+                if (try self.drain(p, spare)) drains += 1;
             }
-            return !drained_any;
+            return drains == 0;
         }
 
         /// Drain the next partition once every producer has finished and
