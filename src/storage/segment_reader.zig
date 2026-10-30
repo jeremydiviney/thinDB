@@ -1029,6 +1029,9 @@ pub fn decodeRleColumn(
 }
 
 fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u32) ![]T {
+    // A run this short is written as one full-width store whose overhang the
+    // next run overwrites: runs of a few rows otherwise pay a fill loop each.
+    const short = 32 / @sizeOf(T);
     const data = try allocator.alloc(T, row_count);
     errdefer allocator.free(data);
     var pos: usize = 0;
@@ -1038,7 +1041,11 @@ fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u3
         // Clamp against a corrupt length so expansion can never write past the
         // block's row count; a short fill surfaces as a value mismatch, not UB.
         const len = @min(@as(usize, rb.runLength(run)), row_count - pos);
-        @memset(data[pos .. pos + len], v);
+        if (len <= short and pos + short <= row_count) {
+            data[pos..][0..short].* = @splat(v);
+        } else {
+            @memset(data[pos .. pos + len], v);
+        }
         pos += len;
         if (pos == row_count) break;
     }
