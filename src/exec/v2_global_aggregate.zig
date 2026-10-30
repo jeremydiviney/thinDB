@@ -108,6 +108,7 @@ fn openScanSource(
     // digesting the materialized bytes in the fold — same digest either way.
     for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
     if (derived.len == 0) {
+        for (hash_cols) |hc| if (scan.blockDictColumnIndex(hc)) |j| try scan.setBlockDictColumn(j);
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
     }
     // A column the aggregates read only through `octet_length` arrives as
@@ -233,6 +234,8 @@ const Lane = struct {
     // so the fold short-circuits them on a `len == 0` check — no hash, no set
     // probe — and the one `''` value re-enters the count as +1 at finalize.
     has_blank: []bool,
+    // Which entries of a dictionary block a batch's rows reference.
+    dict_seen: std.ArrayListUnmanaged(bool) = .empty,
     // Per-aggregate opaque UDAF state blob (16-aligned, sized to the entry's
     // state_size). Empty slice for non-UDAF aggregates. Each lane folds into its
     // own; the merge reduces them via the entry's `combine`.
@@ -302,6 +305,7 @@ const Lane = struct {
         for (self.dsets) |*d| d.deinit(allocator);
         allocator.free(self.dsets);
         allocator.free(self.has_blank);
+        self.dict_seen.deinit(allocator);
         allocator.free(self.distinct_counts);
         allocator.free(self.sstr);
         allocator.free(self.isum);
@@ -431,7 +435,8 @@ fn foldBatch(lane: *Lane, plans: []const AggPlan, resolved: []const ?usize, batc
         const view = batch.values[idx];
         if (p.op == .count_distinct) {
             const digests: ?[]const u128 = if (batch.hashed) |hs| hs[idx] else null;
-            try foldDistinctGlobal(lane, p, i, view, digests, n);
+            const dict: ?exec.BlockDictColumn = if (batch.block_dicts) |bds| bds[idx] else null;
+            try foldDistinctGlobal(lane, p, i, view, digests, dict, n);
             continue;
         }
         if (p.is_string) {
@@ -589,13 +594,33 @@ fn foldExtremeFloatGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns:
 // COUNT(DISTINCT) fold: on the parallel path into the lane's producer for the
 // field's shared set, on the serial path into the lane's own set through a
 // `DistinctFeed`, which overlaps the set probes' cache misses.
-fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, n: usize) !void {
+fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, dict: ?exec.BlockDictColumn, n: usize) !void {
     if (i < lane.producers.len) if (lane.producers[i]) |producer| switch (producer) {
-        inline else => |prod| return foldDistinctInto(prod, lane, p, i, view, digests, n),
+        inline else => |prod| return foldDistinctInto(prod, lane, p, i, view, digests, dict, n),
     };
     var feed: DistinctFeed = .{ .set = &lane.dsets[i], .allocator = lane.allocator };
-    try foldDistinctInto(&feed, lane, p, i, view, digests, n);
+    try foldDistinctInto(&feed, lane, p, i, view, digests, dict, n);
     try feed.drain();
+}
+
+// A dictionary block's rows hold only its entries, so each entry the rows
+// reference enters the set once, by its digest, instead of a digest per row.
+fn foldDistinctDict(sink: anytype, lane: *Lane, i: usize, dict: exec.BlockDictColumn, n: usize) !void {
+    lane.ns[i] += n;
+    try lane.dict_seen.resize(lane.allocator, dict.valueCount());
+    const seen = lane.dict_seen.items;
+    @memset(seen, false);
+    for (dict.codes[0..n]) |c| seen[c] = true;
+    const blank = exec.stringKeyDigest("");
+    for (seen, 0..) |referenced, c| {
+        if (!referenced) continue;
+        const key = if (dict.digests) |ds| ds[c] else exec.stringKeyDigest(dict.dict.rowBytes(c));
+        if (key == blank) {
+            lane.has_blank[i] = true;
+            continue;
+        }
+        try sink.push(@truncate(key));
+    }
 }
 
 // The dkind dispatch happens once and each kernel runs over a typed slice.
@@ -604,9 +629,10 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
 // can't be new — the count bump still happens, only the set insert is elided.
 // `sink.push` takes the key at the sink's width; the field's tier makes the
 // truncation lossless.
-fn foldDistinctInto(sink: anytype, lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, n: usize) !void {
+fn foldDistinctInto(sink: anytype, lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, dict: ?exec.BlockDictColumn, n: usize) !void {
     switch (p.dkind) {
         .string => {
+            if (dict) |d| return foldDistinctDict(sink, lane, i, d, n);
             // Scan-emitted digests: the column is non-nullable (the scan's
             // hash gate), so every row counts; `''` keeps its fast path by
             // digest equality.
