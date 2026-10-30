@@ -173,11 +173,47 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             return true;
         }
 
+        inline fn hashOf(key: Key) u64 {
+            return if (Key == u64) group_table.mix64(key) else group_table.hashU128(key);
+        }
+
+        // The probe walks local copies of the set's fields: through `set`
+        // they reload after every slot store, which may alias them. Each key's
+        // hash is computed once, when its slot is prefetched.
         fn insertAll(set: *Set, keys: []const Key) void {
-            for (keys, 0..) |key, j| {
-                if (j + INSERT_PREFETCH < keys.len) set.prefetch(keys[j + INSERT_PREFETCH]);
-                set.insert(key);
+            const slots = set.slots;
+            const mask = slots.len - 1;
+            var hashes: [INSERT_PREFETCH]u64 = undefined;
+            for (keys[0..@min(keys.len, INSERT_PREFETCH)], 0..) |key, j| {
+                hashes[j] = hashOf(key);
+                @prefetch(&slots[hashes[j] & mask], .{ .rw = .write, .locality = 3 });
             }
+            var added: u32 = 0;
+            var sentinel = false;
+            for (keys, 0..) |key, j| {
+                const ring = j % INSERT_PREFETCH;
+                const h = hashes[ring];
+                if (j + INSERT_PREFETCH < keys.len) {
+                    hashes[ring] = hashOf(keys[j + INSERT_PREFETCH]);
+                    @prefetch(&slots[hashes[ring] & mask], .{ .rw = .write, .locality = 3 });
+                }
+                if (key == Set.SENTINEL) {
+                    sentinel = true;
+                    continue;
+                }
+                var b = h & mask;
+                while (true) : (b = (b + 1) & mask) {
+                    const slot = slots[b];
+                    if (slot == Set.SENTINEL) {
+                        slots[b] = key;
+                        added += 1;
+                        break;
+                    }
+                    if (slot == key) break;
+                }
+            }
+            set.len += added;
+            if (sentinel) set.has_sentinel = true;
         }
 
         // While the queue is over budget, drain up to `RELIEVE_MAX_DRAINS`
