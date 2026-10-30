@@ -1219,8 +1219,8 @@ pub const Compute = struct {
         } else if (plan.func.typed_kernel) |tk| {
             try tk(self.allocator, plan.arg_runtime_types, plan.output_type, arg_views, out, n);
         } else if (self.byteLengthsOf(plan, in_values)) |lens| {
-            try out.data.int.ensureUnusedCapacity(self.allocator, lens.len);
-            for (lens) |l| out.data.int.appendAssumeCapacity(@intCast(l));
+            const dst = try out.data.int.addManyAsSlice(self.allocator, lens.len);
+            for (dst, lens) |*d, l| d.* = @intCast(l);
         } else if (plan.func.kernel) |k| {
             try k(self.allocator, arg_views, out, n);
         } else if (plan.func.udf_kernel) |k| {

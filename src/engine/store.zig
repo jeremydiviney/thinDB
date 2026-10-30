@@ -121,6 +121,13 @@ pub const StringStore = struct {
         try self.bytes.ensureUnusedCapacity(allocator, bytes_len);
     }
 
+    /// Append `n` empty strings: one offset fill instead of `n` appends.
+    pub fn appendEmpty(self: *StringStore, allocator: Allocator, n: usize) !void {
+        const total = self.bytes.items.len;
+        if (self.wide_offsets) |*wo| return wo.appendNTimes(allocator, total, n);
+        try self.offsets.appendNTimes(allocator, @intCast(total), n);
+    }
+
     pub fn appendValueAssumeCapacity(self: *StringStore, slice: []const u8) void {
         self.bytes.appendSliceAssumeCapacity(slice);
         self.offsets.appendAssumeCapacity(@intCast(self.bytes.items.len));

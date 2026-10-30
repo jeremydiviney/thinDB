@@ -2953,144 +2953,7 @@ pub const Scan = struct {
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
 
-            const rg_count = rg.row_count;
-
-            var decoded_cols: usize = 0;
-            errdefer {
-                for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
-                // A later step (e.g. tombstone application) can fail after
-                // `decoded_valid` is set; clear it so the deinit-time
-                // `releaseBatch` doesn't free these columns a second time.
-                self.decoded_valid = false;
-            }
-            const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
-            // Sidecars ride only row groups no tombstone touches: the survivor
-            // compaction would desync them from the values.
-            const rg_clean = !self.rowGroupHasTombstones(rg_first, rg_count);
-            // Phase 4.2: emit the gated key column as codes (sidecar) instead of
-            // materialized strings. Not in late-mat mode.
-            const coding = self.n_coded > 0 and rg_clean and !self.emit_loc;
-            // Key-digest emit is late-mat compatible: the synthesized __rowloc
-            // column is exactly how the real key bytes come back at emit.
-            const hashing = self.n_hashed > 0 and rg_clean;
-            const measuring = self.n_lengths > 0 and rg_clean;
-            const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0 and rg_clean) try self.ensureDictSlots() else null;
-            var any_dict = false;
-            var any_raw = false;
-            for (self.out_phys, 0..) |phys, j| {
-                if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
-                    if (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) |d| {
-                        dict_slots.?[j] = d;
-                        any_dict = true;
-                    } else if (!(hashing and self.hash_cols_by_j[j]) and try self.holdRawStrings(seg, self.cur_rg_idx, phys, j, rg_count)) {
-                        any_raw = true;
-                    } else break :dict;
-                    self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
-                    decoded_cols += 1;
-                    continue;
-                }
-                if (coding and self.coded_dicts_by_j[j] != null) {
-                    self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
-                } else if (hashing and self.hash_cols_by_j[j]) {
-                    self.decoded[j] = try self.fillKeyHashes(seg, self.cur_rg_idx, phys, rg_count, j);
-                } else if (measuring and self.len_cols_by_j[j]) {
-                    _ = try self.fillByteLengths(seg, self.cur_rg_idx, phys, j, rg_count, null);
-                    self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
-                } else {
-                    self.decoded[j] = try seg.decodeColumnMaybeCached(
-                        self.allocator,
-                        self.table.schema,
-                        self.cur_rg_idx,
-                        phys,
-                        self.table.cacheRef(),
-                    );
-                }
-                decoded_cols += 1;
-            }
-
-            // Late-mat: synthesize the trailing `__rowloc` column as a normal
-            // decoded column. The local offset is the row's index within this
-            // row group, so a survivor can later be re-fetched via
-            // `decodeColumnMaybeCached(rg_idx, phys)[offset]`. Carrying it
-            // through `applyTombsIfAny` keeps each surviving row's physical
-            // location correct after tombstone compaction.
-            if (self.emit_loc) {
-                const locs = try self.allocator.alloc(i64, rg_count);
-                for (locs, 0..) |*v, i| v.* = rowloc.packSegment(self.cur_seg_idx, self.cur_rg_idx, i);
-                self.decoded[self.out_phys.len] = .{ .data = .{ .bigint = locs } };
-                decoded_cols += 1;
-            }
-            self.decoded_valid = true;
-
-            self.cur_rg_idx += 1;
-
-            // Apply tombstones if any fall within this row group.
-            const masked = try self.applyTombsIfAny(rg_first, rg_count);
-            if (masked) |out| return out;
-
-            for (self.decoded, 0..) |c, i| self.views[i] = c.view();
-            if (any_raw) {
-                for (self.dict_bufs[0..self.out_phys.len], 0..) |b, j| {
-                    const raw = b.raw orelse continue;
-                    if (raw.seg_idx == self.cur_seg_idx and raw.rg_idx == self.cur_rg_idx - 1) self.views[j] = raw.view;
-                }
-            }
-            var sidecar: ?[]const ?exec.CodedColumn = null;
-            if (coding) {
-                const slots = try self.ensureCodedSlots();
-                for (0..self.out_phys.len) |j| {
-                    if (self.coded_dicts_by_j[j]) |d| {
-                        slots[j] = .{ .codes = self.code_bufs[j].items[0..rg_count], .dict = d };
-                    }
-                }
-                sidecar = slots;
-            }
-            var hash_sidecar: ?[]const ?[]const u128 = null;
-            if (hashing) {
-                const slots = try self.ensureHashedSlots();
-                var any_hashed = false;
-                for (0..self.out_phys.len) |j| {
-                    if (!self.hash_cols_by_j[j]) continue;
-                    if (any_dict and dict_slots.?[j] != null) continue;
-                    slots[j] = self.hash_bufs[j].items[0..rg_count];
-                    any_hashed = true;
-                }
-                if (any_hashed) hash_sidecar = slots;
-            }
-            var length_sidecar: ?[]const ?[]const u32 = null;
-            if (measuring) {
-                const slots = try self.ensureLengthSlots();
-                for (0..self.out_phys.len) |j| {
-                    if (self.len_cols_by_j[j]) slots[j] = self.len_bufs[j].items[0..rg_count];
-                }
-                length_sidecar = slots;
-            }
-            // Sub-batch experiment: emit the row group in `scan_sub_batch`-row
-            // slices (plain projection only — not coded/hashed/late-mat, which
-            // keep the full batch). The decoded buffers stay live until the
-            // cursor exhausts and the next `next()` calls `releaseBatch`.
-            // `emit_runs` also keeps the full row group: the run sidecar is
-            // per-RG (a run-aware consumer does near-zero per-row work, so the
-            // L2-residency slicing buys nothing there).
-            if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !any_raw and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
-                self.sub_off = 0;
-                self.sub_count = rg_count;
-                return self.emitSub();
-            }
-            var runs_sidecar: ?[]const ?exec.RunsColumn = null;
-            if (self.emit_runs and rg_clean) {
-                runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
-            }
-            return Batch{
-                .schema = self.out_schema,
-                .values = self.views,
-                .row_count = rg_count,
-                .coded = sidecar,
-                .hashed = hash_sidecar,
-                .byte_lengths = length_sidecar,
-                .runs = runs_sidecar,
-                .block_dicts = if (any_dict) dict_slots else null,
-            };
+            return try self.emitRowGroup(seg, rg.row_count);
         }
 
         // Memtable phase — read from the pinned snapshot, not the table's
@@ -3117,6 +2980,181 @@ pub const Scan = struct {
         }
 
         return null;
+    }
+
+    /// Emit row group `cur_rg_idx` of `seg` whole, decoded or viewed in
+    /// place with its sidecars, and advance the cursor past it. Tombstoned
+    /// rows still drop out.
+    fn emitRowGroup(self: *Scan, seg: *storage.ReadSegment, rg_count: u32) !Batch {
+        var decoded_cols: usize = 0;
+        errdefer {
+            for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
+            // A later step (e.g. tombstone application) can fail after
+            // `decoded_valid` is set; clear it so the deinit-time
+            // `releaseBatch` doesn't free these columns a second time.
+            self.decoded_valid = false;
+        }
+        const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
+        // Sidecars ride only row groups no tombstone touches: the survivor
+        // compaction would desync them from the values.
+        const rg_clean = !self.rowGroupHasTombstones(rg_first, rg_count);
+        // Phase 4.2: emit the gated key column as codes (sidecar) instead of
+        // materialized strings. Not in late-mat mode.
+        const coding = self.n_coded > 0 and rg_clean and !self.emit_loc;
+        // Key-digest emit is late-mat compatible: the synthesized __rowloc
+        // column is exactly how the real key bytes come back at emit.
+        const hashing = self.n_hashed > 0 and rg_clean;
+        const measuring = self.n_lengths > 0 and rg_clean;
+        const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0 and rg_clean) try self.ensureDictSlots() else null;
+        var any_dict = false;
+        var any_raw = false;
+        for (self.out_phys, 0..) |phys, j| {
+            if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
+                if (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) |d| {
+                    dict_slots.?[j] = d;
+                    any_dict = true;
+                } else if (!(hashing and self.hash_cols_by_j[j]) and try self.holdRawStrings(seg, self.cur_rg_idx, phys, j, rg_count)) {
+                    any_raw = true;
+                } else break :dict;
+                self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
+                decoded_cols += 1;
+                continue;
+            }
+            if (coding and self.coded_dicts_by_j[j] != null) {
+                self.decoded[j] = try self.fillKeyCodes(seg, self.cur_rg_idx, phys, rg_count, j);
+            } else if (hashing and self.hash_cols_by_j[j]) {
+                self.decoded[j] = try self.fillKeyHashes(seg, self.cur_rg_idx, phys, rg_count, j);
+            } else if (measuring and self.len_cols_by_j[j]) {
+                _ = try self.fillByteLengths(seg, self.cur_rg_idx, phys, j, rg_count, null);
+                self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
+            } else {
+                self.decoded[j] = try seg.decodeColumnMaybeCached(
+                    self.allocator,
+                    self.table.schema,
+                    self.cur_rg_idx,
+                    phys,
+                    self.table.cacheRef(),
+                );
+            }
+            decoded_cols += 1;
+        }
+
+        // Late-mat: synthesize the trailing `__rowloc` column as a normal
+        // decoded column. The local offset is the row's index within this
+        // row group, so a survivor can later be re-fetched via
+        // `decodeColumnMaybeCached(rg_idx, phys)[offset]`. Carrying it
+        // through `applyTombsIfAny` keeps each surviving row's physical
+        // location correct after tombstone compaction.
+        if (self.emit_loc) {
+            const locs = try self.allocator.alloc(i64, rg_count);
+            for (locs, 0..) |*v, i| v.* = rowloc.packSegment(self.cur_seg_idx, self.cur_rg_idx, i);
+            self.decoded[self.out_phys.len] = .{ .data = .{ .bigint = locs } };
+            decoded_cols += 1;
+        }
+        self.decoded_valid = true;
+
+        self.cur_rg_idx += 1;
+
+        // Apply tombstones if any fall within this row group.
+        const masked = try self.applyTombsIfAny(rg_first, rg_count);
+        if (masked) |out| return out;
+
+        for (self.decoded, 0..) |c, i| self.views[i] = c.view();
+        if (any_raw) {
+            for (self.dict_bufs[0..self.out_phys.len], 0..) |b, j| {
+                const raw = b.raw orelse continue;
+                if (raw.seg_idx == self.cur_seg_idx and raw.rg_idx == self.cur_rg_idx - 1) self.views[j] = raw.view;
+            }
+        }
+        var sidecar: ?[]const ?exec.CodedColumn = null;
+        if (coding) {
+            const slots = try self.ensureCodedSlots();
+            for (0..self.out_phys.len) |j| {
+                if (self.coded_dicts_by_j[j]) |d| {
+                    slots[j] = .{ .codes = self.code_bufs[j].items[0..rg_count], .dict = d };
+                }
+            }
+            sidecar = slots;
+        }
+        var hash_sidecar: ?[]const ?[]const u128 = null;
+        if (hashing) {
+            const slots = try self.ensureHashedSlots();
+            var any_hashed = false;
+            for (0..self.out_phys.len) |j| {
+                if (!self.hash_cols_by_j[j]) continue;
+                if (any_dict and dict_slots.?[j] != null) continue;
+                slots[j] = self.hash_bufs[j].items[0..rg_count];
+                any_hashed = true;
+            }
+            if (any_hashed) hash_sidecar = slots;
+        }
+        var length_sidecar: ?[]const ?[]const u32 = null;
+        if (measuring) {
+            const slots = try self.ensureLengthSlots();
+            for (0..self.out_phys.len) |j| {
+                if (self.len_cols_by_j[j]) slots[j] = self.len_bufs[j].items[0..rg_count];
+            }
+            length_sidecar = slots;
+        }
+        // Sub-batch experiment: emit the row group in `scan_sub_batch`-row
+        // slices (plain projection only — not coded/hashed/late-mat, which
+        // keep the full batch). The decoded buffers stay live until the
+        // cursor exhausts and the next `next()` calls `releaseBatch`.
+        // `emit_runs` also keeps the full row group: the run sidecar is
+        // per-RG (a run-aware consumer does near-zero per-row work, so the
+        // L2-residency slicing buys nothing there).
+        if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !any_raw and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
+            self.sub_off = 0;
+            self.sub_count = rg_count;
+            return self.emitSub();
+        }
+        var runs_sidecar: ?[]const ?exec.RunsColumn = null;
+        if (self.emit_runs and rg_clean) {
+            runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
+        }
+        return Batch{
+            .schema = self.out_schema,
+            .values = self.views,
+            .row_count = rg_count,
+            .coded = sidecar,
+            .hashed = hash_sidecar,
+            .byte_lengths = length_sidecar,
+            .runs = runs_sidecar,
+            .block_dicts = if (any_dict) dict_slots else null,
+        };
+    }
+
+    /// Whether `rg`'s zone stats prove every row passes the fused filter,
+    /// so the row group skips the mask and the survivor copy. Only plain
+    /// comparisons and NOT NULL tests, alone or ANDed, can be proven.
+    fn statsPassAll(self: *const Scan, rg: storage.RowGroupMeta, expr: PredicateExpr) bool {
+        return switch (expr) {
+            .always => |keep| keep,
+            .leaf => |leaf| blk: {
+                const col = self.rowGroupStatsOf(rg, leaf.col) orelse break :blk false;
+                const text_col = switch (self.table.schema.columns[col.phys].type) {
+                    .varchar, .string => true,
+                    // CHAR compares with its pad, which the stored prefixes lack.
+                    .char => break :blk false,
+                    else => false,
+                };
+                if ((leaf.val == .text) != text_col) break :blk false;
+                break :blk predicate.statsImplyPredicate(col.s, leaf.op, leaf.val);
+            },
+            .is_not_null => |name| if (self.rowGroupStatsOf(rg, name)) |col| col.s.null_count == 0 else false,
+            .@"and" => |children| for (children) |c| {
+                if (!self.statsPassAll(rg, c)) break false;
+            } else true,
+            else => false,
+        };
+    }
+
+    fn rowGroupStatsOf(self: *const Scan, rg: storage.RowGroupMeta, col: []const u8) ?struct { phys: usize, s: storage.format.Stats } {
+        const phys = types.findColumn(self.table.schema.columns, col) orelse return null;
+        if (phys >= rg.stats.len) return null;
+        const col_type = self.table.schema.columns[phys].type;
+        if (!storage.format.typeHasStats(col_type) or !storage.format.bytesFollowComparison(col_type)) return null;
+        return .{ .phys = phys, .s = rg.stats[phys] };
     }
 
     /// Advance past leading-key-excluded segments and open the next eligible
@@ -3168,6 +3206,7 @@ pub const Scan = struct {
         if (self.filter_memo == null) self.filter_memo = self.buildFilterMemo();
         const memo = &self.filter_memo.?;
 
+        if (self.sub_off < self.sub_count) return self.emitSub();
         if (self.pending_rows.len > 0) {
             // The loop below is what moves off a segment, so the pending row
             // group's segment is still `cur_segment`.
@@ -3178,6 +3217,7 @@ pub const Scan = struct {
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
         }
 
+        self.releaseBatch();
         while (self.phase == .segments) {
             if (self.accountant()) |a| try a.checkCancelled();
             if (self.cur_segment == null and !try self.openCurSegment()) break;
@@ -3211,6 +3251,7 @@ pub const Scan = struct {
             }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
+            if (self.key_bound == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             const rg_count = rg.row_count;
@@ -5024,10 +5065,7 @@ pub const Scan = struct {
     /// coded group key (downstream reads the sidecar codes, not this column).
     fn fillEmptyStrings(self: *Scan, out: *ColumnStore, n: usize) !void {
         switch (out.data) {
-            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
-                var i: usize = 0;
-                while (i < n) : (i += 1) try ss.appendValue(self.allocator, "");
-            },
+            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendEmpty(self.allocator, n),
             else => unreachable,
         }
     }
