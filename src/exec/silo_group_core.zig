@@ -1242,7 +1242,7 @@ const GroupRows = struct {
         self.* = .{};
     }
 
-    fn appendRawRowsSlice(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: RawRows, start: usize, count: usize) !void {
+    fn appendRawRowsSlice(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, rows: RawRows, start: usize, count: usize, strs: StagedStrSource) !void {
         if (count == 0) return;
         const old_len = self.len();
         const new_len = old_len + count;
@@ -1270,18 +1270,27 @@ const GroupRows = struct {
             while (vi < nv) : (vi += 1) @memcpy(self.validAll(vi)[old_len..new_len], rows.validAll(vi)[start .. start + count]);
         }
         // Variable-length string payload: copy each scattered row's string
-        // values from the source RawRows store into this bucket's store. Owned
+        // values from its raw chunk's store into this bucket's store. Owned
         // bytes, so the bucket survives the source chunk's recycle.
         if (self.layout.has_str_payload) {
             const k = self.layout.str_columns.len;
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
+            // A bucket's rows keep their source order, so the chunk walk
+            // only moves forward.
+            var chunk: usize = 0;
+            var chunk_start: usize = 0;
+            for (strs.src[start..][0..count], old_len..) |src, dst| {
+                while (src >= chunk_start + strs.chunks[chunk].rows.len()) {
+                    chunk_start += strs.chunks[chunk].rows.len();
+                    chunk += 1;
+                }
+                const from = strs.chunks[chunk].rows.str;
+                const r = src - chunk_start;
                 var c: usize = 0;
                 while (c < k) : (c += 1) {
-                    if (rows.str.isNull(k, start + i, c)) {
-                        self.str.appendNull(k, old_len + i, c);
+                    if (from.isNull(k, r, c)) {
+                        self.str.appendNull(k, dst, c);
                     } else {
-                        try self.str.append(allocator, k, old_len + i, c, rows.str.get(k, start + i, c));
+                        try self.str.append(allocator, k, dst, c, from.get(k, r, c));
                     }
                 }
             }
@@ -1308,6 +1317,13 @@ const GroupRows = struct {
             .u128 => self.keyU128All()[idx] = key,
         }
     }
+};
+
+/// Where a stage's flat rows find their string payloads: row `src[i]` of the
+/// popped raw chunks, counted across them in order.
+const StagedStrSource = struct {
+    chunks: []const RawChunk = &.{},
+    src: []const u32 = &.{},
 };
 
 const PartBucket = struct {
@@ -1362,6 +1378,10 @@ const WorkerParts = struct {
     flat_partitioned: bool = false,
     flat_raw_rows: RawRows = .{},
     flat_bucket_ids: std.ArrayListUnmanaged(u16) = .empty,
+    /// String-payload layouts: each flat row's source row, counted across
+    /// the popped raw chunks, whose stores hold its strings until they
+    /// recycle — so the strings are copied once, into the bucket builders.
+    flat_str_src: std.ArrayListUnmanaged(u32) = .empty,
     flat_counts: []u32 = &.{},
     flat_offsets: []u32 = &.{},
     flat_next: []u32 = &.{},
@@ -1461,6 +1481,7 @@ const WorkerParts = struct {
         if (self.buckets.len > 0) allocator.free(self.buckets);
         self.flat_raw_rows.deinit(allocator);
         self.flat_bucket_ids.deinit(allocator);
+        self.flat_str_src.deinit(allocator);
         self.raw_active_rows.deinit(allocator);
         if (self.fold_slots.len > 0) allocator.free(self.fold_slots);
         if (self.flat_counts.len > 0) allocator.free(self.flat_counts);
@@ -2746,6 +2767,55 @@ test "string pipeline memory: bounded stage preserves partials and frees popped 
 
 test "string pipeline memory: cancelled stage releases its lease and popped input" {
     try string_stage_failure_fixture(std.testing.allocator, true);
+}
+
+test "string stage: each row's strings come from its own raw chunk" {
+    const allocator = std.testing.allocator;
+    var memory_pool = thindb.exec.memory.MemoryPool.init(1024 * 1024);
+    var resources = thindb.exec.memory.MemoryAccountant.init(&memory_pool);
+    var shared = PipeShared{
+        .allocator = allocator,
+        .resources = &resources,
+        .buckets = &.{},
+        .bucket_count = 1,
+        .scan_threads = 1,
+        .group_rows_layout = STRING_MEMORY_TEST_LAYOUT,
+        .recycle_byte_limit = 0,
+    };
+    defer deinitRawQueues(&shared);
+    var local: WorkerParts = .{};
+    defer local.deinit(allocator);
+    shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+    shared.raw_scan_queues[0] = .{};
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+    shared.raw_group_queues[0] = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+    shared.stage_builders[0] = .{};
+    var source: RawRows = .{};
+    defer source.deinit(allocator);
+    var buf: [16]u8 = undefined;
+    // Chunks of 1, 3 and 2 rows, all popped by one stage. Each row's key
+    // names its chunk and row, so its string must spell the same.
+    for ([_]usize{ 1, 3, 2 }, 0..) |size, c| {
+        try source.resize(allocator, STRING_MEMORY_TEST_LAYOUT, size);
+        for (0..size) |row| {
+            source.setKey(row, c * 10 + row);
+            try source.str.append(allocator, 1, row, 0, try std.fmt.bufPrint(&buf, "c{d}r{d}", .{ c, row }));
+        }
+        try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 4, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+    }
+    shared.scans_done.store(1, .release);
+    try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+    try std.testing.expect(try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 4, 8, 4, false));
+    try std.testing.expectEqual(@as(usize, 0), shared.raw_scan_queues[0].chunks.items.len);
+    _ = try flushSharedStageBuilders(&shared, &local, false);
+    try std.testing.expectEqual(@as(usize, 1), shared.raw_group_queues[0].chunks.items.len);
+    const staged = shared.raw_group_queues[0].chunks.items[0].rows;
+    try std.testing.expectEqual(@as(usize, 6), staged.len());
+    for (0..staged.len()) |row| {
+        const key = staged.keyAt(row);
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "c{d}r{d}", .{ key / 10, key % 10 }), staged.str.get(1, row, 0));
+    }
 }
 
 pub const RawGroupMode = enum {
@@ -6930,6 +7000,7 @@ fn appendSharedStageBuilderRawSlice(
     local: *WorkerParts,
     bucket_idx: usize,
     rows: RawRows,
+    strs: StagedStrSource,
     start: usize,
     count: usize,
     raw_group_chunk_rows: usize,
@@ -6954,7 +7025,7 @@ fn appendSharedStageBuilderRawSlice(
 
         const free = raw_group_chunk_rows - builder.rows.len();
         const take = @min(free, count - pos);
-        try builder.rows.appendRawRowsSlice(shared.allocator, shared.group_rows_layout, rows, start + pos, take);
+        try builder.rows.appendRawRowsSlice(shared.allocator, shared.group_rows_layout, rows, start + pos, take, strs);
         _ = shared.stage_builder_rows.fetchAdd(@intCast(take), .release);
         pos += take;
 
@@ -7174,7 +7245,7 @@ fn drainRawDedicatedStageSharedBuilders(
         try local.flat_raw_rows.resize(allocator, shared.group_rows_layout, total_rows);
         try local.flat_bucket_ids.resize(allocator, total_rows);
         const layout = shared.group_rows_layout;
-        if (layout.has_str_payload) local.flat_raw_rows.str.clear();
+        if (layout.has_str_payload) try local.flat_str_src.resize(allocator, total_rows);
 
         const stage_t0 = if (profile) platform.nowTicks() else 0;
         const chunks = raw_chunks[0..popped_total];
@@ -7193,25 +7264,15 @@ fn drainRawDedicatedStageSharedBuilders(
 
         var lanes: [MAX_STAGE_LANES]StageLane = undefined;
         for (StageLane.all(layout, &lanes)) |lane| try scatterStageLane(local.flat_raw_rows, chunks, bucket_ids, offsets, next, lane);
+        var strs: StagedStrSource = .{};
         if (layout.has_str_payload) {
-            const k = layout.str_columns.len;
+            const src = local.flat_str_src.items[0..total_rows];
             @memcpy(next, offsets);
-            var row_idx: usize = 0;
-            for (chunks) |chunk| {
-                const src = chunk.rows;
-                for (bucket_ids[row_idx..][0..src.len()], 0..) |b, r| {
-                    const pos = next[b];
-                    next[b] = pos + 1;
-                    for (0..k) |sc| {
-                        if (src.str.isNull(k, r, sc)) {
-                            local.flat_raw_rows.str.appendNull(k, pos, sc);
-                        } else {
-                            try local.flat_raw_rows.str.append(allocator, k, pos, sc, src.str.get(k, r, sc));
-                        }
-                    }
-                }
-                row_idx += src.len();
+            for (bucket_ids, 0..) |b, r| {
+                src[next[b]] = @intCast(r);
+                next[b] += 1;
             }
+            strs = .{ .chunks = chunks, .src = src };
         }
         if (profile) local.raw_stage_ticks += platform.nowTicks() - stage_t0;
 
@@ -7221,7 +7282,7 @@ fn drainRawDedicatedStageSharedBuilders(
             const count: usize = local.flat_counts[b];
             if (count == 0) continue;
             const start: usize = local.flat_offsets[b];
-            try appendSharedStageBuilderRawSlice(shared, local, b, local.flat_raw_rows, start, count, raw_group_chunk_rows, profile);
+            try appendSharedStageBuilderRawSlice(shared, local, b, local.flat_raw_rows, strs, start, count, raw_group_chunk_rows, profile);
         }
         if (profile) local.raw_stage_slice_ticks += platform.nowTicks() - append_t0;
 
