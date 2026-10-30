@@ -12,7 +12,13 @@ const Io = std.Io;
 
 // Print a stack trace on access violations even in ReleaseFast: a silent
 // exit 139 is useless when a workload crashes the server.
-pub const std_options: std.Options = .{ .enable_segfault_handler = true };
+//
+// No per-thread alternate signal stack: std reserves it as a 256 KiB
+// threadlocal, and glibc zeroes every thread's TLS block when it creates the
+// thread, so each worker a query spawns faulted in and cleared 256 KiB before
+// doing any work. The handler runs on the faulting thread's own stack instead,
+// so only a stack overflow loses its trace.
+pub const std_options: std.Options = .{ .enable_segfault_handler = true, .signal_stack_size = null };
 
 const default_bind: []const u8 = "0.0.0.0";
 
