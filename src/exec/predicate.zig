@@ -3409,6 +3409,67 @@ pub fn statsOverlapPredicateBlankAware(s: storage.format.Stats, op: PredicateOp,
     };
 }
 
+/// True when stats `s` prove every row satisfies `op v`: the dual of
+/// `statsOverlapPredicate`. A NULL satisfies no comparison, so one NULL row
+/// disproves it. Strings hold 16-byte prefixes, and only a strict prefix
+/// order orders the strings themselves; floats prove nothing, as the stats
+/// skip NaN rows.
+pub fn statsImplyPredicate(s: storage.format.Stats, op: PredicateOp, v: Value) bool {
+    if (s.null_count > 0 or s.min > s.max) return false;
+    const wanted: i128 = switch (v) {
+        .text => |x| {
+            const enc = storage.format.encodeStringPrefix(x);
+            return switch (op) {
+                .eq => false,
+                .neq => enc < s.min or enc > s.max,
+                .lt, .lte => s.max < enc,
+                .gt, .gte => s.min > enc,
+            };
+        },
+        .uuid => |x| storage.format.encodeUnsignedU128(x),
+        .float, .double, .decimal256 => return false,
+        else => valueToRangeI128(v) orelse return false,
+    };
+    return switch (op) {
+        .eq => s.min == wanted and s.max == wanted,
+        .neq => wanted < s.min or wanted > s.max,
+        .lt => s.max < wanted,
+        .lte => s.max <= wanted,
+        .gt => s.min > wanted,
+        .gte => s.min >= wanted,
+    };
+}
+
+test "statsImplyPredicate proves only what every row satisfies" {
+    const t = std.testing;
+    const enc = storage.format.encodeStringPrefix;
+    const ints: storage.format.Stats = .{ .min = 10, .max = 20 };
+    try t.expect(statsImplyPredicate(ints, .gte, .{ .int = 10 }));
+    try t.expect(!statsImplyPredicate(ints, .gt, .{ .int = 10 }));
+    try t.expect(statsImplyPredicate(ints, .lt, .{ .int = 21 }));
+    try t.expect(!statsImplyPredicate(ints, .lte, .{ .int = 19 }));
+    try t.expect(statsImplyPredicate(ints, .neq, .{ .int = 9 }));
+    try t.expect(!statsImplyPredicate(ints, .neq, .{ .int = 15 }));
+    try t.expect(!statsImplyPredicate(ints, .eq, .{ .int = 10 }));
+    try t.expect(statsImplyPredicate(.{ .min = 7, .max = 7 }, .eq, .{ .int = 7 }));
+    try t.expect(!statsImplyPredicate(.{ .min = 10, .max = 20, .null_count = 1 }, .gte, .{ .int = 0 }));
+    // All-null range: the inverted sentinel holds no value to prove anything.
+    try t.expect(!statsImplyPredicate(.{ .min = std.math.maxInt(i32), .max = std.math.minInt(i32) }, .neq, .{ .int = 0 }));
+    try t.expect(!statsImplyPredicate(.{ .min = 0, .max = 5 }, .gte, .{ .double = -1 }));
+
+    const urls: storage.format.Stats = .{ .min = enc("http://a"), .max = enc("http://z") };
+    try t.expect(statsImplyPredicate(urls, .neq, .{ .text = "" }));
+    try t.expect(statsImplyPredicate(urls, .gt, .{ .text = "http" }));
+    try t.expect(statsImplyPredicate(urls, .lt, .{ .text = "https" }));
+    try t.expect(!statsImplyPredicate(urls, .eq, .{ .text = "http://a" }));
+    // '' and "\x00" share a prefix: a zero min can't rule out blanks.
+    try t.expect(!statsImplyPredicate(.{ .min = enc(""), .max = enc("b") }, .neq, .{ .text = "" }));
+    // Past 16 bytes the prefixes tie, so neither bound is proven.
+    const long: storage.format.Stats = .{ .min = enc("0123456789abcdefB"), .max = enc("0123456789abcdefB") };
+    try t.expect(!statsImplyPredicate(long, .gt, .{ .text = "0123456789abcdefA" }));
+    try t.expect(!statsImplyPredicate(long, .neq, .{ .text = "0123456789abcdefA" }));
+}
+
 test "statsOverlapPredicateBlankAware: blank-excluded min pruning for strings" {
     const t = std.testing;
     const enc = storage.format.encodeStringPrefix;
