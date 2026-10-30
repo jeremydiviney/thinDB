@@ -2618,6 +2618,8 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
     // a contiguous run of each dictionary (every value but the blank first
     // one), a gapped one (minus the d1* pages), and all of it. `w` varies
     // across a page's rows, so a collapsed row must carry its rows' fold.
+    // The unrolled filter and variant loops build their SQL at comptime.
+    @setEvalBranchQuota(4000);
     const a = std.testing.allocator;
     const n = 40_000;
     const Row = struct { id: i64, url: []const u8, uniq: []const u8, w: i32 };
@@ -2692,7 +2694,8 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
             // order, which settles a MIN early and a MAX late. Two
             // aggregates over one input each stage their own copy of it, and
             // a program without string extremes collapses per value too, as
-            // does one with numeric inputs of its own.
+            // does one with numeric inputs of its own: each aggregate over
+            // `w` carries its own fold of the value's rows.
             const Variant = struct { aggs: []const u8, min_url: ?usize = null, max_url: ?usize = null, len_range: ?usize = null, w_sum: ?usize = null, w_avg: ?usize = null, w_min: ?usize = null, w_max: ?usize = null };
             inline for (.{
                 Variant{ .aggs = ", MIN(url)", .min_url = 3 },
@@ -2704,6 +2707,8 @@ test "V2 group-topN: a string-derived key evaluates once per dictionary value an
                 Variant{ .aggs = ", MAX(w)", .w_max = 3 },
                 Variant{ .aggs = ", SUM(w), MIN(url)", .w_sum = 3, .min_url = 4 },
                 Variant{ .aggs = ", MIN(w), MAX(url)", .w_min = 3, .max_url = 4 },
+                Variant{ .aggs = ", MIN(w), MAX(w)", .w_min = 3, .w_max = 4 },
+                Variant{ .aggs = ", MAX(w), SUM(w), MIN(url), MIN(w), AVG(w)", .w_max = 3, .w_sum = 4, .min_url = 5, .w_min = 6, .w_avg = 7 },
             }) |v| {
                 const sql = "SELECT REGEXP_REPLACE(url, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(url)) AS l, COUNT(*) AS c" ++
                     v.aggs ++ " FROM hits " ++ filter.where ++ " GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 100";
@@ -2795,7 +2800,9 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     // rank the medium hosts above the heavy ones and drop the heavy rows.
     // Light urls come in adjacent pairs: every row group stays under half
     // distinct (so its url block is a dictionary), and the groups are many
-    // enough for the sketch to run.
+    // enough for the sketch to run. A collapsed row the sketch keeps keeps
+    // its folds of `w` too, one per aggregate; light urls sort first in each
+    // dictionary, so the kept rows move when the dropped ones compact away.
     const a = std.testing.allocator;
     const heavy_hosts = 12;
     const medium_hosts = 20;
@@ -2829,20 +2836,29 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     }
     const light_start = u;
     for (0..light_pairs) |l| {
-        unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://light{d}.org/x", .{l});
+        unit_urls[u] = try std.fmt.allocPrint(arena.allocator(), "http://alight{d}.org/x", .{l});
         u += 1;
     }
 
-    const Row = struct { id: i64, url: []const u8 };
+    const Row = struct { id: i64, url: []const u8, w: i32 };
     const rows = try a.alloc(Row, total);
     defer a.free(rows);
+    const Folds = struct { min: i32 = std.math.maxInt(i32), max: i32 = std.math.minInt(i32), sum: i64 = 0 };
+    var heavy_w: [heavy_hosts]Folds = @splat(.{});
     // 7919 is prime and doesn't divide `units`, so this visits every unit once.
     var i: usize = 0;
     for (0..units) |p| {
         const unit = (p * 7919) % units;
         const copies: usize = if (unit >= light_start) 2 else 1;
         for (0..copies) |_| {
-            rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit] };
+            const w: i32 = @intCast((i * 104_729) % 1_013);
+            rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit], .w = w };
+            if (std.mem.startsWith(u8, unit_urls[unit], "http://heavy")) {
+                const f = &heavy_w[try std.fmt.parseInt(usize, unit_urls[unit][12 .. unit_urls[unit].len - 5], 10)];
+                f.min = @min(f.min, w);
+                f.max = @max(f.max, w);
+                f.sum += w;
+            }
             i += 1;
         }
     }
@@ -2853,28 +2869,35 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
         const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
         defer db.close();
         const table = try db.table("hits", .{
-            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string } },
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "url", .type = .string }, .{ .name = "w", .type = .int } },
             .order_key = &.{"id"},
             .unique = false,
         }, .{ .order_key = &.{"id"}, .row_group_size = 2048 });
         try table.insert(rows);
         try table.flush();
 
-        const sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits GROUP BY k ORDER BY c DESC LIMIT 10";
-        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
-        try expectPlanRunsGroupTopN(a, db, sql);
-        var q = try runSql(a, db, sql);
-        defer q.deinit();
-        var rank: usize = 0;
-        while (try q.next()) |batch| {
-            for (0..batch.row_count) |r| {
-                var buf: [16]u8 = undefined;
-                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{rank}), batch.values[0].data.string.rowBytes(r));
-                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * rank)), try cellNumber(batch.values[1], r));
-                rank += 1;
+        inline for (.{ "", ", MIN(w), MAX(w), SUM(w)" }) |aggs| {
+            const sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c" ++ aggs ++ " FROM hits GROUP BY k ORDER BY c DESC LIMIT 10";
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+            try expectPlanRunsGroupTopN(a, db, sql);
+            var q = try runSql(a, db, sql);
+            defer q.deinit();
+            var rank: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    var buf: [16]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{rank}), batch.values[0].data.string.rowBytes(r));
+                    try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * rank)), try cellNumber(batch.values[1], r));
+                    if (aggs.len != 0) {
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(heavy_w[rank].min)), try cellNumber(batch.values[2], r));
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(heavy_w[rank].max)), try cellNumber(batch.values[3], r));
+                        try std.testing.expectEqual(@as(?f64, @floatFromInt(heavy_w[rank].sum)), try cellNumber(batch.values[4], r));
+                    }
+                    rank += 1;
+                }
             }
+            try std.testing.expectEqual(@as(usize, 10), rank);
         }
-        try std.testing.expectEqual(@as(usize, 10), rank);
 
         // The url itself as the key, collapsed with no expression to evaluate.
         const url_sql = "SELECT url, COUNT(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10";

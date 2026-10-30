@@ -724,11 +724,11 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
 }
 
 // A program whose scan reads one string column, deriving its key from it
-// (plus numeric aggregate inputs, one aggregate each), evaluates once per
-// row-group dictionary value and folds the value's rows by count
-// (`SiloCore.dictEvalSource`), so its rows collapse whether or not they
-// arrive in runs. A column the derived expressions read only for its byte
-// length arrives as lengths, not dictionaries.
+// (plus numeric aggregate inputs), evaluates once per row-group dictionary
+// value and folds the value's rows by count (`SiloCore.dictEvalSource`), so
+// its rows collapse whether or not they arrive in runs. A column the derived
+// expressions read only for its byte length arrives as lengths, not
+// dictionaries.
 fn dictionaryCollapses(
     allocator: Allocator,
     table: *api.Table,
@@ -739,10 +739,7 @@ fn dictionaryCollapses(
 ) !bool {
     var foldable: std.ArrayListUnmanaged([]const u8) = .empty;
     defer foldable.deinit(allocator);
-    outer: for (shape.aggregate_inputs, 0..) |input, i| {
-        var uses: usize = 0;
-        for (shape.aggregate_program) |agg| uses += @intFromBool(!agg.is_string and agg.input_column_index != null and agg.input_column_index.? == i);
-        if (uses != 1) continue;
+    outer: for (shape.aggregate_inputs) |input| {
         for (shape.group_key_inputs) |key| {
             if (types.columnNameEql(key.name, input.source_name)) continue :outer;
         }
