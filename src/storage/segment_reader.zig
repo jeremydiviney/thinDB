@@ -1231,6 +1231,12 @@ pub const DictBlock = struct {
             },
         }
     }
+
+    /// `rowCode` for a block known to carry `width`-byte codes, so a per-row
+    /// loop switches on the width once instead of on every row.
+    pub inline fn rowCodeAs(self: DictBlock, comptime width: u8, row: usize) u32 {
+        return std.mem.readInt(std.meta.Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
+    }
 };
 
 /// Parse the dict header + regions out of a decompressed block payload. `values`

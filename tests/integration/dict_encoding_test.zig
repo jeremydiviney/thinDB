@@ -270,6 +270,103 @@ test "string range comparisons evaluate over raw (memtable) and dict (segment)" 
     try checkStringRanges(allocator, db);
 }
 
+// Table `d`: `n` = row index; `k` nullable, NULL every 7th row, else
+// "k{i % 64}" (64 distinct per 256-row group, so dict-encoded); `m` NOT NULL
+// with lengths 1..37. 1000 rows leave a 232-row last group, whose 29-byte
+// validity bitmap leaves `k`'s dictionary offsets unaligned.
+const D_ROWS: i64 = 1000;
+const M_SOURCE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJK";
+
+fn kIsNull(i: i64) bool {
+    return @mod(i, 7) == 0;
+}
+
+fn kOf(buf: []u8, i: i64) []const u8 {
+    return std.fmt.bufPrint(buf, "k{d}", .{@mod(i, 64)}) catch unreachable;
+}
+
+fn mOf(i: i64) []const u8 {
+    return M_SOURCE[0..@intCast(@mod(i, M_SOURCE.len) + 1)];
+}
+
+fn setupDictTable(allocator: std.mem.Allocator, db: anytype) !void {
+    try exec(allocator, db, "CREATE TABLE d (id BIGINT PRIMARY KEY, n BIGINT NOT NULL, k VARCHAR(16), m VARCHAR(64) NOT NULL)");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "INSERT INTO d (id, n, k, m) VALUES ");
+    var line: [160]u8 = undefined;
+    var kbuf: [16]u8 = undefined;
+    var i: i64 = 0;
+    while (i < D_ROWS) : (i += 1) {
+        if (i != 0) try buf.appendSlice(allocator, ", ");
+        const s = if (kIsNull(i))
+            try std.fmt.bufPrint(&line, "({d}, {d}, NULL, '{s}')", .{ i, i, mOf(i) })
+        else
+            try std.fmt.bufPrint(&line, "({d}, {d}, '{s}', '{s}')", .{ i, i, kOf(&kbuf, i), mOf(i) });
+        try buf.appendSlice(allocator, s);
+    }
+    try exec(allocator, db, buf.items);
+}
+
+fn kMatches(op: []const u8, value: []const u8, literal: []const u8) bool {
+    const ord = std.mem.order(u8, value, literal);
+    if (std.mem.eql(u8, op, "=")) return ord == .eq;
+    if (std.mem.eql(u8, op, "<>")) return ord != .eq;
+    if (std.mem.eql(u8, op, "<")) return ord == .lt;
+    if (std.mem.eql(u8, op, "<=")) return ord != .gt;
+    if (std.mem.eql(u8, op, ">")) return ord == .gt;
+    return ord != .lt;
+}
+
+test "dict LIKE, comparisons and lengths match per-row evaluation at any survivor count" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+    try setupDictTable(allocator, db);
+    const t = try db.openTable("d", .{});
+    try t.flush();
+
+    var sql: [160]u8 = undefined;
+    var kbuf: [16]u8 = undefined;
+    // A leading `n < limit` leaves `limit` live rows for the conjunct after
+    // it: few enough, and LIKE matches only the live rows' entries.
+    const limits = [_]i64{ 1, 5, 10, 100, D_ROWS };
+    for (limits) |limit| {
+        inline for (.{ .{ "LIKE", false }, .{ "NOT LIKE", true } }) |c| {
+            var want: i64 = 0;
+            var i: i64 = 0;
+            while (i < limit) : (i += 1) {
+                if (kIsNull(i)) continue;
+                if ((std.mem.indexOf(u8, kOf(&kbuf, i), "3") != null) != c[1]) want += 1;
+            }
+            try expectCount(allocator, db, try std.fmt.bufPrint(&sql, "SELECT COUNT(*) FROM d WHERE n < {d} AND k " ++ c[0] ++ " '%3%'", .{limit}), want);
+        }
+
+        var want_len: i64 = 0;
+        var i: i64 = 0;
+        while (i < limit) : (i += 1) want_len += @intCast(mOf(i).len);
+        try expectCount(allocator, db, try std.fmt.bufPrint(&sql, "SELECT SUM(octet_length(m)) FROM d WHERE n < {d}", .{limit}), want_len);
+    }
+
+    // Literals below, between, on and above the dictionary's entries.
+    const ops = [_][]const u8{ "=", "<>", "<", "<=", ">", ">=" };
+    const literals = [_][]const u8{ "", "a", "k3", "k30", "k35", "k63", "k99", "z" };
+    for (ops) |op| {
+        for (literals) |lit| {
+            var want: i64 = 0;
+            var i: i64 = 0;
+            while (i < D_ROWS) : (i += 1) {
+                if (!kIsNull(i) and kMatches(op, kOf(&kbuf, i), lit)) want += 1;
+            }
+            try expectCount(allocator, db, try std.fmt.bufPrint(&sql, "SELECT COUNT(*) FROM d WHERE k {s} '{s}'", .{ op, lit }), want);
+        }
+    }
+}
+
 test "dict-encoded string columns round-trip across multiple segments" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -670,7 +670,7 @@ pub const Scan = struct {
     filtered_hashed: ?[]const ?[]const u128 = null,
     /// Byte-length emit (`Batch.byte_lengths`): positions whose strings are
     /// read only through `octet_length`. Lengths come straight off the cached
-    /// block — raw offsets, a per-distinct dict LUT, FSST symbol lengths — and
+    /// block — raw offsets, dict entry offsets, FSST symbol lengths — and
     /// the value column is a placeholder, so the string bytes are never
     /// copied. The unfiltered path over a tombstoned row group or the memtable
     /// emits the real bytes without the sidecar; consumers measure those.
@@ -699,6 +699,10 @@ pub const Scan = struct {
     dict_bufs: []DictBuf = &.{},
     dict_slots: []?exec.BlockDictColumn = &.{},
     filtered_dicts: ?[]const ?exec.BlockDictColumn = null,
+    /// LIKE over a dictionary block: one match flag per entry, and the
+    /// entries' offsets when the block's can't be viewed in place.
+    dict_entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    dict_entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
 
     const Phase = enum { segments, memtable, done };
 
@@ -1590,6 +1594,8 @@ pub const Scan = struct {
         if (self.dict_bufs.len > 0) self.allocator.free(self.dict_bufs);
         if (self.dict_cols_by_j.len > 0) self.allocator.free(self.dict_cols_by_j);
         if (self.dict_slots.len > 0) self.allocator.free(self.dict_slots);
+        self.dict_entry_hits.deinit(self.allocator);
+        self.dict_entry_offsets.deinit(self.allocator);
         if (self.key_bound) |*kb| kb.deinit(self.allocator);
         self.prunes.deinit(self.allocator);
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
@@ -2707,15 +2713,7 @@ pub const Scan = struct {
         if (block.encoding == .dict) {
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
-            const db = storage.segment_reader.dictBlockOf(values, rg_count);
-            const lut = try self.allocator.alloc(u32, db.ndv);
-            defer self.allocator.free(lut);
-            for (lut, 0..) |*l, c| l.* = @intCast(db.dictValue(@intCast(c)).len);
-            if (rows) |r| {
-                for (r, lens) |row, *l| l.* = lut[db.rowCode(row)];
-            } else {
-                for (lens, 0..) |*l, row| l.* = lut[db.rowCode(row)];
-            }
+            measureDictRows(storage.segment_reader.dictBlockOf(values, rg_count), rows, lens);
         } else if (block.encoding == .fsst) {
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
             if (rows) |r| {
@@ -2739,6 +2737,33 @@ pub const Scan = struct {
             measureRows(sv, rows, lens);
         }
         return lens;
+    }
+
+    /// Each row's length off its dictionary entry's two offsets. No per-entry
+    /// table: the filtered path measures a row group slice by slice, and a
+    /// table rebuilt per slice costs the dictionary's size each time, which
+    /// near-unique blocks make as large as the row group.
+    fn measureDictRows(db: storage.segment_reader.DictBlock, rows: ?[]const u32, lens: []u32) void {
+        switch (db.code_width) {
+            inline 1, 2, 4 => |w| if (db.offsetsInPlace()) |offs| {
+                if (rows) |r| {
+                    for (r, lens) |row, *l| {
+                        const c = db.rowCodeAs(w, row);
+                        l.* = offs[c + 1] - offs[c];
+                    }
+                } else {
+                    for (lens, 0..) |*l, row| {
+                        const c = db.rowCodeAs(w, row);
+                        l.* = offs[c + 1] - offs[c];
+                    }
+                }
+            } else {
+                for (lens, 0..) |*l, k| l.* = @intCast(db.dictValue(db.rowCodeAs(w, if (rows) |r| r[k] else k)).len);
+            },
+            else => for (lens, 0..) |*l, k| {
+                l.* = @intCast(db.dictValue(db.rowCode(if (rows) |r| r[k] else k)).len);
+            },
+        }
     }
 
     fn measureRows(sv: storage.StringView, rows: ?[]const u32, lens: []u32) void {
@@ -3519,13 +3544,12 @@ pub const Scan = struct {
         return true;
     }
 
-    /// Evaluate `col OP literal` against a DICT-encoded string block by testing
-    /// each distinct dict value once into a matched-codes bitset, then mapping
-    /// per row via the narrow code — no expansion to strings. NULL rows (and
-    /// rows whose code maps to a non-matching value) clear to false, matching
-    /// the 2-valued logic the FOR/raw leaf paths use. Bounded by ndv (≤ 65536),
-    /// so the bitset is at most 8 KiB and L1-resident; the dict is sorted, so a
-    /// later refinement could binary-search a code range instead of scanning.
+    /// Evaluate `col OP literal` against a DICT-encoded string block. The
+    /// dictionary is sorted by bytes, so the matching codes form one range
+    /// (its complement for `<>`) found by binary search, and each row tests
+    /// its code against it — no expansion to strings and no per-entry compare.
+    /// NULL rows clear to false, matching the 2-valued logic the FOR/raw leaf
+    /// paths use.
     fn evalDictLeaf(
         block: storage.ReadSegment.BorrowedBlock,
         rg_count: u32,
@@ -3535,7 +3559,7 @@ pub const Scan = struct {
         out: []bool,
     ) void {
         const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        defer if (exec.prof.enabled) exec.prof.add("dict-filter (cmp per-distinct)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+        defer if (exec.prof.enabled) exec.prof.add("dict-filter (cmp code range)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
 
         var nulls: ?[]const u8 = null;
         var values = block.bytes;
@@ -3546,31 +3570,45 @@ pub const Scan = struct {
         }
         const db = storage.segment_reader.dictBlockOf(values, rg_count);
 
-        var matched: [8192]u8 = undefined; // 65536 codes / 8
-        const nbytes = (db.ndv + 7) / 8;
-        @memset(matched[0..nbytes], 0);
-        var c: u32 = 0;
-        while (c < db.ndv) : (c += 1) {
-            const v = db.dictValue(c);
-            const hit = switch (op) {
-                .eq => std.mem.eql(u8, v, literal),
-                .neq => !std.mem.eql(u8, v, literal),
-                .lt => simd.orderBytes(v, literal) == .lt,
-                .lte => simd.orderBytes(v, literal) != .gt,
-                .gt => simd.orderBytes(v, literal) == .gt,
-                .gte => simd.orderBytes(v, literal) != .lt,
-            };
-            if (hit) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+        const first_at_least = dictBound(db, literal, false);
+        const first_above = dictBound(db, literal, true);
+        const CodeRange = struct { lo: u32, hi: u32, outside: bool = false };
+        const range: CodeRange = switch (op) {
+            .eq => .{ .lo = first_at_least, .hi = first_above },
+            .neq => .{ .lo = first_at_least, .hi = first_above, .outside = true },
+            .lt => .{ .lo = 0, .hi = first_at_least },
+            .lte => .{ .lo = 0, .hi = first_above },
+            .gt => .{ .lo = first_above, .hi = db.ndv },
+            .gte => .{ .lo = first_at_least, .hi = db.ndv },
+        };
+        // `code -% lo < span` is `lo <= code < hi` in one unsigned compare.
+        const span = range.hi - range.lo;
+        switch (db.code_width) {
+            inline 1, 2, 4 => |w| for (out[0..rg_count], 0..) |*o, i| {
+                o.* = (db.rowCodeAs(w, i) -% range.lo < span) != range.outside;
+            },
+            else => for (out[0..rg_count], 0..) |*o, i| {
+                o.* = (db.rowCode(i) -% range.lo < span) != range.outside;
+            },
         }
-
-        for (0..rg_count) |i| {
-            if (storage.column.isValidBit(nulls, i)) {
-                const code = db.rowCode(i);
-                out[i] = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
-            } else {
-                out[i] = false;
+        if (nulls != null) {
+            for (0..rg_count) |i| {
+                if (!storage.column.isValidBit(nulls, i)) out[i] = false;
             }
         }
+    }
+
+    /// The first code whose entry orders after `literal` (`strict`), or at
+    /// or after it, in a dictionary sorted ascending by bytes.
+    fn dictBound(db: storage.segment_reader.DictBlock, literal: []const u8, strict: bool) u32 {
+        var lo: u32 = 0;
+        var hi: u32 = db.ndv;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const ord = simd.orderBytes(db.dictValue(mid), literal);
+            if (ord == .lt or (strict and ord == .eq)) lo = mid + 1 else hi = mid;
+        }
+        return lo;
     }
 
     /// Evaluate an OR of guided arms into `out`. The parser spells a literal
@@ -4137,7 +4175,7 @@ pub const Scan = struct {
         defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
-            evalDictLike(block, rg_count, flags, lp.pattern, negate, out);
+            try self.evalDictLike(block, rg_count, flags, lp.pattern, negate, active, out);
             return true;
         }
         if (block.encoding == .fsst) {
@@ -4196,19 +4234,23 @@ pub const Scan = struct {
         }
     }
 
-    /// `col LIKE pattern` over a DICT-encoded block: compile the pattern once,
-    /// match each distinct dict value into a matched-codes bitset, then map per
-    /// row via the narrow code. NULL rows clear to false. Bounded by ndv.
+    /// `col [NOT] LIKE pattern` over a DICT-encoded block. The pattern runs
+    /// over the dictionary's entries as one string column (`likeRows`: one
+    /// search across their concatenated bytes) and each row maps through its
+    /// code — unless an earlier conjunct left so few rows alive in `active`
+    /// that matching only their entries is cheaper. NULL rows clear to false.
     fn evalDictLike(
+        self: *Scan,
         block: storage.ReadSegment.BorrowedBlock,
         rg_count: u32,
         flags: storage.format.ColumnBlockFlags,
         pattern: []const u8,
         negate: bool,
+        active: ?[]const bool,
         out: []bool,
-    ) void {
+    ) !void {
         const _pt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        defer if (exec.prof.enabled) exec.prof.add("dict-filter (LIKE per-distinct)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
+        defer if (exec.prof.enabled) exec.prof.add("dict-filter (LIKE entries)", @intCast(@max(0, exec.prof.nowTicks() - _pt)));
 
         var nulls: ?[]const u8 = null;
         var values = block.bytes;
@@ -4218,23 +4260,43 @@ pub const Scan = struct {
             values = block.bytes[bm_len..];
         }
         const db = storage.segment_reader.dictBlockOf(values, rg_count);
-
         const plan = predicate.compileLike(pattern);
-        var matched: [8192]u8 = undefined;
-        const nbytes = (db.ndv + 7) / 8;
-        @memset(matched[0..nbytes], 0);
-        var c: u32 = 0;
-        while (c < db.ndv) : (c += 1) {
-            if (plan.match(db.dictValue(c))) matched[c >> 3] |= (@as(u8, 1) << @intCast(c & 7));
+
+        if (active) |a| {
+            var alive: usize = 0;
+            for (a[0..rg_count]) |b| alive += @intFromBool(b);
+            // A live row's match reads its entry at random in the
+            // dictionary: on ClickBench URL dictionaries it costs about
+            // eight entries of the sequential search.
+            if (alive * 8 < @as(usize, db.ndv)) {
+                for (out[0..rg_count], a[0..rg_count], 0..) |*o, live, i| {
+                    o.* = live and storage.column.isValidBit(nulls, i) and plan.match(db.dictValue(db.rowCode(i))) != negate;
+                }
+                return;
+            }
         }
 
-        for (0..rg_count) |i| {
-            if (storage.column.isValidBit(nulls, i)) {
-                const code = db.rowCode(i);
-                const hit = (matched[code >> 3] & (@as(u8, 1) << @intCast(code & 7))) != 0;
-                out[i] = hit != negate;
-            } else {
-                out[i] = false;
+        try self.dict_entry_hits.resize(self.allocator, db.ndv);
+        const hits = self.dict_entry_hits.items;
+        const offsets = db.offsetsInPlace() orelse offsets: {
+            try self.dict_entry_offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
+            for (self.dict_entry_offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+            break :offsets self.dict_entry_offsets.items;
+        };
+        const entries = storage.StringView{ .offsets = offsets, .bytes = db.dict_bytes };
+        predicate.likeRows(.{ .data = .{ .varchar = entries } }, entries, &plan, negate, db.ndv, hits, null);
+
+        switch (db.code_width) {
+            inline 1, 2, 4 => |w| for (out[0..rg_count], 0..) |*o, i| {
+                o.* = hits[db.rowCodeAs(w, i)];
+            },
+            else => for (out[0..rg_count], 0..) |*o, i| {
+                o.* = hits[db.rowCode(i)];
+            },
+        }
+        if (nulls != null) {
+            for (0..rg_count) |i| {
+                if (!storage.column.isValidBit(nulls, i)) out[i] = false;
             }
         }
     }
