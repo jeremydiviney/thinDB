@@ -4372,7 +4372,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var weight_specs_buf: [MAX_GROUP_PAYLOAD_COLUMNS]WeightFoldSpec = undefined;
     var weight_specs: []const WeightFoldSpec = &.{};
     if (layout.has_weight) {
-        try buildWeightFoldSpecs(layout, batch, weight_specs_buf[0..layout.columns.len]);
+        try buildWeightFoldSpecs(layout, batch, if (row_weights) |rw| rw.summed_columns else 0, weight_specs_buf[0..layout.columns.len]);
         weight_specs = weight_specs_buf[0..layout.columns.len];
     } else {
         for (layout.columns, 0..) |column, i| {
@@ -4392,15 +4392,21 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var str_nulls_buf: [MAX_GROUP_STR_COLUMNS]?[]const u8 = undefined;
     var str_views: []const StringView = &.{};
     var str_nulls: []const ?[]const u8 = &.{};
+    // String columns whose values ascend down the batch: an extreme staged
+    // from this batch is already settled against its later rows.
+    var ascending_str: StrColumnMask = 0;
     if (layout.has_str_payload) {
         if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
+        const ascending_column = if (row_weights) |rw| rw.ascending_column else null;
         for (layout.str_columns, 0..) |sc, i| {
-            const view = batch.columnView(sc.source_name) orelse return error.ColumnNotFound;
+            const ci = batch.columnIndex(sc.source_name) orelse return error.ColumnNotFound;
+            const view = batch.values[ci];
             str_views_buf[i] = switch (view.data) {
                 .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv,
                 else => return error.TypeMismatch,
             };
             str_nulls_buf[i] = view.nulls;
+            if (ascending_column == ci) ascending_str |= @as(StrColumnMask, 1) << @intCast(i);
         }
         str_views = str_views_buf[0..layout.str_columns.len];
         str_nulls = str_nulls_buf[0..layout.str_columns.len];
@@ -4464,6 +4470,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var accepted: u64 = 0;
     var probes: u64 = 0;
     var hits: u64 = 0;
+    // Staged rows from here on came from this batch.
+    var batch_first = parts.raw_active_rows.len();
     var r: usize = 0;
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
@@ -4500,7 +4508,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 // A collapsed batch's row stands for `w` equal rows.
                 const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
                 if (idx > 0 and active.keyAt(idx - 1) == key and active.weightAll()[idx - 1] <= std.math.maxInt(u32) - w) {
-                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, idx - 1, r, w);
+                    const settled = if (idx - 1 >= batch_first) ascending_str else 0;
+                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, settled, idx - 1, r, w);
                     accepted += w;
                     continue;
                 }
@@ -4508,7 +4517,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                     const held = foldIndexProbe(parts, active, key, idx);
                     probes += 1;
                     if (held < idx and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
-                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, held, r, w);
+                        const settled = if (held >= batch_first) ascending_str else 0;
+                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, settled, held, r, w);
                         hits += 1;
                         accepted += w;
                         continue;
@@ -4539,6 +4549,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             probes = 0;
             hits = 0;
             try publishActiveRawRows(parts, shared, raw_chunk_rows);
+            batch_first = 0;
         }
     }
     parts.fold_probes += probes;
@@ -4952,15 +4963,18 @@ const WeightFoldSpec = struct {
     /// run-native emitter folds `value × covered` off the runs instead of
     /// reading rows. Null → per-row fold. Only set on the run-native path.
     runs: ?thindb.exec.RunsColumn = null,
+    /// The source rows already sum the rows their weights count.
+    summed: bool = false,
 };
 
-fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, out: []WeightFoldSpec) !void {
+fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, summed_columns: u64, out: []WeightFoldSpec) !void {
     for (layout.columns, 0..) |column, c| {
         if (column.source_name.len == 0) return error.UnsupportedOperatorForType;
         // Run partials are NULL-blind; the engine's weight gate already
         // declines nullable inputs.
         if (column.nullable) return error.UnsupportedOperatorForType;
-        const view = batch.columnView(column.source_name) orelse return error.ColumnNotFound;
+        const ci = batch.columnIndex(column.source_name) orelse return error.ColumnNotFound;
+        const view = batch.values[ci];
         var op: ?WeightFoldOp = null;
         for (layout.aggregates) |agg| {
             if (agg.is_string or agg.is_distinct) continue;
@@ -4980,6 +4994,7 @@ fn buildWeightFoldSpecs(layout: GroupRowsLayout, batch: thindb.Batch, out: []Wei
             .op = op orelse return error.UnsupportedOperatorForType,
             .is_float = physicalIsFloat(column.physical_type),
             .view = view,
+            .summed = ci < 64 and summed_columns & (@as(u64, 1) << @intCast(ci)) != 0,
         };
     }
 }
@@ -5025,18 +5040,19 @@ fn noteFoldChunk(parts: *WorkerParts, probes: u64, hits: u64) void {
     if (chunk_hits * 8 < chunk_probes) parts.fold_off = true;
 }
 
-inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize, w: u32) !void {
+inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, settled: StrColumnMask, dst: usize, src: usize, w: u32) !void {
     active.weightAll()[dst] += w;
     weightFoldScaled(active, specs, dst, src, w, false);
-    if (str_views.len != 0) try weightFoldStr(active, allocator, aggregates, str_views, str_nulls, dst, src);
+    if (str_views.len != 0) try weightFoldStr(active, allocator, aggregates, str_views, str_nulls, settled, dst, src);
 }
 
 // Fold source row `src`, standing for `w` equal rows, into staged row `idx`:
-// a sum takes its value `w` times over, an extreme takes it once.
+// a sum takes its value `w` times over (unless the value sums them already),
+// an extreme takes it once.
 fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
     if (w == 1) return weightFoldRange(active, specs, idx, src, src + 1, init);
     for (specs, 0..) |spec, c| {
-        if (spec.op != .sum) {
+        if (spec.op != .sum or spec.summed) {
             weightFoldOne(active, spec, c, idx, src, src + 1, init);
         } else if (spec.is_float) {
             const col = @as([*]f64, @ptrCast(@alignCast(active.columnByteSlab(c).ptr)))[0..active.capacity_rows];
@@ -5050,22 +5066,30 @@ fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize,
     }
 }
 
+/// One bit per string agg-input column.
+const StrColumnMask = std.meta.Int(.unsigned, MAX_GROUP_STR_COLUMNS);
+
 // Fold source row `src`'s string extremes into staged row `dst`. A NULL input
 // changes nothing and a staged NULL takes the first valid value; a replaced
-// value's bytes stay in the chunk's store until the chunk recycles.
-fn weightFoldStr(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
+// value's bytes stay in the chunk's store until the chunk recycles. A
+// `settled` column's staged value came from an earlier row of the same
+// ascending run, so a MIN keeps it and a MAX takes the source unchecked.
+fn weightFoldStr(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, settled: StrColumnMask, dst: usize, src: usize) !void {
     const k = str_views.len;
     for (aggregates) |agg| {
         if (!agg.is_string) continue;
         const c = agg.str_input_index;
         if (!thindb.storage.column.isValidBit(str_nulls[c], src)) continue;
-        const b = str_views[c].rowBytes(src);
         if (!active.str.isNull(k, dst, c)) {
-            const cmp = json_binary.columnOrder(agg.is_json, b, active.str.get(k, dst, c));
-            const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
-            if (!is_better) continue;
+            const ordered = !agg.is_json and settled & (@as(StrColumnMask, 1) << @intCast(c)) != 0;
+            if (ordered and agg.op == .min) continue;
+            if (!ordered) {
+                const cmp = json_binary.columnOrder(agg.is_json, str_views[c].rowBytes(src), active.str.get(k, dst, c));
+                const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
+                if (!is_better) continue;
+            }
         }
-        try active.str.append(allocator, k, dst, c, b);
+        try active.str.append(allocator, k, dst, c, str_views[c].rowBytes(src));
     }
 }
 
@@ -6461,6 +6485,99 @@ inline fn rawRowBucketIndex(rows: RawRows, row_idx: usize, bucket_count: usize) 
 const RowWeights = struct {
     counts: []const u32,
     input_rows: usize,
+    /// The batch column whose values strictly ascend row by row (a sorted
+    /// row-group dictionary's used values), when there is one.
+    ascending_column: ?usize = null,
+    /// Batch columns, one bit per index, whose rows hold the sum over the
+    /// rows they stand for rather than one row's value.
+    summed_columns: u64 = 0,
+};
+
+/// A numeric aggregate input riding along with a collapsed column: each
+/// collapsed row carries its value's rows folded by `op`.
+const DictPartial = struct {
+    column: usize,
+    op: WeightFoldOp,
+    /// Per dictionary code, then per collapsed value; the column's type
+    /// picks the integer or the float lists.
+    code_ints: std.ArrayListUnmanaged(i64) = .empty,
+    code_floats: std.ArrayListUnmanaged(f64) = .empty,
+    code_seen: std.ArrayListUnmanaged(bool) = .empty,
+    ints: std.ArrayListUnmanaged(i64) = .empty,
+    floats: std.ArrayListUnmanaged(f64) = .empty,
+    is_float: bool = false,
+
+    fn deinit(self: *DictPartial, allocator: Allocator) void {
+        self.code_ints.deinit(allocator);
+        self.code_floats.deinit(allocator);
+        self.code_seen.deinit(allocator);
+        self.ints.deinit(allocator);
+        self.floats.deinit(allocator);
+    }
+
+    fn accumulate(self: *DictPartial, allocator: Allocator, view: ColumnView, codes: []const u32, value_count: usize) !void {
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |values| {
+                self.is_float = false;
+                try self.code_ints.resize(allocator, value_count);
+                const acc = self.code_ints.items;
+                switch (self.op) {
+                    .sum => {
+                        @memset(acc, 0);
+                        for (codes, values[0..codes.len]) |c, v| acc[c] += v;
+                    },
+                    .min => {
+                        @memset(acc, std.math.maxInt(i64));
+                        for (codes, values[0..codes.len]) |c, v| acc[c] = @min(acc[c], v);
+                    },
+                    .max => {
+                        @memset(acc, std.math.minInt(i64));
+                        for (codes, values[0..codes.len]) |c, v| acc[c] = @max(acc[c], v);
+                    },
+                }
+            },
+            inline .float, .double => |values| {
+                self.is_float = true;
+                try self.code_floats.resize(allocator, value_count);
+                const acc = self.code_floats.items;
+                if (self.op == .sum) {
+                    @memset(acc, 0);
+                    for (codes, values[0..codes.len]) |c, v| acc[c] += v;
+                    return;
+                }
+                // A row-by-row extreme starts from the first row (a NaN
+                // there sticks), so each code's first row seeds it.
+                try self.code_seen.resize(allocator, value_count);
+                const seen = self.code_seen.items;
+                @memset(seen, false);
+                for (codes, values[0..codes.len]) |c, v| {
+                    const x: f64 = v;
+                    const better = if (self.op == .min) x < acc[c] else x > acc[c];
+                    if (!seen[c] or better) acc[c] = x;
+                    seen[c] = true;
+                }
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    // The folded values of codes [lo, hi) that some row used, in code order.
+    fn emit(self: *DictPartial, allocator: Allocator, code_rows: []const u32, lo: usize, hi: usize, used: usize) !ColumnView {
+        if (self.is_float) {
+            self.floats.clearRetainingCapacity();
+            try self.floats.ensureTotalCapacity(allocator, used);
+            for (code_rows[lo..hi], self.code_floats.items[lo..hi]) |n, v| {
+                if (n != 0) self.floats.appendAssumeCapacity(v);
+            }
+            return .{ .data = .{ .double = self.floats.items } };
+        }
+        self.ints.clearRetainingCapacity();
+        try self.ints.ensureTotalCapacity(allocator, used);
+        for (code_rows[lo..hi], self.code_ints.items[lo..hi]) |n, v| {
+            if (n != 0) self.ints.appendAssumeCapacity(v);
+        }
+        return .{ .data = .{ .bigint = self.ints.items } };
+    }
 };
 
 /// One worker's per-distinct evaluation. A batch whose string column arrives
@@ -6472,6 +6589,9 @@ const GridDictEval = struct {
     compute: ?*thindb.exec.Compute,
     column: usize,
     loc_column: ?usize,
+    partials: []DictPartial = &.{},
+    /// The partials folded by sum, one bit per batch column.
+    summed_columns: u64 = 0,
     /// Per dictionary code: rows using it, and one such row's location.
     code_rows: std.ArrayListUnmanaged(u32) = .empty,
     code_loc: std.ArrayListUnmanaged(i64) = .empty,
@@ -6487,6 +6607,9 @@ const GridDictEval = struct {
     hashed: []?[]const u128 = &.{},
     input_rows: usize = 0,
     collapsed: bool = false,
+    /// The collapsed column reached the evaluated batch as the dictionary's
+    /// values in code order, so they ascend.
+    ascending: bool = false,
 
     fn deinit(self: *GridDictEval, allocator: Allocator) void {
         self.code_rows.deinit(allocator);
@@ -6498,6 +6621,8 @@ const GridDictEval = struct {
         self.bytes.deinit(allocator);
         if (self.views.len > 0) allocator.free(self.views);
         if (self.hashed.len > 0) allocator.free(self.hashed);
+        for (self.partials) |*p| p.deinit(allocator);
+        if (self.partials.len > 0) allocator.free(self.partials);
     }
 
     fn next(self: *GridDictEval, scan: *Scan, allocator: Allocator) !?thindb.Batch {
@@ -6508,7 +6633,23 @@ const GridDictEval = struct {
         const column = dicts[self.column] orelse return try self.eval(raw);
         const batch = try self.collapse(allocator, raw, column);
         self.collapsed = true;
-        return try self.eval(batch);
+        const out = try self.eval(batch);
+        // A derived column may take the collapsed column's name and slot;
+        // hashed values are the scan's placeholders.
+        self.ascending = column.digests == null and sameStringView(out.values[self.column], batch.values[self.column]);
+        return out;
+    }
+
+    fn sameStringView(a: ColumnView, b: ColumnView) bool {
+        const sa = switch (a.data) {
+            .varchar, .string => |sv| sv,
+            else => return false,
+        };
+        const sb = switch (b.data) {
+            .varchar, .string => |sv| sv,
+            else => return false,
+        };
+        return sa.offsets.ptr == sb.offsets.ptr and sa.offsets.len == sb.offsets.len and sa.bytes.ptr == sb.bytes.ptr;
     }
 
     fn eval(self: *GridDictEval, batch: thindb.Batch) !thindb.Batch {
@@ -6531,6 +6672,7 @@ const GridDictEval = struct {
         } else {
             for (column.codes) |c| code_rows[c] += 1;
         }
+        for (self.partials) |*p| try p.accumulate(allocator, raw.values[p.column], column.codes, code_rows.len);
 
         var lo: usize = code_rows.len;
         var hi: usize = 0;
@@ -6595,6 +6737,7 @@ const GridDictEval = struct {
             else => return error.TypeMismatch,
         } };
         if (self.loc_column) |lc| self.views[lc] = .{ .data = .{ .bigint = self.locs.items } };
+        for (self.partials) |*p| self.views[p.column] = try p.emit(allocator, code_rows, lo, hi, used);
         const hashed: ?[]const ?[]const u128 = if (column.digests != null) blk: {
             @memset(self.hashed, null);
             self.hashed[self.column] = self.digests.items;
@@ -6605,7 +6748,7 @@ const GridDictEval = struct {
 
     fn rowWeights(self: *const GridDictEval) ?RowWeights {
         if (!self.collapsed) return null;
-        return .{ .counts = self.weights.items, .input_rows = self.input_rows };
+        return .{ .counts = self.weights.items, .input_rows = self.input_rows, .ascending_column = if (self.ascending) self.column else null, .summed_columns = self.summed_columns };
     }
 };
 
@@ -6613,25 +6756,68 @@ const GridDictEval = struct {
 /// evaluation, or null when the program can't fold by count. It takes a
 /// weighted program (every aggregate folds a repeated row by its count) with
 /// deterministic derived columns, if any, over a scan reading one non-nullable
-/// string column; the row locations ride along, as any row of a value
-/// recovers it. String expressions, and the string keys they feed, cost far
+/// string column and numeric aggregate inputs (`dictEvalSource`); the row
+/// locations ride along, as any row of a value recovers it. String expressions, and the string keys they feed, cost far
 /// more per row than counting a row's code. The column may be a hashed key:
 /// the scan then digests each dictionary value once, and the collapsed rows
 /// carry those digests.
-fn dictEvalColumn(cfg: RunConfig, scan_schema: []const thindb.types.Column) ?usize {
+fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !?usize {
     if (!cfg.distinct_eval) return null;
     const layout = cfg.group_rows_layout;
     if (!layout.has_weight or layout.has_concat or layout.has_udf) return null;
     if (cfg.byte_length_columns.len != 0) return null;
-    for (cfg.derived) |d| {
-        if (thindb.exec.compute_op.mayVary(d.expr, cfg.udf_registry)) return null;
+    if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return null;
+    var foldable_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
+    var n_foldable: usize = 0;
+    outer: for (layout.columns) |c| {
+        var uses: usize = 0;
+        for (layout.columns) |other| uses += @intFromBool(types_mod.columnNameEql(other.source_name, c.source_name));
+        if (uses != 1) continue;
+        for (layout.key_columns) |k| {
+            if (types_mod.columnNameEql(k.name, c.source_name)) continue :outer;
+        }
+        foldable_buf[n_foldable] = c.source_name;
+        n_foldable += 1;
     }
+    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable]);
+}
+
+/// The one non-nullable string column `scan_schema` reads besides row
+/// locations, when `derived` is deterministic: its row-group dictionaries
+/// can stand in for its rows under a weighted program. Any other column must
+/// be a non-nullable number in `foldable` (aggregate inputs, one aggregate
+/// each) that no derived column reads: a collapsed row carries it folded
+/// over the rows the row stands for.
+pub fn dictEvalSource(
+    allocator: Allocator,
+    scan_schema: []const thindb.types.Column,
+    derived: []const thindb.exec.Derived,
+    udf_registry: ?*const udf_mod.UdfRegistry,
+    foldable: []const []const u8,
+) !?usize {
+    for (derived) |d| {
+        if (thindb.exec.compute_op.mayVary(d.expr, udf_registry)) return null;
+    }
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer refs.deinit(allocator);
+    for (derived) |d| try thindb.exec.compute_op.collectColumnRefs(allocator, &refs, d.expr);
     var column: ?usize = null;
     for (scan_schema, 0..) |col, j| {
         if (types_mod.columnNameEql(col.name, rowloc.col_name)) continue;
-        if (column != null or col.nullable) return null;
+        if (col.nullable) return null;
         switch (col.type) {
-            .varchar, .string => column = j,
+            .varchar, .string => {
+                if (column != null) return null;
+                column = j;
+            },
+            .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64, .float, .double => {
+                for (refs.items) |r| {
+                    if (types_mod.columnNameEql(r, col.name)) return null;
+                }
+                for (foldable) |f| {
+                    if (types_mod.columnNameEql(f, col.name)) break;
+                } else return null;
+            },
             else => return null,
         }
     }
@@ -7698,7 +7884,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             rows += n;
             j += 1;
         }
-        break :blk .{ .counts = scratch.weights.items, .input_rows = rows };
+        break :blk .{ .counts = scratch.weights.items, .input_rows = rows, .ascending_column = w.ascending_column, .summed_columns = w.summed_columns };
     } else null;
 
     try scratch.ensureColumns(allocator, batch);
@@ -8725,7 +8911,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     if (n_workers > 0) distinct: {
         const scan_schema = scans[0].outputSchema();
-        const column = dictEvalColumn(cfg, scan_schema) orelse break :distinct;
+        const column = (try dictEvalColumn(allocator, cfg, scan_schema)) orelse break :distinct;
         if (cfg.derived.len != 0) {
             for (drives) |d| {
                 const compute = thindb.exec.queryAs(thindb.exec.Compute, d) orelse break :distinct;
@@ -8737,16 +8923,47 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (scans[0..n_workers]) |sc| {
             if (sc.blockDictColumnIndex(scan_schema[column].name) == null) break :distinct;
         }
-        for (scans[0..n_workers]) |sc| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[column].name).?);
-        grid_distinct = try allocator.alloc(GridDictEval, n_workers);
         const loc_column = for (scan_schema, 0..) |col, j| {
             if (types_mod.columnNameEql(col.name, rowloc.col_name)) break j;
         } else null;
+        // The scan's other columns are aggregate inputs, each folded per
+        // dictionary code by its one aggregate.
+        var partials_buf: [MAX_GROUP_PAYLOAD_COLUMNS]DictPartial = undefined;
+        var n_partials: usize = 0;
+        var summed_columns: u64 = 0;
+        const layout = cfg.group_rows_layout;
+        for (scan_schema, 0..) |col, j| {
+            if (j == column or (loc_column != null and j == loc_column.?)) continue;
+            const c = for (layout.columns, 0..) |lc, c| {
+                if (types_mod.columnNameEql(lc.source_name, col.name)) break c;
+            } else break :distinct;
+            const op: WeightFoldOp = for (layout.aggregates) |agg| {
+                if (agg.is_string or agg.input_column_index == null or agg.input_column_index.? != c) continue;
+                break switch (agg.op) {
+                    .sum, .avg => .sum,
+                    .min => .min,
+                    .max => .max,
+                    else => break :distinct,
+                };
+            } else break :distinct;
+            if (op == .sum) {
+                if (j >= 64) break :distinct;
+                summed_columns |= @as(u64, 1) << @intCast(j);
+            }
+            partials_buf[n_partials] = .{ .column = j, .op = op };
+            n_partials += 1;
+        }
+        for (scans[0..n_workers]) |sc| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[column].name).?);
+        grid_distinct = try allocator.alloc(GridDictEval, n_workers);
         for (grid_distinct, drives) |*gd, d| gd.* = .{
             .compute = if (cfg.derived.len != 0) thindb.exec.queryAs(thindb.exec.Compute, d).? else null,
             .column = column,
             .loc_column = loc_column,
+            .summed_columns = summed_columns,
         };
+        if (n_partials > 0) {
+            for (grid_distinct) |*gd| gd.partials = try allocator.dupe(DictPartial, partials_buf[0..n_partials]);
+        }
     }
 
     var group_ticks = try allocator.alloc(i64, n_workers);

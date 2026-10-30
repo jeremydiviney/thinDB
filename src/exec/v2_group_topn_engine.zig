@@ -723,6 +723,45 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
     return @as(u64, rg_count) >= 4 * @max(composite_runs, 1);
 }
 
+// A program whose scan reads one string column, deriving its key from it
+// (plus numeric aggregate inputs, one aggregate each), evaluates once per
+// row-group dictionary value and folds the value's rows by count
+// (`SiloCore.dictEvalSource`), so its rows collapse whether or not they
+// arrive in runs. A column the derived expressions read only for its byte
+// length arrives as lengths, not dictionaries.
+fn dictionaryCollapses(
+    allocator: Allocator,
+    table: *api.Table,
+    shape: Shape,
+    scan_columns: ?[]const []const u8,
+    derived: []const exec.Derived,
+    udf_registry: ?*const @import("../udf.zig").UdfRegistry,
+) !bool {
+    var foldable: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer foldable.deinit(allocator);
+    outer: for (shape.aggregate_inputs, 0..) |input, i| {
+        var uses: usize = 0;
+        for (shape.aggregate_program) |agg| uses += @intFromBool(!agg.is_string and agg.input_column_index != null and agg.input_column_index.? == i);
+        if (uses != 1) continue;
+        for (shape.group_key_inputs) |key| {
+            if (types.columnNameEql(key.name, input.source_name)) continue :outer;
+        }
+        try foldable.append(allocator, input.source_name);
+    }
+    var columns: std.ArrayListUnmanaged(types.Column) = .empty;
+    defer columns.deinit(allocator);
+    if (scan_columns) |names| {
+        for (names) |name| {
+            const col = for (table.schema.columns) |col| {
+                if (types.columnNameEql(col.name, name)) break col;
+            } else return false;
+            try columns.append(allocator, col);
+        }
+    } else try columns.appendSlice(allocator, table.schema.columns);
+    const j = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items)) orelse return false;
+    return derived.len == 0 or !try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name);
+}
+
 fn runHarness(
     allocator: Allocator,
     table: *api.Table,
@@ -821,22 +860,27 @@ fn runHarness(
     // staged rows — the scan emitter folds rows of a key already staged in
     // its chunk (a run of adjacent-equal keys, or a repeat its fold index
     // finds) into ONE row carrying the key's partial aggregates.
-    // Declined for COUNT(col)/DISTINCT (need per-row data), for an input
-    // column shared by two aggregates (one staged value can't be both a
-    // run-sum and a run-min), and for a non-count aggregate at state slot 0
-    // (the lane's kernel pass can't express it — mirrors its `kernelizable`
-    // check).
+    // Declined for COUNT(col)/DISTINCT (need per-row data) and for a
+    // non-count aggregate at state slot 0 (the lane's kernel pass can't
+    // express it — mirrors its `kernelizable` check). A staged value is one
+    // aggregate's run partial (a run-sum can't also be a run-min), so a
+    // second aggregate over an input stages its own copy of it.
+    var n_columns = shape.aggregate_inputs.len;
+    var n_str_columns = shape.string_aggregate_inputs.len;
     const weight_mode = blk: {
         if (shape.aggregate_program.len == 0) break :blk false;
         if (distinct_slot_count != 0) break :blk false;
-        var input_used = [_]bool{false} ** 16;
+        var input_used = [_]bool{false} ** group_columns_buf.len;
         var str_input_used = [_]bool{false} ** group_str_columns_buf.len;
+        var copies: usize = 0;
+        var str_copies: usize = 0;
         for (shape.aggregate_program) |agg| {
             if (agg.is_distinct or agg.is_udf) break :blk false;
             if (agg.is_string) {
                 if (agg.is_concat or (agg.op != .min and agg.op != .max)) break :blk false;
                 const si = agg.str_input_index;
-                if (si >= shape.string_aggregate_inputs.len or str_input_used[si]) break :blk false;
+                if (si >= shape.string_aggregate_inputs.len) break :blk false;
+                if (str_input_used[si]) str_copies += 1;
                 str_input_used[si] = true;
                 continue;
             }
@@ -849,13 +893,15 @@ fn runHarness(
                     // nullable inputs decline too.
                     if (agg.wide or agg.nullable) break :blk false;
                     const ic = agg.input_column_index orelse break :blk false;
-                    if (ic >= shape.aggregate_inputs.len or input_used[ic]) break :blk false;
+                    if (ic >= shape.aggregate_inputs.len) break :blk false;
+                    if (input_used[ic]) copies += 1;
                     input_used[ic] = true;
                 },
                 .count_col, .count_distinct, .welford, .concat, .udf => break :blk false,
             }
         }
-        // Every staged column must belong to exactly one folding aggregate.
+        if (n_columns + copies > group_columns_buf.len or n_str_columns + str_copies > group_str_columns_buf.len) break :blk false;
+        // Every staged column must belong to a folding aggregate.
         for (input_used[0..shape.aggregate_inputs.len]) |u| {
             if (!u) break :blk false;
         }
@@ -868,9 +914,11 @@ fn runHarness(
         // staging inflation (measured: Q31/Q32-class +15-20%) — require
         // storage-proven run structure on every key column first. A string
         // extreme's staged bytes dwarf that widening, and the fold index
-        // collapses repeats that never form runs, so it ships regardless.
+        // collapses repeats that never form runs, so it ships regardless,
+        // as does a program whose rows collapse per dictionary value.
         if (shape.aggregate_inputs.len != 0 and shape.string_aggregate_inputs.len == 0 and
-            !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len])) break :blk false;
+            !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len]) and
+            !(params.distinct_eval and try dictionaryCollapses(allocator, table, shape, scan_columns, derived, udf_registry))) break :blk false;
         break :blk true;
     };
     // Weighted staged columns carry RUN PARTIALS, not row values: widen to
@@ -883,6 +931,27 @@ fn runHarness(
                 .f32, .f64 => .f64,
             };
         }
+        var column_taken = [_]bool{false} ** group_columns_buf.len;
+        var str_column_taken = [_]bool{false} ** group_str_columns_buf.len;
+        for (group_aggregates_buf[0..shape.aggregate_program.len]) |*agg| {
+            if (agg.is_string) {
+                const si = agg.str_input_index;
+                if (str_column_taken[si]) {
+                    group_str_columns_buf[n_str_columns] = group_str_columns_buf[si];
+                    agg.str_input_index = @intCast(n_str_columns);
+                    n_str_columns += 1;
+                }
+                str_column_taken[si] = true;
+                continue;
+            }
+            const ic = agg.input_column_index orelse continue;
+            if (column_taken[ic]) {
+                group_columns_buf[n_columns] = group_columns_buf[ic];
+                agg.input_column_index = @intCast(n_columns);
+                n_columns += 1;
+            }
+            column_taken[ic] = true;
+        }
     }
     var has_concat = false;
     for (shape.aggregate_program) |agg| {
@@ -891,9 +960,9 @@ fn runHarness(
     const group_rows_layout = SiloCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
-        .columns = group_columns_buf[0..shape.aggregate_inputs.len],
+        .columns = group_columns_buf[0..n_columns],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
-        .str_columns = group_str_columns_buf[0..shape.string_aggregate_inputs.len],
+        .str_columns = group_str_columns_buf[0..n_str_columns],
         .has_str_payload = shape.string_aggregate_inputs.len > 0,
         .distinct_slot_count = distinct_slot_count,
         // GROUP_CONCAT carries per-row rowrefs (emission order) even under
