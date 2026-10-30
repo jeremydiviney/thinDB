@@ -793,6 +793,13 @@ fn forEncode(
 /// most `u16`-wide; a column whose block exceeds this stays raw (mid-build
 /// abandon below avoids paying the full distinct scan for high-card columns).
 const dict_max_ndv: usize = 65536;
+/// Mid-build abandon past this distinct fraction of the block's rows: there
+/// evaluating once per value saves little, so the distinct scan stops early.
+/// A row-group dictionary stays cache-resident at any NDV under the cap, so
+/// decoding it never costs more than reading the raw layout, and the body
+/// comparison in `tryEncodeDict` settles storage exactly.
+const dict_max_distinct_num: usize = 9;
+const dict_max_distinct_den: usize = 10;
 /// Skip dict encoding for blob-like columns: a high average value length means
 /// the dict bytes dominate and per-row codes save little. Long-but-low-card
 /// values (URLs) still qualify because the dict stores each long value once.
@@ -844,9 +851,7 @@ fn tryEncodeDict(
         const s = sv.rowBytes(r);
         const gop = try map.getOrPut(allocator, s);
         if (!gop.found_existing) {
-            // NDV ≤ n/2: with more distinct values the codes + dict approach
-            // the raw body, so the encoding can't pay for its dict header.
-            if (map.count() > dict_max_ndv or map.count() * 2 > n) return false;
+            if (map.count() > dict_max_ndv or map.count() * dict_max_distinct_den > n * dict_max_distinct_num) return false;
             gop.value_ptr.* = @intCast(distinct.items.len);
             try distinct.append(allocator, s);
         }
