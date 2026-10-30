@@ -2639,6 +2639,43 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         }
         try std.testing.expectEqual(@as(usize, 10), rank);
     }
+
+    // The filter pass sieves the row groups its tally saw whole by the
+    // counters it recorded; deleted rows and memtable rows sit beside them.
+    try exec(allocator, db, "DELETE FROM skewed WHERE id % 13 = 0");
+    const extra_rows = 4000;
+    const extra = try allocator.alloc(Row, extra_rows);
+    defer allocator.free(extra);
+    for (extra, 0..) |*r, j| r.* = .{ .id = @intCast(total + j), .k = 11, .s = "key-11", .v = 0 };
+    try t.insert(extra);
+    var live_counts = [_]i64{0} ** heavy_groups;
+    for (rows, 0..) |r, n| {
+        if (r.k >= heavy_groups or (n * 7919) % total % 13 == 0) continue;
+        live_counts[@intCast(r.k)] += 1;
+    }
+    live_counts[11] += extra_rows;
+    var best = live_counts;
+    std.sort.pdq(i64, &best, {}, std.sort.desc(i64));
+    inline for (.{
+        "SELECT k, COUNT(*) AS c FROM skewed GROUP BY k ORDER BY c DESC LIMIT 10",
+        "SELECT k % 1000 AS m, s, COUNT(*) AS c FROM skewed GROUP BY m, s ORDER BY c DESC LIMIT 10",
+    }) |sql| {
+        errdefer std.debug.print("query: {s}\n", .{sql});
+        var q = try runSql(allocator, db, sql);
+        defer q.deinit();
+        const count_col = if (comptime std.mem.indexOf(u8, sql, " s,") != null) 2 else 1;
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const k = (try cellNumber(batch.values[0], r)).?;
+                try std.testing.expect(k >= 0 and k < heavy_groups);
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(live_counts[@intFromFloat(k)])), try cellNumber(batch.values[count_col], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(best[rank])), try cellNumber(batch.values[count_col], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), rank);
+    }
 }
 
 test "V2 group-topN: a string-derived key evaluates once per dictionary value and folds repeats by count" {
