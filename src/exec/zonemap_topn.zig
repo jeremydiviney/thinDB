@@ -103,6 +103,10 @@ pub const ZonemapTopN = struct {
     key_desc: []bool,
     /// Probe-batch index of each ORDER BY key column. Owned.
     key_probe_idx: []usize,
+    /// Probe-batch index of the one column the WHERE clause reads, when it is
+    /// no ORDER BY key: a dictionary-coded block of it is filtered once per
+    /// dictionary entry instead of being expanded to its rows' strings.
+    dict_filter_probe: ?usize,
     /// Prunable prefix length: the longest leading run of ORDER BY keys with
     /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`).
     /// Only these keys drive row-group pruning; the rest still order rows in the
@@ -210,6 +214,7 @@ pub const ZonemapTopN = struct {
         // `updatedAt >= '<text>' ORDER BY id LIMIT n` came back unfiltered.
         var validated = pred;
         try predicate.validateExpr(&validated, probe_schema);
+        const dict_filter_probe = try dictFilterProbe(allocator, validated, probe_schema, key_probe_idx);
 
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
@@ -242,6 +247,7 @@ pub const ZonemapTopN = struct {
             .key_phys = key_phys,
             .key_desc = key_desc,
             .key_probe_idx = key_probe_idx,
+            .dict_filter_probe = dict_filter_probe,
             .prefix_len = prefix_len,
             .n = n,
             .offset = offset,
@@ -649,6 +655,8 @@ const ProbeScratch = struct {
     blocks: []storage.ReadSegment.BorrowedBlock,
     views: []ColumnView,
     mask: std.ArrayListUnmanaged(bool) = .empty,
+    entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(allocator: Allocator, columns: usize) !ProbeScratch {
         const blocks = try allocator.alloc(storage.ReadSegment.BorrowedBlock, columns);
@@ -662,6 +670,8 @@ const ProbeScratch = struct {
         allocator.free(self.blocks);
         allocator.free(self.views);
         self.mask.deinit(allocator);
+        self.entry_hits.deinit(allocator);
+        self.entry_offsets.deinit(allocator);
     }
 };
 
@@ -671,12 +681,26 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     const rg_count = ref.row_count;
     var borrowed: usize = 0;
     defer for (scratch.blocks[0..borrowed]) |*block| block.release(allocator, z.table.cacheRef());
+    var dict_filter: ?DictFilterBlock = null;
     for (z.probe_phys, 0..) |phys, j| {
         scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
         borrowed += 1;
         const block = &scratch.blocks[j];
         const col = z.table.schema.columns[phys];
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+        if (j == z.dict_filter_probe and block.encoding == .dict) {
+            var values = block.bytes;
+            var nulls: ?[]const u8 = null;
+            if (flags.has_nulls) {
+                const bm_len = storage.column.bitmapBytes(rg_count);
+                nulls = block.bytes[0..bm_len];
+                values = block.bytes[bm_len..];
+            }
+            dict_filter = .{ .db = storage.segment_reader.dictBlockOf(values, rg_count), .nulls = nulls };
+            // Only the predicate reads this column, and it reads the entries.
+            scratch.views[j] = try stringColumnView(col.type, .{ .offsets = &.{0}, .bytes = "" }, null);
+            continue;
+        }
         if (storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding)) |view| {
             scratch.views[j] = view;
         } else {
@@ -688,7 +712,11 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     const vbuf = scratch.views;
     try scratch.mask.resize(allocator, rg_count);
     const mask = scratch.mask.items;
-    try evalPredicate(z, allocator, vbuf, rg_count, mask);
+    if (dict_filter) |df| {
+        try evalDictPredicate(z, allocator, scratch, df, rg_count, mask);
+    } else {
+        try evalPredicate(z, allocator, vbuf, rg_count, mask);
+    }
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
 
     for (mask, 0..) |keep, row| {
@@ -703,6 +731,73 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
 fn evalPredicate(z: *const ZonemapTopN, allocator: Allocator, views: []const ColumnView, n: usize, mask: []bool) !void {
     const batch = Batch{ .schema = z.probe_schema, .values = views, .row_count = n };
     try predicate.evaluateExprGuided(allocator, z.pred, z.probe_schema, batch, mask, null);
+}
+
+/// The probe index of the one column the predicate reads, through per-row
+/// kernels only, when that column is no ORDER BY key.
+fn dictFilterProbe(allocator: Allocator, pred: PredicateExpr, probe_schema: []const Column, key_probe_idx: []const usize) !?usize {
+    if (!predicate.kernelsOnly(pred)) return null;
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer names.deinit(allocator);
+    try predicate.collectColumnNames(allocator, &names, pred);
+    if (names.items.len != 1) return null;
+    const j = types.findColumn(probe_schema, names.items[0]) orelse return null;
+    for (key_probe_idx) |k| if (k == j) return null;
+    return j;
+}
+
+const DictFilterBlock = struct {
+    db: storage.segment_reader.DictBlock,
+    nulls: ?[]const u8,
+};
+
+/// `evalPredicate` for a row group whose filter column is dictionary-coded:
+/// the predicate runs once over the dictionary's entries, and once over a
+/// NULL when the block has NULL rows, and each row takes its value's result.
+fn evalDictPredicate(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, df: DictFilterBlock, n: usize, mask: []bool) !void {
+    const db = df.db;
+    const j = z.dict_filter_probe.?;
+    const schema = z.probe_schema[j..][0..1];
+    const offsets = db.offsetsInPlace() orelse offsets: {
+        try scratch.entry_offsets.resize(allocator, @as(usize, db.ndv) + 1);
+        for (scratch.entry_offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+        break :offsets scratch.entry_offsets.items;
+    };
+    const entries = [1]ColumnView{try stringColumnView(schema[0].type, .{ .offsets = offsets, .bytes = db.dict_bytes }, null)};
+    // An all-NULL block's dictionary may be empty, its rows coded 0.
+    try scratch.entry_hits.resize(allocator, @max(db.ndv, 1));
+    const hits = scratch.entry_hits.items;
+    hits[0] = false;
+    try predicate.evaluateExprGuided(allocator, z.pred, schema, Batch{ .schema = schema, .values = &entries, .row_count = db.ndv }, hits[0..db.ndv], null);
+    switch (db.code_width) {
+        inline 1, 2, 4 => |w| for (mask[0..n], 0..) |*m, i| {
+            m.* = hits[db.rowCodeAs(w, i)];
+        },
+        else => for (mask[0..n], 0..) |*m, i| {
+            m.* = hits[db.rowCode(i)];
+        },
+    }
+
+    const nulls = df.nulls orelse return;
+    const null_bit = [1]u8{0};
+    const null_row = [1]ColumnView{try stringColumnView(schema[0].type, .{ .offsets = &.{ 0, 0 }, .bytes = "" }, &null_bit)};
+    var null_keep = [1]bool{false};
+    try predicate.evaluateExprGuided(allocator, z.pred, schema, Batch{ .schema = schema, .values = &null_row, .row_count = 1 }, &null_keep, null);
+    for (mask[0..n], 0..) |*m, i| {
+        if (!storage.column.isValidBit(nulls, i)) m.* = null_keep[0];
+    }
+}
+
+fn stringColumnView(col_type: types.Type, sv: storage.StringView, nulls: ?[]const u8) !ColumnView {
+    return .{ .data = switch (col_type) {
+        .varchar => .{ .varchar = sv },
+        .string => .{ .string = sv },
+        .char => .{ .char = sv },
+        .json => .{ .json = sv },
+        .nested => .{ .nested = sv },
+        .bitmap => .{ .bitmap = sv },
+        else => return error.TypeMismatch,
+    }, .nulls = nulls };
 }
 
 fn applyTombstones(
