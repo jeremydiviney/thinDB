@@ -1063,6 +1063,26 @@ test "dict block stores a lexicographically sorted dictionary" {
     for (0..n) |i| {
         try std.testing.expectEqualStrings(vals[i], db.dictValue(db.rowCode(i)));
     }
+    // A cached block's offsets view in place, so the scan's dictionary
+    // emit never copies them.
+    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+        const offsets = db.offsetsInPlace().?;
+        for (0..db.ndv) |k2| try std.testing.expectEqualStrings(db.dictValue(@intCast(k2)), db.dict_bytes[offsets[k2]..offsets[k2 + 1]]);
+    }
+}
+
+test "DictBlock.offsetsInPlace views u32-aligned offsets and declines misaligned ones" {
+    var storage_words: [8]u32 = undefined;
+    const bytes = std.mem.sliceAsBytes(&storage_words);
+    for (0..4) |i| std.mem.writeInt(u32, bytes[4 + i * 4 ..][0..4], @intCast(i * 3), .little);
+    const aligned: segment_reader.DictBlock = .{ .ndv = 3, .code_width = 1, .offsets_region = bytes[4..20], .dict_bytes = &.{}, .codes = &.{} };
+    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+        try std.testing.expectEqualSlices(u32, &.{ 0, 3, 6, 9 }, aligned.offsetsInPlace().?);
+    } else {
+        try std.testing.expectEqual(@as(?[]const u32, null), aligned.offsetsInPlace());
+    }
+    const misaligned: segment_reader.DictBlock = .{ .ndv = 3, .code_width = 1, .offsets_region = bytes[5..21], .dict_bytes = &.{}, .codes = &.{} };
+    try std.testing.expectEqual(@as(?[]const u32, null), misaligned.offsetsInPlace());
 }
 
 test "DictBlock.rowCode reads each writer code width little-endian" {
