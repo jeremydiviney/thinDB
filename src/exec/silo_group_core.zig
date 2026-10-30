@@ -7906,12 +7906,7 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
 /// counts them by weight: the sketch must see the counts the grid will.
 fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weights: ?RowWeights) !void {
     const ids = try batchIdentities(job, job.scan.allocator, batch);
-    const counts = sketch.workerCounts(job.worker_index);
-    if (weights) |w| {
-        for (ids, w.counts[0..ids.len]) |id, n| counts[sketch.counter(id)] += n;
-    } else {
-        for (ids) |id| counts[sketch.counter(id)] += 1;
-    }
+    sketch.tally(sketch.workerCounts(job.worker_index), ids, if (weights) |w| w.counts[0..ids.len] else null);
 }
 
 /// A batch bound for the grid, with its rows' repeat counts when collapsed

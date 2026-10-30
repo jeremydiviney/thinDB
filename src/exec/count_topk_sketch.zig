@@ -31,6 +31,14 @@ const MAX_KEPT_FRACTION_DENOM: u64 = 4;
 /// over the counters stops being cheap.
 pub const MAX_NEED: usize = 1024;
 
+/// Identities whose counter slots `tally` computes before incrementing them.
+const TALLY_LANE: usize = 1024;
+
+/// How many increments ahead `tally` prefetches. A worker's counters (1 MiB
+/// at DEFAULT_BITS) overflow L2, and each random increment that waits on its
+/// line holds up the stores queued behind it.
+const TALLY_PREFETCH_DISTANCE: usize = 16;
+
 pub const CountSketch = struct {
     bits: u6,
     /// `workers` slices of 2^bits counters, one per grid worker. A worker
@@ -67,6 +75,29 @@ pub const CountSketch = struct {
         x *%= 0xc4ceb9fe1a85ec53;
         x ^= x >> 33;
         return @intCast(x >> @intCast(64 - @as(u7, self.bits)));
+    }
+
+    /// Counts each identity's rows (`weights[i]` of them, else one) into
+    /// `counts`, a worker's counters.
+    pub fn tally(self: *const CountSketch, counts: []u32, ids: []const u128, weights: ?[]const u32) void {
+        var slots: [TALLY_LANE]u32 = undefined;
+        var lo: usize = 0;
+        while (lo < ids.len) : (lo += TALLY_LANE) {
+            const lane = ids[lo..@min(ids.len, lo + TALLY_LANE)];
+            const lane_slots = slots[0..lane.len];
+            for (lane, lane_slots) |id, *s| s.* = @intCast(self.counter(id));
+            if (weights) |w| {
+                for (lane_slots, w[lo..][0..lane.len], 0..) |s, n, i| {
+                    if (i + TALLY_PREFETCH_DISTANCE < lane_slots.len) @prefetch(&counts[lane_slots[i + TALLY_PREFETCH_DISTANCE]], .{ .rw = .write });
+                    counts[s] += n;
+                }
+            } else {
+                for (lane_slots, 0..) |s, i| {
+                    if (i + TALLY_PREFETCH_DISTANCE < lane_slots.len) @prefetch(&counts[lane_slots[i + TALLY_PREFETCH_DISTANCE]], .{ .rw = .write });
+                    counts[s] += 1;
+                }
+            }
+        }
     }
 
     /// Worker `w`'s counters. Only worker `w` may call this during a tally.
@@ -208,6 +239,42 @@ test "count sketch keeps the heavy groups and proves the top-k exact" {
     try std.testing.expect(sketch.exact(3, 4, 800));
     try std.testing.expect(!sketch.exact(3, 2, 900));
     try std.testing.expect(!sketch.exact(3, 4, sketch.threshold - 2));
+}
+
+test "tally counts like one increment per identity, by weight when given" {
+    const allocator = std.testing.allocator;
+    var sketch = try CountSketch.init(allocator, 9, 3);
+    defer sketch.deinit(allocator);
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    const random = prng.random();
+
+    const n = 2 * TALLY_LANE + 37;
+    const ids = try allocator.alloc(u128, n);
+    defer allocator.free(ids);
+    const weights = try allocator.alloc(u32, n);
+    defer allocator.free(weights);
+    for (ids, weights) |*id, *w| {
+        id.* = random.uintLessThan(u128, 3000);
+        w.* = random.intRangeAtMost(u32, 1, 9);
+    }
+
+    sketch.tally(sketch.workerCounts(0), ids, null);
+    sketch.tally(sketch.workerCounts(1), ids, weights);
+    const expected_rows = try allocator.alloc(u32, @as(usize, 1) << sketch.bits);
+    defer allocator.free(expected_rows);
+    const expected_weighted = try allocator.alloc(u32, expected_rows.len);
+    defer allocator.free(expected_weighted);
+    @memset(expected_rows, 0);
+    @memset(expected_weighted, 0);
+    for (ids, weights) |id, w| {
+        expected_rows[sketch.counter(id)] += 1;
+        expected_weighted[sketch.counter(id)] += w;
+    }
+    try std.testing.expectEqualSlices(u32, expected_rows, sketch.workerCounts(0));
+    try std.testing.expectEqualSlices(u32, expected_weighted, sketch.workerCounts(1));
+
+    sketch.tally(sketch.workerCounts(2), ids[0..0], null);
+    for (sketch.workerCounts(2)) |c| try std.testing.expectEqual(@as(u32, 0), c);
 }
 
 test "count sketch declines near-unique keys" {
