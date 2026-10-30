@@ -77,6 +77,11 @@ pub fn PartitionedDistinct(comptime Key: type) type {
         };
 
         allocator: Allocator,
+        // Sets and slabs recycle through the process buffer pool: from the
+        // query's heap, every statement mapped them fresh and faulted in each
+        // page its sets' growth touched (a fifth of a COUNT(DISTINCT) over a
+        // string column), then unmapped them again.
+        pooled: Allocator,
         partitions: [PARTITIONS]Partition = @splat(.{}),
         slabs: std.atomic.Value(?*Slab) = .init(null),
         queued: std.atomic.Value(usize) = .init(0),
@@ -88,23 +93,24 @@ pub fn PartitionedDistinct(comptime Key: type) type {
         queue_ceiling: usize = QUEUE_CEILING_KEYS,
 
         pub fn create(allocator: Allocator) !*Self {
+            const pooled = try memory.workerAllocatorOf(allocator);
             const self = try allocator.create(Self);
-            self.* = .{ .allocator = allocator };
+            self.* = .{ .allocator = allocator, .pooled = pooled };
             return self;
         }
 
         pub fn destroy(self: *Self) void {
-            for (&self.partitions) |*part| part.set.deinit(self.allocator);
+            for (&self.partitions) |*part| part.set.deinit(self.pooled);
             var slabs = self.slabs.load(.monotonic);
             while (slabs) |slab| {
                 slabs = slab.next;
-                self.allocator.destroy(slab);
+                self.pooled.destroy(slab);
             }
             self.allocator.destroy(self);
         }
 
         fn newSlab(self: *Self) !*Slab {
-            const slab = try self.allocator.create(Slab);
+            const slab = try self.pooled.create(Slab);
             var head = self.slabs.load(.monotonic);
             while (true) {
                 slab.next = head;
@@ -158,7 +164,7 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             while (list) |ch| {
                 remaining -= ch.len;
                 const ahead = if (last_new * 2 > last_len) remaining * last_new / last_len else 0;
-                try part.set.ensureFor(self.allocator, ch.len + ahead);
+                try part.set.ensureFor(self.pooled, ch.len + ahead);
                 const prior = part.set.count();
                 insertAll(&part.set, ch.keys[0..ch.len]);
                 last_new = part.set.count() - prior;
