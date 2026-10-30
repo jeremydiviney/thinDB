@@ -108,7 +108,12 @@ fn openScanSource(
     // digesting the materialized bytes in the fold — same digest either way.
     for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
     if (derived.len == 0) {
-        for (hash_cols) |hc| if (scan.blockDictColumnIndex(hc)) |j| try scan.setBlockDictColumn(j);
+        for (hash_cols) |hc| if (scan.blockDictColumnIndex(hc)) |j| {
+            try scan.setBlockDictColumn(j);
+            // COUNT(DISTINCT) is all that reads a hashed column; with no
+            // filter to compact rows by, it needs no codes.
+            if (where_filter == null) scan.setBlockDictEntriesOnly(j);
+        };
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
     }
     // A column the aggregates read only through `octet_length` arrives as
@@ -607,20 +612,27 @@ fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, diges
 // reference enters the set once, by its digest, instead of a digest per row.
 fn foldDistinctDict(sink: anytype, lane: *Lane, i: usize, dict: exec.BlockDictColumn, n: usize) !void {
     lane.ns[i] += n;
+    const blank = exec.stringKeyDigest("");
+    if (dict.every_value) {
+        for (0..dict.valueCount()) |c| try pushDictValue(sink, lane, i, dict, c, blank);
+        return;
+    }
     try lane.dict_seen.resize(lane.allocator, dict.valueCount());
     const seen = lane.dict_seen.items;
     @memset(seen, false);
     for (dict.codes[0..n]) |c| seen[c] = true;
-    const blank = exec.stringKeyDigest("");
     for (seen, 0..) |referenced, c| {
-        if (!referenced) continue;
-        const key = if (dict.digests) |ds| ds[c] else exec.stringKeyDigest(dict.dict.rowBytes(c));
-        if (key == blank) {
-            lane.has_blank[i] = true;
-            continue;
-        }
-        try sink.push(@truncate(key));
+        if (referenced) try pushDictValue(sink, lane, i, dict, c, blank);
     }
+}
+
+inline fn pushDictValue(sink: anytype, lane: *Lane, i: usize, dict: exec.BlockDictColumn, c: usize, blank: u128) !void {
+    const key = if (dict.digests) |ds| ds[c] else exec.stringKeyDigest(dict.dict.rowBytes(c));
+    if (key == blank) {
+        lane.has_blank[i] = true;
+        return;
+    }
+    try sink.push(@truncate(key));
 }
 
 // The dkind dispatch happens once and each kernel runs over a typed slice.
