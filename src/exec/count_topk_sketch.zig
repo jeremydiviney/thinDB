@@ -10,6 +10,10 @@
 //! it, and SQL leaves ties at the cut unordered), so the kept groups' top k
 //! is the answer.
 //!
+//! A count no greater than the row count, such as COUNT(DISTINCT), ranks the
+//! same way: a dropped group's count is below the threshold too, so the same
+//! proof holds once the k-th best kept group reaches `threshold - 1`.
+//!
 //! It pays when a few groups hold far more rows than the rest (URLs, users,
 //! search phrases): the filter pass then groups a few percent of the rows.
 //! Near-unique keys spread their rows evenly over the counters, keep nearly
@@ -29,6 +33,23 @@ pub const DEFAULT_BITS: u6 = 18;
 /// The filter pass must keep at most 1/this of the rows to beat grouping
 /// them all.
 const MAX_KEPT_FRACTION_DENOM: u64 = 4;
+
+/// A first filter pass ranked by a count below the row count may keep 1/this
+/// of the rows, the lower threshold making a retry less likely.
+const BELOW_ROW_COUNT_KEPT_FRACTION_DENOM: u64 = 16;
+
+/// Thresholds `settle` weighs below half the need-th largest counter for a
+/// count below the row count.
+const BELOW_ROW_COUNT_THRESHOLD_STEPS: u64 = 4096;
+
+/// What the top-K ranks groups by.
+pub const RankedBy = enum {
+    /// COUNT(*): a group's counter bounds it from above.
+    row_count,
+    /// A count no greater than the row count, by an unknown margin
+    /// (COUNT(DISTINCT)).
+    at_most_row_count,
+};
 
 /// Longest LIMIT + OFFSET the sketch serves; past it the threshold search
 /// over the counters stops being cheap.
@@ -119,9 +140,10 @@ pub const CountSketch = struct {
     }
 
     /// Sum the workers' counters and pick the threshold for the `need` best
-    /// groups: half the need-th largest counter. False when the filter pass
-    /// would keep too many rows to pay.
-    pub fn settle(self: *CountSketch, allocator: Allocator, need: usize) !bool {
+    /// groups: half the need-th largest counter, or for a count below the row
+    /// count as far below that as a filter pass keeping 1/16 of the rows
+    /// allows. False when the filter pass would keep too many rows to pay.
+    pub fn settle(self: *CountSketch, allocator: Allocator, need: usize, ranked_by: RankedBy) !bool {
         std.debug.assert(need > 0 and need <= MAX_NEED);
         const n = @as(usize, 1) << self.bits;
         var merged: ?[]u32 = null;
@@ -140,6 +162,7 @@ pub const CountSketch = struct {
         const kth = kthLargest(u32, totals, best[0..need]);
         if (@as(f64, @floatFromInt(kth)) <= collisionCeiling(self.rows, self.bits)) return false;
         self.threshold = @max(1, kth / 2);
+        if (ranked_by == .at_most_row_count) self.threshold = lowestThreshold(totals, self.threshold, self.rows / BELOW_ROW_COUNT_KEPT_FRACTION_DENOM);
 
         self.keep = try allocator.alloc(u64, n / 64);
         return self.fillKeep(totals);
@@ -221,6 +244,24 @@ pub const RowSlots = struct {
         return slots;
     }
 };
+
+/// The lowest threshold up to `ceiling`, in steps of a 1/4096 of it, whose
+/// counters hold at most `budget` rows; `ceiling` when none does.
+fn lowestThreshold(totals: []const u32, ceiling: u64, budget: u64) u64 {
+    const step = ceiling / BELOW_ROW_COUNT_THRESHOLD_STEPS + 1;
+    const top = ceiling / step;
+    var rows_at: [BELOW_ROW_COUNT_THRESHOLD_STEPS]u64 = @splat(0);
+    for (totals) |c| rows_at[@min(c / step, top)] += c;
+    var best = ceiling;
+    var kept: u64 = 0;
+    var b = top;
+    while (b >= 1) : (b -= 1) {
+        kept += rows_at[b];
+        if (kept > budget) break;
+        best = b * step;
+    }
+    return best;
+}
 
 /// Candidates past this many keep too many rows for the filter pass to beat
 /// the counter sketch.
@@ -594,7 +635,7 @@ test "count sketch keeps the heavy groups and proves the top-k exact" {
         try expected.put(g, 1);
     }
 
-    try std.testing.expect(try sketch.settle(allocator, 3));
+    try std.testing.expect(try sketch.settle(allocator, 3, .row_count));
     try std.testing.expectEqual(@as(u64, 23_400), sketch.rows);
     for (0..4) |h| try std.testing.expect(sketch.keeps(h));
     try std.testing.expect(sketch.kept_rows < sketch.rows / 4);
@@ -651,7 +692,7 @@ test "count sketch declines near-unique keys" {
     const counts = sketch.workerCounts(0);
     var g: u128 = 0;
     while (g < 100_000) : (g += 1) counts[sketch.counter(g)] += 1;
-    try std.testing.expect(!try sketch.settle(allocator, 10));
+    try std.testing.expect(!try sketch.settle(allocator, 10, .row_count));
 }
 
 test "count sketch declines unique keys spread thinner than the counters" {
@@ -663,7 +704,7 @@ test "count sketch declines unique keys spread thinner than the counters" {
     const counts = sketch.workerCounts(0);
     var g: u128 = 0;
     while (g < 5_000) : (g += 1) counts[sketch.counter(g)] += 1;
-    try std.testing.expect(!try sketch.settle(allocator, 5));
+    try std.testing.expect(!try sketch.settle(allocator, 5, .row_count));
 }
 
 test "retarget lowers the threshold to one past the found k-th count" {
@@ -675,11 +716,35 @@ test "retarget lowers the threshold to one past the found k-th count" {
     counts[sketch.counter(2)] += 400;
     var g: u128 = 10;
     while (g < 5_000) : (g += 1) counts[sketch.counter(g)] += 1;
-    try std.testing.expect(try sketch.settle(allocator, 2));
+    try std.testing.expect(try sketch.settle(allocator, 2, .row_count));
     try std.testing.expect(sketch.retarget(399));
     try std.testing.expectEqual(@as(u64, 400), sketch.threshold);
     try std.testing.expect(sketch.keeps(1) and sketch.keeps(2));
     try std.testing.expect(sketch.exact(2, 2, 399));
+}
+
+test "a count below the row count settles as low as the kept-row budget allows" {
+    const allocator = std.testing.allocator;
+    var sketch = try CountSketch.init(allocator, 16, 1);
+    defer sketch.deinit(allocator);
+    const counts = sketch.workerCounts(0);
+    // Two groups of 4000 rows, then groups of 800, 400 and 200, among
+    // one-row groups: half the 2nd largest counter is about 2000, and 1/16
+    // of the 148,000 rows is 9250.
+    counts[sketch.counter(1)] += 4000;
+    counts[sketch.counter(2)] += 4000;
+    counts[sketch.counter(3)] += 800;
+    counts[sketch.counter(4)] += 400;
+    counts[sketch.counter(5)] += 200;
+    var g: u128 = 10;
+    while (g < 138_610) : (g += 1) counts[sketch.counter(g)] += 1;
+    try std.testing.expect(try sketch.settle(allocator, 2, .at_most_row_count));
+    try std.testing.expectEqual(@as(u64, 148_000), sketch.rows);
+    // The 800- and 400-row groups fit the budget beside the two largest; the
+    // 200-row one would pass it.
+    try std.testing.expect(sketch.threshold > counts[sketch.counter(5)] and sketch.threshold <= counts[sketch.counter(4)]);
+    for (1..5) |h| try std.testing.expect(sketch.keeps(h));
+    try std.testing.expect(!sketch.keeps(5));
 }
 
 test "approxKth bounds the need-th largest count from below within 2x" {

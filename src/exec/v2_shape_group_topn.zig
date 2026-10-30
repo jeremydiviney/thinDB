@@ -784,7 +784,11 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .emit_rank = emitRank(ctx),
             .hashed = ctx.plan.hashed,
             .key_bound = ctx.request.key_bound,
-            .count_sketch = canUseCoreCountDescTopN(ctx) and ctx.request.key_bound == null,
+            .count_sketch = (canUseCoreCountDescTopN(ctx) or rankedByDistinctCount(ctx)) and ctx.request.key_bound == null,
+            .count_rank = if (!canUseCoreCountDescTopN(ctx) and rankedByDistinctCount(ctx))
+                .{ .ctx = ctx, .value = distinctCountRank }
+            else
+                null,
         },
         .params = params,
         .scan_columns = scan_columns,
@@ -819,6 +823,23 @@ fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
         if (agg.func == .count and agg.state_index == 0 and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
     }
     return false;
+}
+
+// The result's best groups by a COUNT(DISTINCT), which never exceeds the
+// group's row count, so the two-pass count sketch may serve them.
+fn rankedByDistinctCount(ctx: *const ExecutionContext) bool {
+    if (ctx.request.having_filter != null or ctx.request.limit == 0) return false;
+    if (ctx.order_keys.len != 1 or !ctx.order_keys[0].desc) return false;
+    return switch (ctx.order_keys[0].target) {
+        .part => false,
+        .aggregate => |agg_plan| agg_plan.func == .count_distinct,
+    };
+}
+
+fn distinctCountRank(ctx: ?*anyopaque, row: SiloCore.TopRow) u64 {
+    const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
+    const agg_plan = ec.order_keys[0].target.aggregate;
+    return @intCast(rowStateValue(row, agg_plan.state_index, agg_plan.wide));
 }
 
 // A `LIMIT N` with no ORDER BY accepts any N+offset groups, so the core can
