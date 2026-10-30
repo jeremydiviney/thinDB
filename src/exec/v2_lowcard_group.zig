@@ -958,12 +958,11 @@ fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: 
         // Adjacent-equal run over the packed keys (the table is physically
         // ordered, so clustered group keys arrive in runs): one probe and one
         // count bump for the whole run.
-        var run_end = r + 1;
-        if (wide) {
-            while (run_end < n and keys[run_end] == keys[r] and valid[run_end] == valid[r]) run_end += 1;
-        } else {
-            while (run_end < n and keys[run_end] == keys[r]) run_end += 1;
-        }
+        const run_end = if (wide) wide: {
+            var end = r + 1;
+            while (end < n and keys[end] == keys[r] and valid[end] == valid[r]) end += 1;
+            break :wide end;
+        } else runEnd(keys, r);
         const key = tableKey(wide, keys, valid, r);
         const hash = GroupTable.hashKey(key);
         const probe = st.table.getOrPut(hash, key);
@@ -983,8 +982,34 @@ fn groupRows(comptime wide: bool, w: *Worker, batch: Batch, keys: []u64, valid: 
             st.table.commit(slot, key, gid);
         }
         st.counts.items[gid] += @intCast(run_end - r);
-        @memset(gids[r..run_end], gid);
+        fillRun(gids, r, run_end, gid);
         r = run_end;
+    }
+}
+
+const RUN_LANES = 8;
+
+// The end of the run of keys equal to `keys[r]`, found a vector at a time:
+// short runs, the common case, then cost no compare-and-branch per row.
+fn runEnd(keys: []const u64, r: usize) usize {
+    const head: @Vector(RUN_LANES, u64) = @splat(keys[r]);
+    var at = r + 1;
+    while (at + RUN_LANES <= keys.len) : (at += RUN_LANES) {
+        const block: @Vector(RUN_LANES, u64) = keys[at..][0..RUN_LANES].*;
+        const differ: u8 = @bitCast(block != head);
+        if (differ != 0) return at + @ctz(differ);
+    }
+    while (at < keys.len and keys[at] == keys[r]) at += 1;
+    return at;
+}
+
+// Set `gids[lo..hi]` to `gid`. A short run is one full-width store whose
+// overhang the next run overwrites.
+inline fn fillRun(gids: []u32, lo: usize, hi: usize, gid: u32) void {
+    if (hi - lo <= RUN_LANES and lo + RUN_LANES <= gids.len) {
+        gids[lo..][0..RUN_LANES].* = @splat(gid);
+    } else {
+        @memset(gids[lo..hi], gid);
     }
 }
 
@@ -1139,6 +1164,7 @@ fn foldDistinctValues(
 ) !void {
     switch (producer.*) {
         inline else => |*prod| {
+            if (@typeInfo(T) == .int and view.nulls == null) return pushCompositeRunStarts(T, vals[0..keys.len], keys, prod, value_bits);
             var prev_comp: u128 = 0;
             var have_prev = false;
             for (keys, 0..) |key, r| {
@@ -1150,6 +1176,33 @@ fn foldDistinctValues(
                 try prod.push(@truncate(comp));
             }
         },
+    }
+}
+
+// The run starts of a column without NULLs: compare vectors of keys and of
+// values with the same vectors one row back and visit only the lanes where
+// either differs, so a repeat costs no branch of its own.
+fn pushCompositeRunStarts(comptime T: type, vals: []const T, keys: []const u64, prod: anytype, value_bits: u8) !void {
+    const width = 8;
+    const n = keys.len;
+    if (n == 0) return;
+    try prod.push(@truncate(compositeOf(keys[0], distinctValueBits(T, vals[0]), value_bits)));
+    var r: usize = 1;
+    while (r + width <= n) : (r += width) {
+        const key_now: @Vector(width, u64) = keys[r..][0..width].*;
+        const key_prev: @Vector(width, u64) = keys[r - 1 ..][0..width].*;
+        const val_now: @Vector(width, T) = vals[r..][0..width].*;
+        const val_prev: @Vector(width, T) = vals[r - 1 ..][0..width].*;
+        var starts = @as(u8, @bitCast(key_now != key_prev)) | @as(u8, @bitCast(val_now != val_prev));
+        while (starts != 0) : (starts &= starts - 1) {
+            const at = r + @ctz(starts);
+            try prod.push(@truncate(compositeOf(keys[at], distinctValueBits(T, vals[at]), value_bits)));
+        }
+    }
+    while (r < n) : (r += 1) {
+        if (keys[r] != keys[r - 1] or vals[r] != vals[r - 1]) {
+            try prod.push(@truncate(compositeOf(keys[r], distinctValueBits(T, vals[r]), value_bits)));
+        }
     }
 }
 

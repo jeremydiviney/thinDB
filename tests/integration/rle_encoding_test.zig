@@ -184,3 +184,97 @@ test "RLE-encoded columns round-trip across multiple segments" {
         .{ .base = ROWS + 1, .rows = ROWS },
     });
 }
+
+// Short runs: run k is 1 + 7k mod 13 rows long, so runs of 1 to 13 rows
+// straddle row-group edges and the 8-row vector width. `v` is a spread 64-bit
+// value per run (FOR can't narrow it, so RLE wins), `g` one of 37 values that
+// changes every run, and `w` a small value for sums.
+const SHORT_ROWS: usize = 3000;
+const SHORT_GROUPS: usize = 37;
+
+const ShortRun = struct { k: u64, start: usize };
+
+fn shortRunOf(row: usize) ShortRun {
+    var k: u64 = 0;
+    var start: usize = 0;
+    while (true) : (k += 1) {
+        const len: usize = @intCast(1 + (k * 7) % 13);
+        if (row < start + len) return .{ .k = k, .start = start };
+        start += len;
+    }
+}
+fn shortV(k: u64) i64 {
+    return @bitCast(k *% 0x9E3779B97F4A7C15);
+}
+fn shortG(k: u64) i64 {
+    return @intCast((k % SHORT_GROUPS) * 1000003);
+}
+fn shortW(k: u64) i64 {
+    return @intCast(k % 5);
+}
+
+test "RLE columns of short runs round-trip and group exactly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 256 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, g INT NOT NULL, w SMALLINT NOT NULL)");
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "INSERT INTO s VALUES ");
+        var line: [96]u8 = undefined;
+        for (0..SHORT_ROWS) |i| {
+            if (i != 0) try buf.appendSlice(allocator, ", ");
+            const k = shortRunOf(i).k;
+            try buf.appendSlice(allocator, try std.fmt.bufPrint(&line, "({d}, {d}, {d}, {d})", .{ i, shortV(k), shortG(k), shortW(k) }));
+        }
+        try exec(allocator, db, buf.items);
+    }
+    try (try db.openTable("s", .{})).flush();
+
+    {
+        var q = try runSql(allocator, db, "SELECT id, v, g, w FROM s ORDER BY id");
+        defer q.deinit();
+        var seen: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |j| {
+                const id: usize = @intCast(batch.values[0].data.bigint[j]);
+                const k = shortRunOf(id).k;
+                try std.testing.expectEqual(shortV(k), batch.values[1].data.bigint[j]);
+                try std.testing.expectEqual(shortG(k), @as(i64, batch.values[2].data.int[j]));
+                try std.testing.expectEqual(shortW(k), @as(i64, batch.values[3].data.smallint[j]));
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(SHORT_ROWS, seen);
+    }
+
+    // Per g: rows, distinct v (one per run of g) and SUM(w).
+    var rows = [_]i64{0} ** SHORT_GROUPS;
+    var runs = [_]i64{0} ** SHORT_GROUPS;
+    var sums = [_]i64{0} ** SHORT_GROUPS;
+    for (0..SHORT_ROWS) |i| {
+        const r = shortRunOf(i);
+        const g: usize = @intCast(r.k % SHORT_GROUPS);
+        rows[g] += 1;
+        if (r.start == i) runs[g] += 1;
+        sums[g] += shortW(r.k);
+    }
+    var q = try runSql(allocator, db, "SELECT g, COUNT(*), COUNT(DISTINCT v), SUM(w) FROM s GROUP BY g ORDER BY g");
+    defer q.deinit();
+    var at: usize = 0;
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |j| {
+            try std.testing.expectEqual(shortG(at), @as(i64, batch.values[0].data.int[j]));
+            try std.testing.expectEqual(rows[at], batch.values[1].data.bigint[j]);
+            try std.testing.expectEqual(runs[at], batch.values[2].data.bigint[j]);
+            try std.testing.expectEqual(sums[at], batch.values[3].data.bigint[j]);
+            at += 1;
+        }
+    }
+    try std.testing.expectEqual(SHORT_GROUPS, at);
+}
