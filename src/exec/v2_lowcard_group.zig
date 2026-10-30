@@ -97,6 +97,7 @@ const DistinctStrSet = group_table.DistinctStrSet;
 const CountSlotTable = group_table.CountSlotTable;
 const NarrowDistinct = partitioned_distinct.PartitionedDistinct(u64);
 const WideDistinct = partitioned_distinct.PartitionedDistinct(u128);
+const NewKeyCounts = partitioned_distinct.NewKeyCounts;
 
 // A non-string COUNT(DISTINCT)'s shared set and one worker's producer into
 // it, keyed at the composite's tier width.
@@ -702,8 +703,10 @@ const WState = struct {
     ns: std.ArrayListUnmanaged(u64) = .empty,
     // Per distinct aggregate d: `producers[d]` feeds the shared set of an
     // int/float/coded input; a string input's n_distinct × parts sets are
-    // `ssets`, indexed [d * parts + partition].
+    // `ssets`, indexed [d * parts + partition]. `new_counts[d]` tallies, by
+    // group key, the composites this worker's drains found new.
     producers: []?DistinctProducer = &.{},
+    new_counts: []NewKeyCounts = &.{},
     ssets: []DistinctStrSet = &.{},
     // gid → merged gid, filled after the scalar merge for the string merge.
     mgid_of: []u32 = &.{},
@@ -729,7 +732,7 @@ const WState = struct {
     direct_range: DirectRange = undefined,
     direct_gids: []u32 = &.{},
 
-    fn init(allocator: Allocator, scratch_allocator: Allocator, expected_groups: usize, direct: ?DirectRange, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
+    fn init(allocator: Allocator, scratch_allocator: Allocator, expected_groups: usize, direct: ?DirectRange, aggs: []const AggPlan, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
         errdefer self.table.deinit(allocator);
         if (direct) |range| {
@@ -738,21 +741,27 @@ const WState = struct {
             self.direct_range = range;
         }
         errdefer if (self.direct_gids.len > 0) scratch_allocator.free(self.direct_gids);
+        const new_counts = try allocator.alloc(NewKeyCounts, shared.len);
+        errdefer allocator.free(new_counts);
+        initNewCounts(new_counts, aggs, allocator);
         const producers = try allocator.alloc(?DistinctProducer, shared.len);
         errdefer allocator.free(producers);
-        for (producers, shared) |*producer, slot| producer.* = if (slot) |s| switch (s) {
-            .narrow => |set| .{ .narrow = .{ .shared = set } },
-            .wide => |set| .{ .wide = .{ .shared = set } },
+        for (producers, shared, new_counts) |*producer, slot, *counts| producer.* = if (slot) |s| switch (s) {
+            .narrow => |set| .{ .narrow = .{ .shared = set, .counts = counts } },
+            .wide => |set| .{ .wide = .{ .shared = set, .counts = counts } },
         } else null;
         const ssets = try allocator.alloc(DistinctStrSet, shared.len * dop_parts);
         @memset(ssets, .{});
         self.producers = producers;
+        self.new_counts = new_counts;
         self.ssets = ssets;
         return self;
     }
 
     fn deinit(self: *WState, allocator: Allocator, scratch_allocator: Allocator) void {
         if (self.producers.len > 0) allocator.free(self.producers);
+        for (self.new_counts) |*c| c.deinit();
+        if (self.new_counts.len > 0) allocator.free(self.new_counts);
         for (self.ssets) |*d| d.deinit(allocator);
         if (self.ssets.len > 0) allocator.free(self.ssets);
         if (self.mgid_of.len > 0) allocator.free(self.mgid_of);
@@ -1476,7 +1485,8 @@ inline fn setSlotF64(slot: *i128, v: f64) void {
 
 // One thread of the distinct merge. For each distinct aggregate it bumps group
 // counts in its private key→count table: a shared set's partitions are claimed
-// until none are left and each composite counts toward its key; a string
+// until none are left, each drain tallying the composites it finds new (the
+// workers' drains during the fold tallied the rest); a string
 // input's worker partition `part` is unioned across workers, counting first
 // sightings. Partitions are disjoint, so no locks and counts sum.
 const PartMergeJob = struct {
@@ -1485,9 +1495,8 @@ const PartMergeJob = struct {
     workers: []Worker,
     aggs: []const AggPlan,
     shared: []const ?SharedDistinct,
-    n_groups: usize,
     allocator: Allocator,
-    counts: []CountSlotTable,
+    counts: []NewKeyCounts,
     // merged gid → packed key: a string set holds worker gids, which each
     // worker's `mgid_of` lifts to merged gids before the union.
     merged_keys: []const u128,
@@ -1512,25 +1521,11 @@ fn partMergeRun(job: *PartMergeJob) !void {
             continue;
         }
         switch (job.shared[d].?) {
-            inline else => |set| try countSharedPartitions(job, set, &job.counts[d], a.value_bits),
+            inline else => |set| {
+                var spare: @TypeOf(set.*).Spare = .{};
+                while (try set.drainNext(&spare, &job.counts[d])) |_| {}
+            },
         }
-    }
-}
-
-// Every producer has finished, so each claimed partition is final once
-// drained. The one composite equal to the set's sentinel is carried by
-// `has_sentinel`; its key bits extract like any other composite's.
-fn countSharedPartitions(job: *PartMergeJob, shared: anytype, cnt: *CountSlotTable, value_bits: u8) !void {
-    const Shared = @TypeOf(shared.*);
-    const shift: u7 = @intCast(value_bits);
-    var spare: Shared.Spare = .{};
-    while (try shared.drainNext(&spare)) |set| {
-        if (set.count() == 0) continue;
-        try cnt.ensureFor(job.allocator, @min(set.count(), job.n_groups -| cnt.len));
-        for (set.slots) |k| {
-            if (k != Shared.Set.SENTINEL) cnt.insert(@truncate(@as(u128, k) >> shift));
-        }
-        if (set.has_sentinel) cnt.insert(@truncate(@as(u128, Shared.Set.SENTINEL) >> shift));
     }
 }
 
@@ -1540,7 +1535,7 @@ fn countSharedPartitions(job: *PartMergeJob, shared: anytype, cnt: *CountSlotTab
 // count straight through without re-hashing their bytes.
 fn mergeStrPartition(job: *PartMergeJob, d: usize) !void {
     const allocator = job.allocator;
-    const cnt = &job.counts[d];
+    const cnt = &job.counts[d].table;
     var total: usize = 0;
     var sources: usize = 0;
     for (job.workers) |*w| {
@@ -1870,7 +1865,7 @@ const LowCardGroup = struct {
                 .index = i,
                 .cpu = if (layout.order.len == 0) null else layout.order[i % layout.order.len],
                 .source = source,
-                .state = try WState.init(allocator, scan_allocator, @intCast(self.est_groups), self.direct, shared, n_workers),
+                .state = try WState.init(allocator, scan_allocator, @intCast(self.est_groups), self.direct, self.aggs, shared, n_workers),
                 .parts = self.parts[0..self.part_count],
                 .dicts = self.dicts,
                 .distinct_dicts = self.distinct_dicts,
@@ -1992,12 +1987,10 @@ const LowCardGroup = struct {
 
         const jobs = try allocator.alloc(PartMergeJob, n_workers);
         defer allocator.free(jobs);
-        const count_tables = try allocator.alloc(CountSlotTable, n_workers * self.n_distinct);
+        const count_tables = try allocator.alloc(NewKeyCounts, n_workers * self.n_distinct);
         defer allocator.free(count_tables);
-        @memset(count_tables, CountSlotTable.empty);
-        defer for (count_tables) |*t| {
-            if (t.slots.len > 0) t.deinit(allocator);
-        };
+        for (0..n_workers) |p| initNewCounts(count_tables[p * self.n_distinct ..][0..self.n_distinct], self.aggs, allocator);
+        defer for (count_tables) |*t| t.deinit();
         for (jobs, 0..) |*j, p| {
             j.* = .{
                 .part = p,
@@ -2005,7 +1998,6 @@ const LowCardGroup = struct {
                 .workers = workers,
                 .aggs = self.aggs,
                 .shared = shared,
-                .n_groups = n_groups,
                 .allocator = allocator,
                 .counts = count_tables[p * self.n_distinct ..][0..self.n_distinct],
                 .merged_keys = merged.keys.items,
@@ -2031,22 +2023,21 @@ const LowCardGroup = struct {
         for (0..n_workers) |p| if (spawned[p]) threads[p].join();
         for (jobs) |*j| if (j.err) |e| return e;
 
-        // Fold each partition's per-group counts onto the merged groups. Every
-        // counted key folded scalar state in some worker, so it must resolve.
+        // Fold the per-group tallies of every drainer, merge threads and
+        // workers alike, onto the merged groups. Every counted key folded
+        // scalar state in some worker, so it must resolve.
         for (jobs) |*j| {
             for (self.aggs) |a| {
                 if (a.op != .count_distinct) continue;
                 const d: usize = a.distinct_index;
-                const cnt = &j.counts[d];
-                if (cnt.slots.len > 0) {
-                    for (cnt.slots) |s| {
-                        if (s.key == CountSlotTable.SENTINEL) continue;
-                        try addDistinctCount(merged, self.n_distinct, d, s.key, s.count);
-                    }
-                }
-                if (cnt.has_sentinel) {
-                    try addDistinctCount(merged, self.n_distinct, d, CountSlotTable.SENTINEL, cnt.sentinel_count);
-                }
+                try addCountTable(merged, self.n_distinct, d, &j.counts[d].table);
+            }
+        }
+        for (workers[0..n_workers]) |*w| {
+            for (self.aggs) |a| {
+                if (a.op != .count_distinct) continue;
+                const d: usize = a.distinct_index;
+                try addCountTable(merged, self.n_distinct, d, &w.state.new_counts[d].table);
             }
         }
     }
@@ -2157,6 +2148,23 @@ fn addDistinctCount(merged: *Merged, n_distinct: u16, d: usize, key: u64, count:
     const probe = merged.table.getOrPut(GroupTable.hashKey(key), key);
     if (!probe.found) return error.UnsupportedOperatorForType;
     merged.dcounts[@as(usize, probe.gid) * n_distinct + d] += count;
+}
+
+fn addCountTable(merged: *Merged, n_distinct: u16, d: usize, cnt: *const CountSlotTable) !void {
+    for (cnt.slots) |s| {
+        if (s.key == CountSlotTable.SENTINEL) continue;
+        try addDistinctCount(merged, n_distinct, d, s.key, s.count);
+    }
+    if (cnt.has_sentinel) try addDistinctCount(merged, n_distinct, d, CountSlotTable.SENTINEL, cnt.sentinel_count);
+}
+
+// A shared set's tally shifts its composites down to their group key; a
+// string input's slot stays empty.
+fn initNewCounts(counts: []NewKeyCounts, aggs: []const AggPlan, allocator: Allocator) void {
+    @memset(counts, .{ .shift = 0, .allocator = allocator });
+    for (aggs) |a| {
+        if (a.op == .count_distinct and a.distinct_kind != .string) counts[a.distinct_index].shift = @intCast(a.value_bits);
+    }
 }
 
 inline fn keyOfGid(merged: *const Merged, gid: u32) u128 {

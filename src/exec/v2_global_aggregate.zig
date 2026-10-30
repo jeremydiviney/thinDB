@@ -859,8 +859,8 @@ fn distinctDrainRun(job: *DistinctDrainJob) !void {
     var narrow_spare: NarrowDistinct.Spare = .{};
     var wide_spare: WideDistinct.Spare = .{};
     for (job.shared) |slot| if (slot) |shared| switch (shared) {
-        .narrow => |set| while (try set.drainNext(&narrow_spare)) |_| {},
-        .wide => |set| while (try set.drainNext(&wide_spare)) |_| {},
+        .narrow => |set| while (try set.drainNext(&narrow_spare, null)) |_| {},
+        .wide => |set| while (try set.drainNext(&wide_spare, null)) |_| {},
     };
 }
 
