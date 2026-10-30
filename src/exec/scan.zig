@@ -262,6 +262,27 @@ pub const KeyBoundSpec = struct {
     keep: usize,
 };
 
+/// A stored row group of a scan's snapshot, segment `seg`'s row group `rg`,
+/// that a batch holds every row of, in stored order.
+pub const WholeRowGroup = struct { seg: usize, rg: usize, rows: u32 };
+
+/// A first pass's verdict on the rows of the row groups it saw whole, for a
+/// second pass over the same snapshot (`Scan.setRowSieve`): row r of a row
+/// group with slots passes when bit `slots[r]` of `keep` is set. A row group
+/// without slots passes every row.
+pub const RowSieve = struct {
+    /// Per segment of the snapshot, the flat index of its first row group.
+    seg_first: []const usize,
+    /// Per flat row group, its rows' slots, or null.
+    slots: []const ?[]const u32,
+    keep: []const u64,
+
+    fn slotsOf(self: RowSieve, seg: usize, rg: usize) ?[]const u32 {
+        if (seg >= self.seg_first.len) return null;
+        return self.slots[self.seg_first[seg] + rg];
+    }
+};
+
 /// The `keep` best distinct values of one string column among the rows a scan
 /// has emitted. A row whose value ranks past the keep-th best so far can't
 /// lead a kept group: the keep-th best over every row is never worse than
@@ -500,6 +521,12 @@ pub const Scan = struct {
     /// rules out, and row groups whose stats it rules out are skipped. Other
     /// paths emit those rows; the consumer ranks what it gets either way.
     key_bound: ?KeyBound = null,
+    /// Set by `setRowSieve`: like a key bound, the guided filter path drops
+    /// the rows it rules out.
+    row_sieve: ?RowSieve = null,
+    /// The stored row group the last batch held whole; null for any other
+    /// batch.
+    whole_rg: ?WholeRowGroup = null,
     /// What the predicate-miss memo looks up and notes for `fused_filter`,
     /// taken at the first filtered `next()`; null until then and again
     /// whenever the filter changes.
@@ -1290,6 +1317,23 @@ pub const Scan = struct {
         }
         self.key_bound = try KeyBound.init(self.allocator, phys, spec.desc, spec.keep);
         return true;
+    }
+
+    /// Install `sieve`: a row group it holds slots for emits only the rows
+    /// it passes, before any of their columns decode. Like a key bound, it
+    /// narrows what the scan emits and never decides a predicate's result.
+    pub fn setRowSieve(self: *Scan, sieve: RowSieve) void {
+        self.row_sieve = sieve;
+    }
+
+    /// The stored row group the last batch held whole.
+    pub fn wholeRowGroup(self: *const Scan) ?WholeRowGroup {
+        return self.whole_rg;
+    }
+
+    fn sievedSlots(self: *const Scan, rg_idx: usize) ?[]const u32 {
+        const sieve = self.row_sieve orelse return null;
+        return sieve.slotsOf(self.cur_seg_idx, rg_idx);
     }
 
     fn hashColIdx(self: *Scan, name: []const u8) ?usize {
@@ -2886,7 +2930,7 @@ pub const Scan = struct {
             if (ff == .always and !ff.always) return null;
             return self.nextFiltered();
         }
-        if (self.key_bound != null) return self.nextFiltered();
+        if (self.key_bound != null or self.row_sieve != null) return self.nextFiltered();
 
         // Scan sub-batch experiment: serve the next slice of the already-decoded
         // row group without releasing or re-decoding it.
@@ -3112,6 +3156,7 @@ pub const Scan = struct {
         if (self.emit_runs and rg_clean) {
             runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
         }
+        self.whole_rg = .{ .seg = self.cur_seg_idx, .rg = self.cur_rg_idx - 1, .rows = rg_count };
         return Batch{
             .schema = self.out_schema,
             .values = self.views,
@@ -3251,7 +3296,7 @@ pub const Scan = struct {
             }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
-            if (self.key_bound == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
+            if (self.key_bound == null and self.sievedSlots(self.cur_rg_idx) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             const rg_count = rg.row_count;
@@ -3446,12 +3491,17 @@ pub const Scan = struct {
         self.rgs_guided += 1;
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
-        const narrowed = tomb_mask != null or self.key_bound != null;
+        const sieved = self.sievedSlots(rg_idx);
+        const narrowed = tomb_mask != null or self.key_bound != null or sieved != null;
         if (expr != .@"and" and narrowed and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..rg_count], true) == null) self.rg_unmatched = .whole;
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
         if (self.key_bound != null) try self.applyKeyBound(seg, rg_idx, rg_count, mask[0..rg_count]);
+        if (sieved) |slots| if (slots.len == rg_count) {
+            const keep = self.row_sieve.?.keep;
+            for (mask[0..rg_count], slots) |*m, s| m.* = m.* and (keep[s >> 6] >> @intCast(s & 63)) & 1 != 0;
+        };
 
         const _tcnt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         var matched: usize = 0;
@@ -5472,6 +5522,7 @@ pub const Scan = struct {
         self.sub_off = 0;
         self.sub_count = 0;
         self.pending_rows = &.{};
+        self.whole_rg = null;
     }
 
     /// If any tombstone offsets fall within `[rg_first, rg_first + rg_count)`,

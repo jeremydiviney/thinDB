@@ -1109,6 +1109,9 @@ fn runCountSketch(
 
     var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
     defer sketch.deinit(allocator);
+    if (rowSlotsFit(allocator, cfg.snapshot)) {
+        sketch.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
+    }
 
     var none: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     defer none.deinit(allocator);
@@ -1131,6 +1134,13 @@ fn runCountSketch(
     if (found < need or !sketch.retarget(kth)) return false;
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     return true;
+}
+
+/// Whether a tally may record its rows' counters (4 bytes a row) for the
+/// filter pass to sieve by: an eighth of what a statement may hold.
+fn rowSlotsFit(allocator: Allocator, snapshot: exec.Scan.Snapshot) bool {
+    const accountant = exec.memory.accountantOf(allocator) orelse return true;
+    return snapshotRows(snapshot) * @sizeOf(u32) <= accountant.pool.statementLimit() / 8;
 }
 
 /// The heavy-key COUNT top-K (see HeavyKeys) into `rows`. False, leaving

@@ -7959,8 +7959,9 @@ fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weight
     const counts = sketch.workerCounts(job.worker_index);
     const n = batch.row_count;
     const row_weights: ?[]const u32 = if (weights) |w| w.counts[0..n] else null;
+    const slots = try recordedSlots(job, sketch, batch, weights);
     const layout = job.shared.group_rows_layout;
-    if (!foldsSketchKeys(layout)) return sketch.tally(counts, try batchIdentities(job, job.scan.allocator, batch), row_weights);
+    if (!foldsSketchKeys(layout)) return sketch.tally(counts, try batchIdentities(job, job.scan.allocator, batch), row_weights, slots);
     const keys = try BatchKeys.init(layout, batch);
     try job.sketch_scratch.lanes.resize(job.scan.allocator, keys.len * IDENTITY_LANE_ROWS);
     var chunk: [IDENTITY_LANE_ROWS]u128 = undefined;
@@ -7968,8 +7969,19 @@ fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weight
     while (lo < n) : (lo += IDENTITY_LANE_ROWS) {
         const ids = chunk[0..@min(n - lo, IDENTITY_LANE_ROWS)];
         foldSketchKeys(job, &keys, lo, ids);
-        sketch.tally(counts, ids, if (row_weights) |w| w[lo..][0..ids.len] else null);
+        sketch.tally(counts, ids, if (row_weights) |w| w[lo..][0..ids.len] else null, if (slots) |s| s[lo..][0..ids.len] else null);
     }
+}
+
+/// Where a tally records `batch`'s rows' counters: a row group's when the
+/// batch is its every row in stored order, as the filter pass's scan meets
+/// them again.
+fn recordedSlots(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weights: ?RowWeights) !?[]u32 {
+    if (weights != null or job.distinct != null) return null;
+    const row_slots = if (sketch.row_slots) |*rs| rs else return null;
+    const whole = job.scan.wholeRowGroup() orelse return null;
+    if (whole.rows != batch.row_count) return null;
+    return try row_slots.record(whole.seg, whole.rg, batch.row_count);
 }
 
 /// A batch bound for the grid, with its rows' repeat counts when collapsed
@@ -9177,6 +9189,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
+        if (cfg.count_sketch) |pass| if (pass == .filter) if (pass.filter.row_slots) |rs| scans[i].setRowSieve(.{
+            .seg_first = rs.seg_first,
+            .slots = rs.rows,
+            .keep = pass.filter.keep,
+        });
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;
