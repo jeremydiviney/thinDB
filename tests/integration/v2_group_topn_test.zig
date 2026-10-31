@@ -3064,14 +3064,15 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     // rank the medium hosts above the heavy ones and drop the heavy rows.
     // Light urls come in adjacent pairs: every row group stays under half
     // distinct (so its url block is a dictionary), and the groups are many
-    // enough for the sketch to run. A collapsed row the sketch keeps keeps
+    // enough for the sketch to run, filtered too (a filter's group estimate
+    // is a quarter of the rows). A collapsed row the sketch keeps keeps
     // its folds of `w` too, one per aggregate; light urls sort first in each
     // dictionary, so the kept rows move when the dropped ones compact away.
     const a = std.testing.allocator;
     const heavy_hosts = 12;
     const medium_hosts = 20;
     const medium_rows = 600;
-    const light_pairs = 70_000;
+    const light_pairs = 120_000;
     const heavy_rows = comptime blk: {
         var n: usize = 0;
         for (0..heavy_hosts) |g| n += 3000 - 100 * g;
@@ -3109,6 +3110,9 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     defer a.free(rows);
     const Folds = struct { min: i32 = std.math.maxInt(i32), max: i32 = std.math.minInt(i32), sum: i64 = 0 };
     var heavy_w: [heavy_hosts]Folds = @splat(.{});
+    // Heavy rows with `w + 1 > 507`, as (host, count).
+    var heavy_passing: [heavy_hosts][2]i64 = undefined;
+    for (&heavy_passing, 0..) |*hp, g| hp.* = .{ @intCast(g), 0 };
     // 7919 is prime and doesn't divide `units`, so this visits every unit once.
     var i: usize = 0;
     for (0..units) |p| {
@@ -3118,14 +3122,24 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             const w: i32 = @intCast((i * 104_729) % 1_013);
             rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit], .w = w };
             if (std.mem.startsWith(u8, unit_urls[unit], "http://heavy")) {
-                const f = &heavy_w[try std.fmt.parseInt(usize, unit_urls[unit][12 .. unit_urls[unit].len - 5], 10)];
+                const host = try std.fmt.parseInt(usize, unit_urls[unit][12 .. unit_urls[unit].len - 5], 10);
+                const f = &heavy_w[host];
                 f.min = @min(f.min, w);
                 f.max = @max(f.max, w);
                 f.sum += w;
+                if (w + 1 > 507) heavy_passing[host][1] += 1;
             }
             i += 1;
         }
     }
+
+    std.mem.sort([2]i64, &heavy_passing, {}, struct {
+        fn more(_: void, x: [2]i64, y: [2]i64) bool {
+            return x[1] > y[1];
+        }
+    }.more);
+    // The top 10 hosts by passing rows rank without ties.
+    for (heavy_passing[0..10], heavy_passing[1..11]) |x, y| try std.testing.expect(x[1] > y[1]);
 
     inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
         var tmp = std.testing.tmpDir(.{});
@@ -3181,6 +3195,25 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             }
         }
         try std.testing.expectEqual(@as(usize, 10), pre_rank);
+
+        // A WHERE over a computed operand drops collapsed rows ahead of the
+        // sketch, which counts and keeps only the rows that pass it.
+        const where_sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits WHERE w + 1 > 507 GROUP BY k ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, where_sql });
+        try std.testing.expect(try planContains(a, db, where_sql, "residual filter"));
+        var wq = try runSql(a, db, where_sql);
+        defer wq.deinit();
+        var where_rank: usize = 0;
+        while (try wq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                const want = heavy_passing[where_rank];
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{want[0]}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(want[1])), try cellNumber(batch.values[1], r));
+                where_rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), where_rank);
 
         // The url itself as the key, collapsed with no expression to evaluate.
         const url_sql = "SELECT url, COUNT(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10";
@@ -3621,6 +3654,111 @@ test "grouped engines collapse rows by string codes combined with other source c
             try std.testing.expectEqual(c[1].items.len, got.len);
             for (c[1].items, got) |w, g| try std.testing.expectEqualStrings(w, g);
         }
+    }
+}
+
+test "grouped engines filter on computed WHERE operands after the Compute" {
+    // A WHERE conjunct over a computed operand (`x + 1 > 5`,
+    // `octet_length(u) > 1`) filters the Compute's output inside the grouped
+    // engine, while the other conjuncts still fuse into the scan. The rows
+    // it reads stay whole through a collapse, a hashed key it reads keeps
+    // its bytes, and an unordered LIMIT doesn't pick its groups from rows
+    // the filter would drop.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
+    const tags = [_][]const u8{ "p", "qq", "r" };
+    const n = 384;
+    const block_rows = 8;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL, b INT NOT NULL)");
+        var count_x = [_]i64{0} ** words.len;
+        var sum_x = [_]i64{0} ** words.len;
+        var count_qq_not1 = [_]i64{0} ** words.len;
+        var count_qq_or_a = [_]i64{0} ** words.len;
+        var count_not_qq = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, u, x, w, b) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const si = i % words.len;
+                const ui = (i / 7) % tags.len;
+                const g = i % 3;
+                const x: i64 = @intCast(i % 11);
+                const wi = i % 4;
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                try buf.print(allocator, "({d},{d},'{s}','{s}',{d},{d},{d})", .{ i, g, words[si], tags[ui], x, wideValue(wi), i / block_rows });
+                if (x >= 5) {
+                    count_x[si] += 1;
+                    sum_x[si] += x;
+                }
+                if (ui == 1 and g != 1) count_qq_not1[si] += 1;
+                if (ui == 1 or si == 0) count_qq_or_a[si] += 1;
+                if (ui != 1) count_not_qq[si][ui] += 1;
+                if (wi >= 2) {
+                    count_w[si][g] += 1;
+                    sum_w[si][g] += wideValue(wi);
+                }
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var want_sum: std.ArrayList([]const u8) = .empty;
+        var want_mixed: std.ArrayList([]const u8) = .empty;
+        var want_or: std.ArrayList([]const u8) = .empty;
+        var want_strings: std.ArrayList([]const u8) = .empty;
+        var want_wide: std.ArrayList([]const u8) = .empty;
+        for (words, uppers, 0..) |w, up, si| {
+            if (count_x[si] != 0) try want_sum.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ w, count_x[si], sum_x[si] }));
+            if (count_qq_not1[si] != 0) try want_mixed.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ up, count_qq_not1[si] }));
+            if (count_qq_or_a[si] != 0) try want_or.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ w, count_qq_or_a[si] }));
+            for (tags, 0..) |tag, ui| {
+                if (count_not_qq[si][ui] == 0) continue;
+                try want_strings.append(arena, try std.fmt.allocPrint(arena, "{s}|{s}|{d}", .{ w, tag, count_not_qq[si][ui] }));
+            }
+            for (0..3) |g| {
+                if (count_w[si][g] == 0) continue;
+                try want_wide.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, g, sum_w[si][g] }));
+            }
+        }
+        const cases = .{
+            .{ "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE x + 1 > 5 GROUP BY s ORDER BY c DESC LIMIT 100", &want_sum },
+            .{ "SELECT upper(s) AS k, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 AND g <> 1 GROUP BY k ORDER BY c DESC LIMIT 100", &want_mixed },
+            .{ "SELECT s, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 OR s = 'a' GROUP BY s ORDER BY c DESC LIMIT 100", &want_or },
+            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t WHERE upper(u) <> 'QQ' GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_strings },
+            .{ "SELECT upper(s) AS k, g, SUM(w) AS sw FROM t WHERE w DIV 1000003 >= 0 GROUP BY k, g ORDER BY sw DESC LIMIT 100", &want_wide },
+        };
+        inline for (cases) |c| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });
+            try std.testing.expect(try planContains(allocator, db, c[0], "residual filter"));
+            const got = try sortedRowTexts(allocator, arena, db, c[0]);
+            std.mem.sort([]const u8, c[1].items, {}, textLess);
+            try std.testing.expectEqual(c[1].items.len, got.len);
+            for (c[1].items, got) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+
+        // The first blocks in scan order all fail the filter.
+        const unordered = "SELECT b, COUNT(*) AS c FROM t WHERE b + 1 > 40 GROUP BY b LIMIT 1";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, unordered });
+        try std.testing.expect(try planContains(allocator, db, unordered, "residual filter"));
+        const got = try sortedRowTexts(allocator, arena, db, unordered);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        var cells = std.mem.splitScalar(u8, got[0], '|');
+        try std.testing.expect(try std.fmt.parseInt(i64, cells.next().?, 10) >= 40);
+        try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{block_rows}), cells.next().?);
     }
 }
 

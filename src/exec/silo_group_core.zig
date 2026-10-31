@@ -2237,6 +2237,7 @@ const PipeShared = struct {
     stage_builders: []StageBucketBuilder = &.{},
     group_rows_layout: GroupRowsLayout = .{},
     generic_filter_required: bool = false,
+    residual_filter: ?thindb.exec.PredicateExpr = null,
     count_sketch: ?CountSketchPass = null,
     stage_outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stage_outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -7141,7 +7142,10 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
         foldable_buf[n_foldable] = c.source_name;
         n_foldable += 1;
     }
-    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len]);
+    var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer filter_reads.deinit(allocator);
+    if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
+    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items);
 }
 
 /// Whether a heavy tally's units arrive counted: its lone key is the string
@@ -7187,10 +7191,11 @@ pub const DictSource = struct {
 /// instead and joins the combination in their place (`DictSource.pre`).
 /// Any other column must be a non-nullable number in `foldable` (aggregate
 /// inputs) that no later derived column reads: a collapsed row carries it
-/// folded over the rows the row stands for, once per aggregate over it. More
-/// than one column takes a derived column reading a string: the
-/// combinations cost a hash per row, which a string expression evaluated per
-/// row dwarfs.
+/// folded over the rows the row stands for, once per aggregate over it. The
+/// columns a residual filter reads (`filter_reads`, scan or derived) stay
+/// whole, as a later derived column's reads do. More than one column takes
+/// a derived column reading a string: the combinations cost a hash per row,
+/// which a string expression evaluated per row dwarfs.
 pub fn dictEvalSource(
     allocator: Allocator,
     scan_schema: []const thindb.types.Column,
@@ -7198,6 +7203,7 @@ pub fn dictEvalSource(
     udf_registry: ?*const udf_mod.UdfRegistry,
     foldable: []const []const u8,
     keys: []const []const u8,
+    filter_reads: []const []const u8,
 ) !?DictSource {
     for (derived) |d| {
         if (thindb.exec.compute_op.mayVary(d.expr, udf_registry)) return null;
@@ -7218,6 +7224,7 @@ pub fn dictEvalSource(
             try pre_refs.appendSlice(allocator, refs.items);
         } else try later_refs.appendSlice(allocator, refs.items);
     }
+    try later_refs.appendSlice(allocator, filter_reads);
     var numbers: [MAX_DICT_EVAL_COLUMNS]usize = undefined;
     var n_numbers: usize = 0;
     var derived_reads_string = false;
@@ -7319,6 +7326,7 @@ const SiloGridJob = struct {
     top: *TopSet,
     err: *?anyerror,
     sketch_scratch: *SketchScratch,
+    residual_scratch: *SketchScratch,
 };
 
 fn siloGridWorker(job: SiloGridJob) void {
@@ -8378,7 +8386,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             m.* = sketch.keeps(id);
             kept += @intFromBool(m.*);
         }
-        return compactKept(job, allocator, batch, weights, ids, kept);
+        return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, kept);
     }
     const keys = try BatchKeys.init(layout, batch);
     try scratch.lanes.resize(allocator, keys.len * IDENTITY_LANE_ROWS);
@@ -8392,7 +8400,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             kept += @intFromBool(m.*);
         }
     }
-    return compactKept(job, allocator, batch, weights, null, kept);
+    return compactKept(job, job.sketch_scratch, allocator, batch, weights, null, kept);
 }
 
 /// A heavy tally over one batch, a unit. A collapsed batch's rows are its
@@ -8451,7 +8459,7 @@ fn heavyKeptRows(job: SiloGridJob, allocator: Allocator, heavy: *const HeavyKeys
     const ids = scratch.ids.items;
     const ascending = if (weights) |rw| (if (rw.ascending_column) |ac| ac == key.index else false) else false;
     if (ascending and heavy.searchPays(batch.row_count)) {
-        return compactKept(job, allocator, batch, weights, ids, heavy.findSorted(key.values, mask, ids));
+        return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, heavy.findSorted(key.values, mask, ids));
     }
     var kept: usize = 0;
     for (mask, ids, 0..) |*m, *id, r| {
@@ -8462,7 +8470,7 @@ fn heavyKeptRows(job: SiloGridJob, allocator: Allocator, heavy: *const HeavyKeys
         m.* = heavy.keeps(id.*);
         kept += @intFromBool(m.*);
     }
-    return compactKept(job, allocator, batch, weights, ids, kept);
+    return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, kept);
 }
 
 /// A heavy pass's key: the lone non-nullable string key column, and its
@@ -8477,11 +8485,10 @@ fn heavyKeyColumn(job: SiloGridJob, batch: thindb.Batch) !struct { index: usize,
     };
 }
 
-/// The `kept` rows of `batch` the worker's scratch mask marks, compacted
-/// (with their weights) into the worker's scratch when only some are; null
-/// when none are. `ids`, when known, holds each row's identity.
-fn compactKept(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch, weights: ?RowWeights, ids: ?[]const u128, kept: usize) !?KeptRows {
-    const scratch = job.sketch_scratch;
+/// The `kept` rows of `batch` that `scratch`'s mask marks, compacted
+/// (with their weights) into `scratch` when only some are; null when none
+/// are. `ids`, when known, holds each row's identity.
+fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, batch: thindb.Batch, weights: ?RowWeights, ids: ?[]const u128, kept: usize) !?KeptRows {
     const mask = scratch.mask.items;
     const hashed_ids = if (job.shared.group_rows_layout.hashed_key) ids else null;
     if (kept == batch.row_count) return .{ .batch = batch, .weights = weights, .ids = hashed_ids };
@@ -8557,6 +8564,21 @@ fn compactKept(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch, weig
     };
 }
 
+/// The rows of `batch` that pass `expr`, compacted as keptRows compacts
+/// but into the worker's residual scratch, so a sketch pass after it keeps
+/// its own; null when none pass. A collapsed row passes or fails whole, as
+/// the columns `expr` reads are among those its rows share.
+fn residualRows(job: SiloGridJob, allocator: Allocator, expr: thindb.exec.PredicateExpr, batch: thindb.Batch) !?KeptRows {
+    const scratch = job.residual_scratch;
+    try scratch.mask.resize(allocator, batch.row_count);
+    const mask = scratch.mask.items;
+    try thindb.exec.predicate.evaluateExprGuided(allocator, expr, batch.schema, batch, mask, null);
+    var kept: usize = 0;
+    for (mask) |m| kept += @intFromBool(m);
+    const weights = if (job.distinct) |gd| gd.rowWeights() else null;
+    return compactKept(job, scratch, allocator, batch, weights, null, kept);
+}
+
 fn keepMasked(comptime T: type, allocator: Allocator, values: []const T, mask: []const bool, kept: usize, out: *std.ArrayListUnmanaged(T)) ![]const T {
     try out.resize(allocator, kept);
     var j: usize = 0;
@@ -8600,19 +8622,22 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const scanned = maybe_batch orelse break;
         job.local.scan_batches += 1;
-        const weights = if (job.distinct) |gd| gd.rowWeights() else null;
+        const passed: KeptRows = if (job.shared.residual_filter) |expr|
+            (try residualRows(job, job.scan.allocator, expr, scanned)) orelse continue
+        else
+            .{ .batch = scanned, .weights = if (job.distinct) |gd| gd.rowWeights() else null };
         const kept: KeptRows = if (job.shared.count_sketch) |pass| switch (pass) {
             .tally => |sketch| {
-                try tallyRows(job, sketch, scanned, weights);
+                try tallyRows(job, sketch, passed.batch, passed.weights);
                 continue;
             },
-            .filter => |sketch| (try keptRows(job, job.scan.allocator, sketch, scanned, weights)) orelse continue,
+            .filter => |sketch| (try keptRows(job, job.scan.allocator, sketch, passed.batch, passed.weights)) orelse continue,
             .heavy_tally => |heavy| {
-                try heavyTallyRows(job, heavy, scanned, weights);
+                try heavyTallyRows(job, heavy, passed.batch, passed.weights);
                 continue;
             },
-            .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, scanned, weights)) orelse continue,
-        } else .{ .batch = scanned, .weights = weights };
+            .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, passed.batch, passed.weights)) orelse continue,
+        } else passed;
         const hashed_ids = if (layout.hashed_key) kept.ids orelse try batchIdentities(job, job.scan.allocator, kept.batch) else null;
         try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, hashed_ids, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
@@ -9074,6 +9099,9 @@ pub const RunConfig = struct {
     udf_registry: ?*const udf_mod.UdfRegistry = null,
     resources: ?*thindb.exec.memory.MemoryAccountant = null,
     filter_expr: ?thindb.exec.PredicateExpr = null,
+    /// The WHERE's conjuncts over `derived` columns, which filter each batch
+    /// once the Compute has added them.
+    residual_filter: ?thindb.exec.PredicateExpr = null,
     /// Hints the consumer offered on scan columns, after the filter's own.
     offered_prunes: Scan.OfferedPrunes = .{},
     key_bound: ?thindb.exec.KeyBoundSpec = null,
@@ -9344,7 +9372,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
     const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
-    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null));
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null or cfg.residual_filter != null));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
@@ -9534,6 +9562,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .group_rows_layout = group_rows_layout,
         .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
         .generic_filter_required = cfg.filter_expr != null,
+        .residual_filter = cfg.residual_filter,
         .count_sketch = cfg.count_sketch,
         .scan_threads = n_workers,
         .total_scan_rgs = claim_total_rgs,
@@ -9775,6 +9804,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer allocator.free(sketch_scratch);
     for (sketch_scratch) |*sc| sc.* = .{};
     defer for (sketch_scratch) |*sc| sc.deinit(scan_allocator);
+    const residual_scratch = try allocator.alloc(SketchScratch, n_workers);
+    defer allocator.free(residual_scratch);
+    for (residual_scratch) |*sc| sc.* = .{};
+    defer for (residual_scratch) |*sc| sc.deinit(scan_allocator);
 
     i = 0;
     while (i < n_workers) : (i += 1) {
@@ -9805,6 +9838,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .top = &worker_tops[i],
             .err = &errs[i],
             .sketch_scratch = &sketch_scratch[i],
+            .residual_scratch = &residual_scratch[i],
         };
         threads[i] = try parallel.spawn(siloGridWorker, .{job});
     }
