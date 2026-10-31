@@ -1280,23 +1280,27 @@ const GroupRows = struct {
         // bytes, so the bucket survives the source chunk's recycle.
         if (self.layout.has_str_payload) {
             const k = self.layout.str_columns.len;
-            // A bucket's rows keep their source order, so the chunk walk
-            // only moves forward.
-            var chunk: usize = 0;
-            var chunk_start: usize = 0;
-            for (strs.src[start..][0..count], old_len..) |src, dst| {
-                while (src >= chunk_start + strs.chunks[chunk].rows.len()) {
-                    chunk_start += strs.chunks[chunk].rows.len();
-                    chunk += 1;
-                }
-                const from = strs.chunks[chunk].rows.str;
-                const r = src - chunk_start;
+            // Sized once for a full chunk: grown from empty, the store would
+            // copy its bytes again at every doubling.
+            if (old_len == 0) try self.str.bytes.ensureTotalCapacity(allocator, strs.bytes_per_row * self.capacity());
+            // A bucket's rows are scattered over the popped chunks, so every
+            // row's refs and bytes would miss cache in turn: the refs are
+            // fetched 2*STAGED_STR_PREFETCH_ROWS rows ahead and the bytes
+            // they point at STAGED_STR_PREFETCH_ROWS ahead.
+            const srcs = strs.src[start..][0..count];
+            var at: StagedStrCursor = .{ .chunks = strs.chunks };
+            var near = at;
+            var far = at;
+            for (srcs, old_len.., 0..) |src, dst, i| {
+                if (i + 2 * STAGED_STR_PREFETCH_ROWS < srcs.len) far.prefetchRefs(k, srcs[i + 2 * STAGED_STR_PREFETCH_ROWS]);
+                if (i + STAGED_STR_PREFETCH_ROWS < srcs.len) near.prefetchBytes(k, srcs[i + STAGED_STR_PREFETCH_ROWS]);
+                const from = at.locate(src);
                 var c: usize = 0;
                 while (c < k) : (c += 1) {
-                    if (from.isNull(k, r, c)) {
+                    if (from.str.isNull(k, from.row, c)) {
                         self.str.appendNull(k, dst, c);
                     } else {
-                        try self.str.append(allocator, k, dst, c, from.get(k, r, c));
+                        try self.str.append(allocator, k, dst, c, from.str.get(k, from.row, c));
                     }
                 }
             }
@@ -1330,6 +1334,60 @@ const GroupRows = struct {
 const StagedStrSource = struct {
     chunks: []const RawChunk = &.{},
     src: []const u32 = &.{},
+    bytes_per_row: usize = 0,
+
+    fn init(chunks: []const RawChunk, src: []const u32, str_cols: usize) StagedStrSource {
+        return .{ .chunks = chunks, .src = src, .bytes_per_row = liveBytesPerRow(chunks, str_cols) };
+    }
+
+    /// From the refs, not the stores' lengths: a chunk keeps the bytes of
+    /// every extreme a later row replaced, and one closed by
+    /// FOLD_CHUNK_STR_BYTES can be mostly those.
+    fn liveBytesPerRow(chunks: []const RawChunk, str_cols: usize) usize {
+        var bytes: usize = 0;
+        var rows: usize = 0;
+        for (chunks) |chunk| {
+            const n = chunk.rows.len();
+            for (chunk.rows.str.refs[0 .. n * str_cols]) |ref| bytes += ref.len;
+            rows += n;
+        }
+        return if (rows == 0) 0 else bytes / rows;
+    }
+};
+
+const STAGED_STR_PREFETCH_ROWS = 8;
+
+/// Finds a stage's flat row in the popped raw chunks, for rows visited in
+/// ascending order.
+const StagedStrCursor = struct {
+    chunks: []const RawChunk,
+    chunk: usize = 0,
+    chunk_start: usize = 0,
+
+    inline fn locate(self: *StagedStrCursor, src: usize) struct { str: *const StrStore, row: usize } {
+        while (src >= self.chunk_start + self.chunks[self.chunk].rows.len()) {
+            self.chunk_start += self.chunks[self.chunk].rows.len();
+            self.chunk += 1;
+        }
+        return .{ .str = &self.chunks[self.chunk].rows.str, .row = src - self.chunk_start };
+    }
+
+    inline fn prefetchRefs(self: *StagedStrCursor, str_cols: usize, src: usize) void {
+        const from = self.locate(src);
+        @prefetch(&from.str.refs[from.row * str_cols], .{});
+    }
+
+    /// The first few lines of each value: the copy's sequential reads
+    /// carry the hardware prefetcher past them.
+    inline fn prefetchBytes(self: *StagedStrCursor, str_cols: usize, src: usize) void {
+        const from = self.locate(src);
+        for (from.str.refs[from.row * str_cols ..][0..str_cols]) |ref| {
+            if (ref.off == StrStore.NULL_OFF) continue;
+            const p = from.str.bytes.items.ptr + ref.off;
+            var line: usize = 0;
+            while (line < @min(ref.len, 256)) : (line += 64) @prefetch(p + line, .{});
+        }
+    }
 };
 
 const PartBucket = struct {
@@ -7683,7 +7741,7 @@ fn drainRawDedicatedStageSharedBuilders(
                 src[next[b]] = @intCast(r);
                 next[b] += 1;
             }
-            strs = .{ .chunks = chunks, .src = src };
+            strs = StagedStrSource.init(chunks, src, layout.str_columns.len);
         }
         if (profile) local.raw_stage_ticks += platform.nowTicks() - stage_t0;
 
