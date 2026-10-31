@@ -468,38 +468,149 @@ fn matchGroupTopN(arena: std.mem.Allocator, root: *const ir.Op) !?GroupTopNPlan 
     // inputs, e.g. ClientIP - 1 or length(URL)) and an optional WHERE filter,
     // in either order, down to the scan. Derived columns are evaluated in the
     // scan layer's Compute wrapper.
+    const local = (try peelRowLocal(arena, group_by)) orelse return null;
+
+    return .{
+        .scan = local.scan,
+        .where_filter = local.where_filter,
+        .having = chain.having,
+        .group_by = group_by,
+        .order_by = order_by,
+        .limit = limit,
+        .derived = local.derived,
+        .post_steps = chain.steps,
+        .output_columns = output_columns,
+        .output_names = output_names,
+    };
+}
+
+const RowLocal = struct {
+    scan: ir.Op.Scan,
+    where_filter: ?ir.Op.Filter,
+    derived: []const ir.Derived,
+};
+
+/// The row-local work under `group_by` down to its scan: an optional WHERE
+/// (every Filter on the way, conjoined) and the derived columns its keys and
+/// inputs read, evaluated in the scan layer. A second Compute holding the
+/// first one's comparison operands folds into it (`foldOperandCompute`), and
+/// those the WHERE reads evaluate beside it. Null for any other shape.
+fn peelRowLocal(arena: std.mem.Allocator, group_by: ir.Op.GroupBy) !?RowLocal {
     var where_filter: ?ir.Op.Filter = null;
     var derived: []const ir.Derived = &.{};
+    var folded: []const ir.Derived = &.{};
     var source = group_by.upstream;
     while (true) {
         switch (source.*) {
             .compute => {
-                if (derived.len != 0) return null;
-                derived = source.compute.derived;
+                if (derived.len == 0) {
+                    derived = source.compute.derived;
+                } else {
+                    if (folded.len != 0) return null;
+                    folded = source.compute.derived;
+                    derived = (try foldOperandCompute(arena, derived, folded)) orelse return null;
+                }
                 source = source.compute.upstream;
             },
             .filter => {
-                if (where_filter != null) return null;
-                where_filter = source.filter;
+                where_filter = if (where_filter) |w| .{
+                    .predicate = try conjunction(arena, w.predicate, source.filter.predicate),
+                    .upstream = source.filter.upstream,
+                } else source.filter;
                 source = source.filter.upstream;
+            },
+            // A column selection under the aggregate (dropping a folded
+            // Compute's operands) changes nothing the aggregate reads.
+            .select, .exclude => |p| {
+                if (p.outputs != null or p.replace_on_collision != null or p.star_skip_trailing != 0 or p.column_list != null) return null;
+                source = p.upstream;
             },
             else => break,
         }
     }
     if (source.* != .scan) return null;
+    var where_reads: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (folded) |f| {
+        if (nameInList(group_by.group_cols, f.name)) return null;
+        for (group_by.aggs) |agg| {
+            if (agg.col) |c| if (types.columnNameEql(c, f.name)) return null;
+            if (agg.arg2_col) |c| if (types.columnNameEql(c, f.name)) return null;
+            if (nameInList(agg.udf_arg_cols, f.name)) return null;
+        }
+        if (where_filter) |w| if (exec.predicate.touchesColumn(w.predicate, f.name)) try where_reads.append(arena, f);
+    }
+    if (where_reads.items.len != 0) derived = try std.mem.concat(arena, ir.Derived, &.{ where_reads.items, derived });
+    return .{ .scan = source.scan, .where_filter = where_filter, .derived = derived };
+}
 
-    return .{
-        .scan = source.scan,
-        .where_filter = where_filter,
-        .having = chain.having,
-        .group_by = group_by,
-        .order_by = order_by,
-        .limit = limit,
-        .derived = derived,
-        .post_steps = chain.steps,
-        .output_columns = output_columns,
-        .output_names = output_names,
+/// `a AND b`, with either's own conjuncts flattened in.
+fn conjunction(arena: std.mem.Allocator, a: exec.PredicateExpr, b: exec.PredicateExpr) !exec.PredicateExpr {
+    var parts: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    for ([_]exec.PredicateExpr{ a, b }) |e| switch (e) {
+        .@"and" => |kids| try parts.appendSlice(arena, kids),
+        else => try parts.append(arena, e),
     };
+    return .{ .@"and" = parts.items };
+}
+
+/// `upper` reading `lower`'s columns from its own expressions: a CASE whose
+/// conditions compare one takes it as an operand, and any other read takes
+/// its expression. Null when a `lower` expression reads `lower` itself. The
+/// parser computes a comparison's non-column operand (`octet_length(x) > 100`)
+/// in a Compute of its own below the one reading it, as a predicate compares
+/// columns by name; the grouped engines evaluate one Compute.
+fn foldOperandCompute(arena: std.mem.Allocator, upper: []const ir.Derived, lower: []const ir.Derived) !?[]const ir.Derived {
+    for (lower) |l| {
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        try exec.compute_op.collectColumnRefs(arena, &refs, l.expr);
+        for (refs.items) |r| if (derivedNamed(lower, r) != null) return null;
+    }
+    const out = try arena.alloc(ir.Derived, upper.len);
+    for (upper, out) |d, *o| o.* = .{ .name = d.name, .expr = try foldOperands(arena, d.expr, lower) };
+    return out;
+}
+
+fn foldOperands(arena: std.mem.Allocator, e: ir.Expr, lower: []const ir.Derived) std.mem.Allocator.Error!ir.Expr {
+    switch (e) {
+        .col_ref => |name| return if (derivedNamed(lower, name)) |l| l.expr else e,
+        .call => |c| {
+            const args = try arena.alloc(ir.Expr, c.args.len);
+            for (c.args, args) |a, *o| o.* = try foldOperands(arena, a, lower);
+            var call = c;
+            call.args = args;
+            return .{ .call = call };
+        },
+        .case => |cs| {
+            const branches = try arena.alloc(ir.Expr.Branch, cs.branches.len);
+            for (cs.branches, branches) |b, *o| o.* = .{ .cond = b.cond, .then = try foldOperands(arena, b.then, lower) };
+            const else_branch: ?*const ir.Expr = if (cs.else_branch) |eb| blk: {
+                const folded = try arena.create(ir.Expr);
+                folded.* = try foldOperands(arena, eb.*, lower);
+                break :blk folded;
+            } else null;
+            var operands: std.ArrayListUnmanaged(ir.Expr.Operand) = .empty;
+            for (cs.operands) |op| try operands.append(arena, .{ .name = op.name, .expr = try foldOperands(arena, op.expr, lower) });
+            var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (cs.branches) |b| try exec.expr_mod.collectCaseConditionRefs(arena, &refs, cs, b.cond);
+            for (refs.items) |r| {
+                const l = derivedNamed(lower, r) orelse continue;
+                if (exec.expr_mod.operandListed(operands.items, l.name)) continue;
+                try operands.append(arena, .{ .name = l.name, .expr = l.expr });
+            }
+            return .{ .case = .{ .branches = branches, .else_branch = else_branch, .operands = operands.items } };
+        },
+        .lambda => |lm| {
+            const body = try arena.create(ir.Expr);
+            body.* = try foldOperands(arena, lm.body.*, lower);
+            return .{ .lambda = .{ .params = lm.params, .body = body } };
+        },
+        else => return e,
+    }
+}
+
+fn derivedNamed(derived: []const ir.Derived, name: []const u8) ?ir.Derived {
+    for (derived) |d| if (types.columnNameEql(d.name, name)) return d;
+    return null;
 }
 
 // Whether `project`'s selected columns are exactly the group output
@@ -802,9 +913,16 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     }
 
     // The silo cores fuse the WHERE into the scan, below the Compute that
-    // materializes hidden predicate anchors; the operator pipeline orders them.
+    // materializes hidden predicate anchors. The conjuncts over those anchors
+    // filter the Compute's output instead, and keep the columns they read.
+    var residual: ?exec.PredicateExpr = null;
     if (eff_where) |w| {
-        if (predicateRefsDerived(w, plan.derived)) return try buildOperatorGroupBy(input, table, plan);
+        if (predicateRefsDerived(w, plan.derived)) {
+            const split = (try splitResidual(input.node_arena, w, plan.derived)) orelse return try buildOperatorGroupBy(input, table, plan);
+            eff_where = split.scan;
+            residual = split.residual;
+            eff_derived = try residualDerived(input.node_arena, plan.derived, eff_derived, split.residual);
+        }
     }
 
     const request = v2_pipeline.GroupTopNRequest{
@@ -814,6 +932,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .limit = if (post_sort) 0 else if (plan.limit) |l| @intCast(l.n) else 0,
         .offset = if (post_sort) 0 else if (plan.limit) |l| @intCast(l.offset) else 0,
         .where_filter = eff_where,
+        .residual_filter = residual,
         .having_filter = eff_having,
         .needed = needed,
         .derived = eff_derived,
@@ -837,7 +956,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         lowcard_request.offset = 0;
     }
     var having_outside = false;
-    var built_q = try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, lowcard_request);
+    var built_q = if (residual == null) try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, lowcard_request) else null;
     if (built_q != null) {
         having_outside = eff_having != null;
     } else {
@@ -949,6 +1068,77 @@ fn nameInDerivedList(derived: []const ir.Derived, name: []const u8) bool {
 fn predicateRefsDerived(pred: exec.PredicateExpr, derived: []const ir.Derived) bool {
     for (derived) |d| if (exec.predicate.touchesColumn(pred, d.name)) return true;
     return false;
+}
+
+const ResidualSplit = struct { scan: ?exec.PredicateExpr, residual: exec.PredicateExpr };
+
+/// `where`'s conjuncts that read no derived column, which fuse into the
+/// scan, and the rest, which filter the Compute's output. Null when one of
+/// the rest needs more than a batch to answer (a subquery, a variable).
+fn splitResidual(arena: std.mem.Allocator, where: exec.PredicateExpr, derived: []const ir.Derived) !?ResidualSplit {
+    const conjuncts: []const exec.PredicateExpr = switch (where) {
+        .@"and" => |kids| kids,
+        else => @as(*const [1]exec.PredicateExpr, &where),
+    };
+    var scan: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    var residual: std.ArrayListUnmanaged(exec.PredicateExpr) = .empty;
+    for (conjuncts) |c| {
+        if (!predicateRefsDerived(c, derived)) {
+            try scan.append(arena, c);
+        } else if (batchEvaluable(c)) {
+            try residual.append(arena, c);
+        } else return null;
+    }
+    return .{ .scan = conjoin(scan.items), .residual = conjoin(residual.items).? };
+}
+
+fn conjoin(parts: []const exec.PredicateExpr) ?exec.PredicateExpr {
+    return switch (parts.len) {
+        0 => null,
+        1 => parts[0],
+        else => .{ .@"and" = parts },
+    };
+}
+
+fn batchEvaluable(expr: exec.PredicateExpr) bool {
+    return switch (expr) {
+        .leaf, .day_leaf, .text_as_number, .leaf_col_col, .is_null, .is_not_null, .like, .in_set, .text_as_number_set, .always => true,
+        .@"and", .@"or" => |arms| for (arms) |a| {
+            if (!batchEvaluable(a)) break false;
+        } else true,
+        .not => |n| batchEvaluable(n.*),
+        else => false,
+    };
+}
+
+/// `derived`'s columns that are in `kept` or that `residual` reads, with
+/// the earlier ones they read in turn. Those `residual` needs come first,
+/// so the grouped engine can filter before evaluating the others; each
+/// group keeps `derived`'s order.
+fn residualDerived(arena: std.mem.Allocator, derived: []const ir.Derived, kept: []const ir.Derived, residual: exec.PredicateExpr) ![]const ir.Derived {
+    const operand = try arena.alloc(bool, derived.len);
+    for (derived, operand) |d, *o| o.* = exec.predicate.touchesColumn(residual, d.name);
+    try markReadDerived(arena, derived, operand);
+    const used = try arena.alloc(bool, derived.len);
+    for (derived, used, operand) |d, *u, o| u.* = o or nameInDerivedList(kept, d.name);
+    try markReadDerived(arena, derived, used);
+    var out: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (derived, operand) |d, o| if (o) try out.append(arena, d);
+    for (derived, used, operand) |d, u, o| if (u and !o) try out.append(arena, d);
+    return out.items;
+}
+
+/// Marks the columns of `derived` that marked ones read, directly or not.
+fn markReadDerived(arena: std.mem.Allocator, derived: []const ir.Derived, marked: []bool) !void {
+    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var i = derived.len;
+    while (i > 0) {
+        i -= 1;
+        if (!marked[i]) continue;
+        refs.clearRetainingCapacity();
+        try exec.compute_op.collectColumnRefs(arena, &refs, derived[i].expr);
+        for (derived[0..i], marked[0..i]) |d, *m| m.* = m.* or nameInList(refs.items, d.name);
+    }
 }
 
 /// WHERE + row-local derived, ordered by dependency: the filter runs first so
@@ -1085,32 +1275,14 @@ fn matchGlobalAggregate(arena: std.mem.Allocator, root: *const ir.Op) !?GlobalAg
     // Peel an optional row-local Compute (derived aggregate inputs, e.g.
     // SUM(ResolutionWidth + 1)) and an optional WHERE filter, in either order,
     // down to the scan. The derived columns are computed in the scan layer.
-    var where_filter: ?ir.Op.Filter = null;
-    var derived: []const ir.Derived = &.{};
-    var source = group_by.upstream;
-    while (true) {
-        switch (source.*) {
-            .compute => {
-                if (derived.len != 0) return null;
-                derived = source.compute.derived;
-                source = source.compute.upstream;
-            },
-            .filter => {
-                if (where_filter != null) return null;
-                where_filter = source.filter;
-                source = source.filter.upstream;
-            },
-            else => break,
-        }
-    }
-    if (source.* != .scan) return null;
+    const local = (try peelRowLocal(arena, group_by)) orelse return null;
 
     return .{
-        .scan = source.scan,
-        .where_filter = where_filter,
+        .scan = local.scan,
+        .where_filter = local.where_filter,
         .having = chain.having,
         .group_by = group_by,
-        .derived = derived,
+        .derived = local.derived,
         .post_steps = chain.steps,
         .output_names = output_names,
         .output_renames = output_renames,

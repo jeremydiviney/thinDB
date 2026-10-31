@@ -67,6 +67,9 @@ pub const Request = struct {
     limit: usize,
     offset: usize,
     where_filter: ?PredicateExpr,
+    // The WHERE's conjuncts over `derived` columns. `where_filter` fuses
+    // into the scan; this filters each batch once the Compute has run.
+    residual_filter: ?PredicateExpr = null,
     having_filter: ?PredicateExpr,
     needed: ?[]const []const u8,
     // Row-local derived columns (e.g. ClientIP - 1, DATE_TRUNC('minute',
@@ -246,7 +249,8 @@ const FinalRows = struct {
     }
 };
 
-pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Query {
+pub fn tryBuild(allocator: Allocator, table: *api.Table, built_request: Request) !?Query {
+    var request = built_request;
     // Base columns the scan projects to back keys, aggregate inputs, and the
     // derived expressions that feed them. Derived key/agg names are produced by
     // the Compute layer, never projected directly.
@@ -271,6 +275,9 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
             return e;
         };
         probe_schema = probe_q.?.outputSchema();
+        // The residual filter reads the Compute's output, so its literals
+        // take that output's types, as a Filter above the Compute's would.
+        if (request.residual_filter) |*residual| try exec.predicate.validateExpr(residual, probe_schema.?);
     }
 
     var plan = validateShape(table, request, probe_schema) orelse {
@@ -352,10 +359,11 @@ fn collectScanInputName(allocator: Allocator, out: *std.ArrayListUnmanaged([]con
     return true;
 }
 
-// Project the base columns that back every group key and aggregate input: a
-// real table column is projected as-is; a derived name expands to the base
-// columns its expression reads. Returns false (decline) on a name that is
-// neither a table column nor a known derived column.
+// Project the base columns that back every group key, aggregate input and
+// residual filter read: a real table column is projected as-is; a derived
+// name expands to the base columns its expression reads. Returns false
+// (decline) on a name that is neither a table column nor a known derived
+// column.
 fn collectScanBaseColumns(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), table: *api.Table, request: Request) !bool {
     for (request.group_cols) |name| {
         if (!try collectScanInputName(allocator, out, table, request, name)) return false;
@@ -373,6 +381,14 @@ fn collectScanBaseColumns(allocator: Allocator, out: *std.ArrayListUnmanaged([]c
             if (!try collectScanInputName(allocator, out, table, request, name)) return false;
         }
         if (agg.arg2_col) |name| {
+            if (!try collectScanInputName(allocator, out, table, request, name)) return false;
+        }
+    }
+    if (request.residual_filter) |residual| {
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer names.deinit(allocator);
+        try exec.predicate.collectColumnNames(allocator, &names, residual);
+        for (names.items) |name| {
             if (!try collectScanInputName(allocator, out, table, request, name)) return false;
         }
     }
@@ -575,6 +591,7 @@ const GroupTopNPipeline = struct {
     pub fn explain(self: *GroupTopNPipeline, out: *std.ArrayList(u8), allocator: Allocator, depth: usize) !void {
         try exec.explainIndent(out, allocator, depth);
         try out.appendSlice(allocator, "HashAggregate (V2 group-topN: route/fold/order/limit");
+        if (self.request.residual_filter != null) try out.appendSlice(allocator, ", residual filter");
         if (self.request.key_bound) |kb| {
             try out.print(allocator, ", key bound {s} {s} {d}", .{ kb.col, if (kb.desc) "DESC" else "ASC", kb.keep });
         }
@@ -765,7 +782,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .aggregate_inputs = aggregate_inputs[0..ctx.plan.aggregate_input_count],
             .string_aggregate_inputs = string_aggregate_inputs[0..ctx.plan.string_aggregate_input_count],
             .aggregate_program = aggregate_program[0..ctx.plan.aggregate_count],
-            .has_filter = ctx.request.where_filter != null,
+            .has_filter = ctx.request.where_filter != null or ctx.request.residual_filter != null,
             .order_by_count_desc = true,
             .limit = ctx.request.limit,
             .offset = ctx.request.offset,
@@ -795,6 +812,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
         .derived = ctx.plan.derived,
         .udf_registry = ctx.request.udf_registry,
         .filter_expr = ctx.request.where_filter,
+        .residual_filter = ctx.request.residual_filter,
         .offered_prunes = ctx.offered_prunes,
     });
 
@@ -869,9 +887,11 @@ const PICK_SHARE_DENOMINATOR: usize = 8;
 // those keys' rows instead of every group. Keys computed by an expression get
 // no set; distinct base-column values already make distinct groups. Null when
 // the shape doesn't qualify, the table has too few groups, or the picked keys
-// cover too much of the sample to be worth filtering on.
+// cover too much of the sample to be worth filtering on. A residual filter
+// disqualifies it: the read can't apply it, so a picked key might have no
+// rows that pass.
 fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant, table: *api.Table, snapshot: Scan.Snapshot, request: Request, plan: ShapePlan) !?[]const exec.InSet {
-    if (request.order_specs.len != 0 or request.having_filter != null or request.limit == 0) return null;
+    if (request.order_specs.len != 0 or request.having_filter != null or request.residual_filter != null or request.limit == 0) return null;
     const keep = request.limit + request.offset;
     if (keep > Scan.ROW_SET_ZONEMAP_MAX) return null;
 

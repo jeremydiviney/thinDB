@@ -3064,14 +3064,15 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     // rank the medium hosts above the heavy ones and drop the heavy rows.
     // Light urls come in adjacent pairs: every row group stays under half
     // distinct (so its url block is a dictionary), and the groups are many
-    // enough for the sketch to run. A collapsed row the sketch keeps keeps
+    // enough for the sketch to run, filtered too (a filter's group estimate
+    // is a quarter of the rows). A collapsed row the sketch keeps keeps
     // its folds of `w` too, one per aggregate; light urls sort first in each
     // dictionary, so the kept rows move when the dropped ones compact away.
     const a = std.testing.allocator;
     const heavy_hosts = 12;
     const medium_hosts = 20;
     const medium_rows = 600;
-    const light_pairs = 70_000;
+    const light_pairs = 120_000;
     const heavy_rows = comptime blk: {
         var n: usize = 0;
         for (0..heavy_hosts) |g| n += 3000 - 100 * g;
@@ -3109,6 +3110,9 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
     defer a.free(rows);
     const Folds = struct { min: i32 = std.math.maxInt(i32), max: i32 = std.math.minInt(i32), sum: i64 = 0 };
     var heavy_w: [heavy_hosts]Folds = @splat(.{});
+    // Heavy rows with `w + 1 > 507`, as (host, count).
+    var heavy_passing: [heavy_hosts][2]i64 = undefined;
+    for (&heavy_passing, 0..) |*hp, g| hp.* = .{ @intCast(g), 0 };
     // 7919 is prime and doesn't divide `units`, so this visits every unit once.
     var i: usize = 0;
     for (0..units) |p| {
@@ -3118,14 +3122,24 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             const w: i32 = @intCast((i * 104_729) % 1_013);
             rows[i] = .{ .id = @intCast(i), .url = unit_urls[unit], .w = w };
             if (std.mem.startsWith(u8, unit_urls[unit], "http://heavy")) {
-                const f = &heavy_w[try std.fmt.parseInt(usize, unit_urls[unit][12 .. unit_urls[unit].len - 5], 10)];
+                const host = try std.fmt.parseInt(usize, unit_urls[unit][12 .. unit_urls[unit].len - 5], 10);
+                const f = &heavy_w[host];
                 f.min = @min(f.min, w);
                 f.max = @max(f.max, w);
                 f.sum += w;
+                if (w + 1 > 507) heavy_passing[host][1] += 1;
             }
             i += 1;
         }
     }
+
+    std.mem.sort([2]i64, &heavy_passing, {}, struct {
+        fn more(_: void, x: [2]i64, y: [2]i64) bool {
+            return x[1] > y[1];
+        }
+    }.more);
+    // The top 10 hosts by passing rows rank without ties.
+    for (heavy_passing[0..10], heavy_passing[1..11]) |x, y| try std.testing.expect(x[1] > y[1]);
 
     inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
         var tmp = std.testing.tmpDir(.{});
@@ -3162,6 +3176,44 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             }
             try std.testing.expectEqual(@as(usize, 10), rank);
         }
+
+        // A key over `w` alone evaluates per row ahead of the collapse, which
+        // leaves `w` spent; the filter pass compacts it with the kept rows.
+        const pre_sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, w DIV 2000 AS h, COUNT(*) AS c FROM hits GROUP BY k, h ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, pre_sql });
+        try expectPlanRunsGroupTopN(a, db, pre_sql);
+        var pq = try runSql(a, db, pre_sql);
+        defer pq.deinit();
+        var pre_rank: usize = 0;
+        while (try pq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{pre_rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, 0), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * pre_rank)), try cellNumber(batch.values[2], r));
+                pre_rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), pre_rank);
+
+        // A WHERE over a computed operand drops collapsed rows ahead of the
+        // sketch, which counts and keeps only the rows that pass it.
+        const where_sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits WHERE w + 1 > 507 GROUP BY k ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, where_sql });
+        try std.testing.expect(try planContains(a, db, where_sql, "residual filter"));
+        var wq = try runSql(a, db, where_sql);
+        defer wq.deinit();
+        var where_rank: usize = 0;
+        while (try wq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                const want = heavy_passing[where_rank];
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{want[0]}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(want[1])), try cellNumber(batch.values[1], r));
+                where_rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), where_rank);
 
         // The url itself as the key, collapsed with no expression to evaluate.
         const url_sql = "SELECT url, COUNT(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10";
@@ -3386,4 +3438,365 @@ test "group keys packed past 96 bits keep groups that differ only in their high 
             try std.testing.expectEqual(@as(usize, groups), seen);
         }
     }
+}
+
+test "grouped engines take computed comparison operands as CASE operands (keys, conditional sums, global)" {
+    // `octet_length(s) > 3` compares a computed operand, which the parser
+    // materializes in a Compute below the one reading it.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const n = 240;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, ns STRING)");
+        var long_by_g = [_]i64{ 0, 0, 0 };
+        var rows_by_g = [_]i64{ 0, 0, 0 };
+        var long_ids: i64 = 0;
+        var ns_long: i64 = 0;
+        var ns_null: i64 = 0;
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, ns) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const s = words[i % words.len];
+                const g = i % 3;
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                if (i % 5 == 0) {
+                    try buf.print(allocator, "({d},{d},'{s}',NULL)", .{ i, g, s });
+                    ns_null += 1;
+                } else {
+                    try buf.print(allocator, "({d},{d},'{s}','{s}')", .{ i, g, s, s });
+                    if (s.len > 3) ns_long += 1;
+                }
+                rows_by_g[g] += 1;
+                if (s.len > 3) {
+                    long_by_g[g] += 1;
+                    long_ids += @intCast(i);
+                }
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+        const long_total = long_by_g[0] + long_by_g[1] + long_by_g[2];
+
+        const by_key = "SELECT octet_length(s) > 3 AS lng, COUNT(*) AS c FROM t GROUP BY lng ORDER BY c DESC LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, by_key, "(V2 "));
+        var q = try runSql(allocator, db, by_key);
+        defer q.deinit();
+        var counts: std.ArrayList(i64) = .empty;
+        defer counts.deinit(allocator);
+        while (try q.next()) |b| try counts.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        std.mem.sort(i64, counts.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, &.{ long_total, n - long_total }, counts.items);
+
+        const nullable_key = "SELECT octet_length(ns) > 3 AS lng, COUNT(*) AS c FROM t GROUP BY lng ORDER BY c DESC LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, nullable_key, "(V2 "));
+        var nq = try runSql(allocator, db, nullable_key);
+        defer nq.deinit();
+        counts.clearRetainingCapacity();
+        while (try nq.next()) |b| try counts.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        std.mem.sort(i64, counts.items, {}, std.sort.asc(i64));
+        var want = [_]i64{ ns_long, ns_null, n - ns_long - ns_null };
+        std.mem.sort(i64, &want, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, &want, counts.items);
+
+        const conditional = "SELECT g, SUM(CASE WHEN octet_length(s) > 3 THEN 1 ELSE 0 END) AS longs, COUNT(*) AS c FROM t WHERE g <> 1 GROUP BY g ORDER BY g LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, conditional, "(V2 "));
+        var cq = try runSql(allocator, db, conditional);
+        defer cq.deinit();
+        var seen: usize = 0;
+        while (try cq.next()) |b| {
+            for (0..b.row_count) |r| {
+                const g: usize = @intFromFloat((try cellNumber(b.values[0], r)).?);
+                try std.testing.expect(g != 1);
+                try std.testing.expectEqual(long_by_g[g], b.values[1].data.bigint[r]);
+                try std.testing.expectEqual(rows_by_g[g], b.values[2].data.bigint[r]);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+
+        const global = "SELECT SUM(CASE WHEN octet_length(s) > 3 THEN id ELSE 0 END) AS x FROM t";
+        try std.testing.expect(try planContains(allocator, db, global, "(V2 "));
+        var gq = try runSql(allocator, db, global);
+        defer gq.deinit();
+        const gb = (try gq.next()).?;
+        try std.testing.expectEqual(long_ids, gb.values[0].data.bigint[0]);
+    }
+}
+
+test "grouped engines collapse rows by string codes combined with other source columns" {
+    // Derived keys over a string column next to an integer key (narrow or
+    // wide), a second string column, or an integer the derived columns read:
+    // each segment batch evaluates once per value combination its rows use.
+    // A derived column over integers alone evaluates per row ahead of that,
+    // as a key in the combination or as an aggregate input; one that can be
+    // NULL keeps its NULL group.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
+    const tags = [_][]const u8{ "p", "qq", "r" };
+    const n = 384;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL)");
+        var count_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_sw = [_][4]i64{.{ 0, 0, 0, 0 }} ** words.len;
+        var max_w_sg = [_][3]i64{.{ std.math.minInt(i64), std.math.minInt(i64), std.math.minInt(i64) }} ** words.len;
+        var sum_h_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var max_sq_s = [_]i64{std.math.minInt(i64)} ** words.len;
+        var min_sq_s = [_]i64{std.math.maxInt(i64)} ** words.len;
+        var quotient_counts: std.StringArrayHashMapUnmanaged(i64) = .empty;
+        defer {
+            for (quotient_counts.keys()) |k| allocator.free(k);
+            quotient_counts.deinit(allocator);
+        }
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, u, x, w) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const si = i % words.len;
+                const ui = (i / 7) % tags.len;
+                const g = i % 3;
+                const x: i64 = @intCast(i % 11);
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                const wi = i % 4;
+                try buf.print(allocator, "({d},{d},'{s}','{s}',{d},{d})", .{ i, g, words[si], tags[ui], x, wideValue(wi) });
+                count_sw[si][wi] += 1;
+                max_w_sg[si][g] = @max(max_w_sg[si][g], wideValue(wi));
+                sum_h_sg[si][g] += @as(i64, @intCast(wi)) - 2;
+                max_sq_s[si] = @max(max_sq_s[si], x * x - @as(i64, @intCast(g)));
+                min_sq_s[si] = @min(min_sq_s[si], x * x - @as(i64, @intCast(g)));
+                const quotient = if (g == 0)
+                    try std.fmt.allocPrint(allocator, "{s}|NULL", .{uppers[si]})
+                else
+                    try std.fmt.allocPrint(allocator, "{s}|{d}", .{ uppers[si], @divFloor(x, @as(i64, @intCast(g))) });
+                const entry = try quotient_counts.getOrPut(allocator, quotient);
+                if (entry.found_existing) allocator.free(quotient) else entry.value_ptr.* = 0;
+                entry.value_ptr.* += 1;
+                count_sg[si][g] += 1;
+                sum_sg[si][g] += x;
+                count_su[si][ui] += 1;
+                sum_su[si][ui] += x;
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var want_key_int: std.ArrayList([]const u8) = .empty;
+        var want_read_int: std.ArrayList([]const u8) = .empty;
+        var want_two_strings: std.ArrayList([]const u8) = .empty;
+        var want_concat: std.ArrayList([]const u8) = .empty;
+        var want_wide: std.ArrayList([]const u8) = .empty;
+        var want_pre_key: std.ArrayList([]const u8) = .empty;
+        var want_pre_sum: std.ArrayList([]const u8) = .empty;
+        var want_pre_folds: std.ArrayList([]const u8) = .empty;
+        var want_nullable_pre: std.ArrayList([]const u8) = .empty;
+        for (quotient_counts.keys(), quotient_counts.values()) |k, c| {
+            try want_nullable_pre.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ k, c }));
+        }
+        for (words, uppers, 0..) |w, up, si| {
+            for (0..4) |wi| {
+                if (count_sw[si][wi] == 0) continue;
+                try want_wide.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, wideValue(wi), count_sw[si][wi] }));
+                try want_pre_key.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, @as(i64, @intCast(wi)) - 2, count_sw[si][wi] }));
+            }
+            var rows: i64 = 0;
+            for (0..3) |g| {
+                rows += count_sg[si][g];
+                if (count_sg[si][g] == 0) continue;
+                try want_pre_folds.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}", .{ up, g, max_w_sg[si][g], sum_h_sg[si][g] }));
+            }
+            try want_pre_sum.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}", .{ up, rows, max_sq_s[si], min_sq_s[si] }));
+            for (0..3) |g| {
+                if (count_sg[si][g] == 0) continue;
+                try want_key_int.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}|{s}", .{ up, g, count_sg[si][g], sum_sg[si][g], w }));
+                try want_read_int.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, g + 1, count_sg[si][g] }));
+            }
+            for (tags, 0..) |tag, ui| {
+                if (count_su[si][ui] == 0) continue;
+                try want_two_strings.append(arena, try std.fmt.allocPrint(arena, "{s}|{s}|{d}", .{ w, tag, count_su[si][ui] }));
+                try want_concat.append(arena, try std.fmt.allocPrint(arena, "{s}{s}|{d}|{d}", .{ w, tag, count_su[si][ui], sum_su[si][ui] }));
+            }
+        }
+        const cases = .{
+            .{ "SELECT upper(s) AS k, g, COUNT(*) AS c, SUM(x) AS sx, MIN(s) AS ms FROM t GROUP BY k, g ORDER BY c DESC LIMIT 100", &want_key_int },
+            .{ "SELECT upper(s) AS k, g + 1 AS g1, COUNT(*) AS c FROM t GROUP BY k, g1 ORDER BY c DESC LIMIT 100", &want_read_int },
+            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_two_strings },
+            .{ "SELECT concat(s, u) AS k, COUNT(*) AS c, SUM(x) AS sx FROM t GROUP BY k ORDER BY c DESC LIMIT 100", &want_concat },
+            .{ "SELECT upper(s) AS k, w, COUNT(*) AS c FROM t GROUP BY k, w ORDER BY c DESC LIMIT 100", &want_wide },
+            .{ "SELECT upper(s) AS k, w DIV 1000003 AS h, COUNT(*) AS c FROM t GROUP BY k, h ORDER BY c DESC LIMIT 100", &want_pre_key },
+            .{ "SELECT upper(s) AS k, COUNT(*) AS c, MAX(x * x - g) AS mq, MIN(x * x - g) AS nq FROM t GROUP BY k ORDER BY c DESC LIMIT 100", &want_pre_sum },
+            .{ "SELECT upper(s) AS k, g, MAX(w) AS mw, SUM(w DIV 1000003) AS sh FROM t GROUP BY k, g ORDER BY mw DESC LIMIT 100", &want_pre_folds },
+            .{ "SELECT upper(s) AS k, x DIV g AS q, COUNT(*) AS c FROM t GROUP BY k, q ORDER BY c DESC LIMIT 100", &want_nullable_pre },
+        };
+        inline for (cases) |c| {
+            try std.testing.expect(try planContains(allocator, db, c[0], "(V2 "));
+            const got = try sortedRowTexts(allocator, arena, db, c[0]);
+            std.mem.sort([]const u8, c[1].items, {}, textLess);
+            try std.testing.expectEqual(c[1].items.len, got.len);
+            for (c[1].items, got) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+    }
+}
+
+test "grouped engines filter on computed WHERE operands after the Compute" {
+    // A WHERE conjunct over a computed operand (`x + 1 > 5`,
+    // `octet_length(u) > 1`) filters the Compute's output inside the grouped
+    // engine, while the other conjuncts still fuse into the scan. The rows
+    // it reads stay whole through a collapse, a hashed key it reads keeps
+    // its bytes, and an unordered LIMIT doesn't pick its groups from rows
+    // the filter would drop. A key over a column that arrives as byte
+    // lengths evaluates after the filter, on the lengths of the rows kept.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
+    const tags = [_][]const u8{ "p", "qq", "r" };
+    const n = 384;
+    const block_rows = 8;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL, b INT NOT NULL)");
+        var count_x = [_]i64{0} ** words.len;
+        var sum_x = [_]i64{0} ** words.len;
+        var count_qq_not1 = [_]i64{0} ** words.len;
+        var count_qq_or_a = [_]i64{0} ** words.len;
+        var count_not_qq = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, u, x, w, b) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const si = i % words.len;
+                const ui = (i / 7) % tags.len;
+                const g = i % 3;
+                const x: i64 = @intCast(i % 11);
+                const wi = i % 4;
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                try buf.print(allocator, "({d},{d},'{s}','{s}',{d},{d},{d})", .{ i, g, words[si], tags[ui], x, wideValue(wi), i / block_rows });
+                if (x >= 5) {
+                    count_x[si] += 1;
+                    sum_x[si] += x;
+                }
+                if (ui == 1 and g != 1) count_qq_not1[si] += 1;
+                if (ui == 1 or si == 0) count_qq_or_a[si] += 1;
+                if (ui != 1) count_not_qq[si][ui] += 1;
+                if (wi >= 2) {
+                    count_w[si][g] += 1;
+                    sum_w[si][g] += wideValue(wi);
+                }
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var want_sum: std.ArrayList([]const u8) = .empty;
+        var want_mixed: std.ArrayList([]const u8) = .empty;
+        var want_or: std.ArrayList([]const u8) = .empty;
+        var want_strings: std.ArrayList([]const u8) = .empty;
+        var want_wide: std.ArrayList([]const u8) = .empty;
+        var want_lengths: std.ArrayList([]const u8) = .empty;
+        for (words, uppers, 0..) |w, up, si| {
+            if (count_x[si] != 0) try want_sum.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ w, count_x[si], sum_x[si] }));
+            if (count_x[si] != 0) try want_lengths.append(arena, try std.fmt.allocPrint(arena, "{d}|{d}", .{ w.len, count_x[si] }));
+            if (count_qq_not1[si] != 0) try want_mixed.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ up, count_qq_not1[si] }));
+            if (count_qq_or_a[si] != 0) try want_or.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ w, count_qq_or_a[si] }));
+            for (tags, 0..) |tag, ui| {
+                if (count_not_qq[si][ui] == 0) continue;
+                try want_strings.append(arena, try std.fmt.allocPrint(arena, "{s}|{s}|{d}", .{ w, tag, count_not_qq[si][ui] }));
+            }
+            for (0..3) |g| {
+                if (count_w[si][g] == 0) continue;
+                try want_wide.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, g, sum_w[si][g] }));
+            }
+        }
+        const cases = .{
+            .{ "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE x + 1 > 5 GROUP BY s ORDER BY c DESC LIMIT 100", &want_sum },
+            .{ "SELECT upper(s) AS k, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 AND g <> 1 GROUP BY k ORDER BY c DESC LIMIT 100", &want_mixed },
+            .{ "SELECT s, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 OR s = 'a' GROUP BY s ORDER BY c DESC LIMIT 100", &want_or },
+            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t WHERE upper(u) <> 'QQ' GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_strings },
+            .{ "SELECT upper(s) AS k, g, SUM(w) AS sw FROM t WHERE w DIV 1000003 >= 0 GROUP BY k, g ORDER BY sw DESC LIMIT 100", &want_wide },
+            .{ "SELECT octet_length(s) AS l, COUNT(*) AS c FROM t WHERE x + 1 > 5 GROUP BY l ORDER BY c DESC LIMIT 100", &want_lengths },
+        };
+        inline for (cases) |c| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });
+            try std.testing.expect(try planContains(allocator, db, c[0], "residual filter"));
+            const got = try sortedRowTexts(allocator, arena, db, c[0]);
+            std.mem.sort([]const u8, c[1].items, {}, textLess);
+            try std.testing.expectEqual(c[1].items.len, got.len);
+            for (c[1].items, got) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+
+        // The first blocks in scan order all fail the filter.
+        const unordered = "SELECT b, COUNT(*) AS c FROM t WHERE b + 1 > 40 GROUP BY b LIMIT 1";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, unordered });
+        try std.testing.expect(try planContains(allocator, db, unordered, "residual filter"));
+        const got = try sortedRowTexts(allocator, arena, db, unordered);
+        try std.testing.expectEqual(@as(usize, 1), got.len);
+        var cells = std.mem.splitScalar(u8, got[0], '|');
+        try std.testing.expect(try std.fmt.parseInt(i64, cells.next().?, 10) >= 40);
+        try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{block_rows}), cells.next().?);
+    }
+}
+
+/// Spread past what a direct map over a row group's combinations covers.
+fn wideValue(i: usize) i64 {
+    return (@as(i64, @intCast(i)) - 2) * 1_000_003;
+}
+
+fn textLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Each result row as its cells joined by `|`, sorted.
+fn sortedRowTexts(allocator: std.mem.Allocator, arena: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]const []const u8 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var rows: std.ArrayList([]const u8) = .empty;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            var line: std.ArrayList(u8) = .empty;
+            for (b.values, 0..) |col, ci| {
+                if (ci != 0) try line.append(arena, '|');
+                if (!col.isValid(r)) {
+                    try line.appendSlice(arena, "NULL");
+                    continue;
+                }
+                switch (col.data) {
+                    .varchar, .string => |sv| try line.appendSlice(arena, sv.rowBytes(r)),
+                    else => try line.print(arena, "{d}", .{@as(i64, @intFromFloat((try cellNumber(col, r)).?))}),
+                }
+            }
+            try rows.append(arena, line.items);
+        }
+    }
+    std.mem.sort([]const u8, rows.items, {}, textLess);
+    return rows.items;
 }

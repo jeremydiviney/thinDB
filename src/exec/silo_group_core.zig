@@ -28,6 +28,8 @@ const count_topk_sketch = @import("count_topk_sketch.zig");
 const CountSketch = count_topk_sketch.CountSketch;
 const HeavyKeys = count_topk_sketch.HeavyKeys;
 const appendMaskedColumn = @import("../engine/transform.zig").appendMaskedColumn;
+const appendByIndices = @import("../engine/transform.zig").appendByIndices;
+const subViewAligned = @import("../engine/transform.zig").subViewAligned;
 
 // Comptime master switch for the developer execution-trace profilers. False in
 // every production build (default), which makes every `PROFILING and …` gate
@@ -2235,6 +2237,7 @@ const PipeShared = struct {
     stage_builders: []StageBucketBuilder = &.{},
     group_rows_layout: GroupRowsLayout = .{},
     generic_filter_required: bool = false,
+    residual_filter: ?thindb.exec.PredicateExpr = null,
     count_sketch: ?CountSketchPass = null,
     stage_outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stage_outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -6661,11 +6664,19 @@ const DictPartial = struct {
 /// as row-group dictionary codes (`Batch.block_dicts`) collapses to the
 /// values its rows use, in dictionary order; the derived columns evaluate
 /// once per value (when there are any), and the grid folds each value by its
-/// row count. Any other batch (a raw row group, the memtable) evaluates per row.
+/// row count. Several source columns collapse to the value combinations the
+/// rows use, in first-row order. Any other batch (a raw row group, the
+/// memtable) evaluates per row.
 const GridDictEval = struct {
+    /// The derived columns evaluated over the (collapsed) batch, after the
+    /// pre-evaluated ones (`DictSource.pre`) evaluate per row in `pre`.
     compute: ?*thindb.exec.Compute,
-    column: usize,
+    source: DictSource,
     loc_column: ?usize,
+    pre: ?*thindb.exec.Compute = null,
+    /// The Compute layers this evaluation built over the scan, when it split
+    /// out pre-evaluated columns; else `compute` is the drive's.
+    built_layers: ?BuiltLayers = null,
     partials: []DictPartial = &.{},
     /// Per staged column, its partial's folded values in the collapsed batch.
     partial_views: []?ColumnView = &.{},
@@ -6687,8 +6698,28 @@ const GridDictEval = struct {
     /// The collapsed column reached the evaluated batch as the dictionary's
     /// values in code order, so they ascend.
     ascending: bool = false,
+    /// Several source columns: per row, its packed value combination and the
+    /// combination's index; per combination, its packed value and first
+    /// row; the hash slots (index + 1) or the dense map finding them.
+    row_tuples: std.ArrayListUnmanaged(u64) = .empty,
+    row_ids: std.ArrayListUnmanaged(u32) = .empty,
+    tuple_values: std.ArrayListUnmanaged(u64) = .empty,
+    tuple_rows: std.ArrayListUnmanaged(u32) = .empty,
+    tuple_codes: std.ArrayListUnmanaged(u32) = .empty,
+    tuple_slots: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per source column, its values in the collapsed (or materialized)
+    /// batch, and a hashed key's digests.
+    stores: [MAX_DICT_EVAL_COLUMNS]?ColumnStore = @splat(null),
+    source_digests: [MAX_DICT_EVAL_COLUMNS]std.ArrayListUnmanaged(u128) = @splat(.empty),
+    /// After a collapse that kept most rows, the batches left to evaluate
+    /// row by row, and the wait after the next such collapse (doubling).
+    skip_batches: u32 = 0,
+    skip_next: u32 = 1,
+
+    const BuiltLayers = struct { top: thindb.exec.Query, base: thindb.exec.Query };
 
     fn deinit(self: *GridDictEval, allocator: Allocator) void {
+        if (self.built_layers) |l| thindb.exec.Compute.deinitLayersOver(l.top, l.base);
         self.code_rows.deinit(allocator);
         self.code_loc.deinit(allocator);
         self.weights.deinit(allocator);
@@ -6701,21 +6732,272 @@ const GridDictEval = struct {
         for (self.partials) |*p| p.deinit(allocator);
         if (self.partials.len > 0) allocator.free(self.partials);
         if (self.partial_views.len > 0) allocator.free(self.partial_views);
+        self.row_tuples.deinit(allocator);
+        self.row_ids.deinit(allocator);
+        self.tuple_values.deinit(allocator);
+        self.tuple_rows.deinit(allocator);
+        self.tuple_codes.deinit(allocator);
+        self.tuple_slots.deinit(allocator);
+        for (&self.stores) |*st| if (st.*) |*s| s.deinit(allocator);
+        for (&self.source_digests) |*d| d.deinit(allocator);
     }
 
     fn next(self: *GridDictEval, scan: *Scan, allocator: Allocator) !?thindb.Batch {
         self.collapsed = false;
-        const raw = (try scan.next()) orelse return null;
-        self.input_rows = raw.row_count;
-        const dicts = raw.block_dicts orelse return try self.eval(raw);
-        const column = dicts[self.column] orelse return try self.eval(raw);
+        const scanned = (try scan.next()) orelse return null;
+        self.input_rows = scanned.row_count;
+        const dicts = scanned.block_dicts orelse return try self.eval(scanned);
+        const raw = if (self.pre) |pre| try pre.evalBatch(scanned) else scanned;
+        if (self.source.len > 1) return try self.nextTuples(allocator, raw, dicts);
+        const column_index = self.source.columns[0];
+        const column = dicts[column_index] orelse return try self.evalLater(raw);
         const batch = try self.collapse(allocator, raw, column);
         self.collapsed = true;
-        const out = try self.eval(batch);
+        const out = try self.evalLater(batch);
         // A derived column may take the collapsed column's name and slot;
         // hashed values are the scan's placeholders.
-        self.ascending = column.digests == null and sameStringView(out.values[self.column], batch.values[self.column]);
+        self.ascending = column.digests == null and sameStringView(out.values[column_index], batch.values[column_index]);
         return out;
+    }
+
+    /// A batch over several source columns collapses when each string
+    /// column arrives as dictionary codes and the packed combination fits 64
+    /// bits, unless a whole row group's dictionary nears a value per row, or
+    /// a recent collapse kept most rows (which leaves little to collapse).
+    /// Otherwise the coded columns materialize.
+    fn nextTuples(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, dicts: []const ?thindb.exec.BlockDictColumn) !thindb.Batch {
+        if (self.skip_batches > 0) {
+            self.skip_batches -= 1;
+            return try self.evalLater(try self.materialize(allocator, raw, dicts));
+        }
+        var bits: usize = 0;
+        var mins: [MAX_DICT_EVAL_COLUMNS]i64 = @splat(0);
+        var widths: [MAX_DICT_EVAL_COLUMNS]usize = undefined;
+        const collapsible = for (self.source.slice(), 0..) |j, m| {
+            if (m < self.source.strings) {
+                const d = dicts[j] orelse break false;
+                const n = d.valueCount();
+                if (d.every_value and 4 * n > 3 * raw.row_count) break false;
+                widths[m] = valueBits(n -| 1);
+            } else {
+                const range = integerRange(raw.values[j], raw.row_count) orelse break false;
+                mins[m] = range.min;
+                widths[m] = valueBits(range.span);
+            }
+            bits += widths[m];
+        } else bits <= 64;
+        if (!collapsible) return try self.evalLater(try self.materialize(allocator, raw, dicts));
+        const batch = try self.collapseTuples(allocator, raw, dicts, mins[0..self.source.len], widths[0..self.source.len], bits);
+        self.collapsed = true;
+        if (4 * batch.row_count > 3 * raw.row_count) {
+            self.skip_batches = self.skip_next;
+            self.skip_next = @min(2 * self.skip_next, 64);
+        } else self.skip_next = 1;
+        return try self.evalLater(batch);
+    }
+
+    fn valueBits(max_value: u64) usize {
+        return 64 - @clz(max_value);
+    }
+
+    const IntegerRange = struct { min: i64, span: u64 };
+
+    fn integerRange(view: ColumnView, rows: usize) ?IntegerRange {
+        switch (view.data) {
+            inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |all| {
+                const values = all[0..rows];
+                if (values.len == 0) return .{ .min = 0, .span = 0 };
+                var lo: i64 = values[0];
+                var hi: i64 = values[0];
+                for (values) |v| {
+                    lo = @min(lo, v);
+                    hi = @max(hi, v);
+                }
+                return .{ .min = lo, .span = @as(u64, @bitCast(hi -% lo)) };
+            },
+            else => return null,
+        }
+    }
+
+    fn collapseTuples(
+        self: *GridDictEval,
+        allocator: Allocator,
+        raw: thindb.Batch,
+        dicts: []const ?thindb.exec.BlockDictColumn,
+        mins: []const i64,
+        widths: []const usize,
+        bits: usize,
+    ) !thindb.Batch {
+        const rows = raw.row_count;
+        try self.row_tuples.resize(allocator, rows);
+        const packed_rows = self.row_tuples.items;
+        @memset(packed_rows, 0);
+        var shift: usize = 0;
+        for (self.source.slice(), mins, widths, 0..) |j, min, width, m| {
+            defer shift += width;
+            if (width == 0) continue;
+            const at: u6 = @intCast(shift);
+            if (m < self.source.strings) {
+                for (packed_rows, dicts[j].?.codes[0..rows]) |*p, c| p.* |= @as(u64, c) << at;
+            } else switch (raw.values[j].data) {
+                inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |values| {
+                    for (packed_rows, values[0..rows]) |*p, v| p.* |= @as(u64, @bitCast(@as(i64, v) -% min)) << at;
+                },
+                else => return error.TypeMismatch,
+            }
+        }
+
+        try self.row_ids.resize(allocator, rows);
+        const ids = self.row_ids.items;
+        self.tuple_values.clearRetainingCapacity();
+        self.tuple_rows.clearRetainingCapacity();
+        self.weights.clearRetainingCapacity();
+        try self.tuple_values.ensureTotalCapacity(allocator, rows);
+        try self.tuple_rows.ensureTotalCapacity(allocator, rows);
+        try self.weights.ensureTotalCapacity(allocator, rows);
+        // A combination space no larger than twice the rows maps directly.
+        const dense = bits < 32 and (@as(usize, 1) << @intCast(bits)) <= 2 * rows;
+        const slot_count: usize = if (dense) @as(usize, 1) << @intCast(bits) else std.math.ceilPowerOfTwoAssert(usize, @max(2 * rows, 16));
+        try self.tuple_slots.resize(allocator, slot_count);
+        const slots = self.tuple_slots.items;
+        @memset(slots, 0);
+        const slot_shift: u6 = if (dense) 0 else @intCast(64 - @ctz(slot_count));
+        for (packed_rows, ids, 0..) |p, *id, r| {
+            var s: usize = if (dense) @intCast(p) else @intCast((p *% 0x9E3779B97F4A7C15) >> slot_shift);
+            while (true) : (s = (s + 1) & (slot_count - 1)) {
+                const held = slots[s];
+                if (held == 0) {
+                    const t: u32 = @intCast(self.tuple_values.items.len);
+                    slots[s] = t + 1;
+                    self.tuple_values.appendAssumeCapacity(p);
+                    self.tuple_rows.appendAssumeCapacity(@intCast(r));
+                    self.weights.appendAssumeCapacity(1);
+                    id.* = t;
+                    break;
+                }
+                if (dense or self.tuple_values.items[held - 1] == p) {
+                    id.* = held - 1;
+                    self.weights.items[held - 1] += 1;
+                    break;
+                }
+            }
+        }
+        const n = self.tuple_values.items.len;
+        const first_rows = self.tuple_rows.items;
+
+        for (self.partials) |*p| try p.accumulate(allocator, raw.values[p.column], ids, n);
+        try self.spanViews(allocator, raw, n);
+        @memset(self.hashed, null);
+        var any_hashed = false;
+        for (self.source.slice(), 0..) |j, m| {
+            if (m >= self.source.strings) {
+                const store = try self.sourceStore(allocator, m, raw.values[j]);
+                try appendByIndices(allocator, raw.values[j], first_rows, store);
+                self.views[j] = store.view();
+                continue;
+            }
+            const d = dicts[j].?;
+            try self.tuple_codes.resize(allocator, n);
+            for (self.tuple_codes.items, first_rows) |*c, r| c.* = d.codes[r];
+            if (d.digests) |ds| {
+                // A hashed key's value column stays the scan's placeholder.
+                const out = &self.source_digests[m];
+                try out.resize(allocator, n);
+                for (out.items, self.tuple_codes.items) |*o, c| o.* = ds[c];
+                self.hashed[j] = out.items;
+                any_hashed = true;
+            } else {
+                const store = try self.sourceStore(allocator, m, raw.values[j]);
+                try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), self.tuple_codes.items, store);
+                self.views[j] = store.view();
+            }
+        }
+        if (self.loc_column) |lc| {
+            const row_locs = raw.values[lc].data.bigint;
+            self.locs.clearRetainingCapacity();
+            try self.locs.ensureTotalCapacity(allocator, n);
+            for (first_rows) |r| self.locs.appendAssumeCapacity(row_locs[r]);
+            self.views[lc] = .{ .data = .{ .bigint = self.locs.items } };
+        }
+        for (self.partials) |*p| {
+            const view = try p.emit(allocator, self.weights.items, 0, n, n);
+            self.views[p.column] = view;
+            self.partial_views[p.layout_column] = view;
+        }
+        return .{ .schema = raw.schema, .values = self.views, .row_count = n, .hashed = if (any_hashed) self.hashed else null };
+    }
+
+    /// `raw` with its dictionary-coded source columns as per-row values (a
+    /// hashed key's as per-row digests), for evaluation row by row.
+    fn materialize(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, dicts: []const ?thindb.exec.BlockDictColumn) !thindb.Batch {
+        try self.ensureViews(allocator, raw.values.len);
+        @memcpy(self.views, raw.values);
+        @memset(self.hashed, null);
+        var any_hashed = false;
+        if (raw.hashed) |hs| {
+            @memcpy(self.hashed[0..hs.len], hs);
+            any_hashed = true;
+        }
+        for (self.source.columns[0..self.source.strings], 0..) |j, m| {
+            const d = dicts[j] orelse continue;
+            const codes = d.codes[0..raw.row_count];
+            if (d.digests) |ds| {
+                const out = &self.source_digests[m];
+                try out.resize(allocator, codes.len);
+                for (out.items, codes) |*o, c| o.* = ds[c];
+                self.hashed[j] = out.items;
+                any_hashed = true;
+            } else {
+                const store = try self.sourceStore(allocator, m, raw.values[j]);
+                try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), codes, store);
+                self.views[j] = store.view();
+            }
+        }
+        var out = raw;
+        out.values = self.views;
+        out.hashed = if (any_hashed) self.hashed else null;
+        out.block_dicts = null;
+        return out;
+    }
+
+    /// Each of `raw`'s columns over its first `rows` rows, for a collapse to
+    /// replace the ones it carries. A scan column only pre-evaluated columns
+    /// read keeps those rows only so that every view spans the collapsed rows.
+    fn spanViews(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, rows: usize) !void {
+        try self.ensureViews(allocator, raw.values.len);
+        for (self.views, raw.values) |*v, r| v.* = subViewAligned(r, 0, rows);
+    }
+
+    fn ensureViews(self: *GridDictEval, allocator: Allocator, n: usize) !void {
+        if (self.views.len == n and self.hashed.len == n) return;
+        if (self.views.len > 0) allocator.free(self.views);
+        if (self.hashed.len > 0) allocator.free(self.hashed);
+        self.views = &.{};
+        self.hashed = &.{};
+        self.views = try allocator.alloc(ColumnView, n);
+        self.hashed = try allocator.alloc(?[]const u128, n);
+    }
+
+    /// Source column `m`'s store, emptied, typed like `like`.
+    fn sourceStore(self: *GridDictEval, allocator: Allocator, m: usize, like: ColumnView) !*ColumnStore {
+        if (self.stores[m]) |*st| {
+            if (std.meta.activeTag(st.data) == std.meta.activeTag(like.data)) {
+                st.clear();
+                return st;
+            }
+            st.deinit(allocator);
+            self.stores[m] = null;
+        }
+        self.stores[m] = try ColumnStore.initLike(allocator, like, false);
+        return &self.stores[m].?;
+    }
+
+    fn dictionaryView(like: ColumnView, dict: storage_mod.StringView) !ColumnView {
+        return .{ .data = switch (like.data) {
+            .varchar => .{ .varchar = dict },
+            .string => .{ .string = dict },
+            else => return error.TypeMismatch,
+        } };
     }
 
     fn sameStringView(a: ColumnView, b: ColumnView) bool {
@@ -6731,6 +7013,10 @@ const GridDictEval = struct {
     }
 
     fn eval(self: *GridDictEval, batch: thindb.Batch) !thindb.Batch {
+        return try self.evalLater(if (self.pre) |pre| try pre.evalBatch(batch) else batch);
+    }
+
+    fn evalLater(self: *GridDictEval, batch: thindb.Batch) !thindb.Batch {
         const compute = self.compute orelse return batch;
         return try compute.evalBatch(batch);
     }
@@ -6774,7 +7060,8 @@ const GridDictEval = struct {
             if (column.digests) |ds| self.digests.appendAssumeCapacity(ds[c]);
         }
 
-        const raw_values = switch (raw.values[self.column].data) {
+        const column_index = self.source.columns[0];
+        const raw_values = switch (raw.values[column_index].data) {
             .varchar, .string => |sv| sv,
             else => return error.TypeMismatch,
         };
@@ -6800,16 +7087,8 @@ const GridDictEval = struct {
             values = .{ .offsets = self.offsets.items, .bytes = self.bytes.items };
         }
 
-        if (self.views.len != raw.values.len or self.hashed.len != raw.values.len) {
-            if (self.views.len > 0) allocator.free(self.views);
-            if (self.hashed.len > 0) allocator.free(self.hashed);
-            self.views = &.{};
-            self.hashed = &.{};
-            self.views = try allocator.alloc(ColumnView, raw.values.len);
-            self.hashed = try allocator.alloc(?[]const u128, raw.values.len);
-        }
-        @memcpy(self.views, raw.values);
-        self.views[self.column] = .{ .data = switch (raw.values[self.column].data) {
+        try self.spanViews(allocator, raw, used);
+        self.views[column_index] = .{ .data = switch (raw.values[column_index].data) {
             .varchar => .{ .varchar = values },
             .string => .{ .string = values },
             else => return error.TypeMismatch,
@@ -6824,7 +7103,7 @@ const GridDictEval = struct {
         }
         const hashed: ?[]const ?[]const u128 = if (column.digests != null) blk: {
             @memset(self.hashed, null);
-            self.hashed[self.column] = self.digests.items;
+            self.hashed[column_index] = self.digests.items;
             break :blk self.hashed;
         } else null;
         return .{ .schema = raw.schema, .values = self.views, .row_count = used, .hashed = hashed };
@@ -6832,25 +7111,42 @@ const GridDictEval = struct {
 
     fn rowWeights(self: *const GridDictEval) ?RowWeights {
         if (!self.collapsed) return null;
-        return .{ .counts = self.weights.items, .input_rows = self.input_rows, .ascending_column = if (self.ascending) self.column else null, .partials = self.partial_views };
+        return .{ .counts = self.weights.items, .input_rows = self.input_rows, .ascending_column = if (self.ascending) self.source.columns[0] else null, .partials = self.partial_views };
     }
 };
 
-/// The scan column whose row-group dictionary codes drive per-distinct
-/// evaluation, or null when the program can't fold by count. It takes a
-/// weighted program (every aggregate folds a repeated row by its count) with
-/// deterministic derived columns, if any, over a scan reading one non-nullable
-/// string column and numeric aggregate inputs (`dictEvalSource`); the row
-/// locations ride along, as any row of a value recovers it. String expressions, and the string keys they feed, cost far
-/// more per row than counting a row's code. The column may be a hashed key:
-/// the scan then digests each dictionary value once, and the collapsed rows
-/// carry those digests.
-fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !?usize {
+/// The scan columns whose row-group dictionary codes (and integer values)
+/// drive per-distinct evaluation, or null when the program can't fold by
+/// count. It takes a weighted program (every aggregate folds a repeated row
+/// by its count) with deterministic derived columns, if any, over a scan
+/// reading non-nullable string columns, integer keys, and numeric aggregate
+/// inputs (`dictEvalSource`); the row locations ride along, as any row of a
+/// value recovers it. String expressions, and the string keys they feed, cost
+/// far more per row than counting a row's code. A string column may be a
+/// hashed key: the scan then digests each dictionary value once, and the
+/// collapsed rows carry those digests.
+/// How many leading derived columns evaluate ahead of the residual filter,
+/// leaving the rest to the rows that pass: the prefix through the last one
+/// it reads, which holds what those read in turn. Zero keeps one Compute
+/// over them all, as a dictionary collapse evaluates them.
+fn residualSplit(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !usize {
+    const expr = cfg.residual_filter orelse return 0;
+    if (try dictEvalColumn(allocator, cfg, scan_schema) != null) return 0;
+    var split: usize = 0;
+    for (cfg.derived, 1..) |d, n| {
+        if (thindb.exec.predicate.touchesColumn(expr, d.name)) split = n;
+    }
+    return if (split < cfg.derived.len) split else 0;
+}
+
+fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !?DictSource {
     if (!cfg.distinct_eval) return null;
     const layout = cfg.group_rows_layout;
     if (!layout.has_weight or layout.has_concat or layout.has_udf) return null;
     if (cfg.byte_length_columns.len != 0) return null;
-    if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return null;
+    if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS or layout.key_columns.len > MAX_GENERIC_GROUP_KEYS) return null;
+    var keys_buf: [MAX_GENERIC_GROUP_KEYS][]const u8 = undefined;
+    for (layout.key_columns, 0..) |k, i| keys_buf[i] = k.name;
     var foldable_buf: [MAX_GROUP_PAYLOAD_COLUMNS][]const u8 = undefined;
     var n_foldable: usize = 0;
     outer: for (layout.columns) |c| {
@@ -6860,7 +7156,10 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
         foldable_buf[n_foldable] = c.source_name;
         n_foldable += 1;
     }
-    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable]);
+    var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer filter_reads.deinit(allocator);
+    if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
+    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items);
 }
 
 /// Whether a heavy tally's units arrive counted: its lone key is the string
@@ -6868,50 +7167,143 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
 fn heavyTallyApplies(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !bool {
     const keys = cfg.group_rows_layout.key_columns;
     if (cfg.derived.len != 0 or keys.len != 1 or keys[0].nullable) return false;
-    const column = (try dictEvalColumn(allocator, cfg, scan_schema)) orelse return false;
-    return types_mod.columnNameEql(keys[0].name, scan_schema[column].name);
+    const source = (try dictEvalColumn(allocator, cfg, scan_schema)) orelse return false;
+    return source.len == 1 and types_mod.columnNameEql(keys[0].name, scan_schema[source.columns[0]].name);
 }
 
-/// The one non-nullable string column `scan_schema` reads besides row
-/// locations, when `derived` is deterministic: its row-group dictionaries
-/// can stand in for its rows under a weighted program. Any other column must
-/// be a non-nullable number in `foldable` (aggregate inputs) that no derived
-/// column reads: a collapsed row carries it folded over the rows the row
-/// stands for, once per aggregate over it.
+const MAX_DICT_EVAL_COLUMNS = 8;
+
+/// The columns whose values a collapsed row stands for: string columns, by
+/// row-group dictionary code, then integer columns. A position past the
+/// scan's columns names a pre-evaluated derived column: `pre[k]` sits at
+/// the scan's column count plus k.
+pub const DictSource = struct {
+    columns: [MAX_DICT_EVAL_COLUMNS]usize = undefined,
+    len: usize = 0,
+    strings: usize = 0,
+    /// Positions in `derived` of the columns that read only integer scan
+    /// columns. They evaluate per row ahead of the collapse, so the
+    /// combination holds their values (an hour) rather than the integers
+    /// they read (a timestamp); an aggregate over one folds per combination.
+    pre: [MAX_DICT_EVAL_COLUMNS]usize = undefined,
+    n_pre: usize = 0,
+
+    pub fn slice(self: *const DictSource) []const usize {
+        return self.columns[0..self.len];
+    }
+
+    pub fn preDerived(self: *const DictSource) []const usize {
+        return self.pre[0..self.n_pre];
+    }
+};
+
+/// The non-nullable columns `scan_schema` reads besides row locations whose
+/// distinct value combinations can stand in for its rows under a weighted
+/// program, when `derived` is deterministic: every string column, plus the
+/// integer columns that are `keys` or that derived columns read. A derived
+/// column reading only integer columns evaluates ahead of the collapse
+/// instead and joins the combination in their place (`DictSource.pre`).
+/// Any other column must be a non-nullable number in `foldable` (aggregate
+/// inputs) that no later derived column reads: a collapsed row carries it
+/// folded over the rows the row stands for, once per aggregate over it. The
+/// columns a residual filter reads (`filter_reads`, scan or derived) stay
+/// whole, as a later derived column's reads do. More than one column takes
+/// a derived column reading a string: the combinations cost a hash per row,
+/// which a string expression evaluated per row dwarfs.
 pub fn dictEvalSource(
     allocator: Allocator,
     scan_schema: []const thindb.types.Column,
     derived: []const thindb.exec.Derived,
     udf_registry: ?*const udf_mod.UdfRegistry,
     foldable: []const []const u8,
-) !?usize {
+    keys: []const []const u8,
+    filter_reads: []const []const u8,
+) !?DictSource {
     for (derived) |d| {
         if (thindb.exec.compute_op.mayVary(d.expr, udf_registry)) return null;
     }
+    var source: DictSource = .{};
+    var pre_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer pre_refs.deinit(allocator);
+    var later_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer later_refs.deinit(allocator);
     var refs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer refs.deinit(allocator);
-    for (derived) |d| try thindb.exec.compute_op.collectColumnRefs(allocator, &refs, d.expr);
-    var column: ?usize = null;
+    for (derived, 0..) |d, di| {
+        refs.clearRetainingCapacity();
+        try thindb.exec.compute_op.collectColumnRefs(allocator, &refs, d.expr);
+        if (source.n_pre < MAX_DICT_EVAL_COLUMNS and readsOnlyIntegers(scan_schema, d.name, refs.items)) {
+            source.pre[source.n_pre] = di;
+            source.n_pre += 1;
+            try pre_refs.appendSlice(allocator, refs.items);
+        } else try later_refs.appendSlice(allocator, refs.items);
+    }
+    try later_refs.appendSlice(allocator, filter_reads);
+    var numbers: [MAX_DICT_EVAL_COLUMNS]usize = undefined;
+    var n_numbers: usize = 0;
+    var derived_reads_string = false;
     for (scan_schema, 0..) |col, j| {
         if (types_mod.columnNameEql(col.name, rowloc.col_name)) continue;
         if (col.nullable) return null;
+        const read = nameListed(later_refs.items, col.name);
+        const folds = nameListed(foldable, col.name);
+        const key = nameListed(keys, col.name);
         switch (col.type) {
             .varchar, .string => {
-                if (column != null) return null;
-                column = j;
+                if (source.strings == MAX_DICT_EVAL_COLUMNS) return null;
+                source.columns[source.strings] = j;
+                source.strings += 1;
+                derived_reads_string = derived_reads_string or read;
             },
-            .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64, .float, .double => {
-                for (refs.items) |r| {
-                    if (types_mod.columnNameEql(r, col.name)) return null;
-                }
-                for (foldable) |f| {
-                    if (types_mod.columnNameEql(f, col.name)) break;
-                } else return null;
+            .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {
+                // Folded, or read only by pre-evaluated columns.
+                if (!key and !read and (folds or nameListed(pre_refs.items, col.name))) continue;
+                if (n_numbers == MAX_DICT_EVAL_COLUMNS) return null;
+                numbers[n_numbers] = j;
+                n_numbers += 1;
             },
+            .float, .double => if (key or read or !folds) return null,
             else => return null,
         }
     }
-    return column;
+    for (source.preDerived(), 0..) |di, k| {
+        const name = derived[di].name;
+        if (!nameListed(keys, name) and !nameListed(later_refs.items, name) and nameListed(foldable, name)) continue;
+        if (n_numbers == MAX_DICT_EVAL_COLUMNS) return null;
+        numbers[n_numbers] = scan_schema.len + k;
+        n_numbers += 1;
+    }
+    if (source.strings == 0 or source.strings + n_numbers > MAX_DICT_EVAL_COLUMNS) return null;
+    @memcpy(source.columns[source.strings..][0..n_numbers], numbers[0..n_numbers]);
+    source.len = source.strings + n_numbers;
+    if (source.len > 1 and !derived_reads_string) return null;
+    return source;
+}
+
+/// Whether a derived column named `name` reading `refs` reads integer scan
+/// columns only (at least one), under a name of its own.
+fn readsOnlyIntegers(scan_schema: []const thindb.types.Column, name: []const u8, refs: []const []const u8) bool {
+    if (refs.len == 0) return false;
+    for (scan_schema) |col| {
+        if (types_mod.columnNameEql(col.name, name)) return false;
+    }
+    for (refs) |r| {
+        const col = for (scan_schema) |col| {
+            if (types_mod.columnNameEql(col.name, r)) break col;
+        } else return false;
+        switch (col.type) {
+            .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn nameListed(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| {
+        if (types_mod.columnNameEql(n, name)) return true;
+    }
+    return false;
 }
 
 const SiloGridJob = struct {
@@ -6919,8 +7311,13 @@ const SiloGridJob = struct {
     // Batch source driven each tile: a Compute-wrapped scan when the shape has
     // derived columns, else a bare scan. `scan` is the same underlying object,
     // retained for range resets; `drive` produces the batches (with derived
-    // columns appended). Points into the harness-owned `drives` array.
+    // columns appended). Points into the harness-owned `drives` array, or
+    // into `operand_drives` when `rest` is set.
     drive: *thindb.exec.Query,
+    // Set when the derived columns split at the residual filter: `drive`
+    // then appends only the ones it reads, and this evaluates the others
+    // on the rows that pass.
+    rest: ?*thindb.exec.Compute = null,
     // Set when dictionary-coded batches collapse to their distinct values
     // ahead of the derived columns; it then pulls the scan and evaluates
     // them itself.
@@ -6948,6 +7345,7 @@ const SiloGridJob = struct {
     top: *TopSet,
     err: *?anyerror,
     sketch_scratch: *SketchScratch,
+    residual_scratch: *SketchScratch,
 };
 
 fn siloGridWorker(job: SiloGridJob) void {
@@ -7591,6 +7989,8 @@ const SketchScratch = struct {
     views: []ColumnView = &.{},
     digests: []std.ArrayListUnmanaged(u128) = &.{},
     hashed: []?[]const u128 = &.{},
+    lengths: []std.ArrayListUnmanaged(u32) = &.{},
+    byte_lengths: []?[]const u32 = &.{},
     /// A collapsed batch's per-staged-column partials, compacted.
     partial_ints: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(i64) = @splat(.empty),
     partial_floats: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(f64) = @splat(.empty),
@@ -7617,10 +8017,15 @@ const SketchScratch = struct {
         for (self.digests) |*d| d.deinit(allocator);
         if (self.digests.len > 0) allocator.free(self.digests);
         if (self.hashed.len > 0) allocator.free(self.hashed);
+        for (self.lengths) |*l| l.deinit(allocator);
+        if (self.lengths.len > 0) allocator.free(self.lengths);
+        if (self.byte_lengths.len > 0) allocator.free(self.byte_lengths);
         self.stores = &.{};
         self.views = &.{};
         self.digests = &.{};
         self.hashed = &.{};
+        self.lengths = &.{};
+        self.byte_lengths = &.{};
     }
 
     /// One store per column of `batch`, typed like its views. A worker's
@@ -7646,10 +8051,17 @@ const SketchScratch = struct {
         errdefer allocator.free(digests);
         for (digests) |*d| d.* = .empty;
         const hashed = try allocator.alloc(?[]const u128, n);
+        errdefer allocator.free(hashed);
+        const lengths = try allocator.alloc(std.ArrayListUnmanaged(u32), n);
+        errdefer allocator.free(lengths);
+        for (lengths) |*l| l.* = .empty;
+        const byte_lengths = try allocator.alloc(?[]const u32, n);
         self.stores = stores;
         self.views = views;
         self.digests = digests;
         self.hashed = hashed;
+        self.lengths = lengths;
+        self.byte_lengths = byte_lengths;
     }
 
     fn holds(self: *const SketchScratch, batch: thindb.Batch) bool {
@@ -8007,7 +8419,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             m.* = sketch.keeps(id);
             kept += @intFromBool(m.*);
         }
-        return compactKept(job, allocator, batch, weights, ids, kept);
+        return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, kept);
     }
     const keys = try BatchKeys.init(layout, batch);
     try scratch.lanes.resize(allocator, keys.len * IDENTITY_LANE_ROWS);
@@ -8021,7 +8433,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
             kept += @intFromBool(m.*);
         }
     }
-    return compactKept(job, allocator, batch, weights, null, kept);
+    return compactKept(job, job.sketch_scratch, allocator, batch, weights, null, kept);
 }
 
 /// A heavy tally over one batch, a unit. A collapsed batch's rows are its
@@ -8080,7 +8492,7 @@ fn heavyKeptRows(job: SiloGridJob, allocator: Allocator, heavy: *const HeavyKeys
     const ids = scratch.ids.items;
     const ascending = if (weights) |rw| (if (rw.ascending_column) |ac| ac == key.index else false) else false;
     if (ascending and heavy.searchPays(batch.row_count)) {
-        return compactKept(job, allocator, batch, weights, ids, heavy.findSorted(key.values, mask, ids));
+        return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, heavy.findSorted(key.values, mask, ids));
     }
     var kept: usize = 0;
     for (mask, ids, 0..) |*m, *id, r| {
@@ -8091,7 +8503,7 @@ fn heavyKeptRows(job: SiloGridJob, allocator: Allocator, heavy: *const HeavyKeys
         m.* = heavy.keeps(id.*);
         kept += @intFromBool(m.*);
     }
-    return compactKept(job, allocator, batch, weights, ids, kept);
+    return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, kept);
 }
 
 /// A heavy pass's key: the lone non-nullable string key column, and its
@@ -8106,11 +8518,10 @@ fn heavyKeyColumn(job: SiloGridJob, batch: thindb.Batch) !struct { index: usize,
     };
 }
 
-/// The `kept` rows of `batch` the worker's scratch mask marks, compacted
-/// (with their weights) into the worker's scratch when only some are; null
-/// when none are. `ids`, when known, holds each row's identity.
-fn compactKept(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch, weights: ?RowWeights, ids: ?[]const u128, kept: usize) !?KeptRows {
-    const scratch = job.sketch_scratch;
+/// The `kept` rows of `batch` that `scratch`'s mask marks, compacted
+/// (with their weights) into `scratch` when only some are; null when none
+/// are. `ids`, when known, holds each row's identity.
+fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, batch: thindb.Batch, weights: ?RowWeights, ids: ?[]const u128, kept: usize) !?KeptRows {
     const mask = scratch.mask.items;
     const hashed_ids = if (job.shared.group_rows_layout.hashed_key) ids else null;
     if (kept == batch.row_count) return .{ .batch = batch, .weights = weights, .ids = hashed_ids };
@@ -8158,8 +8569,12 @@ fn compactKept(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch, weig
         try appendMaskedColumn(allocator, view, mask, &scratch.stores[ci]);
         scratch.views[ci] = scratch.stores[ci].view();
         scratch.hashed[ci] = null;
+        scratch.byte_lengths[ci] = null;
         // A sidecar can be shorter than `values` (a drive appends derived
         // columns past the scan's).
+        if (batch.byte_lengths) |ls| if (ci < ls.len) if (ls[ci]) |lengths| {
+            scratch.byte_lengths[ci] = try keepMasked(u32, allocator, lengths, mask, kept, &scratch.lengths[ci]);
+        };
         const hs = batch.hashed orelse continue;
         const digests = (if (ci < hs.len) hs[ci] else null) orelse continue;
         const out = &scratch.digests[ci];
@@ -8180,10 +8595,29 @@ fn compactKept(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch, weig
             .values = scratch.views,
             .row_count = kept,
             .hashed = if (batch.hashed != null) scratch.hashed else null,
+            .byte_lengths = if (batch.byte_lengths != null) scratch.byte_lengths else null,
         },
         .weights = kept_weights,
         .ids = kept_ids,
     };
+}
+
+/// The rows of `batch` that pass `expr`, compacted as keptRows compacts
+/// but into the worker's residual scratch, so a sketch pass after it keeps
+/// its own; null when none pass. A collapsed row passes or fails whole, as
+/// the columns `expr` reads are among those its rows share.
+fn residualRows(job: SiloGridJob, allocator: Allocator, expr: thindb.exec.PredicateExpr, scanned: thindb.Batch) !?KeptRows {
+    // Only the rest's Compute reads byte lengths past the filter.
+    var batch = scanned;
+    if (job.rest == null) batch.byte_lengths = null;
+    const scratch = job.residual_scratch;
+    try scratch.mask.resize(allocator, batch.row_count);
+    const mask = scratch.mask.items;
+    try thindb.exec.predicate.evaluateExprGuided(allocator, expr, batch.schema, batch, mask, null);
+    var kept: usize = 0;
+    for (mask) |m| kept += @intFromBool(m);
+    const weights = if (job.distinct) |gd| gd.rowWeights() else null;
+    return compactKept(job, scratch, allocator, batch, weights, null, kept);
 }
 
 fn keepMasked(comptime T: type, allocator: Allocator, values: []const T, mask: []const bool, kept: usize, out: *std.ArrayListUnmanaged(T)) ![]const T {
@@ -8229,19 +8663,23 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const scanned = maybe_batch orelse break;
         job.local.scan_batches += 1;
-        const weights = if (job.distinct) |gd| gd.rowWeights() else null;
+        const passed: KeptRows = if (job.shared.residual_filter) |expr| blk: {
+            const rows = (try residualRows(job, job.scan.allocator, expr, scanned)) orelse continue;
+            const rest = job.rest orelse break :blk rows;
+            break :blk .{ .batch = try rest.evalBatch(rows.batch), .weights = rows.weights, .ids = rows.ids };
+        } else .{ .batch = scanned, .weights = if (job.distinct) |gd| gd.rowWeights() else null };
         const kept: KeptRows = if (job.shared.count_sketch) |pass| switch (pass) {
             .tally => |sketch| {
-                try tallyRows(job, sketch, scanned, weights);
+                try tallyRows(job, sketch, passed.batch, passed.weights);
                 continue;
             },
-            .filter => |sketch| (try keptRows(job, job.scan.allocator, sketch, scanned, weights)) orelse continue,
+            .filter => |sketch| (try keptRows(job, job.scan.allocator, sketch, passed.batch, passed.weights)) orelse continue,
             .heavy_tally => |heavy| {
-                try heavyTallyRows(job, heavy, scanned, weights);
+                try heavyTallyRows(job, heavy, passed.batch, passed.weights);
                 continue;
             },
-            .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, scanned, weights)) orelse continue,
-        } else .{ .batch = scanned, .weights = weights };
+            .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, passed.batch, passed.weights)) orelse continue,
+        } else passed;
         const hashed_ids = if (layout.hashed_key) kept.ids orelse try batchIdentities(job, job.scan.allocator, kept.batch) else null;
         try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, hashed_ids, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
@@ -8703,6 +9141,9 @@ pub const RunConfig = struct {
     udf_registry: ?*const udf_mod.UdfRegistry = null,
     resources: ?*thindb.exec.memory.MemoryAccountant = null,
     filter_expr: ?thindb.exec.PredicateExpr = null,
+    /// The WHERE's conjuncts over `derived` columns, which filter each batch
+    /// once the Compute has added them.
+    residual_filter: ?thindb.exec.PredicateExpr = null,
     /// Hints the consumer offered on scan columns, after the filter's own.
     offered_prunes: Scan.OfferedPrunes = .{},
     key_bound: ?thindb.exec.KeyBoundSpec = null,
@@ -8973,7 +9414,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
     const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
-    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null));
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null or cfg.residual_filter != null));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
@@ -9058,6 +9499,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // `drives`, not `scans`.
     var drives = try allocator.alloc(thindb.exec.Query, n_workers);
     defer allocator.free(drives);
+    // The lower layers of a drive split at the residual filter; `drives`
+    // owns them.
+    var operand_drives = try allocator.alloc(thindb.exec.Query, n_workers);
+    defer allocator.free(operand_drives);
+    var residual_split: usize = 0;
     var built_scans: usize = 0;
     defer {
         const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
@@ -9163,6 +9609,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .group_rows_layout = group_rows_layout,
         .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
         .generic_filter_required = cfg.filter_expr != null,
+        .residual_filter = cfg.residual_filter,
         .count_sketch = cfg.count_sketch,
         .scan_threads = n_workers,
         .total_scan_rgs = claim_total_rgs,
@@ -9206,16 +9653,25 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        if (i == 0) residual_split = try residualSplit(allocator, cfg, scans[0].outputSchema());
         // Weighted integer-key programs consume RLE run headers directly (the
         // run-native emitter); hashed-key layouts pack from digests and string
         // extremes fold per row, so neither has a consumer for the sidecar.
         scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref and !cfg.group_rows_layout.has_str_payload;
         {
             var sq = thindb.exec.makeQuery(scan_allocator, scans[i]);
-            drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(cfg.derived, cfg.udf_registry) catch |e| {
+            const lower = if (residual_split > 0) cfg.derived[0..residual_split] else cfg.derived;
+            drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(lower, cfg.udf_registry) catch |e| {
                 sq.deinit();
                 return e;
             };
+            if (residual_split > 0) {
+                operand_drives[i] = drives[i];
+                drives[i] = operand_drives[i].computeWithRegistry(cfg.derived[residual_split..], cfg.udf_registry) catch |e| {
+                    operand_drives[i].deinit();
+                    return e;
+                };
+            }
         }
         built_scans += 1;
         if (cfg.scan_filter) {
@@ -9243,7 +9699,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     if (n_workers > 0) distinct: {
         const scan_schema = scans[0].outputSchema();
-        const column = (try dictEvalColumn(allocator, cfg, scan_schema)) orelse break :distinct;
+        const source = (try dictEvalColumn(allocator, cfg, scan_schema)) orelse break :distinct;
         if (cfg.derived.len != 0) {
             for (drives) |d| {
                 const compute = thindb.exec.queryAs(thindb.exec.Compute, d) orelse break :distinct;
@@ -9253,27 +9709,49 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         // All or none: a marked scan's string rows arrive as placeholders
         // that only the collapse below reads past.
         for (scans[0..n_workers]) |sc| {
-            if (sc.blockDictColumnIndex(scan_schema[column].name) == null) break :distinct;
+            for (source.columns[0..source.strings]) |j| {
+                if (sc.blockDictColumnIndex(scan_schema[j].name) == null) break :distinct;
+            }
         }
         const loc_column = for (scan_schema, 0..) |col, j| {
             if (types_mod.columnNameEql(col.name, rowloc.col_name)) break j;
         } else null;
-        // The scan's other columns are aggregate inputs. Each staged column
-        // over one folds it per dictionary code by its aggregate; the
-        // engine stages a copy of an input for each aggregate over it.
+        var pre_derived: [MAX_DICT_EVAL_COLUMNS]thindb.exec.Derived = undefined;
+        var later_derived: std.ArrayListUnmanaged(thindb.exec.Derived) = .empty;
+        defer later_derived.deinit(allocator);
+        var pre_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer pre_refs.deinit(allocator);
+        for (cfg.derived, 0..) |d, di| {
+            if (std.mem.indexOfScalar(usize, source.preDerived(), di)) |k| {
+                pre_derived[k] = d;
+                try thindb.exec.compute_op.collectColumnRefs(allocator, &pre_refs, d.expr);
+            } else try later_derived.append(allocator, d);
+        }
+        // The collapse reads the scan's columns, then the pre-evaluated ones.
+        var batch_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer batch_names.deinit(allocator);
+        for (scan_schema) |col| try batch_names.append(allocator, col.name);
+        for (pre_derived[0..source.n_pre]) |d| try batch_names.append(allocator, d.name);
+        // The other columns are aggregate inputs, or scan columns only
+        // pre-evaluated columns read. Each staged column over one folds it
+        // per collapsed value by its aggregate; the engine stages a copy of
+        // an input for each aggregate over it.
         const layout = cfg.group_rows_layout;
-        for (scan_schema, 0..) |col, j| {
-            if (j == column or (loc_column != null and j == loc_column.?)) continue;
+        for (batch_names.items, 0..) |name, j| {
+            if (std.mem.indexOfScalar(usize, source.slice(), j) != null or (loc_column != null and j == loc_column.?)) continue;
             for (layout.columns) |lc| {
-                if (types_mod.columnNameEql(lc.source_name, col.name)) break;
-            } else break :distinct;
+                if (types_mod.columnNameEql(lc.source_name, name)) break;
+            } else {
+                if (j < scan_schema.len and nameListed(pre_refs.items, name)) continue;
+                break :distinct;
+            }
         }
         var partials_buf: [MAX_GROUP_PAYLOAD_COLUMNS]DictPartial = undefined;
         var n_partials: usize = 0;
         for (layout.columns, 0..) |lc, c| {
-            const j = for (scan_schema, 0..) |col, j| {
-                if (j == column or (loc_column != null and j == loc_column.?)) continue;
-                if (types_mod.columnNameEql(col.name, lc.source_name)) break j;
+            const j = for (batch_names.items, 0..) |name, j| {
+                if (std.mem.indexOfScalar(usize, source.slice(), j) != null or (loc_column != null and j == loc_column.?)) continue;
+                if (types_mod.columnNameEql(name, lc.source_name)) break j;
             } else continue;
             const op: WeightFoldOp = for (layout.aggregates) |agg| {
                 if (agg.is_string or agg.input_column_index == null or agg.input_column_index.? != c) continue;
@@ -9287,20 +9765,52 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             partials_buf[n_partials] = .{ .column = j, .layout_column = c, .op = op };
             n_partials += 1;
         }
-        for (scans[0..n_workers]) |sc| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[column].name).?);
-        grid_distinct = try allocator.alloc(GridDictEval, n_workers);
-        for (grid_distinct, drives) |*gd, d| gd.* = .{
-            .compute = if (cfg.derived.len != 0) thindb.exec.queryAs(thindb.exec.Compute, d).? else null,
-            .column = column,
-            .loc_column = loc_column,
+        const evals = try allocator.alloc(GridDictEval, n_workers);
+        for (evals) |*gd| gd.* = .{ .compute = null, .source = source, .loc_column = loc_column };
+        var kept = false;
+        defer if (!kept) {
+            for (evals) |*gd| gd.deinit(allocator);
+            allocator.free(evals);
         };
+        for (evals, drives, scans[0..n_workers]) |*gd, d, sc| {
+            if (source.n_pre == 0) {
+                gd.compute = if (cfg.derived.len != 0) thindb.exec.queryAs(thindb.exec.Compute, d).? else null;
+                continue;
+            }
+            const base = thindb.exec.makeQuery(scan_allocator, sc);
+            const pre_q = try base.computeWithRegistry(pre_derived[0..source.n_pre], cfg.udf_registry);
+            gd.built_layers = .{ .top = pre_q, .base = base };
+            gd.pre = thindb.exec.queryAs(thindb.exec.Compute, pre_q).?;
+            if (later_derived.items.len == 0) continue;
+            const later_q = try pre_q.computeWithRegistry(later_derived.items, cfg.udf_registry);
+            gd.built_layers = .{ .top = later_q, .base = base };
+            gd.compute = thindb.exec.queryAs(thindb.exec.Compute, later_q).?;
+        }
+        // A pre-evaluated column folds or joins the combination as is: it
+        // can't be NULL, and in the combination it must be an integer.
+        if (evals[0].pre) |pre| {
+            const schema = pre.outputSchema();
+            for (schema[scan_schema.len..], scan_schema.len..) |col, j| {
+                if (col.nullable) break :distinct;
+                if (std.mem.indexOfScalar(usize, source.slice(), j) == null) continue;
+                switch (col.type) {
+                    .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {},
+                    else => break :distinct,
+                }
+            }
+        }
         if (n_partials > 0) {
-            for (grid_distinct) |*gd| {
+            for (evals) |*gd| {
                 gd.partials = try allocator.dupe(DictPartial, partials_buf[0..n_partials]);
                 gd.partial_views = try allocator.alloc(?ColumnView, layout.columns.len);
                 @memset(gd.partial_views, null);
             }
         }
+        for (scans[0..n_workers]) |sc| {
+            for (source.columns[0..source.strings]) |j| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[j].name).?);
+        }
+        kept = true;
+        grid_distinct = evals;
     }
 
     // A heavy tally over keys that don't arrive counted would hash every row.
@@ -9350,12 +9860,17 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     defer allocator.free(sketch_scratch);
     for (sketch_scratch) |*sc| sc.* = .{};
     defer for (sketch_scratch) |*sc| sc.deinit(scan_allocator);
+    const residual_scratch = try allocator.alloc(SketchScratch, n_workers);
+    defer allocator.free(residual_scratch);
+    for (residual_scratch) |*sc| sc.* = .{};
+    defer for (residual_scratch) |*sc| sc.deinit(scan_allocator);
 
     i = 0;
     while (i < n_workers) : (i += 1) {
         const job = SiloGridJob{
             .scan = scans[i],
-            .drive = &drives[i],
+            .drive = if (residual_split > 0) &operand_drives[i] else &drives[i],
+            .rest = if (residual_split > 0) thindb.exec.queryAs(thindb.exec.Compute, drives[i]).? else null,
             .distinct = if (grid_distinct.len > 0) &grid_distinct[i] else null,
             .local = &parts[i],
             .shared = &shared,
@@ -9380,6 +9895,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .top = &worker_tops[i],
             .err = &errs[i],
             .sketch_scratch = &sketch_scratch[i],
+            .residual_scratch = &residual_scratch[i],
         };
         threads[i] = try parallel.spawn(siloGridWorker, .{job});
     }

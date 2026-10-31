@@ -544,6 +544,8 @@ pub const RunRequest = struct {
     derived: []const exec.Derived = &.{},
     udf_registry: ?*const @import("../udf.zig").UdfRegistry = null,
     filter_expr: ?exec.PredicateExpr = null,
+    /// Filters each batch once `derived` has added its columns.
+    residual_filter: ?exec.PredicateExpr = null,
     /// Hints the consumer offered on scan columns; every scan gets them.
     offered_prunes: exec.Scan.OfferedPrunes = .{},
 };
@@ -657,7 +659,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: SiloCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.offered_prunes, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -678,7 +680,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.offered_prunes, &rows, &workspace);
+    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -732,12 +734,12 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
     return @as(u64, rg_count) >= 4 * @max(composite_runs, 1);
 }
 
-// A program whose scan reads one string column, deriving its key from it
-// (plus numeric aggregate inputs), evaluates once per row-group dictionary
-// value and folds the value's rows by count (`SiloCore.dictEvalSource`), so
-// its rows collapse whether or not they arrive in runs. A column the derived
-// expressions read only for its byte length arrives as lengths, not
-// dictionaries.
+// A program whose scan reads string columns, deriving its keys from them
+// (plus integer keys and numeric aggregate inputs), evaluates once per
+// distinct row-group dictionary value (or value combination) and folds its
+// rows by count (`SiloCore.dictEvalSource`), so its rows collapse whether or
+// not they arrive in runs. A column the derived expressions read only for
+// its byte length arrives as lengths, not dictionaries.
 fn dictionaryCollapses(
     allocator: Allocator,
     table: *api.Table,
@@ -745,6 +747,7 @@ fn dictionaryCollapses(
     scan_columns: ?[]const []const u8,
     derived: []const exec.Derived,
     udf_registry: ?*const @import("../udf.zig").UdfRegistry,
+    residual_filter: ?exec.PredicateExpr,
 ) !bool {
     var foldable: std.ArrayListUnmanaged([]const u8) = .empty;
     defer foldable.deinit(allocator);
@@ -764,8 +767,18 @@ fn dictionaryCollapses(
             try columns.append(allocator, col);
         }
     } else try columns.appendSlice(allocator, table.schema.columns);
-    const j = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items)) orelse return false;
-    return derived.len == 0 or !try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name);
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys.deinit(allocator);
+    for (shape.group_key_inputs) |key| try keys.append(allocator, key.name);
+    var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer filter_reads.deinit(allocator);
+    if (residual_filter) |expr| try exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
+    const source = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items, keys.items, filter_reads.items)) orelse return false;
+    if (derived.len == 0) return true;
+    for (source.columns[0..source.strings]) |j| {
+        if (try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name)) return false;
+    }
+    return true;
 }
 
 fn runHarness(
@@ -780,6 +793,7 @@ fn runHarness(
     udf_registry: ?*const @import("../udf.zig").UdfRegistry,
     resources: ?*exec.memory.MemoryAccountant,
     filter_expr: ?exec.PredicateExpr,
+    residual_filter: ?exec.PredicateExpr,
     offered_prunes: exec.Scan.OfferedPrunes,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
     workspace: *SiloCore.SiloGridWorkspace,
@@ -924,7 +938,7 @@ fn runHarness(
         // as does a program whose rows collapse per dictionary value.
         if (shape.aggregate_inputs.len != 0 and shape.string_aggregate_inputs.len == 0 and
             !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len]) and
-            !(params.distinct_eval and try dictionaryCollapses(allocator, table, shape, scan_columns, derived, udf_registry))) break :blk false;
+            !(params.distinct_eval and try dictionaryCollapses(allocator, table, shape, scan_columns, derived, udf_registry, residual_filter))) break :blk false;
         break :blk true;
     };
     // Weighted staged columns carry RUN PARTIALS, not row values: widen to
@@ -985,7 +999,8 @@ fn runHarness(
     // the scan emits per-row `stringKeyDigest` values straight off the cached
     // block, and the derived expressions' Compute passes them through.
     // Excluded when the column is also an aggregate input or read by a
-    // derived expression (those need real bytes in the batch).
+    // derived expression or the residual filter (those need real bytes in
+    // the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
     if (force_hash) {
@@ -1004,14 +1019,15 @@ fn runHarness(
                 if (types.columnNameEql(d.name, input.name)) continue :outer;
                 if (derivedReadsColumn(allocator, d, input.name) catch true) continue :outer;
             }
+            if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, input.name)) continue :outer;
             hash_key_cols_buf[n_hash_keys] = input.name;
             n_hash_keys += 1;
         }
     }
 
     // Scan-side byte lengths: a column the derived expressions read only
-    // through `octet_length` (and no key or aggregate reads) arrives as
-    // per-row lengths off the cached block, never as bytes.
+    // through `octet_length` (and no key, aggregate or residual filter
+    // reads) arrives as per-row lengths off the cached block, never as bytes.
     var length_cols_buf: [16][]const u8 = undefined;
     var n_length_cols: usize = 0;
     if (scan_columns) |cols| {
@@ -1026,6 +1042,7 @@ fn runHarness(
             for (shape.string_aggregate_inputs) |si| {
                 if (types.columnNameEql(si.source_name, name)) continue :outer;
             }
+            if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, name)) continue :outer;
             if (!try exec.compute_op.readsOnlyByteLength(allocator, derived, name)) continue;
             length_cols_buf[n_length_cols] = name;
             n_length_cols += 1;
@@ -1058,6 +1075,7 @@ fn runHarness(
         .udf_registry = udf_registry,
         .resources = resources,
         .filter_expr = filter_expr,
+        .residual_filter = residual_filter,
         .offered_prunes = offered_prunes,
         .shared_stage_builders = params.shared_stage_builders,
         .distinct_eval = params.distinct_eval,
