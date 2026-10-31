@@ -21,9 +21,12 @@
 //!
 //! `HeavyKeys` serves keys that arrive counted per row group (dictionary
 //! codes): its tally hashes only the values a row group holds many rows of.
+//! `DupSketch` serves near-unique keys, finding the few groups of two rows
+//! or more.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const parallel = @import("../util/parallel.zig");
 
 /// 2^18 u32 counters are 1 MiB per worker, and 100M rows leave ~380 rows of
 /// collision noise per counter: far below the counts a skewed key's top
@@ -76,6 +79,9 @@ pub const CountSketch = struct {
     kept_rows: u64 = 0,
     /// Where the tally records its rows' counters for the filter pass.
     row_slots: ?RowSlots = null,
+    /// Set when the tally declined because a key is near-unique, which
+    /// `DupSketch` serves.
+    near_unique: bool = false,
 
     pub fn init(allocator: Allocator, bits: u6, workers: usize) !CountSketch {
         std.debug.assert(bits >= 6);
@@ -95,13 +101,7 @@ pub const CountSketch = struct {
     }
 
     pub fn counter(self: *const CountSketch, identity: u128) usize {
-        var x: u64 = @as(u64, @truncate(identity)) ^ (@as(u64, @truncate(identity >> 64)) *% 0x9e3779b97f4a7c15);
-        x ^= x >> 33;
-        x *%= 0xff51afd7ed558ccd;
-        x ^= x >> 33;
-        x *%= 0xc4ceb9fe1a85ec53;
-        x ^= x >> 33;
-        return @intCast(x >> @intCast(64 - @as(u7, self.bits)));
+        return @intCast(identityHash(identity) >> @intCast(64 - @as(u7, self.bits)));
     }
 
     /// Counts each identity's rows (`weights[i]` of them, else one) into
@@ -203,15 +203,28 @@ pub const CountSketch = struct {
     }
 };
 
-/// Each row's counter, per row group a tally saw whole, so the filter pass's
-/// scan can drop the rows of the counters it doesn't keep before decoding
-/// them (`Scan.RowSieve`). The filter pass still tests every row it gets.
+/// The rows a tally saw of each row group it saw in stored order, and their
+/// counters, so the filter pass's scan can pick the rows of the counters it
+/// keeps without running its filter or decoding the rest
+/// (`Scan.RowSieve`).
 pub const RowSlots = struct {
     allocator: Allocator,
     /// Per segment of the snapshot, the flat index of its first row group.
     seg_first: []usize,
-    /// Per flat row group, its rows' counters once a tally records them.
+    /// Per flat row group, once a tally has recorded all of it: bit r set
+    /// for each row r the tally saw, and those rows' counters in row order.
+    held: []?[]const u64,
     rows: []?[]const u32,
+    /// Per flat row group, what a tally is still recording.
+    pending: []?Pending,
+
+    const Pending = struct {
+        held: []u64,
+        slots: []u32,
+        /// The row the next recorded rows start at, and the counters so far.
+        next: u32,
+        len: u32,
+    };
 
     /// Room for the row groups of `segments`, each entry's
     /// `row_group_count` of them.
@@ -223,25 +236,489 @@ pub const RowSlots = struct {
             first.* = total;
             total += entry.row_group_count;
         }
+        const held = try allocator.alloc(?[]const u64, total);
+        errdefer allocator.free(held);
         const rows = try allocator.alloc(?[]const u32, total);
+        errdefer allocator.free(rows);
+        const pending = try allocator.alloc(?Pending, total);
+        @memset(held, null);
         @memset(rows, null);
-        return .{ .allocator = allocator, .seg_first = seg_first, .rows = rows };
+        @memset(pending, null);
+        return .{ .allocator = allocator, .seg_first = seg_first, .held = held, .rows = rows, .pending = pending };
     }
 
     pub fn deinit(self: *RowSlots) void {
-        for (self.rows) |r| if (r) |slots| self.allocator.free(slots);
+        for (self.held, self.rows) |h, r| {
+            if (h) |bits| self.allocator.free(bits);
+            if (r) |slots| self.allocator.free(slots);
+        }
+        for (self.pending) |p| if (p) |open| self.freePending(open);
+        self.allocator.free(self.held);
         self.allocator.free(self.rows);
+        self.allocator.free(self.pending);
         self.allocator.free(self.seg_first);
     }
 
-    /// Room for the `n` counters of segment `seg`'s row group `rg`. Only
-    /// the worker that tallies a row group may record it.
-    pub fn record(self: *RowSlots, seg: usize, rg: usize, n: usize) ![]u32 {
-        const slots = try self.allocator.alloc(u32, n);
-        const at = &self.rows[self.seg_first[seg] + rg];
-        if (at.*) |prior| self.allocator.free(prior);
-        at.* = slots;
-        return slots;
+    fn freePending(self: *RowSlots, open: Pending) void {
+        self.allocator.free(open.held);
+        self.allocator.free(open.slots);
+    }
+
+    /// Room for the counters of the rows a tally sees of segment `seg`'s
+    /// row group `rg`, of `rows` rows, from row `offset` on: the next
+    /// `n`, or of those only the ones at `survivors`, ascending row-group
+    /// positions. Rows record in order: null when the rows before them
+    /// weren't. The row group's record takes effect with its last rows.
+    /// Only the worker that tallies a row group may record it.
+    pub fn record(self: *RowSlots, seg: usize, rg: usize, rows: u32, offset: u32, n: u32, survivors: ?[]const u32) !?[]u32 {
+        const i = self.seg_first[seg] + rg;
+        if (offset == 0) {
+            if (self.pending[i]) |prior| self.freePending(prior);
+            self.pending[i] = null;
+            const held = try self.allocator.alloc(u64, (rows + 63) / 64);
+            errdefer self.allocator.free(held);
+            @memset(held, 0);
+            self.pending[i] = .{ .held = held, .slots = try self.allocator.alloc(u32, rows), .next = 0, .len = 0 };
+        }
+        const open = if (self.pending[i]) |*p| p else return null;
+        if (open.next != offset) return null;
+        const start = open.len;
+        if (survivors) |at| {
+            for (at) |r| open.held[r >> 6] |= @as(u64, 1) << @intCast(r & 63);
+            open.len += @intCast(at.len);
+        } else {
+            holdRange(open.held, offset, offset + n);
+            open.len += n;
+        }
+        open.next = offset + n;
+        const out = open.slots[start..open.len];
+        if (open.next == rows) {
+            if (open.len > 0 and open.len < rows and self.allocator.resize(open.slots, open.len)) open.slots = open.slots[0..open.len];
+            if (self.held[i]) |prior| self.allocator.free(prior);
+            if (self.rows[i]) |prior| self.allocator.free(prior);
+            self.held[i] = open.held;
+            self.rows[i] = open.slots;
+            self.pending[i] = null;
+        }
+        return out;
+    }
+
+    fn holdRange(held: []u64, lo: usize, hi: usize) void {
+        var r = lo;
+        while (r < hi and r & 63 != 0) : (r += 1) held[r >> 6] |= @as(u64, 1) << @intCast(r & 63);
+        while (r + 64 <= hi) : (r += 64) held[r >> 6] = ~@as(u64, 0);
+        while (r < hi) : (r += 1) held[r >> 6] |= @as(u64, 1) << @intCast(r & 63);
+    }
+};
+
+fn identityHash(identity: u128) u64 {
+    var x: u64 = @as(u64, @truncate(identity)) ^ (@as(u64, @truncate(identity >> 64)) *% 0x9e3779b97f4a7c15);
+    x ^= x >> 33;
+    x *%= 0xff51afd7ed558ccd;
+    x ^= x >> 33;
+    x *%= 0xc4ceb9fe1a85ec53;
+    x ^= x >> 33;
+    return x;
+}
+
+/// Fingerprints a cache line holds. A worker gathers each partition's next
+/// line before copying it to the partition's pages, so the tally's scattered
+/// writes stay in cache.
+const DUP_LINE: usize = 16;
+
+/// Fingerprints a page holds: 1 KiB.
+const DUP_PAGE: usize = 256;
+
+/// Pages a worker carves from one allocation.
+const DUP_SLAB_PAGES: usize = 256;
+
+const DUP_NO_PAGE: u32 = std.math.maxInt(u32);
+
+/// Fingerprints a `DupSketch` partition aims to hold.
+const DUP_PART_TARGET: u64 = 64 * 1024;
+
+const DUP_MIN_PART_BITS: u6 = 4;
+/// Bounds a worker's gathering lines at 64 KiB, within L2 beside the scan's
+/// batches.
+const DUP_MAX_PART_BITS: u6 = 10;
+
+/// A settling set's mark on a fingerprint met twice; fingerprints are 31 bits.
+const DUP_REPEATED: u32 = 1 << 31;
+
+/// How many fingerprints ahead a settle prefetches the slot of: a large
+/// partition's set outgrows L2.
+const DUP_PREFETCH: usize = 8;
+
+/// Bits per kept fingerprint in the bitmap most rows fail first, and the
+/// bitmap's bounds (512 B to 16 MiB).
+const DUP_BITS_PER_KEPT: usize = 32;
+const DUP_MIN_BITS: usize = 1 << 12;
+const DUP_MAX_BITS: usize = 1 << 27;
+
+/// Exact top-K by COUNT(*) over near-unique keys, where nearly every group
+/// holds one row (finding duplicate IDs). CountSketch's counters can't tell
+/// a group of two from collision noise there.
+///
+/// The tally sends each row's identity hash to one of 2^part_bits
+/// partitions as a 31-bit fingerprint, and `settle` finds the fingerprints
+/// a partition holds more than once, and `need` it holds once. The filter
+/// pass groups the rows of those: every row of a group of two or more among
+/// them, and `need` groups of one. A dropped group then holds one row, so
+/// none outranks the need-th found (it may tie it); and with fewer than
+/// `need` groups of one, every row is kept.
+pub const DupSketch = struct {
+    need: usize,
+    part_bits: u6,
+    /// Grows the workers' pages, from their threads during a tally.
+    page_allocator: Allocator,
+    workers: []Worker,
+    /// Each row's fingerprint, per row group a tally saw whole, so the
+    /// filter pass's scan drops the rows of the others before decoding them.
+    row_slots: ?RowSlots = null,
+    /// After `settle`: the kept hashes as `partition << 32 | fingerprint`,
+    /// sorted; a bitmap by fingerprint that most rows fail first; and the
+    /// kept fingerprints alone, ascending, for the scan's sieve.
+    kept: []u64 = &.{},
+    kept_bits: []u64 = &.{},
+    kept_fingerprints: []u32 = &.{},
+    /// Whether the groups of one were fewer than `need`, so all are kept.
+    kept_all: bool = false,
+    rows: u64 = 0,
+    kept_rows: u64 = 0,
+
+    const Part = struct {
+        head: u32 = DUP_NO_PAGE,
+        tail: u32 = DUP_NO_PAGE,
+        tail_len: u32 = 0,
+    };
+
+    pub const Worker = struct {
+        /// Per partition, the line it gathers and how much of it is full.
+        lines: []align(64) [DUP_LINE]u32,
+        line_len: []u8,
+        parts: []Part,
+        /// Per page, the next of its partition's.
+        next_page: std.ArrayListUnmanaged(u32) = .empty,
+        slabs: std.ArrayListUnmanaged([]u32) = .empty,
+        rows: u64 = 0,
+        /// What the worker's share of `settle` found, and its set.
+        repeated: std.ArrayListUnmanaged(u64) = .empty,
+        singles: std.ArrayListUnmanaged(u64) = .empty,
+        kept_rows: u64 = 0,
+        set: []u32 = &.{},
+        err: ?anyerror = null,
+
+        fn init(allocator: Allocator, parts: usize) !Worker {
+            const lines = try allocator.alignedAlloc([DUP_LINE]u32, .@"64", parts);
+            errdefer allocator.free(lines);
+            const line_len = try allocator.alloc(u8, parts);
+            errdefer allocator.free(line_len);
+            const part_pages = try allocator.alloc(Part, parts);
+            @memset(line_len, 0);
+            @memset(part_pages, .{});
+            return .{ .lines = lines, .line_len = line_len, .parts = part_pages };
+        }
+
+        fn deinitParts(self: *Worker, allocator: Allocator) void {
+            allocator.free(self.lines);
+            allocator.free(self.line_len);
+            allocator.free(self.parts);
+        }
+
+        fn page(self: *const Worker, id: u32) []u32 {
+            return self.slabs.items[id / DUP_SLAB_PAGES][(id % DUP_SLAB_PAGES) * DUP_PAGE ..][0..DUP_PAGE];
+        }
+
+        fn partLen(self: *const Worker, p: usize) usize {
+            const at = self.parts[p];
+            var n: usize = self.line_len[p];
+            var id = at.head;
+            while (id != DUP_NO_PAGE) : (id = self.next_page.items[id]) n += if (id == at.tail) at.tail_len else DUP_PAGE;
+            return n;
+        }
+
+        fn freePages(self: *Worker, allocator: Allocator) void {
+            for (self.slabs.items) |slab| allocator.free(slab);
+            self.slabs.deinit(allocator);
+            self.slabs = .empty;
+            self.next_page.deinit(allocator);
+            self.next_page = .empty;
+        }
+
+        /// Counts `fps`, partition `part`'s, into `set`, noting each
+        /// fingerprint the moment it repeats.
+        fn settleFingerprints(self: *Worker, allocator: Allocator, set: []u32, part: usize, fps: []const u32) !void {
+            const mask = set.len - 1;
+            for (fps, 0..) |fp, i| {
+                if (i + DUP_PREFETCH < fps.len) @prefetch(&set[fps[i + DUP_PREFETCH] & mask], .{ .rw = .write });
+                var slot: usize = fp & mask;
+                while (true) : (slot = (slot + 1) & mask) {
+                    const held = set[slot];
+                    if (held == 0) {
+                        set[slot] = fp;
+                        break;
+                    }
+                    if (held & ~DUP_REPEATED != fp) continue;
+                    if (held == fp) {
+                        set[slot] = fp | DUP_REPEATED;
+                        try self.repeated.append(allocator, @as(u64, part) << 32 | fp);
+                        self.kept_rows += 2;
+                    } else self.kept_rows += 1;
+                    break;
+                }
+            }
+        }
+
+        /// Notes fingerprints `set` holds once, partition `part`'s, until
+        /// the worker has `need`.
+        fn pickSingles(self: *Worker, allocator: Allocator, set: []const u32, part: usize, need: usize) !void {
+            for (set) |held| {
+                if (self.singles.items.len >= need) return;
+                if (held == 0 or held & DUP_REPEATED != 0) continue;
+                try self.singles.append(allocator, @as(u64, part) << 32 | held);
+            }
+        }
+    };
+
+    /// Partitions sized for `rows` input rows, for `workers` workers.
+    pub fn init(allocator: Allocator, page_allocator: Allocator, need: usize, workers: usize, rows: u64) !DupSketch {
+        std.debug.assert(need > 0 and need <= MAX_NEED);
+        const want = std.math.log2_int_ceil(u64, @max(1, rows / DUP_PART_TARGET));
+        const part_bits: u6 = @intCast(std.math.clamp(want, DUP_MIN_PART_BITS, DUP_MAX_PART_BITS));
+        const ws = try allocator.alloc(Worker, workers);
+        var built: usize = 0;
+        errdefer {
+            for (ws[0..built]) |*w| w.deinitParts(allocator);
+            allocator.free(ws);
+        }
+        for (ws) |*w| {
+            w.* = try Worker.init(allocator, @as(usize, 1) << part_bits);
+            built += 1;
+        }
+        return .{ .need = need, .part_bits = part_bits, .page_allocator = page_allocator, .workers = ws };
+    }
+
+    pub fn deinit(self: *DupSketch, allocator: Allocator) void {
+        for (self.workers) |*w| {
+            w.freePages(self.page_allocator);
+            w.repeated.deinit(self.page_allocator);
+            w.singles.deinit(self.page_allocator);
+            self.page_allocator.free(w.set);
+            w.deinitParts(allocator);
+        }
+        allocator.free(self.workers);
+        if (self.row_slots) |*rs| rs.deinit();
+        if (self.kept.len > 0) allocator.free(self.kept);
+        if (self.kept_bits.len > 0) allocator.free(self.kept_bits);
+        if (self.kept_fingerprints.len > 0) allocator.free(self.kept_fingerprints);
+        self.* = undefined;
+    }
+
+    fn partition(self: *const DupSketch, hash: u64) usize {
+        return @intCast(hash >> @intCast(64 - @as(u7, self.part_bits)));
+    }
+
+    /// The hash's low 31 bits, which the partition's high bits don't
+    /// overlap. Zero marks an empty slot, so it becomes 1.
+    fn fingerprint(hash: u64) u32 {
+        const fp = @as(u32, @truncate(hash)) & ~DUP_REPEATED;
+        return fp | @intFromBool(fp == 0);
+    }
+
+    /// Sends each identity's fingerprint to its partition, twice for a row
+    /// standing for several (`weights[i]` > 1), and into `slots[i]` when
+    /// given. Only worker `w` may tally for `w`.
+    pub fn tally(self: *DupSketch, w: usize, ids: []const u128, weights: ?[]const u32, slots: ?[]u32) !void {
+        const worker = &self.workers[w];
+        for (ids, 0..) |id, i| {
+            const fp = try self.tallyRun(worker, id, if (weights) |ws| ws[i] else 1);
+            if (slots) |s| s[i] = fp;
+        }
+    }
+
+    /// Tallies `rows` rows of one identity.
+    pub fn tallyRows(self: *DupSketch, w: usize, identity: u128, rows: u64) !void {
+        _ = try self.tallyRun(&self.workers[w], identity, rows);
+    }
+
+    inline fn tallyRun(self: *DupSketch, worker: *Worker, identity: u128, rows: u64) !u32 {
+        const hash = identityHash(identity);
+        const part = self.partition(hash);
+        const fp = fingerprint(hash);
+        try self.append(worker, part, fp);
+        if (rows > 1) try self.append(worker, part, fp);
+        worker.rows += rows;
+        return fp;
+    }
+
+    inline fn append(self: *DupSketch, worker: *Worker, part: usize, fp: u32) !void {
+        const n = worker.line_len[part];
+        worker.lines[part][n] = fp;
+        if (n + 1 < DUP_LINE) {
+            worker.line_len[part] = n + 1;
+            return;
+        }
+        try self.flushLine(worker, part);
+        worker.line_len[part] = 0;
+    }
+
+    noinline fn flushLine(self: *DupSketch, worker: *Worker, part: usize) !void {
+        const at = &worker.parts[part];
+        if (at.tail == DUP_NO_PAGE or at.tail_len == DUP_PAGE) {
+            const id = try self.newPage(worker);
+            if (at.tail == DUP_NO_PAGE) at.head = id else worker.next_page.items[at.tail] = id;
+            at.tail = id;
+            at.tail_len = 0;
+        }
+        @memcpy(worker.page(at.tail)[at.tail_len..][0..DUP_LINE], &worker.lines[part]);
+        at.tail_len += DUP_LINE;
+    }
+
+    fn newPage(self: *DupSketch, worker: *Worker) !u32 {
+        const id: u32 = @intCast(worker.next_page.items.len);
+        try worker.next_page.ensureUnusedCapacity(self.page_allocator, 1);
+        if (id % DUP_SLAB_PAGES == 0) {
+            const slab = try self.page_allocator.alloc(u32, DUP_PAGE * DUP_SLAB_PAGES);
+            errdefer self.page_allocator.free(slab);
+            try worker.slabs.append(self.page_allocator, slab);
+        }
+        worker.next_page.appendAssumeCapacity(DUP_NO_PAGE);
+        return id;
+    }
+
+    /// Finds the fingerprints the partitions hold more than once, and
+    /// `need` they hold once, one thread per worker, then frees the pages.
+    /// False when the filter pass would keep too many rows to pay.
+    pub fn settle(self: *DupSketch, allocator: Allocator) !bool {
+        self.rows = 0;
+        for (self.workers) |w| self.rows += w.rows;
+        if (self.rows == 0) return false;
+
+        var next = std.atomic.Value(usize).init(0);
+        const helpers = try allocator.alloc(parallel.Helper, self.workers.len - 1);
+        defer allocator.free(helpers);
+        // A helper that doesn't start leaves its partitions to the others:
+        // this thread claims partitions until none are left.
+        var spawned: usize = 0;
+        for (helpers, 1..) |*h, t| {
+            h.* = parallel.spawn(settleWorker, .{ self, t, &next }) catch break;
+            spawned += 1;
+        }
+        settleWorker(self, 0, &next);
+        for (helpers[0..spawned]) |h| h.join();
+        for (self.workers) |*w| w.freePages(self.page_allocator);
+        for (self.workers) |w| {
+            if (w.err) |e| return e;
+        }
+
+        // A worker stops at `need` groups of one, so fewer in all means
+        // each found all of its partitions'.
+        var repeated: usize = 0;
+        var singles: usize = 0;
+        self.kept_rows = 0;
+        for (self.workers) |w| {
+            repeated += w.repeated.items.len;
+            singles += w.singles.items.len;
+            self.kept_rows += w.kept_rows;
+        }
+        if (self.kept_rows * MAX_KEPT_FRACTION_DENOM > self.rows) return false;
+        self.kept_all = singles < self.need;
+        const chosen = @min(singles, self.need);
+        self.kept_rows += chosen;
+
+        const kept = try allocator.alloc(u64, repeated + chosen);
+        errdefer allocator.free(kept);
+        var at: usize = 0;
+        for (self.workers) |w| {
+            @memcpy(kept[at..][0..w.repeated.items.len], w.repeated.items);
+            at += w.repeated.items.len;
+        }
+        for (self.workers) |w| {
+            const take = @min(w.singles.items.len, kept.len - at);
+            @memcpy(kept[at..][0..take], w.singles.items[0..take]);
+            at += take;
+        }
+        std.sort.pdq(u64, kept, {}, std.sort.asc(u64));
+
+        const bits = std.math.ceilPowerOfTwoAssert(usize, std.math.clamp(kept.len * DUP_BITS_PER_KEPT, DUP_MIN_BITS, DUP_MAX_BITS));
+        const kept_bits = try allocator.alloc(u64, bits / 64);
+        errdefer allocator.free(kept_bits);
+        @memset(kept_bits, 0);
+        const fingerprints = try allocator.alloc(u32, kept.len);
+        errdefer allocator.free(fingerprints);
+        for (kept, fingerprints) |k, *f| {
+            f.* = @truncate(k);
+            const b = f.* & (bits - 1);
+            kept_bits[b >> 6] |= @as(u64, 1) << @intCast(b & 63);
+        }
+        std.sort.pdq(u32, fingerprints, {}, std.sort.asc(u32));
+        var distinct: usize = 0;
+        for (fingerprints) |f| {
+            if (distinct > 0 and fingerprints[distinct - 1] == f) continue;
+            fingerprints[distinct] = f;
+            distinct += 1;
+        }
+        self.kept = kept;
+        self.kept_bits = kept_bits;
+        self.kept_fingerprints = try allocator.realloc(fingerprints, distinct);
+        return true;
+    }
+
+    fn settleWorker(self: *DupSketch, t: usize, next: *std.atomic.Value(usize)) void {
+        self.settlePartitions(t, next) catch |e| {
+            self.workers[t].err = e;
+        };
+    }
+
+    fn settlePartitions(self: *DupSketch, t: usize, next: *std.atomic.Value(usize)) !void {
+        const me = &self.workers[t];
+        const parts = @as(usize, 1) << self.part_bits;
+        while (true) {
+            const p = next.fetchAdd(1, .monotonic);
+            if (p >= parts) return;
+            var total: usize = 0;
+            for (self.workers) |*w| total += w.partLen(p);
+            if (total == 0) continue;
+            const cap = std.math.ceilPowerOfTwoAssert(usize, total * 2);
+            if (me.set.len < cap) {
+                self.page_allocator.free(me.set);
+                me.set = &.{};
+                me.set = try self.page_allocator.alloc(u32, cap);
+            }
+            const set = me.set[0..cap];
+            @memset(set, 0);
+            for (self.workers) |*w| {
+                const at = w.parts[p];
+                var id = at.head;
+                while (id != DUP_NO_PAGE) : (id = w.next_page.items[id]) {
+                    const n = if (id == at.tail) at.tail_len else DUP_PAGE;
+                    try me.settleFingerprints(self.page_allocator, set, p, w.page(id)[0..n]);
+                }
+                try me.settleFingerprints(self.page_allocator, set, p, w.lines[p][0..w.line_len[p]]);
+            }
+            if (me.singles.items.len < self.need) try me.pickSingles(self.page_allocator, set, p, self.need);
+        }
+    }
+
+    /// Whether `identity`'s fingerprint is a kept one of its partition:
+    /// true for every group of two rows or more, for the groups of one
+    /// `settle` chose, and for the few others sharing a fingerprint.
+    pub fn keeps(self: *const DupSketch, identity: u128) bool {
+        const hash = identityHash(identity);
+        const fp = fingerprint(hash);
+        const b = fp & (self.kept_bits.len * 64 - 1);
+        if ((self.kept_bits[b >> 6] >> @intCast(b & 63)) & 1 == 0) return false;
+        const key = @as(u64, self.partition(hash)) << 32 | fp;
+        return std.sort.binarySearch(u64, self.kept, key, orderU64) != null;
+    }
+
+    fn orderU64(a: u64, b: u64) std.math.Order {
+        return std.math.order(a, b);
+    }
+
+    /// Whether a filter pass that found `found` groups found the top `need`.
+    pub fn exact(self: *const DupSketch, found: usize) bool {
+        return found >= self.need or self.kept_all;
     }
 };
 
@@ -297,6 +774,9 @@ pub const HeavyKeys = struct {
     /// Set when the tally declined before scanning for want of input: the
     /// counter sketch would decline too.
     declined_small: bool = false,
+    /// Set when it declined because the key is near-unique, which
+    /// `DupSketch` serves.
+    near_unique: bool = false,
     /// After `settle`: the candidate keys, their signatures by open
     /// addressing (0 marks an empty slot), and the candidates by bytes when
     /// every candidate's bytes were kept.
@@ -949,4 +1429,62 @@ test "heavy keys search only when every candidate's bytes were kept" {
     try std.testing.expect(heavy.keeps(1) and heavy.keeps(2));
     try std.testing.expect(heavy.sorted == null);
     try std.testing.expect(!heavy.searchPays(1 << 20));
+}
+
+test "dup sketch keeps every repeated identity and need groups of one" {
+    const allocator = std.testing.allocator;
+    var dups = try DupSketch.init(allocator, allocator, 3, 2, 50_000);
+    defer dups.deinit(allocator);
+    var ids: [20_000]u128 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i;
+    var slots: [20_000]u32 = undefined;
+    try dups.tally(0, &ids, null, &slots);
+    for (&ids, 0..) |*id, i| id.* = 20_000 + i;
+    try dups.tally(1, &ids, null, null);
+    // Repeats within a worker, across workers, a collapsed row standing for
+    // three, and a run of two.
+    try dups.tally(1, &.{ 20_005, 7 }, null, null);
+    try dups.tally(0, &.{30_000}, &.{3}, null);
+    try dups.tallyRows(1, 40_000, 2);
+    try std.testing.expect(try dups.settle(allocator));
+    try std.testing.expectEqual(@as(u64, 40_007), dups.rows);
+    try std.testing.expect(!dups.kept_all);
+
+    var kept: usize = 0;
+    for (0..40_001) |i| kept += @intFromBool(dups.keeps(i));
+    for ([_]u128{ 7, 20_005, 30_000, 40_000 }) |id| try std.testing.expect(dups.keeps(id));
+    try std.testing.expect(kept >= 4 + 3 and kept < 4 + 3 + 8);
+    try std.testing.expect(dups.exact(3));
+    try std.testing.expect(!dups.exact(2));
+
+    // A kept row's recorded fingerprint passes the scan's sieve.
+    const order = struct {
+        fn f(a: u32, b: u32) std.math.Order {
+            return std.math.order(a, b);
+        }
+    }.f;
+    for (slots, 0..) |s, i| {
+        const passes = std.sort.binarySearch(u32, dups.kept_fingerprints, s, order) != null;
+        if (dups.keeps(i)) try std.testing.expect(passes);
+    }
+}
+
+test "dup sketch keeps every group of one short of the need" {
+    const allocator = std.testing.allocator;
+    var dups = try DupSketch.init(allocator, allocator, 10, 2, 100);
+    defer dups.deinit(allocator);
+    try dups.tally(0, &.{ 1, 2, 3 }, null, null);
+    try std.testing.expect(try dups.settle(allocator));
+    for ([_]u128{ 1, 2, 3 }) |id| try std.testing.expect(dups.keeps(id));
+    try std.testing.expect(dups.kept_all and dups.exact(3));
+}
+
+test "dup sketch declines keys that repeat too often to pay" {
+    const allocator = std.testing.allocator;
+    var dups = try DupSketch.init(allocator, allocator, 1, 1, 1000);
+    defer dups.deinit(allocator);
+    var ids: [1000]u128 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i % 300;
+    try dups.tally(0, &ids, null, null);
+    try std.testing.expect(!try dups.settle(allocator));
 }

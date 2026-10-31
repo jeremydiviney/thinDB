@@ -2786,6 +2786,154 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
     }
 }
 
+const NuRow = struct { id: i64, w: i64, ip: i32, s: []const u8, u: []const u8, r: i32, x: i32 };
+const NuGroup = struct { ip: i32, c: i64 = 0, sr: i64 = 0, sx: i64 = 0 };
+const NuForm = enum { wide, string, narrow };
+const NuCase = struct { sql: []const u8, form: NuForm, limit: usize, offset: usize, keep: *const fn (NuRow) bool };
+
+fn nuKeepAll(_: NuRow) bool {
+    return true;
+}
+
+fn nuKeepTagged(r: NuRow) bool {
+    return r.s.len != 0;
+}
+
+fn nuKeepSmallX(r: NuRow) bool {
+    return r.x < 990;
+}
+
+/// The result's rows are distinct groups of the rows `c.keep` passes, with
+/// their exact aggregates, and their counts are the best counts there are.
+fn checkNearUnique(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const NuRow, live: []const bool, c: NuCase) !void {
+    errdefer std.debug.print("query: {s}\n", .{c.sql});
+    var want: std.AutoHashMapUnmanaged(i64, NuGroup) = .empty;
+    defer want.deinit(allocator);
+    for (rows, live) |r, keep| {
+        if (!keep or !c.keep(r)) continue;
+        const g = try want.getOrPut(allocator, r.w);
+        if (!g.found_existing) g.value_ptr.* = .{ .ip = r.ip };
+        g.value_ptr.c += 1;
+        g.value_ptr.sr += r.r;
+        g.value_ptr.sx += r.x;
+    }
+    const best = try allocator.alloc(i64, want.count());
+    defer allocator.free(best);
+    var it = want.valueIterator();
+    var bi: usize = 0;
+    while (it.next()) |g| : (bi += 1) best[bi] = g.c;
+    std.sort.pdq(i64, best, {}, std.sort.desc(i64));
+
+    var seen: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    defer seen.deinit(allocator);
+    var got: std.ArrayList(i64) = .empty;
+    defer got.deinit(allocator);
+    const count_col: usize = if (c.form == .wide) 2 else 1;
+    var q = try runSql(allocator, db, c.sql);
+    defer q.deinit();
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            const w: i64 = switch (c.form) {
+                .string => try std.fmt.parseInt(i64, batch.values[0].data.string.rowBytes(r)[1..], 10),
+                .wide, .narrow => @intFromFloat((try cellNumber(batch.values[0], r)).?),
+            };
+            const g = want.get(w) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(!(try seen.getOrPut(allocator, w)).found_existing);
+            try std.testing.expectEqual(@as(?f64, @floatFromInt(g.c)), try cellNumber(batch.values[count_col], r));
+            if (c.form == .wide) {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(g.ip)), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(g.sr)), try cellNumber(batch.values[3], r));
+                const avg: f64 = @as(f64, @floatFromInt(g.sx)) / @as(f64, @floatFromInt(g.c));
+                try std.testing.expectApproxEqAbs(avg, (try cellNumber(batch.values[4], r)).?, 1e-9);
+            }
+            try got.append(allocator, g.c);
+        }
+    }
+    try std.testing.expectEqual(c.limit, got.items.len);
+    std.sort.pdq(i64, got.items, {}, std.sort.desc(i64));
+    try std.testing.expectEqualSlices(i64, best[c.offset..][0..c.limit], got.items);
+}
+
+test "V2 COUNT top-K over nearly unique keys groups only the keys that repeat" {
+    const allocator = std.testing.allocator;
+    const base_rows = 300_000;
+    // A base row's index and how many more rows repeat its key; every other
+    // key is a group of one.
+    const repeats = [_][2]usize{ .{ 7, 1 }, .{ 1000, 2 }, .{ 5000, 40 }, .{ 50_001, 2 }, .{ 66_666, 1 }, .{ 120_002, 2 }, .{ 133_333, 1 }, .{ 180_000, 1 }, .{ 199_003, 2 }, .{ 250_000, 1 } };
+    const total = comptime blk: {
+        var n: usize = base_rows;
+        for (repeats) |r| n += r[1];
+        break :blk n;
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = 4 });
+    defer db.close();
+    const t = try db.table("hits", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "w", .type = .bigint },
+            .{ .name = "ip", .type = .int },
+            .{ .name = "s", .type = .string },
+            .{ .name = "u", .type = .string },
+            .{ .name = "r", .type = .int },
+            .{ .name = "x", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const rows = try allocator.alloc(NuRow, total + 2);
+    defer allocator.free(rows);
+    const live = try allocator.alloc(bool, total + 2);
+    defer allocator.free(live);
+    @memset(live, true);
+    var n: usize = 0;
+    var next_repeat: usize = 0;
+    for (0..base_rows) |i| {
+        const w: i64 = @intCast((i * 2654435761) % (1 << 40));
+        const u = try std.fmt.allocPrint(arena.allocator(), "u{d}", .{w});
+        const ip: i32 = @intCast(i % 1000);
+        rows[n] = .{ .id = 0, .w = w, .ip = ip, .s = if (i % 5 == 0) "" else "p", .u = u, .r = @intCast(i % 3), .x = @intCast(i % 1000) };
+        n += 1;
+        if (next_repeat < repeats.len and repeats[next_repeat][0] == i) {
+            for (0..repeats[next_repeat][1]) |j| {
+                rows[n] = .{ .id = 0, .w = w, .ip = ip, .s = if (j % 3 == 2) "" else "p", .u = u, .r = @intCast(1 + j % 2), .x = @intCast(7 + j) };
+                n += 1;
+            }
+            next_repeat += 1;
+        }
+    }
+    // Ids scatter each repeated key's rows over the row groups.
+    for (rows[0..total], 0..) |*r, pos| r.id = @intCast((pos * 7919) % total);
+    try t.insert(rows[0..total]);
+    try t.flush();
+
+    const cases = [_]NuCase{
+        .{ .sql = "SELECT w, ip, COUNT(*) AS c, SUM(r) AS sr, AVG(x) AS ax FROM hits GROUP BY w, ip ORDER BY c DESC LIMIT 15", .form = .wide, .limit = 15, .offset = 0, .keep = nuKeepAll },
+        .{ .sql = "SELECT w, ip, COUNT(*) AS c, SUM(r) AS sr, AVG(x) AS ax FROM hits WHERE s <> '' GROUP BY w, ip ORDER BY c DESC LIMIT 4", .form = .wide, .limit = 4, .offset = 0, .keep = nuKeepTagged },
+        .{ .sql = "SELECT u, COUNT(*) AS c FROM hits GROUP BY u ORDER BY c DESC LIMIT 6 OFFSET 7", .form = .string, .limit = 6, .offset = 7, .keep = nuKeepAll },
+        .{ .sql = "SELECT w, COUNT(*) AS c FROM hits WHERE x < 990 GROUP BY w ORDER BY c DESC LIMIT 25", .form = .narrow, .limit = 25, .offset = 0, .keep = nuKeepSmallX },
+    };
+    for (cases) |c| try checkNearUnique(allocator, db, rows[0..total], live[0..total], c);
+
+    // Deleted rows and memtable rows: a key whose second row is only in the
+    // memtable, and one more row of a repeated key.
+    try exec(allocator, db, "DELETE FROM hits WHERE id % 97 = 0");
+    for (rows[0..total], live[0..total]) |r, *keep| keep.* = @mod(r.id, 97) != 0;
+    const repeated_w: i64 = @intCast((1000 * 2654435761) % (1 << 40));
+    rows[total] = rows[77_777];
+    rows[total + 1] = for (rows[0..total]) |r| {
+        if (r.w == repeated_w) break r;
+    } else unreachable;
+    for (rows[total..], 0..) |*r, j| r.id = @intCast(total + j);
+    try t.insert(rows[total..]);
+    for (cases) |c| try checkNearUnique(allocator, db, rows, live, c);
+}
+
 test "V2 COUNT(DISTINCT) top-K stays exact when the count sketch drops the small groups" {
     const allocator = std.testing.allocator;
     // Twelve groups of 1000+ rows by one user, ten of 600 rows by 300 users,
