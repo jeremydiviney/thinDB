@@ -502,8 +502,9 @@ pub const Shape = struct {
     count_sketch: bool = false,
     count_rank: ?CountRank = null,
     // The HAVING over the groups, as bounds the core prunes staged rows by
-    // (see SiloCore.HavingBound). Null without a HAVING.
-    having_bound: ?SiloCore.HavingBound = null,
+    // (see SiloCore.HavingBound). Null without a HAVING. By pointer, as in
+    // SiloCore.RunConfig.
+    having_bound: ?*const SiloCore.HavingBound = null,
 };
 
 /// A count no greater than a group's row count (COUNT(DISTINCT)) that the

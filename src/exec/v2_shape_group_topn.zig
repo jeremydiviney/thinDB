@@ -777,10 +777,11 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const scan_columns = ctx.plan.scan_base_columns;
     var bound_nodes: [MAX_HAVING_BOUND_NODES]SiloCore.HavingBound = undefined;
     var bound_used: usize = 0;
-    const having_bound: ?SiloCore.HavingBound = if (ctx.request.having_filter orelse ctx.request.bound_having) |having|
-        havingBound(&ctx.plan, having, &bound_nodes, &bound_used)
-    else
-        null;
+    var bound_root: SiloCore.HavingBound = .any_group;
+    const having_bound: ?*const SiloCore.HavingBound = if (ctx.request.having_filter orelse ctx.request.bound_having) |having| blk: {
+        bound_root = havingBound(&ctx.plan, having, &bound_nodes, &bound_used);
+        break :blk &bound_root;
+    } else null;
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,

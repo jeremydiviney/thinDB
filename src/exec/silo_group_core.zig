@@ -9919,8 +9919,10 @@ pub const RunConfig = struct {
     // The caller's ORDER BY ... LIMIT over the all-groups emit; see EmitRank.
     result_rank: ?EmitRank = null,
     // The HAVING the emit applies, as per-slot bounds the drains prune by
-    // (see SlotBound).
-    having_bound: ?HavingBound = null,
+    // (see SlotBound). Held by pointer: Zig 0.16's self-hosted x86_64 backend
+    // (Debug on Linux) miscompiles this literal-built struct with the
+    // 16-byte-aligned union inline, clobbering a neighboring field.
+    having_bound: ?*const HavingBound = null,
     trace_timing: bool = false,
     workspace: ?*SiloGridWorkspace = null,
 };
@@ -10397,7 +10399,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             estimated_groups >= SLOT_BOUND_MIN_GROUPS and bucket_count <= std.math.maxInt(u16))
         {
             const hold_limit: u64 = if (resources) |a| a.pool.budget / DEFER_FOLD_BUDGET_DIVISOR else SLOT_BOUND_DEFAULT_HOLD_BYTES;
-            shared.slot_bound = try SlotBound.create(allocator, group_rows_layout, having, slotBoundBits(estimated_groups), total, hold_limit);
+            shared.slot_bound = try SlotBound.create(allocator, group_rows_layout, having.*, slotBoundBits(estimated_groups), total, hold_limit);
         }
     }
     defer if (shared.slot_bound) |bound| bound.destroy(allocator);
