@@ -3387,3 +3387,93 @@ test "group keys packed past 96 bits keep groups that differ only in their high 
         }
     }
 }
+
+test "grouped engines take computed comparison operands as CASE operands (keys, conditional sums, global)" {
+    // `octet_length(s) > 3` compares a computed operand, which the parser
+    // materializes in a Compute below the one reading it.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const n = 240;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, ns STRING)");
+        var long_by_g = [_]i64{ 0, 0, 0 };
+        var rows_by_g = [_]i64{ 0, 0, 0 };
+        var long_ids: i64 = 0;
+        var ns_long: i64 = 0;
+        var ns_null: i64 = 0;
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, ns) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const s = words[i % words.len];
+                const g = i % 3;
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                if (i % 5 == 0) {
+                    try buf.print(allocator, "({d},{d},'{s}',NULL)", .{ i, g, s });
+                    ns_null += 1;
+                } else {
+                    try buf.print(allocator, "({d},{d},'{s}','{s}')", .{ i, g, s, s });
+                    if (s.len > 3) ns_long += 1;
+                }
+                rows_by_g[g] += 1;
+                if (s.len > 3) {
+                    long_by_g[g] += 1;
+                    long_ids += @intCast(i);
+                }
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+        const long_total = long_by_g[0] + long_by_g[1] + long_by_g[2];
+
+        const by_key = "SELECT octet_length(s) > 3 AS lng, COUNT(*) AS c FROM t GROUP BY lng ORDER BY c DESC LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, by_key, "(V2 "));
+        var q = try runSql(allocator, db, by_key);
+        defer q.deinit();
+        var counts: std.ArrayList(i64) = .empty;
+        defer counts.deinit(allocator);
+        while (try q.next()) |b| try counts.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        std.mem.sort(i64, counts.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, &.{ long_total, n - long_total }, counts.items);
+
+        const nullable_key = "SELECT octet_length(ns) > 3 AS lng, COUNT(*) AS c FROM t GROUP BY lng ORDER BY c DESC LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, nullable_key, "(V2 "));
+        var nq = try runSql(allocator, db, nullable_key);
+        defer nq.deinit();
+        counts.clearRetainingCapacity();
+        while (try nq.next()) |b| try counts.appendSlice(allocator, b.values[1].data.bigint[0..b.row_count]);
+        std.mem.sort(i64, counts.items, {}, std.sort.asc(i64));
+        var want = [_]i64{ ns_long, ns_null, n - ns_long - ns_null };
+        std.mem.sort(i64, &want, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, &want, counts.items);
+
+        const conditional = "SELECT g, SUM(CASE WHEN octet_length(s) > 3 THEN 1 ELSE 0 END) AS longs, COUNT(*) AS c FROM t WHERE g <> 1 GROUP BY g ORDER BY g LIMIT 10";
+        try std.testing.expect(try planContains(allocator, db, conditional, "(V2 "));
+        var cq = try runSql(allocator, db, conditional);
+        defer cq.deinit();
+        var seen: usize = 0;
+        while (try cq.next()) |b| {
+            for (0..b.row_count) |r| {
+                const g: usize = @intFromFloat((try cellNumber(b.values[0], r)).?);
+                try std.testing.expect(g != 1);
+                try std.testing.expectEqual(long_by_g[g], b.values[1].data.bigint[r]);
+                try std.testing.expectEqual(rows_by_g[g], b.values[2].data.bigint[r]);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), seen);
+
+        const global = "SELECT SUM(CASE WHEN octet_length(s) > 3 THEN id ELSE 0 END) AS x FROM t";
+        try std.testing.expect(try planContains(allocator, db, global, "(V2 "));
+        var gq = try runSql(allocator, db, global);
+        defer gq.deinit();
+        const gb = (try gq.next()).?;
+        try std.testing.expectEqual(long_ids, gb.values[0].data.bigint[0]);
+    }
+}
