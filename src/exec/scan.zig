@@ -4831,12 +4831,13 @@ pub const Scan = struct {
     /// its row window `[pending_lo, hi)` is one of its survivors and the
     /// window's null bitmaps start byte-aligned for the dense masked pass.
     /// A tail of up to a quarter sub-batch rides along rather than becoming
-    /// its own batch. A scan emitting block dictionaries keeps the row group
-    /// whole, as its unfiltered batches do: its consumer folds each batch
-    /// over the whole dictionary.
+    /// its own batch. A scan emitting block dictionaries, digests or codes
+    /// keeps the row group whole, as its unfiltered batches do: each batch
+    /// costs a pass over the block's whole dictionary.
     fn materializeNextSlice(self: *Scan, seg: *storage.ReadSegment, mask: []const bool) !usize {
         const rows = self.pending_rows;
-        const sub = if (self.n_dicts > 0) 0 else self.sub_batch_rows;
+        const per_dictionary = self.n_dicts > 0 or self.n_hashed > 0 or self.n_coded > 0;
+        const sub = if (per_dictionary) 0 else self.sub_batch_rows;
         var n = rows.len;
         var hi: usize = self.pending_rg_count;
         // `sub` is a positive multiple of 64 and survivor rows are distinct
