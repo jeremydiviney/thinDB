@@ -807,6 +807,8 @@ const SeqStep = union(enum) {
     optional: SeqOptional,
     save: u32,
     eol,
+    /// The plan's last step: the match ends here.
+    accept,
 };
 
 /// A fixed-width body that may be absent; capture `slot` spans it when
@@ -855,6 +857,7 @@ const SeqPlan = struct {
         if (anchored) nodes = nodes[1..];
         for (nodes) |n| if (!try b.add(n)) return null;
         if (!resolveSeq(b.steps.items, b.parts.items, b.bytes.items)) return null;
+        try b.steps.append(allocator, .accept);
         const steps = try b.steps.toOwnedSlice(allocator);
         errdefer allocator.free(steps);
         const parts = try b.parts.toOwnedSlice(allocator);
@@ -903,26 +906,36 @@ const SeqPlan = struct {
         var n_choices: usize = 0;
         var i: usize = 0;
         var pos = sp;
-        while (i < self.steps.len) {
-            if (budgeted) {
-                if (work.* == 0) return null;
-                work.* -= 1;
-            }
-            const ok = switch (self.steps[i]) {
-                .literal => |lit| blk: {
-                    if (!self.literalAt(lit, input, pos)) break :blk false;
-                    pos += lit.len;
-                    break :blk true;
+        while (true) {
+            // Each step dispatches the next one itself, so every kind of
+            // step has its own indirect branch, which learns what follows
+            // it in this pattern; one shared dispatch mispredicted on most
+            // values.
+            step: switch (std.meta.activeTag(self.steps[i])) {
+                .literal => {
+                    if (exhausted(budgeted, work)) return null;
+                    const lit = self.steps[i].literal;
+                    if (self.literalAt(lit, input, pos)) {
+                        pos += lit.len;
+                        i += 1;
+                        continue :step std.meta.activeTag(self.steps[i]);
+                    }
                 },
-                .run => |*r| blk: {
+                .run => {
+                    if (exhausted(budgeted, work)) return null;
+                    const r = &self.steps[i].run;
                     const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
                     const end = starRunEnd(r.scan, &r.class, input[0..@min(input.len, limit)], pos);
-                    if (end - pos < r.min) break :blk false;
-                    if (budgeted) work.* -|= end - pos;
-                    pos = end;
-                    break :blk true;
+                    if (end - pos >= r.min) {
+                        if (budgeted) work.* -|= end - pos;
+                        pos = end;
+                        i += 1;
+                        continue :step std.meta.activeTag(self.steps[i]);
+                    }
                 },
-                .optional => |*o| blk: {
+                .optional => {
+                    if (exhausted(budgeted, work)) return null;
+                    const o = &self.steps[i].optional;
                     var present = o.mode != .never and self.bodyAt(o, input, pos);
                     if (present and (o.mode == .greedy_choice or o.mode == .lazy_choice)) {
                         choices[n_choices] = .{ .step = i, .pos = pos };
@@ -931,17 +944,23 @@ const SeqPlan = struct {
                     }
                     setOptional(o.slot, slots, pos, if (present) o.width else null);
                     if (present) pos += o.width;
-                    break :blk true;
+                    i += 1;
+                    continue :step std.meta.activeTag(self.steps[i]);
                 },
-                .save => |slot| blk: {
-                    slots[slot] = pos;
-                    break :blk true;
+                .save => {
+                    if (exhausted(budgeted, work)) return null;
+                    slots[self.steps[i].save] = pos;
+                    i += 1;
+                    continue :step std.meta.activeTag(self.steps[i]);
                 },
-                .eol => pos == input.len,
-            };
-            if (ok) {
-                i += 1;
-                continue;
+                .eol => {
+                    if (exhausted(budgeted, work)) return null;
+                    if (pos == input.len) {
+                        i += 1;
+                        continue :step std.meta.activeTag(self.steps[i]);
+                    }
+                },
+                .accept => return pos,
             }
             // The latest choice point takes its other branch, which is
             // known to fit: a choice is only recorded where the body
@@ -955,7 +974,14 @@ const SeqPlan = struct {
             pos = if (present) c.pos + o.width else c.pos;
             i = c.step + 1;
         }
-        return pos;
+    }
+
+    /// Charges one step to `work`; true when none was left.
+    inline fn exhausted(comptime budgeted: bool, work: *usize) bool {
+        if (!budgeted) return false;
+        if (work.* == 0) return true;
+        work.* -= 1;
+        return false;
     }
 
     inline fn setOptional(slot: ?u32, slots: []?usize, pos: usize, width: ?u32) void {
@@ -1212,7 +1238,7 @@ fn resolveSeq(steps: []SeqStep, parts: []const SeqPart, bytes: []const u8) bool 
                 }
                 for (&first.bits, bf.bits) |*x, y| x.* |= y;
             },
-            .save => {},
+            .save, .accept => {},
             .eol => {
                 first = .{};
                 empty = false;
@@ -2195,15 +2221,33 @@ pub const Regex = struct {
         start: usize,
         occurrence: usize,
     ) Error![]const u8 {
-        const allocator = scratch.backing;
+        const out = &scratch.out_buf;
+        out.clearRetainingCapacity();
+        try self.replaceInto(scratch.backing, out, input, template, scratch, start, occurrence);
+        return out.items;
+    }
+
+    /// `replaceScratch` appending the result to `out` rather than returning
+    /// it, so a kernel writes each row's result straight into its output
+    /// column.
+    pub fn replaceInto(
+        self: *const Regex,
+        allocator: Allocator,
+        out: *std.ArrayList(u8),
+        input: []const u8,
+        template: []const u8,
+        scratch: *Scratch,
+        start: usize,
+        occurrence: usize,
+    ) Error!void {
         if (scratch.slots.len < self.n_slots) {
             scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
         }
         const slots = scratch.slots[0..self.n_slots];
 
-        const out = &scratch.out_buf;
-        out.clearRetainingCapacity();
-        try out.appendSlice(allocator, input[0..start]);
+        // Empty pieces are skipped: each append is an out-of-line capacity
+        // check, and an anchored match usually leaves nothing around it.
+        if (start > 0) try out.appendSlice(allocator, input[0..start]);
 
         var pos: usize = start;
         var seen: usize = 0;
@@ -2213,7 +2257,7 @@ pub const Regex = struct {
             if (!found) break;
             const m_start = slots[0].?;
             const m_end = slots[1].?;
-            try out.appendSlice(allocator, input[pos..m_start]);
+            if (m_start > pos) try out.appendSlice(allocator, input[pos..m_start]);
             if (m_end == m_start and last_end == m_start) {
                 pos = afterMatch(input, m_start, m_end);
                 try out.appendSlice(allocator, input[m_end..@min(pos, input.len)]);
@@ -2234,7 +2278,6 @@ pub const Regex = struct {
             if (seen == occurrence or (self.anchored_start and !self.multiline)) break;
         }
         if (pos < input.len) try out.appendSlice(allocator, input[pos..]);
-        return out.items;
     }
 
     /// The `occurrence`-th (1-based) match at or after byte `start`, each

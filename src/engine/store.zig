@@ -75,6 +75,12 @@ pub const StringStore = struct {
 
     pub fn appendValue(self: *StringStore, allocator: Allocator, slice: []const u8) !void {
         try self.bytes.appendSlice(allocator, slice);
+        return self.endValue(allocator);
+    }
+
+    /// Ends a value whose bytes the caller appended to `bytes` itself: the
+    /// bytes since the previous value's end become the next row.
+    pub fn endValue(self: *StringStore, allocator: Allocator) !void {
         const total = self.bytes.items.len;
         if (self.wide_offsets) |*wo| {
             try wo.append(allocator, total);

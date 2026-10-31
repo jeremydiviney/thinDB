@@ -37,6 +37,9 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     const a = RegexArgs.init(args, row_count);
     var call = RegexCall.init(allocator, a, if (args.len > 5) 5 else null);
     defer call.deinit();
+    if (a.onlyTextVaries() and !a.isOnce(0) and !a.once_null) {
+        if (try call.at(0)) |re| return replaceEachText(allocator, a, re, &call.scratch, out, base, row_count);
+    }
     const replacements = stringViewOf(args[2]);
     const sv = stringViewOf(args[0]);
     var repeat = RepeatedText.init(a);
@@ -53,16 +56,58 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
         const s = sv.rowBytes(a.rowOf(0, i));
         if (!repeat.check(s)) {
             const start = if (args.len > 3) try regexStart(s, a.bigint(3, i), 1) else 0;
-            // Occurrence 0 replaces every match; MySQL reads a negative one as 1.
-            const occurrence: usize = if (args.len > 4) switch (a.bigint(4, i)) {
-                std.math.minInt(i64)...-1 => 1,
-                else => |n| @intCast(n),
-            } else 0;
-            replaced = try re.?.replaceScratch(s, replacements.rowBytes(a.rowOf(2, i)), &call.scratch, start, occurrence);
+            replaced = try re.?.replaceScratch(s, replacements.rowBytes(a.rowOf(2, i)), &call.scratch, start, replaceOccurrence(a, i));
         }
         try stringStoreOf(out).appendValue(allocator, replaced);
         try out.appendValidBit(allocator, base + i, true);
     }
+}
+
+/// REGEXP_REPLACE where only the text varies by row: every row's result is
+/// written straight into the output column, and the result is NULL exactly
+/// where the text is.
+fn replaceEachText(allocator: Allocator, a: RegexArgs, re: *const regex.Regex, scratch: *regex.Scratch, out: *ColumnStore, base: usize, row_count: usize) !void {
+    const sv = stringViewOf(a.views[0]);
+    const template = stringViewOf(a.views[2]).rowBytes(0);
+    const occurrence = replaceOccurrence(a, 0);
+    const text_nulls = if (a.nullable & 1 != 0) a.views[0].nulls else null;
+    const strings = stringStoreOf(out);
+    try strings.offsets.ensureUnusedCapacity(allocator, row_count);
+    // The last computed row's text and where its result sits in `bytes`:
+    // adjacent rows often hold the same value.
+    var last_text: ?[]const u8 = null;
+    var last_lo: usize = 0;
+    var last_hi: usize = 0;
+    for (0..row_count) |i| {
+        if (text_nulls != null and !a.views[0].isValid(i)) {
+            try strings.endValue(allocator);
+            continue;
+        }
+        const s = sv.rowBytes(i);
+        if (last_text) |t| if (std.mem.eql(u8, t, s)) {
+            try strings.bytes.ensureUnusedCapacity(allocator, last_hi - last_lo);
+            strings.bytes.appendSliceAssumeCapacity(strings.bytes.items[last_lo..last_hi]);
+            try strings.endValue(allocator);
+            continue;
+        };
+        const start = if (a.views.len > 3) try regexStart(s, a.bigint(3, 0), 1) else 0;
+        last_text = s;
+        last_lo = strings.bytes.items.len;
+        try re.replaceInto(allocator, &strings.bytes, s, template, scratch, start, occurrence);
+        last_hi = strings.bytes.items.len;
+        try strings.endValue(allocator);
+    }
+    try out.appendValidityRange(allocator, base, text_nulls, row_count);
+}
+
+/// The occurrence REGEXP_REPLACE's row `row` replaces: 0 replaces every
+/// match, and MySQL reads a negative one as 1.
+fn replaceOccurrence(a: RegexArgs, row: usize) usize {
+    if (a.views.len <= 4) return 0;
+    return switch (a.bigint(4, row)) {
+        std.math.minInt(i64)...-1 => 1,
+        else => |n| @intCast(n),
+    };
 }
 
 /// The arguments of a REGEXP_* call. Those REGEXP_* functions take a
