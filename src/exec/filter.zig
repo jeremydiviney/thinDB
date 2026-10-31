@@ -21,6 +21,7 @@ const Batch = exec.Batch;
 const makeQuery = exec.makeQuery;
 
 const predicate = @import("predicate.zig");
+const simd = @import("../util/simd.zig");
 const Predicate = predicate.Predicate;
 const PredicateExpr = predicate.PredicateExpr;
 const mat_stage = @import("mat_stage.zig");
@@ -725,7 +726,7 @@ pub const Filter = struct {
             var which: u1 = 0;
 
             try predicate.evaluateExprGuided(self.allocator, conjuncts[0], self.schema, cur, mask[0..n], null);
-            var m = popcount(mask[0..cur.row_count]);
+            var m = simd.countTrue(mask[0..cur.row_count]);
 
             var i: usize = 1;
             while (m > 0 and i < conjuncts.len) : (i += 1) {
@@ -737,7 +738,7 @@ pub const Filter = struct {
                 const p = cur.row_count;
                 try predicate.evaluateExprGuided(self.allocator, conjuncts[i], self.schema, cur, scratch[0..p], mask[0..p]);
                 for (mask[0..p], scratch[0..p]) |*a, b| a.* = a.* and b;
-                m = popcount(mask[0..p]);
+                m = simd.countTrue(mask[0..p]);
             }
             if (m == 0) continue;
 
@@ -775,12 +776,6 @@ pub const Filter = struct {
         self.views_b = vb;
     }
 };
-
-fn popcount(mask: []const bool) usize {
-    var c: usize = 0;
-    for (mask) |m| c += @intFromBool(m);
-    return c;
-}
 
 // Compaction cost model (ns/row, relative — only ratios matter). Calibrated
 // from a microbench on Zen 5: a remaining conjunct costs ~`W_PRED` per row to

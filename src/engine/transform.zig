@@ -866,8 +866,7 @@ fn compactInto(
     mask: []const bool,
     list: *std.ArrayList(T),
 ) !void {
-    var survivors: usize = 0;
-    for (mask) |m| survivors += @intFromBool(m);
+    const survivors = simd.countTrue(mask);
     if (survivors == 0) return;
     // The branchless body writes `base[pos] = v` for EVERY row and advances
     // `pos` only on survivors, so after the last survivor any trailing
@@ -900,8 +899,7 @@ fn compactIntoConvert(
     mask: []const bool,
     list: *std.ArrayList(D),
 ) !void {
-    var survivors: usize = 0;
-    for (mask) |m| survivors += @intFromBool(m);
+    const survivors = simd.countTrue(mask);
     if (survivors == 0) return;
     try list.ensureUnusedCapacity(allocator, survivors);
     for (src, mask) |v, m| {
@@ -935,8 +933,7 @@ pub fn appendMaskedColumn(
     appendMaskedValues(allocator, view, mask, out) catch |err| switch (err) {
         error.ColumnTypeMismatch => {
             if (!maskedRowsAllNull(view, mask)) return err;
-            var survivors: usize = 0;
-            for (mask) |m| survivors += @intFromBool(m);
+            const survivors = simd.countTrue(mask);
             try out.data.appendNullPlaceholders(allocator, survivors);
         },
         else => return err,
