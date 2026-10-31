@@ -1244,7 +1244,13 @@ fn buildGlobalAggregateReduced(
     plan: GlobalAggregatePlan,
     red: affine_agg.Reduction,
 ) !exec.Query {
-    var q = (try v2_global_aggregate.tryBuild(input.allocator, table, .{
+    // A reduced set over plain columns (SUM/COUNT/MIN/MAX of the bases) is
+    // what the metadata lane answers without a scan.
+    const stats_q = if (plan.where_filter == null and red.pre_derived.len == 0)
+        try tryMetaAggStats(input.allocator, table, red.base_aggs, input.accountant)
+    else
+        null;
+    var q = stats_q orelse (try v2_global_aggregate.tryBuild(input.allocator, table, .{
         .aggs = red.base_aggs,
         .where_filter = if (plan.where_filter) |f| f.predicate else null,
         .having_filter = null,
