@@ -3163,6 +3163,25 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
             try std.testing.expectEqual(@as(usize, 10), rank);
         }
 
+        // A key over `w` alone evaluates per row ahead of the collapse, which
+        // leaves `w` spent; the filter pass compacts it with the kept rows.
+        const pre_sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, w DIV 2000 AS h, COUNT(*) AS c FROM hits GROUP BY k, h ORDER BY c DESC LIMIT 10";
+        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, pre_sql });
+        try expectPlanRunsGroupTopN(a, db, pre_sql);
+        var pq = try runSql(a, db, pre_sql);
+        defer pq.deinit();
+        var pre_rank: usize = 0;
+        while (try pq.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "heavy{d}.com", .{pre_rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, 0), try cellNumber(batch.values[1], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(3000 - 100 * pre_rank)), try cellNumber(batch.values[2], r));
+                pre_rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), pre_rank);
+
         // The url itself as the key, collapsed with no expression to evaluate.
         const url_sql = "SELECT url, COUNT(*) AS c FROM hits GROUP BY url ORDER BY c DESC LIMIT 10";
         errdefer std.debug.print("dop {d}: {s}\n", .{ dop, url_sql });
@@ -3476,4 +3495,166 @@ test "grouped engines take computed comparison operands as CASE operands (keys, 
         const gb = (try gq.next()).?;
         try std.testing.expectEqual(long_ids, gb.values[0].data.bigint[0]);
     }
+}
+
+test "grouped engines collapse rows by string codes combined with other source columns" {
+    // Derived keys over a string column next to an integer key (narrow or
+    // wide), a second string column, or an integer the derived columns read:
+    // each segment batch evaluates once per value combination its rows use.
+    // A derived column over integers alone evaluates per row ahead of that,
+    // as a key in the combination or as an aggregate input; one that can be
+    // NULL keeps its NULL group.
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
+    const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
+    const tags = [_][]const u8{ "p", "qq", "r" };
+    const n = 384;
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL)");
+        var count_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var sum_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_sw = [_][4]i64{.{ 0, 0, 0, 0 }} ** words.len;
+        var max_w_sg = [_][3]i64{.{ std.math.minInt(i64), std.math.minInt(i64), std.math.minInt(i64) }} ** words.len;
+        var sum_h_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var max_sq_s = [_]i64{std.math.minInt(i64)} ** words.len;
+        var min_sq_s = [_]i64{std.math.maxInt(i64)} ** words.len;
+        var quotient_counts: std.StringArrayHashMapUnmanaged(i64) = .empty;
+        defer {
+            for (quotient_counts.keys()) |k| allocator.free(k);
+            quotient_counts.deinit(allocator);
+        }
+        for (0..2) |half| {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(allocator);
+            try buf.appendSlice(allocator, "INSERT INTO t (id, g, s, u, x, w) VALUES ");
+            for (half * n / 2..(half + 1) * n / 2) |i| {
+                const si = i % words.len;
+                const ui = (i / 7) % tags.len;
+                const g = i % 3;
+                const x: i64 = @intCast(i % 11);
+                if (i != half * n / 2) try buf.appendSlice(allocator, ",");
+                const wi = i % 4;
+                try buf.print(allocator, "({d},{d},'{s}','{s}',{d},{d})", .{ i, g, words[si], tags[ui], x, wideValue(wi) });
+                count_sw[si][wi] += 1;
+                max_w_sg[si][g] = @max(max_w_sg[si][g], wideValue(wi));
+                sum_h_sg[si][g] += @as(i64, @intCast(wi)) - 2;
+                max_sq_s[si] = @max(max_sq_s[si], x * x - @as(i64, @intCast(g)));
+                min_sq_s[si] = @min(min_sq_s[si], x * x - @as(i64, @intCast(g)));
+                const quotient = if (g == 0)
+                    try std.fmt.allocPrint(allocator, "{s}|NULL", .{uppers[si]})
+                else
+                    try std.fmt.allocPrint(allocator, "{s}|{d}", .{ uppers[si], @divFloor(x, @as(i64, @intCast(g))) });
+                const entry = try quotient_counts.getOrPut(allocator, quotient);
+                if (entry.found_existing) allocator.free(quotient) else entry.value_ptr.* = 0;
+                entry.value_ptr.* += 1;
+                count_sg[si][g] += 1;
+                sum_sg[si][g] += x;
+                count_su[si][ui] += 1;
+                sum_su[si][ui] += x;
+            }
+            try exec(allocator, db, buf.items);
+            // The first half flushes; the second stays in the memtable.
+            if (half == 0) try (try db.openTable("t", .{})).flush();
+        }
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var want_key_int: std.ArrayList([]const u8) = .empty;
+        var want_read_int: std.ArrayList([]const u8) = .empty;
+        var want_two_strings: std.ArrayList([]const u8) = .empty;
+        var want_concat: std.ArrayList([]const u8) = .empty;
+        var want_wide: std.ArrayList([]const u8) = .empty;
+        var want_pre_key: std.ArrayList([]const u8) = .empty;
+        var want_pre_sum: std.ArrayList([]const u8) = .empty;
+        var want_pre_folds: std.ArrayList([]const u8) = .empty;
+        var want_nullable_pre: std.ArrayList([]const u8) = .empty;
+        for (quotient_counts.keys(), quotient_counts.values()) |k, c| {
+            try want_nullable_pre.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ k, c }));
+        }
+        for (words, uppers, 0..) |w, up, si| {
+            for (0..4) |wi| {
+                if (count_sw[si][wi] == 0) continue;
+                try want_wide.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, wideValue(wi), count_sw[si][wi] }));
+                try want_pre_key.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, @as(i64, @intCast(wi)) - 2, count_sw[si][wi] }));
+            }
+            var rows: i64 = 0;
+            for (0..3) |g| {
+                rows += count_sg[si][g];
+                if (count_sg[si][g] == 0) continue;
+                try want_pre_folds.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}", .{ up, g, max_w_sg[si][g], sum_h_sg[si][g] }));
+            }
+            try want_pre_sum.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}", .{ up, rows, max_sq_s[si], min_sq_s[si] }));
+            for (0..3) |g| {
+                if (count_sg[si][g] == 0) continue;
+                try want_key_int.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{d}|{s}", .{ up, g, count_sg[si][g], sum_sg[si][g], w }));
+                try want_read_int.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, g + 1, count_sg[si][g] }));
+            }
+            for (tags, 0..) |tag, ui| {
+                if (count_su[si][ui] == 0) continue;
+                try want_two_strings.append(arena, try std.fmt.allocPrint(arena, "{s}|{s}|{d}", .{ w, tag, count_su[si][ui] }));
+                try want_concat.append(arena, try std.fmt.allocPrint(arena, "{s}{s}|{d}|{d}", .{ w, tag, count_su[si][ui], sum_su[si][ui] }));
+            }
+        }
+        const cases = .{
+            .{ "SELECT upper(s) AS k, g, COUNT(*) AS c, SUM(x) AS sx, MIN(s) AS ms FROM t GROUP BY k, g ORDER BY c DESC LIMIT 100", &want_key_int },
+            .{ "SELECT upper(s) AS k, g + 1 AS g1, COUNT(*) AS c FROM t GROUP BY k, g1 ORDER BY c DESC LIMIT 100", &want_read_int },
+            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_two_strings },
+            .{ "SELECT concat(s, u) AS k, COUNT(*) AS c, SUM(x) AS sx FROM t GROUP BY k ORDER BY c DESC LIMIT 100", &want_concat },
+            .{ "SELECT upper(s) AS k, w, COUNT(*) AS c FROM t GROUP BY k, w ORDER BY c DESC LIMIT 100", &want_wide },
+            .{ "SELECT upper(s) AS k, w DIV 1000003 AS h, COUNT(*) AS c FROM t GROUP BY k, h ORDER BY c DESC LIMIT 100", &want_pre_key },
+            .{ "SELECT upper(s) AS k, COUNT(*) AS c, MAX(x * x - g) AS mq, MIN(x * x - g) AS nq FROM t GROUP BY k ORDER BY c DESC LIMIT 100", &want_pre_sum },
+            .{ "SELECT upper(s) AS k, g, MAX(w) AS mw, SUM(w DIV 1000003) AS sh FROM t GROUP BY k, g ORDER BY mw DESC LIMIT 100", &want_pre_folds },
+            .{ "SELECT upper(s) AS k, x DIV g AS q, COUNT(*) AS c FROM t GROUP BY k, q ORDER BY c DESC LIMIT 100", &want_nullable_pre },
+        };
+        inline for (cases) |c| {
+            try std.testing.expect(try planContains(allocator, db, c[0], "(V2 "));
+            const got = try sortedRowTexts(allocator, arena, db, c[0]);
+            std.mem.sort([]const u8, c[1].items, {}, textLess);
+            try std.testing.expectEqual(c[1].items.len, got.len);
+            for (c[1].items, got) |w, g| try std.testing.expectEqualStrings(w, g);
+        }
+    }
+}
+
+/// Spread past what a direct map over a row group's combinations covers.
+fn wideValue(i: usize) i64 {
+    return (@as(i64, @intCast(i)) - 2) * 1_000_003;
+}
+
+fn textLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Each result row as its cells joined by `|`, sorted.
+fn sortedRowTexts(allocator: std.mem.Allocator, arena: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]const []const u8 {
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    var rows: std.ArrayList([]const u8) = .empty;
+    while (try q.next()) |b| {
+        for (0..b.row_count) |r| {
+            var line: std.ArrayList(u8) = .empty;
+            for (b.values, 0..) |col, ci| {
+                if (ci != 0) try line.append(arena, '|');
+                if (!col.isValid(r)) {
+                    try line.appendSlice(arena, "NULL");
+                    continue;
+                }
+                switch (col.data) {
+                    .varchar, .string => |sv| try line.appendSlice(arena, sv.rowBytes(r)),
+                    else => try line.print(arena, "{d}", .{@as(i64, @intFromFloat((try cellNumber(col, r)).?))}),
+                }
+            }
+            try rows.append(arena, line.items);
+        }
+    }
+    std.mem.sort([]const u8, rows.items, {}, textLess);
+    return rows.items;
 }

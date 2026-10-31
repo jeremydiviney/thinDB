@@ -732,12 +732,12 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
     return @as(u64, rg_count) >= 4 * @max(composite_runs, 1);
 }
 
-// A program whose scan reads one string column, deriving its key from it
-// (plus numeric aggregate inputs), evaluates once per row-group dictionary
-// value and folds the value's rows by count (`SiloCore.dictEvalSource`), so
-// its rows collapse whether or not they arrive in runs. A column the derived
-// expressions read only for its byte length arrives as lengths, not
-// dictionaries.
+// A program whose scan reads string columns, deriving its keys from them
+// (plus integer keys and numeric aggregate inputs), evaluates once per
+// distinct row-group dictionary value (or value combination) and folds its
+// rows by count (`SiloCore.dictEvalSource`), so its rows collapse whether or
+// not they arrive in runs. A column the derived expressions read only for
+// its byte length arrives as lengths, not dictionaries.
 fn dictionaryCollapses(
     allocator: Allocator,
     table: *api.Table,
@@ -764,8 +764,15 @@ fn dictionaryCollapses(
             try columns.append(allocator, col);
         }
     } else try columns.appendSlice(allocator, table.schema.columns);
-    const j = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items)) orelse return false;
-    return derived.len == 0 or !try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name);
+    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer keys.deinit(allocator);
+    for (shape.group_key_inputs) |key| try keys.append(allocator, key.name);
+    const source = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items, keys.items)) orelse return false;
+    if (derived.len == 0) return true;
+    for (source.columns[0..source.strings]) |j| {
+        if (try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name)) return false;
+    }
+    return true;
 }
 
 fn runHarness(
