@@ -3415,11 +3415,13 @@ fn hkGroups(allocator: std.mem.Allocator, rows: []const HkRow, skip: []const u8)
 test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned and memtable rows" {
     // Segment A's row groups are dictionaries: hot urls spread over them
     // among light urls in adjacent pairs, so each row group stays under half
-    // distinct. Segment B's row groups are near-unique (raw blocks), with a
-    // hot url every 16th row; some of segment C's hot rows are deleted; the
-    // memtable adds more. Hot counts differ, so every ranked page is
-    // tie-free. The light urls alone hold 2 rows each: too many candidates,
-    // so that query falls back to grouping them all.
+    // distinct. Segment B's row groups are near-unique long urls (raw
+    // blocks), with a hot url every 16th row and, 8 rows on, a url no other
+    // segment holds, which ranks only if the raw row groups report it. Some
+    // of segment C's hot rows are deleted; the memtable adds more. Hot
+    // counts differ, so every ranked page is tie-free. The light urls alone
+    // hold 2 rows each: too many candidates, so that query falls back to
+    // grouping them all.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3449,7 +3451,7 @@ test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned a
     }
     var seg_b: std.ArrayList(HkRow) = .empty;
     for (0..40_000) |i| {
-        const s = if (i % 16 == 0) hot_urls[(i / 16) % hot] else try std.fmt.allocPrint(arena, "http://uniq{d}.example/", .{i});
+        const s = if (i % 16 == 0) hot_urls[(i / 16) % hot] else if (i % 16 == 8) "http://rawhot.example/" else try std.fmt.allocPrint(arena, "http://uniq{d}.example/{s}", .{ i, "x" ** 300 });
         try seg_b.append(arena, .{ .id = id, .s = s, .v = @intCast(@mod(id * 104_729, 1_013)) });
         id += 1;
     }

@@ -1245,6 +1245,28 @@ pub const DictBlock = struct {
         return std.mem.readInt(std.meta.Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
     }
 
+    /// Every row's code, into `out`, one per row.
+    pub fn codesInto(self: DictBlock, out: []u32) void {
+        switch (self.code_width) {
+            inline 1, 2, 4 => |w| widenCodes(std.meta.Int(.unsigned, @as(u16, w) * 8), self.codes, out),
+            else => for (out, 0..) |*c, row| {
+                c.* = self.rowCode(row);
+            },
+        }
+    }
+
+    /// The codes of `rows`, into `out`.
+    pub fn codesAt(self: DictBlock, rows: []const u32, out: []u32) void {
+        switch (self.code_width) {
+            inline 1, 2, 4 => |w| for (rows, out) |row, *c| {
+                c.* = self.rowCodeAs(w, row);
+            },
+            else => for (rows, out) |row, *c| {
+                c.* = self.rowCode(row);
+            },
+        }
+    }
+
     /// `mask[i]` = whether row i's code lies in `[lo, lo + span)`, or outside
     /// it with `outside`.
     pub fn codeRangeInto(self: DictBlock, lo: u32, span: u32, outside: bool, row_count: u32, mask: []bool) void {
@@ -1285,6 +1307,22 @@ fn codeRangeWidth(comptime T: type, comptime outside: bool, codes: []const u8, l
     while (i < mask.len) : (i += 1) {
         mask[i] = (std.mem.readInt(T, codes[i * W ..][0..W], .little) -% lo < span) != outside;
     }
+}
+
+/// Widens `T`-wide codes into `out`, a vector at a time; codes sit at any
+/// byte offset, so a vector's worth is read as bytes.
+fn widenCodes(comptime T: type, codes: []const u8, out: []u32) void {
+    const W = @sizeOf(T);
+    const N = comptime std.simd.suggestVectorLength(u32) orelse 4;
+    var i: usize = 0;
+    if (native_endian == .little and N > 1) {
+        while (i + N <= out.len) : (i += N) {
+            const bytes: [N * W]u8 = codes[i * W ..][0 .. N * W].*;
+            const v: @Vector(N, T) = @bitCast(bytes);
+            out[i..][0..N].* = @as(@Vector(N, u32), v);
+        }
+    }
+    while (i < out.len) : (i += 1) out[i] = std.mem.readInt(T, codes[i * W ..][0..W], .little);
 }
 
 /// Parse the dict header + regions out of a decompressed block payload. `values`

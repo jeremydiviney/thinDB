@@ -1574,11 +1574,7 @@ pub const Scan = struct {
         const codes_wanted = !(every_value and buf.entries_only);
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
-        if (rows) |r| {
-            for (r, buf.codes.items) |row, *c| c.* = db.rowCode(row);
-        } else {
-            for (buf.codes.items, 0..) |*c, row| c.* = db.rowCode(row);
-        }
+        if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
         if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
     }
@@ -4835,10 +4831,13 @@ pub const Scan = struct {
     /// its row window `[pending_lo, hi)` is one of its survivors and the
     /// window's null bitmaps start byte-aligned for the dense masked pass.
     /// A tail of up to a quarter sub-batch rides along rather than becoming
-    /// its own batch.
+    /// its own batch. A scan emitting block dictionaries, digests or codes
+    /// keeps the row group whole, as its unfiltered batches do: each batch
+    /// costs a pass over the block's whole dictionary.
     fn materializeNextSlice(self: *Scan, seg: *storage.ReadSegment, mask: []const bool) !usize {
         const rows = self.pending_rows;
-        const sub = self.sub_batch_rows;
+        const per_dictionary = self.n_dicts > 0 or self.n_hashed > 0 or self.n_coded > 0;
+        const sub = if (per_dictionary) 0 else self.sub_batch_rows;
         var n = rows.len;
         var hi: usize = self.pending_rg_count;
         // `sub` is a positive multiple of 64 and survivor rows are distinct

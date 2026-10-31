@@ -1097,6 +1097,27 @@ test "DictBlock.rowCode reads each writer code width little-endian" {
     }
 }
 
+test "DictBlock.codesInto and codesAt match rowCode at every width and offset" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var bytes: [4 * 203 + 3]u8 = undefined;
+    random.bytes(&bytes);
+    const rows = [_]u32{ 0, 1, 9, 63, 64, 100, 150, 201, 202 };
+    inline for (.{ 1, 2, 3, 4 }) |width| {
+        for (0..3) |skew| {
+            const n = 203 - skew;
+            const db: segment_reader.DictBlock = .{ .ndv = 0, .code_width = width, .offsets_region = &.{}, .dict_bytes = &.{}, .codes = bytes[skew..][0 .. n * width] };
+            var all: [203]u32 = undefined;
+            db.codesInto(all[0..n]);
+            for (all[0..n], 0..) |code, row| try std.testing.expectEqual(db.rowCode(row), code);
+            var picked: [rows.len]u32 = undefined;
+            const kept = rows.len - skew;
+            db.codesAt(rows[0..kept], picked[0..kept]);
+            for (rows[0..kept], picked[0..kept]) |row, code| try std.testing.expectEqual(db.rowCode(row), code);
+        }
+    }
+}
+
 test "DictBlock.codeRangeInto matches the per-row range test at every width and offset" {
     const n = 203;
     var storage_bytes: [n * 4 + 3]u8 = undefined;
