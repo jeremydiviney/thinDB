@@ -299,6 +299,137 @@ pub fn andNotMaskInto(dst: []bool, keep: ?[]const bool, drop: []const bool) void
     }
 }
 
+/// How many rows of `mask` are set. LLVM leaves the byte loop scalar: one
+/// load and one add per row.
+pub fn countTrue(mask: []const bool) usize {
+    const bytes: []const u8 = @ptrCast(mask);
+    const N = comptime lanes(u8);
+    const Bits = std.meta.Int(.unsigned, N);
+    const zero: @Vector(N, u8) = @splat(0);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + N <= bytes.len) : (i += N) {
+        const v: @Vector(N, u8) = bytes[i..][0..N].*;
+        count += @popCount(@as(Bits, @bitCast(v != zero)));
+    }
+    while (i < bytes.len) : (i += 1) count += bytes[i];
+    return count;
+}
+
+const INDEX_LANES = 8;
+
+// For each mask of eight lanes, its set lanes' positions, lowest first.
+const SET_LANES: [1 << INDEX_LANES][INDEX_LANES]u8 = blk: {
+    @setEvalBranchQuota(4 * (1 << INDEX_LANES) * INDEX_LANES);
+    var table: [1 << INDEX_LANES][INDEX_LANES]u8 = @splat(@splat(0));
+    for (&table, 0..) |*set, bits| {
+        var k: usize = 0;
+        for (0..INDEX_LANES) |lane| {
+            if ((bits >> lane) & 1 == 0) continue;
+            set[k] = lane;
+            k += 1;
+        }
+    }
+    break :blk table;
+};
+
+/// The positions of `mask`'s set rows, ascending, into `out` (at least
+/// `mask.len` long); returns how many. Eight rows at a time go out as one
+/// full store of their set positions and the count advances by how many
+/// there were, so no branch depends on which rows survive; a vector of rows
+/// with none set is skipped. A store per row instead costs the same on a
+/// mask that keeps one row in a hundred as on one that keeps them all.
+pub fn maskIndices(mask: []const bool, out: []u32) usize {
+    std.debug.assert(out.len >= mask.len);
+    const bytes: []const u8 = @ptrCast(mask);
+    const N = comptime lanes(u8);
+    comptime std.debug.assert(N % INDEX_LANES == 0);
+    const Bits = std.meta.Int(.unsigned, N);
+    const zero: @Vector(N, u8) = @splat(0);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + N <= bytes.len) : (i += N) {
+        const v: @Vector(N, u8) = bytes[i..][0..N].*;
+        const bits: Bits = @bitCast(v != zero);
+        if (bits == 0) continue;
+        inline for (0..N / INDEX_LANES) |g| {
+            const set_bits: u8 = @truncate(bits >> (g * INDEX_LANES));
+            const set: @Vector(INDEX_LANES, u8) = SET_LANES[set_bits];
+            const first: @Vector(INDEX_LANES, u32) = @splat(@intCast(i + g * INDEX_LANES));
+            // `count` is at most the rows before this group, so the store
+            // ends inside `out`; the overhang past the set lanes is
+            // overwritten by the next group or left past the result.
+            out[count..][0..INDEX_LANES].* = first + @as(@Vector(INDEX_LANES, u32), set);
+            count += @popCount(set_bits);
+        }
+    }
+    while (i < bytes.len) : (i += 1) {
+        out[count] = @intCast(i);
+        count += bytes[i];
+    }
+    return count;
+}
+
+/// `mask[pos..][0..len] = value`, for masks filled a run at a time. A bool
+/// `@memset` compiles to a store per row; a byte one is a `memset` call,
+/// which a run of a few rows pays more for than one full-vector store whose
+/// overhang the next run overwrites.
+pub fn fillMaskRun(mask: []bool, pos: usize, len: usize, value: bool) void {
+    const N = comptime lanes(u8);
+    const bytes: []u8 = @ptrCast(mask);
+    const byte: u8 = @intFromBool(value);
+    if (len <= N and pos + N <= bytes.len) {
+        bytes[pos..][0..N].* = @splat(byte);
+    } else {
+        @memset(bytes[pos..][0..len], byte);
+    }
+}
+
+test "simd: countTrue, maskIndices and fillMaskRun match the scalar loops" {
+    var prng = std.Random.DefaultPrng.init(0x3a5c);
+    const random = prng.random();
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 0, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 100, 1000, 4097 }) |len| {
+        const mask = try allocator.alloc(bool, len);
+        defer allocator.free(mask);
+        const out = try allocator.alloc(u32, len);
+        defer allocator.free(out);
+        // Densities from none to all, with runs as well as scattered rows.
+        for ([_]u32{ 0, 1, 10, 50, 90, 100 }) |percent| {
+            var pos: usize = 0;
+            while (pos < len) {
+                const run = @min(len - pos, 1 + random.uintLessThan(usize, 40));
+                const value = random.uintLessThan(u32, 100) < percent;
+                if (random.boolean()) {
+                    fillMaskRun(mask, pos, run, value);
+                } else {
+                    for (mask[pos..][0..run]) |*m| m.* = random.uintLessThan(u32, 100) < percent;
+                }
+                pos += run;
+            }
+            var want: usize = 0;
+            for (mask) |m| want += @intFromBool(m);
+            try std.testing.expectEqual(want, countTrue(mask));
+            const n = maskIndices(mask, out);
+            try std.testing.expectEqual(want, n);
+            var k: usize = 0;
+            for (mask, 0..) |m, row| {
+                if (!m) continue;
+                try std.testing.expectEqual(@as(u32, @intCast(row)), out[k]);
+                k += 1;
+            }
+        }
+        // A lone run: the rows before it stay as they were (only rows past
+        // it may take the overhang).
+        @memset(mask, false);
+        const lo = len / 3;
+        const run = len - lo - len / 3;
+        fillMaskRun(mask, lo, run, true);
+        for (mask[0..lo]) |m| try std.testing.expect(!m);
+        for (mask[lo..][0..run]) |m| try std.testing.expect(m);
+    }
+}
+
 test "simd: orderBytes matches std.mem.order at every difference position and length" {
     var a: [100]u8 = undefined;
     var b: [100]u8 = undefined;

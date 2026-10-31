@@ -1620,9 +1620,7 @@ pub fn likeRows(view: ColumnView, sv: storage.StringView, plan: *const LikePlan,
 // (a `SearchPhrase <> ''`-filtered Title LIKE measured 2% slower at a quarter).
 fn mostlyActive(active: ?[]const bool, n: usize) bool {
     const a = active orelse return true;
-    var alive: usize = 0;
-    for (a[0..n]) |b| alive += @intFromBool(b);
-    return alive * 4 >= n * 3;
+    return simd.countTrue(a[0..n]) * 4 >= n * 3;
 }
 
 /// `mask[i]` = row i holds `seg`, for rows [0, n): each hit in the rows'
