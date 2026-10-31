@@ -17,6 +17,7 @@
 //! post-filter) is the one remaining decline.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const api = @import("../api/api.zig");
@@ -1589,13 +1590,13 @@ const GlobalAggregate = struct {
         // orchestrates and merges (left unpinned). A lane whose thread fails to
         // spawn runs inline unpinned — the shared atomic tile claim keeps every
         // row-group counted exactly once regardless of where lanes run.
-        const threads = try self.allocator.alloc(std.Thread, n_workers);
+        const threads = try self.allocator.alloc(parallel.Helper, n_workers);
         defer self.allocator.free(threads);
         const spawned = try self.allocator.alloc(bool, n_workers);
         defer self.allocator.free(spawned);
         @memset(spawned, false);
         for (workers, 0..) |*w, i| {
-            if (std.Thread.spawn(.{}, workerMain, .{w})) |th| {
+            if (parallel.spawn(workerMain, .{w})) |th| {
                 threads[i] = th;
                 spawned[i] = true;
             } else |_| {}
@@ -1654,13 +1655,13 @@ const GlobalAggregate = struct {
         const jobs = try self.allocator.alloc(DistinctDrainJob, n_threads);
         defer self.allocator.free(jobs);
         @memset(jobs, .{ .shared = shared });
-        const threads = try self.allocator.alloc(std.Thread, n_threads);
+        const threads = try self.allocator.alloc(parallel.Helper, n_threads);
         defer self.allocator.free(threads);
         const spawned = try self.allocator.alloc(bool, n_threads);
         defer self.allocator.free(spawned);
         @memset(spawned, false);
         for (jobs, 0..) |*j, t| {
-            if (std.Thread.spawn(.{}, distinctDrainMain, .{j})) |th| {
+            if (parallel.spawn(distinctDrainMain, .{j})) |th| {
                 threads[t] = th;
                 spawned[t] = true;
             } else |_| {}

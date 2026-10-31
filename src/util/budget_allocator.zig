@@ -1,4 +1,5 @@
 const std = @import("std");
+const parallel = @import("parallel.zig");
 const MemoryAccountant = @import("../memory.zig").MemoryAccountant;
 const buffer_pool = @import("buffer_pool.zig");
 const Allocator = std.mem.Allocator;
@@ -211,7 +212,7 @@ pub const DeferredFrees = struct {
     pub fn releaseDetached(self: DeferredFrees) void {
         for (self.lanes[0..self.lane_count]) |lane| {
             const chunks = lane.chunks orelse continue;
-            if (std.Thread.spawn(.{}, releaseLane, .{chunks})) |thread| {
+            if (parallel.spawn(releaseLane, .{chunks})) |thread| {
                 thread.detach();
             } else |_| releaseLane(chunks);
         }

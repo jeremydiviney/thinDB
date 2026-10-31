@@ -28,6 +28,7 @@
 //! lives inside table-sourced stages (which run the regular V2 handlers).
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const exec = @import("exec.zig");
@@ -580,8 +581,8 @@ fn castStageColumn(
     defer for (jobs[0..workers]) |*job| {
         if (job.out) |*o| o.deinit(wa);
     };
-    var handles: [MAX_CAST_WORKERS]?std.Thread = .{null} ** MAX_CAST_WORKERS;
-    for (1..workers) |w| handles[w] = std.Thread.spawn(.{}, CastJob.run, .{&jobs[w]}) catch null;
+    var handles: [MAX_CAST_WORKERS]?parallel.Helper = .{null} ** MAX_CAST_WORKERS;
+    for (1..workers) |w| handles[w] = parallel.spawn(CastJob.run, .{&jobs[w]}) catch null;
     jobs[0].run();
     for (1..workers) |w| {
         if (handles[w]) |t| t.join() else jobs[w].run();
@@ -870,9 +871,9 @@ fn fillContiguous(scratch: Allocator, store_alloc: Allocator, stores: []engine.C
     const cuts = try scratch.alloc(usize, n_workers + 1);
     for (cuts[0..n_workers], 0..) |*c, w| c.* = (w * total / n_workers) & ~@as(usize, 7);
     cuts[n_workers] = total;
-    const handles = try scratch.alloc(?std.Thread, n_workers);
+    const handles = try scratch.alloc(?parallel.Helper, n_workers);
     for (handles[1..], 1..) |*h, w| {
-        h.* = std.Thread.spawn(.{}, Fill.run, .{ &fill, cuts[w], cuts[w + 1] }) catch null;
+        h.* = parallel.spawn(Fill.run, .{ &fill, cuts[w], cuts[w + 1] }) catch null;
     }
     fill.run(cuts[0], cuts[1]);
     for (handles[1..], 1..) |h, w| {
@@ -915,7 +916,7 @@ pub const Stage = struct {
     uses_done: std.atomic.Value(usize) = .init(0),
     /// Holds the compile pin `addStage` registers (see `releaseCompilePin`).
     compile_pinned: bool = true,
-    free_thread: ?std.Thread = null,
+    free_thread: ?parallel.Helper = null,
     /// Query-scoped accountant the buffered result is charged against
     /// (null = no tracking). All reserve/release calls happen on the
     /// driving connection thread — the background free thread only frees
@@ -1259,7 +1260,7 @@ pub const Stage = struct {
     fn freeResult(self: *Stage, res: *MaterializedResult) void {
         const tracked = if (self.accountant) |acct| acct.physical_tracking else false;
         if (!tracked) {
-            if (std.Thread.spawn(.{}, destroyResult, .{res})) |th| {
+            if (parallel.spawn(destroyResult, .{res})) |th| {
                 self.free_thread = th;
             } else |_| destroyResult(res);
             return;
@@ -1269,7 +1270,7 @@ pub const Stage = struct {
         destroyResult(res);
         frees.stop();
         if (frees.isEmpty()) return;
-        if (std.Thread.spawn(.{}, exec.memory.DeferredFrees.release, .{frees})) |th| {
+        if (parallel.spawn(exec.memory.DeferredFrees.release, .{frees})) |th| {
             self.free_thread = th;
         } else |_| frees.release();
     }

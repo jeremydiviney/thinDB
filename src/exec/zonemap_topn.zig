@@ -42,6 +42,7 @@
 //! and the caller falls back to lateScan.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -389,13 +390,13 @@ pub const ZonemapTopN = struct {
             };
         }
 
-        const threads = try allocator.alloc(std.Thread, n_workers);
+        const threads = try allocator.alloc(parallel.Helper, n_workers);
         defer allocator.free(threads);
         const spawned = try allocator.alloc(bool, n_workers);
         defer allocator.free(spawned);
         @memset(spawned, false);
         for (workers, 0..) |*w, i| {
-            if (std.Thread.spawn(.{}, zWorkerMain, .{w})) |th| {
+            if (parallel.spawn(zWorkerMain, .{w})) |th| {
                 threads[i] = th;
                 spawned[i] = true;
             } else |_| {}

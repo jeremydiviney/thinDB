@@ -663,7 +663,7 @@ pub const Window = struct {
             }
         };
         var g = Gather{ .win = self, .perm = perm, .arenas = arenas, .stores = stores };
-        var threads: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var threads: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
         var spawned: usize = 0;
         var grant: core_scheduler.Workers = .{};
         defer grant.release();
@@ -671,7 +671,7 @@ pub const Window = struct {
             grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, ncols - 1), max_drain_workers) + 1);
             const want = grant.count - 1;
             while (spawned < want) {
-                threads[spawned] = std.Thread.spawn(.{}, Gather.run, .{&g}) catch break;
+                threads[spawned] = parallel.spawn(Gather.run, .{&g}) catch break;
                 spawned += 1;
             }
         }
@@ -1007,7 +1007,7 @@ pub const Window = struct {
             break :blk b;
         };
         var pd = ParDrain{ .win = self, .owned = owned };
-        var workers: [max_drain_workers]?std.Thread = .{null} ** max_drain_workers;
+        var workers: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
         var n_workers: usize = 0;
         var max_tiles: usize = 1;
         var may_fan_out = self.dop > 1 and ncols >= 2 and !builtin.is_test;
@@ -1042,7 +1042,7 @@ pub const Window = struct {
                 drain_grant = core_scheduler.reserveWorkers(@min(@min(self.dop - 1, ncols - 1), max_drain_workers) + 1);
                 const want = drain_grant.count - 1;
                 while (n_workers < want) {
-                    workers[n_workers] = std.Thread.spawn(.{}, ParDrain.worker, .{&pd}) catch break;
+                    workers[n_workers] = parallel.spawn(ParDrain.worker, .{&pd}) catch break;
                     n_workers += 1;
                 }
                 pd.parked.store(n_workers, .release);
@@ -1537,10 +1537,10 @@ pub const Window = struct {
             .n = n,
             .workers = grant.count,
         };
-        var threads: [32]std.Thread = undefined;
+        var threads: [32]parallel.Helper = undefined;
         var spawned: usize = 0;
         while (spawned < job.workers - 1) {
-            threads[spawned] = std.Thread.spawn(.{}, GlobalEvalJob.worker, .{ &job, spawned }) catch break;
+            threads[spawned] = parallel.spawn(GlobalEvalJob.worker, .{ &job, spawned }) catch break;
             spawned += 1;
         }
         var w = spawned;
@@ -1607,10 +1607,10 @@ pub const Window = struct {
     /// threads, run the rest inline (covers spawn failure by absorbing the
     /// unspawned ranges), join.
     fn runRangePhase(job: *SpecParJob, comptime phase: fn (*SpecParJob, usize) void) void {
-        var threads: [32]std.Thread = undefined;
+        var threads: [32]parallel.Helper = undefined;
         var spawned: usize = 0;
         while (spawned < job.workers - 1) {
-            threads[spawned] = std.Thread.spawn(.{}, phase, .{ job, spawned }) catch break;
+            threads[spawned] = parallel.spawn(phase, .{ job, spawned }) catch break;
             spawned += 1;
         }
         var w = spawned;
@@ -1619,10 +1619,10 @@ pub const Window = struct {
     }
 
     fn runBucketPhase(job: *SpecParJob) void {
-        var threads: [32]std.Thread = undefined;
+        var threads: [32]parallel.Helper = undefined;
         var spawned: usize = 0;
         while (spawned < job.workers - 1) {
-            threads[spawned] = std.Thread.spawn(.{}, SpecParJob.phaseBuckets, .{job}) catch break;
+            threads[spawned] = parallel.spawn(SpecParJob.phaseBuckets, .{job}) catch break;
             spawned += 1;
         }
         SpecParJob.phaseBuckets(job);
