@@ -104,10 +104,12 @@ pub const ZonemapTopN = struct {
     key_desc: []bool,
     /// Probe-batch index of each ORDER BY key column. Owned.
     key_probe_idx: []usize,
-    /// Probe-batch index of the one column the WHERE clause reads, when it is
-    /// no ORDER BY key: a dictionary-coded block of it is filtered once per
-    /// dictionary entry instead of being expanded to its rows' strings.
+    /// Probe-batch index of the one column the WHERE clause reads: a
+    /// dictionary-coded block of it is filtered once per dictionary entry
+    /// instead of being expanded to its rows' strings.
     dict_filter_probe: ?usize,
+    /// Per probe column: a dictionary-coded block may stay coded. Owned.
+    dict_ok: []bool,
     /// Prunable prefix length: the longest leading run of ORDER BY keys with
     /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`).
     /// Only these keys drive row-group pruning; the rest still order rows in the
@@ -215,7 +217,9 @@ pub const ZonemapTopN = struct {
         // `updatedAt >= '<text>' ORDER BY id LIMIT n` came back unfiltered.
         var validated = pred;
         try predicate.validateExpr(&validated, probe_schema);
-        const dict_filter_probe = try dictFilterProbe(allocator, validated, probe_schema, key_probe_idx);
+        const dict_filter_probe = try dictFilterProbe(allocator, validated, probe_schema);
+        const dict_ok = try dictCodedProbes(allocator, validated, probe_schema, key_probe_idx, dict_filter_probe);
+        errdefer allocator.free(dict_ok);
 
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
@@ -249,6 +253,7 @@ pub const ZonemapTopN = struct {
             .key_desc = key_desc,
             .key_probe_idx = key_probe_idx,
             .dict_filter_probe = dict_filter_probe,
+            .dict_ok = dict_ok,
             .prefix_len = prefix_len,
             .n = n,
             .offset = offset,
@@ -270,6 +275,7 @@ pub const ZonemapTopN = struct {
         self.allocator.free(self.key_phys);
         self.allocator.free(self.key_desc);
         self.allocator.free(self.key_probe_idx);
+        self.allocator.free(self.dict_ok);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -412,16 +418,17 @@ pub const ZonemapTopN = struct {
         for (heaps) |*h| try self.mergeHeapInto(h);
     }
 
-    /// Fold a worker's surviving candidates into the main heap. The push path
-    /// reads views only at the key positions, so a probe-shaped view buffer
-    /// with just those slots populated suffices.
+    /// Fold a worker's surviving candidates into the main heap.
     fn mergeHeapInto(self: *ZonemapTopN, src: *CandidateHeap) !void {
         if (src.heap.items.len == 0) return;
-        const vbuf = try self.allocator.alloc(ColumnView, self.probe_phys.len);
-        defer self.allocator.free(vbuf);
-        for (self.key_probe_idx, 0..) |pi, i| vbuf[pi] = src.key_cols[i].view();
+        const views = try self.allocator.alloc(ColumnView, src.key_cols.len);
+        defer self.allocator.free(views);
+        const rows = try self.allocator.alloc(usize, src.key_cols.len);
+        defer self.allocator.free(rows);
+        for (src.key_cols, views) |kc, *v| v.* = kc.view();
         for (src.heap.items) |row| {
-            try self.main.pushCandidate(vbuf, row, src.loc_store.items[row]);
+            @memset(rows, row);
+            try self.main.pushCandidate(.{ .views = views, .rows = rows }, src.loc_store.items[row]);
         }
     }
 
@@ -528,11 +535,17 @@ pub const ZonemapTopN = struct {
 
         const mask = try self.allocator.alloc(bool, n);
         defer self.allocator.free(mask);
-        try evalPredicate(self, self.allocator, vbuf, n, mask);
+        try evalPredicate(self, self.allocator, vbuf, n, mask, null);
 
+        const views = try self.allocator.alloc(ColumnView, self.key_probe_idx.len);
+        defer self.allocator.free(views);
+        const rows = try self.allocator.alloc(usize, self.key_probe_idx.len);
+        defer self.allocator.free(rows);
+        for (self.key_probe_idx, views) |j, *v| v.* = vbuf[j];
         for (mask, 0..) |keep, row| {
             if (!keep) continue;
-            try self.main.pushCandidate(vbuf, row, rowloc.packMemtable(row));
+            @memset(rows, row);
+            try self.main.pushCandidate(.{ .views = views, .rows = rows }, rowloc.packMemtable(row));
         }
     }
 
@@ -587,7 +600,7 @@ fn zWorkerMain(w: *ZWorker) void {
 fn zWorkerRun(w: *ZWorker) !void {
     const z = w.z;
     const allocator = w.allocator;
-    var scratch = try ProbeScratch.init(allocator, z.probe_phys.len);
+    var scratch = try ProbeScratch.init(allocator, z.probe_phys.len, z.key_phys.len);
     defer scratch.deinit(allocator);
 
     // Per-worker segment + tombstone caches: the corner-sorted claim order
@@ -654,130 +667,273 @@ const SegCache = struct {
 
 const ProbeScratch = struct {
     blocks: []storage.ReadSegment.BorrowedBlock,
+    borrowed: []bool,
+    cols: []ProbeColumn,
     views: []ColumnView,
+    /// Per probe column, a dictionary's entry offsets when its block doesn't
+    /// store them in place.
+    entry_offsets: []std.ArrayListUnmanaged(u32),
+    key_views: []ColumnView,
+    key_rows: []usize,
     mask: std.ArrayListUnmanaged(bool) = .empty,
+    pred_mask: std.ArrayListUnmanaged(bool) = .empty,
     entry_hits: std.ArrayListUnmanaged(bool) = .empty,
-    entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
 
-    fn init(allocator: Allocator, columns: usize) !ProbeScratch {
+    fn init(allocator: Allocator, columns: usize, keys: usize) !ProbeScratch {
         const blocks = try allocator.alloc(storage.ReadSegment.BorrowedBlock, columns);
         errdefer allocator.free(blocks);
+        const borrowed = try allocator.alloc(bool, columns);
+        errdefer allocator.free(borrowed);
+        const cols = try allocator.alloc(ProbeColumn, columns);
+        errdefer allocator.free(cols);
         const views = try allocator.alloc(ColumnView, columns);
         errdefer allocator.free(views);
-        return .{ .blocks = blocks, .views = views };
+        const entry_offsets = try allocator.alloc(std.ArrayListUnmanaged(u32), columns);
+        errdefer allocator.free(entry_offsets);
+        @memset(entry_offsets, .empty);
+        const key_views = try allocator.alloc(ColumnView, keys);
+        errdefer allocator.free(key_views);
+        const key_rows = try allocator.alloc(usize, keys);
+        errdefer allocator.free(key_rows);
+        return .{
+            .blocks = blocks,
+            .borrowed = borrowed,
+            .cols = cols,
+            .views = views,
+            .entry_offsets = entry_offsets,
+            .key_views = key_views,
+            .key_rows = key_rows,
+        };
     }
 
     fn deinit(self: *ProbeScratch, allocator: Allocator) void {
         allocator.free(self.blocks);
+        allocator.free(self.borrowed);
+        allocator.free(self.cols);
         allocator.free(self.views);
+        for (self.entry_offsets) |*o| o.deinit(allocator);
+        allocator.free(self.entry_offsets);
+        allocator.free(self.key_views);
+        allocator.free(self.key_rows);
         self.mask.deinit(allocator);
+        self.pred_mask.deinit(allocator);
         self.entry_hits.deinit(allocator);
-        self.entry_offsets.deinit(allocator);
     }
+};
+
+/// One probe column of a row group: a view of its values, or its dictionary
+/// block left coded and read through the entries.
+const ProbeColumn = union(enum) {
+    view: ColumnView,
+    dict: DictColumn,
+};
+
+const DictColumn = struct {
+    db: storage.segment_reader.DictBlock,
+    nulls: ?[]const u8,
+    entries: ColumnView,
 };
 
 fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, scratch: *ProbeScratch, cache: *SegCache, ref: RgRef) !void {
     const seg = try cache.segment(z, allocator, ref.seg_idx);
 
     const rg_count = ref.row_count;
-    var borrowed: usize = 0;
-    defer for (scratch.blocks[0..borrowed]) |*block| block.release(allocator, z.table.cacheRef());
-    var dict_filter: ?DictFilterBlock = null;
-    for (z.probe_phys, 0..) |phys, j| {
-        scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
-        borrowed += 1;
-        const block = &scratch.blocks[j];
-        const col = z.table.schema.columns[phys];
-        const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
-        if (j == z.dict_filter_probe and block.encoding == .dict) {
-            var values = block.bytes;
-            var nulls: ?[]const u8 = null;
-            if (flags.has_nulls) {
-                const bm_len = storage.column.bitmapBytes(rg_count);
-                nulls = block.bytes[0..bm_len];
-                values = block.bytes[bm_len..];
-            }
-            dict_filter = .{ .db = storage.segment_reader.dictBlockOf(values, rg_count), .nulls = nulls };
-            // Only the predicate reads this column, and it reads the entries.
-            scratch.views[j] = try stringColumnView(col.type, .{ .offsets = &.{0}, .bytes = "" }, null);
-            continue;
-        }
-        if (storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding)) |view| {
-            scratch.views[j] = view;
-        } else {
-            block.expanded = try storage.segment_reader.decodeColumnPayload(allocator, col.type, block.bytes, rg_count, flags, block.encoding);
-            scratch.views[j] = block.expanded.?.view();
-        }
-    }
-
-    const vbuf = scratch.views;
+    @memset(scratch.borrowed, false);
+    defer for (scratch.blocks, scratch.borrowed) |*block, borrowed| {
+        if (borrowed) block.release(allocator, z.table.cacheRef());
+    };
     try scratch.mask.resize(allocator, rg_count);
     const mask = scratch.mask.items;
-    if (dict_filter) |df| {
-        try evalDictPredicate(z, allocator, scratch, df, rg_count, mask);
+
+    // A full heap admits no row whose leading key sorts after its worst, so
+    // those rows are dropped before the WHERE runs or another column loads.
+    const lead = z.key_probe_idx[0];
+    try loadProbeColumn(z, allocator, scratch, seg, ref, lead);
+    const prefiltered = z.keep > 0 and ch.full();
+    if (prefiltered) {
+        try leadKeyPrefilter(z, allocator, ch, scratch, scratch.cols[lead], mask);
+        if (std.mem.indexOfScalar(bool, mask, true) == null) return;
     } else {
-        try evalPredicate(z, allocator, vbuf, rg_count, mask);
+        @memset(mask, true);
     }
+    for (0..z.probe_phys.len) |j| {
+        if (j != lead) try loadProbeColumn(z, allocator, scratch, seg, ref, j);
+    }
+
+    try scratch.pred_mask.resize(allocator, rg_count);
+    const pred_mask = scratch.pred_mask.items;
+    const dict_filter: ?DictColumn = if (z.dict_filter_probe) |j| switch (scratch.cols[j]) {
+        .dict => |d| d,
+        .view => null,
+    } else null;
+    if (dict_filter) |df| {
+        try evalDictPredicate(z, allocator, scratch, df, rg_count, pred_mask);
+    } else {
+        try evalPredicate(z, allocator, scratch.views, rg_count, pred_mask, if (prefiltered) mask else null);
+    }
+    for (mask, pred_mask) |*m, p| m.* = m.* and p;
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
 
+    for (z.key_probe_idx, scratch.key_views) |j, *kv| kv.* = switch (scratch.cols[j]) {
+        .view => |v| v,
+        .dict => |d| d.entries,
+    };
+    const key: KeyRef = .{ .views = scratch.key_views, .rows = scratch.key_rows };
     for (mask, 0..) |keep, row| {
         if (!keep) continue;
-        try ch.pushCandidate(vbuf, row, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
+        for (z.key_probe_idx, scratch.key_rows) |j, *kr| kr.* = switch (scratch.cols[j]) {
+            .view => row,
+            .dict => |d| d.db.rowCode(row),
+        };
+        try ch.pushCandidate(key, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
+    }
+}
+
+/// Borrow probe column `j`'s block for this row group. A dictionary-coded
+/// string block stays coded where `z.dict_ok` allows it; anything else is
+/// viewed in place or decoded.
+fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, seg: *storage.ReadSegment, ref: RgRef, j: usize) !void {
+    const rg_count = ref.row_count;
+    const phys = z.probe_phys[j];
+    scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
+    scratch.borrowed[j] = true;
+    const block = &scratch.blocks[j];
+    const col = z.table.schema.columns[phys];
+    const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+    if (z.dict_ok[j] and block.encoding == .dict) {
+        var values = block.bytes;
+        var nulls: ?[]const u8 = null;
+        if (flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(rg_count);
+            nulls = block.bytes[0..bm_len];
+            values = block.bytes[bm_len..];
+        }
+        const db = storage.segment_reader.dictBlockOf(values, rg_count);
+        const offsets = db.offsetsInPlace() orelse offsets: {
+            const decoded = &scratch.entry_offsets[j];
+            try decoded.resize(allocator, @as(usize, db.ndv) + 1);
+            for (decoded.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+            break :offsets decoded.items;
+        };
+        scratch.cols[j] = .{ .dict = .{
+            .db = db,
+            .nulls = nulls,
+            .entries = try stringColumnView(col.type, .{ .offsets = offsets, .bytes = db.dict_bytes }, null),
+        } };
+        // Nothing reads a coded column's rows through the probe batch.
+        scratch.views[j] = try stringColumnView(col.type, .{ .offsets = &.{0}, .bytes = "" }, null);
+        return;
+    }
+    const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, block.encoding) orelse view: {
+        block.expanded = try storage.segment_reader.decodeColumnPayload(allocator, col.type, block.bytes, rg_count, flags, block.encoding);
+        break :view block.expanded.?.view();
+    };
+    scratch.cols[j] = .{ .view = view };
+    scratch.views[j] = view;
+}
+
+/// Set `mask` to the rows whose leading ORDER BY key doesn't sort strictly
+/// after the full heap's worst kept row.
+fn leadKeyPrefilter(z: *const ZonemapTopN, allocator: Allocator, ch: *const CandidateHeap, scratch: *ProbeScratch, lead: ProbeColumn, mask: []bool) !void {
+    const worst_view = ch.key_cols[0].view();
+    const worst = ch.heap.items[0];
+    const desc = z.key_desc[0];
+    const after: std.math.Order = if (desc) .lt else .gt;
+    switch (lead) {
+        .dict => |d| {
+            try scratch.entry_hits.resize(allocator, @max(d.db.ndv, 1));
+            const ok = scratch.entry_hits.items;
+            for (ok[0..d.db.ndv], 0..) |*o, e| o.* = transform.compareViewRowsNullsFirst(d.entries, e, worst_view, worst) != after;
+            mapCodes(d.db, ok, mask);
+        },
+        .view => |v| switch (v.data) {
+            inline .tinyint, .smallint, .int, .bigint, .largeint, .date, .datetime, .decimal64, .decimal128 => |values, tag| {
+                const w = @field(worst_view.data, @tagName(tag))[worst];
+                if (desc) {
+                    for (values[0..mask.len], mask) |x, *m| m.* = x >= w;
+                } else {
+                    for (values[0..mask.len], mask) |x, *m| m.* = x <= w;
+                }
+            },
+            else => for (mask, 0..) |*m, row| {
+                m.* = transform.compareViewRowsNullsFirst(v, row, worst_view, worst) != after;
+            },
+        },
+    }
+}
+
+/// `mask[row] = hits[code of row]` over a dictionary block's rows.
+fn mapCodes(db: storage.segment_reader.DictBlock, hits: []const bool, mask: []bool) void {
+    switch (db.code_width) {
+        inline 1, 2, 4 => |w| for (mask, 0..) |*m, i| {
+            m.* = hits[db.rowCodeAs(w, i)];
+        },
+        else => for (mask, 0..) |*m, i| {
+            m.* = hits[db.rowCode(i)];
+        },
     }
 }
 
 /// Evaluate the WHERE predicate over a probe batch into `mask` (true =
 /// keep). NULL handling matches the reference Filter path: `evaluateExprGuided`
-/// clears a leaf's bit on a NULL row.
-fn evalPredicate(z: *const ZonemapTopN, allocator: Allocator, views: []const ColumnView, n: usize, mask: []bool) !void {
+/// clears a leaf's bit on a NULL row. Rows outside `active` are don't-care.
+fn evalPredicate(z: *const ZonemapTopN, allocator: Allocator, views: []const ColumnView, n: usize, mask: []bool, active: ?[]const bool) !void {
     const batch = Batch{ .schema = z.probe_schema, .values = views, .row_count = n };
-    try predicate.evaluateExprGuided(allocator, z.pred, z.probe_schema, batch, mask, null);
+    try predicate.evaluateExprGuided(allocator, z.pred, z.probe_schema, batch, mask, active);
 }
 
 /// The probe index of the one column the predicate reads, through per-row
-/// kernels only, when that column is no ORDER BY key.
-fn dictFilterProbe(allocator: Allocator, pred: PredicateExpr, probe_schema: []const Column, key_probe_idx: []const usize) !?usize {
+/// kernels only.
+fn dictFilterProbe(allocator: Allocator, pred: PredicateExpr, probe_schema: []const Column) !?usize {
     if (!predicate.kernelsOnly(pred)) return null;
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer names.deinit(allocator);
-    try predicate.collectColumnNames(allocator, &names, pred);
-    if (names.items.len != 1) return null;
-    const j = types.findColumn(probe_schema, names.items[0]) orelse return null;
-    for (key_probe_idx) |k| if (k == j) return null;
-    return j;
+    const names = try predicateColumns(allocator, pred);
+    defer allocator.free(names);
+    if (names.len != 1) return null;
+    return types.findColumn(probe_schema, names[0]);
 }
 
-const DictFilterBlock = struct {
-    db: storage.segment_reader.DictBlock,
-    nulls: ?[]const u8,
-};
+fn predicateColumns(allocator: Allocator, pred: PredicateExpr) ![]const []const u8 {
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer names.deinit(allocator);
+    try predicate.collectColumnNames(allocator, &names, pred);
+    return names.toOwnedSlice(allocator);
+}
+
+/// Which probe columns may stay dictionary-coded: a string column the
+/// predicate either doesn't read or reads alone through the dictionary path,
+/// and that, as an ORDER BY key, can't be NULL (a coded key row reads its
+/// entry, which has no NULL).
+fn dictCodedProbes(allocator: Allocator, pred: PredicateExpr, probe_schema: []const Column, key_probe_idx: []const usize, dict_filter_probe: ?usize) ![]bool {
+    const names = try predicateColumns(allocator, pred);
+    defer allocator.free(names);
+    const ok = try allocator.alloc(bool, probe_schema.len);
+    for (probe_schema, ok, 0..) |col, *o, j| {
+        var read = false;
+        for (names) |nm| {
+            if (types.columnNameEql(nm, col.name)) read = true;
+        }
+        const is_key = std.mem.indexOfScalar(usize, key_probe_idx, j) != null;
+        o.* = col.type.isString() and
+            (!read or dict_filter_probe == j) and
+            !(is_key and col.nullable);
+    }
+    return ok;
+}
 
 /// `evalPredicate` for a row group whose filter column is dictionary-coded:
 /// the predicate runs once over the dictionary's entries, and once over a
 /// NULL when the block has NULL rows, and each row takes its value's result.
-fn evalDictPredicate(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, df: DictFilterBlock, n: usize, mask: []bool) !void {
+fn evalDictPredicate(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, df: DictColumn, n: usize, mask: []bool) !void {
     const db = df.db;
     const j = z.dict_filter_probe.?;
     const schema = z.probe_schema[j..][0..1];
-    const offsets = db.offsetsInPlace() orelse offsets: {
-        try scratch.entry_offsets.resize(allocator, @as(usize, db.ndv) + 1);
-        for (scratch.entry_offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
-        break :offsets scratch.entry_offsets.items;
-    };
-    const entries = [1]ColumnView{try stringColumnView(schema[0].type, .{ .offsets = offsets, .bytes = db.dict_bytes }, null)};
+    const entries = [1]ColumnView{df.entries};
     // An all-NULL block's dictionary may be empty, its rows coded 0.
     try scratch.entry_hits.resize(allocator, @max(db.ndv, 1));
     const hits = scratch.entry_hits.items;
     hits[0] = false;
     try predicate.evaluateExprGuided(allocator, z.pred, schema, Batch{ .schema = schema, .values = &entries, .row_count = db.ndv }, hits[0..db.ndv], null);
-    switch (db.code_width) {
-        inline 1, 2, 4 => |w| for (mask[0..n], 0..) |*m, i| {
-            m.* = hits[db.rowCodeAs(w, i)];
-        },
-        else => for (mask[0..n], 0..) |*m, i| {
-            m.* = hits[db.rowCode(i)];
-        },
-    }
+    mapCodes(db, hits, mask[0..n]);
 
     const nulls = df.nulls orelse return;
     const null_bit = [1]u8{0};
@@ -820,6 +976,13 @@ fn applyTombstones(
         if (off >= rg_first and off < rg_end) mask[off - rg_first] = false;
     }
 }
+
+/// A candidate row's ORDER BY key values: key `i` is row `rows[i]` of
+/// `views[i]`. A dictionary-coded key reads its entry, so the rows differ.
+const KeyRef = struct {
+    views: []const ColumnView,
+    rows: []const usize,
+};
 
 /// Bounded candidate heap: an append-only store of each candidate's ORDER BY
 /// key values (`key_cols`) + packed `__rowloc` (`loc_store`), and a binary
@@ -879,20 +1042,20 @@ const CandidateHeap = struct {
     /// max-heap. Below `keep`: append + sift up. At capacity: if the candidate
     /// is NOT worse than the worst-kept (root), append it, replace the root with
     /// it, sift down (the old root becomes a dead row); else drop.
-    fn pushCandidate(self: *CandidateHeap, views: []const ColumnView, row: usize, loc: i64) !void {
+    fn pushCandidate(self: *CandidateHeap, key: KeyRef, loc: i64) !void {
         if (self.z.keep == 0) return;
 
         if (self.heap.items.len < self.z.keep) {
-            const slot = try self.appendCandidateRow(views, row, loc);
+            const slot = try self.appendCandidateRow(key, loc);
             try self.heap.append(self.allocator, slot);
             self.siftUp(self.heap.items.len - 1);
             return;
         }
 
         const worst_row = self.heap.items[0];
-        if (self.candidateWorseThanRow(views, row, loc, worst_row)) return;
+        if (self.candidateWorseThanRow(key, loc, worst_row)) return;
 
-        const slot = try self.appendCandidateRow(views, row, loc);
+        const slot = try self.appendCandidateRow(key, loc);
         self.heap.items[0] = slot;
         self.siftDown(0);
         self.compactIfNeeded();
@@ -900,25 +1063,25 @@ const CandidateHeap = struct {
 
     /// Append the candidate's per-key values + loc as a fresh row; return its
     /// row index.
-    fn appendCandidateRow(self: *CandidateHeap, views: []const ColumnView, row: usize, loc: i64) !u32 {
+    fn appendCandidateRow(self: *CandidateHeap, key: KeyRef, loc: i64) !u32 {
         const slot: u32 = @intCast(self.loc_store.items.len);
-        for (self.key_cols, 0..) |*kc, i| {
-            try transform.appendOneRow(self.allocator, views[self.z.key_probe_idx[i]], row, kc);
+        for (self.key_cols, key.views, key.rows) |*kc, v, row| {
+            try transform.appendOneRow(self.allocator, v, row, kc);
         }
         try self.loc_store.append(self.allocator, loc);
         return slot;
     }
 
-    /// True when candidate (`views`,`row`,`loc`) is NOT strictly better than
+    /// True when candidate (`key`,`loc`) is NOT strictly better than
     /// stored row `other` — i.e. it would be rejected when the heap is full.
     /// Full key ties break on the storage location (smaller wins), making the
     /// kept set a total order — DETERMINISTIC and independent of visit order,
     /// so the parallel workers and the serial reference keep identical rows.
     /// (The reference `TopN` converges to the same set: its arrival order IS
     /// storage order and it keeps the earliest arrival among ties.)
-    fn candidateWorseThanRow(self: *const CandidateHeap, views: []const ColumnView, row: usize, loc: i64, other: u32) bool {
-        for (self.key_cols, 0..) |kc, i| {
-            const ord = transform.compareViewRowsNullsFirst(views[self.z.key_probe_idx[i]], row, kc.view(), other);
+    fn candidateWorseThanRow(self: *const CandidateHeap, key: KeyRef, loc: i64, other: u32) bool {
+        for (self.key_cols, key.views, key.rows, 0..) |kc, v, row, i| {
+            const ord = transform.compareViewRowsNullsFirst(v, row, kc.view(), other);
             if (ord == .lt) return self.z.key_desc[i];
             if (ord == .gt) return !self.z.key_desc[i];
         }
