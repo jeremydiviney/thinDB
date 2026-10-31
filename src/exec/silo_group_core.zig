@@ -8804,6 +8804,42 @@ fn expectedTotalGroups(total_rows: u64, stats: thindb.exec.PipelineStats, schema
         @min(estimated_total, conservative_total);
 }
 
+/// The most groups the aggregation can see when every key column carries an
+/// offered row-level set: rows outside the sets never reach it, so the groups
+/// number at most the product of the set sizes. maxInt when a key has no set.
+fn offeredSetGroupBound(sets: []const thindb.exec.InSet, key_columns: []const GroupKeyColumnSpec) u64 {
+    if (key_columns.len == 0) return std.math.maxInt(u64);
+    var bound: u64 = 1;
+    for (key_columns) |kc| {
+        const size: u64 = for (sets) |set| {
+            if (set.rows and !set.negate and types_mod.columnNameEql(set.col, kc.name)) break set.values.len;
+        } else return std.math.maxInt(u64);
+        bound = std.math.mul(u64, bound, @max(size, 1)) catch return std.math.maxInt(u64);
+    }
+    return bound;
+}
+
+test "offered row sets bound the groups only when every key column has one" {
+    const keys = [_]GroupKeyColumnSpec{
+        .{ .name = "a", .typ = .bigint, .offset_bits = 0, .width_bits = 64 },
+        .{ .name = "b", .typ = .string, .offset_bits = 64, .width_bits = 64 },
+    };
+    const a_vals = [_]thindb.types.Value{ .{ .bigint = 1 }, .{ .bigint = 2 }, .{ .bigint = 3 } };
+    const b_vals = [_]thindb.types.Value{ .{ .text = "x" }, .{ .text = "y" } };
+    const a_set: thindb.exec.InSet = .{ .col = "A", .values = &a_vals, .negate = false, .rows = true };
+    const b_set: thindb.exec.InSet = .{ .col = "b", .values = &b_vals, .negate = false, .rows = true };
+    const none = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u64, 6), offeredSetGroupBound(&.{ a_set, b_set }, &keys));
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{a_set}, &keys));
+    var zonemap_only = b_set;
+    zonemap_only.rows = false;
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{ a_set, zonemap_only }, &keys));
+    var negated = b_set;
+    negated.negate = true;
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{ a_set, negated }, &keys));
+    try std.testing.expectEqual(@as(u64, 3), offeredSetGroupBound(&.{a_set}, keys[0..1]));
+}
+
 fn expectedGroupsPerBucket(total_groups: u64, bucket_count: usize) usize {
     const per_bucket = (total_groups + @as(u64, @intCast(bucket_count)) - 1) / @as(u64, @intCast(bucket_count));
     return @intCast(@max(@as(u64, 16), per_bucket));
@@ -8936,7 +8972,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // Partitioning only pays when workers fold buckets in parallel; a lone
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
-    const estimated_groups = expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null);
+    const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
@@ -8975,7 +9012,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const defer_groups: u64 = if (cfg.count_sketch != null)
         total_groups
     else
-        @max(total_groups, estimateGroupCountFromStats(stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns) orelse total);
+        @max(total_groups, @min(set_bound, estimateGroupCountFromStats(stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns) orelse total));
     const init_groups_per_bucket = if (cfg.group_init_cap > 0)
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else

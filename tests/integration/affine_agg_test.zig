@@ -62,6 +62,44 @@ test "affine-agg: Q29-shape SUM(w+k) identical to SUM(w)+k*COUNT(w)" {
     try std.testing.expectEqual(@as(?thindb.Batch, null), try q.next());
 }
 
+test "affine-agg: reduced global set reads column stats, exact through deletes and memtable rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try setup(allocator, io, tmp.dir);
+    defer db.close();
+
+    const sql = "SELECT SUM(w), SUM(w + 3), MIN(w - 2), MAX(w + 5), MAX(2 * w) FROM t";
+    try std.testing.expect(try explainMentions(allocator, db, sql, "MetaAggStats"));
+
+    // Drop w=60, add an unflushed w=70: SUM 210-60+70 = 220 over 6 rows.
+    try exec(allocator, db, "DELETE FROM t WHERE id = 6");
+    try exec(allocator, db, "INSERT INTO t (id, w, g, f) VALUES (7, 70, 1, 70.0)");
+    var q = try runSql(allocator, db, sql);
+    defer q.deinit();
+    const b = (try q.next()).?;
+    try std.testing.expectEqual(@as(i64, 220), b.values[0].data.bigint[0]);
+    try std.testing.expectEqual(@as(i64, 220 + 6 * 3), b.values[1].data.bigint[0]);
+    try std.testing.expectEqual(@as(i32, 8), b.values[2].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 75), b.values[3].data.int[0]);
+    try std.testing.expectEqual(@as(i32, 140), b.values[4].data.int[0]);
+}
+
+fn explainMentions(allocator: std.mem.Allocator, db: anytype, sql: []const u8, needle: []const u8) !bool {
+    const explain_sql = try std.fmt.allocPrint(allocator, "EXPLAIN {s}", .{sql});
+    defer allocator.free(explain_sql);
+    var plan = try runSql(allocator, db, explain_sql);
+    defer plan.deinit();
+    var found = false;
+    while (try plan.next()) |b| {
+        for (0..b.row_count) |i| {
+            if (std.mem.indexOf(u8, b.values[0].data.string.rowBytes(i), needle) != null) found = true;
+        }
+    }
+    return found;
+}
+
 test "affine-agg: SUM with sub and mul affine args" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

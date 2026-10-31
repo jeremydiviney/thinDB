@@ -760,6 +760,83 @@ test "zonemap narrow projection: output subset of probe (Q26 shape)" {
     try std.testing.expectEqual(@as(i128, 4), got.rows.items[4].cells[0].int);
 }
 
+test "zonemap dictionary-coded string keys match lateScan (lead and secondary, filtered and not)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "k1", .type = .int },
+            .{ .name = "s", .type = .string },
+            .{ .name = "w", .type = .bigint },
+        },
+        .order_key = &.{"k1"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 64,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k1"}, .row_group_size = 64 });
+
+    // A few repeated strings per row group, so blocks come out dictionary-coded.
+    const vocab = [_][]const u8{ "", "", "", "apple", "banana", "cherry", "date" };
+    var gen = Gen.init(0x5eed);
+    var w: i64 = 0;
+    for (0..5) |batch| {
+        const Row3 = struct { k1: i32, s: []const u8, w: i64 };
+        var rows: [256]Row3 = undefined;
+        const count: usize = if (batch == 4) 50 else rows.len;
+        for (rows[0..count]) |*r| {
+            r.* = .{ .k1 = gen.r().intRangeAtMost(i32, 0, 20), .s = vocab[gen.r().uintLessThan(usize, vocab.len)], .w = w };
+            w += 1;
+        }
+        try t.insert(rows[0..count]);
+        // The last batch stays in the memtable.
+        if (batch < 4) try t.flush();
+    }
+
+    const not_blank = leafExpr("s", .neq, .{ .text = "" });
+    const k1_gt = leafExpr("k1", .gt, .{ .int = 5 });
+    const Case = struct { specs: []const SortSpec, pred: PredicateExpr, n: usize, offset: usize };
+    const cases = [_]Case{
+        .{ .specs = &.{ .{ .col = "k1" }, .{ .col = "s" }, .{ .col = "w" } }, .pred = not_blank, .n = 7, .offset = 0 },
+        .{ .specs = &.{ .{ .col = "k1", .desc = true }, .{ .col = "s", .desc = true }, .{ .col = "w" } }, .pred = not_blank, .n = 9, .offset = 4 },
+        .{ .specs = &.{ .{ .col = "s" }, .{ .col = "w" } }, .pred = not_blank, .n = 7, .offset = 3 },
+        .{ .specs = &.{ .{ .col = "s", .desc = true }, .{ .col = "w", .desc = true } }, .pred = not_blank, .n = 12, .offset = 0 },
+        .{ .specs = &.{ .{ .col = "k1" }, .{ .col = "s" }, .{ .col = "w" } }, .pred = k1_gt, .n = 10, .offset = 2 },
+        .{ .specs = &.{ .{ .col = "s" }, .{ .col = "k1" }, .{ .col = "w" } }, .pred = .{ .always = true }, .n = 20, .offset = 0 },
+    };
+    const out = &[_][]const u8{ "k1", "s", "w" };
+    for (cases) |c| {
+        var probe_buf: [3][]const u8 = undefined;
+        for (c.specs, 0..) |sp, i| probe_buf[i] = sp.col;
+        var probe: []const []const u8 = probe_buf[0..c.specs.len];
+        if (c.specs.len == 2) {
+            probe_buf[2] = "k1";
+            probe = probe_buf[0..3];
+        }
+
+        var ref_q = try exec.lateScan(allocator, t, null, probe, c.pred, c.specs, out, c.n, c.offset);
+        defer ref_q.deinit();
+        var ref = try capture(allocator, &ref_q);
+        defer ref.deinit();
+
+        inline for (.{ 1, 4 }) |dop| {
+            var z_q = (try exec.zonemapTopN(allocator, t, null, probe, c.pred, c.specs, out, c.n, c.offset, dop)).?;
+            defer z_q.deinit();
+            var got = try capture(allocator, &z_q);
+            defer got.deinit();
+            try expectSameRows(ref, got);
+            try std.testing.expectEqual(c.n, got.rows.items.len);
+        }
+    }
+}
+
 test "zonemap NO RGs pruned (heavily overlapping ranges)" {
     try runScenario(.{
         .lead_type = .int,
