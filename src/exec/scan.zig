@@ -262,24 +262,82 @@ pub const KeyBoundSpec = struct {
     keep: usize,
 };
 
-/// A stored row group of a scan's snapshot, segment `seg`'s row group `rg`,
-/// that a batch holds every row of, in stored order.
-pub const WholeRowGroup = struct { seg: usize, rg: usize, rows: u32 };
+/// The rows a batch holds of a stored row group of a scan's snapshot,
+/// segment `seg`'s row group `rg` of `rows` rows, in stored order: the
+/// `len` of them from `offset` on, or with `survivors` only the rows of
+/// that window at those row-group positions, the ones the scan's filter
+/// passed.
+pub const RowGroupSlice = struct { seg: usize, rg: usize, rows: u32, offset: u32, len: u32, survivors: ?[]const u32 = null };
 
-/// A first pass's verdict on the rows of the row groups it saw whole, for a
-/// second pass over the same snapshot (`Scan.setRowSieve`): row r of a row
-/// group with slots passes when bit `slots[r]` of `keep` is set. A row group
-/// without slots passes every row.
+/// A first pass's verdict on the rows of the row groups it recorded, for a
+/// second pass over the same snapshot with the same filter
+/// (`Scan.setRowSieve`). Of a recorded row group, the second pass emits
+/// just the rows the first emitted (bit r of `held`) whose slots pass: the
+/// k-th held row's slot is `slots[k]`, passing when that bit of `keep` is
+/// set. The filter needn't run again there. A row group without a record
+/// passes every row.
 pub const RowSieve = struct {
     /// Per segment of the snapshot, the flat index of its first row group.
     seg_first: []const usize,
-    /// Per flat row group, its rows' slots, or null.
+    /// Per flat row group, its record's rows and their slots, or null.
+    held: []const ?[]const u64,
     slots: []const ?[]const u32,
     keep: []const u64,
+    /// When set, `keep` (a power of two bits long) tests a slot's low bits,
+    /// and a row passes only if its slot is among these, ascending.
+    exact: ?[]const u32 = null,
 
-    fn slotsOf(self: RowSieve, seg: usize, rg: usize) ?[]const u32 {
+    const Record = struct { held: []const u64, slots: []const u32 };
+
+    fn recordOf(self: RowSieve, seg: usize, rg: usize) ?Record {
         if (seg >= self.seg_first.len) return null;
-        return self.slots[self.seg_first[seg] + rg];
+        const i = self.seg_first[seg] + rg;
+        return .{ .held = self.held[i] orelse return null, .slots = self.slots[i].? };
+    }
+
+    /// Clears `mask`'s rows the record doesn't hold or whose slots don't
+    /// pass.
+    fn sift(self: RowSieve, record: Record, mask: []bool) void {
+        var k: usize = 0;
+        for (mask, 0..) |*m, r| {
+            if ((record.held[r >> 6] >> @intCast(r & 63)) & 1 == 0) {
+                m.* = false;
+                continue;
+            }
+            m.* = m.* and self.passes(record.slots[k]);
+            k += 1;
+        }
+    }
+
+    /// Sets `mask`'s rows the record holds whose slots pass; their count.
+    fn pick(self: RowSieve, record: Record, mask: []bool) usize {
+        var k: usize = 0;
+        var picked: usize = 0;
+        for (record.held, 0..) |word, w| {
+            var bits = word;
+            while (bits != 0) : (bits &= bits - 1) {
+                if (self.passes(record.slots[k])) {
+                    mask[w * 64 + @ctz(bits)] = true;
+                    picked += 1;
+                }
+                k += 1;
+            }
+        }
+        return picked;
+    }
+
+    fn passes(self: RowSieve, slot: u32) bool {
+        const exact = self.exact orelse return self.bit(slot);
+        const low: u32 = @intCast(self.keep.len * 64 - 1);
+        return self.bit(slot & low) and std.sort.binarySearch(u32, exact, slot, orderSlot) != null;
+    }
+
+    fn bit(self: RowSieve, b: u32) bool {
+        return (self.keep[b >> 6] >> @intCast(b & 63)) & 1 != 0;
+    }
+
+    fn orderSlot(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
     }
 };
 
@@ -521,12 +579,12 @@ pub const Scan = struct {
     /// rules out, and row groups whose stats it rules out are skipped. Other
     /// paths emit those rows; the consumer ranks what it gets either way.
     key_bound: ?KeyBound = null,
-    /// Set by `setRowSieve`: like a key bound, the guided filter path drops
-    /// the rows it rules out.
+    /// Set by `setRowSieve`: a row group it holds a record of emits only
+    /// the rows the record passes.
     row_sieve: ?RowSieve = null,
-    /// The stored row group the last batch held whole; null for any other
-    /// batch.
-    whole_rg: ?WholeRowGroup = null,
+    /// The stored rows the last batch held, when a row group's in stored
+    /// order; null for any other batch.
+    rg_slice: ?RowGroupSlice = null,
     /// What the predicate-miss memo looks up and notes for `fused_filter`,
     /// taken at the first filtered `next()`; null until then and again
     /// whenever the filter changes.
@@ -1322,21 +1380,31 @@ pub const Scan = struct {
         return true;
     }
 
-    /// Install `sieve`: a row group it holds slots for emits only the rows
-    /// it passes, before any of their columns decode. Like a key bound, it
-    /// narrows what the scan emits and never decides a predicate's result.
+    /// Install `sieve`: a row group it holds a record of emits only the
+    /// rows the record passes, before any of their columns decode. Without
+    /// a key bound the record stands in for the filter there, which the
+    /// first pass already ran over the same snapshot.
     pub fn setRowSieve(self: *Scan, sieve: RowSieve) void {
         self.row_sieve = sieve;
     }
 
-    /// The stored row group the last batch held whole.
-    pub fn wholeRowGroup(self: *const Scan) ?WholeRowGroup {
-        return self.whole_rg;
+    /// The stored rows the last batch held, when a row group's in stored
+    /// order.
+    pub fn rowGroupSlice(self: *const Scan) ?RowGroupSlice {
+        return self.rg_slice;
     }
 
-    fn sievedSlots(self: *const Scan, rg_idx: usize) ?[]const u32 {
+    fn sievedRows(self: *const Scan, rg_idx: usize, rg_count: u32) ?RowSieve.Record {
         const sieve = self.row_sieve orelse return null;
-        return sieve.slotsOf(self.cur_seg_idx, rg_idx);
+        const record = sieve.recordOf(self.cur_seg_idx, rg_idx) orelse return null;
+        return if (record.held.len == (rg_count + 63) / 64) record else null;
+    }
+
+    /// Row group `rg_idx`'s record when it alone decides which of the row
+    /// group's `rg_count` rows the scan emits.
+    fn coveredRows(self: *const Scan, rg_idx: usize, rg_count: u32) ?RowSieve.Record {
+        if (self.key_bound != null) return null;
+        return self.sievedRows(rg_idx, rg_count);
     }
 
     fn hashColIdx(self: *Scan, name: []const u8) ?usize {
@@ -2858,6 +2926,7 @@ pub const Scan = struct {
     fn emitSub(self: *Scan) Batch {
         const n = @min(self.sub_batch_rows, self.sub_count - self.sub_off);
         for (self.decoded[0..self.views.len], 0..) |c, i| self.views[i] = subView(c.view(), self.sub_off, n);
+        self.rg_slice = .{ .seg = self.cur_seg_idx, .rg = self.cur_rg_idx - 1, .rows = @intCast(self.sub_count), .offset = @intCast(self.sub_off), .len = @intCast(n) };
         self.sub_off += n;
         return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(n) };
     }
@@ -3168,7 +3237,7 @@ pub const Scan = struct {
         if (self.emit_runs and rg_clean) {
             runs_sidecar = try self.fillRunsSidecar(seg, self.cur_rg_idx - 1, rg_count);
         }
-        self.whole_rg = .{ .seg = self.cur_seg_idx, .rg = self.cur_rg_idx - 1, .rows = rg_count };
+        self.rg_slice = .{ .seg = self.cur_seg_idx, .rg = self.cur_rg_idx - 1, .rows = rg_count, .offset = 0, .len = rg_count };
         return Batch{
             .schema = self.out_schema,
             .values = self.views,
@@ -3308,12 +3377,19 @@ pub const Scan = struct {
             }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
-            if (self.key_bound == null and self.sievedSlots(self.cur_rg_idx) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
+            if (self.key_bound == null and self.sievedRows(self.cur_rg_idx, rg.row_count) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             const rg_count = rg.row_count;
             const this_rg = self.cur_rg_idx;
             self.cur_rg_idx += 1;
+
+            if (self.coveredRows(this_rg, rg_count)) |record| {
+                const sifted = try self.siftRowGroup(seg, this_rg, rg_count, record);
+                if (sifted == 0) continue;
+                for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+                return Batch{ .schema = self.out_schema, .values = self.views, .row_count = sifted, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
+            }
 
             self.rg_unmatched = .none;
             const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
@@ -3346,6 +3422,15 @@ pub const Scan = struct {
         }
 
         return null;
+    }
+
+    /// Emit the rows of row group `rg_idx` that the sieve passes, by its
+    /// `record` alone.
+    fn siftRowGroup(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, record: RowSieve.Record) !usize {
+        const mask = (try self.ensureMask(rg_count))[0..rg_count];
+        @memset(mask, false);
+        if (self.row_sieve.?.pick(record, mask) == 0) return 0;
+        return self.materializeSurvivors(seg, rg_idx, rg_count, mask);
     }
 
     /// Filter one segment row group into `filtered`. Fast path: borrow typed
@@ -3503,17 +3588,14 @@ pub const Scan = struct {
         self.rgs_guided += 1;
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
-        const sieved = self.sievedSlots(rg_idx);
+        const sieved = self.sievedRows(rg_idx, rg_count);
         const narrowed = tomb_mask != null or self.key_bound != null or sieved != null;
         if (expr != .@"and" and narrowed and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..rg_count], true) == null) self.rg_unmatched = .whole;
         if (tomb_mask) |tm| {
             for (mask[0..rg_count], tm) |*m, keep| m.* = m.* and keep;
         }
         if (self.key_bound != null) try self.applyKeyBound(seg, rg_idx, rg_count, mask[0..rg_count]);
-        if (sieved) |slots| if (slots.len == rg_count) {
-            const keep = self.row_sieve.?.keep;
-            for (mask[0..rg_count], slots) |*m, s| m.* = m.* and (keep[s >> 6] >> @intCast(s & 63)) & 1 != 0;
-        };
+        if (sieved) |record| self.row_sieve.?.sift(record, mask[0..rg_count]);
 
         const _tcnt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const matched = simd.countTrue(mask[0..rg_count]);
@@ -4767,6 +4849,7 @@ pub const Scan = struct {
         }
         const lo = self.pending_lo;
         try self.materializeRows(seg, self.pending_rg, self.pending_rg_count, mask[lo..hi], lo, rows[0..n]);
+        self.rg_slice = .{ .seg = self.cur_seg_idx, .rg = self.pending_rg, .rows = self.pending_rg_count, .offset = @intCast(lo), .len = @intCast(hi - lo), .survivors = rows[0..n] };
         self.pending_rows = rows[n..];
         self.pending_lo = hi;
         return n;
@@ -5514,7 +5597,7 @@ pub const Scan = struct {
         self.sub_off = 0;
         self.sub_count = 0;
         self.pending_rows = &.{};
-        self.whole_rg = null;
+        self.rg_slice = null;
     }
 
     /// If any tombstone offsets fall within `[rg_first, rg_first + rg_count)`,

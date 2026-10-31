@@ -27,6 +27,7 @@ const RowGroupTiles = @import("rg_tiles.zig").RowGroupTiles;
 const count_topk_sketch = @import("count_topk_sketch.zig");
 const CountSketch = count_topk_sketch.CountSketch;
 const HeavyKeys = count_topk_sketch.HeavyKeys;
+const DupSketch = count_topk_sketch.DupSketch;
 const appendMaskedColumn = @import("../engine/transform.zig").appendMaskedColumn;
 const appendByIndices = @import("../engine/transform.zig").appendByIndices;
 const subViewAligned = @import("../engine/transform.zig").subViewAligned;
@@ -7940,14 +7941,17 @@ const EncodedCountGroups = struct {
 };
 
 /// One pass of a two-pass COUNT top-K (see count_topk_sketch.zig): a tally
-/// counts every input row into the sketch, or reports each row group's
-/// heavy keys, and groups none; a filter pass groups only the rows of the
-/// groups the sketch keeps, or of the heavy candidates.
+/// counts every input row into the sketch, reports each row group's heavy
+/// keys, or fingerprints each row's key, and groups none; a filter pass
+/// groups only the rows of the groups the sketch keeps, of the heavy
+/// candidates, or of the keys that repeat and a few groups of one.
 pub const CountSketchPass = union(enum) {
     tally: *CountSketch,
     filter: *CountSketch,
     heavy_tally: *HeavyKeys,
     heavy_filter: *const HeavyKeys,
+    dup_tally: *DupSketch,
+    dup_filter: *DupSketch,
 };
 
 /// Below this many estimated groups the single pass groups in cache, and a
@@ -8141,9 +8145,10 @@ fn sketchRuns(job: SiloGridJob, pass: CountSketchPass, row_count: usize, key_run
             const counts = sketch.workerCounts(job.worker_index);
             while (try spans.next()) |key| counts[sketch.counter(key)] += @intCast(spans.rows);
         },
+        .dup_tally => |dups| while (try spans.next()) |key| try dups.tallyRows(job.worker_index, key, spans.rows),
         // A heavy pass keys on a string, which never arrives run-encoded.
         .heavy_tally, .heavy_filter => return error.UnsupportedOperatorForType,
-        .filter => |sketch| {
+        .filter, .dup_filter => {
             const allocator = job.scan.allocator;
             const scratch = job.sketch_scratch;
             const values = scratch.span_values[0..key_runs.len];
@@ -8151,7 +8156,7 @@ fn sketchRuns(job: SiloGridJob, pass: CountSketchPass, row_count: usize, key_run
             for (values) |*v| v.clearRetainingCapacity();
             var kept: usize = 0;
             while (try spans.next()) |key| {
-                if (!sketch.keeps(key)) continue;
+                if (!filterKeeps(pass, key)) continue;
                 try scratch.span_lengths.append(allocator, @intCast(spans.rows));
                 for (values, 0..) |*v, i| try v.append(allocator, spans.value(i));
                 kept += spans.rows;
@@ -8368,13 +8373,12 @@ inline fn foldSketchPart(prior: u64, bits: u128) u64 {
 
 /// A collapsed batch's rows stand for `weights` rows each, so the tally
 /// counts them by weight: the sketch must see the counts the grid will.
-fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weights: ?RowWeights) !void {
-    const counts = sketch.workerCounts(job.worker_index);
+fn tallyRows(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, weights: ?RowWeights) !void {
     const n = batch.row_count;
     const row_weights: ?[]const u32 = if (weights) |w| w.counts[0..n] else null;
-    const slots = try recordedSlots(job, sketch, batch, weights);
+    const slots = try recordedSlots(job, pass, batch, weights);
     const layout = job.shared.group_rows_layout;
-    if (!foldsSketchKeys(layout)) return sketch.tally(counts, try batchIdentities(job, job.scan.allocator, batch), row_weights, slots);
+    if (!foldsSketchKeys(layout)) return tallyIdentities(job, pass, try batchIdentities(job, job.scan.allocator, batch), row_weights, slots);
     const keys = try BatchKeys.init(layout, batch);
     try job.sketch_scratch.lanes.resize(job.scan.allocator, keys.len * IDENTITY_LANE_ROWS);
     var chunk: [IDENTITY_LANE_ROWS]u128 = undefined;
@@ -8382,19 +8386,41 @@ fn tallyRows(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weight
     while (lo < n) : (lo += IDENTITY_LANE_ROWS) {
         const ids = chunk[0..@min(n - lo, IDENTITY_LANE_ROWS)];
         foldSketchKeys(job, &keys, lo, ids);
-        sketch.tally(counts, ids, if (row_weights) |w| w[lo..][0..ids.len] else null, if (slots) |s| s[lo..][0..ids.len] else null);
+        try tallyIdentities(job, pass, ids, if (row_weights) |w| w[lo..][0..ids.len] else null, if (slots) |s| s[lo..][0..ids.len] else null);
     }
 }
 
-/// Where a tally records `batch`'s rows' counters: a row group's when the
-/// batch is its every row in stored order, as the filter pass's scan meets
-/// them again.
-fn recordedSlots(job: SiloGridJob, sketch: *CountSketch, batch: thindb.Batch, weights: ?RowWeights) !?[]u32 {
+fn tallyIdentities(job: SiloGridJob, pass: CountSketchPass, ids: []const u128, weights: ?[]const u32, slots: ?[]u32) !void {
+    switch (pass) {
+        .tally => |sketch| sketch.tally(sketch.workerCounts(job.worker_index), ids, weights, slots),
+        .dup_tally => |dups| try dups.tally(job.worker_index, ids, weights, slots),
+        .filter, .heavy_tally, .heavy_filter, .dup_filter => return error.UnsupportedOperatorForType,
+    }
+}
+
+/// Whether a filter pass keeps the rows of the group `identity` names.
+fn filterKeeps(pass: CountSketchPass, identity: u128) bool {
+    return switch (pass) {
+        .filter => |sketch| sketch.keeps(identity),
+        .dup_filter => |dups| dups.keeps(identity),
+        .tally, .heavy_tally, .heavy_filter, .dup_tally => true,
+    };
+}
+
+/// Where a tally records `batch`'s rows' counters or fingerprints: a row
+/// group's when the batch holds its rows, or a filter's survivors among
+/// them, in stored order, as the filter pass's scan meets them again.
+fn recordedSlots(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, weights: ?RowWeights) !?[]u32 {
     if (weights != null or job.distinct != null) return null;
-    const row_slots = if (sketch.row_slots) |*rs| rs else return null;
-    const whole = job.scan.wholeRowGroup() orelse return null;
-    if (whole.rows != batch.row_count) return null;
-    return try row_slots.record(whole.seg, whole.rg, batch.row_count);
+    const row_slots = switch (pass) {
+        .tally => |sketch| if (sketch.row_slots) |*rs| rs else return null,
+        .dup_tally => |dups| if (dups.row_slots) |*rs| rs else return null,
+        .filter, .heavy_tally, .heavy_filter, .dup_filter => return null,
+    };
+    const slice = job.scan.rowGroupSlice() orelse return null;
+    const held = if (slice.survivors) |rows| rows.len else slice.len;
+    if (held != batch.row_count) return null;
+    return try row_slots.record(slice.seg, slice.rg, slice.rows, slice.offset, slice.len, slice.survivors);
 }
 
 /// A batch bound for the grid, with its rows' repeat counts when collapsed
@@ -8407,7 +8433,7 @@ const KeptRows = struct {
 
 /// The rows of `batch` whose groups the sketch keeps, compacted (with their
 /// weights) into the worker's scratch when only some are; null when none are.
-fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, batch: thindb.Batch, weights: ?RowWeights) !?KeptRows {
+fn keptRows(job: SiloGridJob, allocator: Allocator, pass: CountSketchPass, batch: thindb.Batch, weights: ?RowWeights) !?KeptRows {
     const scratch = job.sketch_scratch;
     try scratch.mask.resize(allocator, batch.row_count);
     const mask = scratch.mask.items;
@@ -8416,7 +8442,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
     if (!foldsSketchKeys(layout)) {
         const ids = try batchIdentities(job, allocator, batch);
         for (mask, ids) |*m, id| {
-            m.* = sketch.keeps(id);
+            m.* = filterKeeps(pass, id);
             kept += @intFromBool(m.*);
         }
         return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, kept);
@@ -8429,7 +8455,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, sketch: *const CountSketch, 
         const ids = chunk[0..@min(mask.len - lo, IDENTITY_LANE_ROWS)];
         foldSketchKeys(job, &keys, lo, ids);
         for (mask[lo..][0..ids.len], ids) |*m, id| {
-            m.* = sketch.keeps(id);
+            m.* = filterKeeps(pass, id);
             kept += @intFromBool(m.*);
         }
     }
@@ -8669,11 +8695,11 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
             break :blk .{ .batch = try rest.evalBatch(rows.batch), .weights = rows.weights, .ids = rows.ids };
         } else .{ .batch = scanned, .weights = if (job.distinct) |gd| gd.rowWeights() else null };
         const kept: KeptRows = if (job.shared.count_sketch) |pass| switch (pass) {
-            .tally => |sketch| {
-                try tallyRows(job, sketch, passed.batch, passed.weights);
+            .tally, .dup_tally => {
+                try tallyRows(job, pass, passed.batch, passed.weights);
                 continue;
             },
-            .filter => |sketch| (try keptRows(job, job.scan.allocator, sketch, passed.batch, passed.weights)) orelse continue,
+            .filter, .dup_filter => (try keptRows(job, job.scan.allocator, pass, passed.batch, passed.weights)) orelse continue,
             .heavy_tally => |heavy| {
                 try heavyTallyRows(job, heavy, passed.batch, passed.weights);
                 continue;
@@ -9420,21 +9446,31 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // groups nothing itself, and a filter pass groups at most the rows it
     // keeps.
     if (cfg.count_sketch) |pass| {
+        const large = !small_input and estimated_groups >= COUNT_SKETCH_MIN_GROUPS;
+        const near_unique = large and nearUniqueKeyColumn(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns);
         const tally_declines = switch (pass) {
-            .tally, .heavy_tally => small_input or estimated_groups < COUNT_SKETCH_MIN_GROUPS or
-                nearUniqueKeyColumn(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns),
-            .filter, .heavy_filter => false,
+            .tally, .heavy_tally => !large or near_unique,
+            .dup_tally => small_input,
+            .filter, .heavy_filter, .dup_filter => false,
         };
         if (tally_declines) {
-            if (pass == .heavy_tally) pass.heavy_tally.declined_small = true;
+            switch (pass) {
+                .tally => |sketch| sketch.near_unique = near_unique,
+                .heavy_tally => |heavy| {
+                    heavy.declined_small = true;
+                    heavy.near_unique = near_unique;
+                },
+                .filter, .heavy_filter, .dup_tally, .dup_filter => {},
+            }
             return;
         }
         if (pass == .heavy_tally and !try heavyTallyApplies(allocator, cfg, stats_scan.outputSchema())) return;
     }
     const total_groups: u64 = if (cfg.count_sketch) |pass| switch (pass) {
-        .tally, .heavy_tally => 1,
+        .tally, .heavy_tally, .dup_tally => 1,
         .filter => |sketch| @max(1, @min(estimated_groups, sketch.kept_rows)),
         .heavy_filter => |heavy| @max(1, @min(estimated_groups, heavy.candidates.count())),
+        .dup_filter => |dups| @max(1, @min(estimated_groups, dups.kept.len)),
     } else estimated_groups;
     const bucket_count = if (serial_fold)
         1
@@ -9683,11 +9719,22 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
-        if (cfg.count_sketch) |pass| if (pass == .filter) if (pass.filter.row_slots) |rs| scans[i].setRowSieve(.{
-            .seg_first = rs.seg_first,
-            .slots = rs.rows,
-            .keep = pass.filter.keep,
-        });
+        if (cfg.count_sketch) |pass| switch (pass) {
+            .filter => |sketch| if (sketch.row_slots) |rs| scans[i].setRowSieve(.{
+                .seg_first = rs.seg_first,
+                .held = rs.held,
+                .slots = rs.rows,
+                .keep = sketch.keep,
+            }),
+            .dup_filter => |dups| if (dups.row_slots) |rs| scans[i].setRowSieve(.{
+                .seg_first = rs.seg_first,
+                .held = rs.held,
+                .slots = rs.rows,
+                .keep = dups.kept_bits,
+                .exact = dups.kept_fingerprints,
+            }),
+            .tally, .heavy_tally, .heavy_filter, .dup_tally => {},
+        };
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;

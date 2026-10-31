@@ -1132,12 +1132,13 @@ fn runCountSketch(
         var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
         defer heavy.deinit(allocator);
         if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
+        if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
         if (heavy.declined_small) return false;
     }
 
     var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
     defer sketch.deinit(allocator);
-    if (rowSlotsFit(allocator, cfg.snapshot)) {
+    if (rowBytesFit(allocator, cfg.snapshot, @sizeOf(u32))) {
         sketch.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
     }
 
@@ -1149,6 +1150,7 @@ fn runCountSketch(
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
+    if (sketch.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
     if (!try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return false;
 
     var filter = cfg;
@@ -1164,11 +1166,49 @@ fn runCountSketch(
     return true;
 }
 
-/// Whether a tally may record its rows' counters (4 bytes a row) for the
-/// filter pass to sieve by: an eighth of what a statement may hold.
-fn rowSlotsFit(allocator: Allocator, snapshot: exec.Scan.Snapshot) bool {
+/// The near-unique COUNT(*) top-K (see DupSketch) into `rows`. False,
+/// leaving `rows` empty, when its fingerprints wouldn't fit or the keys
+/// repeat too often for it to pay.
+fn runDupSketch(
+    allocator: Allocator,
+    table: *api.Table,
+    cpus: []const usize,
+    cfg: SiloCore.RunConfig,
+    need: usize,
+    rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
+) !bool {
+    if (!rowBytesFit(allocator, cfg.snapshot, @sizeOf(u32))) return false;
+    const worker_allocator = try exec.memory.workerAllocatorOf(allocator);
+    var dups = try count_topk_sketch.DupSketch.init(allocator, worker_allocator, need, cpus.len, snapshotRows(cfg.snapshot));
+    defer dups.deinit(allocator);
+    if (rowBytesFit(allocator, cfg.snapshot, 2 * @sizeOf(u32))) {
+        dups.row_slots = try count_topk_sketch.RowSlots.init(worker_allocator, cfg.snapshot.segments);
+    }
+
+    var none: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
+    defer none.deinit(allocator);
+    var tally = cfg;
+    tally.count_sketch = .{ .dup_tally = &dups };
+    tally.result_out = &none;
+    tally.workspace = null;
+    tally.defer_heavy_teardown = false;
+    try SiloCore.runSiloGrid(allocator, table, cpus, tally);
+    if (!try dups.settle(allocator)) return false;
+
+    var filter = cfg;
+    filter.count_sketch = .{ .dup_filter = &dups };
+    try SiloCore.runSiloGrid(allocator, table, cpus, filter);
+    if (dups.exact(rows.items.len)) return true;
+    rows.clearRetainingCapacity();
+    return false;
+}
+
+/// Whether a tally may hold `bytes` a row for the filter pass (its rows'
+/// counters to sieve by, or its fingerprints): an eighth of what a statement
+/// may hold.
+fn rowBytesFit(allocator: Allocator, snapshot: exec.Scan.Snapshot, bytes: u64) bool {
     const accountant = exec.memory.accountantOf(allocator) orelse return true;
-    return snapshotRows(snapshot) * @sizeOf(u32) <= accountant.pool.statementLimit() / 8;
+    return snapshotRows(snapshot) * bytes <= accountant.pool.statementLimit() / 8;
 }
 
 /// The heavy-key COUNT top-K (see HeavyKeys) into `rows`. False, leaving
