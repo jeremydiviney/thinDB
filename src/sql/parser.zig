@@ -2420,16 +2420,20 @@ pub const Parser = struct {
     /// the query spells out (an alias, a column), or an earlier display name,
     /// becomes `name_N` with the smallest N no shown name claims.
     fn dedupeDisplayNames(self: *Parser, items: []ProjItem) ParseError!void {
+        var next_suffix: std.StringHashMapUnmanaged(usize) = .empty;
         for (items, 0..) |*item, i| {
             const display = item.display orelse continue;
             if (!displayNameClaimed(items, i, display)) continue;
-            var n: usize = 1;
+            const slot = try next_suffix.getOrPut(self.arena, display);
+            if (!slot.found_existing) slot.value_ptr.* = 1;
+            var n = slot.value_ptr.*;
             while (true) : (n += 1) {
                 const candidate = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ display, n });
                 if (shownNameClaimed(items, candidate)) continue;
                 item.display = candidate;
                 break;
             }
+            slot.value_ptr.* = n + 1;
         }
         for (items) |*item| {
             if (item.display) |d| if (std.mem.eql(u8, d, item.name)) {
@@ -2442,16 +2446,25 @@ pub const Parser = struct {
     /// A repeated name (`SELECT 1, 1`, `SELECT id, NULL, NULL`, `a AS x, b AS
     /// x`, `x.id, y.qty AS id`) keeps its first use; each later use becomes
     /// `name_N` with the smallest N no item claims — DuckDB's naming.
+    /// Each search for a base name resumes where the last one stopped, which
+    /// keeps many same-named items (`SUM(a + 1), SUM(a + 2), ...`) from going
+    /// cubic. The names it skipped stay claimed, except where a column item
+    /// renamed off its own unqualified name frees one; a later duplicate then
+    /// takes a higher N, still distinct.
     fn dedupeProjectionNames(self: *Parser, items: []ProjItem) ParseError!void {
+        var next_suffix: std.StringHashMapUnmanaged(usize) = .empty;
         for (items, 0..) |*item, i| {
             if (item.kind == .star or !projectionNameClaimed(items[0..i], item.name)) continue;
-            var n: usize = 1;
+            const slot = try next_suffix.getOrPut(self.arena, item.name);
+            if (!slot.found_existing) slot.value_ptr.* = 1;
+            var n = slot.value_ptr.*;
             while (true) : (n += 1) {
                 const candidate = try std.fmt.allocPrint(self.arena, "{s}_{d}", .{ item.name, n });
                 if (projectionNameClaimed(items, candidate)) continue;
                 item.name = candidate;
                 break;
             }
+            slot.value_ptr.* = n + 1;
         }
     }
 
