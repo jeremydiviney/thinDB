@@ -8819,6 +8819,27 @@ fn offeredSetGroupBound(sets: []const thindb.exec.InSet, key_columns: []const Gr
     return bound;
 }
 
+test "offered row sets bound the groups only when every key column has one" {
+    const keys = [_]GroupKeyColumnSpec{
+        .{ .name = "a", .typ = .bigint, .offset_bits = 0, .width_bits = 64 },
+        .{ .name = "b", .typ = .string, .offset_bits = 64, .width_bits = 64 },
+    };
+    const a_vals = [_]thindb.types.Value{ .{ .bigint = 1 }, .{ .bigint = 2 }, .{ .bigint = 3 } };
+    const b_vals = [_]thindb.types.Value{ .{ .text = "x" }, .{ .text = "y" } };
+    const a_set: thindb.exec.InSet = .{ .col = "A", .values = &a_vals, .negate = false, .rows = true };
+    const b_set: thindb.exec.InSet = .{ .col = "b", .values = &b_vals, .negate = false, .rows = true };
+    const none = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u64, 6), offeredSetGroupBound(&.{ a_set, b_set }, &keys));
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{a_set}, &keys));
+    var zonemap_only = b_set;
+    zonemap_only.rows = false;
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{ a_set, zonemap_only }, &keys));
+    var negated = b_set;
+    negated.negate = true;
+    try std.testing.expectEqual(none, offeredSetGroupBound(&.{ a_set, negated }, &keys));
+    try std.testing.expectEqual(@as(u64, 3), offeredSetGroupBound(&.{a_set}, keys[0..1]));
+}
+
 fn expectedGroupsPerBucket(total_groups: u64, bucket_count: usize) usize {
     const per_bucket = (total_groups + @as(u64, @intCast(bucket_count)) - 1) / @as(u64, @intCast(bucket_count));
     return @intCast(@max(@as(u64, 16), per_bucket));
