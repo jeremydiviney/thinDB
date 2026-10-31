@@ -2245,6 +2245,18 @@ pub const Regex = struct {
         }
         const slots = scratch.slots[0..self.n_slots];
 
+        // An anchored sequence matches once, at the text's start or nowhere,
+        // so the search loop below reduces to one plan run.
+        if (self.seq) |*plan| if (plan.anchored and start == 0 and occurrence <= 1) {
+            var work: usize = 0;
+            const end = plan.matchAt(false, input, 0, slots, &work) orelse return out.appendSlice(allocator, input);
+            slots[0] = 0;
+            slots[1] = end;
+            try expandTemplate(allocator, out, template, input, slots);
+            if (end < input.len) try out.appendSlice(allocator, input[end..]);
+            return;
+        };
+
         // Empty pieces are skipped: each append is an out-of-line capacity
         // check, and an anchored match usually leaves nothing around it.
         if (start > 0) try out.appendSlice(allocator, input[0..start]);
@@ -2903,6 +2915,32 @@ test "regex: replaceScratch keeps the prefix and replaces one occurrence" {
     };
     inline for (cases) |c| {
         try std.testing.expectEqualStrings(c[2], try re.replaceScratch("abc abc abc", "X", &scratch, c[0], c[1]));
+    }
+}
+
+test "regex: anchored replace runs the sequence plan once per row" {
+    const cases = .{
+        .{ "^https?://(?:www\\.)?([^/]+)/.*$", "\\1", "https://www.google.com/search?q=1", "google.com" },
+        .{ "^https?://(?:www\\.)?([^/]+)/.*$", "\\1", "ftp://x/y", "ftp://x/y" },
+        .{ "^https?://(?:www\\.)?([^/]+)/.*$", "\\1", "", "" },
+        .{ "^a*", "X", "aaab", "Xb" },
+        .{ "^a*", "X", "bcd", "Xbcd" },
+        .{ "^a*", "X", "", "X" },
+        .{ "^(a)?b", "[\\1]", "abc", "[a]c" },
+        .{ "^(a)?b", "[\\1]", "bc", "[]c" },
+        .{ "^(a)?b", "[\\1]", "xbc", "xbc" },
+        .{ "^(www\\.)?w", "[\\1]", "www.x", "[]ww.x" },
+        .{ "^(www\\.)?w", "[\\1]", "www.wx", "[www.]x" },
+    };
+    var scratch = Scratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    inline for (cases) |c| {
+        var re = try Regex.compile(std.testing.allocator, c[0]);
+        defer re.deinit();
+        try std.testing.expect(re.seq != null and re.seq.?.anchored);
+        try std.testing.expectEqualStrings(c[3], try re.replaceScratch(c[2], c[1], &scratch, 0, 0));
+        try std.testing.expectEqualStrings(c[3], try re.replaceScratch(c[2], c[1], &scratch, 0, 1));
+        try std.testing.expectEqualStrings(c[2], try re.replaceScratch(c[2], c[1], &scratch, 0, 2));
     }
 }
 
