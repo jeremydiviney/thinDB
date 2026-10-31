@@ -6681,9 +6681,9 @@ const GridDictEval = struct {
     partials: []DictPartial = &.{},
     /// Per staged column, its partial's folded values in the collapsed batch.
     partial_views: []?ColumnView = &.{},
-    /// Per dictionary code: rows using it, and one such row's location.
+    /// Per dictionary code: rows using it, and one such row.
     code_rows: std.ArrayListUnmanaged(u32) = .empty,
-    code_loc: std.ArrayListUnmanaged(i64) = .empty,
+    code_row: std.ArrayListUnmanaged(u32) = .empty,
     /// Per collapsed value: its row count and a row's location, its digest
     /// when the column is a hashed key, else the value bytes when the used
     /// codes aren't one contiguous run.
@@ -6722,7 +6722,7 @@ const GridDictEval = struct {
     fn deinit(self: *GridDictEval, allocator: Allocator) void {
         if (self.built_layers) |l| thindb.exec.Compute.deinitLayersOver(l.top, l.base);
         self.code_rows.deinit(allocator);
-        self.code_loc.deinit(allocator);
+        self.code_row.deinit(allocator);
         self.weights.deinit(allocator);
         self.locs.deinit(allocator);
         self.digests.deinit(allocator);
@@ -7027,11 +7027,11 @@ const GridDictEval = struct {
         const code_rows = self.code_rows.items;
         @memset(code_rows, 0);
         const row_locs: ?[]const i64 = if (self.loc_column) |lc| raw.values[lc].data.bigint else null;
-        if (row_locs) |rl| {
-            try self.code_loc.resize(allocator, code_rows.len);
-            const code_loc = self.code_loc.items;
-            for (column.codes, rl[0..column.codes.len]) |c, loc| {
-                code_loc[c] = loc;
+        if (row_locs != null) {
+            try self.code_row.resize(allocator, code_rows.len);
+            const code_row = self.code_row.items;
+            for (column.codes, 0..) |c, row| {
+                code_row[c] = @intCast(row);
                 code_rows[c] += 1;
             }
         } else {
@@ -7057,7 +7057,7 @@ const GridDictEval = struct {
         for (code_rows[lo..hi], lo..) |n, c| {
             if (n == 0) continue;
             self.weights.appendAssumeCapacity(n);
-            if (row_locs != null) self.locs.appendAssumeCapacity(self.code_loc.items[c]);
+            if (row_locs) |rl| self.locs.appendAssumeCapacity(rl[self.code_row.items[c]]);
             if (column.digests) |ds| self.digests.appendAssumeCapacity(ds[c]);
         }
 
@@ -7952,6 +7952,14 @@ pub const CountSketchPass = union(enum) {
     heavy_filter: *const HeavyKeys,
     dup_tally: *DupSketch,
     dup_filter: *DupSketch,
+
+    /// Whether the pass groups no rows, and so never reads where one lies.
+    fn tallies(self: CountSketchPass) bool {
+        return switch (self) {
+            .tally, .heavy_tally, .dup_tally => true,
+            .filter, .heavy_filter, .dup_filter => false,
+        };
+    }
 };
 
 /// Below this many estimated groups the single pass groups in cache, and a
@@ -7987,8 +7995,11 @@ const SketchScratch = struct {
     weights: std.ArrayListUnmanaged(u32) = .empty,
     span_lengths: std.ArrayListUnmanaged(u32) = .empty,
     span_values: [MAX_GENERIC_GROUP_KEYS]std.ArrayListUnmanaged(i64) = @splat(.empty),
-    /// A heavy tally's batch-local key counts, for a batch that isn't collapsed.
+    /// A heavy tally's batch-local key counts, for a batch that isn't
+    /// collapsed, and its rows' signature bins and their counts.
     unit_keys: std.AutoHashMapUnmanaged(u128, UnitKey) = .empty,
+    row_bins: std.ArrayListUnmanaged(u32) = .empty,
+    bin_counts: std.ArrayListUnmanaged(u32) = .empty,
     stores: []ColumnStore = &.{},
     views: []ColumnView = &.{},
     digests: []std.ArrayListUnmanaged(u128) = &.{},
@@ -8009,6 +8020,8 @@ const SketchScratch = struct {
         self.span_lengths.deinit(allocator);
         for (&self.span_values) |*v| v.deinit(allocator);
         self.unit_keys.deinit(allocator);
+        self.row_bins.deinit(allocator);
+        self.bin_counts.deinit(allocator);
         for (&self.partial_ints) |*v| v.deinit(allocator);
         for (&self.partial_floats) |*v| v.deinit(allocator);
         self.deinitColumns(allocator);
@@ -8464,8 +8477,10 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, pass: CountSketchPass, batch
 
 /// A heavy tally over one batch, a unit. A collapsed batch's rows are its
 /// row group's distinct keys and their counts, so only the keys over the
-/// unit's threshold are hashed; any other batch (a raw row group, the
-/// memtable) first counts its keys in a batch-local table.
+/// unit's threshold are hashed. Any other batch (a raw row group, the
+/// memtable) first bins its rows by key signature: a bin's rows bound each
+/// of its keys' counts, so only the rows of bins reaching the threshold are
+/// hashed and counted, in a batch-local table.
 fn heavyTallyRows(job: SiloGridJob, heavy: *HeavyKeys, batch: thindb.Batch, weights: ?RowWeights) !void {
     const keys = (try heavyKeyColumn(job, batch)).values;
     const w = job.worker_index;
@@ -8483,20 +8498,28 @@ fn heavyTallyRows(job: SiloGridJob, heavy: *HeavyKeys, batch: thindb.Batch, weig
         return;
     }
     const scratch_allocator = job.scan.allocator;
-    const ids = try batchIdentities(job, scratch_allocator, batch);
     const scratch = job.sketch_scratch;
+    // As many bins as rows: a light key's bin rarely holds enough other
+    // rows to reach a threshold that matters.
+    const n_bins = std.math.ceilPowerOfTwoAssert(usize, @max(batch.row_count, 2));
+    const shift: u6 = @intCast(@as(u7, 64) - std.math.log2_int(usize, n_bins));
+    try scratch.bin_counts.resize(scratch_allocator, n_bins);
+    try scratch.row_bins.resize(scratch_allocator, batch.row_count);
+    const bin_counts = scratch.bin_counts.items;
+    @memset(bin_counts, 0);
+    for (scratch.row_bins.items, 0..) |*bin, r| {
+        bin.* = @intCast(count_topk_sketch.keySignature(keys.rowBytes(r)) >> shift);
+        bin_counts[bin.*] += 1;
+    }
+    const t = heavy.unitThreshold(w, batch.row_count, count_topk_sketch.approxKth(bin_counts, heavy.need));
     const unit_keys = &scratch.unit_keys;
     unit_keys.clearRetainingCapacity();
-    for (ids, 0..) |id, r| {
-        const gop = try unit_keys.getOrPut(scratch_allocator, id);
+    for (scratch.row_bins.items, 0..) |bin, r| {
+        if (bin_counts[bin] < t) continue;
+        const gop = try unit_keys.getOrPut(scratch_allocator, thindb.exec.stringKeyDigest(keys.rowBytes(r)));
         if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .row = @intCast(r) };
         gop.value_ptr.count += 1;
     }
-    try scratch.weights.resize(scratch_allocator, unit_keys.count());
-    var i: usize = 0;
-    var counts = unit_keys.valueIterator();
-    while (counts.next()) |k| : (i += 1) scratch.weights.items[i] = k.count;
-    const t = heavy.unitThreshold(w, batch.row_count, count_topk_sketch.approxKth(scratch.weights.items, heavy.need));
     var it = unit_keys.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.count < t) continue;
@@ -9688,7 +9711,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
-        scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        const locates = cfg.group_rows_layout.has_rowref and !(if (cfg.count_sketch) |pass| pass.tallies() else false);
+        scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, locates, snap);
         if (i == 0) residual_split = try residualSplit(allocator, cfg, scans[0].outputSchema());
         // Weighted integer-key programs consume RLE run headers directly (the
         // run-native emitter); hashed-key layouts pack from digests and string
