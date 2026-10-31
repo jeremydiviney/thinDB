@@ -183,6 +183,22 @@ test "REGEXP functions read a constant argument once for every row" {
     try helpers.expectText(allocator, db, "SELECT REGEXP_REPLACE('a\na', '^a', 'X', 1, 0, 'm')", "X\nX");
 }
 
+test "REGEXP_REPLACE over a text column alone keeps NULL texts NULL and repeats adjacent results" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{});
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE rn (id BIGINT PRIMARY KEY, s VARCHAR(16))");
+    try exec(allocator, db, "INSERT INTO rn VALUES (1, 'abcb'), (2, NULL), (3, 'abcb'), (4, 'abcb'), (5, NULL), (6, 'b'), (7, '')");
+    for (0..2) |pass| {
+        if (pass == 1) try (try db.openTable("rn", .{})).flush();
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', '-') FROM rn ORDER BY id", &.{ "a-c-", null, "a-c-", "a-c-", null, "-", "" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', '-', 1, 2) FROM rn ORDER BY id", &.{ "abc-", null, "abc-", "abc-", null, "b", "" });
+        try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, '^a(b)', '<\\1\\1>', 1) FROM rn ORDER BY id", &.{ "<bb>cb", null, "<bb>cb", "<bb>cb", null, "b", "" });
+    }
+}
+
 test "REGEXP_COUNT, REGEXP_EXTRACT and REGEXP_EXTRACT_ALL count and cut out every match" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
