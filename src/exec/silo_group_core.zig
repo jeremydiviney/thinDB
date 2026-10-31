@@ -9,6 +9,7 @@
 //! surface (bench/clientip_pipeline.zig).
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const platform = @import("../util/platform.zig");
 const exec_mod = @import("exec.zig");
 const api_mod = @import("../api/api.zig");
@@ -2985,7 +2986,7 @@ pub const SiloGridWorkspace = struct {
             return;
         }
         const threads_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
-        const threads = allocator.alloc(std.Thread, workers) catch {
+        const threads = allocator.alloc(parallel.Helper, workers) catch {
             self.deinit(allocator);
             if (profile) |p| p.teardown_total_ticks = platform.nowTicks() - total_t0;
             return;
@@ -3011,7 +3012,7 @@ pub const SiloGridWorkspace = struct {
                 .worker_count = workers,
                 .profile = profile,
             };
-            threads[i] = std.Thread.spawn(.{}, workspaceDeinitWorker, .{&jobs[i]}) catch unreachable;
+            threads[i] = parallel.spawn(workspaceDeinitWorker, .{&jobs[i]}) catch unreachable;
         }
         if (profile) |p| p.teardown_spawn_ticks = platform.nowTicks() - spawn_t0;
         const join_t0 = if (profile != null) platform.nowTicks() else 0;
@@ -3094,7 +3095,7 @@ pub const SiloGridWorkspace = struct {
         const workers = @max(@as(usize, 1), @min(n_workers, @max(cpus.len, 1)));
         if (workers == 1 or (self.parts.len + self.buckets.len) < 128) return self.reset(allocator);
 
-        const threads = try allocator.alloc(std.Thread, workers);
+        const threads = try allocator.alloc(parallel.Helper, workers);
         defer allocator.free(threads);
         var jobs = try allocator.alloc(WorkspaceResetJob, workers);
         defer allocator.free(jobs);
@@ -3107,7 +3108,7 @@ pub const SiloGridWorkspace = struct {
                 .worker_index = i,
                 .worker_count = workers,
             };
-            threads[i] = try std.Thread.spawn(.{}, workspaceResetWorker, .{&jobs[i]});
+            threads[i] = try parallel.spawn(workspaceResetWorker, .{&jobs[i]});
         }
         for (threads) |thread| thread.join();
     }
@@ -3220,7 +3221,7 @@ fn initWorkspaceFreshParallel(
     }
 
     const threads_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
-    const threads = try allocator.alloc(std.Thread, workers);
+    const threads = try allocator.alloc(parallel.Helper, workers);
     if (profile) |p| p.setup_thread_alloc_ticks = platform.nowTicks() - threads_alloc_t0;
     defer allocator.free(threads);
     const jobs_alloc_t0 = if (profile != null) platform.nowTicks() else 0;
@@ -3243,7 +3244,7 @@ fn initWorkspaceFreshParallel(
             .worker_count = workers,
             .profile = profile,
         };
-        threads[i] = try std.Thread.spawn(.{}, workspaceFreshInitWorker, .{&jobs[i]});
+        threads[i] = try parallel.spawn(workspaceFreshInitWorker, .{&jobs[i]});
     }
     if (profile) |p| p.setup_spawn_ticks = platform.nowTicks() - spawn_t0;
     const join_t0 = if (profile != null) platform.nowTicks() else 0;
@@ -3441,7 +3442,7 @@ fn scheduleHeavyTeardown(shared: *PipeShared) bool {
         .raw_recycled_rows = shared.raw_recycled_rows,
         .group_recycled_rows = shared.group_recycled_rows,
     };
-    const thread = std.Thread.spawn(.{}, heavyTeardownMain, .{task}) catch {
+    const thread = parallel.spawn(heavyTeardownMain, .{task}) catch {
         shared.allocator.destroy(task);
         return false;
     };
@@ -3913,7 +3914,7 @@ fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.A
     }
     const jobs = try allocator.alloc(AllGroupsFillJob, workers);
     defer allocator.free(jobs);
-    const threads = try allocator.alloc(?std.Thread, workers);
+    const threads = try allocator.alloc(?parallel.Helper, workers);
     defer allocator.free(threads);
     var b_start: usize = 0;
     for (jobs, 1..) |*job, w| {
@@ -3922,7 +3923,7 @@ fn emitAllGroupsNumeric(allocator: Allocator, buckets: []PipeBucket, out: *std.A
         b_start = b_end;
     }
     for (jobs, threads) |*job, *t| {
-        t.* = std.Thread.spawn(.{}, allGroupsFillWorker, .{job}) catch null;
+        t.* = parallel.spawn(allGroupsFillWorker, .{job}) catch null;
         if (t.* == null) allGroupsFillWorker(job);
     }
     for (threads) |t| if (t) |th| th.join();
@@ -4025,10 +4026,10 @@ fn runRankedJobs(allocator: Allocator, jobs: []RankedFillJob, comptime work: any
         for (jobs) |*job| run(job);
         return;
     }
-    const threads = try allocator.alloc(?std.Thread, jobs.len);
+    const threads = try allocator.alloc(?parallel.Helper, jobs.len);
     defer allocator.free(threads);
     for (jobs, threads) |*job, *t| {
-        t.* = std.Thread.spawn(.{}, run, .{job}) catch null;
+        t.* = parallel.spawn(run, .{job}) catch null;
         if (t.* == null) run(job);
     }
     for (threads) |t| if (t) |th| th.join();
@@ -9303,7 +9304,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         });
     }
     const total_t0 = platform.nowTicks();
-    var threads = try allocator.alloc(std.Thread, n_workers);
+    var threads = try allocator.alloc(parallel.Helper, n_workers);
     defer allocator.free(threads);
     var errs = try allocator.alloc(?anyerror, n_workers);
     defer allocator.free(errs);
@@ -9343,7 +9344,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             .err = &errs[i],
             .sketch_scratch = &sketch_scratch[i],
         };
-        threads[i] = try std.Thread.spawn(.{}, siloGridWorker, .{job});
+        threads[i] = try parallel.spawn(siloGridWorker, .{job});
     }
     i = 0;
     while (i < n_workers) : (i += 1) threads[i].join();

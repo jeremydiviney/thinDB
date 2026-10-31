@@ -59,6 +59,7 @@
 //! scan's code sidecars still reach the key columns.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const api = @import("../api/api.zig");
@@ -1884,13 +1885,13 @@ const LowCardGroup = struct {
         snap.release(table);
         pin_held = false;
 
-        const threads = try allocator.alloc(std.Thread, n_workers);
+        const threads = try allocator.alloc(parallel.Helper, n_workers);
         defer allocator.free(threads);
         const spawned = try allocator.alloc(bool, n_workers);
         defer allocator.free(spawned);
         @memset(spawned, false);
         for (workers, 0..) |*w, i| {
-            if (std.Thread.spawn(.{}, workerMain, .{w})) |th| {
+            if (parallel.spawn(workerMain, .{w})) |th| {
                 threads[i] = th;
                 spawned[i] = true;
             } else |_| {}
@@ -2004,13 +2005,13 @@ const LowCardGroup = struct {
             };
         }
 
-        const threads = try allocator.alloc(std.Thread, n_workers);
+        const threads = try allocator.alloc(parallel.Helper, n_workers);
         defer allocator.free(threads);
         const spawned = try allocator.alloc(bool, n_workers);
         defer allocator.free(spawned);
         @memset(spawned, false);
         for (jobs, 0..) |*j, p| {
-            if (std.Thread.spawn(.{}, partMergeMain, .{j})) |th| {
+            if (parallel.spawn(partMergeMain, .{j})) |th| {
                 threads[p] = th;
                 spawned[p] = true;
             } else |_| {}

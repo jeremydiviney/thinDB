@@ -15,6 +15,7 @@
 //! operator vtable, and routing land in later phases.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -1291,11 +1292,11 @@ pub const RadixLeaseAggregate = struct {
         const errs = try self.allocator.alloc(?anyerror, S);
         defer self.allocator.free(errs);
         @memset(errs, null);
-        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var threads: [MAX_LEASE_THREADS]parallel.Helper = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
         while (t < @min(S, self.run_threads)) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &mutex, t, &errs[t] }) catch {
+            threads[spawned] = parallel.spawn(Entry.go, .{ self, &mutex, t, &errs[t] }) catch {
                 Entry.go(self, &mutex, t, &errs[t]);
                 continue;
             };
@@ -1437,12 +1438,12 @@ pub const RadixLeaseAggregate = struct {
         defer self.allocator.free(errs);
         @memset(errs, null);
         var cursor = std.atomic.Value(usize).init(0);
-        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var threads: [MAX_LEASE_THREADS]parallel.Helper = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
         if (pscan.compute_fused) {
             while (t < pscan.n_threads and t < self.run_threads and t < MAX_LEASE_THREADS) : (t += 1) {
-                threads[spawned] = std.Thread.spawn(.{}, Entry.queryGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
+                threads[spawned] = parallel.spawn(Entry.queryGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
                     Entry.queryGo(self, pscan, &cursor, t, &errs[t]);
                     continue;
                 };
@@ -1451,7 +1452,7 @@ pub const RadixLeaseAggregate = struct {
             Entry.queryGo(self, pscan, &cursor, 0, &errs[0]);
         } else {
             while (t < pscan.n_threads and t < self.run_threads and t < MAX_LEASE_THREADS) : (t += 1) {
-                threads[spawned] = std.Thread.spawn(.{}, Entry.scanGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
+                threads[spawned] = parallel.spawn(Entry.scanGo, .{ self, pscan, &cursor, t, &errs[t] }) catch {
                     Entry.scanGo(self, pscan, &cursor, t, &errs[t]);
                     continue;
                 };
@@ -1792,12 +1793,12 @@ pub const RadixLeaseAggregate = struct {
             }
         };
         var ctr = std.atomic.Value(usize).init(0);
-        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var threads: [MAX_LEASE_THREADS]parallel.Helper = undefined;
         var spawned: usize = 0;
         // Spawn dop-1 helpers; the calling thread runs the last share.
         var t: usize = 1;
         while (t < self.run_threads) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
+            threads[spawned] = parallel.spawn(Entry.go, .{ self, &workers[t], &ctr, results }) catch {
                 Entry.go(self, &workers[t], &ctr, results); // spawn failed: run inline
                 continue;
             };
@@ -1887,11 +1888,11 @@ pub const RadixLeaseAggregate = struct {
             }
         };
         var ctr = std.atomic.Value(usize).init(0);
-        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var threads: [MAX_LEASE_THREADS]parallel.Helper = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
         while (t < self.run_threads) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, &workers[t], &ctr, results }) catch {
+            threads[spawned] = parallel.spawn(Entry.go, .{ self, &workers[t], &ctr, results }) catch {
                 Entry.go(self, &workers[t], &ctr, results);
                 continue;
             };
@@ -1973,11 +1974,11 @@ pub const RadixLeaseAggregate = struct {
             }
         };
         var ctr = std.atomic.Value(usize).init(0);
-        var threads: [MAX_LEASE_THREADS]std.Thread = undefined;
+        var threads: [MAX_LEASE_THREADS]parallel.Helper = undefined;
         var spawned: usize = 0;
         var t: usize = 1;
         while (t < self.run_threads) : (t += 1) {
-            threads[spawned] = std.Thread.spawn(.{}, Entry.go, .{ self, plan, &workers[t], &ctr, results }) catch {
+            threads[spawned] = parallel.spawn(Entry.go, .{ self, plan, &workers[t], &ctr, results }) catch {
                 Entry.go(self, plan, &workers[t], &ctr, results);
                 continue;
             };

@@ -14,6 +14,7 @@
 //! Windows allocator drift and cut steady-state stage time by a third).
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const types = @import("../types.zig");
@@ -4072,7 +4073,7 @@ pub fn runRegionOrdered(
     const errs = try alloc.alloc(?anyerror, n_workers);
     defer alloc.free(errs);
     @memset(errs, null);
-    const threads = try alloc.alloc(std.Thread, n_workers);
+    const threads = try alloc.alloc(parallel.Helper, n_workers);
     defer alloc.free(threads);
 
     const trace = getenv("THINDB_REGION_TRACE") != null;
@@ -4159,7 +4160,7 @@ pub fn runRegionOrdered(
     };
     var spawned: usize = 0;
     for (0..n_workers - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, OrderedExecPhase.worker, .{ &phase, w });
+        threads[w] = try parallel.spawn(OrderedExecPhase.worker, .{ &phase, w });
         spawned += 1;
     }
     phase.worker(n_workers - 1);
@@ -4455,7 +4456,7 @@ pub fn runRegionPooled(
     const errs = try alloc.alloc(?anyerror, opts.n_threads);
     defer alloc.free(errs);
     @memset(errs, null);
-    const threads = try alloc.alloc(std.Thread, opts.n_threads);
+    const threads = try alloc.alloc(parallel.Helper, opts.n_threads);
     defer alloc.free(threads);
 
     const t0 = if (trace) exec.prof.nowTicks() else 0;
@@ -4488,7 +4489,7 @@ pub fn runRegionPooled(
     };
     var spawned: usize = 0;
     for (0..n_workers - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, ScanPhase.worker, .{ &scan_phase, w });
+        threads[w] = try parallel.spawn(ScanPhase.worker, .{ &scan_phase, w });
         spawned += 1;
     }
     scan_phase.worker(n_workers - 1);
@@ -4531,7 +4532,7 @@ pub fn runRegionPooled(
     };
     spawned = 0;
     for (0..shard_workers - 1) |w| {
-        threads[w] = try std.Thread.spawn(.{}, ShardPhase.worker, .{ &shard_phase, w });
+        threads[w] = try parallel.spawn(ShardPhase.worker, .{ &shard_phase, w });
         spawned += 1;
     }
     shard_phase.worker(shard_workers - 1);

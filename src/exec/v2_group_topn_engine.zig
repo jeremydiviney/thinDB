@@ -7,6 +7,7 @@
 //! chunk model that the native SoA chunk implementation can replace in-place.
 
 const std = @import("std");
+const parallel = @import("../util/parallel.zig");
 const Allocator = std.mem.Allocator;
 const build_options = @import("build_options");
 
@@ -1273,7 +1274,7 @@ fn scheduleWorkspaceTeardown(
         .bucket_count = params.bucket_count,
     };
     workspace.* = .{};
-    const thread = std.Thread.spawn(.{}, asyncWorkspaceTeardown, .{task}) catch {
+    const thread = parallel.spawn(asyncWorkspaceTeardown, .{task}) catch {
         var teardown_profile: SiloCore.WorkspaceProfile = .{};
         const profile_ptr: ?*SiloCore.WorkspaceProfile = if (params.trace_timing) &teardown_profile else null;
         task.workspace.deinitParallel(allocator, n_workers, cpus_copy, profile_ptr);

@@ -1484,13 +1484,13 @@ const EmitRanges = struct {
 
     allocator: Allocator,
     jobs: []EmitRange,
-    threads: []?std.Thread,
+    threads: []?parallel.Helper,
 
     fn init(op: *GroupTopNPipeline, workers: usize, total: usize) !EmitRanges {
         const worker_alloc = try workerAllocator(op);
         const jobs = try op.allocator.alloc(EmitRange, workers);
         errdefer op.allocator.free(jobs);
-        const threads = try op.allocator.alloc(?std.Thread, workers);
+        const threads = try op.allocator.alloc(?parallel.Helper, workers);
         errdefer op.allocator.free(threads);
         @memset(threads, null);
         var inited: usize = 0;
@@ -1542,7 +1542,7 @@ const EmitRanges = struct {
     /// spawn fails) and surface the first range error.
     fn run(self: *EmitRanges, comptime worker: fn (*EmitRange) void) !void {
         for (self.jobs, self.threads) |*job, *t| {
-            t.* = std.Thread.spawn(.{}, worker, .{job}) catch null;
+            t.* = parallel.spawn(worker, .{job}) catch null;
             if (t.* == null) worker(job);
         }
         for (self.threads) |*t| {
@@ -1724,10 +1724,10 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: 
         p.* = try MatPartition.create(try EmitRanges.workerAllocator(op), op.table, snapshot, op.request.udf_registry, names, derived, locs[p0..p1]);
         created += 1;
     }
-    const mat_threads = try allocator.alloc(?std.Thread, workers);
+    const mat_threads = try allocator.alloc(?parallel.Helper, workers);
     defer allocator.free(mat_threads);
     for (parts, mat_threads) |*p, *t| {
-        t.* = std.Thread.spawn(.{}, matPartitionWorker, .{p}) catch null;
+        t.* = parallel.spawn(matPartitionWorker, .{p}) catch null;
         if (t.* == null) matPartitionWorker(p);
     }
     for (mat_threads) |t| if (t) |th| th.join();
