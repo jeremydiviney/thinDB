@@ -3771,16 +3771,22 @@ fn assembleCaseStrings(
     winners: []const CaseWinner,
 ) !void {
     const unmatched: CaseWinner = @intCast(srcs.len);
+    // One reservation for the winners' bytes: growing the buffer per row
+    // re-copies everything appended so far.
+    var total_bytes: usize = 0;
     for (winners, 0..) |w, i| {
+        if (w != unmatched) total_bytes += stringRowBytes(srcs[w].view, srcs[w].row(i)).len;
+    }
+    const reserved = !ss.isWide() and ss.bytes.items.len + total_bytes <= std.math.maxInt(u32);
+    if (reserved) try ss.ensureUnusedValueCapacity(allocator, winners.len, total_bytes);
+    for (winners, 0..) |w, i| {
+        const bytes = if (w == unmatched) "" else stringRowBytes(srcs[w].view, srcs[w].row(i));
+        if (reserved) ss.appendValueAssumeCapacity(bytes) else try ss.appendValue(allocator, bytes);
         if (w == unmatched) {
-            try ss.appendValue(allocator, "");
             try out.appendValidBit(allocator, i, false);
-            continue;
+        } else if (out.nulls != null) {
+            try out.appendValidBit(allocator, i, srcs[w].view.isValid(srcs[w].row(i)));
         }
-        const s = srcs[w];
-        const r = s.row(i);
-        try ss.appendValue(allocator, stringRowBytes(s.view, r));
-        if (out.nulls != null) try out.appendValidBit(allocator, i, s.view.isValid(r));
     }
 }
 
