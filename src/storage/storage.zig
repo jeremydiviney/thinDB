@@ -1097,6 +1097,34 @@ test "DictBlock.rowCode reads each writer code width little-endian" {
     }
 }
 
+test "DictBlock.codeRangeInto matches the per-row range test at every width and offset" {
+    const n = 203;
+    var storage_bytes: [n * 4 + 3]u8 = undefined;
+    var mask: [n]bool = undefined;
+    var prng = std.Random.DefaultPrng.init(0xd1c7);
+    const rand = prng.random();
+    inline for (.{ 1, 2, 4 }) |width| {
+        const T = std.meta.Int(.unsigned, width * 8);
+        // Code counts a width can hold, up to every code at width 1.
+        const ndv: u32 = if (width == 1) 256 else 1000;
+        for ([_]usize{ 0, 1, 3 }) |misalign| {
+            const codes = storage_bytes[misalign..][0 .. n * width];
+            for (0..n) |i| std.mem.writeInt(T, codes[i * width ..][0..width], @intCast(rand.uintLessThan(u32, ndv)), .little);
+            const db: segment_reader.DictBlock = .{ .ndv = ndv, .code_width = width, .offsets_region = &.{}, .dict_bytes = &.{}, .codes = codes };
+            const ranges = [_][2]u32{ .{ 0, 0 }, .{ 0, ndv }, .{ 0, 1 }, .{ ndv - 1, ndv }, .{ 17, 140 }, .{ ndv, ndv } };
+            for (ranges) |r| {
+                for ([_]bool{ false, true }) |outside| {
+                    db.codeRangeInto(r[0], r[1] - r[0], outside, n, &mask);
+                    for (mask, 0..) |got, i| {
+                        const code = db.rowCode(i);
+                        try std.testing.expectEqual((code >= r[0] and code < r[1]) != outside, got);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode to" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

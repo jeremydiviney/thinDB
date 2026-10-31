@@ -1244,7 +1244,48 @@ pub const DictBlock = struct {
     pub inline fn rowCodeAs(self: DictBlock, comptime width: u8, row: usize) u32 {
         return std.mem.readInt(std.meta.Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
     }
+
+    /// `mask[i]` = whether row i's code lies in `[lo, lo + span)`, or outside
+    /// it with `outside`.
+    pub fn codeRangeInto(self: DictBlock, lo: u32, span: u32, outside: bool, row_count: u32, mask: []bool) void {
+        const out = mask[0..row_count];
+        switch (self.code_width) {
+            inline 1, 2, 4 => |w| {
+                const T = std.meta.Int(.unsigned, @as(u16, w) * 8);
+                // A span of every code a width holds doesn't fit that width.
+                if (span == 0 or span > std.math.maxInt(T)) return simd_mod.fillMaskRun(out, 0, out.len, (span != 0) != outside);
+                switch (outside) {
+                    inline else => |o| codeRangeWidth(T, o, self.codes, @intCast(lo), @intCast(span), out),
+                }
+            },
+            else => for (out, 0..) |*m, i| {
+                m.* = (self.rowCode(i) -% lo < span) != outside;
+            },
+        }
+    }
 };
+
+/// One wrapping subtract and one unsigned compare per code, a vector of codes
+/// at a time: the per-row loop stays scalar. Codes sit at any byte offset, so
+/// a vector's worth is read as bytes.
+fn codeRangeWidth(comptime T: type, comptime outside: bool, codes: []const u8, lo: T, span: T, mask: []bool) void {
+    const W = @sizeOf(T);
+    const N = comptime std.simd.suggestVectorLength(T) orelse 16 / W;
+    var i: usize = 0;
+    if (native_endian == .little and N > 1) {
+        const lo_v: @Vector(N, T) = @splat(lo);
+        const span_v: @Vector(N, T) = @splat(span);
+        while (i + N <= mask.len) : (i += N) {
+            const bytes: [N * W]u8 = codes[i * W ..][0 .. N * W].*;
+            const v: @Vector(N, T) = @bitCast(bytes);
+            const inside = v -% lo_v < span_v;
+            mask[i..][0..N].* = if (outside) !inside else inside;
+        }
+    }
+    while (i < mask.len) : (i += 1) {
+        mask[i] = (std.mem.readInt(T, codes[i * W ..][0..W], .little) -% lo < span) != outside;
+    }
+}
 
 /// Parse the dict header + regions out of a decompressed block payload. `values`
 /// is the payload past the validity bitmap (the caller strips the bitmap the

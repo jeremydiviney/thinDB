@@ -3516,8 +3516,7 @@ pub const Scan = struct {
         };
 
         const _tcnt = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        var matched: usize = 0;
-        for (mask[0..rg_count]) |m| matched += @intFromBool(m);
+        const matched = simd.countTrue(mask[0..rg_count]);
         if (exec.prof.enabled) exec.prof.add("scan.mask_count", @intCast(@max(0, exec.prof.nowTicks() - _tcnt)));
         if (matched == 0) {
             if (expr != .@"and" and !narrowed) self.rg_unmatched = .whole;
@@ -3717,16 +3716,7 @@ pub const Scan = struct {
             .gt => .{ .lo = first_above, .hi = db.ndv },
             .gte => .{ .lo = first_at_least, .hi = db.ndv },
         };
-        // `code -% lo < span` is `lo <= code < hi` in one unsigned compare.
-        const span = range.hi - range.lo;
-        switch (db.code_width) {
-            inline 1, 2, 4 => |w| for (out[0..rg_count], 0..) |*o, i| {
-                o.* = (db.rowCodeAs(w, i) -% range.lo < span) != range.outside;
-            },
-            else => for (out[0..rg_count], 0..) |*o, i| {
-                o.* = (db.rowCode(i) -% range.lo < span) != range.outside;
-            },
-        }
+        db.codeRangeInto(range.lo, range.hi - range.lo, range.outside, rg_count, out);
         if (nulls != null) {
             for (0..rg_count) |i| {
                 if (!storage.column.isValidBit(nulls, i)) out[i] = false;
@@ -4399,8 +4389,7 @@ pub const Scan = struct {
         const plan = predicate.compileLike(pattern);
 
         if (active) |a| {
-            var alive: usize = 0;
-            for (a[0..rg_count]) |b| alive += @intFromBool(b);
+            const alive = simd.countTrue(a[0..rg_count]);
             // A live row's match reads its entry at random in the
             // dictionary: on ClickBench URL dictionaries it costs about
             // eight entries of the sequential search.
@@ -4463,7 +4452,7 @@ pub const Scan = struct {
                     while (run < rb.n_runs and pos < rg_count) : (run += 1) {
                         const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
                         const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
-                        @memset(out[pos .. pos + len], fcmpFor(o, v, want));
+                        simd.fillMaskRun(out, pos, len, fcmpFor(o, v, want));
                         pos += len;
                     }
                 },
@@ -4487,7 +4476,7 @@ pub const Scan = struct {
                     const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
                     const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
                     const hit = std.sort.binarySearch(i128, wants, v, orderI128) != null;
-                    @memset(out[pos .. pos + len], hit);
+                    simd.fillMaskRun(out, pos, len, hit);
                     pos += len;
                 }
             },
@@ -4906,21 +4895,13 @@ pub const Scan = struct {
     }
 
     /// The set rows of `mask` as ascending indices, in a scratch reused across
-    /// row groups. Branchless: one store per row, the cursor advances only on
-    /// survivors (the throw-away store lands at most one slot past the last
-    /// survivor, always inside the mask-sized scratch).
+    /// row groups.
     fn survivorRows(self: *Scan, mask: []const bool) ![]const u32 {
         if (self.survivor_rows.len < mask.len) {
             if (self.survivor_rows.len > 0) self.allocator.free(self.survivor_rows);
             self.survivor_rows = try self.allocator.alloc(u32, mask.len);
         }
-        const buf = self.survivor_rows;
-        var pos: usize = 0;
-        for (mask, 0..) |m, i| {
-            buf[pos] = @intCast(i);
-            pos += @intFromBool(m);
-        }
-        return buf[0..pos];
+        return self.survivor_rows[0..simd.maskIndices(mask, self.survivor_rows)];
     }
 
     /// A raw (natively viewable) column's survivors `rows` in the row window
@@ -5272,8 +5253,7 @@ pub const Scan = struct {
             if (segment_rg and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..n], true) == null) self.rg_unmatched = .whole;
             for (mask[0..n], tm) |*m, keep| m.* = m.* and keep;
         }
-        var matched: usize = 0;
-        for (mask[0..n]) |m| matched += @intFromBool(m);
+        const matched = simd.countTrue(mask[0..n]);
         if (matched == 0) {
             if (segment_rg and tomb_mask == null) self.rg_unmatched = .whole;
             self.filtered_coded = null;
