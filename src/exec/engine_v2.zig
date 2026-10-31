@@ -1112,22 +1112,33 @@ fn batchEvaluable(expr: exec.PredicateExpr) bool {
 }
 
 /// `derived`'s columns that are in `kept` or that `residual` reads, with
-/// the earlier ones they read in turn, in `derived`'s order.
+/// the earlier ones they read in turn. Those `residual` needs come first,
+/// so the grouped engine can filter before evaluating the others; each
+/// group keeps `derived`'s order.
 fn residualDerived(arena: std.mem.Allocator, derived: []const ir.Derived, kept: []const ir.Derived, residual: exec.PredicateExpr) ![]const ir.Derived {
+    const operand = try arena.alloc(bool, derived.len);
+    for (derived, operand) |d, *o| o.* = exec.predicate.touchesColumn(residual, d.name);
+    try markReadDerived(arena, derived, operand);
     const used = try arena.alloc(bool, derived.len);
-    for (derived, used) |d, *u| u.* = nameInDerivedList(kept, d.name) or exec.predicate.touchesColumn(residual, d.name);
+    for (derived, used, operand) |d, *u, o| u.* = o or nameInDerivedList(kept, d.name);
+    try markReadDerived(arena, derived, used);
+    var out: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (derived, operand) |d, o| if (o) try out.append(arena, d);
+    for (derived, used, operand) |d, u, o| if (u and !o) try out.append(arena, d);
+    return out.items;
+}
+
+/// Marks the columns of `derived` that marked ones read, directly or not.
+fn markReadDerived(arena: std.mem.Allocator, derived: []const ir.Derived, marked: []bool) !void {
     var refs: std.ArrayListUnmanaged([]const u8) = .empty;
     var i = derived.len;
     while (i > 0) {
         i -= 1;
-        if (!used[i]) continue;
+        if (!marked[i]) continue;
         refs.clearRetainingCapacity();
         try exec.compute_op.collectColumnRefs(arena, &refs, derived[i].expr);
-        for (derived[0..i], used[0..i]) |d, *u| u.* = u.* or nameInList(refs.items, d.name);
+        for (derived[0..i], marked[0..i]) |d, *m| m.* = m.* or nameInList(refs.items, d.name);
     }
-    var out: std.ArrayListUnmanaged(ir.Derived) = .empty;
-    for (derived, used) |d, u| if (u) try out.append(arena, d);
-    return out.items;
 }
 
 /// WHERE + row-local derived, ordered by dependency: the filter runs first so

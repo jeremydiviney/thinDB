@@ -3663,7 +3663,8 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
     // engine, while the other conjuncts still fuse into the scan. The rows
     // it reads stay whole through a collapse, a hashed key it reads keeps
     // its bytes, and an unordered LIMIT doesn't pick its groups from rows
-    // the filter would drop.
+    // the filter would drop. A key over a column that arrives as byte
+    // lengths evaluates after the filter, on the lengths of the rows kept.
     const allocator = std.testing.allocator;
     const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
     const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
@@ -3721,8 +3722,10 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
         var want_or: std.ArrayList([]const u8) = .empty;
         var want_strings: std.ArrayList([]const u8) = .empty;
         var want_wide: std.ArrayList([]const u8) = .empty;
+        var want_lengths: std.ArrayList([]const u8) = .empty;
         for (words, uppers, 0..) |w, up, si| {
             if (count_x[si] != 0) try want_sum.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ w, count_x[si], sum_x[si] }));
+            if (count_x[si] != 0) try want_lengths.append(arena, try std.fmt.allocPrint(arena, "{d}|{d}", .{ w.len, count_x[si] }));
             if (count_qq_not1[si] != 0) try want_mixed.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ up, count_qq_not1[si] }));
             if (count_qq_or_a[si] != 0) try want_or.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ w, count_qq_or_a[si] }));
             for (tags, 0..) |tag, ui| {
@@ -3740,6 +3743,7 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
             .{ "SELECT s, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 OR s = 'a' GROUP BY s ORDER BY c DESC LIMIT 100", &want_or },
             .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t WHERE upper(u) <> 'QQ' GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_strings },
             .{ "SELECT upper(s) AS k, g, SUM(w) AS sw FROM t WHERE w DIV 1000003 >= 0 GROUP BY k, g ORDER BY sw DESC LIMIT 100", &want_wide },
+            .{ "SELECT octet_length(s) AS l, COUNT(*) AS c FROM t WHERE x + 1 > 5 GROUP BY l ORDER BY c DESC LIMIT 100", &want_lengths },
         };
         inline for (cases) |c| {
             errdefer std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });

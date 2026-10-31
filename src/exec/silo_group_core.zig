@@ -7125,6 +7125,20 @@ const GridDictEval = struct {
 /// far more per row than counting a row's code. A string column may be a
 /// hashed key: the scan then digests each dictionary value once, and the
 /// collapsed rows carry those digests.
+/// How many leading derived columns evaluate ahead of the residual filter,
+/// leaving the rest to the rows that pass: the prefix through the last one
+/// it reads, which holds what those read in turn. Zero keeps one Compute
+/// over them all, as a dictionary collapse evaluates them.
+fn residualSplit(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !usize {
+    const expr = cfg.residual_filter orelse return 0;
+    if (try dictEvalColumn(allocator, cfg, scan_schema) != null) return 0;
+    var split: usize = 0;
+    for (cfg.derived, 1..) |d, n| {
+        if (thindb.exec.predicate.touchesColumn(expr, d.name)) split = n;
+    }
+    return if (split < cfg.derived.len) split else 0;
+}
+
 fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thindb.types.Column) !?DictSource {
     if (!cfg.distinct_eval) return null;
     const layout = cfg.group_rows_layout;
@@ -7297,8 +7311,13 @@ const SiloGridJob = struct {
     // Batch source driven each tile: a Compute-wrapped scan when the shape has
     // derived columns, else a bare scan. `scan` is the same underlying object,
     // retained for range resets; `drive` produces the batches (with derived
-    // columns appended). Points into the harness-owned `drives` array.
+    // columns appended). Points into the harness-owned `drives` array, or
+    // into `operand_drives` when `rest` is set.
     drive: *thindb.exec.Query,
+    // Set when the derived columns split at the residual filter: `drive`
+    // then appends only the ones it reads, and this evaluates the others
+    // on the rows that pass.
+    rest: ?*thindb.exec.Compute = null,
     // Set when dictionary-coded batches collapse to their distinct values
     // ahead of the derived columns; it then pulls the scan and evaluates
     // them itself.
@@ -7970,6 +7989,8 @@ const SketchScratch = struct {
     views: []ColumnView = &.{},
     digests: []std.ArrayListUnmanaged(u128) = &.{},
     hashed: []?[]const u128 = &.{},
+    lengths: []std.ArrayListUnmanaged(u32) = &.{},
+    byte_lengths: []?[]const u32 = &.{},
     /// A collapsed batch's per-staged-column partials, compacted.
     partial_ints: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(i64) = @splat(.empty),
     partial_floats: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(f64) = @splat(.empty),
@@ -7996,10 +8017,15 @@ const SketchScratch = struct {
         for (self.digests) |*d| d.deinit(allocator);
         if (self.digests.len > 0) allocator.free(self.digests);
         if (self.hashed.len > 0) allocator.free(self.hashed);
+        for (self.lengths) |*l| l.deinit(allocator);
+        if (self.lengths.len > 0) allocator.free(self.lengths);
+        if (self.byte_lengths.len > 0) allocator.free(self.byte_lengths);
         self.stores = &.{};
         self.views = &.{};
         self.digests = &.{};
         self.hashed = &.{};
+        self.lengths = &.{};
+        self.byte_lengths = &.{};
     }
 
     /// One store per column of `batch`, typed like its views. A worker's
@@ -8025,10 +8051,17 @@ const SketchScratch = struct {
         errdefer allocator.free(digests);
         for (digests) |*d| d.* = .empty;
         const hashed = try allocator.alloc(?[]const u128, n);
+        errdefer allocator.free(hashed);
+        const lengths = try allocator.alloc(std.ArrayListUnmanaged(u32), n);
+        errdefer allocator.free(lengths);
+        for (lengths) |*l| l.* = .empty;
+        const byte_lengths = try allocator.alloc(?[]const u32, n);
         self.stores = stores;
         self.views = views;
         self.digests = digests;
         self.hashed = hashed;
+        self.lengths = lengths;
+        self.byte_lengths = byte_lengths;
     }
 
     fn holds(self: *const SketchScratch, batch: thindb.Batch) bool {
@@ -8536,8 +8569,12 @@ fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, 
         try appendMaskedColumn(allocator, view, mask, &scratch.stores[ci]);
         scratch.views[ci] = scratch.stores[ci].view();
         scratch.hashed[ci] = null;
+        scratch.byte_lengths[ci] = null;
         // A sidecar can be shorter than `values` (a drive appends derived
         // columns past the scan's).
+        if (batch.byte_lengths) |ls| if (ci < ls.len) if (ls[ci]) |lengths| {
+            scratch.byte_lengths[ci] = try keepMasked(u32, allocator, lengths, mask, kept, &scratch.lengths[ci]);
+        };
         const hs = batch.hashed orelse continue;
         const digests = (if (ci < hs.len) hs[ci] else null) orelse continue;
         const out = &scratch.digests[ci];
@@ -8558,6 +8595,7 @@ fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, 
             .values = scratch.views,
             .row_count = kept,
             .hashed = if (batch.hashed != null) scratch.hashed else null,
+            .byte_lengths = if (batch.byte_lengths != null) scratch.byte_lengths else null,
         },
         .weights = kept_weights,
         .ids = kept_ids,
@@ -8568,7 +8606,10 @@ fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, 
 /// but into the worker's residual scratch, so a sketch pass after it keeps
 /// its own; null when none pass. A collapsed row passes or fails whole, as
 /// the columns `expr` reads are among those its rows share.
-fn residualRows(job: SiloGridJob, allocator: Allocator, expr: thindb.exec.PredicateExpr, batch: thindb.Batch) !?KeptRows {
+fn residualRows(job: SiloGridJob, allocator: Allocator, expr: thindb.exec.PredicateExpr, scanned: thindb.Batch) !?KeptRows {
+    // Only the rest's Compute reads byte lengths past the filter.
+    var batch = scanned;
+    if (job.rest == null) batch.byte_lengths = null;
     const scratch = job.residual_scratch;
     try scratch.mask.resize(allocator, batch.row_count);
     const mask = scratch.mask.items;
@@ -8622,10 +8663,11 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
         if (job.profile) job.local.scan_ticks += platform.nowTicks() - t0;
         const scanned = maybe_batch orelse break;
         job.local.scan_batches += 1;
-        const passed: KeptRows = if (job.shared.residual_filter) |expr|
-            (try residualRows(job, job.scan.allocator, expr, scanned)) orelse continue
-        else
-            .{ .batch = scanned, .weights = if (job.distinct) |gd| gd.rowWeights() else null };
+        const passed: KeptRows = if (job.shared.residual_filter) |expr| blk: {
+            const rows = (try residualRows(job, job.scan.allocator, expr, scanned)) orelse continue;
+            const rest = job.rest orelse break :blk rows;
+            break :blk .{ .batch = try rest.evalBatch(rows.batch), .weights = rows.weights, .ids = rows.ids };
+        } else .{ .batch = scanned, .weights = if (job.distinct) |gd| gd.rowWeights() else null };
         const kept: KeptRows = if (job.shared.count_sketch) |pass| switch (pass) {
             .tally => |sketch| {
                 try tallyRows(job, sketch, passed.batch, passed.weights);
@@ -9457,6 +9499,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // `drives`, not `scans`.
     var drives = try allocator.alloc(thindb.exec.Query, n_workers);
     defer allocator.free(drives);
+    // The lower layers of a drive split at the residual filter; `drives`
+    // owns them.
+    var operand_drives = try allocator.alloc(thindb.exec.Query, n_workers);
+    defer allocator.free(operand_drives);
+    var residual_split: usize = 0;
     var built_scans: usize = 0;
     defer {
         const cleanup_t0 = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() else 0;
@@ -9606,16 +9653,25 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         scans[i] = try Scan.allocWithProjectionLoc(scan_allocator, table, null, scan_columns, cfg.group_rows_layout.has_rowref, snap);
+        if (i == 0) residual_split = try residualSplit(allocator, cfg, scans[0].outputSchema());
         // Weighted integer-key programs consume RLE run headers directly (the
         // run-native emitter); hashed-key layouts pack from digests and string
         // extremes fold per row, so neither has a consumer for the sidecar.
         scans[i].emit_runs = cfg.group_rows_layout.has_weight and !cfg.group_rows_layout.has_rowref and !cfg.group_rows_layout.has_str_payload;
         {
             var sq = thindb.exec.makeQuery(scan_allocator, scans[i]);
-            drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(cfg.derived, cfg.udf_registry) catch |e| {
+            const lower = if (residual_split > 0) cfg.derived[0..residual_split] else cfg.derived;
+            drives[i] = if (cfg.derived.len == 0) sq else sq.computeWithRegistry(lower, cfg.udf_registry) catch |e| {
                 sq.deinit();
                 return e;
             };
+            if (residual_split > 0) {
+                operand_drives[i] = drives[i];
+                drives[i] = operand_drives[i].computeWithRegistry(cfg.derived[residual_split..], cfg.udf_registry) catch |e| {
+                    operand_drives[i].deinit();
+                    return e;
+                };
+            }
         }
         built_scans += 1;
         if (cfg.scan_filter) {
@@ -9813,7 +9869,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     while (i < n_workers) : (i += 1) {
         const job = SiloGridJob{
             .scan = scans[i],
-            .drive = &drives[i],
+            .drive = if (residual_split > 0) &operand_drives[i] else &drives[i],
+            .rest = if (residual_split > 0) thindb.exec.queryAs(thindb.exec.Compute, drives[i]).? else null,
             .distinct = if (grid_distinct.len > 0) &grid_distinct[i] else null,
             .local = &parts[i],
             .shared = &shared,
