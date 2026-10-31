@@ -90,6 +90,10 @@ pub const Request = struct {
     // key): the core keeps the groups within the best `keep` on the leading
     // aggregates, ties at the cut included (see SiloCore.EmitRank.ties).
     prefix_rank: ?PrefixRank = null,
+    // A HAVING applied over this core's output rather than inside it (a
+    // hashed key's HAVING that reads a key part): the core still drops the
+    // rows of groups its aggregate conditions rule out.
+    bound_having: ?PredicateExpr = null,
 };
 
 pub const PrefixRank = struct { specs: []const SortSpec, keep: usize };
@@ -295,6 +299,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, built_request: Request)
     var core_request = request;
     if (finish_after_emit) {
         core_request.order_specs = &.{};
+        core_request.bound_having = request.having_filter;
         core_request.having_filter = null;
         core_request.limit = 0;
         core_request.offset = 0;
@@ -770,6 +775,12 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     // themselves are added by the Compute layer the engine wraps the scan in;
     // any filter-only columns are sourced by the fused filter itself.
     const scan_columns = ctx.plan.scan_base_columns;
+    var bound_nodes: [MAX_HAVING_BOUND_NODES]SiloCore.HavingBound = undefined;
+    var bound_used: usize = 0;
+    const having_bound: ?SiloCore.HavingBound = if (ctx.request.having_filter orelse ctx.request.bound_having) |having|
+        havingBound(&ctx.plan, having, &bound_nodes, &bound_used)
+    else
+        null;
 
     var result = try GroupTopNEngine.run(core_allocator, .{
         .table = ctx.table,
@@ -806,6 +817,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
                 .{ .ctx = ctx, .value = distinctCountRank }
             else
                 null,
+            .having_bound = having_bound,
         },
         .params = params,
         .scan_columns = scan_columns,
@@ -2450,6 +2462,49 @@ fn havingEmitPass(ctx: ?*anyopaque, row: SiloCore.TopRow) bool {
     const ec: *const ExecutionContext = @ptrCast(@alignCast(ctx.?));
     const expr = ec.request.having_filter orelse return true;
     return havingPasses(&ec.plan, expr, row);
+}
+
+const MAX_HAVING_BOUND_NODES: usize = 32;
+
+/// `expr` in the core's terms (see SiloCore.HavingBound), its AND and OR
+/// children built into `nodes`. A leaf that compares an aggregate with a
+/// constant keeps its comparison; anything else, or a tree past `nodes`,
+/// bounds nothing.
+fn havingBound(plan: *const ShapePlan, expr: PredicateExpr, nodes: *[MAX_HAVING_BOUND_NODES]SiloCore.HavingBound, used: *usize) SiloCore.HavingBound {
+    switch (expr) {
+        .leaf => |p| return havingLeafBound(plan, p),
+        .@"and", .@"or" => |children| {
+            if (used.* + children.len > nodes.len) return .any_group;
+            const kids = nodes[used.*..][0..children.len];
+            used.* += children.len;
+            for (children, kids) |child, *kid| kid.* = havingBound(plan, child, nodes, used);
+            return if (expr == .@"and") .{ .all = kids } else .{ .any = kids };
+        },
+        else => return .any_group,
+    }
+}
+
+// Resolves `p.col` the way havingOutputNum does: key parts first.
+fn havingLeafBound(plan: *const ShapePlan, p: exec.predicate.Predicate) SiloCore.HavingBound {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (types.columnNameEql(p.col, part.name)) return .any_group;
+    }
+    const op: SiloCore.HavingOp = switch (p.op) {
+        .eq => .eq,
+        .lt => .lt,
+        .lte => .lte,
+        .gt => .gt,
+        .gte => .gte,
+        .neq => return .any_group,
+    };
+    const value: SiloCore.HavingValue = switch (valueAsNum(p.val) orelse return .any_group) {
+        .i => |v| .{ .int = v },
+        .f => |v| .{ .float = v },
+    };
+    for (plan.aggregates[0..plan.aggregate_count], 0..) |agg, i| {
+        if (types.columnNameEql(p.col, agg.name)) return .{ .leaf = .{ .aggregate = @intCast(i), .op = op, .value = value } };
+    }
+    return .any_group;
 }
 
 fn applyHaving(op: *GroupTopNPipeline, expr: PredicateExpr, rows: []SiloCore.TopRow) []SiloCore.TopRow {

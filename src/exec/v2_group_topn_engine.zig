@@ -501,6 +501,9 @@ pub const Shape = struct {
     // too small to place.
     count_sketch: bool = false,
     count_rank: ?CountRank = null,
+    // The HAVING over the groups, as bounds the core prunes staged rows by
+    // (see SiloCore.HavingBound). Null without a HAVING.
+    having_bound: ?SiloCore.HavingBound = null,
 };
 
 /// A count no greater than a group's row count (COUNT(DISTINCT)) that the
@@ -529,6 +532,7 @@ pub const Params = struct {
     arena_workspace: bool = false,
     sync_teardown: bool = false,
     count_sketch: bool = true,
+    having_bound: bool = true,
 };
 
 pub const RunRequest = struct {
@@ -599,6 +603,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .arena_workspace = getenv("THINDB_V2_ARENA_WORKSPACE") != null,
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
+        .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
     };
 }
 
@@ -1087,6 +1092,7 @@ fn runHarness(
         .result_all_groups_cap = shape.emit_all_groups_cap,
         .result_emit_filter = shape.emit_filter,
         .result_rank = shape.emit_rank,
+        .having_bound = if (params.having_bound) shape.having_bound else null,
         .key_bound = shape.key_bound,
         .trace_timing = params.trace_timing,
         .workspace = workspace,

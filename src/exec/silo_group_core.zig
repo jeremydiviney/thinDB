@@ -1526,17 +1526,13 @@ const WorkerParts = struct {
     }
 
     fn ensureWideBucketScratch(self: *WorkerParts, allocator: Allocator, bucket_count: usize) !void {
-        if (self.flat_counts.len == 0) {
-            self.flat_counts = try allocator.alloc(u32, bucket_count);
-            @memset(self.flat_counts, 0);
-        }
-        if (self.flat_offsets.len == 0) {
-            self.flat_offsets = try allocator.alloc(u32, bucket_count);
-            @memset(self.flat_offsets, 0);
-        }
-        if (self.flat_next.len == 0) {
-            self.flat_next = try allocator.alloc(u32, bucket_count);
-            @memset(self.flat_next, 0);
+        inline for (.{ "flat_counts", "flat_offsets", "flat_next" }) |name| {
+            if (@field(self, name).len < bucket_count) {
+                const grown = try allocator.alloc(u32, bucket_count);
+                @memset(grown, 0);
+                if (@field(self, name).len > 0) allocator.free(@field(self, name));
+                @field(self, name) = grown;
+            }
         }
     }
 
@@ -2283,6 +2279,8 @@ const PipeShared = struct {
     /// No bucket folds until every row is staged (see DEFER_FOLD_MIN_GROUPS).
     defer_fold: bool = false,
     defer_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Per-slot HAVING bounds the drains prune by once the scans settle them.
+    slot_bound: ?*SlotBound = null,
 
     /// Every row sits in a group queue: scans are done, no raw chunk awaits
     /// a stage pass, and no stage builder holds a tail.
@@ -2302,6 +2300,19 @@ const PipeShared = struct {
         if (!self.stage_complete()) return false;
         if (!self.defer_released.swap(true, .acq_rel)) self.signalWork(std.math.maxInt(u32));
         return true;
+    }
+
+    /// Drains wait while a HAVING bound is still tallying.
+    fn drainsHeld(self: *const PipeShared) bool {
+        const bound = self.slot_bound orelse return false;
+        return !bound.settled.load(.acquire) and !bound.abandoned.load(.acquire);
+    }
+
+    /// The slots a drain keeps, once the last scan has settled them.
+    fn slotKeep(self: *const PipeShared) ?SlotKeep {
+        const bound = self.slot_bound orelse return null;
+        if (bound.abandoned.load(.acquire) or !bound.settled.load(.acquire)) return null;
+        return .{ .bits = bound.keep, .shift = bound.shift };
     }
 
     fn grouping_complete(self: *const PipeShared) bool {
@@ -2406,6 +2417,228 @@ test "group completion waits for a delayed partial before collecting top rows an
         const row = top.rowAt(rank);
         try std.testing.expectEqual(@as(u128, group_count - 1 - offset - i), row.key);
         try std.testing.expectEqual(@as(u64, group_count - offset - i), row.count);
+    }
+}
+
+fn testSlotOf(bound: *const SlotBound, key: u64) usize {
+    return slotOfHash(routeHashRowBits(key, 0), bound.shift);
+}
+
+fn testSlotKept(bound: *const SlotBound, key: u64) bool {
+    const keep = SlotKeep{ .bits = bound.keep, .shift = bound.shift };
+    return keep.holds(routeHashRowBits(key, 0));
+}
+
+test "a HAVING count bound keeps only the slots whose rows can reach it" {
+    const allocator = std.testing.allocator;
+    const layout = GroupRowsLayout{
+        .key_width = .u64,
+        .columns = &.{},
+        .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+        .has_weight = true,
+    };
+    const having: HavingBound = .{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 100 } } };
+    const bound = (try SlotBound.create(allocator, layout, having, 12, 1000, std.math.maxInt(u64))).?;
+    defer bound.destroy(allocator);
+    try std.testing.expect(testSlotOf(bound, 7) != testSlotOf(bound, 8));
+
+    var rows: RawRows = .{};
+    defer rows.deinit(allocator);
+    try rows.resize(allocator, layout, 3);
+    for ([_]u64{ 7, 8, 7 }, [_]u32{ 60, 100, 41 }, 0..) |key, weight, r| {
+        rows.setKey(r, key);
+        rows.weightAll()[r] = weight;
+    }
+    try std.testing.expect(!bound.noteStaged(&rows));
+    bound.settle();
+    try std.testing.expect(testSlotKept(bound, 7));
+    try std.testing.expect(!testSlotKept(bound, 8));
+}
+
+test "a HAVING bound declines what can't prune" {
+    const allocator = std.testing.allocator;
+    const layout = GroupRowsLayout{
+        .key_width = .u64,
+        .columns = &.{.{ .physical_type = .f64 }},
+        .aggregates = &.{ .{ .op = .count_star, .state_index = 0 }, .{ .op = .sum, .input_column_index = 0, .state_index = 1 } },
+    };
+    const count_over = HavingBound{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 100 } } };
+    const cases = [_]struct { having: HavingBound, input_rows: u64 }{
+        .{ .having = .{ .leaf = .{ .aggregate = 0, .op = .lt, .value = .{ .int = 5 } } }, .input_rows = 1000 },
+        // 4096 slots of 100M rows: a count past 2 could fill them all.
+        .{ .having = .{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 2 } } }, .input_rows = 100_000_000 },
+        // A float sum isn't bounded.
+        .{ .having = .{ .leaf = .{ .aggregate = 1, .op = .gt, .value = .{ .int = 5 } } }, .input_rows = 1000 },
+        .{ .having = .{ .any = &.{ count_over, .any_group } }, .input_rows = 1000 },
+        .{ .having = .any_group, .input_rows = 1000 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(@as(?*SlotBound, null), try SlotBound.create(allocator, layout, c.having, 12, c.input_rows, std.math.maxInt(u64)));
+    }
+    const kept = (try SlotBound.create(allocator, layout, .{ .all = &.{ count_over, .any_group } }, 12, 1000, std.math.maxInt(u64))).?;
+    kept.destroy(allocator);
+}
+
+test "HAVING sum, min and max bounds hold every group's own" {
+    const allocator = std.testing.allocator;
+    const layout = GroupRowsLayout{
+        .key_width = .u64,
+        .columns = &.{
+            .{ .physical_type = .i32, .nullable = true, .valid_index = 0 },
+            .{ .physical_type = .f64 },
+        },
+        .aggregates = &.{
+            .{ .op = .sum, .input_column_index = 0, .state_index = 1 },
+            .{ .op = .min, .input_column_index = 0, .state_index = 2 },
+            .{ .op = .max, .input_column_index = 1, .state_index = 3 },
+        },
+    };
+    var rows: RawRows = .{};
+    defer rows.deinit(allocator);
+    try rows.resize(allocator, layout, 5);
+    // Key 1: sums 5 - 3, min -3, max 2.5. Key 2: sum 50, min 50, max -1; its
+    // NULL row's -100 counts toward neither.
+    const keys = [_]u64{ 1, 1, 2, 2, 2 };
+    const ints = [_]i32{ 5, -3, 50, -100, 50 };
+    const valid = [_]u8{ 1, 1, 1, 0, 1 };
+    const floats = [_]f64{ 1.5, 2.5, -1.0, -1.0, -2.0 };
+    for (keys, 0..) |key, r| {
+        rows.setKey(r, key);
+        rows.validAll(0)[r] = valid[r];
+    }
+    @memcpy(@as([]i32, @alignCast(std.mem.bytesAsSlice(i32, rows.columnByteSlab(0))))[0..5], &ints);
+    @memcpy(@as([]f64, @alignCast(std.mem.bytesAsSlice(f64, rows.columnByteSlab(1))))[0..5], &floats);
+
+    const sum_over = HavingBound{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 10 } } };
+    const sum_under = HavingBound{ .leaf = .{ .aggregate = 0, .op = .lt, .value = .{ .int = -1 } } };
+    const min_under = HavingBound{ .leaf = .{ .aggregate = 1, .op = .lt, .value = .{ .int = 0 } } };
+    const max_over = HavingBound{ .leaf = .{ .aggregate = 2, .op = .gte, .value = .{ .float = 2.5 } } };
+    const max_is = HavingBound{ .leaf = .{ .aggregate = 2, .op = .eq, .value = .{ .int = -1 } } };
+    const cases = [_]struct { having: HavingBound, keeps_1: bool, keeps_2: bool }{
+        .{ .having = sum_over, .keeps_1 = false, .keeps_2 = true },
+        .{ .having = sum_under, .keeps_1 = true, .keeps_2 = false },
+        .{ .having = min_under, .keeps_1 = true, .keeps_2 = false },
+        .{ .having = max_over, .keeps_1 = true, .keeps_2 = false },
+        .{ .having = max_is, .keeps_1 = true, .keeps_2 = true },
+        .{ .having = .{ .any = &.{ sum_over, max_over } }, .keeps_1 = true, .keeps_2 = true },
+        .{ .having = .{ .all = &.{ sum_over, max_over } }, .keeps_1 = false, .keeps_2 = false },
+        .{ .having = .{ .all = &.{ sum_over, .any_group } }, .keeps_1 = false, .keeps_2 = true },
+    };
+    for (cases) |c| {
+        const bound = (try SlotBound.create(allocator, layout, c.having, 12, 5, std.math.maxInt(u64))).?;
+        defer bound.destroy(allocator);
+        try std.testing.expect(testSlotOf(bound, 1) != testSlotOf(bound, 2));
+        try std.testing.expect(!bound.noteStaged(&rows));
+        bound.settle();
+        try std.testing.expectEqual(c.keeps_1, testSlotKept(bound, 1));
+        try std.testing.expectEqual(c.keeps_2, testSlotKept(bound, 2));
+    }
+}
+
+test "a HAVING bound gives up past its hold, and keeps every slot past a NaN" {
+    const allocator = std.testing.allocator;
+    const layout = GroupRowsLayout{
+        .key_width = .u64,
+        .columns = &.{.{ .physical_type = .f64 }},
+        .aggregates = &.{.{ .op = .max, .input_column_index = 0, .state_index = 1 }},
+    };
+    var rows: RawRows = .{};
+    defer rows.deinit(allocator);
+    try rows.resize(allocator, layout, 2);
+    rows.setKey(0, 1);
+    rows.setKey(1, 2);
+    const values: []f64 = @alignCast(std.mem.bytesAsSlice(f64, rows.columnByteSlab(0)));
+    values[0] = 1.0;
+    values[1] = std.math.nan(f64);
+    const having: HavingBound = .{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 5 } } };
+
+    const poisoned = (try SlotBound.create(allocator, layout, having, 12, 2, std.math.maxInt(u64))).?;
+    defer poisoned.destroy(allocator);
+    try std.testing.expect(!poisoned.noteStaged(&rows));
+    poisoned.settle();
+    try std.testing.expect(testSlotKept(poisoned, 1));
+
+    const small = (try SlotBound.create(allocator, layout, having, 12, 2, 1)).?;
+    defer small.destroy(allocator);
+    try std.testing.expect(small.noteStaged(&rows));
+    try std.testing.expect(!small.noteStaged(&rows));
+    small.settle();
+    try std.testing.expect(small.abandoned.load(.acquire));
+    try std.testing.expect(!small.settled.load(.acquire));
+}
+
+test "a settled HAVING bound drops failing groups' rows at the drain and completes grouping" {
+    const allocator = std.testing.allocator;
+    const group_count = 1000;
+    var buckets = [_]PipeBucket{ try PipeBucket.init(allocator, 16), try PipeBucket.init(allocator, 16) };
+    defer for (&buckets) |*b| b.deinit(allocator);
+    var local: WorkerParts = .{};
+    defer local.deinit(allocator);
+    var scratch: GroupScratch = .{};
+    defer scratch.deinit(allocator);
+    var shared = PipeShared{
+        .allocator = allocator,
+        .buckets = &buckets,
+        .bucket_count = 2,
+        .input_rows_per_bucket = group_count * (group_count + 1) / 2,
+        .scan_threads = 1,
+        .group_rows_layout = .{
+            .key_width = .u32,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+            .has_weight = true,
+        },
+    };
+    defer deinitRawQueues(&shared);
+    shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+    shared.raw_scan_queues[0] = .{};
+    shared.raw_group_queues = try allocator.alloc(GroupQueue, 2);
+    for (shared.raw_group_queues) |*q| q.* = .{};
+    shared.stage_builders = try allocator.alloc(StageBucketBuilder, 2);
+    for (shared.stage_builders) |*b| b.* = .{};
+    const having: HavingBound = .{ .leaf = .{ .aggregate = 0, .op = .gt, .value = .{ .int = 900 } } };
+    shared.slot_bound = (try SlotBound.create(allocator, shared.group_rows_layout, having, 12, group_count * (group_count + 1) / 2, std.math.maxInt(u64))).?;
+    defer shared.slot_bound.?.destroy(allocator);
+
+    var source: RawRows = .{};
+    defer source.deinit(allocator);
+    try source.resize(allocator, shared.group_rows_layout, group_count);
+    for (0..group_count) |i| {
+        source.setKey(i, i);
+        source.weightAll()[i] = @intCast(i + 1);
+    }
+    try std.testing.expect(!shared.slot_bound.?.noteStaged(&source));
+    try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 16384, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+    try std.testing.expect(shared.drainsHeld());
+    shared.scans_done.store(1, .release);
+    shared.slot_bound.?.settle();
+    try std.testing.expect(!shared.drainsHeld());
+
+    try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+    try std.testing.expect(try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 16384, 32768, 1, false));
+    const dropped = shared.slot_bound.?.dropped_rows.load(.acquire);
+    try std.testing.expect(dropped > 0);
+    try std.testing.expectEqual(@as(u64, group_count) - dropped, shared.pending_group_rows.load(.acquire));
+    _ = try flushSharedStageBuilders(&shared, &local, false);
+    var ticks: i64 = 0;
+    var chunks: u64 = 0;
+    for (0..2) |lane| {
+        if (!claimRawQueueLaneExact(shared.raw_group_queues, lane)) continue;
+        _ = try drainRawDedicatedGroupLane(allocator, &shared, &local, &scratch, lane, 32768, 1, &ticks, &chunks, false);
+    }
+    try std.testing.expect(shared.grouping_complete());
+
+    var top = try TopSet.init(allocator, group_count);
+    defer top.deinit(allocator);
+    for (0..2) |w| try collectOwnedTop(&shared, w, 2, &top, &ticks, false);
+    try top.sortBestFirst(allocator);
+    try std.testing.expectEqual(@as(usize, group_count) - dropped, top.len);
+    // Every passing group survives whole; the rest are failing groups that
+    // share a slot with one.
+    for (0..100) |rank| {
+        const row = top.rowAt(rank);
+        try std.testing.expectEqual(@as(u128, group_count - 1 - rank), row.key);
+        try std.testing.expectEqual(@as(u64, group_count - rank), row.count);
     }
 }
 
@@ -3873,6 +4106,447 @@ pub const EmitRank = struct {
     ties: bool = false,
 };
 
+/// A HAVING comparison of one aggregate's result with a constant.
+pub const HavingLeaf = struct {
+    /// Index into the layout's `aggregates`.
+    aggregate: u16,
+    op: HavingOp,
+    value: HavingValue,
+};
+
+pub const HavingOp = enum { eq, lt, lte, gt, gte };
+
+pub const HavingValue = union(enum) {
+    int: i128,
+    float: f64,
+};
+
+/// A HAVING as the grid can bound it from staged partials: aggregate-vs-
+/// constant comparisons under AND and OR. `any_group` stands for a condition
+/// the partials say nothing about (NOT, a key column, a NULL test), which any
+/// group may meet.
+pub const HavingBound = union(enum) {
+    any_group,
+    leaf: HavingLeaf,
+    all: []const HavingBound,
+    any: []const HavingBound,
+};
+
+// Expected groups below which a HAVING bound doesn't hold staging back: the
+// drains it saves cost less than the slots it fills and settles.
+const SLOT_BOUND_MIN_GROUPS: u64 = 65536;
+const SLOT_BOUND_MIN_BITS: u6 = 12;
+const SLOT_BOUND_MAX_BITS: u6 = 20;
+const MAX_SLOT_LANES: usize = 8;
+// The staged bytes a bound may hold back without an accountant to size it.
+const SLOT_BOUND_DEFAULT_HOLD_BYTES: u64 = 1 << 30;
+
+const SlotLaneKind = enum {
+    rows,
+    /// The sum of a column's positive partials.
+    pos_sum,
+    /// The magnitude of the sum of a column's negative partials.
+    neg_sum,
+    max,
+    min,
+};
+
+const SlotLane = struct {
+    kind: SlotLaneKind,
+    column: u16 = 0,
+    float: bool = false,
+    valid: ?u16 = null,
+    /// The rows, pos_sum and neg_sum cells.
+    sums: []u64 = &.{},
+    /// The max and min cells; a float column's hold order-preserving integers.
+    extremes: []i64 = &.{},
+};
+
+const SlotTest = struct {
+    lane: u8,
+    /// The slot is kept when its lane value compares to `value` this way.
+    op: HavingOp,
+    value: HavingValue,
+};
+
+const SlotCond = union(enum) {
+    always,
+    lane: SlotTest,
+    all: []const SlotCond,
+    any: []const SlotCond,
+};
+
+/// The settled slots a drain tests each staged row's key hash against.
+const SlotKeep = struct {
+    bits: []const u64,
+    shift: u6,
+
+    inline fn holds(self: SlotKeep, hash: u64) bool {
+        const slot = slotOfHash(hash, self.shift);
+        return (self.bits[slot >> 6] >> @as(u6, @truncate(slot))) & 1 != 0;
+    }
+};
+
+// The route hash's low bits pick the bucket, and a small integer key leaves
+// its high bits zero, so the slot comes from a multiplicative remix.
+inline fn slotOfHash(hash: u64, shift: u6) usize {
+    return @intCast((hash *% 0x9E3779B97F4A7C15) >> shift);
+}
+
+inline fn orderedFromFloat(f: f64) i64 {
+    const bits: i64 = @bitCast(f);
+    return if (bits < 0) bits ^ std.math.maxInt(i64) else bits;
+}
+
+inline fn floatFromOrdered(ordered: i64) f64 {
+    return @bitCast(if (ordered < 0) ordered ^ std.math.maxInt(i64) else ordered);
+}
+
+fn havingOrder(a: HavingValue, b: HavingValue) std.math.Order {
+    return switch (a) {
+        .int => |x| switch (b) {
+            .int => |y| std.math.order(x, y),
+            .float => |y| std.math.order(@as(f64, @floatFromInt(x)), y),
+        },
+        .float => |x| std.math.order(x, switch (b) {
+            .int => |y| @as(f64, @floatFromInt(y)),
+            .float => |y| y,
+        }),
+    };
+}
+
+fn slotBoundBits(expected_groups: u64) u6 {
+    const want = std.math.log2_int_ceil(u64, @max(2, expected_groups *| 2));
+    return @intCast(std.math.clamp(want, SLOT_BOUND_MIN_BITS, SLOT_BOUND_MAX_BITS));
+}
+
+/// Bounds, per hash slot of the group key, on the aggregates a HAVING
+/// compares: the slot's rows, the sums of its positive and of its negative
+/// partials, its largest and smallest values. Each bounds the same of every
+/// group hashing there, so a slot whose bounds fail the HAVING holds no group
+/// that passes it. The scans tally every staged row as it publishes; the
+/// drains wait for the last scan to settle the slots, then drop the rows of
+/// failing slots instead of staging and folding groups the emit's HAVING
+/// would discard.
+const SlotBound = struct {
+    arena: std.heap.ArenaAllocator,
+    lanes: []SlotLane = &.{},
+    cond: SlotCond = .always,
+    shift: u6,
+    keep: []u64 = &.{},
+    hold_limit: u64,
+    held_bytes: std.atomic.Value(u64) = .init(0),
+    dropped_rows: std.atomic.Value(u64) = .init(0),
+    // Staging outgrew `hold_limit` before the scans finished: the drains go
+    // ahead unpruned.
+    abandoned: std.atomic.Value(bool) = .init(false),
+    // A partial no lane bounds arrived (a NaN, or a sum past 64 bits): every
+    // slot is kept.
+    poisoned: std.atomic.Value(bool) = .init(false),
+    settled: std.atomic.Value(bool) = .init(false),
+
+    /// Null when no part of `having` both bounds and can prune.
+    fn create(allocator: Allocator, layout: GroupRowsLayout, having: HavingBound, slot_bits: u6, input_rows: u64, hold_limit: u64) !?*SlotBound {
+        const self = try allocator.create(SlotBound);
+        self.* = .{ .arena = .init(allocator), .shift = @intCast(@as(u7, 64) - slot_bits), .hold_limit = hold_limit };
+        errdefer self.destroy(allocator);
+        const arena = self.arena.allocator();
+        const slots = @as(usize, 1) << slot_bits;
+        var compiler: SlotCompiler = .{ .arena = arena, .layout = layout, .slots = slots, .input_rows = input_rows };
+        const compiled = try compiler.compile(having);
+        if (!compiled.prunes) {
+            self.destroy(allocator);
+            return null;
+        }
+        const lanes = try arena.alloc(SlotLane, compiler.lane_count);
+        for (lanes, compiler.lanes[0..compiler.lane_count]) |*lane, spec| {
+            lane.* = spec;
+            switch (spec.kind) {
+                .rows, .pos_sum, .neg_sum => {
+                    lane.sums = try arena.alloc(u64, slots);
+                    @memset(lane.sums, 0);
+                },
+                .max => {
+                    lane.extremes = try arena.alloc(i64, slots);
+                    @memset(lane.extremes, if (spec.float) orderedFromFloat(-std.math.inf(f64)) else std.math.minInt(i64));
+                },
+                .min => {
+                    lane.extremes = try arena.alloc(i64, slots);
+                    @memset(lane.extremes, if (spec.float) orderedFromFloat(std.math.inf(f64)) else std.math.maxInt(i64));
+                },
+            }
+        }
+        self.lanes = lanes;
+        self.cond = compiled.cond;
+        self.keep = try arena.alloc(u64, slots / 64);
+        return self;
+    }
+
+    fn destroy(self: *SlotBound, allocator: Allocator) void {
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+
+    /// Tallies `rows` as they publish. True when they push the held bytes
+    /// past the limit and the bound gives up, which wakes the held drains.
+    fn noteStaged(self: *SlotBound, rows: *const RawRows) bool {
+        if (rows.len() == 0 or self.abandoned.load(.monotonic)) return false;
+        const bytes: u64 = rowBufferBytes(rows.*);
+        if (self.held_bytes.fetchAdd(bytes, .monotonic) + bytes > self.hold_limit) {
+            return !self.abandoned.swap(true, .acq_rel);
+        }
+        switch (rows.layout.key_width) {
+            inline else => |kw| self.tally(kw, rows.*),
+        }
+        return false;
+    }
+
+    fn tally(self: *SlotBound, comptime key_width: GroupKeyWidth, rows: RawRows) void {
+        const n = rows.len();
+        const keys = switch (key_width) {
+            .u32 => rows.keyU32All(),
+            .u64 => rows.keyU64All(),
+            .u96 => rows.keyU96LoAll(),
+            .u128 => rows.keyU128All(),
+        };
+        const key_hi: []const u32 = if (key_width == .u96) rows.keyU96HiAll() else &.{};
+        for (self.lanes) |lane| {
+            switch (lane.kind) {
+                .rows => if (rows.layout.has_weight) {
+                    for (rows.weightAll()[0..n], 0..) |w, r| {
+                        _ = @atomicRmw(u64, &lane.sums[self.rowSlot(key_width, keys, key_hi, r)], .Add, w, .monotonic);
+                    }
+                } else {
+                    for (0..n) |r| _ = @atomicRmw(u64, &lane.sums[self.rowSlot(key_width, keys, key_hi, r)], .Add, 1, .monotonic);
+                },
+                inline .pos_sum, .neg_sum, .max, .min => |kind| switch (rows.layout.columns[lane.column].physical_type) {
+                    inline else => |pt| self.tallyColumn(key_width, kind, groupPhysicalT(pt), lane, rows, keys, key_hi),
+                },
+            }
+        }
+    }
+
+    fn tallyColumn(self: *SlotBound, comptime key_width: GroupKeyWidth, comptime kind: SlotLaneKind, comptime T: type, lane: SlotLane, rows: RawRows, keys: anytype, key_hi: []const u32) void {
+        const values: []const T = @alignCast(std.mem.bytesAsSlice(T, rows.columnByteSlab(lane.column)));
+        const valid: []const u8 = if (lane.valid) |v| rows.validAll(v) else &.{};
+        for (values[0..rows.len()], 0..) |value, r| {
+            if (lane.valid != null and valid[r] == 0) continue;
+            const slot = self.rowSlot(key_width, keys, key_hi, r);
+            if (@typeInfo(T) == .float) {
+                // Sums of floats aren't bounded: rounding could undercut them.
+                if (kind == .pos_sum or kind == .neg_sum or std.math.isNan(value)) {
+                    self.poisoned.store(true, .monotonic);
+                    return;
+                }
+                _ = @atomicRmw(i64, &lane.extremes[slot], if (kind == .max) .Max else .Min, orderedFromFloat(value), .monotonic);
+                continue;
+            }
+            switch (kind) {
+                .pos_sum => if (value > 0) self.addSum(&lane.sums[slot], @intCast(value)),
+                .neg_sum => if (value < 0) self.addSum(&lane.sums[slot], @abs(value)),
+                .max => _ = @atomicRmw(i64, &lane.extremes[slot], .Max, value, .monotonic),
+                .min => _ = @atomicRmw(i64, &lane.extremes[slot], .Min, value, .monotonic),
+                .rows => @compileError("a rows lane reads no column"),
+            }
+        }
+    }
+
+    fn addSum(self: *SlotBound, cell: *u64, amount: u64) void {
+        const prior = @atomicRmw(u64, cell, .Add, amount, .monotonic);
+        if (prior > std.math.maxInt(u64) - amount) self.poisoned.store(true, .monotonic);
+    }
+
+    inline fn rowSlot(self: *const SlotBound, comptime key_width: GroupKeyWidth, keys: anytype, key_hi: []const u32, r: usize) usize {
+        const key = groupKeyAt(key_width, keys, key_hi, r);
+        return slotOfHash(routeHashRowBits(@truncate(key), @truncate(key >> 64)), self.shift);
+    }
+
+    /// Run once, by the last scan to finish, after every tally.
+    fn settle(self: *SlotBound) void {
+        if (self.abandoned.load(.acquire)) return;
+        if (self.poisoned.load(.monotonic)) {
+            @memset(self.keep, std.math.maxInt(u64));
+        } else {
+            for (self.keep, 0..) |*word, w| {
+                var bits: u64 = 0;
+                for (0..64) |i| bits |= @as(u64, @intFromBool(self.passes(self.cond, w * 64 + i))) << @intCast(i);
+                word.* = bits;
+            }
+        }
+        self.settled.store(true, .release);
+    }
+
+    fn passes(self: *const SlotBound, cond: SlotCond, slot: usize) bool {
+        return switch (cond) {
+            .always => true,
+            .lane => |t| self.lanePasses(t, slot),
+            .all => |conds| for (conds) |c| {
+                if (!self.passes(c, slot)) break false;
+            } else true,
+            .any => |conds| for (conds) |c| {
+                if (self.passes(c, slot)) break true;
+            } else false,
+        };
+    }
+
+    fn lanePasses(self: *const SlotBound, t: SlotTest, slot: usize) bool {
+        const lane = self.lanes[t.lane];
+        const have: HavingValue = switch (lane.kind) {
+            .rows, .pos_sum => .{ .int = lane.sums[slot] },
+            .neg_sum => .{ .int = -@as(i128, lane.sums[slot]) },
+            .max, .min => if (lane.float) .{ .float = floatFromOrdered(lane.extremes[slot]) } else .{ .int = lane.extremes[slot] },
+        };
+        const ord = havingOrder(have, t.value);
+        return switch (t.op) {
+            .eq => ord == .eq,
+            .lt => ord == .lt,
+            .lte => ord != .gt,
+            .gt => ord == .gt,
+            .gte => ord != .lt,
+        };
+    }
+};
+
+/// Turns a HavingBound into slot tests over as few lanes as it can share.
+const SlotCompiler = struct {
+    arena: Allocator,
+    layout: GroupRowsLayout,
+    slots: usize,
+    input_rows: u64,
+    lanes: [MAX_SLOT_LANES]SlotLane = undefined,
+    lane_count: usize = 0,
+
+    /// `prunes`: the condition can fail for some slot the input could fill.
+    /// AND prunes when any side does; OR only when every side does.
+    const Compiled = struct { cond: SlotCond, prunes: bool };
+    const NONE: Compiled = .{ .cond = .always, .prunes = false };
+
+    fn compile(self: *SlotCompiler, having: HavingBound) !Compiled {
+        switch (having) {
+            .any_group => return NONE,
+            .leaf => |leaf| return self.compileLeaf(leaf),
+            .all => |children| {
+                const conds = try self.arena.alloc(SlotCond, children.len);
+                var n: usize = 0;
+                var prunes = false;
+                for (children) |child| {
+                    const c = try self.compile(child);
+                    if (c.cond == .always) continue;
+                    conds[n] = c.cond;
+                    n += 1;
+                    prunes = prunes or c.prunes;
+                }
+                if (n == 0) return NONE;
+                return .{ .cond = .{ .all = conds[0..n] }, .prunes = prunes };
+            },
+            .any => |children| {
+                if (children.len == 0) return NONE;
+                const conds = try self.arena.alloc(SlotCond, children.len);
+                var prunes = true;
+                for (children, conds) |child, *cond| {
+                    const c = try self.compile(child);
+                    if (c.cond == .always) return NONE;
+                    cond.* = c.cond;
+                    prunes = prunes and c.prunes;
+                }
+                return .{ .cond = .{ .any = conds }, .prunes = prunes };
+            },
+        }
+    }
+
+    fn compileLeaf(self: *SlotCompiler, leaf: HavingLeaf) !Compiled {
+        if (leaf.aggregate >= self.layout.aggregates.len) return NONE;
+        if (leaf.value == .float and std.math.isNan(leaf.value.float)) return NONE;
+        const agg = self.layout.aggregates[leaf.aggregate];
+        if (agg.is_string or agg.is_concat or agg.is_udf) return NONE;
+        switch (agg.op) {
+            // A group's count, of rows, non-NULL values or distinct ones,
+            // is at most its rows.
+            .count_star, .count_col, .count_distinct => {
+                const op: HavingOp = switch (leaf.op) {
+                    .gt => .gt,
+                    .gte, .eq => .gte,
+                    .lt, .lte => return NONE,
+                };
+                const lane = self.laneFor(.{ .kind = .rows }) orelse return NONE;
+                return .{ .cond = .{ .lane = .{ .lane = lane, .op = op, .value = leaf.value } }, .prunes = self.countPrunes(leaf.value) };
+            },
+            .sum => {
+                const column = agg.input_column_index orelse return NONE;
+                if (column >= self.layout.columns.len or physicalIsFloat(self.layout.columns[column].physical_type)) return NONE;
+                switch (leaf.op) {
+                    .gt, .gte => return self.columnTest(.pos_sum, column, leaf.op, leaf.value),
+                    .lt, .lte => return self.columnTest(.neg_sum, column, leaf.op, leaf.value),
+                    .eq => {
+                        const sides = [_]Compiled{
+                            self.columnTest(.pos_sum, column, .gte, leaf.value),
+                            self.columnTest(.neg_sum, column, .lte, leaf.value),
+                        };
+                        const conds = try self.arena.alloc(SlotCond, sides.len);
+                        var n: usize = 0;
+                        for (sides) |side| {
+                            if (side.cond == .always) continue;
+                            conds[n] = side.cond;
+                            n += 1;
+                        }
+                        if (n == 0) return NONE;
+                        return .{ .cond = .{ .all = conds[0..n] }, .prunes = true };
+                    },
+                }
+            },
+            .min => {
+                const column = agg.input_column_index orelse return NONE;
+                return switch (leaf.op) {
+                    .lt => self.columnTest(.min, column, .lt, leaf.value),
+                    .lte, .eq => self.columnTest(.min, column, .lte, leaf.value),
+                    .gt, .gte => NONE,
+                };
+            },
+            .max => {
+                const column = agg.input_column_index orelse return NONE;
+                return switch (leaf.op) {
+                    .gt => self.columnTest(.max, column, .gt, leaf.value),
+                    .gte, .eq => self.columnTest(.max, column, .gte, leaf.value),
+                    .lt, .lte => NONE,
+                };
+            },
+            .avg, .welford, .concat, .udf => return NONE,
+        }
+    }
+
+    fn columnTest(self: *SlotCompiler, kind: SlotLaneKind, column: u16, op: HavingOp, value: HavingValue) Compiled {
+        if (column >= self.layout.columns.len) return NONE;
+        const spec = self.layout.columns[column];
+        const lane = self.laneFor(.{
+            .kind = kind,
+            .column = column,
+            .float = physicalIsFloat(spec.physical_type),
+            .valid = if (spec.nullable) spec.valid_index else null,
+        }) orelse return NONE;
+        return .{ .cond = .{ .lane = .{ .lane = lane, .op = op, .value = value } }, .prunes = true };
+    }
+
+    fn laneFor(self: *SlotCompiler, spec: SlotLane) ?u8 {
+        for (self.lanes[0..self.lane_count], 0..) |held, i| {
+            if (held.kind == spec.kind and held.column == spec.column) return @intCast(i);
+        }
+        if (self.lane_count == MAX_SLOT_LANES) return null;
+        self.lanes[self.lane_count] = spec;
+        self.lane_count += 1;
+        return @intCast(self.lane_count - 1);
+    }
+
+    /// Input rows enough to carry a quarter of the slots past `threshold`
+    /// leave a count bound little to drop.
+    fn countPrunes(self: *const SlotCompiler, threshold: HavingValue) bool {
+        const t: f64 = switch (threshold) {
+            .int => |v| @floatFromInt(v),
+            .float => |v| v,
+        };
+        return t * @as(f64, @floatFromInt(self.slots)) > 4 * @as(f64, @floatFromInt(self.input_rows));
+    }
+};
+
 const ALL_GROUPS_FILL_ROWS_PER_WORKER: usize = 65536;
 
 fn bucketGroupOffsets(allocator: Allocator, buckets: []PipeBucket) ![]usize {
@@ -5322,6 +5996,9 @@ inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []
 fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
     if (shared.serial_fold_scratch) |scratch| return foldActiveRawRows(parts, shared, scratch);
     if (shared.raw_scan_queues.len > 0) {
+        if (shared.slot_bound) |bound| {
+            if (bound.noteStaged(&parts.raw_active_rows)) shared.signalWork(std.math.maxInt(u32));
+        }
         const qidx = chooseRawScanPublishLane(shared, parts.raw_scan_lane, @max(@as(usize, 1), raw_chunk_rows / 2));
         try publishRawRowsToQueue(shared, &shared.raw_scan_queues[qidx], parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &shared.outstanding_chunks, &shared.pending_group_rows, &parts.raw_scan_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     } else {
@@ -7470,31 +8147,40 @@ fn flushSharedStageBuilders(
     return flushed;
 }
 
-/// Each staged row's bucket, and the rows each bucket receives.
-fn stageBucketIds(comptime key_width: GroupKeyWidth, chunks: []const RawChunk, bucket_ids: []u16, counts: []u32) void {
+/// Each staged row's bucket, and the rows each bucket receives. With `keep`,
+/// a row whose slot failed takes the id past the buckets, the last count.
+fn stageBucketIds(comptime key_width: GroupKeyWidth, chunks: []const RawChunk, bucket_ids: []u16, counts: []u32, keep: ?SlotKeep) void {
     @memset(counts, 0);
-    switch (std.math.isPowerOfTwo(counts.len)) {
-        inline else => |pow2| {
-            var row_idx: usize = 0;
-            for (chunks) |chunk| {
-                const rows = chunk.rows;
-                const n = rows.len();
-                const keys = switch (key_width) {
-                    .u32 => rows.keyU32All(),
-                    .u64 => rows.keyU64All(),
-                    .u96 => rows.keyU96LoAll(),
-                    .u128 => rows.keyU128All(),
-                };
-                const key_hi: []const u32 = if (key_width == .u96) rows.keyU96HiAll() else &.{};
-                for (bucket_ids[row_idx..][0..n], 0..) |*id, r| {
-                    const key = groupKeyAt(key_width, keys, key_hi, r);
-                    const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
-                    const b = if (pow2) @as(usize, @truncate(h)) & (counts.len - 1) else bucketIndexHash(h, counts.len);
-                    id.* = @intCast(b);
-                    counts[b] += 1;
+    const live = counts.len - @intFromBool(keep != null);
+    switch (keep != null) {
+        inline else => |pruning| switch (std.math.isPowerOfTwo(live)) {
+            inline else => |pow2| {
+                var row_idx: usize = 0;
+                for (chunks) |chunk| {
+                    const rows = chunk.rows;
+                    const n = rows.len();
+                    const keys = switch (key_width) {
+                        .u32 => rows.keyU32All(),
+                        .u64 => rows.keyU64All(),
+                        .u96 => rows.keyU96LoAll(),
+                        .u128 => rows.keyU128All(),
+                    };
+                    const key_hi: []const u32 = if (key_width == .u96) rows.keyU96HiAll() else &.{};
+                    for (bucket_ids[row_idx..][0..n], 0..) |*id, r| {
+                        const key = groupKeyAt(key_width, keys, key_hi, r);
+                        const h = routeHashRowBits(@truncate(key), @truncate(key >> 64));
+                        const b = if (pruning and !keep.?.holds(h))
+                            live
+                        else if (pow2)
+                            @as(usize, @truncate(h)) & (live - 1)
+                        else
+                            bucketIndexHash(h, live);
+                        id.* = @intCast(b);
+                        counts[b] += 1;
+                    }
+                    row_idx += n;
                 }
-                row_idx += n;
-            }
+            },
         },
     }
 }
@@ -7575,18 +8261,21 @@ const StageLane = union(enum) {
 /// Scatters one lane of the staged chunks into `flat`, each row to the next
 /// slot of its bucket's run. A typed loop per lane keeps one write stream per
 /// bucket and no per-row dispatch on the key width or a column's size.
-fn scatterStageLane(flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) !void {
-    switch (lane.width(flat.layout)) {
-        1 => scatterStageRuns(u8, flat, chunks, bucket_ids, offsets, next, lane),
-        2 => scatterStageRuns(u16, flat, chunks, bucket_ids, offsets, next, lane),
-        4 => scatterStageRuns(u32, flat, chunks, bucket_ids, offsets, next, lane),
-        8 => scatterStageRuns(u64, flat, chunks, bucket_ids, offsets, next, lane),
-        16 => scatterStageRuns(u128, flat, chunks, bucket_ids, offsets, next, lane),
-        else => return error.UnsupportedOperatorForType,
+/// With `drops`, rows with an id past the buckets' (`offsets.len`) are skipped.
+fn scatterStageLane(flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane, drops: bool) !void {
+    switch (drops) {
+        inline else => |d| switch (lane.width(flat.layout)) {
+            1 => scatterStageRuns(u8, d, flat, chunks, bucket_ids, offsets, next, lane),
+            2 => scatterStageRuns(u16, d, flat, chunks, bucket_ids, offsets, next, lane),
+            4 => scatterStageRuns(u32, d, flat, chunks, bucket_ids, offsets, next, lane),
+            8 => scatterStageRuns(u64, d, flat, chunks, bucket_ids, offsets, next, lane),
+            16 => scatterStageRuns(u128, d, flat, chunks, bucket_ids, offsets, next, lane),
+            else => return error.UnsupportedOperatorForType,
+        },
     }
 }
 
-fn scatterStageRuns(comptime T: type, flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) void {
+fn scatterStageRuns(comptime T: type, comptime drops: bool, flat: RawRows, chunks: []const RawChunk, bucket_ids: []const u16, offsets: []const u32, next: []u32, lane: StageLane) void {
     const dst: []T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(flat)));
     @memcpy(next, offsets);
     var row_idx: usize = 0;
@@ -7594,6 +8283,7 @@ fn scatterStageRuns(comptime T: type, flat: RawRows, chunks: []const RawChunk, b
         const n = chunk.rows.len();
         const src: []const T = @alignCast(std.mem.bytesAsSlice(T, lane.bytes(chunk.rows)));
         for (src[0..n], bucket_ids[row_idx..][0..n]) |v, b| {
+            if (drops and b >= offsets.len) continue;
             dst[next[b]] = v;
             next[b] += 1;
         }
@@ -7626,8 +8316,10 @@ fn drainRawDedicatedStageSharedBuilders(
     defer _ = shared.active_stage_jobs.fetchSub(1, .release);
 
     const bucket_count = @min(shared.bucket_count, shared.raw_group_queues.len);
-    std.debug.assert(bucket_count <= @as(usize, std.math.maxInt(u16)) + 1);
-    try local.ensureWideBucketScratch(allocator, bucket_count);
+    const keep = shared.slotKeep();
+    const id_count = bucket_count + @intFromBool(keep != null);
+    std.debug.assert(id_count <= @as(usize, std.math.maxInt(u16)) + 1);
+    try local.ensureWideBucketScratch(allocator, id_count);
 
     while (popped_total > 0) {
         if (shared.resources) |a| try a.checkCancelled();
@@ -7653,10 +8345,8 @@ fn drainRawDedicatedStageSharedBuilders(
             continue;
         }
 
-        try local.flat_raw_rows.resize(allocator, shared.group_rows_layout, total_rows);
         try local.flat_bucket_ids.resize(allocator, total_rows);
         const layout = shared.group_rows_layout;
-        if (layout.has_str_payload) try local.flat_str_src.resize(allocator, total_rows);
 
         const stage_t0 = if (profile) platform.nowTicks() else 0;
         const chunks = raw_chunks[0..popped_total];
@@ -7665,8 +8355,12 @@ fn drainRawDedicatedStageSharedBuilders(
         const offsets = local.flat_offsets[0..bucket_count];
         const next = local.flat_next[0..bucket_count];
         switch (layout.key_width) {
-            inline else => |kw| stageBucketIds(kw, chunks, bucket_ids, counts),
+            inline else => |kw| stageBucketIds(kw, chunks, bucket_ids, local.flat_counts[0..id_count], keep),
         }
+        const dropped: usize = if (keep != null) local.flat_counts[bucket_count] else 0;
+        const kept_rows = total_rows - dropped;
+        try local.flat_raw_rows.resize(allocator, layout, kept_rows);
+        if (layout.has_str_payload) try local.flat_str_src.resize(allocator, kept_rows);
         var offset: u32 = 0;
         for (counts, offsets) |n, *run_start| {
             run_start.* = offset;
@@ -7674,12 +8368,13 @@ fn drainRawDedicatedStageSharedBuilders(
         }
 
         var lanes: [MAX_STAGE_LANES]StageLane = undefined;
-        for (StageLane.all(layout, &lanes)) |lane| try scatterStageLane(local.flat_raw_rows, chunks, bucket_ids, offsets, next, lane);
+        for (StageLane.all(layout, &lanes)) |lane| try scatterStageLane(local.flat_raw_rows, chunks, bucket_ids, offsets, next, lane, keep != null);
         var strs: StagedStrSource = .{};
         if (layout.has_str_payload) {
-            const src = local.flat_str_src.items[0..total_rows];
+            const src = local.flat_str_src.items[0..kept_rows];
             @memcpy(next, offsets);
             for (bucket_ids, 0..) |b, r| {
+                if (b >= bucket_count) continue;
                 src[next[b]] = @intCast(r);
                 next[b] += 1;
             }
@@ -7704,6 +8399,10 @@ fn drainRawDedicatedStageSharedBuilders(
             try recycleRawRows(shared, raw_chunks[i].rows, raw_chunk_rows, &local.raw_recycle_lock_ticks);
         }
         if (profile) local.raw_stage_recycle_ticks += platform.nowTicks() - recycle_t0;
+        if (dropped > 0) {
+            _ = shared.slot_bound.?.dropped_rows.fetchAdd(dropped, .monotonic);
+            if (shared.pending_group_rows.fetchSub(dropped, .release) == dropped) shared.signalWork(std.math.maxInt(u32));
+        }
 
         // Return the lane so ready aggregation can consume its payload before
         // a producer fills more buffers, even while this queue has input left.
@@ -8755,7 +9454,10 @@ fn markGridScanDone(job: SiloGridJob, marked_scan_done: *bool) !void {
         }
         if (job.profile) job.local.publish_ticks += platform.nowTicks() - publish_t0;
     }
-    if (job.shared.scans_done.fetchAdd(1, .release) + 1 == job.shared.scan_threads) job.shared.signalWork(std.math.maxInt(u32));
+    if (job.shared.scans_done.fetchAdd(1, .acq_rel) + 1 == job.shared.scan_threads) {
+        if (job.shared.slot_bound) |bound| bound.settle();
+        job.shared.signalWork(std.math.maxInt(u32));
+    }
     marked_scan_done.* = true;
 }
 
@@ -8994,7 +9696,7 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
 
         if (job.raw_group_mode == .staged_final) {
             const scan_choice = if (scan_claims_available) minUnlockedScanLane(job.shared.raw_scan_queues, job.worker_index) else null;
-            const stage_choice = maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
+            const stage_choice = if (job.shared.drainsHeld()) null else maxUnlockedQueueLaneRows(job.shared.raw_scan_queues, job.worker_index);
             const folds_held = job.shared.defer_fold and !job.shared.deferred_folds_released();
             const group_choice = if (folds_held) null else maxUnlockedQueueLaneRows(job.shared.raw_group_queues, job.worker_index);
             const max_stage_rows = if (stage_choice) |choice| choice.rows else 0;
@@ -9216,6 +9918,9 @@ pub const RunConfig = struct {
     result_emit_filter: ?EmitFilter = null,
     // The caller's ORDER BY ... LIMIT over the all-groups emit; see EmitRank.
     result_rank: ?EmitRank = null,
+    // The HAVING the emit applies, as per-slot bounds the drains prune by
+    // (see SlotBound).
+    having_bound: ?HavingBound = null,
     trace_timing: bool = false,
     workspace: ?*SiloGridWorkspace = null,
 };
@@ -9685,6 +10390,17 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var serial_fold_scratch: GroupScratch = .{};
     defer serial_fold_scratch.deinit(allocator);
     if (serial_fold) shared.serial_fold_scratch = &serial_fold_scratch;
+    // A HAVING bound holds every staged row until the scans finish, so it
+    // needs peers to drain them after and groups enough to repay the wait.
+    if (cfg.having_bound) |having| {
+        if (use_dedicated_raw_stage and !serial_fold and n_workers >= 2 and !small_input and cfg.count_sketch == null and
+            estimated_groups >= SLOT_BOUND_MIN_GROUPS and bucket_count <= std.math.maxInt(u16))
+        {
+            const hold_limit: u64 = if (resources) |a| a.pool.budget / DEFER_FOLD_BUDGET_DIVISOR else SLOT_BOUND_DEFAULT_HOLD_BYTES;
+            shared.slot_bound = try SlotBound.create(allocator, group_rows_layout, having, slotBoundBits(estimated_groups), total, hold_limit);
+        }
+    }
+    defer if (shared.slot_bound) |bound| bound.destroy(allocator);
     var heavy_teardown_scheduled = false;
     defer if (!heavy_teardown_scheduled) deinitRawQueues(&shared);
     if (use_dedicated_raw_stage) {
@@ -9974,6 +10690,16 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     while (i < n_workers) : (i += 1) threads[i].join();
     const worker_wall_ticks = platform.nowTicks() - total_t0;
     for (errs) |maybe_err| if (maybe_err) |e| return e;
+    if (PROFILING and cfg.trace_timing) if (shared.slot_bound) |bound| {
+        std.debug.print("[having-bound] slots={d} lanes={d} held_mb={d:.1} dropped_rows={d} abandoned={} poisoned={}\n", .{
+            @as(usize, 1) << @intCast(@as(u7, 64) - bound.shift),
+            bound.lanes.len,
+            @as(f64, @floatFromInt(bound.held_bytes.load(.monotonic))) / (1024 * 1024),
+            bound.dropped_rows.load(.monotonic),
+            bound.abandoned.load(.monotonic),
+            bound.poisoned.load(.monotonic),
+        });
+    };
 
     var scan_cpu_ticks: i64 = 0;
     var partition_cpu_ticks: i64 = 0;
