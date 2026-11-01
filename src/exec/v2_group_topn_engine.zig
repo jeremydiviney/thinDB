@@ -501,6 +501,9 @@ pub const Shape = struct {
     // too small to place.
     count_sketch: bool = false,
     count_rank: ?CountRank = null,
+    // The fewest rows a group needs to pass a HAVING the core's top-N
+    // filters after it runs, so the sketch may drop every smaller group.
+    count_floor: u64 = 0,
     // The HAVING over the groups, as bounds the core prunes staged rows by
     // (see SiloCore.HavingBound). Null without a HAVING. By pointer, as in
     // SiloCore.RunConfig.
@@ -1110,7 +1113,12 @@ fn runHarness(
         snapshotRows(snapshot) <= std.math.maxInt(u32) and !group_rows_layout.has_str_payload and
         !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
-        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, rows)) return;
+        // A HAVING here filters the best groups after the run (see
+        // canUseCoreCountDescTopN). Its bound would drop groups from the
+        // sketch's passes, which then find fewer than `need` and fall back.
+        var sketch_cfg = cfg;
+        sketch_cfg.having_bound = null;
+        if (try runCountSketch(allocator, table, cpus, sketch_cfg, need, shape.count_rank, shape.count_floor, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
 }
@@ -1131,6 +1139,7 @@ fn runCountSketch(
     cfg: SiloCore.RunConfig,
     need: usize,
     rank: ?CountRank,
+    floor: u64,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
     // A lone string key read only as identity may arrive as row-group
@@ -1138,6 +1147,7 @@ fn runCountSketch(
     if (cfg.distinct_eval and cfg.derived.len == 0 and cfg.hash_key_columns.len == 1 and cfg.group_rows_layout.key_columns.len == 1) {
         var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
         defer heavy.deinit(allocator);
+        heavy.floor = floor;
         if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
         if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
         if (heavy.declined_small) return false;
@@ -1145,6 +1155,7 @@ fn runCountSketch(
 
     var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
     defer sketch.deinit(allocator);
+    sketch.floor = floor;
     if (rowBytesFit(allocator, cfg.snapshot, @sizeOf(u32))) {
         sketch.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
     }
@@ -1239,6 +1250,7 @@ fn runHeavyKeys(
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
     if (heavy.declined_small or !try heavy.settle(allocator)) return false;
+    if (heavy.candidates.count() == 0) return true;
 
     var filter = cfg;
     filter.hash_key_columns = &.{};

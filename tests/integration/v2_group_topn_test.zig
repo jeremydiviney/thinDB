@@ -2656,6 +2656,40 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         try std.testing.expectEqual(@as(usize, 10), rank);
     }
     {
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s HAVING COUNT(*) > 4500 ORDER BY c DESC LIMIT 6 OFFSET 2");
+        defer q.deinit();
+        var rank: usize = 2;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                var buf: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[0].data.string.rowBytes(r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 6), rank);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT k, COUNT(*) AS c FROM skewed GROUP BY k HAVING COUNT(*) >= 5000 ORDER BY c DESC LIMIT 10");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(rank)), try cellNumber(batch.values[0], r));
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(counts[rank])), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 5), rank);
+    }
+    {
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s HAVING COUNT(*) > 6000 ORDER BY c DESC LIMIT 3");
+        defer q.deinit();
+        var rows_out: usize = 0;
+        while (try q.next()) |batch| rows_out += batch.row_count;
+        try std.testing.expectEqual(@as(usize, 0), rows_out);
+    }
+    {
         var q = try runSql(allocator, db, "SELECT k, s, COUNT(*) AS c, SUM(v) FROM skewed GROUP BY k, s ORDER BY c DESC LIMIT 10");
         defer q.deinit();
         var rank: usize = 0;
