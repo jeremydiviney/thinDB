@@ -140,8 +140,8 @@ pub fn decodeError(payload: []const u8) !struct { code: WireErrorCode, msg: []co
 }
 
 fn codeFromU16(v: u16) WireErrorCode {
-    inline for (@typeInfo(WireErrorCode).@"enum".fields) |f| {
-        if (f.value == v) return @enumFromInt(v);
+    inline for (@typeInfo(WireErrorCode).@"enum".field_values) |field_value| {
+        if (field_value == v) return @enumFromInt(v);
     }
     return .unknown_error;
 }
@@ -200,7 +200,7 @@ pub fn writeFrame(
     msg_type: MsgType,
     payload: []const u8,
 ) !void {
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
+    var hdr: [frame_header_size]u8 = @splat(0);
     hdr[0] = @intFromEnum(msg_type);
     // hdr[1..4] reserved, zero
     std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
@@ -216,7 +216,7 @@ pub fn writeFrameToIo(
     msg_type: MsgType,
     payload: []const u8,
 ) std.Io.Writer.Error!void {
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
+    var hdr: [frame_header_size]u8 = @splat(0);
     hdr[0] = @intFromEnum(msg_type);
     std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
     try w.writeAll(&hdr);
@@ -239,7 +239,7 @@ pub fn writeFrameToIoMaybeCompressed(
     const compressed = try compression.compress(allocator, payload);
     defer allocator.free(compressed);
 
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
+    var hdr: [frame_header_size]u8 = @splat(0);
     hdr[0] = @intFromEnum(msg_type);
     hdr[1] = @bitCast(FrameFlags{ .compressed = true });
     std.mem.writeInt(u32, hdr[4..8], @intCast(4 + compressed.len), .little);
@@ -512,8 +512,8 @@ pub fn readFrame(bytes: []const u8, offset: *usize) Error!struct { msg_type: Msg
 }
 
 fn validMsgType(b: u8) ?MsgType {
-    inline for (@typeInfo(MsgType).@"enum".fields) |f| {
-        if (f.value == b) return @enumFromInt(b);
+    inline for (@typeInfo(MsgType).@"enum".field_values) |field_value| {
+        if (field_value == b) return @enumFromInt(b);
     }
     return null;
 }

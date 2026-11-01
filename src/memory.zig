@@ -52,7 +52,7 @@ pub const Source = enum {
     execution,
 };
 
-const source_count = std.meta.fields(Source).len;
+const source_count = @typeInfo(Source).@"enum".field_names.len;
 
 pub const accountantOf = BudgetAllocator.accountantOf;
 pub const ownerOf = BudgetAllocator.ownerOf;
@@ -630,7 +630,7 @@ pub const MemoryAccountant = struct {
     /// charged and a released owner stays alive until they are back.
     retired_bytes: usize = 0,
     /// Live bytes attributed to each `Source`, indexed by `@intFromEnum`.
-    by_source: [source_count]usize = [_]usize{0} ** source_count,
+    by_source: [source_count]usize = @splat(0),
     /// Shared cross-query pool this accountant draws from (null = per-query
     /// budget only). Every reserve must also fit the pool; every release
     /// hands the bytes back.
@@ -949,7 +949,7 @@ pub const MemoryAccountant = struct {
         std.debug.assert(!self.physical_tracking or self.current_bytes == 0);
         self.pool.release(self.current_bytes);
         self.current_bytes = 0;
-        self.by_source = [_]usize{0} ** source_count;
+        self.by_source = @as([source_count]usize, @splat(0));
     }
 
     /// Bytes this statement can still reserve: what the pool's statement
@@ -966,9 +966,9 @@ pub const MemoryAccountant = struct {
             "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would pass what the memory budget leaves statements (this one holds {d} MiB)\n",
             .{ want / mib, @tagName(failing), self.current_bytes / mib },
         );
-        inline for (std.meta.fields(Source)) |f| {
-            const v = self.by_source[@intFromEnum(@field(Source, f.name))];
-            if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ f.name, v / mib });
+        inline for (@typeInfo(Source).@"enum".field_names) |field_name| {
+            const v = self.by_source[@intFromEnum(@field(Source, field_name))];
+            if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ field_name, v / mib });
         }
         std.debug.print(
             "[mem-audit]   statements hold {d} MiB of their {d} MiB (other queries hold the rest)\n",

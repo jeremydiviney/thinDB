@@ -536,7 +536,7 @@ const SqlKind = enum(u8) {
     other,
 };
 
-const sql_kind_count = @typeInfo(SqlKind).@"enum".fields.len;
+const sql_kind_count = @typeInfo(SqlKind).@"enum".field_names.len;
 
 const ProfileStats = struct {
     count: u64 = 0,
@@ -1069,9 +1069,9 @@ extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn setProcessEnv(allocator: Allocator, name: []const u8, value: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
+    const name_z = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(name_z);
-    const value_z = try allocator.dupeZ(u8, value);
+    const value_z = try allocator.dupeSentinel(u8, value, 0);
     defer allocator.free(value_z);
     if (@import("builtin").os.tag == .windows) {
         _ = _putenv_s(name_z.ptr, value_z.ptr);

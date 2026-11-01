@@ -640,7 +640,7 @@ pub const PartitionedAggregate = struct {
         for (self.group_indices) |ci| hashColumnInto(engine.transform.subViewAligned(batch.values[ci], lo, rows), hashes);
         if (self.track_ndv) for (hashes) |h| worker.ndv.add(h);
 
-        var counts = [_]u32{0} ** MAX_PARTS;
+        var counts: [MAX_PARTS]u32 = @splat(0);
         for (hashes) |*h| {
             h.* %= self.n_parts;
             counts[@intCast(h.*)] += 1;
@@ -1332,9 +1332,9 @@ test "PartitionedAggregate drains a partition in windows with exact NULL and dis
     const Pair = struct { g: i64, v: i64 };
     var pairs: std.AutoHashMapUnmanaged(Pair, void) = .empty;
     defer pairs.deinit(a);
-    var want_rows = [_]i64{0} ** group_count;
-    var want_valid = [_]i64{0} ** group_count;
-    var want_distinct = [_]i64{0} ** group_count;
+    var want_rows: [group_count]i64 = @splat(0);
+    var want_valid: [group_count]i64 = @splat(0);
+    var want_distinct: [group_count]i64 = @splat(0);
     for (0..row_count) |i| {
         const g: i64 = @intCast(i % group_count);
         // Each group sees each value twice; every seventh row is NULL.
@@ -1750,7 +1750,7 @@ fn testTrackedAccountant(a: Allocator, pool: *exec.memory.MemoryPool) !*exec.mem
 
 test "PartitionedAggregate charges about the raw input bytes and frees the input before it emits" {
     const a = testing.allocator;
-    const sizes = [_]usize{65536} ** 16 ++ [_]usize{4099};
+    const sizes = @as([16]usize, @splat(65536)) ++ [_]usize{4099};
     var input = try MixedInput.init(a, &sizes);
     defer input.deinit(a);
     const raw = input.rawBatchBytes();
@@ -1851,7 +1851,7 @@ fn testHashCorePeak(
 
 test "PartitionedAggregate hash cores aggregate the input a round at a time" {
     const a = testing.allocator;
-    const sizes = [_]usize{16384} ** 96 ++ [_]usize{4099};
+    const sizes = @as([96]usize, @splat(16384)) ++ [_]usize{4099};
     var input = try MixedInput.init(a, &sizes);
     defer input.deinit(a);
     const raw = input.rawBatchBytes();
@@ -1885,7 +1885,7 @@ test "PartitionedAggregate hash cores keep one MAX_BY payload per group however 
     const aggs = [_]AggSpec{mixed_aggs[5]};
     var peaks: [2]usize = undefined;
     inline for (.{ 24, 96 }, 0..) |full_batches, i| {
-        const sizes = [_]usize{16384} ** full_batches ++ [_]usize{4099};
+        const sizes = @as([full_batches]usize, @splat(16384)) ++ [_]usize{4099};
         var input = try MixedInput.init(a, &sizes);
         defer input.deinit(a);
         const want = try testSerialLines(a, &input, &group_cols, &aggs);
@@ -1897,7 +1897,7 @@ test "PartitionedAggregate hash cores keep one MAX_BY payload per group however 
 
 test "PartitionedAggregate keeps buffering once the first round's keys look near-unique" {
     const a = testing.allocator;
-    const sizes = [_]usize{16384} ** 16;
+    const sizes: [16]usize = @splat(16384);
     var input = try MixedInput.init(a, &sizes);
     defer input.deinit(a);
     const raw = input.rawBatchBytes();
@@ -1937,7 +1937,7 @@ test "PartitionedAggregate hash cores sized for any group estimate match the ser
     // first table holds, so the estimates below start a core past its
     // groups, grow it to the estimate in one step, or double it past an
     // estimate that was short.
-    const sizes = [_]usize{16384} ** 13 ++ [_]usize{4099};
+    const sizes = @as([13]usize, @splat(16384)) ++ [_]usize{4099};
     var input = try MixedInput.init(a, &sizes);
     defer input.deinit(a);
     // One heavy aggregate at most, so the unique keys keep the hash cores.

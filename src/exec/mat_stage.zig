@@ -581,7 +581,7 @@ fn castStageColumn(
     defer for (jobs[0..workers]) |*job| {
         if (job.out) |*o| o.deinit(wa);
     };
-    var handles: [MAX_CAST_WORKERS]?parallel.Helper = .{null} ** MAX_CAST_WORKERS;
+    var handles: [MAX_CAST_WORKERS]?parallel.Helper = @splat(null);
     for (1..workers) |w| handles[w] = parallel.spawn(CastJob.run, .{&jobs[w]}) catch null;
     jobs[0].run();
     for (1..workers) |w| {

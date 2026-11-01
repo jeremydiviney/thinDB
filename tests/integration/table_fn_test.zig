@@ -1566,7 +1566,7 @@ test "table UDF input conversion: a DATETIME month converted to a DATE order key
         const amount_col = thindb.types.findColumn(out_schema, "amount").?;
         const last_col = thindb.types.findColumn(out_schema, "lastAmount").?;
         const up_down_col = thindb.types.findColumn(out_schema, "upDown").?;
-        var seen = [_]bool{false} ** want.len;
+        var seen: [want.len]bool = @splat(false);
         while (try res.next()) |batch| {
             for (0..batch.row_count) |i| {
                 const lc = batch.values[lc_col].data.string.rowBytes(i);

@@ -503,7 +503,7 @@ fn readRows(
     if (row_count == 0) return;
     const base = out.data.rowCount();
     for (0..row_count) |i| {
-        const value = if (!args[0].isValid(i)) null else switch (@typeInfo(@TypeOf(read)).@"fn".params[0].type.?) {
+        const value = if (!args[0].isValid(i)) null else switch (@typeInfo(@TypeOf(read)).@"fn".param_types[0].?) {
             []const u8 => read(stringViewOf(args[0]).rowBytes(i)),
             i64 => read(args[0].data.bigint[i]),
             f64 => read(args[0].data.double[i]),
@@ -830,8 +830,8 @@ pub fn lastDayOfUnitKernel(comptime source: enum { date, datetime }) Kernel {
 }
 
 fn lastDayUnitNamed(name: []const u8) ?LastDayUnit {
-    inline for (@typeInfo(LastDayUnit).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(name, f.name)) return @enumFromInt(f.value);
+    inline for (@typeInfo(LastDayUnit).@"enum".field_names, @typeInfo(LastDayUnit).@"enum".field_values) |field_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(name, field_name)) return @enumFromInt(field_value);
     }
     return null;
 }

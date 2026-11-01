@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
                     var minr: u64 = std.math.maxInt(u64);
                     var maxr: u64 = 0;
                     var total: u64 = 0;
-                    var tiers = [_]u32{0} ** 10;
+                    var tiers: [10]u32 = @splat(0);
                     for (segs) |s| {
                         if (s.row_count < minr) minr = s.row_count;
                         if (s.row_count > maxr) maxr = s.row_count;

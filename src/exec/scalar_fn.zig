@@ -491,8 +491,8 @@ fn decimalResultOf(args: []const Type) ?Type {
 pub const IntArithOp = enum { add, sub, mul, intdiv, mod };
 
 pub fn intArithOp(name: []const u8) ?IntArithOp {
-    inline for (@typeInfo(IntArithOp).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(name, f.name)) return @field(IntArithOp, f.name);
+    inline for (@typeInfo(IntArithOp).@"enum".field_names) |field_name| {
+        if (std.ascii.eqlIgnoreCase(name, field_name)) return @field(IntArithOp, field_name);
     }
     return null;
 }
@@ -551,8 +551,8 @@ pub fn arithOperandLiteral(name: []const u8, arg_types: []const Type, lit: types
 /// once, at plan time, instead of per row.
 pub fn arithTakesDouble(name: []const u8, arg_types: []const Type) bool {
     if (arg_types.len != 2 or !(arg_types[0].isFloat() or arg_types[1].isFloat())) return false;
-    inline for (@typeInfo(dec.Op).@"enum".fields) |f| {
-        if (std.ascii.eqlIgnoreCase(name, f.name)) return true;
+    inline for (@typeInfo(dec.Op).@"enum".field_names) |field_name| {
+        if (std.ascii.eqlIgnoreCase(name, field_name)) return true;
     }
     return false;
 }
@@ -2026,9 +2026,9 @@ pub const builtins = [_]ScalarFn{
 
 /// `extract_<unit>` over text, a DATETIME or a DATE for each of MySQL's
 /// compound EXTRACT units, which the parser lowers EXTRACT(unit FROM x) to.
-fn extractBuiltins() [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn {
+fn extractBuiltins() [3 * (@typeInfo(time.ClockUnit).@"enum".field_names.len + 1)]ScalarFn {
     const operand_types = [_]Type{ .string, .datetime, .date };
-    var fns: [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn = undefined;
+    var fns: [3 * (@typeInfo(time.ClockUnit).@"enum".field_names.len + 1)]ScalarFn = undefined;
     for (operand_types, 0..) |t, i| fns[i] = .{
         .name = "extract_year_month",
         .arg_types = &[_]Type{t},
@@ -2053,8 +2053,8 @@ fn extractBuiltins() [3 * (std.meta.fields(time.ClockUnit).len + 1)]ScalarFn {
 /// DATETIME, so every one returns a DATETIME, as in StarRocks.
 const unit_add_sub_builtins = unitAddSubBuiltins();
 
-fn unitAddSubBuiltins() [2 * std.meta.fields(date.DiffUnit).len]ScalarFn {
-    var fns: [2 * std.meta.fields(date.DiffUnit).len]ScalarFn = undefined;
+fn unitAddSubBuiltins() [2 * @typeInfo(date.DiffUnit).@"enum".field_names.len]ScalarFn {
+    var fns: [2 * @typeInfo(date.DiffUnit).@"enum".field_names.len]ScalarFn = undefined;
     for (std.enums.values(date.DiffUnit), 0..) |unit, u| {
         for ([_]bool{ false, true }, 0..) |negate, i| fns[u * 2 + i] = .{
             .name = @tagName(unit) ++ if (negate) "s_sub" else "s_add",

@@ -13,7 +13,7 @@ fn runTestStandalone(b: *std.Build, quiet: *std.Build.Step.Compile, test_exe: *s
     // Named time zones read TZif files from TZDIR. Tests read the committed
     // fixtures, so they see the same zones on every platform, including
     // Windows, which has no zone files of its own.
-    run.setEnvironmentVariable("TZDIR", b.pathFromRoot("tests/fixtures/zoneinfo"));
+    run.setEnvironmentVariable("TZDIR", b.root.joinString(b.allocator, "tests/fixtures/zoneinfo") catch @panic("OOM"));
     // An inherited terminal holds the build runner's stderr lock for the whole
     // run, so the test binaries ran one after another. Checking the exit code
     // captures the output instead, and the binaries run in parallel; `quiet`
@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the demo executable");
     run_step.dependOn(&run_cmd.step);
 
@@ -220,7 +220,7 @@ pub fn build(b: *std.Build) void {
     // server binary in zig-out/bin — which then makes every subsequent
     // wire benchmark ~6x slower. `addRunArtifact` already builds bench_exe.
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| run_bench.addArgs(args);
+    run_bench.addPassthruArgs();
     const bench_step = b.step("bench", "Run benchmarks (always built ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) void {
     gbmicro_mod.addImport("thindb", thindb_fast);
     const gbmicro_exe = b.addExecutable(.{ .name = "gbmicro", .root_module = gbmicro_mod });
     const run_gbmicro = b.addRunArtifact(gbmicro_exe);
-    if (b.args) |args| run_gbmicro.addArgs(args);
+    run_gbmicro.addPassthruArgs();
     const gbmicro_step = b.step("gbmicro", "Run the isolated GROUP BY probe microbench (ReleaseFast)");
     gbmicro_step.dependOn(&run_gbmicro.step);
 
@@ -264,7 +264,7 @@ pub fn build(b: *std.Build) void {
     regex_real_mod.addImport("thindb", thindb_fast);
     const regex_real_exe = b.addExecutable(.{ .name = "regex_real", .root_module = regex_real_mod });
     const run_regex_real = b.addRunArtifact(regex_real_exe);
-    if (b.args) |args| run_regex_real.addArgs(args);
+    run_regex_real.addPassthruArgs();
     const regex_real_step = b.step("regexreal", "Run the real-data regex throughput microbench (ReleaseFast)");
     regex_real_step.dependOn(&run_regex_real.step);
 
@@ -279,7 +279,7 @@ pub fn build(b: *std.Build) void {
     clientip_mod.addImport("thindb", thindb_fast);
     const clientip_exe = b.addExecutable(.{ .name = "clientip_pipeline", .root_module = clientip_mod });
     const run_clientip = b.addRunArtifact(clientip_exe);
-    if (b.args) |args| run_clientip.addArgs(args);
+    run_clientip.addPassthruArgs();
     const clientip_step = b.step("clientip", "Run the simplified ClientIP GROUP BY top-N pipeline benchmark (ReleaseFast)");
     clientip_step.dependOn(&run_clientip.step);
 
@@ -299,7 +299,7 @@ pub fn build(b: *std.Build) void {
     // Same reasoning as `bench` above: don't pull in the global install step,
     // which would reinstall a Debug `thindb-server` over a ReleaseFast one.
     const run_clickbench = b.addRunArtifact(clickbench_exe);
-    if (b.args) |args| run_clickbench.addArgs(args);
+    run_clickbench.addPassthruArgs();
     const clickbench_step = b.step("clickbench", "Load ClickBench TSV into a fresh DB (always built ReleaseFast). First arg = TSV path, second arg = max rows.");
     clickbench_step.dependOn(&run_clickbench.step);
 
@@ -332,7 +332,7 @@ pub fn build(b: *std.Build) void {
         .root_module = segstats_mod,
     });
     const run_segstats = b.addRunArtifact(segstats_exe);
-    if (b.args) |args| run_segstats.addArgs(args);
+    run_segstats.addPassthruArgs();
     const segstats_step = b.step("segstats", "Verify per-RG footer stats vs decoded values: -- <table_dir> <column>");
     segstats_step.dependOn(&run_segstats.step);
 
@@ -348,7 +348,7 @@ pub fn build(b: *std.Build) void {
         .root_module = compact_tool_mod,
     });
     const run_compact_tool = b.addRunArtifact(compact_tool_exe);
-    if (b.args) |args| run_compact_tool.addArgs(args);
+    run_compact_tool.addPassthruArgs();
     const compact_tool_step = b.step("compact-table", "Force compaction sweeps on a database dir: -- <database_dir> [table]");
     compact_tool_step.dependOn(&run_compact_tool.step);
 
@@ -366,7 +366,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(tvf_ab_exe);
     const run_tvf_ab = b.addRunArtifact(tvf_ab_exe);
     run_tvf_ab.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_tvf_ab.addArgs(args);
+    run_tvf_ab.addPassthruArgs();
     const tvf_ab_step = b.step("tvf-walk-ab", "Rollforward gap-fill walk: table UDF vs 6-CTE chain, values + wall-clock (pass -Doptimize=ReleaseFast)");
     tvf_ab_step.dependOn(&run_tvf_ab.step);
 
@@ -415,7 +415,7 @@ pub fn build(b: *std.Build) void {
 
     const run_server = b.addRunArtifact(server_exe);
     run_server.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_server.addArgs(args);
+    run_server.addPassthruArgs();
     const server_step = b.step("server", "Run thindb-server (pass --data-dir etc via -- ...)");
     server_step.dependOn(&run_server.step);
 

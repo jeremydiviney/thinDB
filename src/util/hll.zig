@@ -25,7 +25,7 @@ pub fn Sketch(comptime p: comptime_int) type {
         const registers_len: usize = 1 << p;
 
         /// One register per bucket: the max observed `rho` (leading-zero rank).
-        registers: [registers_len]u8 = [_]u8{0} ** registers_len,
+        registers: [registers_len]u8 = @splat(0),
 
         pub fn add(self: *Self, hash: u64) void {
             const idx: usize = @intCast(hash >> (64 - p));

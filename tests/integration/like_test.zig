@@ -159,7 +159,7 @@ test "REGEXP functions read a constant argument once for every row" {
         \\INSERT INTO rc VALUES (1, 'abc', 'b', '-', 'c'), (2, 'xyz', 'y', '+', 'c'), (3, 'xyz', 'q', '-', 'c'),
         \\  (4, 'XYZ', 'y', '*', 'i'), (5, 'abc', NULL, '-', 'c'), (6, 'aBc', 'b', NULL, NULL), (7, 'abcb', 'b', '=', 'c')
     );
-    const all_null = [_]?[]const u8{null} ** 7;
+    const all_null: [7]?[]const u8 = @splat(null);
     try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', '-') FROM rc ORDER BY id", &.{ "a-c", "xyz", "xyz", "XYZ", "a-c", "aBc", "a-c-" });
     try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE(s, 'b', r) FROM rc ORDER BY id", &.{ "a-c", "xyz", "xyz", "XYZ", "a-c", null, "a=c=" });
     try helpers.expectTexts(allocator, db, "SELECT REGEXP_REPLACE('abc', p, r) FROM rc ORDER BY id", &.{ "a-c", "abc", "abc", "abc", null, null, "a=c" });

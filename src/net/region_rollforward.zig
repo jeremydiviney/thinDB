@@ -1891,7 +1891,7 @@ const Builder = struct {
         if (part.len != b.range_key_names.len or part.len > 8) return false;
         var buf: [8]usize = undefined;
         const keys = try b.rangeKeyIdxs(&buf);
-        var seen = [_]bool{false} ** 8;
+        var seen: [8]bool = @splat(false);
         for (part) |p| {
             const idx = (b.fb.resolve(p) orelse return NoMatch).idx;
             var found = false;
@@ -3529,7 +3529,7 @@ const BranchNamespace = struct {
 
 fn clone_list(comptime T: type, a: Allocator, source: std.ArrayListUnmanaged(T)) !std.ArrayListUnmanaged(T) {
     const items = try a.dupe(T, source.items);
-    return .{ .items = items, .capacity = items.len };
+    return .{ .items = items, .capacity = items.len, .pointer_stability = .{} };
 }
 
 fn capture_namespace(b: *Builder) !BranchNamespace {
@@ -4653,7 +4653,7 @@ fn trySideJoin(b: *Builder, j: *const ir.Op.Join, ralias: ?[]const u8, live: ?[]
         sideTrace("route name '{s}' unresolved", .{b.route_name});
         if (getenv("THINDB_REGION_STEPS") != null) {
             for (b.fb.vis.items) |e| {
-                if (std.ascii.indexOfIgnoreCase(e.name, lastSegment(b.route_name)) != null) {
+                if (std.ascii.findIgnoreCase(e.name, lastSegment(b.route_name)) != null) {
                     std.debug.print("[region]   vis '{s}' -> {d}\n", .{ e.name, e.idx });
                 }
             }

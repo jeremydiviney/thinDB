@@ -573,7 +573,7 @@ test "xa prepared statements and long XIDs survive reopening" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const xid = "a" ** 300;
+    const xid = &@as([300]u8, @splat('a'));
     {
         var mgr = XaManager.init(a);
         defer mgr.deinit();

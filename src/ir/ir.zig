@@ -801,8 +801,8 @@ pub const SessionOption = enum {
     }
 
     pub fn fromSqlName(name: []const u8) ?SessionOption {
-        inline for (@typeInfo(SessionOption).@"enum".fields) |field| {
-            const option: SessionOption = @enumFromInt(field.value);
+        inline for (@typeInfo(SessionOption).@"enum".field_values) |field_value| {
+            const option: SessionOption = @enumFromInt(field_value);
             if (std.ascii.eqlIgnoreCase(name, option.sqlName())) return option;
         }
         return null;
@@ -1191,13 +1191,13 @@ pub const Op = union(OpTag) {
             inline else => |*payload| {
                 const Payload = @TypeOf(payload.*);
                 if (@typeInfo(Payload) != .@"struct") return copy;
-                inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                    const child = &@field(payload.*, field.name);
-                    if (field.type == *Op) {
+                inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                    const child = &@field(payload.*, field_name);
+                    if (field_type == *Op) {
                         child.* = try child.*.cloneTree(arena);
-                    } else if (field.type == ?*Op) {
+                    } else if (field_type == ?*Op) {
                         if (child.*) |op| child.* = try op.cloneTree(arena);
-                    } else if (field.type == []const *Op) {
+                    } else if (field_type == []const *Op) {
                         const ops = try arena.alloc(*Op, child.len);
                         for (child.*, ops) |op, *dst| dst.* = try op.cloneTree(arena);
                         child.* = ops;
@@ -2717,7 +2717,7 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const func_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (func_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
+                if (func_byte >= @typeInfo(AggFunc).@"enum".field_names.len) return Error.IrCorrupt;
                 const func: AggFunc = @enumFromInt(func_byte);
                 const udf_name = try readOptString(bytes, cursor);
                 if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
@@ -3063,7 +3063,7 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const agg_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (agg_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
+            if (agg_byte >= @typeInfo(AggFunc).@"enum".field_names.len) return Error.IrCorrupt;
             break :blk .{ .func = @enumFromInt(agg_byte), .params = try decodeAggParams(bytes, cursor) };
         } else null;
         calls[j] = .{
@@ -3205,14 +3205,14 @@ fn decodeAlterAction(bytes: []const u8, cursor: *usize) DecodeError!AlterAction 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t >= @typeInfo(AlterAction).@"union".fields.len) return Error.IrCorrupt;
+    if (t >= @typeInfo(AlterAction).@"union".field_names.len) return Error.IrCorrupt;
     return switch (@as(std.meta.Tag(AlterAction), @enumFromInt(t))) {
         .add_column => blk: {
             const column = try decodeColumnDef(bytes, cursor);
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const pos = bytes[cursor.*];
             cursor.* += 1;
-            if (pos >= @typeInfo(types.ColumnPosition).@"union".fields.len) return Error.IrCorrupt;
+            if (pos >= @typeInfo(types.ColumnPosition).@"union".field_names.len) return Error.IrCorrupt;
             const position: types.ColumnPosition = switch (@as(std.meta.Tag(types.ColumnPosition), @enumFromInt(pos))) {
                 .last => .last,
                 .first => .first,

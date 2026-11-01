@@ -71,7 +71,7 @@ const Expected = struct {
 };
 
 fn bruteForce() [GROUPS]Expected {
-    var out = [_]Expected{.{}} ** GROUPS;
+    var out: [GROUPS]Expected = @splat(.{});
     for (0..ROWS) |i| {
         const e = &out[groupOf(i)];
         if (ordOf(i)) |k| {
@@ -361,7 +361,7 @@ const IMPROVING_BATCH: usize = 4096;
 /// LAST. The strings' lengths wander between 9 and 57 bytes, so a group's
 /// successive copies change size.
 fn improvingString(buf: []u8, n: usize, i: usize) ![]const u8 {
-    const pad = "x" ** 48;
+    const pad = &@as([48]u8, @splat('x'));
     return std.fmt.bufPrint(buf, "{d:0>9}{s}", .{ n, pad[0 .. (i * 7) % 49] });
 }
 

@@ -872,7 +872,7 @@ fn appendGrouped(allocator: Allocator, text: *std.ArrayList(u8), whole: []const 
 pub fn formatDecimal(buf: *[DECIMAL_TEXT_MAX]u8, mantissa: anytype, s: u8) []const u8 {
     const T = @TypeOf(mantissa);
     const W = if (T != comptime_int and @bitSizeOf(T) > 128) i256 else i128;
-    const U = std.meta.Int(.unsigned, @bitSizeOf(W));
+    const U = @Int(.unsigned, @bitSizeOf(W));
     const m: W = mantissa;
     if (s == 0) return std.fmt.bufPrint(buf, "{d}", .{m}) catch unreachable;
     const neg = m < 0;
@@ -1155,7 +1155,7 @@ test "textMantissa and formatDecimal round-trip" {
 }
 
 test "76-digit text reads exactly and prints back" {
-    const nines = "9" ** 56 ++ "." ++ "9" ** 20;
+    const nines = &@as([56]u8, @splat('9')) ++ "." ++ &@as([20]u8, @splat('9'));
     const m = (try textMantissa(i256, nines, 20)).?;
     try std.testing.expectEqual(pow10Of(i256, 76) - 1, m);
     var buf: [DECIMAL_TEXT_MAX]u8 = undefined;
@@ -1164,7 +1164,7 @@ test "76-digit text reads exactly and prints back" {
     try std.testing.expectEqual(@as(?i256, null), textConstantMantissa(nines, .{ .p = 75, .s = 20 }));
     try std.testing.expectEqual(@as(?i256, m), textConstantMantissa(nines, .{ .p = 76, .s = 20 }));
     // Past 76 digits the text reads as a double, too wide for any DECIMAL.
-    try std.testing.expectError(error.ArithmeticOverflow, textMantissa(i256, "1" ++ "0" ** 76, 0));
+    try std.testing.expectError(error.ArithmeticOverflow, textMantissa(i256, "1" ++ &@as([76]u8, @splat('0')), 0));
     try std.testing.expectEqual(@as(?i256, 15 * pow10Of(i256, 49)), try floatMantissa(i256, 1.5e50, 0));
 }
 

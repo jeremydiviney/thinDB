@@ -498,13 +498,13 @@ fn dropPinnedKeys(ctx: Ctx, op: *ir.Op, in_region: bool, seen: *std.AutoHashMapU
         inline else => |payload| {
             const Payload = @TypeOf(payload);
             if (@typeInfo(Payload) != .@"struct") return;
-            inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                const child = @field(payload, field.name);
-                if (field.type == *ir.Op) {
+            inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                const child = @field(payload, field_name);
+                if (field_type == *ir.Op) {
                     try dropPinnedKeys(ctx, child, region, seen);
-                } else if (field.type == ?*ir.Op) {
+                } else if (field_type == ?*ir.Op) {
                     if (child) |c| try dropPinnedKeys(ctx, c, region, seen);
-                } else if (field.type == []const *ir.Op) {
+                } else if (field_type == []const *ir.Op) {
                     for (child) |c| try dropPinnedKeys(ctx, c, region, seen);
                 }
             }

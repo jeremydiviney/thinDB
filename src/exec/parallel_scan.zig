@@ -349,7 +349,7 @@ test "planBufferUnits: stripes tile the chunks in order, aligned, within the pla
         // Five uneven pull-copied chunks, DOP 12: far more stripes than chunks.
         .{ .rows = [_]usize{ 40_000, 40_000, 40_000, 40_000, 3_934 }, .dop = 12, .ordered = false, .min_units = 12 },
         // More chunks than dop × CHUNK_FACTOR: stripes span chunks.
-        .{ .rows = [_]usize{65_536} ** 13 ++ [_]usize{5}, .dop = 2, .ordered = false, .min_units = 8 },
+        .{ .rows = @as([13]usize, @splat(65_536)) ++ [_]usize{5}, .dop = 2, .ordered = false, .min_units = 8 },
         // Ordered: pieces stay inside their chunk; an empty chunk gets none.
         .{ .rows = [_]usize{ 40_000, 0, 40_000, 3_934 }, .dop = 12, .ordered = true, .min_units = 4 },
         // One 100K-row ordered chunk: 11 pieces for 12 threads.
@@ -2747,8 +2747,8 @@ pub const ParallelScan = struct {
         var borrow_ticks: u64 = 0;
         var kernel_ticks: u64 = 0;
         var materialize_ticks: u64 = 0;
-        var kind_ticks = [_]u64{0} ** scan_mod.MAT_KINDS;
-        var kind_cols = [_]u64{0} ** scan_mod.MAT_KINDS;
+        var kind_ticks: [scan_mod.MAT_KINDS]u64 = @splat(0);
+        var kind_cols: [scan_mod.MAT_KINDS]u64 = @splat(0);
         for (self.workers) |w| switch (w) {
             .segment => |s| {
                 borrow_ticks +%= s.scan_borrow_ticks;

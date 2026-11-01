@@ -117,7 +117,7 @@ pub fn sendInitialHandshake(
 
     try payload.append(allocator, 21);
 
-    const reserved = [_]u8{0} ** 10;
+    const reserved: [10]u8 = @splat(0);
     try payload.appendSlice(allocator, &reserved);
 
     try payload.appendSlice(allocator, salt[8..20]);
@@ -327,7 +327,7 @@ test "handshake response parses minimal Protocol41 payload" {
     try bytes.appendSlice(std.testing.allocator, &ms_buf);
 
     try bytes.append(std.testing.allocator, 0xff);
-    try bytes.appendSlice(std.testing.allocator, &([_]u8{0} ** 23));
+    try bytes.appendSlice(std.testing.allocator, &@as([23]u8, @splat(0)));
     try bytes.appendSlice(std.testing.allocator, "alice\x00");
     try bytes.append(std.testing.allocator, 0);
 

@@ -601,7 +601,7 @@ pub const TableFnExec = struct {
         }
 
         var dp = DrainPar{ .op = self, .arenas = drain_arenas, .stores = input_cols, .owned = owned };
-        var dworkers: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
+        var dworkers: [max_drain_workers]?parallel.Helper = @splat(null);
         var n_dworkers: usize = 0;
         var max_tiles: usize = 1;
         var drain_grant: core_scheduler.Workers = .{};
@@ -893,7 +893,7 @@ pub const TableFnExec = struct {
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
-            var threads: [16]?parallel.Helper = .{null} ** 16;
+            var threads: [16]?parallel.Helper = @splat(null);
             const want = @min(n_workers, threads.len);
             for (threads[0..want]) |*th| th.* = parallel.spawn(Ctx.main, .{&ctx}) catch null;
             var spawned: usize = 0;
@@ -1732,7 +1732,7 @@ pub const TableFnExec = struct {
         if (n_workers <= 1) {
             Ctx.main(&ctx);
         } else {
-            var threads: [16]?parallel.Helper = .{null} ** 16;
+            var threads: [16]?parallel.Helper = @splat(null);
             const want = @min(n_workers, threads.len);
             for (threads[0..want]) |*th| th.* = parallel.spawn(Ctx.main, .{&ctx}) catch null;
             var spawned: usize = 0;

@@ -101,8 +101,8 @@ const NOT_SUPPORTED = [_][]const u8{
 };
 
 fn isParseError(err_name: []const u8) bool {
-    inline for (@typeInfo(sql.ParseError).error_set.?) |e| {
-        if (std.mem.eql(u8, err_name, e.name)) return true;
+    inline for (@typeInfo(sql.ParseError).error_set.error_names.?) |name| {
+        if (std.mem.eql(u8, err_name, name)) return true;
     }
     return false;
 }
@@ -145,17 +145,17 @@ test "classify recognizes known errors" {
 }
 
 test "classify reads the parser's errors as syntax errors, except its refusals of forms MySQL runs (issue #490)" {
-    inline for (@typeInfo(sql.ParseError).error_set.?) |e| {
-        const refusal = std.mem.indexOf(u8, e.name, "Unsupported") != null or std.mem.indexOf(u8, e.name, "NotSupported") != null;
-        const want: Category = if (std.mem.eql(u8, e.name, "SqlOnColumnAmbiguous"))
+    inline for (@typeInfo(sql.ParseError).error_set.error_names.?) |error_name| {
+        const refusal = std.mem.indexOf(u8, error_name, "Unsupported") != null or std.mem.indexOf(u8, error_name, "NotSupported") != null;
+        const want: Category = if (std.mem.eql(u8, error_name, "SqlOnColumnAmbiguous"))
             .ambiguous_column
-        else if (std.mem.eql(u8, e.name, "OutOfMemory"))
+        else if (std.mem.eql(u8, error_name, "OutOfMemory"))
             .out_of_memory
         else if (refusal)
             .not_supported
         else
             .syntax_error;
-        try std.testing.expectEqual(want, classify(e.name));
+        try std.testing.expectEqual(want, classify(error_name));
     }
     const runtime = .{ "MemoryBudgetExceeded", "TypeMismatch", "ComputeNoSuchOverload", "JsonInvalid", "TableFnInputMismatch" };
     inline for (runtime) |name| try std.testing.expect(classify(name) != .syntax_error);

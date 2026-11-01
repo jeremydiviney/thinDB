@@ -61,7 +61,7 @@ test "encoded machinery count groups merge different run boundaries across worke
         const Row = struct { id: i64, g: i64, h: i64 };
         const rows = try allocator.alloc(Row, 32768);
         defer allocator.free(rows);
-        var counts = [_][17]i64{[_]i64{0} ** 17} ** 31;
+        var counts: [31][17]i64 = @splat(@splat(0));
         for (rows, 0..) |*row, i| {
             const g = (i / 97) % 31;
             const h = (i / 43) % 17;
@@ -75,7 +75,7 @@ test "encoded machinery count groups merge different run boundaries across worke
         for (0..4) |_| {
             var q = try helpers.runSql(allocator, db, "SELECT g,h,COUNT(*) AS c FROM t GROUP BY g,h ORDER BY c DESC,g,h LIMIT 600");
             defer q.deinit();
-            var seen = [_][17]bool{[_]bool{false} ** 17} ** 31;
+            var seen: [31][17]bool = @splat(@splat(false));
             var total: i64 = 0;
             while (try q.next()) |batch| {
                 for (0..batch.row_count) |i| {
@@ -154,8 +154,8 @@ test "tombstones in one row group keep the rest of the segment on the encoded pa
         defer sql.deinit(allocator);
         try sql.appendSlice(allocator, "INSERT INTO t VALUES ");
         const groups = 5;
-        var counts = [_]i64{0} ** groups;
-        var sums = [_]i64{0} ** groups;
+        var counts: [groups]i64 = @splat(0);
+        var sums: [groups]i64 = @splat(0);
         for (0..1024) |i| {
             if (i != 0) try sql.append(allocator, ',');
             const g = (i / 7) % groups;

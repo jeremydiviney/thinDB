@@ -449,7 +449,7 @@ pub const AggregateSpec = struct {
     udf_entry: ?udf_mod.AggregateEntry = null,
     udf_state_index: u16 = 0,
     udf_arg_count: u8 = 0,
-    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS,
+    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = @splat(0),
 };
 
 pub const StringAggInput = struct {
@@ -896,8 +896,8 @@ fn runHarness(
     const weight_mode = blk: {
         if (shape.aggregate_program.len == 0) break :blk false;
         if (distinct_slot_count != 0) break :blk false;
-        var input_used = [_]bool{false} ** group_columns_buf.len;
-        var str_input_used = [_]bool{false} ** group_str_columns_buf.len;
+        var input_used: [group_columns_buf.len]bool = @splat(false);
+        var str_input_used: [group_str_columns_buf.len]bool = @splat(false);
         var copies: usize = 0;
         var str_copies: usize = 0;
         for (shape.aggregate_program) |agg| {
@@ -957,8 +957,8 @@ fn runHarness(
                 .f32, .f64 => .f64,
             };
         }
-        var column_taken = [_]bool{false} ** group_columns_buf.len;
-        var str_column_taken = [_]bool{false} ** group_str_columns_buf.len;
+        var column_taken: [group_columns_buf.len]bool = @splat(false);
+        var str_column_taken: [group_str_columns_buf.len]bool = @splat(false);
         for (group_aggregates_buf[0..shape.aggregate_program.len]) |*agg| {
             if (agg.is_string) {
                 const si = agg.str_input_index;

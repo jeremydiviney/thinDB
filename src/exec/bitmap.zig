@@ -999,7 +999,7 @@ fn readArray(r: *Reader, card: u32, values: *[ARRAY_MAX]u16) error{BitmapInvalid
         v.* = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
         if (i > 0 and v.* <= values[i - 1]) return error.BitmapInvalid;
     }
-    return .{ .array = .{ .items = values[0..card], .capacity = card } };
+    return .{ .array = .{ .items = values[0..card], .capacity = card, .pointer_stability = .{} } };
 }
 
 fn readBitset(r: *Reader, card: u32, bits: *Bitset) error{BitmapInvalid}!Container {
@@ -1033,7 +1033,7 @@ fn readRuns(r: *Reader, card: u32, values: *[ARRAY_MAX]u16, bits: *Bitset) error
                 at += 1;
             }
         }
-        return .{ .array = .{ .items = values[0..card], .capacity = card } };
+        return .{ .array = .{ .items = values[0..card], .capacity = card, .pointer_stability = .{} } };
     }
     @memset(&bits.words, 0);
     for (0..n) |k| {

@@ -753,7 +753,7 @@ inline fn distinctIntKey(value: anytype) u128 {
 fn pushRunStarts(sink: anytype, values: anytype) !void {
     const T = @typeInfo(@TypeOf(values)).pointer.child;
     const width = std.simd.suggestVectorLength(T) orelse 8;
-    const Lanes = std.meta.Int(.unsigned, width);
+    const Lanes = @Int(.unsigned, width);
     if (values.len == 0) return;
     try sink.push(@truncate(distinctIntKey(values[0])));
     var r: usize = 1;
@@ -926,7 +926,7 @@ const EncodedFold = struct {
 fn fold_run_aggregate(lane: *Lane, p: AggPlan, i: usize, typ: Type, runs: storage.segment_reader.RleBlock, row_count: u32) !void {
     switch (runs.value_width) {
         inline 1, 2, 4, 8 => |width| {
-            const T = std.meta.Int(.signed, width * 8);
+            const T = @Int(.signed, width * 8);
             const Acc = if (width <= 4) i64 else i128;
             var count: u64 = 0;
             var sum: Acc = 0;

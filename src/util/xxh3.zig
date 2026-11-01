@@ -227,6 +227,11 @@ fn long(input: []const u8, secret: *const [SECRET_LEN]u8) Halves {
     };
 }
 
+fn ab8Times(comptime n: usize) *const [8 * n]u8 {
+    const flat: [8 * n]u8 = @bitCast(@as([n][8]u8, @splat("abcdefgh".*)));
+    return &flat;
+}
+
 test "XXH3-128 matches StarRocks across every input-length path" {
     // StarRocks' XX_HASH3_128 answers, read as signed LARGEINTs.
     const ab8 = "abcdefgh";
@@ -239,13 +244,13 @@ test "XXH3-128 matches StarRocks across every input-length path" {
         .{ "abcdefghi", -100689228862623767862525847912314381416 },
         .{ "abcdefghijklmnop", 41668111349311858976869800786634171184 },
         .{ "abcdefghijklmnopq", 22636066031784431813857569789036654507 },
-        .{ ab8 ** 16, 134018816784972153682010339138580759315 },
-        .{ ab8 ** 16 ++ "x", -4590305595231998317837289130799445395 },
-        .{ ab8 ** 30, -135041434779996440649634732658357321958 },
-        .{ ab8 ** 30 ++ "x", 145367417897179468193453102402462419006 },
-        .{ ab8 ** 128, 143766852459482183353646331477400323263 },
-        .{ ab8 ** 128 ++ "x", 93967746685416702219370960950665292183 },
-        .{ ab8 ** 375, -68405818285202680017503919040926716798 },
+        .{ ab8Times(16), 134018816784972153682010339138580759315 },
+        .{ ab8Times(16) ++ "x", -4590305595231998317837289130799445395 },
+        .{ ab8Times(30), -135041434779996440649634732658357321958 },
+        .{ ab8Times(30) ++ "x", 145367417897179468193453102402462419006 },
+        .{ ab8Times(128), 143766852459482183353646331477400323263 },
+        .{ ab8Times(128) ++ "x", 93967746685416702219370960950665292183 },
+        .{ ab8Times(375), -68405818285202680017503919040926716798 },
     };
     inline for (cases) |c| try std.testing.expectEqual(@as(i128, c[1]), @as(i128, @bitCast(hash128(0, c[0]))));
 }
@@ -266,8 +271,7 @@ test "XXH3-128 over fixed-width parts matches the concatenated bytes" {
 }
 
 test "XXH3-128's low half is XXH3-64 where the specification says so" {
-    const ab8 = "abcdefgh";
-    inline for (.{ "a", "abc", ab8 ** 30 ++ "x", ab8 ** 375 }) |input| {
+    inline for (.{ "a", "abc", ab8Times(30) ++ "x", ab8Times(375) }) |input| {
         inline for (.{ 0, 7, 0x9E3779B185EBCA87 }) |seed| {
             try std.testing.expectEqual(std.hash.XxHash3.hash(seed, input), @as(u64, @truncate(hash128(seed, input))));
         }

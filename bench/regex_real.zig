@@ -58,7 +58,7 @@ const LogicalProcInfo = extern struct {
     processor_mask: usize,
     relationship: u32,
     _pad: u32 = 0,
-    _union: [16]u8 = [_]u8{0} ** 16,
+    _union: [16]u8 = @splat(0),
 };
 
 /// Returns a logical-CPU ordering that fills distinct physical cores first
@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     inline for (.{ Mode.find_vm, Mode.find, Mode.replace }) |mode| {
         inline for (.{ 1, 12 }) |dop| if (!(quick and mode == .find_vm)) {
-            var checksums: [dop]usize = [_]usize{0} ** dop;
+            var checksums: [dop]usize = @splat(0);
             var threads: [dop]std.Thread = undefined;
             const t0 = nowTicks();
             var t: usize = 0;

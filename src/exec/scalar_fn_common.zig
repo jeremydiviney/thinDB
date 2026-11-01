@@ -367,8 +367,8 @@ fn scanMoment(s: []const u8) ?Moment {
     const run_len = run_end - i;
     const short_year = !(run_len == 4 or run_len == 8 or run_len >= 14);
 
-    var fields = [_]u32{0} ** 7;
-    var widths = [_]usize{0} ** 7;
+    var fields: [7]u32 = @splat(0);
+    var widths: [7]usize = @splat(0);
     var count: usize = 0;
     while (count < fields.len and i < s.len and std.ascii.isDigit(s[i])) {
         const max_width: usize = if (count == 6) 6 else if (!fixed_widths) std.math.maxInt(usize) else if (count == 0 and !short_year) 4 else 2;

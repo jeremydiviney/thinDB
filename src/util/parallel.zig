@@ -135,7 +135,7 @@ fn futexIo() std.Io {
 pub fn forRanges(threads: usize, n: usize, ctx: anytype, comptime body: fn (@TypeOf(ctx), usize, usize, usize) void) void {
     const nt = @min(@max(threads, 1), MAX_THREADS);
     if (nt == 1) return body(ctx, 0, 0, n);
-    var handles: [MAX_THREADS]?Helper = .{null} ** MAX_THREADS;
+    var handles: [MAX_THREADS]?Helper = @splat(null);
     for (0..nt) |t| {
         const lo = n * t / nt;
         const hi = n * (t + 1) / nt;
@@ -161,7 +161,7 @@ pub fn forJobs(threads: usize, n_jobs: usize, ctx: anytype, comptime body: fn (@
             }
         }
     };
-    var handles: [MAX_THREADS]?Helper = .{null} ** MAX_THREADS;
+    var handles: [MAX_THREADS]?Helper = @splat(null);
     for (0..nt) |t| {
         handles[t] = spawn(Claim.run, .{ ctx, t, &next, n_jobs }) catch null;
         if (handles[t] == null) Claim.run(ctx, t, &next, n_jobs);

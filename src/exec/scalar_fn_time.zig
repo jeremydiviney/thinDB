@@ -320,8 +320,8 @@ fn numberKernel(comptime rows: TimeRows) common.TypedKernelFn {
 pub fn numberArgFn(name: []const u8, arg_types: []const Type) ?struct { kernel: common.TypedKernelFn, return_type: Type } {
     const eql = std.ascii.eqlIgnoreCase;
     if (arg_types.len == 1) {
-        inline for (std.meta.fields(ClockPart)) |f| {
-            if (eql(name, f.name)) return .{ .kernel = numberKernel(clockPartRows(@enumFromInt(f.value))), .return_type = .int };
+        inline for (@typeInfo(ClockPart).@"enum".field_names, @typeInfo(ClockPart).@"enum".field_values) |field_name, field_value| {
+            if (eql(name, field_name)) return .{ .kernel = numberKernel(clockPartRows(@enumFromInt(field_value))), .return_type = .int };
         }
         if (eql(name, "time_to_sec")) return .{ .kernel = numberKernel(timeToSecRows), .return_type = .bigint };
         if (eql(name, "time")) return .{ .kernel = numberKernel(timeRows), .return_type = .string };

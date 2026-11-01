@@ -39,7 +39,7 @@ pub const Options = struct {
 
 /// 256-bit set of matchable bytes.
 const CharClass = struct {
-    bits: [32]u8 = [_]u8{0} ** 32,
+    bits: [32]u8 = @splat(0),
 
     fn add(self: *CharClass, b: u8) void {
         self.bits[b >> 3] |= (@as(u8, 1) << @intCast(b & 7));
@@ -2132,7 +2132,7 @@ pub const Regex = struct {
     /// breaks on '/', `.*` on '\n'), each is found with a vectorized
     /// `indexOfScalar` (memchr) and the earliest wins.
     fn runEnd(self: *const Regex, clist_items: []const Thread, sig0: u64, input: []const u8, from: usize) usize {
-        var cont: CharClass = .{ .bits = [_]u8{0xFF} ** 32 };
+        var cont: CharClass = .{ .bits = @as([32]u8, @splat(0xFF)) };
         for (clist_items, 0..) |t, k| {
             const cc = self.prog[t.pc].class;
             if ((sig0 >> @intCast(k)) & 1 != 0) {
@@ -3491,7 +3491,7 @@ test "regex throughput micro-bench" {
     }.run;
 
     inline for (.{ 1, 2, 4, 8 }) |dop| {
-        var checksums: [dop]usize = [_]usize{0} ** dop;
+        var checksums: [dop]usize = @splat(0);
         var threads: [dop]std.Thread = undefined;
         const t0 = prof.nowTicks();
         for (0..dop) |t| {

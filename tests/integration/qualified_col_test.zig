@@ -287,7 +287,7 @@ test "qualified join projection ignores sibling CTE wildcards and keeps nested j
                 try std.testing.expect(!std.mem.endsWith(u8, column.name, ".payload"));
             }
         }
-        var seen = [_]bool{false} ** 3;
+        var seen: [3]bool = @splat(false);
         while (try result.next()) |batch| {
             for (0..batch.row_count) |row| {
                 const id = batch.values[0].data.bigint[row];

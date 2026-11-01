@@ -256,13 +256,14 @@ const digest_budget = 4096;
 // stops the build until the digest takes it in.
 comptime {
     for (.{ .{ Predicate, 5 }, .{ LikePred, 2 }, .{ ColColPred, 3 }, .{ InSet, 5 } }) |known| {
-        if (@typeInfo(known[0]).@"struct".fields.len != known[1])
+        if (@typeInfo(known[0]).@"struct".field_names.len != known[1])
             @compileError(@typeName(known[0]) ++ " changed: hash the new field in predicate.Digest, then update its count here");
     }
-    for (@typeInfo(Value).@"union".fields) |f| switch (@typeInfo(f.type)) {
+    const value_info = @typeInfo(Value).@"union";
+    for (value_info.field_names, value_info.field_types) |field_name, field_type| switch (@typeInfo(field_type)) {
         .int, .float, .bool => {},
-        else => if (!std.mem.eql(u8, f.name, "text"))
-            @compileError("Value." ++ f.name ++ " is no plain number: teach predicate.Digest.value to hash it"),
+        else => if (!std.mem.eql(u8, field_name, "text"))
+            @compileError("Value." ++ field_name ++ " is no plain number: teach predicate.Digest.value to hash it"),
     };
 }
 
@@ -2651,7 +2652,7 @@ fn evalInNumericSet(
     const hi = set[set.len - 1];
     // Offsets from `lo` in the unsigned twin: a value below `lo` wraps past
     // `span`, so one compare bounds both ends.
-    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const U = @Int(.unsigned, @bitSizeOf(T));
     const span: U = @bitCast(hi -% lo);
     if (span < IN_SET_BITMAP_SPAN) {
         var bitmap: [IN_SET_BITMAP_SPAN / 8]u8 = undefined;
@@ -3969,7 +3970,7 @@ test "validateExpr raises on a constant no date reads, and drops it from a set" 
     long_value[128] = 0xA9;
     var long: PredicateExpr = .{ .leaf = .{ .col = "d", .op = .eq, .val = .{ .text = &long_value }, .from_statement = true } };
     try t.expectError(Error.InvalidTemporalLiteral, validateExpr(&long, &schema));
-    try t.expectEqualStrings("Incorrect DATE value: '" ++ "x" ** 127 ++ "'", takeInvalidTemporalMessage().?);
+    try t.expectEqualStrings("Incorrect DATE value: '" ++ &@as([127]u8, @splat('x')) ++ "'", takeInvalidTemporalMessage().?);
 
     var values = [_]Value{ .{ .text = "abc" }, .{ .text = "2026-09-26" } };
     var set: PredicateExpr = .{ .in_set = .{ .col = "d", .values = &values, .negate = false, .value_type = .string } };

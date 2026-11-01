@@ -253,7 +253,7 @@ test "DELETE and UPDATE with a long IN list: segment row groups and memtable row
     // Keys: a stride over two id ranges (none in 501..1000, so whole row
     // groups hold no key), row-group and segment/memtable boundaries, a
     // duplicate, and keys the table doesn't hold.
-    var listed = [_]bool{false} ** (max_id + 1);
+    var listed: [max_id + 1]bool = @splat(false);
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
     try list.appendSlice(allocator, "(0, -5, 5000, 99999, 10");

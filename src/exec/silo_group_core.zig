@@ -642,7 +642,7 @@ pub const GroupAggregateSpec = struct {
     udf_entry: ?udf_mod.AggregateEntry = null,
     udf_state_index: u16 = 0,
     udf_arg_count: u8 = 0,
-    udf_arg_input_indices: [MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** MAX_GROUP_UDF_ARGS,
+    udf_arg_input_indices: [MAX_GROUP_UDF_ARGS]u16 = @splat(0),
 };
 
 // Per-group numeric accumulators are stored in a runtime variable-stride slab
@@ -799,8 +799,8 @@ pub const DistinctSet = struct {
 // distinct_state_index: integer and float inputs key (gid, value bits) in
 // `ints`, string inputs key (gid, bytes) in `strs`. An index uses one of them.
 const DistinctSlots = struct {
-    ints: [MAX_GROUP_DISTINCT_SLOTS]DistinctSet = [_]DistinctSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
-    strs: [MAX_GROUP_DISTINCT_SLOTS]group_table.DistinctStrSet = [_]group_table.DistinctStrSet{.{}} ** MAX_GROUP_DISTINCT_SLOTS,
+    ints: [MAX_GROUP_DISTINCT_SLOTS]DistinctSet = @splat(.{}),
+    strs: [MAX_GROUP_DISTINCT_SLOTS]group_table.DistinctStrSet = @splat(.{}),
 
     // Releases the sets rather than keeping capacity, like `DistinctSet.clear`.
     fn clear(self: *DistinctSlots, allocator: Allocator) void {
@@ -1671,8 +1671,8 @@ const PendingCountUpdates = struct {
 };
 
 test "count update pipeline preserves repeated keys weights and partial batches" {
-    var heads = [_]StateHead{.{}} ** 127;
-    var expected = [_]u64{0} ** heads.len;
+    var heads: [127]StateHead = @splat(.{});
+    var expected: [heads.len]u64 = @splat(0);
     var pending: PendingCountUpdates = .{};
     for (0..1003) |i| {
         const index = if (i % 3 == 0) 7 else (i * 37) % heads.len;
@@ -2196,7 +2196,7 @@ const PipeBucket = struct {
                     resetPipeBucket(&bucket, allocator);
                     // A stale, too-small hint must not truncate later groups.
                     bucket.expected_groups = if (distribution == .late_unique) 16 else 1_000_000;
-                    var expected = [_]u64{0} ** total_rows;
+                    var expected: [total_rows]u64 = @splat(0);
                     for (0..total_rows / batch_rows) |batch| {
                         rows.len_rows = batch_rows;
                         for (0..batch_rows) |r| {
@@ -2965,7 +2965,7 @@ test "string MIN keeps one copy per group however many rows improve it" {
     const layout = STRING_MEMORY_TEST_LAYOUT;
     const groups = 38;
     const n = 200_000;
-    const pad = "x" ** 48;
+    const pad = &@as([48]u8, @splat('x'));
     var buf: [64]u8 = undefined;
     var rows: GroupRows = .{};
     defer rows.deinit(allocator);
@@ -2975,7 +2975,7 @@ test "string MIN keeps one copy per group however many rows improve it" {
 
     var str_states: std.ArrayListUnmanaged(StrAccRow) = .empty;
     defer str_states.deinit(allocator);
-    try str_states.appendNTimes(allocator, [_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS, groups);
+    try str_states.appendNTimes(allocator, @as([MAX_GROUP_STR_SLOTS]StrAcc, @splat(.{})), groups);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var bank: StringBank = .{};
@@ -3134,9 +3134,9 @@ pub const WorkspaceProfile = struct {
     setup_spawn_ticks: i64 = 0,
     setup_join_ticks: i64 = 0,
     setup_assign_ticks: i64 = 0,
-    setup_worker_part_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
-    setup_worker_bucket_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
-    setup_worker_total_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
+    setup_worker_part_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
+    setup_worker_bucket_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
+    setup_worker_total_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
 
     teardown_total_ticks: i64 = 0,
     teardown_thread_alloc_ticks: i64 = 0,
@@ -3144,9 +3144,9 @@ pub const WorkspaceProfile = struct {
     teardown_spawn_ticks: i64 = 0,
     teardown_join_ticks: i64 = 0,
     teardown_outer_free_ticks: i64 = 0,
-    teardown_worker_part_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
-    teardown_worker_bucket_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
-    teardown_worker_total_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = [_]i64{0} ** MAX_WORKSPACE_PROFILE_WORKERS,
+    teardown_worker_part_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
+    teardown_worker_bucket_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
+    teardown_worker_total_ticks: [MAX_WORKSPACE_PROFILE_WORKERS]i64 = @splat(0),
 
     pub fn printSetup(self: *const WorkspaceProfile, query: []const u8, bucket_count: usize, local_reserve_per_bucket: usize, expected_groups_per_bucket: usize) void {
         const freq = platform.perfFreq();
@@ -4126,15 +4126,15 @@ pub const TopRow = struct {
     // carries the slots inline up to the generous MAX_GROUP_AGG_SLOTS ceiling
     // rather than allocating per row — the per-group store (StateSlab) is the
     // one sized to exactly the program's slot count.
-    slots: [MAX_GROUP_AGG_SLOTS]i64 = [_]i64{0} ** MAX_GROUP_AGG_SLOTS,
+    slots: [MAX_GROUP_AGG_SLOTS]i64 = @splat(0),
     rowref: i64 = 0,
     // String MIN/MAX results, indexed by the aggregate's str_state_index. Empty
     // for numeric queries. Borrows the bucket's str_states bytes during the
     // top-N merge, then re-dup'd into the result allocator at the final emit.
-    str: [MAX_GROUP_STR_SLOTS][]const u8 = [_][]const u8{&.{}} ** MAX_GROUP_STR_SLOTS,
+    str: [MAX_GROUP_STR_SLOTS][]const u8 = @splat(&.{}),
     // False when the group's string inputs were all NULL (the accumulator
     // never saw a value) — the emit outputs NULL, distinct from a valid ''.
-    str_present: [MAX_GROUP_STR_SLOTS]bool = [_]bool{true} ** MAX_GROUP_STR_SLOTS,
+    str_present: [MAX_GROUP_STR_SLOTS]bool = @splat(true),
 };
 
 // Optional per-group predicate applied during the all-groups emit (a HAVING
@@ -5398,14 +5398,14 @@ fn appendBatchRunsWeighted(
     if (row_count == 0) return;
     const route_t0 = if (profile) platform.nowTicks() else 0;
     var accepted: u64 = 0;
-    var run_idx = [_]usize{0} ** MAX_GENERIC_GROUP_KEYS;
+    var run_idx: [MAX_GENERIC_GROUP_KEYS]usize = @splat(0);
     var run_left: [MAX_GENERIC_GROUP_KEYS]usize = undefined;
     for (key_runs, 0..) |kr, i| {
         if (kr.lengths.len == 0) return error.UnsupportedOperatorForType;
         run_left[i] = kr.lengths[0];
     }
-    var spec_idx = [_]usize{0} ** MAX_GROUP_PAYLOAD_COLUMNS;
-    var spec_left = [_]usize{0} ** MAX_GROUP_PAYLOAD_COLUMNS;
+    var spec_idx: [MAX_GROUP_PAYLOAD_COLUMNS]usize = @splat(0);
+    var spec_left: [MAX_GROUP_PAYLOAD_COLUMNS]usize = @splat(0);
     for (weight_specs, 0..) |spec, c| {
         if (spec.runs) |ir| {
             if (ir.lengths.len == 0) return error.UnsupportedOperatorForType;
@@ -5877,7 +5877,7 @@ fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize,
 }
 
 /// One bit per string agg-input column.
-const StrColumnMask = std.meta.Int(.unsigned, MAX_GROUP_STR_COLUMNS);
+const StrColumnMask = @Int(.unsigned, MAX_GROUP_STR_COLUMNS);
 
 // Fold source row `src`'s string extremes into staged row `dst`. A NULL input
 // changes nothing and a staged NULL takes the first valid value; a replaced
@@ -6776,10 +6776,10 @@ fn groupChunkRowsDirectKeys(
             if (rowrefs.len != 0) head.rowref = rowrefs[r];
             table.commit(probe.slot, key, gid);
             if (has_str) {
-                str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
+                str_states.appendAssumeCapacity(@as([MAX_GROUP_STR_SLOTS]StrAcc, @splat(.{})));
             }
             if (has_concat) {
-                concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
+                concat_states.appendAssumeCapacity(@as([MAX_GROUP_CONCAT_SLOTS]ConcatCell, @splat(.empty)));
             }
             tagged = if (mark_new) gid | NEW_GID_BIT else gid;
         } else {
@@ -6883,15 +6883,15 @@ fn groupChunkRowsDirectKeysProgram(
             if (rowrefs.len != 0) states.head(new_gid).rowref = rowrefs[r];
             table.commit(probe.slot, key, new_gid);
             if (has_str) {
-                str_states.appendAssumeCapacity([_]StrAcc{.{}} ** MAX_GROUP_STR_SLOTS);
+                str_states.appendAssumeCapacity(@as([MAX_GROUP_STR_SLOTS]StrAcc, @splat(.{})));
                 if (has_str_fold) try foldGroupStr(str_states, str_bank, str_arena, new_gid, aggregates, rows, r);
             }
             if (has_concat) {
-                concat_states.appendAssumeCapacity([_]ConcatCell{.empty} ** MAX_GROUP_CONCAT_SLOTS);
+                concat_states.appendAssumeCapacity(@as([MAX_GROUP_CONCAT_SLOTS]ConcatCell, @splat(.empty)));
                 try foldGroupConcat(concat_states, str_arena, new_gid, aggregates, rows, r);
             }
             if (has_udf) {
-                udf_states.appendAssumeCapacity([_]UdfCell{.{}} ** MAX_GROUP_UDF_SLOTS);
+                udf_states.appendAssumeCapacity(@as([MAX_GROUP_UDF_SLOTS]UdfCell, @splat(.{})));
                 try initUdfStatesRow(udf_states, udf_arena, new_gid, aggregates);
                 try foldGroupUdf(udf_states, udf_arena, new_gid, aggregates, rows, r, n);
             }
@@ -8593,7 +8593,7 @@ fn concatItemLess(_: void, a: ConcatItem, b: ConcatItem) bool {
 // million-group emit doesn't allocate a store per group.
 const UdfEmitScratch = struct {
     allocator: Allocator,
-    stores: [MAX_GROUP_UDF_SLOTS]?ColumnStore = [_]?ColumnStore{null} ** MAX_GROUP_UDF_SLOTS,
+    stores: [MAX_GROUP_UDF_SLOTS]?ColumnStore = @splat(null),
 
     fn deinit(self: *UdfEmitScratch) void {
         for (&self.stores) |*s| if (s.*) |*cs| cs.deinit(self.allocator);
@@ -8956,7 +8956,7 @@ fn keyLane(view: ColumnView, digests: ?[]const u128, typ: thindb.types.Type, lo:
         },
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vals| {
             if (readGenericKeyBits(view, typ, lo)) |_| {
-                const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(vals[0])));
+                const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(vals[0])));
                 for (lane, vals[lo..][0..lane.len]) |*p, v| p.* = @as(Bits, @bitCast(v));
             } else |_| @memset(lane, 0);
         },
@@ -9021,7 +9021,7 @@ test "hashed identities filled by column match hashGenericKeyFromViews row by ro
     defer allocator.free(offsets);
     var bytes: std.ArrayListUnmanaged(u8) = .empty;
     defer bytes.deinit(allocator);
-    const phrases = [_][]const u8{ "", "a", "thin", "columnar analytics", "x" ** 40 };
+    const phrases = [_][]const u8{ "", "a", "thin", "columnar analytics", &@as([40]u8, @splat('x')) };
     offsets[0] = 0;
     for (0..n) |r| {
         users[r] = random.intRangeAtMost(i64, -3, 3);
@@ -9103,7 +9103,7 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
         if (n > 0) _ = try readGenericKeyBits(view, part.typ, 0);
         switch (view.data) {
             inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vals| {
-                const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(vals[0])));
+                const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(vals[0])));
                 for (out, vals[0..n]) |*id, v| id.* |= @as(u128, @as(Bits, @bitCast(v))) << shift;
             },
             else => return error.TypeMismatch,
@@ -9566,7 +9566,7 @@ fn scatterPartLane(layout: GroupRowsLayout, parts: []GroupRows, chunks: []const 
 
 fn scatterPartRuns(comptime T: type, parts: []GroupRows, chunks: []const GroupChunk, part_ids: []const u8, lane: StageLane) void {
     var dst: [MAX_DEFER_PARTS][*]T = undefined;
-    var next = [_]u32{0} ** MAX_DEFER_PARTS;
+    var next: [MAX_DEFER_PARTS]u32 = @splat(0);
     for (parts, 0..) |part, p| {
         // A part no row maps to has no slab to point into.
         if (part.len() == 0) continue;

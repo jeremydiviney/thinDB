@@ -269,9 +269,9 @@ test "RLE columns of short runs round-trip and group exactly" {
     }
 
     // Per g: rows, distinct v (one per run of g) and SUM(w).
-    var rows = [_]i64{0} ** SHORT_GROUPS;
-    var runs = [_]i64{0} ** SHORT_GROUPS;
-    var sums = [_]i64{0} ** SHORT_GROUPS;
+    var rows: [SHORT_GROUPS]i64 = @splat(0);
+    var runs: [SHORT_GROUPS]i64 = @splat(0);
+    var sums: [SHORT_GROUPS]i64 = @splat(0);
     for (0..SHORT_ROWS) |i| {
         const r = shortRunOf(i);
         const g: usize = @intCast(r.k % SHORT_GROUPS);

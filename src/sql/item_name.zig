@@ -435,9 +435,10 @@ test "mysqlName cuts a long name at 255 bytes, on a character boundary" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const template: Lexer = .{ .arena = arena, .src = "", .dialect = .mysql };
-    const ascii = try std.mem.concat(arena, u8, &.{ "CONCAT('", "a" ** 300, "')" });
+    const ascii = try std.mem.concat(arena, u8, &.{ "CONCAT('", &@as([300]u8, @splat('a')), "')" });
     try std.testing.expectEqual(@as(usize, 255), (try mysqlName(arena, template, ascii)).len);
-    const wide = try std.mem.concat(arena, u8, &.{ "CONCAT('", "\u{e9}" ** 200, "')" });
+    const e_acute = "\u{e9}";
+    const wide = try std.mem.concat(arena, u8, &.{ "CONCAT('", &@as([200 * e_acute.len]u8, @bitCast(@as([200][e_acute.len]u8, @splat(e_acute.*)))), "')" });
     const cut = try mysqlName(arena, template, wide);
     try std.testing.expectEqual(@as(usize, 254), cut.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(cut));

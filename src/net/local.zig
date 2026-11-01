@@ -2495,13 +2495,13 @@ fn capGroupConcats(arena: Allocator, op: *ir.Op, max_len: u64, visited: *std.Aut
         inline else => |*payload| {
             const Payload = @TypeOf(payload.*);
             if (@typeInfo(Payload) != .@"struct") return;
-            inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                const child = @field(payload.*, field.name);
-                if (field.type == *ir.Op) {
+            inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                const child = @field(payload.*, field_name);
+                if (field_type == *ir.Op) {
                     try capGroupConcats(arena, child, max_len, visited);
-                } else if (field.type == ?*ir.Op) {
+                } else if (field_type == ?*ir.Op) {
                     if (child) |c| try capGroupConcats(arena, c, max_len, visited);
-                } else if (field.type == []const *ir.Op) {
+                } else if (field_type == []const *ir.Op) {
                     for (child) |c| try capGroupConcats(arena, c, max_len, visited);
                 }
             }
@@ -5126,25 +5126,25 @@ fn encodeRowsAsBatchFromIterable(
     rows: anytype,
 ) !void {
     const Row = @TypeOf(rows[0]);
-    const fields = @typeInfo(Row).@"struct".fields;
+    const row_info = @typeInfo(Row).@"struct";
     const row_count = rows.len;
 
     try wire.appendU32(allocator, out, @intCast(row_count));
-    try wire.appendU32(allocator, out, @intCast(fields.len));
+    try wire.appendU32(allocator, out, @intCast(row_info.field_names.len));
 
-    inline for (fields) |field| {
-        const Inner = comptime innerType(field.type);
-        const is_nullable = comptime isOptionalType(field.type);
+    inline for (row_info.field_names, row_info.field_types) |field_name, field_type| {
+        const Inner = comptime innerType(field_type);
+        const is_nullable = comptime isOptionalType(field_type);
 
-        try wire.appendLenString(allocator, out, field.name);
+        try wire.appendLenString(allocator, out, field_name);
         try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
         try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0); // type_extra unused
 
         if (is_nullable) {
-            try writeOptionalColumnFromRows(Inner, allocator, out, rows, field.name);
+            try writeOptionalColumnFromRows(Inner, allocator, out, rows, field_name);
         } else {
-            try writeColumnFromRows(field.type, allocator, out, rows, field.name);
+            try writeColumnFromRows(field_type, allocator, out, rows, field_name);
             try wire.appendU32(allocator, out, 0); // empty null bitmap
         }
     }
@@ -5163,43 +5163,43 @@ fn encodeRowsAsBatchFromTuple(
 ) !void {
     const TupleT = @TypeOf(tuple_ptr.*);
     const tuple_info = @typeInfo(TupleT).@"struct";
-    const tuple_fields = tuple_info.fields;
-    if (tuple_fields.len == 0) {
+    const tuple_names = tuple_info.field_names;
+    if (tuple_names.len == 0) {
         @compileError("encodeRowsAsBatch: empty tuple has no row type to infer");
     }
-    const Row0 = tuple_fields[0].type;
-    const row_fields = @typeInfo(Row0).@"struct".fields;
+    const Row0 = tuple_info.field_types[0];
+    const row_info = @typeInfo(Row0).@"struct";
 
-    try wire.appendU32(allocator, out, @intCast(tuple_fields.len));
-    try wire.appendU32(allocator, out, @intCast(row_fields.len));
+    try wire.appendU32(allocator, out, @intCast(tuple_names.len));
+    try wire.appendU32(allocator, out, @intCast(row_info.field_names.len));
 
-    inline for (row_fields) |rf| {
-        const Inner = comptime innerType(rf.type);
-        const is_nullable = comptime isOptionalType(rf.type);
+    inline for (row_info.field_names, row_info.field_types) |field_name, field_type| {
+        const Inner = comptime innerType(field_type);
+        const is_nullable = comptime isOptionalType(field_type);
 
-        try wire.appendLenString(allocator, out, rf.name);
+        try wire.appendLenString(allocator, out, field_name);
         try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
         try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0);
 
         // Per-field collection across tuple elements. Each tuple slot may
-        // have its own anonymous-struct type, but `@field(row, rf.name)`
+        // have its own anonymous-struct type, but `@field(row, field_name)`
         // works regardless — the value coerces to the schema column type
         // we declared above. For nullable fields we collect Inner +
         // build a validity bitmap in parallel.
         if (is_nullable) {
             var values: std.ArrayList(Inner) = .empty;
             defer values.deinit(allocator);
-            try values.ensureTotalCapacity(allocator, tuple_fields.len);
+            try values.ensureTotalCapacity(allocator, tuple_names.len);
 
-            const bitmap_len = (tuple_fields.len + 7) / 8;
+            const bitmap_len = (tuple_names.len + 7) / 8;
             const bitmap = try allocator.alloc(u8, bitmap_len);
             defer allocator.free(bitmap);
             @memset(bitmap, 0);
 
-            inline for (tuple_fields, 0..) |tf, i| {
-                const row = @field(tuple_ptr.*, tf.name);
-                const optv = @field(row, rf.name);
+            inline for (tuple_names, 0..) |tuple_name, i| {
+                const row = @field(tuple_ptr.*, tuple_name);
+                const optv = @field(row, field_name);
                 if (optv) |v| {
                     values.appendAssumeCapacity(v);
                     bitmap[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
@@ -5211,14 +5211,14 @@ fn encodeRowsAsBatchFromTuple(
             try wire.appendU32(allocator, out, @intCast(bitmap_len));
             try out.appendSlice(allocator, bitmap);
         } else {
-            var typed: std.ArrayList(rf.type) = .empty;
+            var typed: std.ArrayList(field_type) = .empty;
             defer typed.deinit(allocator);
-            try typed.ensureTotalCapacity(allocator, tuple_fields.len);
-            inline for (tuple_fields) |tf| {
-                const row = @field(tuple_ptr.*, tf.name);
-                typed.appendAssumeCapacity(@field(row, rf.name));
+            try typed.ensureTotalCapacity(allocator, tuple_names.len);
+            inline for (tuple_names) |tuple_name| {
+                const row = @field(tuple_ptr.*, tuple_name);
+                typed.appendAssumeCapacity(@field(row, field_name));
             }
-            try writeColumnFromTypedSlice(rf.type, allocator, out, typed.items);
+            try writeColumnFromTypedSlice(field_type, allocator, out, typed.items);
             try wire.appendU32(allocator, out, 0); // empty null bitmap
         }
     }

@@ -1848,7 +1848,7 @@ test "global COUNT(DISTINCT) over row-group dictionaries counts each referenced 
             .{ " WHERE d >= 3 AND id <> 650", 3, true },
         };
         inline for (filters) |f| {
-            var seen = [_]bool{false} ** 64;
+            var seen: [64]bool = @splat(false);
             var blank = false;
             var id: i64 = 0;
             while (id < DICT_ROWS) : (id += 1) {

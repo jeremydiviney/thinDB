@@ -93,7 +93,7 @@ test "group completion: filtered compound groups retain large OFFSET pages acros
         for (0..16) |_| {
             var q = try runSql(allocator, db, "SELECT g0, g1, COUNT(*) AS c FROM completion_rows WHERE kept = 1 GROUP BY g0, g1 ORDER BY c DESC LIMIT 10 OFFSET 10000");
             defer q.deinit();
-            var seen = [_]bool{false} ** group_count;
+            var seen: [group_count]bool = @splat(false);
             var count: usize = 0;
             while (try q.next()) |batch| {
                 for (0..batch.row_count) |i| {
@@ -732,8 +732,8 @@ test "string GROUP BY and COUNT(DISTINCT) over lz4_fsst blocks" {
     try exec(allocator, db, "CREATE TABLE visits (id BIGINT PRIMARY KEY, k INT NOT NULL, s TEXT) PROPERTIES (\"compression\" = \"lz4_fsst\")");
 
     const n_keys: usize = 100;
-    var cnt_all = [_]i64{0} ** n_keys;
-    var cnt_filt = [_]i64{0} ** n_keys;
+    var cnt_all: [n_keys]i64 = @splat(0);
+    var cnt_filt: [n_keys]i64 = @splat(0);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, "INSERT INTO visits VALUES ");
@@ -1586,7 +1586,7 @@ fn checkGroupedDistinct(allocator: std.mem.Allocator, db: *thindb.Database, e: G
         try std.testing.expect(try planContains(allocator, db, sql, route));
         var q = try runSql(allocator, db, sql);
         defer q.deinit();
-        var seen = [_]bool{false} ** GD_GROUPS;
+        var seen: [GD_GROUPS]bool = @splat(false);
         var groups: usize = 0;
         while (try q.next()) |batch| {
             for (0..batch.row_count) |r| {
@@ -2130,7 +2130,7 @@ fn lowcardPeak(allocator: std.mem.Allocator, batch_rows: usize) !usize {
     try std.testing.expect(try planContains(allocator, db, sql, "lowcard"));
     var q = try runSql(allocator, db, sql);
     defer q.deinit();
-    var seen = [_]bool{false} ** LC_GROUPS;
+    var seen: [LC_GROUPS]bool = @splat(false);
     while (try q.next()) |out| {
         for (0..out.row_count) |r| {
             const g: usize = @intCast(out.values[0].data.int[r]);
@@ -2452,7 +2452,8 @@ fn olLen(s: []const u8) i64 {
 test "V2 octet_length reads string lengths without the bytes" {
     const allocator = std.testing.allocator;
     const n_rows = 6000;
-    const text = "https://www.example.org/some/longer/path/with-a-tail/" ** 4;
+    const segment = "https://www.example.org/some/longer/path/with-a-tail/";
+    const text = segment ++ segment ++ segment ++ segment;
     const rows = try allocator.alloc(OlRow, n_rows);
     defer allocator.free(rows);
     for (rows, 0..) |*r, i| r.* = .{
@@ -2531,7 +2532,7 @@ test "V2 octet_length reads string lengths without the bytes" {
         for (cases) |c| {
             errdefer std.debug.print("query: {s}\n", .{c.sql});
             if (c.route) |route| try std.testing.expect(try planContains(allocator, db, c.sql, route));
-            var want = [_][3]i64{.{ 0, 0, 0 }} ** OL_GROUPS;
+            var want: [OL_GROUPS][3]i64 = @splat(.{ 0, 0, 0 });
             for (rows, live) |r, keep| {
                 if (!keep) continue;
                 const add = c.row(r) orelse continue;
@@ -2604,9 +2605,9 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
     defer arena.deinit();
     const rows = try allocator.alloc(Row, total);
     defer allocator.free(rows);
-    var counts = [_]i64{0} ** heavy_groups;
-    var kept_counts = [_]i64{0} ** heavy_groups;
-    var sums = [_]i64{0} ** heavy_groups;
+    var counts: [heavy_groups]i64 = @splat(0);
+    var kept_counts: [heavy_groups]i64 = @splat(0);
+    var sums: [heavy_groups]i64 = @splat(0);
     var i: usize = 0;
     for (0..heavy_groups) |g| {
         for (0..6000 - 250 * g) |_| {
@@ -2756,7 +2757,7 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
     defer allocator.free(extra);
     for (extra, 0..) |*r, j| r.* = .{ .id = @intCast(total + j), .k = 11, .s = "key-11", .v = 0 };
     try t.insert(extra);
-    var live_counts = [_]i64{0} ** heavy_groups;
+    var live_counts: [heavy_groups]i64 = @splat(0);
     for (rows, 0..) |r, n| {
         if (r.k >= heavy_groups or (n * 7919) % total % 13 == 0) continue;
         live_counts[@intCast(r.k)] += 1;
@@ -3451,7 +3452,7 @@ test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned a
     }
     var seg_b: std.ArrayList(HkRow) = .empty;
     for (0..40_000) |i| {
-        const s = if (i % 16 == 0) hot_urls[(i / 16) % hot] else if (i % 16 == 8) "http://rawhot.example/" else try std.fmt.allocPrint(arena, "http://uniq{d}.example/{s}", .{ i, "x" ** 300 });
+        const s = if (i % 16 == 0) hot_urls[(i / 16) % hot] else if (i % 16 == 8) "http://rawhot.example/" else try std.fmt.allocPrint(arena, "http://uniq{d}.example/{s}", .{ i, &@as([300]u8, @splat('x')) });
         try seg_b.append(arena, .{ .id = id, .s = s, .v = @intCast(@mod(id * 104_729, 1_013)) });
         id += 1;
     }
@@ -3698,15 +3699,15 @@ test "grouped engines collapse rows by string codes combined with other source c
         var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
         defer db.close();
         try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL)");
-        var count_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
-        var sum_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
-        var count_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
-        var sum_su = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
-        var count_sw = [_][4]i64{.{ 0, 0, 0, 0 }} ** words.len;
-        var max_w_sg = [_][3]i64{.{ std.math.minInt(i64), std.math.minInt(i64), std.math.minInt(i64) }} ** words.len;
-        var sum_h_sg = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
-        var max_sq_s = [_]i64{std.math.minInt(i64)} ** words.len;
-        var min_sq_s = [_]i64{std.math.maxInt(i64)} ** words.len;
+        var count_sg: [words.len][3]i64 = @splat(.{ 0, 0, 0 });
+        var sum_sg: [words.len][3]i64 = @splat(.{ 0, 0, 0 });
+        var count_su: [words.len][tags.len]i64 = @splat(.{ 0, 0, 0 });
+        var sum_su: [words.len][tags.len]i64 = @splat(.{ 0, 0, 0 });
+        var count_sw: [words.len][4]i64 = @splat(.{ 0, 0, 0, 0 });
+        var max_w_sg: [words.len][3]i64 = @splat(.{ std.math.minInt(i64), std.math.minInt(i64), std.math.minInt(i64) });
+        var sum_h_sg: [words.len][3]i64 = @splat(.{ 0, 0, 0 });
+        var max_sq_s: [words.len]i64 = @splat(std.math.minInt(i64));
+        var min_sq_s: [words.len]i64 = @splat(std.math.maxInt(i64));
         var quotient_counts: std.StringArrayHashMapUnmanaged(i64) = .empty;
         defer {
             for (quotient_counts.keys()) |k| allocator.free(k);
@@ -3827,13 +3828,13 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
         var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
         defer db.close();
         try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL, b INT NOT NULL)");
-        var count_x = [_]i64{0} ** words.len;
-        var sum_x = [_]i64{0} ** words.len;
-        var count_qq_not1 = [_]i64{0} ** words.len;
-        var count_qq_or_a = [_]i64{0} ** words.len;
-        var count_not_qq = [_][tags.len]i64{.{ 0, 0, 0 }} ** words.len;
-        var count_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
-        var sum_w = [_][3]i64{.{ 0, 0, 0 }} ** words.len;
+        var count_x: [words.len]i64 = @splat(0);
+        var sum_x: [words.len]i64 = @splat(0);
+        var count_qq_not1: [words.len]i64 = @splat(0);
+        var count_qq_or_a: [words.len]i64 = @splat(0);
+        var count_not_qq: [words.len][tags.len]i64 = @splat(.{ 0, 0, 0 });
+        var count_w: [words.len][3]i64 = @splat(.{ 0, 0, 0 });
+        var sum_w: [words.len][3]i64 = @splat(.{ 0, 0, 0 });
         for (0..2) |half| {
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(allocator);

@@ -937,7 +937,7 @@ test "wal: an UPDATE past the staging bound keeps the chunk it committed when a 
     };
     const Row = struct { id: i64, qty: i32, label: []const u8 };
     var rows: [14]Row = undefined;
-    for (&rows, 1..) |*r, id| r.* = .{ .id = @intCast(id), .qty = @intCast(id * 10), .label = "x" ** 100 };
+    for (&rows, 1..) |*r, id| r.* = .{ .id = @intCast(id), .qty = @intCast(id * 10), .label = &@as([100]u8, @splat('x')) };
     // A row-group step stages about 240 bytes (two rows and two offsets), the
     // memtable step about 470 (two rows out, two in). Under a 1070-byte bound
     // the first chunk ends after row group {5,6}; the second takes {7,8} and

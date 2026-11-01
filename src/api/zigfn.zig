@@ -714,7 +714,7 @@ test "embedded SDK imports only std, builtin and other embedded files" {
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);
     for (EMBEDDED_SDK) |file| {
-        const source = try allocator.dupeZ(u8, file.data);
+        const source = try allocator.dupeSentinel(u8, file.data, 0);
         defer allocator.free(source);
         var tokenizer = std.zig.Tokenizer.init(source);
         var token = tokenizer.next();

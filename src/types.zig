@@ -103,8 +103,9 @@ const nested_allocator = std.heap.smp_allocator;
 /// so two shapes are equal exactly when their shallow bytes, field names
 /// included, are.
 pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
-    var fallback = std.heap.stackFallback(256, nested_allocator);
-    const key_allocator = fallback.get();
+    var fallback_buffer: [256]u8 = undefined;
+    var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buffer, nested_allocator);
+    const key_allocator = fallback.allocator();
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(key_allocator);
     try appendNestedKey(key_allocator, &key, shape);
@@ -293,8 +294,9 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
     }
     if (std.mem.eql(u8, name, "struct")) {
         try expectTypeChar(text, pos, '<');
-        var fallback = std.heap.stackFallback(16 * @sizeOf(StructField), nested_allocator);
-        const allocator = fallback.get();
+        var fallback_buffer: [16 * @sizeOf(StructField)]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buffer, nested_allocator);
+        const allocator = fallback.allocator();
         var fields: std.ArrayList(StructField) = .empty;
         defer fields.deinit(allocator);
         while (true) {
@@ -324,8 +326,8 @@ fn parseTypeTextAt(text: []const u8, pos: *usize) TypeTextError!Type {
         if (p == 0 or p > max_decimal_precision or s > p) return error.InvalidTypeText;
         return decimalOf(.{ .p = p, .s = s });
     }
-    inline for (@typeInfo(Type).@"union".fields) |f| {
-        if (f.type == void and std.mem.eql(u8, name, f.name)) return @unionInit(Type, f.name, {});
+    inline for (@typeInfo(Type).@"union".field_names, @typeInfo(Type).@"union".field_types) |field_name, field_type| {
+        if (field_type == void and std.mem.eql(u8, name, field_name)) return @unionInit(Type, field_name, {});
     }
     return error.InvalidTypeText;
 }
@@ -593,7 +595,7 @@ pub fn canonicalFloat(v: anytype) @TypeOf(v) {
     return if (v == 0) 0 else v;
 }
 
-pub fn canonicalFloatBits(v: anytype) std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(v))) {
+pub fn canonicalFloatBits(v: anytype) @Int(.unsigned, @bitSizeOf(@TypeOf(v))) {
     return @bitCast(canonicalFloat(v));
 }
 

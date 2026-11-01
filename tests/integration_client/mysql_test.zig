@@ -69,7 +69,7 @@ const TestClient = struct {
     writer: std.Io.net.Stream.Writer,
     /// Salt captured from the most recent greeting. Used by
     /// COM_CHANGE_USER tests to recompute the SHA1 hash.
-    last_salt: [20]u8 = .{0} ** 20,
+    last_salt: [20]u8 = @splat(0),
 
     fn connect(allocator: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !TestClient {
         const stream = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp });
@@ -147,7 +147,7 @@ const TestClient = struct {
         try payload.appendSlice(self.allocator, &buf4);
 
         try payload.append(self.allocator, 0xff);
-        try payload.appendSlice(self.allocator, &([_]u8{0} ** 23));
+        try payload.appendSlice(self.allocator, &@as([23]u8, @splat(0)));
 
         try payload.appendSlice(self.allocator, "test\x00");
 
@@ -439,7 +439,7 @@ const TestClient = struct {
         std.mem.writeInt(u32, &buf4, 0x01000000, .little);
         try payload.appendSlice(self.allocator, &buf4);
         try payload.append(self.allocator, 0xff);
-        try payload.appendSlice(self.allocator, &([_]u8{0} ** 23));
+        try payload.appendSlice(self.allocator, &@as([23]u8, @splat(0)));
         try payload.appendSlice(self.allocator, "test\x00");
         try payload.append(self.allocator, 32);
         try payload.appendSlice(self.allocator, &hash);

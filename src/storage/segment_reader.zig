@@ -20,7 +20,7 @@ fn decodeFixed(comptime T: type, allocator: Allocator, values: []const u8, row_c
     if (native_endian == .little) {
         @memcpy(std.mem.sliceAsBytes(data), values[0..n_bytes]);
     } else {
-        const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
         for (data, 0..) |*slot, i| {
             const bits = std.mem.readInt(Bits, values[i * @sizeOf(T) ..][0..@sizeOf(T)], .little);
             slot.* = @bitCast(bits);
@@ -1242,13 +1242,13 @@ pub const DictBlock = struct {
     /// `rowCode` for a block known to carry `width`-byte codes, so a per-row
     /// loop switches on the width once instead of on every row.
     pub inline fn rowCodeAs(self: DictBlock, comptime width: u8, row: usize) u32 {
-        return std.mem.readInt(std.meta.Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
+        return std.mem.readInt(@Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
     }
 
     /// Every row's code, into `out`, one per row.
     pub fn codesInto(self: DictBlock, out: []u32) void {
         switch (self.code_width) {
-            inline 1, 2, 4 => |w| widenCodes(std.meta.Int(.unsigned, @as(u16, w) * 8), self.codes, out),
+            inline 1, 2, 4 => |w| widenCodes(@Int(.unsigned, @as(u16, w) * 8), self.codes, out),
             else => for (out, 0..) |*c, row| {
                 c.* = self.rowCode(row);
             },
@@ -1273,7 +1273,7 @@ pub const DictBlock = struct {
         const out = mask[0..row_count];
         switch (self.code_width) {
             inline 1, 2, 4 => |w| {
-                const T = std.meta.Int(.unsigned, @as(u16, w) * 8);
+                const T = @Int(.unsigned, @as(u16, w) * 8);
                 // A span of every code a width holds doesn't fit that width.
                 if (span == 0 or span > std.math.maxInt(T)) return simd_mod.fillMaskRun(out, 0, out.len, (span != 0) != outside);
                 switch (outside) {
