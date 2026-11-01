@@ -4095,8 +4095,32 @@ test "create frees what it built when any allocation fails" {
     // Covers literal slots re-typed after they were built (a text literal
     // read as a date, CASE literals and NULLs unified to the result type):
     // a failed replacement must leave the old buffer freeable exactly once.
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, createAndRelease, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator_without_growth_in_place, createAndRelease, .{});
 }
+
+/// `std.testing.allocator`, refusing to grow or shrink a block in place. It
+/// grows one in place only while the block is the last one carved from its
+/// bucket, which turns on what earlier runs left there, so a list's growth
+/// would cost a different number of allocations from one run to the next
+/// and `checkAllAllocationFailures` would miss the allocation points it
+/// counted.
+const testing_allocator_without_growth_in_place: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = struct {
+            fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+                return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+            }
+        }.alloc,
+        .resize = Allocator.noResize,
+        .remap = Allocator.noRemap,
+        .free = struct {
+            fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+                std.testing.allocator.rawFree(memory, alignment, ret_addr);
+            }
+        }.free,
+    },
+};
 
 test "only octet_length reads every row reaches qualify for the byte-length sidecar" {
     const allocator = std.testing.allocator;
