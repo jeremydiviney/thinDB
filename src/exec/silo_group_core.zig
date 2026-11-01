@@ -9482,6 +9482,11 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
             .filter, .dup_filter => (try keptRows(job, job.scan.allocator, pass, passed.batch, passed.weights)) orelse continue,
             .heavy_tally => |heavy| {
                 try heavyTallyRows(job, heavy, passed.batch, passed.weights);
+                // A declined tally is thrown away, so its scan stops here.
+                if (heavy.declined()) {
+                    job.shared.scan_tiles.close();
+                    break;
+                }
                 continue;
             },
             .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, passed.batch, passed.weights)) orelse continue,

@@ -757,6 +757,15 @@ const SLACK_SHARE_DENOM: u64 = 4;
 /// filter: the filter streams every row's bytes, a probe touches one row's.
 const SEARCH_ROWS_PER_PROBE: usize = 8;
 
+/// A tally whose units report more than 1/this of their rows hashes about
+/// as many keys as grouping every row would, into a slower table that settle
+/// then merges serially; the counter sketch serves such even counts better.
+const MAX_REPORTS_SHARE_DENOM: u64 = 32;
+
+/// Units the workers close, all told, before their reports may decline the
+/// tally, so that a few units of rare keys can't.
+const DECLINE_MIN_UNITS: u64 = 16;
+
 /// Exact top-K over units whose keys arrive counted (TPUT: Cao & Wang,
 /// "Efficient top-K query calculation in distributed networks", PODC 2004).
 /// A row group's dictionary codes count its distinct values exactly, so a
@@ -787,6 +796,13 @@ pub const HeavyKeys = struct {
     /// Set when it declined because the key is near-unique, which
     /// `DupSketch` serves.
     near_unique: bool = false,
+    /// Set mid-pass when the units report too many of their keys (see
+    /// `MAX_REPORTS_SHARE_DENOM`): the rest of the pass is wasted.
+    declined_flat: std.atomic.Value(bool) = .init(false),
+    /// The workers' closed units, their rows, and the keys they reported.
+    tallied_units: std.atomic.Value(u64) = .init(0),
+    tallied_rows: std.atomic.Value(u64) = .init(0),
+    tallied_reports: std.atomic.Value(u64) = .init(0),
     /// After `settle`: the candidate keys, their signatures by open
     /// addressing (0 marks an empty slot), and the candidates by bytes when
     /// every candidate's bytes were kept.
@@ -808,6 +824,8 @@ pub const HeavyKeys = struct {
         least: usize = 0,
         slack: u64 = 0,
         rows: u64 = 0,
+        /// Keys reported since the worker's unit opened.
+        unit_reports: u64 = 0,
 
         fn findLeast(self: *Worker) void {
             var least: usize = 0;
@@ -884,6 +902,7 @@ pub const HeavyKeys = struct {
     /// worker `w`'s partials. Only worker `w` may call this.
     pub fn report(self: *HeavyKeys, allocator: Allocator, w: usize, key: u128, bytes: []const u8, count: u64) !void {
         const worker = &self.workers[w];
+        worker.unit_reports += 1;
         const gop = try worker.partials.getOrPut(allocator, key);
         if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .signature = keySignature(bytes), .slot = NO_SLOT, .bytes = null };
         const p = gop.value_ptr;
@@ -914,8 +933,22 @@ pub const HeavyKeys = struct {
     /// Closes worker `w`'s unit of `rows` rows, which reported every key it
     /// held `threshold` rows of or more.
     pub fn endUnit(self: *HeavyKeys, w: usize, rows: u64, threshold: u64) void {
-        self.workers[w].slack += threshold - 1;
-        self.workers[w].rows += rows;
+        const worker = &self.workers[w];
+        worker.slack += threshold - 1;
+        worker.rows += rows;
+        // Pooled over the workers: one worker's units can report many keys
+        // early on, before its need-th best partial nears its share of τ.
+        const reports = self.tallied_reports.fetchAdd(worker.unit_reports, .monotonic) + worker.unit_reports;
+        const tallied_rows = self.tallied_rows.fetchAdd(rows, .monotonic) + rows;
+        worker.unit_reports = 0;
+        const units = self.tallied_units.fetchAdd(1, .monotonic) + 1;
+        if (units >= DECLINE_MIN_UNITS and reports * MAX_REPORTS_SHARE_DENOM > tallied_rows) {
+            self.declined_flat.store(true, .monotonic);
+        }
+    }
+
+    pub fn declined(self: *const HeavyKeys) bool {
+        return self.declined_flat.load(.monotonic);
     }
 
     /// Merges the workers' partials and picks the candidates. False when the
@@ -1362,6 +1395,41 @@ test "heavy keys decline when the slack reaches the need-th partial" {
     defer heavy.deinit(allocator);
     try heavyTallyUnits(allocator, &heavy, units, 4);
     try std.testing.expect(!try heavy.settle(allocator));
+}
+
+test "heavy keys decline once the units report too many of their keys" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // 300 one-row keys a unit: t = 1, so a unit reports every row's key.
+    const even = try arena.alloc([]const [2]u64, DECLINE_MIN_UNITS);
+    for (even, 0..) |*unit, u| {
+        const keys = try arena.alloc([2]u64, 300);
+        for (keys, 0..) |*kc, i| kc.* = .{ u * 300 + i, 1 };
+        unit.* = keys;
+    }
+    var flat = try HeavyKeys.init(allocator, 10, 1);
+    defer flat.deinit(allocator);
+    try heavyTallyUnits(allocator, &flat, even[0 .. even.len - 1], 1);
+    try std.testing.expect(!flat.declined());
+    try heavyTallyUnits(allocator, &flat, even[even.len - 1 ..], 1);
+    try std.testing.expect(flat.declined());
+
+    // Two keys of 1000 rows beside the one-row keys: t passes over the light
+    // keys, and the tally goes on.
+    const skewed = try arena.alloc([]const [2]u64, 2 * DECLINE_MIN_UNITS);
+    for (skewed, 0..) |*unit, u| {
+        const keys = try arena.alloc([2]u64, 302);
+        keys[0] = .{ 1 << 40, 1000 };
+        keys[1] = .{ (1 << 40) + 1, 1000 };
+        for (keys[2..], 0..) |*kc, i| kc.* = .{ u * 300 + i, 1 };
+        unit.* = keys;
+    }
+    var heavy = try HeavyKeys.init(allocator, 2, 1);
+    defer heavy.deinit(allocator);
+    try heavyTallyUnits(allocator, &heavy, skewed, 1);
+    try std.testing.expect(!heavy.declined());
 }
 
 test "heavy keys track each worker's need-th best partial as keys overtake it" {

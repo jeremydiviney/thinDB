@@ -87,6 +87,12 @@ pub const RowGroupTiles = struct {
     pub fn exhausted(self: *const RowGroupTiles) bool {
         return self.next.load(.acquire) >= self.unit_count;
     }
+
+    /// Ends the claims, for a pass whose result will be thrown away. The
+    /// memtable, which rides the final tile, goes unread too.
+    pub fn close(self: *RowGroupTiles) void {
+        _ = self.next.fetchMax(self.unit_count, .release);
+    }
 };
 
 /// A half-open row-group range in `(segment, row_group)` coordinates, and
@@ -277,6 +283,16 @@ test "RowGroupTiles shrinks claims toward single row groups as the work runs out
     // Under 2 claims per worker of work left, every claim is one row group.
     for (got[got.len - 24 ..]) |t| try std.testing.expectEqual(@as(usize, 1), t.hi - t.lo);
     try std.testing.expectEqual(@as(usize, 1500), got[got.len - 1].hi);
+}
+
+test "RowGroupTiles hands out no claims once closed" {
+    const allocator = std.testing.allocator;
+    var tiles = try RowGroupTiles.init(allocator, 100, null, 4, 16, true);
+    defer tiles.deinit(allocator);
+    try std.testing.expect(tiles.claim() != null);
+    tiles.close();
+    try std.testing.expect(tiles.exhausted());
+    try std.testing.expect(tiles.claim() == null);
 }
 
 test "ChunkClaims give each chunk one contiguous run until the partials collapse" {
