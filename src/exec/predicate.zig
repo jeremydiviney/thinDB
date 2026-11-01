@@ -271,12 +271,12 @@ fn nodeDigest(expr: PredicateExpr, budget: *usize) ?u128 {
     if (budget.* == 0) return null;
     budget.* -= 1;
     var d: Digest = .{};
-    d.int(@intFromEnum(std.meta.activeTag(expr)));
+    d.int(@backingInt(std.meta.activeTag(expr)));
     switch (expr) {
         .leaf, .text_as_number => |p| d.leaf(p),
         .leaf_col_col => |c| {
             d.column(c.left);
-            d.int(@intFromEnum(c.op));
+            d.int(@backingInt(c.op));
             d.column(c.right);
         },
         .is_null, .is_not_null => |c| d.column(c),
@@ -359,7 +359,7 @@ const Digest = struct {
     }
 
     fn value(self: *Digest, v: Value) void {
-        self.int(@intFromEnum(std.meta.activeTag(v)));
+        self.int(@backingInt(std.meta.activeTag(v)));
         switch (v) {
             .text => |t| self.text(t),
             inline else => |x| self.int(x),
@@ -368,7 +368,7 @@ const Digest = struct {
 
     fn leaf(self: *Digest, p: Predicate) void {
         self.column(p.col);
-        self.int(@intFromEnum(p.op));
+        self.int(@backingInt(p.op));
         self.value(p.val);
         self.int(@intFromBool(p.from_statement));
         self.int(@intFromBool(p.as_boolean));

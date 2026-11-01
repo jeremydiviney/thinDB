@@ -580,12 +580,12 @@ const MysqlProfiler = struct {
         if (!self.enabled) return;
         const t0 = start_ts orelse return;
         const elapsed = t0.durationTo(Io.Clock.awake.now(self.io));
-        self.phases[@intFromEnum(phase)].add(@intCast(elapsed.toNanoseconds()));
+        self.phases[@backingInt(phase)].add(@intCast(elapsed.toNanoseconds()));
     }
 
     fn recordSqlKind(self: *MysqlProfiler, kind: SqlKind) void {
         if (!self.enabled) return;
-        self.sql_kinds[@intFromEnum(kind)] += 1;
+        self.sql_kinds[@backingInt(kind)] += 1;
     }
 
     fn addRowsAffected(self: *MysqlProfiler, rows: u64) void {
@@ -634,14 +634,14 @@ const MysqlProfiler = struct {
                 self.total_commands,
                 self.rows_affected,
                 self.rows_returned,
-                self.sql_kinds[@intFromEnum(SqlKind.select)],
-                self.sql_kinds[@intFromEnum(SqlKind.insert)],
-                self.sql_kinds[@intFromEnum(SqlKind.ddl)],
-                self.sql_kinds[@intFromEnum(SqlKind.other)],
+                self.sql_kinds[@backingInt(SqlKind.select)],
+                self.sql_kinds[@backingInt(SqlKind.insert)],
+                self.sql_kinds[@backingInt(SqlKind.ddl)],
+                self.sql_kinds[@backingInt(SqlKind.other)],
             },
         );
         for (profile_phases) |phase| {
-            const stats = self.phases[@intFromEnum(phase)];
+            const stats = self.phases[@backingInt(phase)];
             if (stats.count == 0) continue;
             const total_ms = @as(f64, @floatFromInt(stats.total_ns)) / 1e6;
             const mean_ms = total_ms / @as(f64, @floatFromInt(stats.count));

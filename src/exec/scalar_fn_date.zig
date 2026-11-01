@@ -831,7 +831,7 @@ pub fn lastDayOfUnitKernel(comptime source: enum { date, datetime }) Kernel {
 
 fn lastDayUnitNamed(name: []const u8) ?LastDayUnit {
     inline for (@typeInfo(LastDayUnit).@"enum".field_names, @typeInfo(LastDayUnit).@"enum".field_values) |field_name, field_value| {
-        if (std.ascii.eqlIgnoreCase(name, field_name)) return @enumFromInt(field_value);
+        if (std.ascii.eqlIgnoreCase(name, field_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

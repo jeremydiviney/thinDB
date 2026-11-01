@@ -57,7 +57,7 @@ pub const Error = error{JsonInvalid} || Allocator.Error;
 
 /// True if `bytes` is (the start of) a JSONB value rather than JSON text.
 pub inline fn looksBinary(bytes: []const u8) bool {
-    return bytes.len > 0 and bytes[0] <= @intFromEnum(Tag.number);
+    return bytes.len > 0 and bytes[0] <= @backingInt(Tag.number);
 }
 
 fn readU32(b: []const u8, at: usize) u32 {
@@ -75,36 +75,36 @@ fn writeU32(list: *std.ArrayList(u8), aa: Allocator, v: u32) !void {
 // ---------------------------------------------------------------------------
 
 pub fn appendNull(aa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
-    try out.append(aa, @intFromEnum(Tag.null));
+    try out.append(aa, @backingInt(Tag.null));
 }
 
 pub fn appendBool(aa: Allocator, out: *std.ArrayList(u8), v: bool) Allocator.Error!void {
-    try out.append(aa, @intFromEnum(if (v) Tag.true else Tag.false));
+    try out.append(aa, @backingInt(if (v) Tag.true else Tag.false));
 }
 
 pub fn appendInt(aa: Allocator, out: *std.ArrayList(u8), v: i64) Allocator.Error!void {
     var buf: [9]u8 = undefined;
-    buf[0] = @intFromEnum(Tag.int);
+    buf[0] = @backingInt(Tag.int);
     std.mem.writeInt(i64, buf[1..9], v, .little);
     try out.appendSlice(aa, &buf);
 }
 
 pub fn appendDouble(aa: Allocator, out: *std.ArrayList(u8), v: f64) Allocator.Error!void {
     var buf: [9]u8 = undefined;
-    buf[0] = @intFromEnum(Tag.double);
+    buf[0] = @backingInt(Tag.double);
     std.mem.writeInt(u64, buf[1..9], @bitCast(v), .little);
     try out.appendSlice(aa, &buf);
 }
 
 pub fn appendString(aa: Allocator, out: *std.ArrayList(u8), s: []const u8) Allocator.Error!void {
-    try out.append(aa, @intFromEnum(Tag.string));
+    try out.append(aa, @backingInt(Tag.string));
     try writeU32(out, aa, @intCast(s.len));
     try out.appendSlice(aa, s);
 }
 
 /// An exact number from its canonical digits (`-12.50`, `18446744073709551615`).
 pub fn appendNumber(aa: Allocator, out: *std.ArrayList(u8), kind: NumberKind, digits: []const u8) Allocator.Error!void {
-    try out.appendSlice(aa, &.{ @intFromEnum(Tag.number), @intFromEnum(kind) });
+    try out.appendSlice(aa, &.{ @backingInt(Tag.number), @backingInt(kind) });
     try writeU32(out, aa, @intCast(digits.len));
     try out.appendSlice(aa, digits);
 }
@@ -113,7 +113,7 @@ pub fn appendNumber(aa: Allocator, out: *std.ArrayList(u8), kind: NumberKind, di
 /// starting at byte `offsets[i]`.
 pub fn appendArray(aa: Allocator, out: *std.ArrayList(u8), elems: []const u8, offsets: []const u32) Allocator.Error!void {
     const start = out.items.len;
-    try out.append(aa, @intFromEnum(Tag.array));
+    try out.append(aa, @backingInt(Tag.array));
     const bytelen_pos = out.items.len;
     try writeU32(out, aa, 0);
     const count: u32 = @intCast(offsets.len);
@@ -145,7 +145,7 @@ pub fn appendObject(aa: Allocator, out: *std.ArrayList(u8), members: []Member) A
     }
     const unique = members[0..kept];
     const start = out.items.len;
-    try out.append(aa, @intFromEnum(Tag.object));
+    try out.append(aa, @backingInt(Tag.object));
     const bytelen_pos = out.items.len;
     try writeU32(out, aa, 0);
     try writeU32(out, aa, @intCast(unique.len));
@@ -194,20 +194,20 @@ const Parser = struct {
             '{' => try self.object(out),
             '[' => try self.array(out),
             '"' => {
-                try out.append(self.aa, @intFromEnum(Tag.string));
+                try out.append(self.aa, @backingInt(Tag.string));
                 try self.stringBody(out);
             },
             't' => {
                 try self.literal("true");
-                try out.append(self.aa, @intFromEnum(Tag.true));
+                try out.append(self.aa, @backingInt(Tag.true));
             },
             'f' => {
                 try self.literal("false");
-                try out.append(self.aa, @intFromEnum(Tag.false));
+                try out.append(self.aa, @backingInt(Tag.false));
             },
             'n' => {
                 try self.literal("null");
-                try out.append(self.aa, @intFromEnum(Tag.null));
+                try out.append(self.aa, @backingInt(Tag.null));
             },
             '-', '0'...'9' => try self.number(out),
             else => return Error.JsonInvalid,
@@ -450,7 +450,7 @@ pub fn normalize(aa: Allocator, bytes: []const u8) Error!Normalized {
 // ---------------------------------------------------------------------------
 
 pub fn tagOf(v: []const u8) Tag {
-    return @enumFromInt(v[0]);
+    return @fromBackingInt(@intCast(v[0]));
 }
 
 /// Byte length of the value starting at `v[0]`.
@@ -467,7 +467,7 @@ pub fn valueLen(v: []const u8) usize {
 /// Byte length of the value starting at `v[0]`, or null when `v` is too short
 /// to hold it or its tag isn't one.
 pub fn checkedValueLen(v: []const u8) ?usize {
-    if (v.len == 0 or v[0] > @intFromEnum(Tag.number)) return null;
+    if (v.len == 0 or v[0] > @backingInt(Tag.number)) return null;
     const header: usize = switch (tagOf(v)) {
         .null, .false, .true => 1,
         .int, .double => 9,
@@ -485,7 +485,7 @@ pub fn wellFormed(v: []const u8) bool {
     const len = checkedValueLen(v) orelse return false;
     if (len != v.len) return false;
     switch (tagOf(v)) {
-        .number => return v[1] <= @intFromEnum(NumberKind.unsigned),
+        .number => return v[1] <= @backingInt(NumberKind.unsigned),
         .array, .object => {
             if (len < 9) return false;
             const count = readU32(v, 5);
@@ -512,7 +512,7 @@ pub fn wellFormed(v: []const u8) bool {
 }
 
 fn numberKind(v: []const u8) NumberKind {
-    return @enumFromInt(v[1]);
+    return @fromBackingInt(@intCast(v[1]));
 }
 
 fn numberDigits(v: []const u8) []const u8 {
@@ -846,7 +846,7 @@ pub inline fn columnOrder(json: bool, a: []const u8, b: []const u8) std.math.Ord
 }
 
 pub fn compareOperands(a: Operand, b: Operand) std.math.Order {
-    const kind_order = std.math.order(@intFromEnum(std.meta.activeTag(a)), @intFromEnum(std.meta.activeTag(b)));
+    const kind_order = std.math.order(@backingInt(std.meta.activeTag(a)), @backingInt(std.meta.activeTag(b)));
     if (kind_order != .eq) return kind_order;
     return switch (a) {
         .null => .eq,

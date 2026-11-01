@@ -90,26 +90,26 @@ pub const Date = enum(i32) {
     _,
 
     pub fn days(self: Date) i32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
     pub fn fromDays(d: i32) Date {
-        return @enumFromInt(d);
+        return @fromBackingInt(@intCast(d));
     }
     pub fn eq(self: Date, other: Date) bool {
-        return @intFromEnum(self) == @intFromEnum(other);
+        return @backingInt(self) == @backingInt(other);
     }
     pub fn lt(self: Date, other: Date) bool {
-        return @intFromEnum(self) < @intFromEnum(other);
+        return @backingInt(self) < @backingInt(other);
     }
     pub fn lte(self: Date, other: Date) bool {
-        return @intFromEnum(self) <= @intFromEnum(other);
+        return @backingInt(self) <= @backingInt(other);
     }
 
     pub const Ymd = struct { y: i32, m: u8, d: u8 };
 
     /// Howard Hinnant's civil-from-days algorithm.
     pub fn ymd(self: Date) Ymd {
-        var z: i64 = @intFromEnum(self);
+        var z: i64 = @backingInt(self);
         z += 719468;
         const era: i64 = @divFloor(z, 146097);
         const doe: u32 = @intCast(z - era * 146097);
@@ -129,7 +129,7 @@ pub const Date = enum(i32) {
         const mp: u32 = if (v.m > 2) v.m - 3 else v.m + 9;
         const doy: u32 = (153 * mp + 2) / 5 + v.d - 1;
         const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        return @enumFromInt(@as(i32, @intCast(era * 146097 + doe - 719468)));
+        return @fromBackingInt(@intCast(@as(i32, @intCast(era * 146097 + doe - 719468))));
     }
 
     pub fn addMonths(self: Date, n: i32) Date {
@@ -158,22 +158,22 @@ pub const DateTime = enum(i64) {
     _,
 
     pub fn micros(self: DateTime) i64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
     pub fn fromMicros(us: i64) DateTime {
-        return @enumFromInt(us);
+        return @fromBackingInt(@intCast(us));
     }
     pub fn eq(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) == @intFromEnum(other);
+        return @backingInt(self) == @backingInt(other);
     }
     pub fn lt(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) < @intFromEnum(other);
+        return @backingInt(self) < @backingInt(other);
     }
     pub fn lte(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) <= @intFromEnum(other);
+        return @backingInt(self) <= @backingInt(other);
     }
     pub fn date(self: DateTime) Date {
-        return Date.fromDays(@intCast(@divFloor(@intFromEnum(self), std.time.us_per_day)));
+        return Date.fromDays(@intCast(@divFloor(@backingInt(self), std.time.us_per_day)));
     }
 };
 
@@ -309,13 +309,13 @@ pub fn Partition(comptime Input: type) type {
         const Self = @This();
 
         fn fieldType(comptime f: FieldEnum) type {
-            return @typeInfo(Input).@"struct".field_types[@intFromEnum(f)];
+            return @typeInfo(Input).@"struct".field_types[@backingInt(f)];
         }
 
         /// Columnar accessor: `[]const T` for scalars (zero-copy), `Strings`
         /// for text, `Opt(T)` / `OptStrings` for nullable fields.
         pub fn col(self: Self, comptime f: FieldEnum) ColAccessor(fieldType(f)) {
-            const view = self.raw.columns[@intFromEnum(f)];
+            const view = self.raw.columns[@backingInt(f)];
             const u = unwrapOptional(fieldType(f));
             if (u.child == []const u8) {
                 if (u.nullable) return .{ .view = stringViewOf(view), .valid = view.nulls };
@@ -327,7 +327,7 @@ pub fn Partition(comptime Input: type) type {
 
         /// Bool columns (u8 storage): per-row accessor.
         pub fn colBool(self: Self, comptime f: FieldEnum, i: usize) bool {
-            return self.raw.columns[@intFromEnum(f)].data.boolean[i] != 0;
+            return self.raw.columns[@backingInt(f)].data.boolean[i] != 0;
         }
 
         /// One row assembled as an `Input` value. Strings are borrowed.
@@ -376,7 +376,7 @@ pub fn Partition(comptime Input: type) type {
         /// by it). Meaningful only for PARTITION BY columns.
         pub fn key(self: Self, comptime f: FieldEnum) fieldType(f) {
             std.debug.assert(self.len > 0);
-            return fieldValueAt(unwrapOptional(fieldType(f)).child, self.raw.columns[@intFromEnum(f)], 0);
+            return fieldValueAt(unwrapOptional(fieldType(f)).child, self.raw.columns[@backingInt(f)], 0);
         }
     };
 }

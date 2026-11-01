@@ -760,9 +760,9 @@ pub const MemoryAccountant = struct {
         self.lock();
         defer self.reservation_lock.unlock();
         std.debug.assert(self.current_bytes >= bytes);
-        std.debug.assert(self.by_source[@intFromEnum(Source.execution)] >= bytes);
+        std.debug.assert(self.by_source[@backingInt(Source.execution)] >= bytes);
         self.current_bytes -= bytes;
-        self.by_source[@intFromEnum(Source.execution)] -= bytes;
+        self.by_source[@backingInt(Source.execution)] -= bytes;
         self.retired_bytes += bytes;
         self.rearmWatch();
     }
@@ -860,7 +860,7 @@ pub const MemoryAccountant = struct {
         }
         self.current_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.current_bytes);
-        self.by_source[@intFromEnum(source)] += bytes;
+        self.by_source[@backingInt(source)] += bytes;
         if (self.current_bytes < self.watch_next_bytes) return false;
         self.watch_next_bytes = self.current_bytes +| self.watch_step;
         return true;
@@ -929,9 +929,9 @@ pub const MemoryAccountant = struct {
 
     fn releaseLocked(self: *MemoryAccountant, source: Source, bytes: usize) void {
         std.debug.assert(self.current_bytes >= bytes);
-        std.debug.assert(self.by_source[@intFromEnum(source)] >= bytes);
+        std.debug.assert(self.by_source[@backingInt(source)] >= bytes);
         self.current_bytes -= bytes;
-        self.by_source[@intFromEnum(source)] -= bytes;
+        self.by_source[@backingInt(source)] -= bytes;
         self.rearmWatch();
         self.pool.release(bytes);
     }
@@ -967,7 +967,7 @@ pub const MemoryAccountant = struct {
             .{ want / mib, @tagName(failing), self.current_bytes / mib },
         );
         inline for (@typeInfo(Source).@"enum".field_names) |field_name| {
-            const v = self.by_source[@intFromEnum(@field(Source, field_name))];
+            const v = self.by_source[@backingInt(@field(Source, field_name))];
             if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ field_name, v / mib });
         }
         std.debug.print(
@@ -1105,8 +1105,8 @@ test "memory: multiple operators sharing one accountant" {
     try a.reserve(.materialize, 200);
     try std.testing.expectEqual(@as(usize, 700), a.current_bytes);
     // Per-source attribution is tracked independently.
-    try std.testing.expectEqual(@as(usize, 500), a.by_source[@intFromEnum(Source.hash_aggregate)]);
-    try std.testing.expectEqual(@as(usize, 200), a.by_source[@intFromEnum(Source.materialize)]);
+    try std.testing.expectEqual(@as(usize, 500), a.by_source[@backingInt(Source.hash_aggregate)]);
+    try std.testing.expectEqual(@as(usize, 200), a.by_source[@backingInt(Source.materialize)]);
 }
 
 test "memory: tracked allocations charge capacities and refund failed growth" {

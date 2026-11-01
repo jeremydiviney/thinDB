@@ -123,7 +123,7 @@ pub const Array = struct {
         const count = std.mem.readInt(u32, bytes[1..5], .little);
         const vb = validityBytes(count);
         return .{
-            .class = @enumFromInt(bytes[0]),
+            .class = @fromBackingInt(@intCast(bytes[0])),
             .count = count,
             .validity = bytes[HEADER_BYTES..][0..vb],
             .body = bytes[HEADER_BYTES + vb ..],
@@ -189,7 +189,7 @@ pub const Struct = struct {
     }
 
     pub fn class(self: Struct, i: usize) ElemClass {
-        return @enumFromInt(self.classes[i]);
+        return @fromBackingInt(@intCast(self.classes[i]));
     }
 
     pub fn field(self: Struct, i: usize) []const u8 {
@@ -229,7 +229,7 @@ fn structWellFormed(bytes: []const u8, fields: []const types.StructField) bool {
     if (prev != s.data.len) return false;
     for (fields, 0..) |f, i| {
         const class = ElemClass.of(f.type);
-        if (s.classes[i] != @intFromEnum(class)) return false;
+        if (s.classes[i] != @backingInt(class)) return false;
         const value = s.field(i);
         if (!s.isValid(i)) {
             if (value.len != 0) return false;
@@ -245,7 +245,7 @@ fn structWellFormed(bytes: []const u8, fields: []const types.StructField) bool {
 fn arrayWellFormed(bytes: []const u8, element: Type) bool {
     if (bytes.len < HEADER_BYTES) return false;
     const class = ElemClass.of(element);
-    if (bytes[0] != @intFromEnum(class)) return false;
+    if (bytes[0] != @backingInt(class)) return false;
     const count: usize = std.mem.readInt(u32, bytes[1..5], .little);
     const vb = validityBytes(count);
     if (bytes.len - HEADER_BYTES < vb) return false;
@@ -304,7 +304,7 @@ const PickedRows = struct {
 /// `PickedRows`, names.
 fn appendEncodedRows(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, elements: ColumnView, rows: anytype) !void {
     const count = rows.len();
-    try out.append(allocator, @intFromEnum(class));
+    try out.append(allocator, @backingInt(class));
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(count), .little);
     try out.appendSlice(allocator, &count_buf);
@@ -449,7 +449,7 @@ pub fn appendMapConcat(allocator: Allocator, out: *std.ArrayList(u8), parts: []c
 
 /// Append the array of `a`'s elements at `picked`, in that order.
 fn appendPickedElements(allocator: Allocator, out: *std.ArrayList(u8), a: Array, picked: []const u32) !void {
-    try out.append(allocator, @intFromEnum(a.class));
+    try out.append(allocator, @backingInt(a.class));
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(picked.len), .little);
     try out.appendSlice(allocator, &count_buf);
@@ -523,7 +523,7 @@ fn writeFixed(dst: []u8, v: ColumnView, row: usize) void {
 pub fn appendConcat(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, parts: []const []const u8) !void {
     var count: usize = 0;
     for (parts) |p| count += Array.decode(p).count;
-    try out.append(allocator, @intFromEnum(class));
+    try out.append(allocator, @backingInt(class));
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(count), .little);
     try out.appendSlice(allocator, &count_buf);
@@ -698,7 +698,7 @@ pub fn appendStruct(allocator: Allocator, out: *std.ArrayList(u8), fields: []con
     try out.appendSlice(allocator, &count_buf);
     const vb_at = out.items.len;
     try out.appendNTimes(allocator, 0, validityBytes(fields.len));
-    for (fields) |f| try out.append(allocator, @intFromEnum(ElemClass.of(f.type)));
+    for (fields) |f| try out.append(allocator, @backingInt(ElemClass.of(f.type)));
     const offsets_at = out.items.len;
     try out.appendNTimes(allocator, 0, 4 * (fields.len + 1));
     const data_at = out.items.len;
@@ -721,7 +721,7 @@ pub fn appendRawStruct(allocator: Allocator, out: *std.ArrayList(u8), classes: [
     try out.appendSlice(allocator, &count_buf);
     const vb_at = out.items.len;
     try out.appendNTimes(allocator, 0, validityBytes(fields.len));
-    for (classes) |c| try out.append(allocator, @intFromEnum(c));
+    for (classes) |c| try out.append(allocator, @backingInt(c));
     const offsets_at = out.items.len;
     try out.appendNTimes(allocator, 0, 4 * (fields.len + 1));
     const data_at = out.items.len;
@@ -737,7 +737,7 @@ pub fn appendRawStruct(allocator: Allocator, out: *std.ArrayList(u8), classes: [
 /// Append one array of `class` whose elements, none NULL, are stored
 /// bytes already.
 pub fn appendRawArray(allocator: Allocator, out: *std.ArrayList(u8), class: ElemClass, elements: []const []const u8) !void {
-    try out.append(allocator, @intFromEnum(class));
+    try out.append(allocator, @backingInt(class));
     var count_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buf, @intCast(elements.len), .little);
     try out.appendSlice(allocator, &count_buf);

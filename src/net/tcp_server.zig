@@ -347,43 +347,43 @@ fn handleConnection(
         return;
     };
 
-    switch (@intFromEnum(frame.msg_type)) {
-        @intFromEnum(wire.MsgType.req_create_table) => {
+    switch (@backingInt(frame.msg_type)) {
+        @backingInt(wire.MsgType.req_create_table) => {
             handleCreateTable(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_drop_table) => {
+        @backingInt(wire.MsgType.req_drop_table) => {
             handleDropTable(db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_rename_table) => {
+        @backingInt(wire.MsgType.req_rename_table) => {
             handleRenameTable(db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_alter_table) => {
+        @backingInt(wire.MsgType.req_alter_table) => {
             handleAlterTable(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_flush) => {
+        @backingInt(wire.MsgType.req_flush) => {
             handleFlush(db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_compact) => {
+        @backingInt(wire.MsgType.req_compact) => {
             handleCompact(db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_delete) => {
+        @backingInt(wire.MsgType.req_delete) => {
             handleDelete(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };
         },
-        @intFromEnum(wire.MsgType.req_insert) => {
+        @backingInt(wire.MsgType.req_insert) => {
             handleInsert(allocator, db, payload, &writer.interface) catch |err| {
                 try sendError(allocator, &writer.interface, err);
             };

@@ -399,9 +399,9 @@ pub const Connection = struct {
         // of whether the server compressed. Cleanup contract:
         //   - resp_ok: hand the buffer to the caller.
         //   - any other arm: free here.
-        return switch (@intFromEnum(frame.msg_type)) {
-            @intFromEnum(wire.MsgType.resp_ok) => frame.payload,
-            @intFromEnum(wire.MsgType.resp_error) => {
+        return switch (@backingInt(frame.msg_type)) {
+            @backingInt(wire.MsgType.resp_ok) => frame.payload,
+            @backingInt(wire.MsgType.resp_error) => {
                 defer self.allocator.free(frame.payload);
                 const decoded = wire.decodeError(frame.payload) catch return Error.RemoteError;
                 return errorFromCode(decoded.code);
@@ -742,16 +742,16 @@ pub const ClientQuery = struct {
         tcp.frame_payload.clearRetainingCapacity();
         try tcp.frame_payload.appendSlice(self.allocator, frame.payload);
 
-        return switch (@intFromEnum(frame.msg_type)) {
-            @intFromEnum(wire.MsgType.resp_batch) => blk: {
+        return switch (@backingInt(frame.msg_type)) {
+            @backingInt(wire.MsgType.resp_batch) => blk: {
                 tcp.current_batch = try wire.decodeBatch(self.allocator, tcp.frame_payload.items);
                 break :blk tcp.current_batch.?.batch();
             },
-            @intFromEnum(wire.MsgType.resp_end) => blk: {
+            @backingInt(wire.MsgType.resp_end) => blk: {
                 tcp.done = true;
                 break :blk null;
             },
-            @intFromEnum(wire.MsgType.resp_error) => {
+            @backingInt(wire.MsgType.resp_error) => {
                 const decoded = wire.decodeError(tcp.frame_payload.items) catch return Error.RemoteError;
                 return errorFromCode(decoded.code);
             },
@@ -5137,7 +5137,7 @@ fn encodeRowsAsBatchFromIterable(
         const is_nullable = comptime isOptionalType(field_type);
 
         try wire.appendLenString(allocator, out, field_name);
-        try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
+        try out.append(allocator, @backingInt(zigTypeToWireTag(Inner)));
         try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0); // type_extra unused
 
@@ -5178,7 +5178,7 @@ fn encodeRowsAsBatchFromTuple(
         const is_nullable = comptime isOptionalType(field_type);
 
         try wire.appendLenString(allocator, out, field_name);
-        try out.append(allocator, @intFromEnum(zigTypeToWireTag(Inner)));
+        try out.append(allocator, @backingInt(zigTypeToWireTag(Inner)));
         try out.append(allocator, @intFromBool(is_nullable));
         try wire.appendU32(allocator, out, 0);
 

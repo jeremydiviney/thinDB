@@ -235,7 +235,7 @@ pub const Pool = struct {
     /// both directions.
     fn classOf(len: usize, alignment: std.mem.Alignment) ?usize {
         if (len == 0) return null;
-        if (@intFromEnum(alignment) > max_align_log2) return null;
+        if (@backingInt(alignment) > max_align_log2) return null;
         const need_log2 = std.math.log2_int_ceil(usize, len);
         if (need_log2 < min_log2) return null;
         if (need_log2 <= max_log2) return need_log2 - min_log2;

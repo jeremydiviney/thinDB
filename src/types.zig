@@ -123,7 +123,7 @@ pub fn internNested(shape: Nested) error{OutOfMemory}!*const Nested {
 }
 
 fn appendNestedKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), shape: Nested) !void {
-    try key.append(allocator, @intFromEnum(std.meta.activeTag(shape)));
+    try key.append(allocator, @backingInt(std.meta.activeTag(shape)));
     switch (shape) {
         .array => |element| try appendTypeKey(allocator, key, element),
         .map => |m| {
@@ -141,7 +141,7 @@ fn appendNestedKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), shape:
 }
 
 fn appendTypeKey(allocator: std.mem.Allocator, key: *std.ArrayList(u8), t: Type) !void {
-    try key.append(allocator, @intFromEnum(std.meta.activeTag(t)));
+    try key.append(allocator, @backingInt(std.meta.activeTag(t)));
     const payload: u64 = switch (t) {
         .varchar, .char => |n| n,
         .decimal64, .decimal128, .decimal256 => |spec| (@as(u64, spec.p) << 8) | spec.s,
@@ -607,10 +607,10 @@ pub fn canonicalFloatBits(v: anytype) @Int(.unsigned, @bitSizeOf(@TypeOf(v))) {
 pub const Uuid = enum(u128) {
     _,
     pub fn fromU128(v: u128) Uuid {
-        return @enumFromInt(v);
+        return @fromBackingInt(@intCast(v));
     }
     pub fn value(self: Uuid) u128 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -620,10 +620,10 @@ pub const Uuid = enum(u128) {
 pub const Date = enum(i32) {
     _,
     pub fn fromDays(d: i32) Date {
-        return @enumFromInt(d);
+        return @fromBackingInt(@intCast(d));
     }
     pub fn days(self: Date) i32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -631,10 +631,10 @@ pub const Date = enum(i32) {
 pub const DateTime = enum(i64) {
     _,
     pub fn fromMicros(us: i64) DateTime {
-        return @enumFromInt(us);
+        return @fromBackingInt(@intCast(us));
     }
     pub fn micros(self: DateTime) i64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

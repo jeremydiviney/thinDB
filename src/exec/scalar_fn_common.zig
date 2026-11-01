@@ -898,7 +898,7 @@ test "daysToYmd round-trips ymdToDays and matches std's calendar" {
         try std.testing.expectEqual(month, ymd.month);
         try std.testing.expectEqual(day, ymd.day);
 
-        if (day < std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) {
+        if (day < std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(month)))) {
             day += 1;
         } else if (month < 12) {
             day = 1;

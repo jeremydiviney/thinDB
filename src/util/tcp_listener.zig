@@ -62,7 +62,7 @@ fn listenWindows(address: *const Io.net.IpAddress, io: Io) !Io.net.Server {
     const ws = w.ws2_32;
     // Zig's enum omits AFD_SHARE_EXCLUSIVE (3); Passive (1) requests reuse.
     // https://doxygen.reactos.org/de/dd0/sdk_2include_2reactos_2drivers_2afd_2shared_8h_source.html
-    const exclusive_bind: w.AFD.BIND_INFO.MODE = @enumFromInt(3);
+    const exclusive_bind: w.AFD.BIND_INFO.MODE = @fromBackingInt(@intCast(3));
     var handle: w.HANDLE = undefined;
     var status_block: w.IO_STATUS_BLOCK = undefined;
     // Match the AFD handles consumed by Io.Threaded.accept/read/write, without

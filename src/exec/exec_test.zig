@@ -1295,7 +1295,7 @@ test "parallel scan: the next pull frees the materialized buffer the consumer wa
         for (&ids, 0..) |*id, i| id.* = @intCast(150 + i);
         break :blk ids;
     };
-    const materialize = @intFromEnum(exec.memory.Source.materialize);
+    const materialize = @backingInt(exec.memory.Source.materialize);
 
     inline for (.{ 1, 4 }) |dop| {
         // Physical tracking (the scan mints its own accountant from the table
@@ -1395,7 +1395,7 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
         try t.flush();
     }
     const survivors = 350;
-    const materialize = @intFromEnum(exec.memory.Source.materialize);
+    const materialize = @backingInt(exec.memory.Source.materialize);
 
     inline for (.{ 1, 4 }) |dop| {
         // A scan with no filter streams, so it buffers nothing ahead of its

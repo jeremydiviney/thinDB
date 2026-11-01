@@ -1162,7 +1162,7 @@ fn hash_fusion_attempt(input: engine_v2.CompileInput, anchor: *const ir.Op, keys
     hu(&h, @intFromBool(input.session.current_db != null));
     if (input.session.current_db) |db| hstr(&h, db);
     hstr(&h, input.session.current_schema);
-    hu(&h, @intFromEnum(input.session.dialect));
+    hu(&h, @backingInt(input.session.dialect));
     hu(&h, input.effectiveDop());
     hu(&h, @intFromBool(input.force_ordered));
     if (input.prune_names) |names| {
@@ -1221,7 +1221,7 @@ fn hash_fusion_expr(registry: ?*const udf_mod.UdfRegistry, h: *std.hash.Wyhash, 
                 hu(h, entry.arg_types.len);
                 for (entry.arg_types) |arg_type| hashType(h, arg_type);
                 hashType(h, entry.return_type);
-                hu(h, @intFromEnum(entry.null_strategy));
+                hu(h, @backingInt(entry.null_strategy));
                 h.update(std.mem.asBytes(&entry.kernel));
             };
             for (call.args) |arg| try hash_fusion_expr(registry, h, arg);
@@ -1291,7 +1291,7 @@ fn hostr(h: *std.hash.Wyhash, s: ?[]const u8) void {
 /// the program reads their values only through per-run scans, apart from
 /// equality pins, so the shared key hashes only their shape.
 fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) error{RegionUnhashable}!void {
-    hu(h, @intFromEnum(std.meta.activeTag(op.*)));
+    hu(h, @backingInt(std.meta.activeTag(op.*)));
     switch (op.*) {
         .scan => |s| {
             hostr(h, s.table.database);
@@ -1338,7 +1338,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
             hu(h, g.aggs.len);
             for (g.aggs) |spec| {
                 if (spec.out_type_override != null) return Unhashable;
-                hu(h, @intFromEnum(spec.func));
+                hu(h, @backingInt(spec.func));
                 hostr(h, spec.udf_name);
                 hu(h, spec.udf_arg_cols.len);
                 for (spec.udf_arg_cols) |c| hstr(h, c);
@@ -1358,8 +1358,8 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
             try hashOp(h, c.upstream, entry);
         },
         .join => |j| {
-            hu(h, @intFromEnum(j.algorithm));
-            hu(h, @intFromEnum(j.join_type));
+            hu(h, @backingInt(j.algorithm));
+            hu(h, @backingInt(j.join_type));
             hu(h, j.on.len);
             for (j.on) |p| {
                 hstr(h, p.left);
@@ -1369,7 +1369,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
             hu(h, j.ranges.len);
             for (j.ranges) |r| {
                 hstr(h, r.left);
-                hu(h, @intFromEnum(r.op));
+                hu(h, @backingInt(r.op));
                 hstr(h, r.right);
             }
             if (j.extra_predicate) |p| {
@@ -1401,20 +1401,20 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
                 hu(h, spec.partition_by.len);
                 for (spec.partition_by) |c| hstr(h, c);
                 hashSorts(h, spec.order_by);
-                hu(h, @intFromEnum(spec.frame.kind));
+                hu(h, @backingInt(spec.frame.kind));
                 hashBound(h, spec.frame.start);
                 hashBound(h, spec.frame.end);
             }
             hu(h, w.calls.len);
             for (w.calls) |c| {
                 hu(h, c.spec_idx);
-                hu(h, @intFromEnum(c.func));
+                hu(h, @backingInt(c.func));
                 hu(h, c.args.len);
                 for (c.args) |e| try hashExpr(h, e);
                 hu(h, @intFromBool(c.ignore_nulls));
                 hstr(h, c.output_name);
                 if (c.agg) |agg| {
-                    hu(h, @intFromEnum(agg.func));
+                    hu(h, @backingInt(agg.func));
                     hashAggParams(h, agg.params);
                 }
             }
@@ -1422,7 +1422,7 @@ fn hashOp(h: *std.hash.Wyhash, op: *const ir.Op, entry: []const *const ir.Op) er
         },
         .set_union => |u| {
             hu(h, @intFromBool(u.all));
-            hu(h, @intFromEnum(u.kind));
+            hu(h, @backingInt(u.kind));
             try hashOp(h, u.left, entry);
             try hashOp(h, u.right, entry);
         },
@@ -1460,7 +1460,7 @@ fn hashSorts(h: *std.hash.Wyhash, specs: []const ir.SortSpec) void {
 }
 
 fn hashBound(h: *std.hash.Wyhash, b: ir.FrameBound) void {
-    hu(h, @intFromEnum(std.meta.activeTag(b)));
+    hu(h, @backingInt(std.meta.activeTag(b)));
     switch (b) {
         .preceding, .following => |n| hu(h, n),
         else => {},
@@ -1484,14 +1484,14 @@ fn hashAggParams(h: *std.hash.Wyhash, params: ir.AggParams) void {
         },
         .mann_whitney => |m| {
             hu(h, 5);
-            hu(h, @intFromEnum(m.alternative));
+            hu(h, @backingInt(m.alternative));
             hu(h, @intFromBool(m.continuity_correction));
         },
     }
 }
 
 fn hashValue(h: *std.hash.Wyhash, v: Value) void {
-    hu(h, @intFromEnum(std.meta.activeTag(v)));
+    hu(h, @backingInt(std.meta.activeTag(v)));
     switch (v) {
         .tinyint => |x| hu(h, @bitCast(@as(i64, x))),
         .smallint => |x| hu(h, @bitCast(@as(i64, x))),
@@ -1516,7 +1516,7 @@ fn hashType(h: *std.hash.Wyhash, t: types.Type) void {
 }
 
 fn hashExpr(h: *std.hash.Wyhash, e: Expr) error{RegionUnhashable}!void {
-    hu(h, @intFromEnum(std.meta.activeTag(e)));
+    hu(h, @backingInt(std.meta.activeTag(e)));
     switch (e) {
         .col_ref => |n| hstr(h, n),
         .lit => |v| hashValue(h, v),
@@ -1558,7 +1558,7 @@ fn hashEntryPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!
     switch (p) {
         .leaf => |l| if (l.op == .eq) try hashPred(h, p) else try hashPredValues(h, p, false),
         .@"and" => |kids| {
-            hu(h, @intFromEnum(std.meta.activeTag(p)));
+            hu(h, @backingInt(std.meta.activeTag(p)));
             hu(h, kids.len);
             for (kids) |k| try hashEntryPred(h, k);
         },
@@ -1567,28 +1567,28 @@ fn hashEntryPred(h: *std.hash.Wyhash, p: PredicateExpr) error{RegionUnhashable}!
 }
 
 fn hashLiteral(h: *std.hash.Wyhash, v: Value, values: bool) void {
-    if (values) hashValue(h, v) else hu(h, @intFromEnum(std.meta.activeTag(v)));
+    if (values) hashValue(h, v) else hu(h, @backingInt(std.meta.activeTag(v)));
 }
 
 fn hashPredValues(h: *std.hash.Wyhash, p: PredicateExpr, values: bool) error{RegionUnhashable}!void {
     // An AND with a constant-FALSE conjunct is FALSE whatever the other
     // conjuncts hold (the folded `... AND 1=0` arm of a query variant).
     if (predAlwaysFalse(p)) {
-        hu(h, @intFromEnum(std.meta.activeTag(PredicateExpr{ .always = false })));
+        hu(h, @backingInt(std.meta.activeTag(PredicateExpr{ .always = false })));
         hu(h, 0);
         return;
     }
-    hu(h, @intFromEnum(std.meta.activeTag(p)));
+    hu(h, @backingInt(std.meta.activeTag(p)));
     switch (p) {
         .leaf, .day_leaf, .text_as_number => |l| {
             hstr(h, l.col);
-            hu(h, @intFromEnum(l.op));
+            hu(h, @backingInt(l.op));
             hu(h, @intFromBool(l.as_boolean));
             hashLiteral(h, l.val, values);
         },
         .leaf_col_col => |l| {
             hstr(h, l.left);
-            hu(h, @intFromEnum(l.op));
+            hu(h, @backingInt(l.op));
             hstr(h, l.right);
         },
         .is_null, .is_not_null => |c| hstr(h, c),
@@ -2696,7 +2696,7 @@ fn pipeline_recipe_hash(steps: []const Step) u64 {
     var hash = std.hash.Wyhash.init(0x726563697065);
     hu(&hash, steps.len);
     for (steps) |step| {
-        hu(&hash, @intFromEnum(std.meta.activeTag(step)));
+        hu(&hash, @backingInt(std.meta.activeTag(step)));
         if (step == .sql_union) {
             hu(&hash, pipeline_recipe_hash(step.sql_union.left));
             hu(&hash, pipeline_recipe_hash(step.sql_union.right));

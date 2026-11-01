@@ -643,18 +643,18 @@ pub const Bitmap = struct {
 
     pub fn serialize(self: *const Bitmap, gpa: Allocator, out: *std.ArrayList(u8)) Allocator.Error!void {
         const card = self.cardinality();
-        if (card == 0) return out.append(gpa, @intFromEnum(Layout.empty));
+        if (card == 0) return out.append(gpa, @backingInt(Layout.empty));
         const largest = self.max().?;
         if (card == 1) {
             if (largest <= std.math.maxInt(u32)) {
-                try out.append(gpa, @intFromEnum(Layout.single32));
+                try out.append(gpa, @backingInt(Layout.single32));
                 return writeInt(gpa, out, u32, @intCast(largest));
             }
-            try out.append(gpa, @intFromEnum(Layout.single64));
+            try out.append(gpa, @backingInt(Layout.single64));
             return writeInt(gpa, out, u64, largest);
         }
         if (card <= SET_MAX) {
-            try out.append(gpa, @intFromEnum(Layout.set));
+            try out.append(gpa, @backingInt(Layout.set));
             try writeInt(gpa, out, u32, @intCast(card));
             var it = self.iterator();
             while (it.next()) |v| try writeInt(gpa, out, u64, v);
@@ -662,10 +662,10 @@ pub const Bitmap = struct {
         }
         const chunks = self.chunks.items;
         if (largest <= std.math.maxInt(u32)) {
-            try out.append(gpa, @intFromEnum(Layout.bitmap32));
+            try out.append(gpa, @backingInt(Layout.bitmap32));
             return writePortable(gpa, out, chunks);
         }
-        try out.append(gpa, @intFromEnum(Layout.bitmap64));
+        try out.append(gpa, @backingInt(Layout.bitmap64));
         var buckets: u64 = 0;
         for (chunks, 0..) |ch, i| buckets += @intFromBool(i == 0 or chunks[i - 1].key >> 16 != ch.key >> 16);
         try writeVarint(gpa, out, buckets);
@@ -798,15 +798,15 @@ pub fn cardinalityOf(bytes: []const u8) error{BitmapInvalid}!u64 {
 /// Appends the stored form of the set `{v}`, as `to_bitmap(v)` gives.
 pub fn appendSingle(gpa: Allocator, out: *std.ArrayList(u8), v: u64) Allocator.Error!void {
     if (v <= std.math.maxInt(u32)) {
-        try out.append(gpa, @intFromEnum(Layout.single32));
+        try out.append(gpa, @backingInt(Layout.single32));
         return writeInt(gpa, out, u32, @intCast(v));
     }
-    try out.append(gpa, @intFromEnum(Layout.single64));
+    try out.append(gpa, @backingInt(Layout.single64));
     try writeInt(gpa, out, u64, v);
 }
 
 /// The stored form of the empty set.
-pub const EMPTY_BYTES = [_]u8{@intFromEnum(Layout.empty)};
+pub const EMPTY_BYTES = [_]u8{@backingInt(Layout.empty)};
 
 /// The member a text spells: an unsigned 64-bit decimal, spaces around it
 /// allowed.

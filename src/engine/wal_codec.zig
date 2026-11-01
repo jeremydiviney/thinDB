@@ -178,7 +178,7 @@ pub fn applyDeleteRecord(allocator: Allocator, payload: []const u8, mt: *Memtabl
     cursor += 1;
 
     const col_idx = mt.schema.columnIndex(col_name) orelse return Error.WalCorrupt;
-    const value = try decodeValue(@enumFromInt(value_tag_byte), payload, &cursor);
+    const value = try decodeValue(@fromBackingInt(@intCast(value_tag_byte)), payload, &cursor);
 
     // Apply: rebuild memtable keeping rows that DON'T match.
     const n: usize = @intCast(mt.row_count);
@@ -753,8 +753,8 @@ fn decodeOwnedPredicate(payload: []const u8, cursor: *usize, alloc: Allocator) !
     if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
     const tag_byte = payload[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTagWal.in_set)) return Error.WalUnknownRecord;
-    const tag: PredTagWal = @enumFromInt(tag_byte);
+    if (tag_byte > @backingInt(PredTagWal.in_set)) return Error.WalUnknownRecord;
+    const tag: PredTagWal = @fromBackingInt(@intCast(tag_byte));
     return switch (tag) {
         .leaf => blk: {
             if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
@@ -764,7 +764,7 @@ fn decodeOwnedPredicate(payload: []const u8, cursor: *usize, alloc: Allocator) !
             if (cursor.* + 1 > payload.len) return Error.WalCorrupt;
             const val_tag_byte = payload[cursor.*];
             cursor.* += 1;
-            const val = try decodeValue(@enumFromInt(val_tag_byte), payload, cursor);
+            const val = try decodeValue(@fromBackingInt(@intCast(val_tag_byte)), payload, cursor);
             break :blk OwnedPredicate{ .leaf = .{ .col = col, .op = op_byte, .val = val } };
         },
         .leaf_col_col => blk: {
@@ -811,7 +811,7 @@ fn decodeOwnedPredicate(payload: []const u8, cursor: *usize, alloc: Allocator) !
             const n = format.readU32(payload[cursor.*..][0..4]);
             cursor.* += 4;
             const vals = try alloc.alloc(Value, n);
-            for (vals) |*v| v.* = try decodeValue(@enumFromInt(val_tag_byte), payload, cursor);
+            for (vals) |*v| v.* = try decodeValue(@fromBackingInt(@intCast(val_tag_byte)), payload, cursor);
             break :blk OwnedPredicate{ .in_set = .{ .col = col, .negate = negate, .values = vals } };
         },
     };

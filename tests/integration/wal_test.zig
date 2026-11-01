@@ -761,7 +761,7 @@ test "wal: an UPDATE cut off at any logged point keeps all its rows old or all n
             const payload_len = std.mem.readInt(u32, wal_after[cursor + 1 ..][0..4], .little);
             cursor += thindb.engine.wal.record_header_size + payload_len + thindb.engine.wal.record_trailer_size;
             if (cursor >= update_start) try ends.append(aa, cursor);
-            if (tag == @intFromEnum(thindb.engine.wal.RecordType.statement)) statement_records += 1;
+            if (tag == @backingInt(thindb.engine.wal.RecordType.statement)) statement_records += 1;
         }
         try std.testing.expectEqual(wal_after.len, cursor);
         try std.testing.expectEqual(@as(usize, 1), statement_records);
@@ -853,7 +853,7 @@ fn countRecords(wal: []const u8, tag: thindb.engine.wal.RecordType) usize {
     var count: usize = 0;
     var cursor: usize = thindb.engine.wal.header_size;
     while (cursor < wal.len) {
-        if (wal[cursor] == @intFromEnum(tag)) count += 1;
+        if (wal[cursor] == @backingInt(tag)) count += 1;
         const payload_len = std.mem.readInt(u32, wal[cursor + 1 ..][0..4], .little);
         cursor += thindb.engine.wal.record_header_size + payload_len + thindb.engine.wal.record_trailer_size;
     }
