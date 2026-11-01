@@ -77,6 +77,10 @@ pub const CountSketch = struct {
     threshold: u64 = 0,
     rows: u64 = 0,
     kept_rows: u64 = 0,
+    /// The fewest rows a group needs to place at all: the filter pass
+    /// drops every counter below it, and once the threshold is down to it
+    /// the pass holds every group that can place.
+    floor: u64 = 0,
     /// Where the tally records its rows' counters for the filter pass.
     row_slots: ?RowSlots = null,
     /// Set when the tally declined because a key is near-unique, which
@@ -160,9 +164,10 @@ pub const CountSketch = struct {
 
         var best: [MAX_NEED]u32 = undefined;
         const kth = kthLargest(u32, totals, best[0..need]);
-        if (@as(f64, @floatFromInt(kth)) <= collisionCeiling(self.rows, self.bits)) return false;
+        if (@as(f64, @floatFromInt(@max(kth, self.floor))) <= collisionCeiling(self.rows, self.bits)) return false;
         self.threshold = @max(1, kth / 2);
         if (ranked_by == .at_most_row_count) self.threshold = lowestThreshold(totals, self.threshold, self.rows / BELOW_ROW_COUNT_KEPT_FRACTION_DENOM);
+        self.threshold = @max(self.threshold, self.floor);
 
         self.keep = try allocator.alloc(u64, n / 64);
         return self.fillKeep(totals);
@@ -175,7 +180,7 @@ pub const CountSketch = struct {
     pub fn retarget(self: *CountSketch, kth_count: u64) bool {
         const n = @as(usize, 1) << self.bits;
         const w = std.mem.indexOfScalar(bool, self.touched, true) orelse return false;
-        self.threshold = kth_count + 1;
+        self.threshold = @max(kth_count + 1, self.floor);
         return self.fillKeep(self.counts[w * n ..][0..n]);
     }
 
@@ -198,7 +203,7 @@ pub const CountSketch = struct {
     /// Whether a filter pass that found `found` groups, the need-th best
     /// holding `kth_count` rows, found the top `need` of every group.
     pub fn exact(self: *const CountSketch, need: usize, found: usize, kth_count: u64) bool {
-        if (self.kept_rows == self.rows) return true;
+        if (self.kept_rows == self.rows or self.threshold <= self.floor) return true;
         return found >= need and kth_count + 1 >= self.threshold;
     }
 };
@@ -771,6 +776,11 @@ pub const HeavyKeys = struct {
     workers: []Worker,
     top_keys: []u128,
     top_counts: []u64,
+    /// The fewest rows a group needs to place at all: `settle` passes over
+    /// every key that can't reach it, as over those that can't reach τ.
+    floor: u64 = 0,
+    /// At least the rows the tally sees, over which `floor` prorates.
+    input_rows: u64 = 0,
     /// Set when the tally declined before scanning for want of input: the
     /// counter sketch would decline too.
     declined_small: bool = false,
@@ -860,11 +870,13 @@ pub const HeavyKeys = struct {
     /// of the unit's share of τ. The unit's own need-th count overshoots it
     /// where hot keys come and go between units; worker `w`'s need-th best
     /// partial prorated by rows undershoots it early on, which costs only
-    /// hashing.
+    /// hashing. A floor above τ raises the share to the floor's, prorated
+    /// over the input.
     pub fn unitThreshold(self: *const HeavyKeys, w: usize, rows: u64, unit_kth: u64) u64 {
         const worker = &self.workers[w];
         var share = unit_kth;
         if (worker.rows > 0) share = @min(share, @as(u64, @intCast(@as(u128, worker.kth()) * rows / worker.rows)));
+        if (self.input_rows > 0) share = @max(share, @as(u64, @intCast(@as(u128, self.floor) * @min(rows, self.input_rows) / self.input_rows)));
         return 1 + share / SLACK_SHARE_DENOM;
     }
 
@@ -932,14 +944,14 @@ pub const HeavyKeys = struct {
         var values = merged.valueIterator();
         while (values.next()) |p| : (i += 1) counts[i] = p.count;
         var best: [MAX_NEED]u64 = undefined;
-        const tau = kthLargest(u64, counts, best[0..self.need]);
+        const tau = @max(kthLargest(u64, counts, best[0..self.need]), self.floor);
         if (tau <= slack) return false;
 
         var n: usize = 0;
         for (counts) |c| n += @intFromBool(c + slack >= tau);
         if (n > MAX_HEAVY_CANDIDATES) return false;
         try self.candidates.ensureTotalCapacity(allocator, @intCast(n));
-        self.signature_bits = @intCast(@max(6, std.math.log2_int_ceil(usize, 2 * n)));
+        self.signature_bits = @intCast(@max(6, std.math.log2_int_ceil(usize, @max(1, 2 * n))));
         self.signatures = try allocator.alloc(u64, @as(usize, 1) << self.signature_bits);
         @memset(self.signatures, 0);
         const sorted = try allocator.alloc(Candidate, n);

@@ -814,6 +814,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .hashed = ctx.plan.hashed,
             .key_bound = ctx.request.key_bound,
             .count_sketch = (canUseCoreCountDescTopN(ctx) or rankedByDistinctCount(ctx)) and ctx.request.key_bound == null,
+            .count_floor = if (ctx.request.having_filter) |having| countFloor(&ctx.plan, having) orelse 0 else 0,
             .count_rank = if (!canUseCoreCountDescTopN(ctx) and rankedByDistinctCount(ctx))
                 .{ .ctx = ctx, .value = distinctCountRank }
             else
@@ -839,7 +840,9 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
 fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
     // HAVING reduces the group set before LIMIT, so the core must emit every
     // group; the top-N is then taken after applyHaving in prepareFinalRows.
-    if (ctx.request.having_filter != null) return false;
+    if (ctx.request.having_filter) |having| {
+        if (countFloor(&ctx.plan, having) == null) return false;
+    }
     if (ctx.request.order_specs.len != 1) return false;
     if (!ctx.request.order_specs[0].desc) return false;
     if (ctx.request.limit == 0) return false;
@@ -852,6 +855,62 @@ fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
         // Only counts that mirror the group row count rank via the core's
         // count-desc heap; a nullable COUNT(col) accumulates its own slot.
         if (agg.func == .count and agg.state_index == 0 and types.columnNameEql(agg.name, ctx.request.order_specs[0].col)) return true;
+    }
+    return false;
+}
+
+// The fewest rows a group needs to pass a HAVING that only bounds the row
+// count from below, or null for any other HAVING. Such a HAVING keeps a
+// prefix of the count order, ties included, so the best groups filtered by
+// it are the best groups that pass it, and a count sketch may pass over
+// every group short of the floor.
+fn countFloor(plan: *const ShapePlan, expr: PredicateExpr) ?u64 {
+    switch (expr) {
+        .leaf => |p| {
+            if (!isRowCount(plan, p.col)) return null;
+            return leastCountPassing(p.op, valueAsNum(p.val) orelse return null);
+        },
+        .@"and" => |children| {
+            var floor: u64 = 0;
+            for (children) |child| floor = @max(floor, countFloor(plan, child) orelse return null);
+            return floor;
+        },
+        .@"or" => |children| {
+            var floor: u64 = std.math.maxInt(u64);
+            for (children) |child| floor = @min(floor, countFloor(plan, child) orelse return null);
+            return floor;
+        },
+        else => return null,
+    }
+}
+
+// The least row count that havingPasses lets through `count op v`, for
+// the ops that bound it from below.
+fn leastCountPassing(op: exec.predicate.PredicateOp, v: Num) ?u64 {
+    if (op != .gt and op != .gte) return null;
+    switch (v) {
+        .i => |x| {
+            const least = if (op == .gt) x +| 1 else x;
+            if (least <= 0) return 0;
+            return std.math.cast(u64, least) orelse std.math.maxInt(u64);
+        },
+        .f => |x| {
+            if (std.math.isNan(x)) return null;
+            const least = if (op == .gt) @floor(x) + 1 else @ceil(x);
+            if (least <= 0) return 0;
+            if (least >= 0x1p64) return std.math.maxInt(u64);
+            return @intFromFloat(least);
+        },
+    }
+}
+
+// Resolves `name` the way havingOutputNum does: key parts first.
+fn isRowCount(plan: *const ShapePlan, name: []const u8) bool {
+    for (plan.layout.parts[0..plan.layout.part_count]) |part| {
+        if (types.columnNameEql(name, part.name)) return false;
+    }
+    for (plan.aggregates[0..plan.aggregate_count]) |agg| {
+        if (types.columnNameEql(name, agg.name)) return agg.func == .count and agg.state_index == 0;
     }
     return false;
 }

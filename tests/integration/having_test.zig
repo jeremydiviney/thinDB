@@ -177,6 +177,12 @@ const repeated_aggregate_cases = .{
     .{ .sql = "SELECT g, MAX(v) AS mx, MAX(v) + MIN(v) AS spread FROM r GROUP BY g HAVING MAX(v) - MIN(v) >= 0 ORDER BY MAX(v), g", .want = "3|7|12\n2|20|25\n4|30|31\n1|100|110" },
     .{ .sql = "SELECT k, COUNT(DISTINCT s) AS ds FROM r GROUP BY k HAVING COUNT(DISTINCT S) >= 2 AND COUNT(s) > 2 ORDER BY k", .want = "east|3" },
     .{ .sql = "SELECT k, COUNT(*) FROM r GROUP BY ROLLUP(k) HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC", .want = "NULL|10\neast|4\nnorth|3\nwest|2" },
+    .{ .sql = "SELECT k, COUNT(*) AS c FROM r GROUP BY k HAVING COUNT(*) >= 2 ORDER BY c DESC LIMIT 2", .want = "east|4\nnorth|3" },
+    .{ .sql = "SELECT k, COUNT(*) AS c FROM r GROUP BY k HAVING COUNT(*) > 2 ORDER BY c DESC LIMIT 5", .want = "east|4\nnorth|3" },
+    .{ .sql = "SELECT k, COUNT(*) AS c FROM r GROUP BY k HAVING c >= 2 ORDER BY c DESC LIMIT 2 OFFSET 1", .want = "north|3\nwest|2" },
+    .{ .sql = "SELECT COUNT(*) AS c FROM r GROUP BY g HAVING COUNT(*) > 2 OR COUNT(*) >= 4 ORDER BY c DESC LIMIT 4", .want = "3\n3" },
+    .{ .sql = "SELECT k, COUNT(*) AS c FROM r GROUP BY k HAVING COUNT(*) < 4 ORDER BY c DESC LIMIT 1", .want = "north|3" },
+    .{ .sql = "SELECT k, COUNT(*) AS c FROM r GROUP BY k HAVING COUNT(*) > 1 AND k <> 'east' ORDER BY c DESC LIMIT 1", .want = "north|3" },
     .{ .sql = "SELECT k, COUNT(*) AS c, SUM(COUNT(*)) OVER () AS total, RANK() OVER (ORDER BY COUNT(*) DESC) AS rk FROM r GROUP BY k ORDER BY k", .want = "east|4|10|1\nnorth|3|10|2\nsouth|1|10|4\nwest|2|10|3" },
     .{ .sql = "SELECT DISTINCT MAX(v) - MIN(v) AS d FROM r GROUP BY g HAVING MAX(v) > 0 ORDER BY MAX(v) - MIN(v) DESC", .want = "90\n29\n15\n2" },
 };
