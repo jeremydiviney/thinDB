@@ -779,6 +779,8 @@ pub const HeavyKeys = struct {
     /// The fewest rows a group needs to place at all: `settle` passes over
     /// every key that can't reach it, as over those that can't reach τ.
     floor: u64 = 0,
+    /// At least the rows the tally sees, over which `floor` prorates.
+    input_rows: u64 = 0,
     /// Set when the tally declined before scanning for want of input: the
     /// counter sketch would decline too.
     declined_small: bool = false,
@@ -868,11 +870,13 @@ pub const HeavyKeys = struct {
     /// of the unit's share of τ. The unit's own need-th count overshoots it
     /// where hot keys come and go between units; worker `w`'s need-th best
     /// partial prorated by rows undershoots it early on, which costs only
-    /// hashing.
+    /// hashing. A floor above τ raises the share to the floor's, prorated
+    /// over the input.
     pub fn unitThreshold(self: *const HeavyKeys, w: usize, rows: u64, unit_kth: u64) u64 {
         const worker = &self.workers[w];
         var share = unit_kth;
         if (worker.rows > 0) share = @min(share, @as(u64, @intCast(@as(u128, worker.kth()) * rows / worker.rows)));
+        if (self.input_rows > 0) share = @max(share, @as(u64, @intCast(@as(u128, self.floor) * @min(rows, self.input_rows) / self.input_rows)));
         return 1 + share / SLACK_SHARE_DENOM;
     }
 

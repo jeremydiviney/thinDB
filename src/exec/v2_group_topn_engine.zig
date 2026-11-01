@@ -1148,6 +1148,7 @@ fn runCountSketch(
         var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
         defer heavy.deinit(allocator);
         heavy.floor = floor;
+        heavy.input_rows = snapshotRows(cfg.snapshot);
         if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
         if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
         if (heavy.declined_small) return false;
