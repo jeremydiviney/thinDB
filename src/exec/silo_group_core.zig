@@ -5196,6 +5196,11 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
         const use_fold = layout.has_weight and !parts.fold_off and parts.fold_slots.len != 0;
+        // The staged row the previous source row went to: a repeated key
+        // (sorted data, or a collapsed batch's derived values) folds there
+        // without probing, wherever the fold index had put the row.
+        var last: usize = active.len() -% 1;
+        var last_key: u128 = if (active.len() > 0) active.keyAt(last) else 0;
         // The row loop is duplicated on the (per-batch constant) validity
         // flag so the non-nullable copy carries zero per-row validity code —
         // this loop runs once per scanned row on every staged GROUP BY.
@@ -5218,7 +5223,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             const key = if (hashed_ids) |ids| ids[r] else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             // Weighted collapse (decomposable programs): a key already staged
-            // in the chunk — the adjacent row, or one the fold index finds —
+            // in the chunk — the previous row's, or one the fold index finds —
             // folds into that row instead of appending, so the chunk ships
             // ONE (key, weight, partials) row per key. The creating row's
             // rowref is kept (any row of the key has the same key values).
@@ -5227,8 +5232,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             if (layout.has_weight) {
                 // A collapsed batch's row stands for `w` equal rows.
                 const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
-                if (idx > 0 and active.keyAt(idx - 1) == key and active.weightAll()[idx - 1] <= std.math.maxInt(u32) - w) {
-                    weightFoldRow(parts, active, weight_specs, str_inputs, idx - 1, r, w);
+                if (last < idx and last_key == key and active.weightAll()[last] <= std.math.maxInt(u32) - w) {
+                    weightFoldRow(parts, active, weight_specs, str_inputs, last, r, w);
                     accepted += w;
                     continue;
                 }
@@ -5237,6 +5242,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                     probes += 1;
                     if (held < idx and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
                         weightFoldRow(parts, active, weight_specs, str_inputs, held, r, w);
+                        last = held;
+                        last_key = key;
                         hits += 1;
                         accepted += w;
                         continue;
@@ -5251,6 +5258,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
+                last = idx;
+                last_key = key;
                 accepted += w;
                 continue;
             }
@@ -5767,7 +5776,7 @@ inline fn weightFoldRow(parts: *WorkerParts, active: *RawRows, specs: []const We
 // Fold source row `src`, standing for `w` equal rows, into staged row `idx`:
 // a sum takes its value `w` times over (unless the value sums them already),
 // an extreme takes it once.
-fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
+inline fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
     if (w == 1) return weightFoldRange(active, specs, idx, src, src + 1, init);
     for (specs, 0..) |spec, c| {
         if (spec.op != .sum or spec.summed) {
@@ -5886,7 +5895,7 @@ fn weightFoldRange(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, 
     for (specs, 0..) |spec, c| weightFoldOne(active, spec, c, idx, r0, r1, init);
 }
 
-fn weightFoldOne(active: *RawRows, spec: WeightFoldSpec, c: usize, idx: usize, r0: usize, r1: usize, init: bool) void {
+inline fn weightFoldOne(active: *RawRows, spec: WeightFoldSpec, c: usize, idx: usize, r0: usize, r1: usize, init: bool) void {
     {
         switch (spec.op) {
             inline else => |op| {
@@ -9015,15 +9024,22 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
     const k = keys.len;
     for (layout.key_columns) |part| {
         if (!part.nullable) continue;
-        // A wide key compares several columns before a miss, so past its
-        // first 64 rows a batch whose rows repeat under one in eight stops
-        // checking.
+        // A wide key compares several columns before a miss, so while the
+        // checked rows repeat under one in eight, only every eighth row
+        // checks. Those keep checking: a collapsed batch's first sorted
+        // values often hold no repeats where the rest mostly do.
+        var checked: usize = 0;
         var repeats: usize = 0;
         for (out, 0..) |*id, r| {
-            if (r > 0 and (r < 64 or 8 * repeats >= r) and keyRowRepeats(layout, keys, r)) {
-                id.* = out[r - 1];
-                repeats += 1;
-            } else id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+            if (r > 0 and (8 * repeats >= checked or r % 8 == 0)) {
+                checked += 1;
+                if (keyRowRepeats(layout, keys, r)) {
+                    id.* = out[r - 1];
+                    repeats += 1;
+                    continue;
+                }
+            }
+            id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
         }
         return;
     }
