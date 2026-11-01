@@ -1250,7 +1250,7 @@ fn runHeavyKeys(
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
-    if (heavy.declined_small or !try heavy.settle(allocator)) return false;
+    if (heavy.declined_small or heavy.declined() or !try heavy.settle(allocator)) return false;
     if (heavy.candidates.count() == 0) return true;
 
     var filter = cfg;

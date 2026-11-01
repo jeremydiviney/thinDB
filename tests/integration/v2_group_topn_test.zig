@@ -2656,6 +2656,25 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         try std.testing.expectEqual(@as(usize, 10), rank);
     }
     {
+        // Past the heavy keys the need reaches the one-row keys, which every
+        // unit then reports: the heavy tally declines mid-pass.
+        var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s ORDER BY c DESC LIMIT 1000");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                if (rank < heavy_groups) {
+                    var buf: [16]u8 = undefined;
+                    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "key-{d}", .{rank}), batch.values[0].data.string.rowBytes(r));
+                }
+                const expected: i64 = if (rank < heavy_groups) counts[rank] else 1;
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(expected)), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1000), rank);
+    }
+    {
         var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s HAVING COUNT(*) > 4500 ORDER BY c DESC LIMIT 6 OFFSET 2");
         defer q.deinit();
         var rank: usize = 2;
