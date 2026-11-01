@@ -470,10 +470,8 @@ pub fn lowerKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnS
 // octet_length / byte length: raw byte count.
 pub fn lengthKernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
     const sv = stringViewOf(args[0]);
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        try out.data.int.append(allocator, @intCast(sv.rowBytes(i).len));
-    }
+    try out.data.int.ensureUnusedCapacity(allocator, row_count);
+    for (0..row_count) |i| out.data.int.appendAssumeCapacity(@intCast(sv.rowBytes(i).len));
 }
 
 // length / char_length: UTF-8 character (codepoint) count, matching DuckDB and

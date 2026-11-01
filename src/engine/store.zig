@@ -98,7 +98,11 @@ pub const StringStore = struct {
             self.wide_offsets = wo;
             return;
         }
-        try self.offsets.append(allocator, @intCast(total));
+        // Row-at-a-time kernels reserve a batch's offsets up front, so the
+        // growth path stays out of their per-row call.
+        if (self.offsets.items.len < self.offsets.capacity) {
+            self.offsets.appendAssumeCapacity(@intCast(total));
+        } else try self.offsets.append(allocator, @intCast(total));
     }
 
     pub fn isWide(self: StringStore) bool {
