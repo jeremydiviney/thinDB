@@ -274,25 +274,26 @@ pub const RowGroupSlice = struct { seg: usize, rg: usize, rows: u32, offset: u32
 /// (`Scan.setRowSieve`). Of a recorded row group, the second pass emits
 /// just the rows the first emitted (bit r of `held`) whose slots pass: the
 /// k-th held row's slot is `slots[k]`, passing when that bit of `keep` is
-/// set. The filter needn't run again there. A row group without a record
-/// passes every row.
+/// set, and a record without slots passes every held row. The filter
+/// needn't run again there. A row group without a record passes every row.
 pub const RowSieve = struct {
     /// Per segment of the snapshot, the flat index of its first row group.
     seg_first: []const usize,
-    /// Per flat row group, its record's rows and their slots, or null.
+    /// Per flat row group, its record's rows and their slots, or null;
+    /// no record has slots when `slots` is null.
     held: []const ?[]const u64,
-    slots: []const ?[]const u32,
+    slots: ?[]const ?[]const u32,
     keep: []const u64,
     /// When set, `keep` (a power of two bits long) tests a slot's low bits,
     /// and a row passes only if its slot is among these, ascending.
     exact: ?[]const u32 = null,
 
-    const Record = struct { held: []const u64, slots: []const u32 };
+    const Record = struct { held: []const u64, slots: ?[]const u32 };
 
     fn recordOf(self: RowSieve, seg: usize, rg: usize) ?Record {
         if (seg >= self.seg_first.len) return null;
         const i = self.seg_first[seg] + rg;
-        return .{ .held = self.held[i] orelse return null, .slots = self.slots[i].? };
+        return .{ .held = self.held[i] orelse return null, .slots = if (self.slots) |slots| slots[i] else null };
     }
 
     /// Clears `mask`'s rows the record doesn't hold or whose slots don't
@@ -304,7 +305,7 @@ pub const RowSieve = struct {
                 m.* = false;
                 continue;
             }
-            m.* = m.* and self.passes(record.slots[k]);
+            if (record.slots) |slots| m.* = m.* and self.passes(slots[k]);
             k += 1;
         }
     }
@@ -313,10 +314,18 @@ pub const RowSieve = struct {
     fn pick(self: RowSieve, record: Record, mask: []bool) usize {
         var k: usize = 0;
         var picked: usize = 0;
+        const slots = record.slots orelse {
+            for (record.held, 0..) |word, w| {
+                var bits = word;
+                while (bits != 0) : (bits &= bits - 1) mask[w * 64 + @ctz(bits)] = true;
+                picked += @popCount(word);
+            }
+            return picked;
+        };
         for (record.held, 0..) |word, w| {
             var bits = word;
             while (bits != 0) : (bits &= bits - 1) {
-                if (self.passes(record.slots[k])) {
+                if (self.passes(slots[k])) {
                     mask[w * 64 + @ctz(bits)] = true;
                     picked += 1;
                 }
