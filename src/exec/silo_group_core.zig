@@ -293,7 +293,9 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
 /// Where each region of a staged-rows slab starts: the keys, each payload
 /// column, the rowrefs (when the layout has them), the weights (likewise),
 /// then the nullable inputs' validity bytes. Row loops read them per row, so
-/// a slab computes them once for its layout and capacity.
+/// a slab computes them once for its layout and capacity. The accessors that
+/// index `columns` take their rows by pointer: a by-value copy indexed at
+/// runtime can't stay in registers, so every call would copy the struct.
 const SlabOffsets = struct {
     columns: [MAX_GROUP_PAYLOAD_COLUMNS]usize = @splat(0),
     rowref: usize = 0,
@@ -385,7 +387,7 @@ const RawRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnByteSlab(self: RawRows, column_index: usize) []u8 {
+    inline fn columnByteSlab(self: *const RawRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.offsets.columns[column_index])[0 .. sz * self.capacity_rows];
     }
@@ -1063,13 +1065,13 @@ const GroupRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnTypedAll(self: GroupRows, comptime T: type, column_index: usize) []T {
+    inline fn columnTypedAll(self: *const GroupRows, comptime T: type, column_index: usize) []T {
         return @as([*]T, @ptrCast(@alignCast(self.slab.ptr + self.offsets.columns[column_index])))[0..self.capacity_rows];
     }
 
     // Read aggregate-input column `column_index` at `row` as i64 (integer
     // physical types, sign-extended) — the generic native-width group read.
-    inline fn columnIntAt(self: GroupRows, column_index: usize, row: usize) i64 {
+    inline fn columnIntAt(self: *const GroupRows, column_index: usize, row: usize) i64 {
         return switch (self.layout.columns[column_index].physical_type) {
             .i8 => self.columnTypedAll(i8, column_index)[row],
             .i16 => self.columnTypedAll(i16, column_index)[row],
@@ -1082,7 +1084,7 @@ const GroupRows = struct {
     // Read aggregate-input column `column_index` at `row` as f64 (float
     // physical types direct/widened; integer physical types converted) — the
     // float counterpart to columnIntAt for SUM/AVG/MIN/MAX over float inputs.
-    inline fn columnFloatAt(self: GroupRows, column_index: usize, row: usize) f64 {
+    inline fn columnFloatAt(self: *const GroupRows, column_index: usize, row: usize) f64 {
         return switch (self.layout.columns[column_index].physical_type) {
             .i8 => @floatFromInt(self.columnTypedAll(i8, column_index)[row]),
             .i16 => @floatFromInt(self.columnTypedAll(i16, column_index)[row]),
@@ -1093,7 +1095,7 @@ const GroupRows = struct {
         };
     }
 
-    inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
+    inline fn columnByteSlab(self: *const GroupRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
         return (self.slab.ptr + self.offsets.columns[column_index])[0 .. sz * self.capacity_rows];
     }
@@ -9013,7 +9015,16 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
     const k = keys.len;
     for (layout.key_columns) |part| {
         if (!part.nullable) continue;
-        for (out, 0..) |*id, r| id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+        // A wide key compares several columns before a miss, so past its
+        // first 64 rows a batch whose rows repeat under one in eight stops
+        // checking.
+        var repeats: usize = 0;
+        for (out, 0..) |*id, r| {
+            if (r > 0 and (r < 64 or 8 * repeats >= r) and keyRowRepeats(layout, keys, r)) {
+                id.* = out[r - 1];
+                repeats += 1;
+            } else id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+        }
         return;
     }
     // A lone string key's digest is its identity, not a part to digest.
@@ -9042,6 +9053,26 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
             else => return error.UnsupportedOperatorForType,
         }
     }
+}
+
+/// Whether row `r` of `keys` holds row `r - 1`'s key, by the parts
+/// hashGenericKeyFromViews digests: adjacent rows often repeat a key (a
+/// collapsed batch's derived values follow their sorted source values), and
+/// a repeat takes the previous row's identity instead of its digests.
+fn keyRowRepeats(layout: GroupRowsLayout, keys: *const BatchKeys, r: usize) bool {
+    for (layout.key_columns, keys.views[0..keys.len], keys.digests[0..keys.len]) |part, view, digests| {
+        if (part.nullable) {
+            const valid = view.isValid(r);
+            if (valid != view.isValid(r - 1)) return false;
+            if (!valid) continue;
+        }
+        const same = switch (view.data) {
+            .string, .varchar, .char, .json, .nested, .bitmap => |sv| if (digests) |ds| ds[r] == ds[r - 1] else std.mem.eql(u8, sv.rowBytes(r), sv.rowBytes(r - 1)),
+            else => (readGenericKeyBits(view, part.typ, r) catch 0) == (readGenericKeyBits(view, part.typ, r - 1) catch 0),
+        };
+        if (!same) return false;
+    }
+    return true;
 }
 
 test "hashed identities filled by column match hashGenericKeyFromViews row by row" {
@@ -9089,6 +9120,8 @@ test "hashed identities filled by column match hashGenericKeyFromViews row by ro
         // Pairings readGenericKeyBits rejects key as part 0.
         .{ Key{ .view = minute, .typ = .bigint }, Key{ .view = .{ .data = .{ .double = ratios } }, .typ = .double }, Key{ .view = phrase, .typ = .string } },
         .{ Key{ .view = phrase, .typ = .string }, Key{ .view = .{ .data = .{ .bigint = users }, .nulls = &nulls }, .typ = .bigint, .nullable = true } },
+        .{Key{ .view = .{ .data = .{ .string = sv }, .nulls = &nulls }, .typ = .string, .nullable = true }},
+        .{Key{ .view = .{ .data = .{ .string = sv }, .nulls = &nulls }, .typ = .string, .nullable = true, .digests = true }},
     };
     var lanes: std.ArrayListUnmanaged(u128) = .empty;
     defer lanes.deinit(allocator);

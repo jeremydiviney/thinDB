@@ -5059,14 +5059,11 @@ pub const Scan = struct {
     /// wide columns.
     fn appendSurvivorLocs(self: *Scan, rows: []const u32, rg_idx: ?usize) !void {
         const list = &self.filtered.?[self.out_phys.len].data.bigint;
-        try list.ensureUnusedCapacity(self.allocator, rows.len);
-        for (rows) |i| {
-            const loc: i64 = if (rg_idx) |rg|
-                rowloc.packSegment(self.cur_seg_idx, rg, i)
-            else
-                rowloc.packMemtable(i);
-            list.appendAssumeCapacity(loc);
-        }
+        const locs = try list.addManyAsSlice(self.allocator, rows.len);
+        // A location packs the row's offset into its low bits, under its
+        // row group's (or the memtable's) fields.
+        const base = if (rg_idx) |rg| rowloc.packSegment(self.cur_seg_idx, rg, 0) else rowloc.packMemtable(0);
+        for (locs, rows) |*loc, i| loc.* = base | @as(i64, i);
     }
 
     /// Fill `code_bufs[j]` with the global dict codes of just the surviving
