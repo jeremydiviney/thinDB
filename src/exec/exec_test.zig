@@ -1554,6 +1554,73 @@ test "scan: a column only its fused filter reads is not gathered" {
     }
 }
 
+// A hashed key column's dictionary blocks carry a digest for each entry the
+// batch's codes name: just the survivors' entries when a filter keeps fewer
+// rows than the dictionary has entries, every entry when it keeps more.
+test "scan: a hashed dictionary column's survivors find their values' digests" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "tag", .type = .string },
+            .{ .name = "v", .type = .int },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 256,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 256 });
+
+    const Row = struct { id: i64, tag: []const u8, v: i32 };
+    var names: [64][8]u8 = undefined;
+    for (&names, 0..) |*n, i| _ = try std.fmt.bufPrint(n, "tag-{d:0>4}", .{i});
+    const total = 1024;
+    var rows: [total]Row = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .tag = &names[(i * 7) % 64], .v = @intCast(i % 50) };
+    try t.insert(&rows);
+    try t.flush();
+
+    // A row group holds all 64 tags; `v = 0` keeps about 5 of its 256 rows,
+    // `v <> 0` about 250.
+    const cases = .{
+        .{ .expr = leafExpr("v", .eq, .{ .int = 0 }), .rows = 21 },
+        .{ .expr = leafExpr("v", .neq, .{ .int = 0 }), .rows = total - 21 },
+    };
+    inline for (cases) |case| {
+        var base = try scan(allocator, t);
+        const leaf = exec.queryAs(exec.Scan, base).?;
+        try std.testing.expect(leaf.setHashKeyColumn("tag"));
+        try leaf.setBlockDictColumn(leaf.blockDictColumnIndex("tag").?);
+        var q = try base.filter(case.expr);
+        defer q.deinit();
+
+        var seen: usize = 0;
+        var dict_batches: usize = 0;
+        while (try q.next()) |b| {
+            const ids = b.values[types.findColumn(b.schema, "id").?].data.bigint[0..b.row_count];
+            const dicts = b.block_dicts orelse continue;
+            const d = dicts[types.findColumn(b.schema, "tag").?] orelse continue;
+            dict_batches += 1;
+            for (ids, d.codes[0..b.row_count]) |id, c| {
+                const want = exec.stringKeyDigest(&names[@intCast(@mod(id * 7, 64))]);
+                try std.testing.expectEqual(want, d.digests.?[c]);
+            }
+            seen += b.row_count;
+        }
+        try std.testing.expect(dict_batches > 0);
+        try std.testing.expectEqual(@as(usize, case.rows), seen);
+    }
+}
+
 // Every chunk scan of a parallel scan reads one snapshot, so they share one
 // merge of its column stats: each chunk reports what a lone scan of the
 // table does and orders its fused conjuncts the same way.
