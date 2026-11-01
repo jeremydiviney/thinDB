@@ -757,14 +757,16 @@ const SLACK_SHARE_DENOM: u64 = 4;
 /// filter: the filter streams every row's bytes, a probe touches one row's.
 const SEARCH_ROWS_PER_PROBE: usize = 8;
 
-/// A tally whose units report more than 1/this of their rows hashes about
-/// as many keys as grouping every row would, into a slower table that settle
-/// then merges serially; the counter sketch serves such even counts better.
-const MAX_REPORTS_SHARE_DENOM: u64 = 32;
+/// A tally whose units report more than 1/this of their rows grows tables
+/// that settle then merges serially, past the cost of the counter sketch's
+/// pass over every row. A short key's tally reporting 1/20 of its rows still
+/// beats the sketch, so the bar sits well above that.
+const MAX_REPORTS_SHARE_DENOM: u64 = 8;
 
 /// Units the workers close, all told, before their reports may decline the
-/// tally, so that a few units of rare keys can't.
-const DECLINE_MIN_UNITS: u64 = 16;
+/// tally: a worker's first units report most of their keys, before its
+/// partials know which keys lead.
+const DECLINE_MIN_UNITS: u64 = 64;
 
 /// Exact top-K over units whose keys arrive counted (TPUT: Cao & Wang,
 /// "Efficient top-K query calculation in distributed networks", PODC 2004).
