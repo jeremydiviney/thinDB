@@ -1743,6 +1743,7 @@ pub const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 pub const Scan = @import("scan.zig").Scan;
 pub const KeyBoundSpec = @import("scan.zig").KeyBoundSpec;
+pub const RowGroupSlice = @import("scan.zig").RowGroupSlice;
 pub const ParallelScan = @import("parallel_scan.zig").ParallelScan;
 /// True if a derived projection column is row-local (so a parallel scan can run
 /// it in its workers). Used by the compile layer to split a Compute into a

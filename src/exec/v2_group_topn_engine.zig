@@ -1113,12 +1113,7 @@ fn runHarness(
         snapshotRows(snapshot) <= std.math.maxInt(u32) and !group_rows_layout.has_str_payload and
         !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
-        // A HAVING here filters the best groups after the run (see
-        // canUseCoreCountDescTopN). Its bound would drop groups from the
-        // sketch's passes, which then find fewer than `need` and fall back.
-        var sketch_cfg = cfg;
-        sketch_cfg.having_bound = null;
-        if (try runCountSketch(allocator, table, cpus, sketch_cfg, need, shape.count_rank, shape.count_floor, rows)) return;
+        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
 }
@@ -1131,17 +1126,20 @@ fn snapshotRows(snapshot: exec.Scan.Snapshot) u64 {
 
 /// The two-pass COUNT top-K (see count_topk_sketch.zig) into `rows`. False,
 /// leaving `rows` empty, when the input is too small or its counts too even
-/// for the sketch to pay; the caller then groups every row.
+/// for the sketch to pay before a tally scans; the caller then groups every
+/// row. Once a tally scanned, a sketch that can't finish groups every row by
+/// `grid` itself (see groupHeldRows).
 fn runCountSketch(
     allocator: Allocator,
     table: *api.Table,
     cpus: []const usize,
-    cfg: SiloCore.RunConfig,
+    grid: SiloCore.RunConfig,
     need: usize,
     rank: ?CountRank,
     floor: u64,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
+    const cfg = sketchPasses(grid);
     // A lone string key read only as identity may arrive as row-group
     // dictionary codes, which a heavy tally counts without hashing.
     if (cfg.distinct_eval and cfg.derived.len == 0 and cfg.hash_key_columns.len == 1 and cfg.group_rows_layout.key_columns.len == 1) {
@@ -1149,15 +1147,18 @@ fn runCountSketch(
         defer heavy.deinit(allocator);
         heavy.floor = floor;
         heavy.input_rows = snapshotRows(cfg.snapshot);
+        if (cfg.filter_expr != null and rowBitsFit(allocator, cfg.snapshot, 1)) {
+            heavy.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
+        }
         if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
-        if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
+        if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, grid, need, rows);
         if (heavy.declined_small) return false;
     }
 
     var sketch = try count_topk_sketch.CountSketch.init(allocator, count_topk_sketch.DEFAULT_BITS, cpus.len);
     defer sketch.deinit(allocator);
     sketch.floor = floor;
-    if (rowBytesFit(allocator, cfg.snapshot, @sizeOf(u32))) {
+    if (rowBitsFit(allocator, cfg.snapshot, @bitSizeOf(u32))) {
         sketch.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
     }
 
@@ -1169,8 +1170,9 @@ fn runCountSketch(
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
-    if (sketch.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, cfg, need, rows);
-    if (!try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return false;
+    if (sketch.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, grid, need, rows);
+    const held = if (sketch.row_slots) |*rs| rs else null;
+    if (!try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return try groupHeldRows(allocator, table, cpus, grid, held);
 
     var filter = cfg;
     filter.count_sketch = .{ .filter = &sketch };
@@ -1180,27 +1182,57 @@ fn runCountSketch(
     if (sketch.exact(need, found, kth)) return true;
 
     rows.clearRetainingCapacity();
-    if (found < need or !sketch.retarget(kth)) return false;
+    if (found < need or !sketch.retarget(kth)) return try groupHeldRows(allocator, table, cpus, grid, held);
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     return true;
 }
 
+/// `grid` for a sketch's passes. A HAVING here filters the best groups
+/// after the run (see canUseCoreCountDescTopN). Its bound would drop groups
+/// from the sketch's passes, which then find fewer than `need` and fall
+/// back.
+fn sketchPasses(grid: SiloCore.RunConfig) SiloCore.RunConfig {
+    var cfg = grid;
+    cfg.having_bound = null;
+    return cfg;
+}
+
+/// Groups every row by `grid` after a sketch's tally scanned and the sketch
+/// can't finish, into `rows`: the rows `held` holds of the tally's filter
+/// survivors are read without filtering them again. True, as the result is
+/// complete.
+fn groupHeldRows(
+    allocator: Allocator,
+    table: *api.Table,
+    cpus: []const usize,
+    grid: SiloCore.RunConfig,
+    held: ?*const count_topk_sketch.RowSlots,
+) !bool {
+    var all = grid;
+    if (held) |rs| {
+        if (rs.holdsAny()) all.held_rows = rs;
+    }
+    try SiloCore.runSiloGrid(allocator, table, cpus, all);
+    return true;
+}
+
 /// The near-unique COUNT(*) top-K (see DupSketch) into `rows`. False,
-/// leaving `rows` empty, when its fingerprints wouldn't fit or the keys
-/// repeat too often for it to pay.
+/// leaving `rows` empty, when its fingerprints wouldn't fit; when the keys
+/// repeat too often for it to pay, it groups every row by `grid`.
 fn runDupSketch(
     allocator: Allocator,
     table: *api.Table,
     cpus: []const usize,
-    cfg: SiloCore.RunConfig,
+    grid: SiloCore.RunConfig,
     need: usize,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
-    if (!rowBytesFit(allocator, cfg.snapshot, @sizeOf(u32))) return false;
+    const cfg = sketchPasses(grid);
+    if (!rowBitsFit(allocator, cfg.snapshot, @bitSizeOf(u32))) return false;
     const worker_allocator = try exec.memory.workerAllocatorOf(allocator);
     var dups = try count_topk_sketch.DupSketch.init(allocator, worker_allocator, need, cpus.len, snapshotRows(cfg.snapshot));
     defer dups.deinit(allocator);
-    if (rowBytesFit(allocator, cfg.snapshot, 2 * @sizeOf(u32))) {
+    if (rowBitsFit(allocator, cfg.snapshot, 2 * @bitSizeOf(u32))) {
         dups.row_slots = try count_topk_sketch.RowSlots.init(worker_allocator, cfg.snapshot.segments);
     }
 
@@ -1212,22 +1244,23 @@ fn runDupSketch(
     tally.workspace = null;
     tally.defer_heavy_teardown = false;
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
-    if (!try dups.settle(allocator)) return false;
+    const held = if (dups.row_slots) |*rs| rs else null;
+    if (!try dups.settle(allocator)) return try groupHeldRows(allocator, table, cpus, grid, held);
 
     var filter = cfg;
     filter.count_sketch = .{ .dup_filter = &dups };
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     if (dups.exact(rows.items.len)) return true;
     rows.clearRetainingCapacity();
-    return false;
+    return try groupHeldRows(allocator, table, cpus, grid, held);
 }
 
-/// Whether a tally may hold `bytes` a row for the filter pass (its rows'
-/// counters to sieve by, or its fingerprints): an eighth of what a statement
-/// may hold.
-fn rowBytesFit(allocator: Allocator, snapshot: exec.Scan.Snapshot, bytes: u64) bool {
+/// Whether a tally may hold `bits` a row for the filter pass (its rows'
+/// counters to sieve by, its fingerprints, or which rows its filter
+/// passed): an eighth of what a statement may hold.
+fn rowBitsFit(allocator: Allocator, snapshot: exec.Scan.Snapshot, bits: u64) bool {
     const accountant = exec.memory.accountantOf(allocator) orelse return true;
-    return snapshotRows(snapshot) * bytes <= accountant.pool.statementLimit() / 8;
+    return snapshotRows(snapshot) * bits / 8 <= accountant.pool.statementLimit() / 8;
 }
 
 /// The heavy-key COUNT top-K (see HeavyKeys) into `rows`. False, leaving

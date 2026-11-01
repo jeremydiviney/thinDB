@@ -211,13 +211,15 @@ pub const CountSketch = struct {
 /// The rows a tally saw of each row group it saw in stored order, and their
 /// counters, so the filter pass's scan can pick the rows of the counters it
 /// keeps without running its filter or decoding the rest
-/// (`Scan.RowSieve`).
+/// (`Scan.RowSieve`). A tally that can't count by row still holds which
+/// rows its filter passed, so the filter pass reads only those.
 pub const RowSlots = struct {
     allocator: Allocator,
     /// Per segment of the snapshot, the flat index of its first row group.
     seg_first: []usize,
     /// Per flat row group, once a tally has recorded all of it: bit r set
-    /// for each row r the tally saw, and those rows' counters in row order.
+    /// for each row r the tally saw, and those rows' counters in row order
+    /// (null when it held the rows alone).
     held: []?[]const u64,
     rows: []?[]const u32,
     /// Per flat row group, what a tally is still recording.
@@ -225,7 +227,7 @@ pub const RowSlots = struct {
 
     const Pending = struct {
         held: []u64,
-        slots: []u32,
+        slots: ?[]u32,
         /// The row the next recorded rows start at, and the counters so far.
         next: u32,
         len: u32,
@@ -264,9 +266,16 @@ pub const RowSlots = struct {
         self.allocator.free(self.seg_first);
     }
 
+    pub fn holdsAny(self: *const RowSlots) bool {
+        for (self.held) |h| {
+            if (h != null) return true;
+        }
+        return false;
+    }
+
     fn freePending(self: *RowSlots, open: Pending) void {
         self.allocator.free(open.held);
-        self.allocator.free(open.slots);
+        if (open.slots) |slots| self.allocator.free(slots);
     }
 
     /// Room for the counters of the rows a tally sees of segment `seg`'s
@@ -277,17 +286,42 @@ pub const RowSlots = struct {
     /// Only the worker that tallies a row group may record it.
     pub fn record(self: *RowSlots, seg: usize, rg: usize, rows: u32, offset: u32, n: u32, survivors: ?[]const u32) !?[]u32 {
         const i = self.seg_first[seg] + rg;
+        const open = (try self.openRecord(i, rows, offset, true)) orelse return null;
+        const start = open.len;
+        holdRows(open, offset, n, survivors);
+        const out = open.slots.?[start..open.len];
+        self.closeIfWhole(i, rows);
+        return out;
+    }
+
+    /// Note which rows of segment `seg`'s row group `rg` a tally saw, as
+    /// `record` does, without counters: the filter pass keeps every one.
+    pub fn hold(self: *RowSlots, seg: usize, rg: usize, rows: u32, offset: u32, n: u32, survivors: ?[]const u32) !void {
+        const i = self.seg_first[seg] + rg;
+        const open = (try self.openRecord(i, rows, offset, false)) orelse return;
+        holdRows(open, offset, n, survivors);
+        self.closeIfWhole(i, rows);
+    }
+
+    /// Flat row group `i`'s record in progress, begun afresh at row 0; null
+    /// when the rows before `offset` weren't recorded, or were recorded
+    /// with (or without) counters when these aren't.
+    fn openRecord(self: *RowSlots, i: usize, rows: u32, offset: u32, counted: bool) !?*Pending {
         if (offset == 0) {
             if (self.pending[i]) |prior| self.freePending(prior);
             self.pending[i] = null;
             const held = try self.allocator.alloc(u64, (rows + 63) / 64);
             errdefer self.allocator.free(held);
             @memset(held, 0);
-            self.pending[i] = .{ .held = held, .slots = try self.allocator.alloc(u32, rows), .next = 0, .len = 0 };
+            const slots: ?[]u32 = if (counted) try self.allocator.alloc(u32, rows) else null;
+            self.pending[i] = .{ .held = held, .slots = slots, .next = 0, .len = 0 };
         }
         const open = if (self.pending[i]) |*p| p else return null;
-        if (open.next != offset) return null;
-        const start = open.len;
+        if (open.next != offset or (open.slots != null) != counted) return null;
+        return open;
+    }
+
+    fn holdRows(open: *Pending, offset: u32, n: u32, survivors: ?[]const u32) void {
         if (survivors) |at| {
             for (at) |r| open.held[r >> 6] |= @as(u64, 1) << @intCast(r & 63);
             open.len += @intCast(at.len);
@@ -296,16 +330,20 @@ pub const RowSlots = struct {
             open.len += n;
         }
         open.next = offset + n;
-        const out = open.slots[start..open.len];
-        if (open.next == rows) {
-            if (open.len > 0 and open.len < rows and self.allocator.resize(open.slots, open.len)) open.slots = open.slots[0..open.len];
-            if (self.held[i]) |prior| self.allocator.free(prior);
-            if (self.rows[i]) |prior| self.allocator.free(prior);
-            self.held[i] = open.held;
-            self.rows[i] = open.slots;
-            self.pending[i] = null;
+    }
+
+    /// Flat row group `i`'s record takes effect once it reaches the last row.
+    fn closeIfWhole(self: *RowSlots, i: usize, rows: u32) void {
+        const open = &self.pending[i].?;
+        if (open.next != rows) return;
+        if (open.slots) |slots| {
+            if (open.len > 0 and open.len < rows and self.allocator.resize(slots, open.len)) open.slots = slots[0..open.len];
         }
-        return out;
+        if (self.held[i]) |prior| self.allocator.free(prior);
+        if (self.rows[i]) |prior| self.allocator.free(prior);
+        self.held[i] = open.held;
+        self.rows[i] = open.slots;
+        self.pending[i] = null;
     }
 
     fn holdRange(held: []u64, lo: usize, hi: usize) void {
@@ -801,6 +839,8 @@ pub const HeavyKeys = struct {
     /// Set mid-pass when the units report too many of their keys (see
     /// `MAX_REPORTS_SHARE_DENOM`): the rest of the pass is wasted.
     declined_flat: std.atomic.Value(bool) = .init(false),
+    /// Which rows the tally's filter passed, for the filter pass's scan.
+    row_slots: ?RowSlots = null,
     /// The workers' closed units, their rows, and the keys they reported.
     tallied_units: std.atomic.Value(u64) = .init(0),
     tallied_rows: std.atomic.Value(u64) = .init(0),
@@ -882,6 +922,7 @@ pub const HeavyKeys = struct {
         self.candidates.deinit(allocator);
         if (self.signatures.len > 0) allocator.free(self.signatures);
         if (self.sorted) |sorted| allocator.free(sorted);
+        if (self.row_slots) |*rs| rs.deinit();
         self.* = undefined;
     }
 

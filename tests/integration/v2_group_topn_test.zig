@@ -2674,6 +2674,25 @@ test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
         }
         try std.testing.expectEqual(@as(usize, 1000), rank);
     }
+    // The need reaches the one-row keys, so the sketch can't settle after
+    // its tally, and every row is grouped again: the filter's survivors
+    // come from the rows the tally held, by row for the integer key and
+    // collapsed by dictionary value for the string key.
+    var kept_desc = kept_counts;
+    std.sort.pdq(i64, &kept_desc, {}, std.sort.desc(i64));
+    inline for (.{ "k", "s" }) |key| {
+        var q = try runSql(allocator, db, "SELECT " ++ key ++ ", COUNT(*) AS c FROM skewed WHERE v <> 3 GROUP BY " ++ key ++ " ORDER BY c DESC LIMIT 1000");
+        defer q.deinit();
+        var rank: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const expected: i64 = if (rank < heavy_groups) kept_desc[rank] else 1;
+                try std.testing.expectEqual(@as(?f64, @floatFromInt(expected)), try cellNumber(batch.values[1], r));
+                rank += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1000), rank);
+    }
     {
         var q = try runSql(allocator, db, "SELECT s, COUNT(*) AS c FROM skewed GROUP BY s HAVING COUNT(*) > 4500 ORDER BY c DESC LIMIT 6 OFFSET 2");
         defer q.deinit();
@@ -3535,6 +3554,19 @@ test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned a
     const no_hot0 = try hkGroups(allocator, live.items, hot_urls[0]);
     defer allocator.free(no_hot0);
     for (0..hot - 1) |i| try std.testing.expect(all_groups[i].count > all_groups[i + 1].count);
+    var low_v: std.StringHashMapUnmanaged(i64) = .empty;
+    defer low_v.deinit(allocator);
+    for (live.items) |row| {
+        if (row.v >= 300) continue;
+        const gop = try low_v.getOrPut(allocator, row.s);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    var low_v_top: std.ArrayList(i64) = .empty;
+    defer low_v_top.deinit(allocator);
+    var low_v_counts = low_v.valueIterator();
+    while (low_v_counts.next()) |count| try low_v_top.append(allocator, count.*);
+    std.sort.pdq(i64, low_v_top.items, {}, std.sort.desc(i64));
 
     inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
         var tmp = std.testing.tmpDir(.{});
@@ -3590,6 +3622,31 @@ test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned a
             n += batch.row_count;
         }
         try std.testing.expectEqual(@as(usize, 5), n);
+
+        // A filter on a column the key doesn't read leaves survivors in most
+        // row groups, which the filter pass reads without running the filter
+        // again. The derived key collapses dictionary rows, so its tally
+        // holds them without counting them by row.
+        const filtered = [_][]const u8{
+            "SELECT s, COUNT(*) AS c FROM hk WHERE v < 300 GROUP BY s ORDER BY c DESC LIMIT 5",
+            "SELECT lower(s) AS k, COUNT(*) AS c FROM hk WHERE v < 300 GROUP BY k ORDER BY c DESC LIMIT 5",
+        };
+        for (filtered) |sql| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, sql });
+            try expectPlanRunsGroupTopN(allocator, db, sql);
+            var fq = try runSql(allocator, db, sql);
+            defer fq.deinit();
+            var got: std.ArrayList(i64) = .empty;
+            defer got.deinit(allocator);
+            while (try fq.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const count: i64 = @intFromFloat((try cellNumber(batch.values[1], r)).?);
+                    try std.testing.expectEqual(low_v.get(batch.values[0].data.string.rowBytes(r)).?, count);
+                    try got.append(allocator, count);
+                }
+            }
+            try std.testing.expectEqualSlices(i64, low_v_top.items[0..5], got.items);
+        }
     }
 }
 
