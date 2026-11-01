@@ -4624,8 +4624,8 @@ test "sql: cross-side WHERE over a fused join feeds a grouped aggregate" {
     try fr.insert(&rrows);
     try fr.flush();
 
-    var want_n = [_]i64{0} ** 7;
-    var want_s = [_]i64{0} ** 7;
+    var want_n: [7]i64 = @splat(0);
+    var want_s: [7]i64 = @splat(0);
     for (rrows) |r| {
         if (r.id >= lrows.len) continue;
         const l = lrows[@intCast(r.id)];
@@ -4641,8 +4641,8 @@ test "sql: cross-side WHERE over a fused join feeds a grouped aggregate" {
         \\GROUP BY fl.g ORDER BY fl.g
     );
     defer q.deinit();
-    var got_n = [_]i64{0} ** 7;
-    var got_s = [_]i64{0} ** 7;
+    var got_n: [7]i64 = @splat(0);
+    var got_s: [7]i64 = @splat(0);
     while (try q.next()) |b| {
         for (0..b.row_count) |i| {
             const g: usize = @intCast(b.values[0].data.int[i]);

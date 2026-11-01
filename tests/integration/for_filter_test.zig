@@ -565,10 +565,10 @@ test "row groups whose stats prove the filter skip it" {
 
     // Grouped folds over the proven row groups: per g, COUNT(*) and SUM(v)
     // past d >= 3, then SUM(LENGTH(s)) and COUNT(DISTINCT s) of the non-blank.
-    var counts = [_]i64{0} ** 7;
-    var sums = [_]i64{0} ** 7;
-    var lens = [_]i64{0} ** 7;
-    var seen = [_][51]bool{[_]bool{false} ** 51} ** 7;
+    var counts: [7]i64 = @splat(0);
+    var sums: [7]i64 = @splat(0);
+    var lens: [7]i64 = @splat(0);
+    var seen: [7][51]bool = @splat(@splat(false));
     for (live) |r| {
         const g: usize = @intCast(r.g);
         if (r.d >= 3) {

@@ -663,7 +663,7 @@ pub const Window = struct {
             }
         };
         var g = Gather{ .win = self, .perm = perm, .arenas = arenas, .stores = stores };
-        var threads: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
+        var threads: [max_drain_workers]?parallel.Helper = @splat(null);
         var spawned: usize = 0;
         var grant: core_scheduler.Workers = .{};
         defer grant.release();
@@ -1007,7 +1007,7 @@ pub const Window = struct {
             break :blk b;
         };
         var pd = ParDrain{ .win = self, .owned = owned };
-        var workers: [max_drain_workers]?parallel.Helper = .{null} ** max_drain_workers;
+        var workers: [max_drain_workers]?parallel.Helper = @splat(null);
         var n_workers: usize = 0;
         var max_tiles: usize = 1;
         var may_fan_out = self.dop > 1 and ncols >= 2 and !builtin.is_test;
@@ -2828,13 +2828,13 @@ fn freeSpecIndices(allocator: Allocator, specs: []Window.SpecIndices, n: usize) 
 // empty and teardown never deinitializes the borrowed stores themselves.
 fn borrowed_store(view: ColumnView) ColumnStore {
     return .{
-        .nulls = if (view.nulls) |bits| .{ .items = @constCast(bits), .capacity = 0 } else null,
+        .nulls = if (view.nulls) |bits| .{ .items = @constCast(bits), .capacity = 0, .pointer_stability = .{} } else null,
         .data = switch (view.data) {
             inline .varchar, .string, .char, .json, .nested, .bitmap => |strings, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{
-                .offsets = .{ .items = @constCast(strings.offsets), .capacity = 0 },
-                .bytes = .{ .items = @constCast(strings.bytes), .capacity = 0 },
+                .offsets = .{ .items = @constCast(strings.offsets), .capacity = 0, .pointer_stability = .{} },
+                .bytes = .{ .items = @constCast(strings.bytes), .capacity = 0, .pointer_stability = .{} },
             }),
-            inline else => |values, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{ .items = @constCast(values), .capacity = 0 }),
+            inline else => |values, tag| @unionInit(@import("../engine/store.zig").DataStore, @tagName(tag), .{ .items = @constCast(values), .capacity = 0, .pointer_stability = .{} }),
         },
     };
 }

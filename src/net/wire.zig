@@ -120,7 +120,7 @@ pub fn encodeError(
     msg: []const u8,
 ) !void {
     var hdr: [error_header_size]u8 = undefined;
-    std.mem.writeInt(u16, hdr[0..2], @intFromEnum(code), .little);
+    std.mem.writeInt(u16, hdr[0..2], @backingInt(code), .little);
     std.mem.writeInt(u32, hdr[2..6], @intCast(msg.len), .little);
     try out.appendSlice(allocator, &hdr);
     try out.appendSlice(allocator, msg);
@@ -140,8 +140,8 @@ pub fn decodeError(payload: []const u8) !struct { code: WireErrorCode, msg: []co
 }
 
 fn codeFromU16(v: u16) WireErrorCode {
-    inline for (@typeInfo(WireErrorCode).@"enum".fields) |f| {
-        if (f.value == v) return @enumFromInt(v);
+    inline for (@typeInfo(WireErrorCode).@"enum".field_values) |field_value| {
+        if (field_value == v) return @fromBackingInt(@intCast(v));
     }
     return .unknown_error;
 }
@@ -200,8 +200,8 @@ pub fn writeFrame(
     msg_type: MsgType,
     payload: []const u8,
 ) !void {
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
-    hdr[0] = @intFromEnum(msg_type);
+    var hdr: [frame_header_size]u8 = @splat(0);
+    hdr[0] = @backingInt(msg_type);
     // hdr[1..4] reserved, zero
     std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
     try out.appendSlice(allocator, &hdr);
@@ -216,8 +216,8 @@ pub fn writeFrameToIo(
     msg_type: MsgType,
     payload: []const u8,
 ) std.Io.Writer.Error!void {
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
-    hdr[0] = @intFromEnum(msg_type);
+    var hdr: [frame_header_size]u8 = @splat(0);
+    hdr[0] = @backingInt(msg_type);
     std.mem.writeInt(u32, hdr[4..8], @intCast(payload.len), .little);
     try w.writeAll(&hdr);
     try w.writeAll(payload);
@@ -239,8 +239,8 @@ pub fn writeFrameToIoMaybeCompressed(
     const compressed = try compression.compress(allocator, payload);
     defer allocator.free(compressed);
 
-    var hdr: [frame_header_size]u8 = .{0} ** frame_header_size;
-    hdr[0] = @intFromEnum(msg_type);
+    var hdr: [frame_header_size]u8 = @splat(0);
+    hdr[0] = @backingInt(msg_type);
     hdr[1] = @bitCast(FrameFlags{ .compressed = true });
     std.mem.writeInt(u32, hdr[4..8], @intCast(4 + compressed.len), .little);
     try w.writeAll(&hdr);
@@ -303,7 +303,7 @@ pub fn encodeSchema(allocator: Allocator, out: *std.ArrayList(u8), schema: Table
     try appendU32(allocator, out, @intCast(schema.columns.len));
     for (schema.columns) |c| {
         try appendLenString(allocator, out, c.name);
-        try out.append(allocator, @intFromEnum(@as(TypeTag, c.type)));
+        try out.append(allocator, @backingInt(@as(TypeTag, c.type)));
         try out.append(allocator, @intFromBool(c.nullable));
         try appendU32(allocator, out, typeExtra(c.type));
     }
@@ -363,11 +363,11 @@ pub fn encodeAlterOp(allocator: Allocator, out: *std.ArrayList(u8), op: AlterOp)
         .add => |a| {
             try out.append(allocator, 0);
             try appendLenString(allocator, out, a.name);
-            try out.append(allocator, @intFromEnum(@as(TypeTag, a.type)));
+            try out.append(allocator, @backingInt(@as(TypeTag, a.type)));
             try out.append(allocator, @intFromBool(a.nullable));
             try appendU32(allocator, out, typeExtra(a.type));
             try encodeClauses(allocator, out, a.default, a.default_now, a.on_update_now);
-            try out.append(allocator, @intFromEnum(@as(std.meta.Tag(types.ColumnPosition), a.position)));
+            try out.append(allocator, @backingInt(@as(std.meta.Tag(types.ColumnPosition), a.position)));
             if (a.position == .after) try appendLenString(allocator, out, a.position.after);
         },
         .set_clauses => |sc| {
@@ -512,8 +512,8 @@ pub fn readFrame(bytes: []const u8, offset: *usize) Error!struct { msg_type: Msg
 }
 
 fn validMsgType(b: u8) ?MsgType {
-    inline for (@typeInfo(MsgType).@"enum".fields) |f| {
-        if (f.value == b) return @enumFromInt(b);
+    inline for (@typeInfo(MsgType).@"enum".field_values) |field_value| {
+        if (field_value == b) return @fromBackingInt(@intCast(b));
     }
     return null;
 }
@@ -535,7 +535,7 @@ pub fn encodeBatch(allocator: Allocator, out: *std.ArrayList(u8), batch: Batch) 
         // Column header
         try appendU32(allocator, out, @intCast(col.name.len));
         try out.appendSlice(allocator, col.name);
-        try out.append(allocator, @intFromEnum(@as(TypeTag, col.type)));
+        try out.append(allocator, @backingInt(@as(TypeTag, col.type)));
         try out.append(allocator, @intFromBool(col.nullable));
         try appendU32(allocator, out, typeExtra(col.type));
 

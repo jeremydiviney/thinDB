@@ -117,7 +117,7 @@ fn reserveDouble(allocator: Allocator, out: *ColumnStore, n: usize) ![]f64 {
 /// `null_strategy = .kernel_managed`. A NULL slot holds 0, not the NaN.
 fn finiteOrNull(comptime f: anytype) Kernel {
     const Operands = std.meta.ArgsTuple(@TypeOf(f));
-    const arity = @typeInfo(Operands).@"struct".fields.len;
+    const arity = @typeInfo(Operands).@"struct".field_names.len;
     return struct {
         fn kernel(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const dst = try reserveDouble(allocator, out, row_count);
@@ -441,7 +441,7 @@ pub fn unsignedBitNotKernel(comptime T: type) Kernel {
 /// by a count outside 0..63 shifts every bit out; `>>` is arithmetic,
 /// keeping the sign.
 pub fn bitwiseKernel(comptime op: BitOp, comptime T: type) Kernel {
-    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const U = @Int(.unsigned, @bitSizeOf(T));
     return struct {
         fn f(allocator: Allocator, args: []const ColumnView, out: *ColumnStore, row_count: usize) !void {
             const field = comptime intField(T);

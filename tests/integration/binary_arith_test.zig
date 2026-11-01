@@ -546,7 +546,7 @@ test "binary arith: BIT_COUNT, BIN and CONV read a value as MySQL does" {
     const cases = .{
         .{ "SELECT BIT_COUNT(-1) FROM t WHERE id = 1", &[_]?[]const u8{"64"} },
         .{ "SELECT BIT_COUNT(~qty) FROM t ORDER BY id", &[_]?[]const u8{ "62", "62", "60" } },
-        .{ "SELECT BIN(-1) FROM t WHERE id = 1", &[_]?[]const u8{"1" ** 64} },
+        .{ "SELECT BIN(-1) FROM t WHERE id = 1", &[_]?[]const u8{&@as([64]u8, @splat('1'))} },
         .{ "SELECT BIN(qty) FROM t ORDER BY id", &[_]?[]const u8{ "1010", "10100", "11110" } },
         // A number reaches BIN as its text, so a fraction is cut, not rounded.
         .{ "SELECT BIN(price) FROM t ORDER BY id", &[_]?[]const u8{ "1", "10", "11" } },

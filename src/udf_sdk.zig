@@ -90,26 +90,26 @@ pub const Date = enum(i32) {
     _,
 
     pub fn days(self: Date) i32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
     pub fn fromDays(d: i32) Date {
-        return @enumFromInt(d);
+        return @fromBackingInt(@intCast(d));
     }
     pub fn eq(self: Date, other: Date) bool {
-        return @intFromEnum(self) == @intFromEnum(other);
+        return @backingInt(self) == @backingInt(other);
     }
     pub fn lt(self: Date, other: Date) bool {
-        return @intFromEnum(self) < @intFromEnum(other);
+        return @backingInt(self) < @backingInt(other);
     }
     pub fn lte(self: Date, other: Date) bool {
-        return @intFromEnum(self) <= @intFromEnum(other);
+        return @backingInt(self) <= @backingInt(other);
     }
 
     pub const Ymd = struct { y: i32, m: u8, d: u8 };
 
     /// Howard Hinnant's civil-from-days algorithm.
     pub fn ymd(self: Date) Ymd {
-        var z: i64 = @intFromEnum(self);
+        var z: i64 = @backingInt(self);
         z += 719468;
         const era: i64 = @divFloor(z, 146097);
         const doe: u32 = @intCast(z - era * 146097);
@@ -129,7 +129,7 @@ pub const Date = enum(i32) {
         const mp: u32 = if (v.m > 2) v.m - 3 else v.m + 9;
         const doy: u32 = (153 * mp + 2) / 5 + v.d - 1;
         const doe: u32 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        return @enumFromInt(@as(i32, @intCast(era * 146097 + doe - 719468)));
+        return @fromBackingInt(@intCast(@as(i32, @intCast(era * 146097 + doe - 719468))));
     }
 
     pub fn addMonths(self: Date, n: i32) Date {
@@ -158,22 +158,22 @@ pub const DateTime = enum(i64) {
     _,
 
     pub fn micros(self: DateTime) i64 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
     pub fn fromMicros(us: i64) DateTime {
-        return @enumFromInt(us);
+        return @fromBackingInt(@intCast(us));
     }
     pub fn eq(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) == @intFromEnum(other);
+        return @backingInt(self) == @backingInt(other);
     }
     pub fn lt(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) < @intFromEnum(other);
+        return @backingInt(self) < @backingInt(other);
     }
     pub fn lte(self: DateTime, other: DateTime) bool {
-        return @intFromEnum(self) <= @intFromEnum(other);
+        return @backingInt(self) <= @backingInt(other);
     }
     pub fn date(self: DateTime) Date {
-        return Date.fromDays(@intCast(@divFloor(@intFromEnum(self), std.time.us_per_day)));
+        return Date.fromDays(@intCast(@divFloor(@backingInt(self), std.time.us_per_day)));
     }
 };
 
@@ -248,13 +248,13 @@ fn unwrapOptional(comptime T: type) struct { child: type, nullable: bool } {
 
 /// Comptime schema for a row struct: field name = column name, declaration
 /// order = column order.
-fn schemaFor(comptime Row: type) [@typeInfo(Row).@"struct".fields.len]types.Column {
-    const fields = @typeInfo(Row).@"struct".fields;
-    var cols: [fields.len]types.Column = undefined;
-    for (fields, 0..) |f, i| {
-        const u = unwrapOptional(f.type);
+fn schemaFor(comptime Row: type) [@typeInfo(Row).@"struct".field_names.len]types.Column {
+    const info = @typeInfo(Row).@"struct";
+    var cols: [info.field_names.len]types.Column = undefined;
+    for (info.field_names, info.field_types, 0..) |name, T, i| {
+        const u = unwrapOptional(T);
         cols[i] = .{
-            .name = f.name,
+            .name = name,
             .type = columnTypeFor(u.child),
             .nullable = u.nullable,
         };
@@ -309,13 +309,13 @@ pub fn Partition(comptime Input: type) type {
         const Self = @This();
 
         fn fieldType(comptime f: FieldEnum) type {
-            return @typeInfo(Input).@"struct".fields[@intFromEnum(f)].type;
+            return @typeInfo(Input).@"struct".field_types[@backingInt(f)];
         }
 
         /// Columnar accessor: `[]const T` for scalars (zero-copy), `Strings`
         /// for text, `Opt(T)` / `OptStrings` for nullable fields.
         pub fn col(self: Self, comptime f: FieldEnum) ColAccessor(fieldType(f)) {
-            const view = self.raw.columns[@intFromEnum(f)];
+            const view = self.raw.columns[@backingInt(f)];
             const u = unwrapOptional(fieldType(f));
             if (u.child == []const u8) {
                 if (u.nullable) return .{ .view = stringViewOf(view), .valid = view.nulls };
@@ -327,22 +327,22 @@ pub fn Partition(comptime Input: type) type {
 
         /// Bool columns (u8 storage): per-row accessor.
         pub fn colBool(self: Self, comptime f: FieldEnum, i: usize) bool {
-            return self.raw.columns[@intFromEnum(f)].data.boolean[i] != 0;
+            return self.raw.columns[@backingInt(f)].data.boolean[i] != 0;
         }
 
         /// One row assembled as an `Input` value. Strings are borrowed.
         pub fn at(self: Self, i: usize) Input {
             var row: Input = undefined;
-            inline for (@typeInfo(Input).@"struct".fields, 0..) |fld, ci| {
+            inline for (@typeInfo(Input).@"struct".field_names, @typeInfo(Input).@"struct".field_types, 0..) |field_name, field_type, ci| {
                 const view = self.raw.columns[ci];
-                const u = unwrapOptional(fld.type);
+                const u = unwrapOptional(field_type);
                 if (u.nullable) {
-                    @field(row, fld.name) = if (!view.isValid(i))
+                    @field(row, field_name) = if (!view.isValid(i))
                         null
                     else
                         fieldValueAt(u.child, view, i);
                 } else {
-                    @field(row, fld.name) = fieldValueAt(u.child, view, i);
+                    @field(row, field_name) = fieldValueAt(u.child, view, i);
                 }
             }
             return row;
@@ -376,7 +376,7 @@ pub fn Partition(comptime Input: type) type {
         /// by it). Meaningful only for PARTITION BY columns.
         pub fn key(self: Self, comptime f: FieldEnum) fieldType(f) {
             std.debug.assert(self.len > 0);
-            return fieldValueAt(unwrapOptional(fieldType(f)).child, self.raw.columns[@intFromEnum(f)], 0);
+            return fieldValueAt(unwrapOptional(fieldType(f)).child, self.raw.columns[@backingInt(f)], 0);
         }
     };
 }
@@ -393,10 +393,10 @@ pub fn Writer(comptime Output: type) type {
 
         pub fn row(self: *Self, r: Output) !void {
             const alloc = self.raw.allocator;
-            inline for (@typeInfo(Output).@"struct".fields, 0..) |fld, ci| {
+            inline for (@typeInfo(Output).@"struct".field_names, @typeInfo(Output).@"struct".field_types, 0..) |field_name, field_type, ci| {
                 const store = self.raw.columns[ci];
-                const u = unwrapOptional(fld.type);
-                const v = @field(r, fld.name);
+                const u = unwrapOptional(field_type);
+                const v = @field(r, field_name);
                 if (u.nullable) {
                     if (v) |val| {
                         try appendScalar(u.child, store, alloc, val);
@@ -462,12 +462,12 @@ pub fn argTypesFor(comptime Mod: type) []const types.Type {
     // Built in a comptime block and returned outside it, so a runtime
     // caller (`Database.registerTableFn`) gets the static list.
     const result = comptime blk: {
-        const fields = @typeInfo(Mod.Args).@"struct".fields;
-        var out: [fields.len]types.Type = undefined;
-        for (fields, 0..) |f, i| {
-            const T = switch (@typeInfo(f.type)) {
+        const field_types = @typeInfo(Mod.Args).@"struct".field_types;
+        var out: [field_types.len]types.Type = undefined;
+        for (field_types, 0..) |field_type, i| {
+            const T = switch (@typeInfo(field_type)) {
                 .optional => |o| o.child,
-                else => f.type,
+                else => field_type,
             };
             out[i] = columnTypeFor(T);
         }
@@ -531,8 +531,8 @@ fn argFromValue(comptime T: type, v: ?types.Value) error{TableFnInputMismatch}!T
 
 fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) error{TableFnInputMismatch}!Mod.Args {
     var out: Mod.Args = undefined;
-    inline for (@typeInfo(Mod.Args).@"struct".fields, 0..) |f, i| {
-        @field(out, f.name) = try argFromValue(f.type, raw[i]);
+    inline for (@typeInfo(Mod.Args).@"struct".field_names, @typeInfo(Mod.Args).@"struct".field_types, 0..) |field_name, field_type, i| {
+        @field(out, field_name) = try argFromValue(field_type, raw[i]);
     }
     return out;
 }
@@ -540,18 +540,24 @@ fn argsValueFor(comptime Mod: type, raw: []const ?types.Value) error{TableFnInpu
 /// Full input-0 field list: `Input` fields, then optional `Carry` fields.
 /// Carry columns are part of the call site's input contract but are never
 /// handed to the kernel — they exist purely as pass-through sources.
-fn fullInputFields(comptime Mod: type) []const std.builtin.Type.StructField {
+const FieldList = struct {
+    field_names: []const [:0]const u8,
+    field_types: []const type,
+};
+
+fn fullInputFields(comptime Mod: type) FieldList {
     comptime {
-        const base = @typeInfo(Mod.Input).@"struct".fields;
-        if (!@hasDecl(Mod, "Carry")) return base;
-        return base ++ @typeInfo(Mod.Carry).@"struct".fields;
+        const base = @typeInfo(Mod.Input).@"struct";
+        if (!@hasDecl(Mod, "Carry")) return .{ .field_names = base.field_names, .field_types = base.field_types };
+        const carry = @typeInfo(Mod.Carry).@"struct";
+        return .{ .field_names = base.field_names ++ carry.field_names, .field_types = base.field_types ++ carry.field_types };
     }
 }
 
-fn fieldIndexOf(comptime fields: []const std.builtin.Type.StructField, comptime name: []const u8) ?usize {
+fn fieldIndexOf(comptime field_names: []const [:0]const u8, comptime name: []const u8) ?usize {
     comptime {
-        for (fields, 0..) |f, i| {
-            if (std.mem.eql(u8, f.name, name)) return i;
+        for (field_names, 0..) |field_name, i| {
+            if (std.mem.eql(u8, field_name, name)) return i;
         }
         return null;
     }
@@ -575,14 +581,14 @@ pub fn ComputedOutput(comptime Mod: type) type {
     if (!@hasDecl(Mod, "passthrough")) return Mod.Output;
     comptime {
         @setEvalBranchQuota(1_000_000);
-        const all = @typeInfo(Mod.Output).@"struct".fields;
-        var names: [all.len][]const u8 = undefined;
-        var field_types: [all.len]type = undefined;
+        const all = @typeInfo(Mod.Output).@"struct";
+        var names: [all.field_names.len][]const u8 = undefined;
+        var field_types: [all.field_names.len]type = undefined;
         var n: usize = 0;
-        for (all) |f| {
-            if (!isPassthroughField(Mod, f.name)) {
-                names[n] = f.name;
-                field_types[n] = f.type;
+        for (all.field_names, all.field_types) |name, T| {
+            if (!isPassthroughField(Mod, name)) {
+                names[n] = name;
+                field_types[n] = T;
                 n += 1;
             }
         }
@@ -590,8 +596,7 @@ pub fn ComputedOutput(comptime Mod: type) type {
             "': every output column is pass-through — the kernel must compute something");
         const kept_names = names[0..n].*;
         const kept_types = field_types[0..n].*;
-        const attrs: [n]std.builtin.Type.StructField.Attributes = @splat(.{});
-        return @Struct(.auto, null, &kept_names, &kept_types, &attrs);
+        return @Struct(.auto, null, &kept_names, &kept_types, &@splat(.{}));
     }
 }
 
@@ -604,18 +609,18 @@ fn passPairsFor(comptime Mod: type) []const udf.PassPair {
         // Multi-input functions pass through from the FIRST input table
         // (Input + Carry); rows align to input 0 per the row_aligned
         // contract.
-        const out_fields = @typeInfo(Mod.Output).@"struct".fields;
+        const out_fields = @typeInfo(Mod.Output).@"struct";
         const in_fields = fullInputFields(Mod);
         var pairs: [Mod.passthrough.len]udf.PassPair = undefined;
         for (0..Mod.passthrough.len) |k| {
             const name: []const u8 = Mod.passthrough[k];
-            const oi = fieldIndexOf(out_fields, name) orelse
+            const oi = fieldIndexOf(out_fields.field_names, name) orelse
                 @compileError("thinDB table UDF '" ++ Mod.spec.name ++
                     "': passthrough field '" ++ name ++ "' is not an Output field");
-            const ii = fieldIndexOf(in_fields, name) orelse
+            const ii = fieldIndexOf(in_fields.field_names, name) orelse
                 @compileError("thinDB table UDF '" ++ Mod.spec.name ++
                     "': passthrough field '" ++ name ++ "' is not an Input/Carry field");
-            if (out_fields[oi].type != in_fields[ii].type)
+            if (out_fields.field_types[oi] != in_fields.field_types[ii])
                 @compileError("thinDB table UDF '" ++ Mod.spec.name ++
                     "': passthrough field '" ++ name ++ "' has different Input and Output types");
             pairs[k] = .{ .out_idx = oi, .in_idx = ii };
@@ -631,7 +636,7 @@ fn kernelInputCols(comptime Mod: type) u32 {
     // `Input` fields of input 0 plus every other input whole.
     const n = comptime blk: {
         if (!@hasDecl(Mod, "Carry")) break :blk 0;
-        break :blk @typeInfo(Mod.Input).@"struct".fields.len;
+        break :blk @typeInfo(Mod.Input).@"struct".field_names.len;
     };
     return n;
 }
@@ -642,15 +647,15 @@ fn kernelInputCols(comptime Mod: type) u32 {
 fn assertWriterShape(comptime Mod: type, comptime DeclaredRow: type) void {
     comptime {
         @setEvalBranchQuota(1_000_000);
-        const want = @typeInfo(ComputedOutput(Mod)).@"struct".fields;
-        const got = @typeInfo(DeclaredRow).@"struct".fields;
-        if (want.len != got.len) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
+        const want = @typeInfo(ComputedOutput(Mod)).@"struct";
+        const got = @typeInfo(DeclaredRow).@"struct";
+        if (want.field_names.len != got.field_names.len) @compileError("thinDB table UDF '" ++ Mod.spec.name ++
             "': process()'s Writer row must have exactly the non-pass-through Output fields");
-        for (want, got) |w, g| {
-            if (!std.mem.eql(u8, w.name, g.name) or w.type != g.type)
+        for (want.field_names, want.field_types, got.field_names, got.field_types) |want_name, want_type, got_name, got_type| {
+            if (!std.mem.eql(u8, want_name, got_name) or want_type != got_type)
                 @compileError("thinDB table UDF '" ++ Mod.spec.name ++
-                    "': Writer field '" ++ g.name ++ "' does not match Output field '" ++
-                    w.name ++ "' (non-pass-through Output fields, in declaration order)");
+                    "': Writer field '" ++ got_name ++ "' does not match Output field '" ++
+                    want_name ++ "' (non-pass-through Output fields, in declaration order)");
         }
     }
 }
@@ -681,7 +686,7 @@ pub fn descriptorFor(comptime Mod: type) udf.TableUdf {
         const CallArgs = std.meta.ArgsTuple(@TypeOf(Mod.process));
         const arg_ofs = if (has_args) 1 else 0;
         const WriterT = @typeInfo(
-            @typeInfo(CallArgs).@"struct".fields[inputs.len + 1 + arg_ofs].type,
+            @typeInfo(CallArgs).@"struct".field_types[inputs.len + 1 + arg_ofs],
         ).pointer.child;
 
         fn trampoline(

@@ -542,7 +542,7 @@ test "linux: leases never narrow thread affinity (spawned workers must inherit t
 
 fn linuxCurrentAffinity() u64 {
     if (builtin.os.tag != .linux) return 0;
-    var set = [_]u8{0} ** 128;
+    var set: [128]u8 = @splat(0);
     _ = std.os.linux.syscall3(.sched_getaffinity, 0, set.len, @intFromPtr(&set));
     return std.mem.readInt(u64, set[0..8], .little);
 }

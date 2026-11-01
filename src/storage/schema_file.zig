@@ -127,7 +127,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator,
     for (schema.columns) |c| {
         try appendU32(scratch, &buf, @intCast(c.name.len));
         try buf.appendSlice(scratch, c.name);
-        const tag: u8 = @intFromEnum(@as(TypeTag, c.type));
+        const tag: u8 = @backingInt(@as(TypeTag, c.type));
         try buf.append(scratch, tag);
         try buf.append(scratch, @intFromBool(c.nullable));
         const extra: u32 = switch (c.type) {
@@ -160,7 +160,7 @@ pub fn writeSchema(io: Io, dir: Io.Dir, schema: TableSchema, scratch: Allocator,
     }
 
     try buf.append(scratch, @intFromBool(schema.unique));
-    try buf.append(scratch, @intFromEnum(schema.compression));
+    try buf.append(scratch, @backingInt(schema.compression));
     try buf.appendSlice(scratch, &schema_magic);
 
     try @import("storage.zig").writeFileSynced(io, dir, schema_filename, buf.items, durable);
@@ -275,8 +275,8 @@ pub fn readSchema(allocator: Allocator, io: Io, dir: Io.Dir) !SchemaOwner {
     cursor += 1;
     const compression_byte = bytes[cursor];
     cursor += 1;
-    if (compression_byte > @intFromEnum(types.TableCompression.lz4_fsst)) return Error.SchemaCorrupt;
-    const compression: types.TableCompression = @enumFromInt(compression_byte);
+    if (compression_byte > @backingInt(types.TableCompression.lz4_fsst)) return Error.SchemaCorrupt;
+    const compression: types.TableCompression = @fromBackingInt(@intCast(compression_byte));
     if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &schema_magic)) {
         return Error.SchemaBadTrailerMagic;
     }
@@ -348,7 +348,7 @@ fn encodeDefault(scratch: Allocator, buf: *std.ArrayList(u8), c: Column) !void {
         return;
     };
     try buf.append(scratch, 1 | on_update);
-    try buf.append(scratch, @intFromEnum(@as(types.ValueTag, dv)));
+    try buf.append(scratch, @backingInt(@as(types.ValueTag, dv)));
     var tmp: [32]u8 = undefined;
     switch (dv) {
         .int => |x| {
@@ -428,7 +428,7 @@ fn decodeDefaultValue(arena: Allocator, bytes: []const u8, cursor: *usize) !?typ
     if (cursor.* + 1 > bytes.len) return Error.SchemaCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    const tag: types.ValueTag = @enumFromInt(tag_byte);
+    const tag: types.ValueTag = @fromBackingInt(@intCast(tag_byte));
     return switch (tag) {
         .int => blk: {
             if (cursor.* + 4 > bytes.len) return Error.SchemaCorrupt;

@@ -801,8 +801,8 @@ pub const SessionOption = enum {
     }
 
     pub fn fromSqlName(name: []const u8) ?SessionOption {
-        inline for (@typeInfo(SessionOption).@"enum".fields) |field| {
-            const option: SessionOption = @enumFromInt(field.value);
+        inline for (@typeInfo(SessionOption).@"enum".field_values) |field_value| {
+            const option: SessionOption = @fromBackingInt(@intCast(field_value));
             if (std.ascii.eqlIgnoreCase(name, option.sqlName())) return option;
         }
         return null;
@@ -1191,13 +1191,13 @@ pub const Op = union(OpTag) {
             inline else => |*payload| {
                 const Payload = @TypeOf(payload.*);
                 if (@typeInfo(Payload) != .@"struct") return copy;
-                inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                    const child = &@field(payload.*, field.name);
-                    if (field.type == *Op) {
+                inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                    const child = &@field(payload.*, field_name);
+                    if (field_type == *Op) {
                         child.* = try child.*.cloneTree(arena);
-                    } else if (field.type == ?*Op) {
+                    } else if (field_type == ?*Op) {
                         if (child.*) |op| child.* = try op.cloneTree(arena);
-                    } else if (field.type == []const *Op) {
+                    } else if (field_type == []const *Op) {
                         const ops = try arena.alloc(*Op, child.len);
                         for (child.*, ops) |op, *dst| dst.* = try op.cloneTree(arena);
                         child.* = ops;
@@ -1444,7 +1444,7 @@ pub fn encode(allocator: Allocator, out: *std.ArrayList(u8), root: Op) !void {
 const EncodeError = Allocator.Error;
 
 fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!void {
-    try out.append(allocator, @intFromEnum(@as(OpTag, op)));
+    try out.append(allocator, @backingInt(@as(OpTag, op)));
     switch (op) {
         .scan => |s| {
             try encodeTableRef(allocator, out, s.table);
@@ -1456,7 +1456,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
             try encodeOp(allocator, out, a.upstream.*);
         },
         .expand => |e| {
-            try out.append(allocator, @intFromEnum(e.generator));
+            try out.append(allocator, @backingInt(e.generator));
             try encodeOptNames(allocator, out, e.args);
             try encodeOptNames(allocator, out, e.columns);
             try encodeOptString(allocator, out, e.alias);
@@ -1515,7 +1515,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
         .window => |w| try encodeWindow(allocator, out, w),
         .set_union => |u| {
             try out.append(allocator, if (u.all) @as(u8, 1) else 0);
-            try out.append(allocator, @intFromEnum(u.kind));
+            try out.append(allocator, @backingInt(u.kind));
             try encodeOp(allocator, out, u.left.*);
             try encodeOp(allocator, out, u.right.*);
         },
@@ -1550,7 +1550,7 @@ fn encodeOp(allocator: Allocator, out: *std.ArrayList(u8), op: Op) EncodeError!v
 }
 
 fn encodeFileScan(allocator: Allocator, out: *std.ArrayList(u8), f: FileScan) EncodeError!void {
-    try out.append(allocator, @intFromEnum(f.format));
+    try out.append(allocator, @backingInt(f.format));
     try appendU32(allocator, out, @intCast(f.path.len));
     try out.appendSlice(allocator, f.path);
     try encodeOptString(allocator, out, f.alias);
@@ -1593,14 +1593,14 @@ fn encodeWindow(allocator: Allocator, out: *std.ArrayList(u8), w: WindowOp) Enco
             try out.appendSlice(allocator, s.col);
             try out.append(allocator, @intFromBool(s.desc));
         }
-        try out.append(allocator, @intFromEnum(sp.frame.kind));
+        try out.append(allocator, @backingInt(sp.frame.kind));
         try encodeFrameBound(allocator, out, sp.frame.start);
         try encodeFrameBound(allocator, out, sp.frame.end);
     }
     try appendU32(allocator, out, @intCast(w.calls.len));
     for (w.calls) |c| {
         try appendU32(allocator, out, c.spec_idx);
-        try out.append(allocator, @intFromEnum(c.func));
+        try out.append(allocator, @backingInt(c.func));
         try out.append(allocator, @intFromBool(c.ignore_nulls));
         try appendU32(allocator, out, @intCast(c.output_name.len));
         try out.appendSlice(allocator, c.output_name);
@@ -1608,7 +1608,7 @@ fn encodeWindow(allocator: Allocator, out: *std.ArrayList(u8), w: WindowOp) Enco
         for (c.args) |a| try encodeExpr(allocator, out, a);
         if (c.agg) |agg| {
             try out.append(allocator, 1);
-            try out.append(allocator, @intFromEnum(agg.func));
+            try out.append(allocator, @backingInt(agg.func));
             try encodeAggParams(allocator, out, agg.params);
         } else {
             try out.append(allocator, 0);
@@ -1634,7 +1634,7 @@ fn encodeFrameBound(allocator: Allocator, out: *std.ArrayList(u8), b: FrameBound
 }
 
 fn encodeCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) EncodeError!void {
-    try out.append(allocator, @intFromEnum(c.direction));
+    try out.append(allocator, @backingInt(c.direction));
     try encodeTableRef(allocator, out, c.table);
     if (c.columns) |cols| {
         try out.append(allocator, 1);
@@ -1649,11 +1649,11 @@ fn encodeCopy(allocator: Allocator, out: *std.ArrayList(u8), c: CopyOp) EncodeEr
 }
 
 fn encodeAlterAction(allocator: Allocator, out: *std.ArrayList(u8), action: AlterAction) EncodeError!void {
-    try out.append(allocator, @intFromEnum(@as(std.meta.Tag(AlterAction), action)));
+    try out.append(allocator, @backingInt(@as(std.meta.Tag(AlterAction), action)));
     switch (action) {
         .add_column => |add| {
             try encodeColumnDef(allocator, out, add.column);
-            try out.append(allocator, @intFromEnum(@as(std.meta.Tag(types.ColumnPosition), add.position)));
+            try out.append(allocator, @backingInt(@as(std.meta.Tag(types.ColumnPosition), add.position)));
             if (add.position == .after) try encodeString(allocator, out, add.position.after);
         },
         .drop_column => |name| try encodeString(allocator, out, name),
@@ -1738,45 +1738,45 @@ const TypeWireTag = enum(u8) {
 
 fn encodeType(allocator: Allocator, out: *std.ArrayList(u8), t: types.Type) EncodeError!void {
     switch (t) {
-        .int => try out.append(allocator, @intFromEnum(TypeWireTag.int)),
-        .bigint => try out.append(allocator, @intFromEnum(TypeWireTag.bigint)),
-        .boolean => try out.append(allocator, @intFromEnum(TypeWireTag.boolean)),
+        .int => try out.append(allocator, @backingInt(TypeWireTag.int)),
+        .bigint => try out.append(allocator, @backingInt(TypeWireTag.bigint)),
+        .boolean => try out.append(allocator, @backingInt(TypeWireTag.boolean)),
         .varchar => |n| {
-            try out.append(allocator, @intFromEnum(TypeWireTag.varchar));
+            try out.append(allocator, @backingInt(TypeWireTag.varchar));
             try appendU32(allocator, out, n);
         },
-        .string => try out.append(allocator, @intFromEnum(TypeWireTag.string)),
-        .float => try out.append(allocator, @intFromEnum(TypeWireTag.float)),
-        .double => try out.append(allocator, @intFromEnum(TypeWireTag.double)),
-        .date => try out.append(allocator, @intFromEnum(TypeWireTag.date)),
-        .datetime => try out.append(allocator, @intFromEnum(TypeWireTag.datetime)),
-        .tinyint => try out.append(allocator, @intFromEnum(TypeWireTag.tinyint)),
-        .smallint => try out.append(allocator, @intFromEnum(TypeWireTag.smallint)),
-        .largeint => try out.append(allocator, @intFromEnum(TypeWireTag.largeint)),
+        .string => try out.append(allocator, @backingInt(TypeWireTag.string)),
+        .float => try out.append(allocator, @backingInt(TypeWireTag.float)),
+        .double => try out.append(allocator, @backingInt(TypeWireTag.double)),
+        .date => try out.append(allocator, @backingInt(TypeWireTag.date)),
+        .datetime => try out.append(allocator, @backingInt(TypeWireTag.datetime)),
+        .tinyint => try out.append(allocator, @backingInt(TypeWireTag.tinyint)),
+        .smallint => try out.append(allocator, @backingInt(TypeWireTag.smallint)),
+        .largeint => try out.append(allocator, @backingInt(TypeWireTag.largeint)),
         .char => |n| {
-            try out.append(allocator, @intFromEnum(TypeWireTag.char));
+            try out.append(allocator, @backingInt(TypeWireTag.char));
             try appendU32(allocator, out, n);
         },
         .decimal64 => |spec| {
-            try out.append(allocator, @intFromEnum(TypeWireTag.decimal64));
+            try out.append(allocator, @backingInt(TypeWireTag.decimal64));
             try out.append(allocator, spec.p);
             try out.append(allocator, spec.s);
         },
         .decimal128 => |spec| {
-            try out.append(allocator, @intFromEnum(TypeWireTag.decimal128));
+            try out.append(allocator, @backingInt(TypeWireTag.decimal128));
             try out.append(allocator, spec.p);
             try out.append(allocator, spec.s);
         },
         .decimal256 => |spec| {
-            try out.append(allocator, @intFromEnum(TypeWireTag.decimal256));
+            try out.append(allocator, @backingInt(TypeWireTag.decimal256));
             try out.append(allocator, spec.p);
             try out.append(allocator, spec.s);
         },
-        .uuid => try out.append(allocator, @intFromEnum(TypeWireTag.uuid)),
-        .json => try out.append(allocator, @intFromEnum(TypeWireTag.json)),
-        .bitmap => try out.append(allocator, @intFromEnum(TypeWireTag.bitmap)),
+        .uuid => try out.append(allocator, @backingInt(TypeWireTag.uuid)),
+        .json => try out.append(allocator, @backingInt(TypeWireTag.json)),
+        .bitmap => try out.append(allocator, @backingInt(TypeWireTag.bitmap)),
         .nested => {
-            try out.append(allocator, @intFromEnum(TypeWireTag.nested));
+            try out.append(allocator, @backingInt(TypeWireTag.nested));
             const len_at = out.items.len;
             try appendU32(allocator, out, 0);
             try types.appendTypeText(allocator, out, t);
@@ -1789,8 +1789,8 @@ fn decodeType(bytes: []const u8, cursor: *usize) DecodeError!types.Type {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(TypeWireTag.bitmap)) return Error.IrCorrupt;
-    const tag: TypeWireTag = @enumFromInt(t);
+    if (t > @backingInt(TypeWireTag.bitmap)) return Error.IrCorrupt;
+    const tag: TypeWireTag = @fromBackingInt(@intCast(t));
     return switch (tag) {
         .int => .int,
         .bigint => .bigint,
@@ -1875,43 +1875,43 @@ fn encodeColumnDef(allocator: Allocator, out: *std.ArrayList(u8), c: ColumnDef) 
 fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeError!void {
     switch (d) {
         .create_database => |ns| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_database));
+            try out.append(allocator, @backingInt(DdlTag.create_database));
             try appendU32(allocator, out, @intCast(ns.name.len));
             try out.appendSlice(allocator, ns.name);
             try out.append(allocator, @intFromBool(ns.if_not_exists));
         },
         .drop_database => |ns| {
-            try out.append(allocator, @intFromEnum(DdlTag.drop_database));
+            try out.append(allocator, @backingInt(DdlTag.drop_database));
             try appendU32(allocator, out, @intCast(ns.name.len));
             try out.appendSlice(allocator, ns.name);
             try out.append(allocator, @intFromBool(ns.if_exists));
         },
         .create_schema => |ns| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_schema));
+            try out.append(allocator, @backingInt(DdlTag.create_schema));
             try appendU32(allocator, out, @intCast(ns.name.len));
             try out.appendSlice(allocator, ns.name);
             try out.append(allocator, @intFromBool(ns.if_not_exists));
         },
         .drop_schema => |ns| {
-            try out.append(allocator, @intFromEnum(DdlTag.drop_schema));
+            try out.append(allocator, @backingInt(DdlTag.drop_schema));
             try appendU32(allocator, out, @intCast(ns.name.len));
             try out.appendSlice(allocator, ns.name);
             try out.append(allocator, @intFromBool(ns.if_exists));
         },
         .use_schema => |n| {
-            try out.append(allocator, @intFromEnum(DdlTag.use_schema));
+            try out.append(allocator, @backingInt(DdlTag.use_schema));
             try appendU32(allocator, out, @intCast(n.len));
             try out.appendSlice(allocator, n);
         },
         .use_database_schema => |p| {
-            try out.append(allocator, @intFromEnum(DdlTag.use_database_schema));
+            try out.append(allocator, @backingInt(DdlTag.use_database_schema));
             try appendU32(allocator, out, @intCast(p.database.len));
             try out.appendSlice(allocator, p.database);
             try appendU32(allocator, out, @intCast(p.schema.len));
             try out.appendSlice(allocator, p.schema);
         },
         .create_table => |ct| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_table));
+            try out.append(allocator, @backingInt(DdlTag.create_table));
             try encodeTableRef(allocator, out, ct.table);
             try out.append(allocator, @intFromBool(ct.if_not_exists));
             try out.append(allocator, @intFromBool(ct.is_temp));
@@ -1924,33 +1924,33 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
                 try out.appendSlice(allocator, k);
             }
             // 255 = unset (table default); else types.TableCompression.
-            try out.append(allocator, if (ct.compression) |comp| @intFromEnum(comp) else 255);
+            try out.append(allocator, if (ct.compression) |comp| @backingInt(comp) else 255);
             try out.append(allocator, @intFromBool(ct.like != null));
             if (ct.like) |src| try encodeTableRef(allocator, out, src);
         },
         .drop_table => |dt| {
-            try out.append(allocator, @intFromEnum(DdlTag.drop_table));
+            try out.append(allocator, @backingInt(DdlTag.drop_table));
             try appendU32(allocator, out, @intCast(dt.tables.len));
             for (dt.tables) |ref| try encodeTableRef(allocator, out, ref);
             try out.append(allocator, @intFromBool(dt.if_exists));
         },
         .rename_table => |rt| {
-            try out.append(allocator, @intFromEnum(DdlTag.rename_table));
+            try out.append(allocator, @backingInt(DdlTag.rename_table));
             try encodeTableRef(allocator, out, rt.from);
             try encodeTableRef(allocator, out, rt.to);
         },
         .alter_table => |at| {
-            try out.append(allocator, @intFromEnum(DdlTag.alter_table));
+            try out.append(allocator, @backingInt(DdlTag.alter_table));
             try encodeTableRef(allocator, out, at.table);
             try appendU32(allocator, out, @intCast(at.actions.len));
             for (at.actions) |action| try encodeAlterAction(allocator, out, action);
         },
         .truncate_table => |ref| {
-            try out.append(allocator, @intFromEnum(DdlTag.truncate_table));
+            try out.append(allocator, @backingInt(DdlTag.truncate_table));
             try encodeTableRef(allocator, out, ref);
         },
         .create_sql_function => |cf| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_sql_function));
+            try out.append(allocator, @backingInt(DdlTag.create_sql_function));
             try appendU32(allocator, out, @intCast(cf.name.len));
             try out.appendSlice(allocator, cf.name);
             try out.append(allocator, @intFromBool(cf.or_replace));
@@ -1964,13 +1964,13 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.appendSlice(allocator, cf.body);
         },
         .drop_sql_function => |df| {
-            try out.append(allocator, @intFromEnum(DdlTag.drop_sql_function));
+            try out.append(allocator, @backingInt(DdlTag.drop_sql_function));
             try appendU32(allocator, out, @intCast(df.name.len));
             try out.appendSlice(allocator, df.name);
             try out.append(allocator, @intFromBool(df.if_exists));
         },
         .create_zig_function => |zf| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_zig_function));
+            try out.append(allocator, @backingInt(DdlTag.create_zig_function));
             try appendU32(allocator, out, @intCast(zf.name.len));
             try out.appendSlice(allocator, zf.name);
             try out.append(allocator, @intFromBool(zf.or_replace));
@@ -1979,7 +1979,7 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.append(allocator, @intFromBool(zf.using_path));
         },
         .create_view => |cv| {
-            try out.append(allocator, @intFromEnum(DdlTag.create_view));
+            try out.append(allocator, @backingInt(DdlTag.create_view));
             try appendU32(allocator, out, @intCast(cv.name.len));
             try out.appendSlice(allocator, cv.name);
             try out.append(allocator, @intFromBool(cv.or_replace));
@@ -1988,14 +1988,14 @@ fn encodeDdl(allocator: Allocator, out: *std.ArrayList(u8), d: DdlOp) EncodeErro
             try out.appendSlice(allocator, cv.body);
         },
         .drop_view => |dv| {
-            try out.append(allocator, @intFromEnum(DdlTag.drop_view));
+            try out.append(allocator, @backingInt(DdlTag.drop_view));
             try appendU32(allocator, out, @intCast(dv.name.len));
             try out.appendSlice(allocator, dv.name);
             try out.append(allocator, @intFromBool(dv.if_exists));
             try out.append(allocator, @intFromBool(dv.materialized));
         },
         .refresh_view => |n| {
-            try out.append(allocator, @intFromEnum(DdlTag.refresh_view));
+            try out.append(allocator, @backingInt(DdlTag.refresh_view));
             try appendU32(allocator, out, @intCast(n.len));
             try out.appendSlice(allocator, n);
         },
@@ -2042,7 +2042,7 @@ const INSERT_ON_DUPLICATE: u8 = 0x80;
 
 fn encodeInsertMode(allocator: Allocator, out: *std.ArrayList(u8), mode: InsertMode, on_duplicate: ?OnDuplicate) EncodeError!void {
     const flag: u8 = if (on_duplicate != null) INSERT_ON_DUPLICATE else 0;
-    try out.append(allocator, @intFromEnum(mode) | flag);
+    try out.append(allocator, @backingInt(mode) | flag);
 }
 
 fn encodeOptNames(allocator: Allocator, out: *std.ArrayList(u8), names: ?[]const []const u8) EncodeError!void {
@@ -2078,23 +2078,23 @@ const ShowTag = enum(u8) {
 
 fn encodeShow(allocator: Allocator, out: *std.ArrayList(u8), s: ShowOp) EncodeError!void {
     switch (s) {
-        .databases => try out.append(allocator, @intFromEnum(ShowTag.databases)),
+        .databases => try out.append(allocator, @backingInt(ShowTag.databases)),
         .schemas => |db| {
-            try out.append(allocator, @intFromEnum(ShowTag.schemas));
+            try out.append(allocator, @backingInt(ShowTag.schemas));
             try encodeOptString(allocator, out, db);
         },
         .tables => |ref| {
-            try out.append(allocator, @intFromEnum(ShowTag.tables));
+            try out.append(allocator, @backingInt(ShowTag.tables));
             try encodeTableRef(allocator, out, ref);
         },
-        .functions => try out.append(allocator, @intFromEnum(ShowTag.functions)),
+        .functions => try out.append(allocator, @backingInt(ShowTag.functions)),
         .create_function => |name| {
-            try out.append(allocator, @intFromEnum(ShowTag.create_function));
+            try out.append(allocator, @backingInt(ShowTag.create_function));
             try appendU32(allocator, out, @intCast(name.len));
             try out.appendSlice(allocator, name);
         },
         .create_database => |cd| {
-            try out.append(allocator, @intFromEnum(ShowTag.create_database));
+            try out.append(allocator, @backingInt(ShowTag.create_database));
             try appendU32(allocator, out, @intCast(cd.name.len));
             try out.appendSlice(allocator, cd.name);
             try out.append(allocator, @intFromBool(cd.if_not_exists));
@@ -2121,7 +2121,7 @@ fn encodeGroupBy(allocator: Allocator, out: *std.ArrayList(u8), g: Op.GroupBy) E
     try appendU32(allocator, out, @intCast(g.aggs.len));
     for (g.aggs) |a| {
         // func (u8)
-        try out.append(allocator, @intFromEnum(a.func));
+        try out.append(allocator, @backingInt(a.func));
         try encodeOptString(allocator, out, a.udf_name);
         try appendU32(allocator, out, @intCast(a.udf_arg_cols.len));
         for (a.udf_arg_cols) |c| {
@@ -2173,7 +2173,7 @@ fn encodeAggParams(allocator: Allocator, out: *std.ArrayList(u8), params: AggPar
         },
         .mann_whitney => |m| {
             try out.append(allocator, 5);
-            try out.append(allocator, @intFromEnum(m.alternative));
+            try out.append(allocator, @backingInt(m.alternative));
             try out.append(allocator, @intFromBool(m.continuity_correction));
         },
     }
@@ -2226,8 +2226,8 @@ fn encodeCompute(allocator: Allocator, out: *std.ArrayList(u8), c: Op.Compute) E
 }
 
 fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeError!void {
-    try out.append(allocator, @intFromEnum(j.algorithm));
-    try out.append(allocator, @intFromEnum(j.join_type));
+    try out.append(allocator, @backingInt(j.algorithm));
+    try out.append(allocator, @backingInt(j.join_type));
     // ON pairs
     try appendU32(allocator, out, @intCast(j.on.len));
     for (j.on) |kp| {
@@ -2244,7 +2244,7 @@ fn encodeJoin(allocator: Allocator, out: *std.ArrayList(u8), j: Op.Join) EncodeE
         try out.appendSlice(allocator, rg.left);
         try appendU32(allocator, out, @intCast(rg.right.len));
         try out.appendSlice(allocator, rg.right);
-        try out.append(allocator, @intFromEnum(rg.op));
+        try out.append(allocator, @backingInt(rg.op));
     }
     // Optional extra predicate (post-join filter)
     if (j.extra_predicate) |pred| {
@@ -2314,20 +2314,20 @@ const ExprTag = enum(u8) { col_ref = 0, lit = 1, call = 2, case = 3, null_lit = 
 pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) EncodeError!void {
     switch (e) {
         .col_ref => |name| {
-            try out.append(allocator, @intFromEnum(ExprTag.col_ref));
+            try out.append(allocator, @backingInt(ExprTag.col_ref));
             try appendU32(allocator, out, @intCast(name.len));
             try out.appendSlice(allocator, name);
         },
         .lit => |v| {
-            try out.append(allocator, @intFromEnum(ExprTag.lit));
+            try out.append(allocator, @backingInt(ExprTag.lit));
             try encodeValue(allocator, out, v);
         },
         .null_lit => |t| {
-            try out.append(allocator, @intFromEnum(ExprTag.null_lit));
+            try out.append(allocator, @backingInt(ExprTag.null_lit));
             try encodeType(allocator, out, t);
         },
         .call => |c| {
-            try out.append(allocator, @intFromEnum(ExprTag.call));
+            try out.append(allocator, @backingInt(ExprTag.call));
             try appendU32(allocator, out, @intCast(c.fn_name.len));
             try out.appendSlice(allocator, c.fn_name);
             try appendU32(allocator, out, @intCast(c.args.len));
@@ -2338,7 +2338,7 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
         // loudly if someone tries to encode an unresolved tree.
         .scalar_subquery, .exists_subquery, .var_ref => return EncodeError.OutOfMemory,
         .case => |cs| {
-            try out.append(allocator, @intFromEnum(ExprTag.case));
+            try out.append(allocator, @backingInt(ExprTag.case));
             try appendU32(allocator, out, @intCast(cs.branches.len));
             for (cs.branches) |br| {
                 try encodePredicate(allocator, out, br.cond);
@@ -2354,7 +2354,7 @@ pub fn encodeExpr(allocator: Allocator, out: *std.ArrayList(u8), e: Expr) Encode
             }
         },
         .lambda => |l| {
-            try out.append(allocator, @intFromEnum(ExprTag.lambda));
+            try out.append(allocator, @backingInt(ExprTag.lambda));
             try appendU32(allocator, out, @intCast(l.params.len));
             for (l.params) |p| {
                 try appendU32(allocator, out, @intCast(p.len));
@@ -2409,39 +2409,39 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
     switch (expr) {
         // Validation's text-against-number form re-validates from the leaf.
         .leaf, .text_as_number => |p| {
-            try out.append(allocator, @intFromEnum(if (p.as_boolean) PredTag.as_boolean_leaf else PredTag.leaf));
-            try out.append(allocator, @intFromEnum(p.op));
+            try out.append(allocator, @backingInt(if (p.as_boolean) PredTag.as_boolean_leaf else PredTag.leaf));
+            try out.append(allocator, @backingInt(p.op));
             try appendU32(allocator, out, @intCast(p.col.len));
             try out.appendSlice(allocator, p.col);
             try encodeValue(allocator, out, p.val);
         },
         .day_leaf => |p| {
-            try out.append(allocator, @intFromEnum(PredTag.day_leaf));
-            try out.append(allocator, @intFromEnum(p.op));
+            try out.append(allocator, @backingInt(PredTag.day_leaf));
+            try out.append(allocator, @backingInt(p.op));
             try appendU32(allocator, out, @intCast(p.col.len));
             try out.appendSlice(allocator, p.col);
             try encodeValue(allocator, out, p.val);
         },
         .is_null => |col| {
-            try out.append(allocator, @intFromEnum(PredTag.is_null));
+            try out.append(allocator, @backingInt(PredTag.is_null));
             try appendU32(allocator, out, @intCast(col.len));
             try out.appendSlice(allocator, col);
         },
         .is_not_null => |col| {
-            try out.append(allocator, @intFromEnum(PredTag.is_not_null));
+            try out.append(allocator, @backingInt(PredTag.is_not_null));
             try appendU32(allocator, out, @intCast(col.len));
             try out.appendSlice(allocator, col);
         },
         .like => |lp| {
-            try out.append(allocator, @intFromEnum(PredTag.like));
+            try out.append(allocator, @backingInt(PredTag.like));
             try appendU32(allocator, out, @intCast(lp.col.len));
             try out.appendSlice(allocator, lp.col);
             try appendU32(allocator, out, @intCast(lp.pattern.len));
             try out.appendSlice(allocator, lp.pattern);
         },
         .leaf_col_col => |lc| {
-            try out.append(allocator, @intFromEnum(PredTag.leaf_col_col));
-            try out.append(allocator, @intFromEnum(lc.op));
+            try out.append(allocator, @backingInt(PredTag.leaf_col_col));
+            try out.append(allocator, @backingInt(lc.op));
             try appendU32(allocator, out, @intCast(lc.left.len));
             try out.appendSlice(allocator, lc.left);
             try appendU32(allocator, out, @intCast(lc.right.len));
@@ -2454,24 +2454,24 @@ pub fn encodePredicate(allocator: Allocator, out: *std.ArrayList(u8), expr: Pred
         // via SQL).
         .scalar_subquery, .exists_subquery, .in_subquery, .always, .in_set, .text_as_number_set, .correlated_set, .correlated_scalar, .correlated_range, .leaf_var, .unknown => return EncodeError.OutOfMemory,
         .@"and" => |children| {
-            try out.append(allocator, @intFromEnum(PredTag.p_and));
+            try out.append(allocator, @backingInt(PredTag.p_and));
             try appendU32(allocator, out, @intCast(children.len));
             for (children) |c| try encodePredicate(allocator, out, c);
         },
         .@"or" => |children| {
-            try out.append(allocator, @intFromEnum(PredTag.p_or));
+            try out.append(allocator, @backingInt(PredTag.p_or));
             try appendU32(allocator, out, @intCast(children.len));
             for (children) |c| try encodePredicate(allocator, out, c);
         },
         .not => |child| {
-            try out.append(allocator, @intFromEnum(PredTag.p_not));
+            try out.append(allocator, @backingInt(PredTag.p_not));
             try encodePredicate(allocator, out, child.*);
         },
     }
 }
 
 pub fn encodeValue(allocator: Allocator, out: *std.ArrayList(u8), v: Value) EncodeError!void {
-    try out.append(allocator, @intFromEnum(@as(ValueTag, v)));
+    try out.append(allocator, @backingInt(@as(ValueTag, v)));
     var b: [16]u8 = undefined;
     switch (v) {
         .int => |x| {
@@ -2555,8 +2555,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(OpTag.expand)) return Error.IrUnknownOp;
-    const tag: OpTag = @enumFromInt(tag_byte);
+    if (tag_byte > @backingInt(OpTag.expand)) return Error.IrUnknownOp;
+    const tag: OpTag = @fromBackingInt(@intCast(tag_byte));
 
     return switch (tag) {
         .scan => blk: {
@@ -2576,8 +2576,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const generator_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (generator_byte > @intFromEnum(Op.Expand.Generator.unnest)) return Error.IrCorrupt;
-            const generator: Op.Expand.Generator = @enumFromInt(generator_byte);
+            if (generator_byte > @backingInt(Op.Expand.Generator.unnest)) return Error.IrCorrupt;
+            const generator: Op.Expand.Generator = @fromBackingInt(@intCast(generator_byte));
             const args = (try decodeOptNames(allocator, bytes, cursor)) orelse return Error.IrCorrupt;
             errdefer allocator.free(args);
             const columns = (try decodeOptNames(allocator, bytes, cursor)) orelse return Error.IrCorrupt;
@@ -2717,8 +2717,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const func_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (func_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
-                const func: AggFunc = @enumFromInt(func_byte);
+                if (func_byte >= @typeInfo(AggFunc).@"enum".field_names.len) return Error.IrCorrupt;
+                const func: AggFunc = @fromBackingInt(@intCast(func_byte));
                 const udf_name = try readOptString(bytes, cursor);
                 if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
                 const n_udf_args = readU32(bytes[cursor.* .. cursor.* + 4]);
@@ -2769,10 +2769,10 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
             const algo_byte = bytes[cursor.*];
             const jtype_byte = bytes[cursor.* + 1];
             cursor.* += 2;
-            if (algo_byte > @intFromEnum(JoinAlgorithm.range_sweep)) return Error.IrCorrupt;
-            if (jtype_byte > @intFromEnum(JoinType.full)) return Error.IrCorrupt;
-            const algo: JoinAlgorithm = @enumFromInt(algo_byte);
-            const jtype: JoinType = @enumFromInt(jtype_byte);
+            if (algo_byte > @backingInt(JoinAlgorithm.range_sweep)) return Error.IrCorrupt;
+            if (jtype_byte > @backingInt(JoinType.full)) return Error.IrCorrupt;
+            const algo: JoinAlgorithm = @fromBackingInt(@intCast(algo_byte));
+            const jtype: JoinType = @fromBackingInt(@intCast(jtype_byte));
 
             if (cursor.* + 4 > bytes.len) return Error.IrCorrupt;
             const n_on = readU32(bytes[cursor.* .. cursor.* + 4]);
@@ -2804,8 +2804,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
                 if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
                 const op_byte = bytes[cursor.*];
                 cursor.* += 1;
-                if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
-                rg.* = .{ .left = l, .right = r, .op = @enumFromInt(op_byte) };
+                if (op_byte > @backingInt(PredicateOp.gte)) return Error.IrCorrupt;
+                rg.* = .{ .left = l, .right = r, .op = @fromBackingInt(@intCast(op_byte)) };
             }
 
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
@@ -2887,8 +2887,8 @@ fn decodeOp(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError
         .set_union => blk: {
             if (cursor.* + 2 > bytes.len) return Error.IrCorrupt;
             const all = bytes[cursor.*] != 0;
-            if (bytes[cursor.* + 1] > @intFromEnum(SetKind.except)) return Error.IrCorrupt;
-            const kind: SetKind = @enumFromInt(bytes[cursor.* + 1]);
+            if (bytes[cursor.* + 1] > @backingInt(SetKind.except)) return Error.IrCorrupt;
+            const kind: SetKind = @fromBackingInt(@intCast(bytes[cursor.* + 1]));
             cursor.* += 2;
             const left = try allocator.create(Op);
             errdefer allocator.destroy(left);
@@ -3009,8 +3009,8 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
         const kind_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (kind_byte > @intFromEnum(FrameKind.groups)) return Error.IrCorrupt;
-        const kind: FrameKind = @enumFromInt(kind_byte);
+        if (kind_byte > @backingInt(FrameKind.groups)) return Error.IrCorrupt;
+        const kind: FrameKind = @fromBackingInt(@intCast(kind_byte));
         const start = try decodeFrameBound(bytes, cursor);
         const end = try decodeFrameBound(bytes, cursor);
 
@@ -3039,8 +3039,8 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
         cursor.* += 4;
         const func_byte = bytes[cursor.*];
         cursor.* += 1;
-        if (func_byte > @intFromEnum(WindowFunc.aggregate)) return Error.IrCorrupt;
-        const func: WindowFunc = @enumFromInt(func_byte);
+        if (func_byte > @backingInt(WindowFunc.aggregate)) return Error.IrCorrupt;
+        const func: WindowFunc = @fromBackingInt(@intCast(func_byte));
         const ignore_nulls = bytes[cursor.*] != 0;
         cursor.* += 1;
         const output_name = try readString(bytes, cursor);
@@ -3063,8 +3063,8 @@ fn decodeWindow(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeE
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const agg_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (agg_byte >= @typeInfo(AggFunc).@"enum".fields.len) return Error.IrCorrupt;
-            break :blk .{ .func = @enumFromInt(agg_byte), .params = try decodeAggParams(bytes, cursor) };
+            if (agg_byte >= @typeInfo(AggFunc).@"enum".field_names.len) return Error.IrCorrupt;
+            break :blk .{ .func = @fromBackingInt(@intCast(agg_byte)), .params = try decodeAggParams(bytes, cursor) };
         } else null;
         calls[j] = .{
             .spec_idx = spec_idx,
@@ -3111,8 +3111,8 @@ fn decodeFileScan(bytes: []const u8, cursor: *usize) DecodeError!FileScan {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const fmt_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (fmt_byte > @intFromEnum(FileFormat.parquet)) return Error.IrCorrupt;
-    const format: FileFormat = @enumFromInt(fmt_byte);
+    if (fmt_byte > @backingInt(FileFormat.parquet)) return Error.IrCorrupt;
+    const format: FileFormat = @fromBackingInt(@intCast(fmt_byte));
     const path = try readString(bytes, cursor);
     const alias = try decodeOptString(bytes, cursor);
     const csv = try decodeCsvOptions(bytes, cursor);
@@ -3173,8 +3173,8 @@ fn decodeCopy(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErr
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const dir_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (dir_byte > @intFromEnum(CopyOp.Direction.to_stdout)) return Error.IrCorrupt;
-    const direction: CopyOp.Direction = @enumFromInt(dir_byte);
+    if (dir_byte > @backingInt(CopyOp.Direction.to_stdout)) return Error.IrCorrupt;
+    const direction: CopyOp.Direction = @fromBackingInt(@intCast(dir_byte));
     const ref = try decodeTableRef(bytes, cursor);
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const has_cols = bytes[cursor.*] != 0;
@@ -3205,15 +3205,15 @@ fn decodeAlterAction(bytes: []const u8, cursor: *usize) DecodeError!AlterAction 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t >= @typeInfo(AlterAction).@"union".fields.len) return Error.IrCorrupt;
-    return switch (@as(std.meta.Tag(AlterAction), @enumFromInt(t))) {
+    if (t >= @typeInfo(AlterAction).@"union".field_names.len) return Error.IrCorrupt;
+    return switch (@as(std.meta.Tag(AlterAction), @fromBackingInt(@intCast(t)))) {
         .add_column => blk: {
             const column = try decodeColumnDef(bytes, cursor);
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const pos = bytes[cursor.*];
             cursor.* += 1;
-            if (pos >= @typeInfo(types.ColumnPosition).@"union".fields.len) return Error.IrCorrupt;
-            const position: types.ColumnPosition = switch (@as(std.meta.Tag(types.ColumnPosition), @enumFromInt(pos))) {
+            if (pos >= @typeInfo(types.ColumnPosition).@"union".field_names.len) return Error.IrCorrupt;
+            const position: types.ColumnPosition = switch (@as(std.meta.Tag(types.ColumnPosition), @fromBackingInt(@intCast(pos)))) {
                 .last => .last,
                 .first => .first,
                 .after => .{ .after = try readString(bytes, cursor) },
@@ -3338,7 +3338,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const comp_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (comp_byte != 255 and comp_byte > @intFromEnum(types.TableCompression.lz4)) return Error.IrCorrupt;
+            if (comp_byte != 255 and comp_byte > @backingInt(types.TableCompression.lz4)) return Error.IrCorrupt;
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const has_like = bytes[cursor.*] != 0;
             cursor.* += 1;
@@ -3350,7 +3350,7 @@ fn decodeDdl(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeErro
                 .columns = cols,
                 .order_key = keys,
                 .unique = unique,
-                .compression = if (comp_byte == 255) null else @enumFromInt(comp_byte),
+                .compression = if (comp_byte == 255) null else @fromBackingInt(@intCast(comp_byte)),
                 .like = like,
             } };
         },
@@ -3505,8 +3505,8 @@ fn decodeInsertMode(bytes: []const u8, cursor: *usize) DecodeError!InsertHead {
     const byte = bytes[cursor.*];
     cursor.* += 1;
     const tag = byte & ~INSERT_ON_DUPLICATE;
-    if (tag > @intFromEnum(InsertMode.ignore)) return Error.IrCorrupt;
-    return .{ .mode = @enumFromInt(tag), .on_duplicate = byte & INSERT_ON_DUPLICATE != 0 };
+    if (tag > @backingInt(InsertMode.ignore)) return Error.IrCorrupt;
+    return .{ .mode = @fromBackingInt(@intCast(tag)), .on_duplicate = byte & INSERT_ON_DUPLICATE != 0 };
 }
 
 fn decodeOptNames(allocator: Allocator, bytes: []const u8, cursor: *usize) DecodeError!?[]const []const u8 {
@@ -3549,8 +3549,8 @@ fn decodeShow(bytes: []const u8, cursor: *usize) DecodeError!ShowOp {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const t = bytes[cursor.*];
     cursor.* += 1;
-    if (t > @intFromEnum(ShowTag.create_database)) return Error.IrCorrupt;
-    const tag: ShowTag = @enumFromInt(t);
+    if (t > @backingInt(ShowTag.create_database)) return Error.IrCorrupt;
+    const tag: ShowTag = @fromBackingInt(@intCast(t));
     return switch (tag) {
         .databases => ShowOp.databases,
         .schemas => ShowOp{ .schemas = try decodeOptString(bytes, cursor) },
@@ -3575,8 +3575,8 @@ pub fn decodeExpr(allocator: Allocator, bytes: []const u8, cursor: *usize) Decod
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(ExprTag.lambda)) return Error.IrCorrupt;
-    const tag: ExprTag = @enumFromInt(tag_byte);
+    if (tag_byte > @backingInt(ExprTag.lambda)) return Error.IrCorrupt;
+    const tag: ExprTag = @fromBackingInt(@intCast(tag_byte));
     return switch (tag) {
         .col_ref => Expr{ .col_ref = try readString(bytes, cursor) },
         .lit => Expr{ .lit = try decodeValue(bytes, cursor) },
@@ -3665,16 +3665,16 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    if (tag_byte > @intFromEnum(PredTag.as_boolean_leaf)) return Error.IrCorrupt;
-    const tag: PredTag = @enumFromInt(tag_byte);
+    if (tag_byte > @backingInt(PredTag.as_boolean_leaf)) return Error.IrCorrupt;
+    const tag: PredTag = @fromBackingInt(@intCast(tag_byte));
 
     return switch (tag) {
         .leaf, .as_boolean_leaf => blk: {
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const op_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
-            const op: PredicateOp = @enumFromInt(op_byte);
+            if (op_byte > @backingInt(PredicateOp.gte)) return Error.IrCorrupt;
+            const op: PredicateOp = @fromBackingInt(@intCast(op_byte));
             const col = try readString(bytes, cursor);
             const val = try decodeValue(bytes, cursor);
             break :blk PredicateExpr{ .leaf = .{ .col = col, .op = op, .val = val, .as_boolean = tag == .as_boolean_leaf } };
@@ -3683,8 +3683,8 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const op_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
-            const op: PredicateOp = @enumFromInt(op_byte);
+            if (op_byte > @backingInt(PredicateOp.gte)) return Error.IrCorrupt;
+            const op: PredicateOp = @fromBackingInt(@intCast(op_byte));
             const col = try readString(bytes, cursor);
             const val = try decodeValue(bytes, cursor);
             break :blk PredicateExpr{ .day_leaf = .{ .col = col, .op = op, .val = val } };
@@ -3727,8 +3727,8 @@ pub fn decodePredicate(allocator: Allocator, bytes: []const u8, cursor: *usize) 
             if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
             const op_byte = bytes[cursor.*];
             cursor.* += 1;
-            if (op_byte > @intFromEnum(PredicateOp.gte)) return Error.IrCorrupt;
-            const op: PredicateOp = @enumFromInt(op_byte);
+            if (op_byte > @backingInt(PredicateOp.gte)) return Error.IrCorrupt;
+            const op: PredicateOp = @fromBackingInt(@intCast(op_byte));
             const left = try readString(bytes, cursor);
             const right = try readString(bytes, cursor);
             break :blk PredicateExpr{ .leaf_col_col = .{ .left = left, .op = op, .right = right } };
@@ -3757,7 +3757,7 @@ pub fn decodeValue(bytes: []const u8, cursor: *usize) DecodeError!Value {
     if (cursor.* + 1 > bytes.len) return Error.IrCorrupt;
     const tag_byte = bytes[cursor.*];
     cursor.* += 1;
-    const tag: ValueTag = @enumFromInt(tag_byte);
+    const tag: ValueTag = @fromBackingInt(@intCast(tag_byte));
     const c = cursor.*;
     return switch (tag) {
         .int => blk: {
@@ -4299,7 +4299,7 @@ test "ir: an INSERT's mode byte is unchanged without ON DUPLICATE KEY UPDATE" {
     defer buf.deinit(allocator);
     try encode(allocator, &buf, .{ .insert = .{ .mode = .ignore, .table = .{ .name = "t" }, .columns = null, .rows = &rows } });
     const mode_at = header_size + 1 + 1 + 1 + 4 + 1;
-    try std.testing.expectEqual(@intFromEnum(InsertMode.ignore), buf.items[mode_at]);
+    try std.testing.expectEqual(@backingInt(InsertMode.ignore), buf.items[mode_at]);
     buf.items[mode_at] = 3;
     try std.testing.expectError(Error.IrCorrupt, decode(allocator, buf.items));
 }

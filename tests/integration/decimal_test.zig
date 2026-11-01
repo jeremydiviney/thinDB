@@ -478,8 +478,8 @@ test "decimal: grouped SUM/AVG/MIN/MAX scale correctly" {
     try std.testing.expectApproxEqAbs(@as(f64, 15.0), av[1], 1e-9);
 }
 
-const NINES_76 = "9" ** 76;
-const DIGITS_76 = "1234567890" ** 7 ++ "123456";
+const NINES_76 = &@as([76]u8, @splat('9'));
+const DIGITS_76 = "1234567890123456789012345678901234567890123456789012345678901234567890123456";
 
 fn expectOverflow(allocator: std.mem.Allocator, db: anytype, sql: []const u8) !void {
     var q = try runSql(allocator, db, sql);
@@ -524,12 +524,12 @@ test "decimal: SUM, MIN, MAX, DISTINCT, GROUP BY and window SUM over DECIMAL256"
 
     // A SUM holds what its i256 holds, past DECIMAL(76)'s digits, as a
     // DECIMAL128 SUM holds its i128; six 76-digit nines pass even that.
-    try helpers.expectText(allocator, db, "SELECT SUM(v) FROM s WHERE g = 1", "1" ++ "9" ** 75 ++ "8");
-    try helpers.expectTexts(allocator, db, "SELECT SUM(v) FROM s WHERE g < 3 GROUP BY g ORDER BY g", &.{ "1" ++ "9" ** 75 ++ "8", "-5" });
+    try helpers.expectText(allocator, db, "SELECT SUM(v) FROM s WHERE g = 1", "1" ++ &@as([75]u8, @splat('9')) ++ "8");
+    try helpers.expectTexts(allocator, db, "SELECT SUM(v) FROM s WHERE g < 3 GROUP BY g ORDER BY g", &.{ "1" ++ &@as([75]u8, @splat('9')) ++ "8", "-5" });
     try expectOverflow(allocator, db, "SELECT SUM(v) FROM s WHERE g = 3");
     try helpers.expectText(allocator, db, "SELECT MIN(v) FROM s", "-5");
     try helpers.expectText(allocator, db, "SELECT MAX(v) FROM s", NINES_76);
-    try helpers.expectText(allocator, db, "SELECT SUM(DISTINCT v) FROM s", "9" ** 75 ++ "4");
+    try helpers.expectText(allocator, db, "SELECT SUM(DISTINCT v) FROM s", &@as([75]u8, @splat('9')) ++ "4");
     try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT v) FROM s", "2");
     try helpers.expectText(allocator, db, "SELECT SUM(f) FROM s", "5.2500000000");
 
@@ -544,7 +544,7 @@ test "decimal: SUM, MIN, MAX, DISTINCT, GROUP BY and window SUM over DECIMAL256"
         allocator,
         db,
         "SELECT SUM(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM s WHERE g < 3 ORDER BY id",
-        &.{ NINES_76, "1" ++ "9" ** 75 ++ "8", "9" ** 75 ++ "4", "-5" },
+        &.{ NINES_76, "1" ++ &@as([75]u8, @splat('9')) ++ "8", &@as([75]u8, @splat('9')) ++ "4", "-5" },
     );
 }
 

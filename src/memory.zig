@@ -52,7 +52,7 @@ pub const Source = enum {
     execution,
 };
 
-const source_count = std.meta.fields(Source).len;
+const source_count = @typeInfo(Source).@"enum".field_names.len;
 
 pub const accountantOf = BudgetAllocator.accountantOf;
 pub const ownerOf = BudgetAllocator.ownerOf;
@@ -630,7 +630,7 @@ pub const MemoryAccountant = struct {
     /// charged and a released owner stays alive until they are back.
     retired_bytes: usize = 0,
     /// Live bytes attributed to each `Source`, indexed by `@intFromEnum`.
-    by_source: [source_count]usize = [_]usize{0} ** source_count,
+    by_source: [source_count]usize = @splat(0),
     /// Shared cross-query pool this accountant draws from (null = per-query
     /// budget only). Every reserve must also fit the pool; every release
     /// hands the bytes back.
@@ -760,9 +760,9 @@ pub const MemoryAccountant = struct {
         self.lock();
         defer self.reservation_lock.unlock();
         std.debug.assert(self.current_bytes >= bytes);
-        std.debug.assert(self.by_source[@intFromEnum(Source.execution)] >= bytes);
+        std.debug.assert(self.by_source[@backingInt(Source.execution)] >= bytes);
         self.current_bytes -= bytes;
-        self.by_source[@intFromEnum(Source.execution)] -= bytes;
+        self.by_source[@backingInt(Source.execution)] -= bytes;
         self.retired_bytes += bytes;
         self.rearmWatch();
     }
@@ -860,7 +860,7 @@ pub const MemoryAccountant = struct {
         }
         self.current_bytes += bytes;
         self.peak_bytes = @max(self.peak_bytes, self.current_bytes);
-        self.by_source[@intFromEnum(source)] += bytes;
+        self.by_source[@backingInt(source)] += bytes;
         if (self.current_bytes < self.watch_next_bytes) return false;
         self.watch_next_bytes = self.current_bytes +| self.watch_step;
         return true;
@@ -929,9 +929,9 @@ pub const MemoryAccountant = struct {
 
     fn releaseLocked(self: *MemoryAccountant, source: Source, bytes: usize) void {
         std.debug.assert(self.current_bytes >= bytes);
-        std.debug.assert(self.by_source[@intFromEnum(source)] >= bytes);
+        std.debug.assert(self.by_source[@backingInt(source)] >= bytes);
         self.current_bytes -= bytes;
-        self.by_source[@intFromEnum(source)] -= bytes;
+        self.by_source[@backingInt(source)] -= bytes;
         self.rearmWatch();
         self.pool.release(bytes);
     }
@@ -949,7 +949,7 @@ pub const MemoryAccountant = struct {
         std.debug.assert(!self.physical_tracking or self.current_bytes == 0);
         self.pool.release(self.current_bytes);
         self.current_bytes = 0;
-        self.by_source = [_]usize{0} ** source_count;
+        self.by_source = @as([source_count]usize, @splat(0));
     }
 
     /// Bytes this statement can still reserve: what the pool's statement
@@ -966,9 +966,9 @@ pub const MemoryAccountant = struct {
             "[mem-audit] MemoryBudgetExceeded: +{d} MiB for '{s}' would pass what the memory budget leaves statements (this one holds {d} MiB)\n",
             .{ want / mib, @tagName(failing), self.current_bytes / mib },
         );
-        inline for (std.meta.fields(Source)) |f| {
-            const v = self.by_source[@intFromEnum(@field(Source, f.name))];
-            if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ f.name, v / mib });
+        inline for (@typeInfo(Source).@"enum".field_names) |field_name| {
+            const v = self.by_source[@backingInt(@field(Source, field_name))];
+            if (v > 0) std.debug.print("[mem-audit]   {s:<16} {d:>6} MiB\n", .{ field_name, v / mib });
         }
         std.debug.print(
             "[mem-audit]   statements hold {d} MiB of their {d} MiB (other queries hold the rest)\n",
@@ -1105,8 +1105,8 @@ test "memory: multiple operators sharing one accountant" {
     try a.reserve(.materialize, 200);
     try std.testing.expectEqual(@as(usize, 700), a.current_bytes);
     // Per-source attribution is tracked independently.
-    try std.testing.expectEqual(@as(usize, 500), a.by_source[@intFromEnum(Source.hash_aggregate)]);
-    try std.testing.expectEqual(@as(usize, 200), a.by_source[@intFromEnum(Source.materialize)]);
+    try std.testing.expectEqual(@as(usize, 500), a.by_source[@backingInt(Source.hash_aggregate)]);
+    try std.testing.expectEqual(@as(usize, 200), a.by_source[@backingInt(Source.materialize)]);
 }
 
 test "memory: tracked allocations charge capacities and refund failed growth" {

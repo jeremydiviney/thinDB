@@ -2312,8 +2312,9 @@ fn filledExprType(e: ir.Expr, own: types.Type, other: types.Type) error{OutOfMem
     if (own.structFields()) |fields| {
         const other_fields = other.structFields() orelse return own;
         if (!std.mem.startsWith(u8, call.fn_name, scalar_fn.STRUCT_VALUE_PREFIX) or call.args.len != fields.len or other_fields.len != fields.len) return own;
-        var fallback = std.heap.stackFallback(16 * @sizeOf(types.StructField), std.heap.smp_allocator);
-        const allocator = fallback.get();
+        var fallback_buffer: [16 * @sizeOf(types.StructField)]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buffer, std.heap.smp_allocator);
+        const allocator = fallback.allocator();
         const filled = try allocator.alloc(types.StructField, fields.len);
         defer allocator.free(filled);
         for (filled, fields, other_fields, call.args) |*f, field, other_field, arg| {
@@ -3374,13 +3375,13 @@ fn countReferences(allocator: Allocator, op: *const ir.Op, refs: *std.AutoHashMa
         inline else => |payload| {
             const Payload = @TypeOf(payload);
             if (@typeInfo(Payload) != .@"struct") return;
-            inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                const child = @field(payload, field.name);
-                if (field.type == *ir.Op) {
+            inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                const child = @field(payload, field_name);
+                if (field_type == *ir.Op) {
                     try countReferences(allocator, child, refs);
-                } else if (field.type == ?*ir.Op) {
+                } else if (field_type == ?*ir.Op) {
                     if (child) |c| try countReferences(allocator, c, refs);
-                } else if (field.type == []const *ir.Op) {
+                } else if (field_type == []const *ir.Op) {
                     for (child) |c| try countReferences(allocator, c, refs);
                 }
             }
@@ -3397,13 +3398,13 @@ fn unshareChildren(u: *Unshare, op: *ir.Op) Allocator.Error!void {
         inline else => |*payload| {
             const Payload = @TypeOf(payload.*);
             if (@typeInfo(Payload) != .@"struct") return;
-            inline for (@typeInfo(Payload).@"struct".fields) |field| {
-                const child = &@field(payload.*, field.name);
-                if (field.type == *ir.Op) {
+            inline for (@typeInfo(Payload).@"struct".field_names, @typeInfo(Payload).@"struct".field_types) |field_name, field_type| {
+                const child = &@field(payload.*, field_name);
+                if (field_type == *ir.Op) {
                     child.* = try unshareEdge(u, child.*);
-                } else if (field.type == ?*ir.Op) {
+                } else if (field_type == ?*ir.Op) {
                     if (child.*) |c| child.* = try unshareEdge(u, c);
-                } else if (field.type == []const *ir.Op) {
+                } else if (field_type == []const *ir.Op) {
                     const ops = try u.node_arena.dupe(*ir.Op, child.*);
                     for (ops) |*c| c.* = try unshareEdge(u, c.*);
                     child.* = ops;

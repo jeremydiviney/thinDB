@@ -708,8 +708,8 @@ pub const Scan = struct {
     /// The guided filtered path's survivor materialization (per-survivor
     /// decode of every projected column), summed like the two above.
     scan_materialize_ticks: u64 = 0,
-    scan_mat_kind_ticks: [MAT_KINDS]u64 = [_]u64{0} ** MAT_KINDS,
-    scan_mat_kind_cols: [MAT_KINDS]u32 = [_]u32{0} ** MAT_KINDS,
+    scan_mat_kind_ticks: [MAT_KINDS]u64 = @splat(0),
+    scan_mat_kind_cols: [MAT_KINDS]u32 = @splat(0),
 
     /// Phase 4.2 (Option A): when set, the projected column at `out_phys[code_col]`
     /// is emitted as global dict CODES (via the `Batch.coded` sidecar) instead of
@@ -1628,7 +1628,7 @@ pub const Scan = struct {
             const rb = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags).block;
             switch (rb.value_width) {
                 inline 1, 2, 4, 8 => |W| {
-                    const T = std.meta.Int(.signed, W * 8);
+                    const T = @Int(.signed, W * 8);
                     try self.runs_v_bufs[j].resize(self.allocator, rb.n_runs);
                     try self.runs_l_bufs[j].resize(self.allocator, rb.n_runs);
                     const vs = self.runs_v_bufs[j].items;
@@ -2986,7 +2986,7 @@ pub const Scan = struct {
             const rb = storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{ .has_nulls = false }).block;
             switch (rb.value_width) {
                 inline 1, 2, 4, 8 => |width| {
-                    const T = std.meta.Int(.signed, width * 8);
+                    const T = @Int(.signed, width * 8);
                     try self.runs_v_bufs[j].resize(self.allocator, rb.n_runs);
                     try self.runs_l_bufs[j].resize(self.allocator, rb.n_runs);
                     var count: u64 = 0;
@@ -4534,7 +4534,7 @@ pub const Scan = struct {
         switch (op) {
             inline else => |o| switch (rb.value_width) {
                 inline 1, 2, 4, 8 => |W| {
-                    const T = std.meta.Int(.signed, W * 8);
+                    const T = @Int(.signed, W * 8);
                     var run: usize = 0;
                     while (run < rb.n_runs and pos < rg_count) : (run += 1) {
                         const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
@@ -4557,7 +4557,7 @@ pub const Scan = struct {
         var pos: usize = 0;
         switch (rb.value_width) {
             inline 1, 2, 4, 8 => |W| {
-                const T = std.meta.Int(.signed, W * 8);
+                const T = @Int(.signed, W * 8);
                 var run: usize = 0;
                 while (run < rb.n_runs and pos < rg_count) : (run += 1) {
                     const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
@@ -4724,7 +4724,7 @@ pub const Scan = struct {
                 switch (op) {
                     inline else => |o| switch (fv.block.width) {
                         inline 1, 2, 4 => |W| {
-                            const CW = std.meta.Int(.unsigned, W * 8);
+                            const CW = @Int(.unsigned, W * 8);
                             var i: usize = 0;
                             // Width-1 SIMD screen for low-cardinality FOR columns:
                             // `base+code <op> want` is order-preserving, so it equals
@@ -4793,7 +4793,7 @@ pub const Scan = struct {
                 switch (op) {
                     inline else => |o| switch (rb.value_width) {
                         inline 1, 2, 4, 8 => |W| {
-                            const RT = std.meta.Int(.signed, W * 8);
+                            const RT = @Int(.signed, W * 8);
                             var run: usize = 0;
                             while (run < rb.n_runs and pos < rg_count) : (run += 1) {
                                 const v: i128 = std.mem.readInt(RT, rb.values[run * W ..][0..W], .little);

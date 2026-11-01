@@ -533,7 +533,7 @@ test "manifest v10 remains readable without a WAL checkpoint" {
     try std.testing.expectEqual(@as(u64, 8), read.segments.items[0].segment_id);
     try std.testing.expectEqual(@as(u64, 23), read.segments.items[0].row_count);
     try std.testing.expectEqual(@as(u64, 0), read.wal_checkpoint.offset);
-    try std.testing.expectEqual([_]u8{0} ** 16, read.wal_checkpoint.generation);
+    try std.testing.expectEqual(@as([16]u8, @splat(0)), read.wal_checkpoint.generation);
 }
 
 test "manifest fingerprint mismatch errors" {

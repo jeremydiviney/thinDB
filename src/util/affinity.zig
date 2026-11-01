@@ -135,7 +135,7 @@ fn setLinuxAffinity(mask: u64) void {
     if (builtin.os.tag != .linux) return;
     const linux = std.os.linux;
     // cpu_set_t is a 1024-bit mask; we only ever touch the low 64.
-    var set = [_]u8{0} ** 128;
+    var set: [128]u8 = @splat(0);
     std.mem.writeInt(u64, set[0..8], mask, .little);
     _ = linux.syscall3(
         .sched_setaffinity,
@@ -169,7 +169,7 @@ fn cgroupCpuQuotaCores() ?usize {
     while (cur) |p| : (cur = parentCgroupPath(p)) {
         var path_buf: [512]u8 = undefined;
         const dir = if (std.mem.eql(u8, p, "/")) "" else p;
-        const full = std.fmt.bufPrintZ(&path_buf, "/sys/fs/cgroup{s}/cpu.max", .{dir}) catch break;
+        const full = std.mem.printSentinel(&path_buf, "/sys/fs/cgroup{s}/cpu.max", .{dir}, 0) catch break;
         var file_buf: [64]u8 = undefined;
         const text = readSmallFile(full, &file_buf) orelse continue;
         const cores = cpuMaxCores(text) orelse continue;
@@ -199,13 +199,13 @@ fn linuxPhysicalCoreCount(allocator: std.mem.Allocator) !usize {
     var path_buf: [128]u8 = undefined;
     var cpu: usize = 0;
     while (cpu < 4096) : (cpu += 1) {
-        const dir = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}", .{cpu}) catch unreachable;
+        const dir = std.mem.printSentinel(&path_buf, "/sys/devices/system/cpu/cpu{d}", .{cpu}, 0) catch unreachable;
         const dir_fd = linuxOpenReadonly(dir, true) orelse break;
         _ = std.os.linux.close(dir_fd);
 
-        const core_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}) catch unreachable;
+        const core_path = std.mem.printSentinel(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/core_id", .{cpu}, 0) catch unreachable;
         const core_id = readSysfsInt(core_path) orelse continue;
-        const pkg_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu}) catch unreachable;
+        const pkg_path = std.mem.printSentinel(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/physical_package_id", .{cpu}, 0) catch unreachable;
         const pkg_id = readSysfsInt(pkg_path) orelse 0;
         try seen.put(allocator, (pkg_id << 32) | (core_id & 0xffff_ffff), {});
     }
@@ -322,7 +322,7 @@ fn minLimitAlongPath(mount: []const u8, path: []const u8, file: []const u8) ?u64
     while (cur) |p| : (cur = parentCgroupPath(p)) {
         var path_buf: [512]u8 = undefined;
         const dir = if (std.mem.eql(u8, p, "/")) "" else p;
-        const full = std.fmt.bufPrintZ(&path_buf, "{s}{s}/{s}", .{ mount, dir, file }) catch break;
+        const full = std.mem.printSentinel(&path_buf, "{s}{s}/{s}", .{ mount, dir, file }, 0) catch break;
         const v = readSysfsInt(full) orelse continue;
         const lim = cgroupLimitValue(v) orelse continue;
         best = if (best) |b| @min(b, lim) else lim;
@@ -403,7 +403,7 @@ const LogicalProcInfo = extern struct {
     processor_mask: usize,
     relationship: u32,
     _pad: u32 = 0,
-    _union: [16]u8 = [_]u8{0} ** 16,
+    _union: [16]u8 = @splat(0),
 };
 
 fn detectWindows(allocator: std.mem.Allocator) !Topology {

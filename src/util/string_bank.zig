@@ -23,7 +23,7 @@ pub const StringBank = struct {
     free: [CLASS_COUNT]?[*]u8 = @splat(null),
     /// The classes whose free list has had a block, so `reset` clears only
     /// those.
-    listed: std.StaticBitSet(CLASS_COUNT) = .initEmpty(),
+    listed: std.StaticBitSet(CLASS_COUNT) = .empty,
 
     /// Small blocks are carved from chunks of the arena, so most copies cost
     /// no arena call. The chunks stay small because the arena already grows
@@ -81,7 +81,7 @@ pub const StringBank = struct {
     pub fn reset(self: *StringBank) void {
         var listed = self.listed.iterator(.{});
         while (listed.next()) |class| self.free[class] = null;
-        self.listed = .initEmpty();
+        self.listed = .empty;
         self.chunk = &.{};
         self.used = 0;
     }
@@ -177,14 +177,14 @@ test "StringBank replace keeps every live copy intact and its memory bounded by 
     try std.testing.expect(arena.queryCapacity() < 512 * 1024);
 
     const kept = try bank.dupe(aa, "never replaced");
-    held[0] = try bank.replace(aa, held[0], "x" ** 100_000);
+    held[0] = try bank.replace(aa, held[0], &@as([100_000]u8, @splat('x')));
     const with_large_block = arena.queryCapacity();
-    held[0] = try bank.replace(aa, held[0], "y" ** 100_000);
+    held[0] = try bank.replace(aa, held[0], &@as([100_000]u8, @splat('y')));
     held[0] = try bank.replace(aa, held[0], "short");
-    held[1] = try bank.replace(aa, held[1], "z" ** 100_000);
+    held[1] = try bank.replace(aa, held[1], &@as([100_000]u8, @splat('z')));
     try std.testing.expectEqual(with_large_block, arena.queryCapacity());
     try std.testing.expectEqualStrings("short", held[0]);
-    try std.testing.expectEqualStrings("z" ** 100_000, held[1]);
+    try std.testing.expectEqualStrings(&@as([100_000]u8, @splat('z')), held[1]);
     try std.testing.expectEqualStrings("never replaced", kept);
 
     _ = arena.reset(.retain_capacity);

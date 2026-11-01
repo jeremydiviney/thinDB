@@ -772,7 +772,7 @@ fn appendColumnValueBytes(
 
 fn appendSignedKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
     const bits = @bitSizeOf(T);
-    const U = std.meta.Int(.unsigned, bits);
+    const U = @Int(.unsigned, bits);
     const u: U = @bitCast(v);
     const top_bit: U = @as(U, 1) << (bits - 1);
     var b: [@sizeOf(T)]u8 = undefined;
@@ -788,7 +788,7 @@ fn appendUnsignedKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: 
 
 fn appendFloatKey(allocator: Allocator, out: *std.ArrayList(u8), comptime T: type, v: T) !void {
     const bits = @bitSizeOf(T);
-    const U = std.meta.Int(.unsigned, bits);
+    const U = @Int(.unsigned, bits);
     var u: U = types.canonicalFloatBits(v);
     const top_bit: U = @as(U, 1) << (bits - 1);
     // IEEE total-ordering: positives XOR sign bit; negatives flip all bits.

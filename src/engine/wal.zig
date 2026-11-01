@@ -520,7 +520,7 @@ pub const WalWriter = struct {
         const buf = try self.allocator.alloc(u8, total);
         defer self.allocator.free(buf);
 
-        buf[0] = @intFromEnum(t);
+        buf[0] = @backingInt(t);
         format.writeU32(buf[1..5], @intCast(payload.len));
         @memcpy(buf[5 .. 5 + payload.len], payload);
 
@@ -646,9 +646,9 @@ fn readRecord(bytes: []const u8, off: usize) !ReadRecord {
     const checksum_actual = std.hash.XxHash64.hash(0, bytes[off..payload_end]);
     if (checksum_stored != checksum_actual) return Error.WalCorrupt;
     const tag_byte = bytes[off];
-    if (tag_byte < 1 or tag_byte > @intFromEnum(RecordType.statement)) return Error.WalUnknownRecord;
+    if (tag_byte < 1 or tag_byte > @backingInt(RecordType.statement)) return Error.WalUnknownRecord;
     return .{
-        .type = @enumFromInt(tag_byte),
+        .type = @fromBackingInt(@intCast(tag_byte)),
         .payload = bytes[off + record_header_size .. payload_end],
         .cursor_after = payload_end + record_trailer_size,
     };
@@ -982,7 +982,7 @@ test "a whole record of an unknown type still fails replay" {
     const log = try twoRowLog(a, io, tmp.dir);
     defer a.free(log);
     var record: [record_header_size + record_trailer_size]u8 = undefined;
-    record[0] = @intFromEnum(RecordType.statement) + 1;
+    record[0] = @backingInt(RecordType.statement) + 1;
     format.writeU32(record[1..5], 0);
     format.writeU64(record[5..13], std.hash.XxHash64.hash(0, record[0..5]));
     const newer = try std.mem.concat(a, u8, &.{ log, &record });

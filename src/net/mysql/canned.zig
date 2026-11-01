@@ -87,7 +87,7 @@ fn selectExprLabel(sql: []const u8, fallback: []const u8) []const u8 {
     if (s.len < 8 or !std.ascii.eqlIgnoreCase(s[0..6], "select")) return fallback;
     if (s[6] != ' ' and s[6] != '\t') return fallback;
     s = std.mem.trim(u8, s[7..], " \t\r\n");
-    if (std.ascii.indexOfIgnoreCase(s, " limit ")) |i| s = std.mem.trimEnd(u8, s[0..i], " \t");
+    if (std.ascii.findIgnoreCase(s, " limit ")) |i| s = std.mem.trimEnd(u8, s[0..i], " \t");
     return if (s.len == 0) fallback else s;
 }
 

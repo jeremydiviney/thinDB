@@ -1057,7 +1057,7 @@ const PartitionPass = struct {
     }
 
     fn tagRows(p: *PartitionPass, comptime kind: FastKeyKind, w: usize, lo: usize, hi: usize) void {
-        var c: [PARALLEL_INSERT_RANGES]u32 = .{0} ** PARALLEL_INSERT_RANGES;
+        var c: [PARALLEL_INSERT_RANGES]u32 = @splat(0);
         var row: u32 = @intCast(lo);
         while (row < hi) : (row += 1) {
             const digest = digestRow(kind, p.views, p.null_safe_keys, row) orelse {
@@ -1132,8 +1132,8 @@ const RangeInsert = struct {
     chain_next: []u32,
     mask: u64,
     wrap_mask: u64,
-    keys_unique: [PARALLEL_INSERT_RANGES]bool = .{true} ** PARALLEL_INSERT_RANGES,
-    range_full: [PARALLEL_INSERT_RANGES]bool = .{false} ** PARALLEL_INSERT_RANGES,
+    keys_unique: [PARALLEL_INSERT_RANGES]bool = @splat(true),
+    range_full: [PARALLEL_INSERT_RANGES]bool = @splat(false),
 
     fn job(self: *RangeInsert, _: usize, r: usize) void {
         switch (self.kind) {
@@ -1356,7 +1356,7 @@ fn digestAll(kind: FastKeyKind, views: []const ColumnView, null_safe_keys: u8, d
             .end = @intCast(if (w + 1 == workers) n else @as(usize, n) * (w + 1) / workers),
         };
     }
-    var handles: [MAX_DIGEST_WORKERS]?parallel.Helper = .{null} ** MAX_DIGEST_WORKERS;
+    var handles: [MAX_DIGEST_WORKERS]?parallel.Helper = @splat(null);
     for (1..workers) |w| handles[w] = parallel.spawn(DigestJob.run, .{&jobs[w]}) catch null;
     jobs[0].run();
     for (1..workers) |w| {

@@ -284,7 +284,7 @@ const experiments = [_]Experiment{
 pub fn run(a: std.mem.Allocator, hz: f64) !void {
     std.debug.print("\n=== RF  (projectId, customerNumber, month) wide partial aggregate   ({d} rows, {d} groups, {d}-row batches, fresh operator per repeat) ===\n", .{ ROWS, GROUPS, BATCH });
     std.debug.print("{s:<44} {s:>9} {s:>9}  {s}\n", .{ "experiment", "ns/row", "ms/call", "cksum" });
-    std.debug.print("{s}\n", .{"-" ** 78});
+    std.debug.print("{s}\n", .{&@as([78]u8, @splat('-'))});
     const d = try Data.gen(a);
     defer d.free(a);
     for (experiments) |e| {

@@ -610,7 +610,7 @@ pub fn loadAndRegister(
         std.debug.print("[zigfn] name mismatch: DDL '{s}' vs spec.name '{s}'\n", .{ name, decl_name });
         return Error.FunctionInvalidDefinition;
     }
-    if (desc.execution > @intFromEnum(udf_mod.TvfExecution.either)) return Error.FunctionInvalidDefinition;
+    if (desc.execution > @backingInt(udf_mod.TvfExecution.either)) return Error.FunctionInvalidDefinition;
 
     var cols_arena = std.heap.ArenaAllocator.init(allocator);
     defer cols_arena.deinit();
@@ -651,7 +651,7 @@ pub fn loadAndRegister(
         .input_schemas = input_schemas,
         .output_schema = output_schema,
         .arg_types = arg_types,
-        .execution = @enumFromInt(desc.execution),
+        .execution = @fromBackingInt(@intCast(desc.execution)),
         .row_aligned = desc.row_aligned != 0,
         .ordered_output = desc.ordered_output != 0,
         .broadcast_inputs = broadcast_inputs,
@@ -670,8 +670,8 @@ pub fn loadAndRegister(
 }
 
 fn argTypeFromTag(tag: u8) ?types.Type {
-    if (tag > @intFromEnum(types.TypeTag.uuid)) return null;
-    return switch (@as(types.TypeTag, @enumFromInt(tag))) {
+    if (tag > @backingInt(types.TypeTag.uuid)) return null;
+    return switch (@as(types.TypeTag, @fromBackingInt(@intCast(tag)))) {
         .tinyint => .tinyint,
         .smallint => .smallint,
         .int => .int,
@@ -691,10 +691,10 @@ fn argTypeFromTag(tag: u8) ?types.Type {
 fn descCols(arena: Allocator, descs: []const ColDesc) ![]types.Column {
     const cols = try arena.alloc(types.Column, descs.len);
     for (descs, cols) |d, *c| {
-        if (d.type_tag == 0 or d.type_tag > @intFromEnum(types.TypeTag.uuid)) {
+        if (d.type_tag == 0 or d.type_tag > @backingInt(types.TypeTag.uuid)) {
             return Error.FunctionInvalidDefinition;
         }
-        const tag: types.TypeTag = @enumFromInt(d.type_tag);
+        const tag: types.TypeTag = @fromBackingInt(@intCast(d.type_tag));
         c.* = .{
             .name = try arena.dupe(u8, d.name_ptr[0..d.name_len]),
             .type = switch (tag) {
@@ -714,7 +714,7 @@ test "embedded SDK imports only std, builtin and other embedded files" {
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);
     for (EMBEDDED_SDK) |file| {
-        const source = try allocator.dupeZ(u8, file.data);
+        const source = try allocator.dupeSentinel(u8, file.data, 0);
         defer allocator.free(source);
         var tokenizer = std.zig.Tokenizer.init(source);
         var token = tokenizer.next();

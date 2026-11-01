@@ -2,7 +2,7 @@
     .name = .thindb,
     .version = "0.1.0-dev",
     .fingerprint = 0x2e79228c6ae295d8,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zstd = .{
             .url = "https://github.com/allyourcodebase/zstd/archive/refs/tags/1.5.7-1.tar.gz",

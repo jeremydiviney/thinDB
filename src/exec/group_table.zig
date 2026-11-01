@@ -1339,7 +1339,7 @@ pub const DistinctStrSet = struct {
     }
 
     inline fn packInline(bytes: []const u8) u64 {
-        var buf = [_]u8{0} ** INLINE_MAX;
+        var buf: [INLINE_MAX]u8 = @splat(0);
         @memcpy(buf[0..bytes.len], bytes);
         return std.mem.readInt(u64, &buf, .little);
     }

@@ -761,7 +761,7 @@ test "wal: an UPDATE cut off at any logged point keeps all its rows old or all n
             const payload_len = std.mem.readInt(u32, wal_after[cursor + 1 ..][0..4], .little);
             cursor += thindb.engine.wal.record_header_size + payload_len + thindb.engine.wal.record_trailer_size;
             if (cursor >= update_start) try ends.append(aa, cursor);
-            if (tag == @intFromEnum(thindb.engine.wal.RecordType.statement)) statement_records += 1;
+            if (tag == @backingInt(thindb.engine.wal.RecordType.statement)) statement_records += 1;
         }
         try std.testing.expectEqual(wal_after.len, cursor);
         try std.testing.expectEqual(@as(usize, 1), statement_records);
@@ -853,7 +853,7 @@ fn countRecords(wal: []const u8, tag: thindb.engine.wal.RecordType) usize {
     var count: usize = 0;
     var cursor: usize = thindb.engine.wal.header_size;
     while (cursor < wal.len) {
-        if (wal[cursor] == @intFromEnum(tag)) count += 1;
+        if (wal[cursor] == @backingInt(tag)) count += 1;
         const payload_len = std.mem.readInt(u32, wal[cursor + 1 ..][0..4], .little);
         cursor += thindb.engine.wal.record_header_size + payload_len + thindb.engine.wal.record_trailer_size;
     }
@@ -937,7 +937,7 @@ test "wal: an UPDATE past the staging bound keeps the chunk it committed when a 
     };
     const Row = struct { id: i64, qty: i32, label: []const u8 };
     var rows: [14]Row = undefined;
-    for (&rows, 1..) |*r, id| r.* = .{ .id = @intCast(id), .qty = @intCast(id * 10), .label = "x" ** 100 };
+    for (&rows, 1..) |*r, id| r.* = .{ .id = @intCast(id), .qty = @intCast(id * 10), .label = &@as([100]u8, @splat('x')) };
     // A row-group step stages about 240 bytes (two rows and two offsets), the
     // memtable step about 470 (two rows out, two in). Under a 1070-byte bound
     // the first chunk ends after row group {5,6}; the second takes {7,8} and

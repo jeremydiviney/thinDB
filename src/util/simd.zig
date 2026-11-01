@@ -108,7 +108,7 @@ pub fn indexOfSubstringPos(haystack: []const u8, start: usize, needle: []const u
     if (start >= haystack.len or haystack.len - start < n) return null;
     const last_start = haystack.len - n;
     const N = comptime lanes(u8);
-    const Mask = std.meta.Int(.unsigned, N);
+    const Mask = @Int(.unsigned, N);
     const all: Mask = ~@as(Mask, 0);
     var i = start;
     while (i + N - 1 <= last_start) : (i += N) {
@@ -130,8 +130,8 @@ pub fn indexOfSubstringPos(haystack: []const u8, start: usize, needle: []const u
     return null;
 }
 
-inline fn substringStep(comptime N: comptime_int, haystack: []const u8, at: usize, needle: []const u8, keep: std.meta.Int(.unsigned, N)) ?usize {
-    const Mask = std.meta.Int(.unsigned, N);
+inline fn substringStep(comptime N: comptime_int, haystack: []const u8, at: usize, needle: []const u8, keep: @Int(.unsigned, N)) ?usize {
+    const Mask = @Int(.unsigned, N);
     const n = needle.len;
     const firsts: @Vector(N, u8) = haystack[at..][0..N].*;
     const lasts: @Vector(N, u8) = haystack[at + n - 1 ..][0..N].*;
@@ -304,7 +304,7 @@ pub fn andNotMaskInto(dst: []bool, keep: ?[]const bool, drop: []const bool) void
 pub fn countTrue(mask: []const bool) usize {
     const bytes: []const u8 = @ptrCast(mask);
     const N = comptime lanes(u8);
-    const Bits = std.meta.Int(.unsigned, N);
+    const Bits = @Int(.unsigned, N);
     const zero: @Vector(N, u8) = @splat(0);
     var count: usize = 0;
     var i: usize = 0;
@@ -344,7 +344,7 @@ pub fn maskIndices(mask: []const bool, out: []u32) usize {
     const bytes: []const u8 = @ptrCast(mask);
     const N = comptime lanes(u8);
     comptime std.debug.assert(N % INDEX_LANES == 0);
-    const Bits = std.meta.Int(.unsigned, N);
+    const Bits = @Int(.unsigned, N);
     const zero: @Vector(N, u8) = @splat(0);
     var count: usize = 0;
     var i: usize = 0;
@@ -585,8 +585,8 @@ test "simd: binInto and scalarOp wrap an overflowing lane anywhere in the slice"
         };
         inline for (cases) |c| {
             for ([_]usize{ 0, 5, len - 1 }) |at| {
-                var a = [_]T{1} ** len;
-                const b = [_]T{2} ** len;
+                var a: [len]T = @splat(1);
+                const b: [len]T = @splat(2);
                 var dst: [len]T = undefined;
                 a[at] = c.big;
                 binInto(T, c.op, &a, &b, &dst);

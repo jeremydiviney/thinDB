@@ -20,7 +20,7 @@ fn decodeFixed(comptime T: type, allocator: Allocator, values: []const u8, row_c
     if (native_endian == .little) {
         @memcpy(std.mem.sliceAsBytes(data), values[0..n_bytes]);
     } else {
-        const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
         for (data, 0..) |*slot, i| {
             const bits = std.mem.readInt(Bits, values[i * @sizeOf(T) ..][0..@sizeOf(T)], .little);
             slot.* = @bitCast(bits);
@@ -503,7 +503,7 @@ fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
     // an unknown value would be caught by a downstream decode mismatch, but we
     // keep the reader total here rather than introducing a new error path for a
     // byte the writer fully controls.
-    return if (b <= @intFromEnum(format.Encoding.fsst)) @enumFromInt(b) else .raw;
+    return if (b <= @backingInt(format.Encoding.fsst)) @fromBackingInt(@intCast(b)) else .raw;
 }
 
 fn decodeBlock(
@@ -533,8 +533,8 @@ fn readBlockRaw(
     owned_raw: *?[]u8,
 ) ![]const u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.lz4)) return format.Error.UnknownCompression;
-    const kind: format.Compression = @enumFromInt(kind_byte);
+    if (kind_byte > @backingInt(format.Compression.lz4)) return format.Error.UnknownCompression;
+    const kind: format.Compression = @fromBackingInt(@intCast(kind_byte));
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
     const payload_start = offset + format.column_block_header_size;
@@ -566,8 +566,8 @@ fn getDecompressedBytes(
     offset: usize,
 ) ![]align(16) u8 {
     const kind_byte = bytes[offset];
-    if (kind_byte > @intFromEnum(format.Compression.lz4)) return format.Error.UnknownCompression;
-    const kind: format.Compression = @enumFromInt(kind_byte);
+    if (kind_byte > @backingInt(format.Compression.lz4)) return format.Error.UnknownCompression;
+    const kind: format.Compression = @fromBackingInt(@intCast(kind_byte));
     const uncompressed_size = format.readU32(bytes[offset + 4 .. offset + 8]);
     const compressed_size = format.readU32(bytes[offset + 8 .. offset + 12]);
     const payload_start = offset + format.column_block_header_size;
@@ -1242,13 +1242,13 @@ pub const DictBlock = struct {
     /// `rowCode` for a block known to carry `width`-byte codes, so a per-row
     /// loop switches on the width once instead of on every row.
     pub inline fn rowCodeAs(self: DictBlock, comptime width: u8, row: usize) u32 {
-        return std.mem.readInt(std.meta.Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
+        return std.mem.readInt(@Int(.unsigned, @as(u16, width) * 8), self.codes[row * width ..][0..width], .little);
     }
 
     /// Every row's code, into `out`, one per row.
     pub fn codesInto(self: DictBlock, out: []u32) void {
         switch (self.code_width) {
-            inline 1, 2, 4 => |w| widenCodes(std.meta.Int(.unsigned, @as(u16, w) * 8), self.codes, out),
+            inline 1, 2, 4 => |w| widenCodes(@Int(.unsigned, @as(u16, w) * 8), self.codes, out),
             else => for (out, 0..) |*c, row| {
                 c.* = self.rowCode(row);
             },
@@ -1273,7 +1273,7 @@ pub const DictBlock = struct {
         const out = mask[0..row_count];
         switch (self.code_width) {
             inline 1, 2, 4 => |w| {
-                const T = std.meta.Int(.unsigned, @as(u16, w) * 8);
+                const T = @Int(.unsigned, @as(u16, w) * 8);
                 // A span of every code a width holds doesn't fit that width.
                 if (span == 0 or span > std.math.maxInt(T)) return simd_mod.fillMaskRun(out, 0, out.len, (span != 0) != outside);
                 switch (outside) {

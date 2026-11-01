@@ -1,18 +1,25 @@
 //! In-memory zstd compress/decompress, used by the segment writer/reader for
-//! column-block compression. Calls into the vendored libzstd C library via
-//! `@cImport`.
+//! column-block compression. Calls into the vendored libzstd and liblz4 C
+//! libraries through declarations of the entry points it uses.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const c = @cImport({
-    @cInclude("zstd.h");
-});
+const c = struct {
+    const ZSTD_CCtx = opaque {};
+    extern fn ZSTD_createCCtx() ?*ZSTD_CCtx;
+    extern fn ZSTD_freeCCtx(cctx: ?*ZSTD_CCtx) usize;
+    extern fn ZSTD_compressBound(src_size: usize) usize;
+    extern fn ZSTD_compressCCtx(cctx: ?*ZSTD_CCtx, dst: ?*anyopaque, dst_capacity: usize, src: ?*const anyopaque, src_size: usize, compression_level: c_int) usize;
+    extern fn ZSTD_decompress(dst: ?*anyopaque, dst_capacity: usize, src: ?*const anyopaque, compressed_size: usize) usize;
+    extern fn ZSTD_isError(code: usize) c_uint;
+};
 
-const lz4c = @cImport({
-    @cInclude("lz4.h");
-    @cInclude("lz4hc.h");
-});
+const lz4c = struct {
+    extern fn LZ4_compressBound(input_size: c_int) c_int;
+    extern fn LZ4_compress_HC(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int, compression_level: c_int) c_int;
+    extern fn LZ4_decompress_safe(src: [*]const u8, dst: [*]u8, compressed_size: c_int, dst_capacity: c_int) c_int;
+};
 
 /// Default zstd compression level. 3 is the upstream default — Pareto-optimal
 /// speed/ratio for analytics-shaped data. Range is 1 (fastest) to 22.
@@ -161,7 +168,8 @@ pub fn lz4DecompressAligned(allocator: Allocator, input: []const u8, uncompresse
 
 test "lz4 round-trips and beats raw on redundant data" {
     const allocator = std.testing.allocator;
-    const payload = "https://example.com/products/widgets?id=12345&ref=search " ** 64;
+    const line = "https://example.com/products/widgets?id=12345&ref=search ";
+    const payload: *const [64 * line.len]u8 = &@bitCast(@as([64][line.len]u8, @splat(line.*)));
 
     const compressed = try lz4CompressHC(allocator, payload);
     defer allocator.free(compressed);
@@ -189,7 +197,7 @@ test "compress + decompress round-trip — simple bytes" {
 
 test "compress + decompress on a 1KB redundant buffer ~10x ratio" {
     const allocator = std.testing.allocator;
-    const payload = "aaaaaaaaaa" ** 100; // 1000 bytes of 'a' — very compressible
+    const payload = &@as([1000]u8, @splat('a')); // 1000 bytes of 'a' — very compressible
 
     const compressed = try compress(allocator, payload);
     defer allocator.free(compressed);

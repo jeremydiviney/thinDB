@@ -49,7 +49,7 @@ const LogicalProcInfo = extern struct {
     processor_mask: usize,
     relationship: u32,
     _pad: u32 = 0,
-    _union: [16]u8 = [_]u8{0} ** 16,
+    _union: [16]u8 = @splat(0),
 };
 
 pub const CpuLayout = struct {

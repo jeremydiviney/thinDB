@@ -88,7 +88,7 @@ pub const Pool = struct {
     /// Source of class-sized blocks; `backing` serves the requests that
     /// bypass the pool.
     mint: Allocator,
-    classes: [class_count]Class = [_]Class{.{}} ** class_count,
+    classes: [class_count]Class = @splat(.{}),
     retained_bytes: std.atomic.Value(usize) = .{ .raw = 0 },
     cap_bytes: usize,
     clock: std.atomic.Value(u64) = .{ .raw = 0 },
@@ -176,7 +176,7 @@ pub const Pool = struct {
     /// little; the caller then evicts the block it was freeing.
     fn evictStaleClasses(self: *Pool, keep: usize, want: usize) bool {
         const keep_use = self.classes[keep].last_use.load(.monotonic);
-        var tried = std.StaticBitSet(class_count).initEmpty();
+        var tried = std.StaticBitSet(class_count).empty;
         var released: usize = 0;
         while (released < want) {
             var victim: ?usize = null;
@@ -235,7 +235,7 @@ pub const Pool = struct {
     /// both directions.
     fn classOf(len: usize, alignment: std.mem.Alignment) ?usize {
         if (len == 0) return null;
-        if (@intFromEnum(alignment) > max_align_log2) return null;
+        if (@backingInt(alignment) > max_align_log2) return null;
         const need_log2 = std.math.log2_int_ceil(usize, len);
         if (need_log2 < min_log2) return null;
         if (need_log2 <= max_log2) return need_log2 - min_log2;

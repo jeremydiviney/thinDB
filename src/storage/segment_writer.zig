@@ -558,9 +558,9 @@ fn writeColumnBlock(
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + payload_size);
-    buf.appendAssumeCapacity(@intFromEnum(kind));
+    buf.appendAssumeCapacity(@backingInt(kind));
     buf.appendAssumeCapacity(flags.toByte());
-    buf.appendAssumeCapacity(@intFromEnum(encoding));
+    buf.appendAssumeCapacity(@backingInt(encoding));
     buf.appendAssumeCapacity(0); // remaining reserved byte
     var b4: [4]u8 = undefined;
     format.writeU32(&b4, raw_size);

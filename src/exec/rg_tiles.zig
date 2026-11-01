@@ -192,7 +192,7 @@ fn drainTiles(allocator: std.mem.Allocator, tiles: *RowGroupTiles) ![]Tile {
 
 test "RowGroupTiles cuts a clustered survivor run across every worker" {
     const allocator = std.testing.allocator;
-    var mask = [_]bool{false} ** 100;
+    var mask: [100]bool = @splat(false);
     for (mask[40..52]) |*m| m.* = true;
     var tiles = try RowGroupTiles.init(allocator, mask.len, &mask, 6, 16, false);
     defer tiles.deinit(allocator);
@@ -223,7 +223,7 @@ test "RowGroupTiles covers every survivor exactly once and ends at the flat tota
         defer tiles.deinit(allocator);
         const got = try drainTiles(allocator, &tiles);
         defer allocator.free(got);
-        var seen = [_]u8{0} ** c.total;
+        var seen: [c.total]u8 = @splat(0);
         for (got, 0..) |t, i| {
             try std.testing.expect(t.lo < t.hi);
             if (i > 0) try std.testing.expectEqual(got[i - 1].hi, t.lo);
@@ -236,9 +236,9 @@ test "RowGroupTiles covers every survivor exactly once and ends at the flat tota
 
 test "RowGroupTiles keeps the flat space without pruning, without survivors, or on a torn mask" {
     const allocator = std.testing.allocator;
-    const all = [_]bool{true} ** 40;
-    const none = [_]bool{false} ** 40;
-    const torn = [_]bool{true} ** 39;
+    const all: [40]bool = @splat(true);
+    const none: [40]bool = @splat(false);
+    const torn: [39]bool = @splat(true);
     const masks = [_]?[]const bool{ null, &all, &none, &torn };
     for (masks) |mask| {
         var tiles = try RowGroupTiles.init(allocator, 40, mask, 4, 16, false);

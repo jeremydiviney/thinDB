@@ -536,7 +536,7 @@ const SqlKind = enum(u8) {
     other,
 };
 
-const sql_kind_count = @typeInfo(SqlKind).@"enum".fields.len;
+const sql_kind_count = @typeInfo(SqlKind).@"enum".field_names.len;
 
 const ProfileStats = struct {
     count: u64 = 0,
@@ -580,12 +580,12 @@ const MysqlProfiler = struct {
         if (!self.enabled) return;
         const t0 = start_ts orelse return;
         const elapsed = t0.durationTo(Io.Clock.awake.now(self.io));
-        self.phases[@intFromEnum(phase)].add(@intCast(elapsed.toNanoseconds()));
+        self.phases[@backingInt(phase)].add(@intCast(elapsed.toNanoseconds()));
     }
 
     fn recordSqlKind(self: *MysqlProfiler, kind: SqlKind) void {
         if (!self.enabled) return;
-        self.sql_kinds[@intFromEnum(kind)] += 1;
+        self.sql_kinds[@backingInt(kind)] += 1;
     }
 
     fn addRowsAffected(self: *MysqlProfiler, rows: u64) void {
@@ -634,14 +634,14 @@ const MysqlProfiler = struct {
                 self.total_commands,
                 self.rows_affected,
                 self.rows_returned,
-                self.sql_kinds[@intFromEnum(SqlKind.select)],
-                self.sql_kinds[@intFromEnum(SqlKind.insert)],
-                self.sql_kinds[@intFromEnum(SqlKind.ddl)],
-                self.sql_kinds[@intFromEnum(SqlKind.other)],
+                self.sql_kinds[@backingInt(SqlKind.select)],
+                self.sql_kinds[@backingInt(SqlKind.insert)],
+                self.sql_kinds[@backingInt(SqlKind.ddl)],
+                self.sql_kinds[@backingInt(SqlKind.other)],
             },
         );
         for (profile_phases) |phase| {
-            const stats = self.phases[@intFromEnum(phase)];
+            const stats = self.phases[@backingInt(phase)];
             if (stats.count == 0) continue;
             const total_ms = @as(f64, @floatFromInt(stats.total_ns)) / 1e6;
             const mean_ms = total_ms / @as(f64, @floatFromInt(stats.count));
@@ -1069,9 +1069,9 @@ extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 fn setProcessEnv(allocator: Allocator, name: []const u8, value: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
+    const name_z = try allocator.dupeSentinel(u8, name, 0);
     defer allocator.free(name_z);
-    const value_z = try allocator.dupeZ(u8, value);
+    const value_z = try allocator.dupeSentinel(u8, value, 0);
     defer allocator.free(value_z);
     if (@import("builtin").os.tag == .windows) {
         _ = _putenv_s(name_z.ptr, value_z.ptr);

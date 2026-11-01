@@ -170,7 +170,7 @@ const AggregatePlan = struct {
     udf_entry: ?udf_mod.AggregateEntry = null,
     udf_state_index: u16 = 0,
     udf_arg_count: u8 = 0,
-    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS,
+    udf_arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = @splat(0),
 };
 
 const StringAggInputPlan = struct {
@@ -1157,7 +1157,7 @@ const OrderPrefix = struct {
     }
 
     fn ofBytes(bytes: []const u8) OrderPrefix {
-        var lead = [_]u8{0} ** 8;
+        var lead: [8]u8 = @splat(0);
         const n: usize = @min(bytes.len, 8);
         @memcpy(lead[0..n], bytes[0..n]);
         return .{ .class = 1, .value = std.mem.readInt(u64, &lead, .big), .exact = false };
@@ -2232,7 +2232,7 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
                 if (next_udf_state_index >= SiloCore.MAX_GROUP_UDF_SLOTS) return traceDecline(request, "udf slot count");
                 // value slot + present slot (one past) must both fit.
                 if (next_numeric_state_index + 1 > MAX_AGGS) return traceDecline(request, "udf state count");
-                var arg_input_indices = [_]u16{0} ** SiloCore.MAX_GROUP_UDF_ARGS;
+                var arg_input_indices: [SiloCore.MAX_GROUP_UDF_ARGS]u16 = @splat(0);
                 var arg_types_buf: [SiloCore.MAX_GROUP_UDF_ARGS]Type = undefined;
                 for (arg_cols, 0..) |col_name, k| {
                     const arg_type = resolveColumnType(table, schema, col_name) orelse return traceDecline(request, "udf arg type");

@@ -472,8 +472,8 @@ fn q32_full(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
 
     // Emit: top-10 by COUNT over every group (the O(groups) walk), then finalize
     // the survivors (decode key → WatchID/ClientIP, finalize AVG).
-    var top_cnt = [_]u64{0} ** 10;
-    var top_gid = [_]usize{0} ** 10;
+    var top_cnt: [10]u64 = @splat(0);
+    var top_gid: [10]usize = @splat(0);
     for (0..gid) |g| {
         const cnt = gstate[g * 12];
         var mi: usize = 0;
@@ -556,10 +556,10 @@ fn q32RadixImpl(a: std.mem.Allocator, d: Q32, comptime PBITS: u8) !Result {
         pres[j] = d.reswidth[i];
     }
     // (d) aggregate each (now cache-resident) partition independently.
-    var top_cnt = [_]u64{0} ** 10;
-    var top_key = [_]u128{0} ** 10;
-    var top_sum = [_]u64{0} ** 10;
-    var top_avg = [_]u64{0} ** 10;
+    var top_cnt: [10]u64 = @splat(0);
+    var top_key: [10]u128 = @splat(0);
+    var top_sum: [10]u64 = @splat(0);
+    var top_avg: [10]u64 = @splat(0);
     var total_groups: u64 = 0;
     var total_count: u64 = 0;
     for (0..P) |p| {
@@ -1165,7 +1165,7 @@ inline fn faithAvg(gstate: []u64, b: usize, v: i64) void {
 fn faithEmit(gstate: []const u64, gkeys: []const u128, n_groups: usize) u64 {
     var groups: u64 = 0;
     var count: u64 = 0;
-    var top_cnt = [_]u64{0} ** 10;
+    var top_cnt: [10]u64 = @splat(0);
     for (0..n_groups) |g| {
         const b = g * 12;
         const c = gstate[b];
@@ -1323,7 +1323,7 @@ fn q32_sort(a: std.mem.Allocator, d: Q32, _: []u64) !Result {
     std.sort.pdq(KP, kp, {}, lessKP);
     var total_groups: u64 = 0;
     var total_count: u64 = 0;
-    var top_cnt = [_]u64{0} ** 10;
+    var top_cnt: [10]u64 = @splat(0);
     var i: usize = 0;
     while (i < N) {
         const k = kp[i].key;
@@ -1607,7 +1607,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== Q08  RegionID, COUNT(DISTINCT UserID)   (5M rows, 3238 regions, 1.06M users) ===\n", .{});
     std.debug.print("{s:<34} {s:>9} {s:>9} {s:>7}  {s}\n", .{ "experiment", "ns/row", "total ms", "rel", "cksum" });
-    std.debug.print("{s}\n", .{"-" ** 78});
+    std.debug.print("{s}\n", .{&@as([78]u8, @splat('-'))});
     {
         const d = try Q08.gen(a, 3238, 1_062_330);
         defer d.free(a);
@@ -1629,7 +1629,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== Q32  WatchID, ClientIP, COUNT/SUM/AVG   (5M rows, ~5M groups, 480 MB gstate) ===\n", .{});
     std.debug.print("{s:<34} {s:>9} {s:>9} {s:>7}  {s}\n", .{ "experiment", "ns/row", "total ms", "rel", "cksum" });
-    std.debug.print("{s}\n", .{"-" ** 78});
+    std.debug.print("{s}\n", .{&@as([78]u8, @splat('-'))});
     {
         const d = try Q32.gen(a, N);
         defer d.free(a);

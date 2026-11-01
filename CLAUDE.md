@@ -51,7 +51,7 @@ zig build -Doptimize=ReleaseFast       # production build
 zig build bench                        # run benchmarks
 ```
 
-Target Zig version: **0.16**. If a feature requires a newer Zig, raise it in PR rather than working around it.
+Target Zig version: **0.17**. If a feature requires a newer Zig, raise it in PR rather than working around it.
 
 ---
 

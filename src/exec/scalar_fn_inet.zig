@@ -215,7 +215,7 @@ fn parseIpv4(s: []const u8) ?[4]u8 {
 /// as the last 32 bits.
 fn parseIpv6(s: []const u8) ?[16]u8 {
     if (s.len < 2 or s.len > 39) return null;
-    var bytes = [_]u8{0} ** 16;
+    var bytes: [16]u8 = @splat(0);
     var i: usize = 0;
     if (s[0] == ':') {
         if (s[1] != ':') return null;

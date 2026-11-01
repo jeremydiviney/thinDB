@@ -389,8 +389,8 @@ pub const Memtable = struct {
                     const child_info = @typeInfo(p.child);
                     if (comptime child_info == .@"struct" and child_info.@"struct".is_tuple) {
                         // &.{ .{...}, .{...} } syntax — iterate tuple fields by comptime name
-                        inline for (child_info.@"struct".fields) |tf| {
-                            try self.insertOneRow(@field(rows, tf.name));
+                        inline for (child_info.@"struct".field_names) |field_name| {
+                            try self.insertOneRow(@field(rows, field_name));
                         }
                     } else if (comptime child_info == .array) {
                         for (rows) |row| try self.insertOneRow(row);
@@ -585,14 +585,14 @@ pub const Memtable = struct {
         if (comptime info != .@"struct") {
             @compileError("expected struct row, got " ++ @typeName(R));
         }
-        const fields = info.@"struct".fields;
+        const row_info = info.@"struct";
 
         // Validate fields against schema.
-        inline for (fields) |field| {
-            const col_idx = self.schema.columnIndex(field.name) orelse return Error.ColumnNotFound;
+        inline for (row_info.field_names, row_info.field_types) |field_name, field_type| {
+            const col_idx = self.schema.columnIndex(field_name) orelse return Error.ColumnNotFound;
             const sch_col = self.schema.columns[col_idx];
-            const InnerT = comptime innerType(field.type);
-            if (comptime isOptionalType(field.type)) {
+            const InnerT = comptime innerType(field_type);
+            if (comptime isOptionalType(field_type)) {
                 if (!sch_col.nullable) return Error.TypeMismatch;
             }
             if (!sch_col.type.matchesZigType(InnerT)) {
@@ -602,24 +602,24 @@ pub const Memtable = struct {
         // Validate every schema column has a value in the row.
         for (self.schema.columns) |col| {
             var found = false;
-            inline for (fields) |field| {
-                if (std.mem.eql(u8, field.name, col.name)) found = true;
+            inline for (row_info.field_names) |field_name| {
+                if (std.mem.eql(u8, field_name, col.name)) found = true;
             }
             if (!found) return Error.MissingColumn;
         }
 
         // Append.
-        inline for (fields) |field| {
-            const col_idx = self.schema.columnIndex(field.name).?;
-            const value = @field(row, field.name);
-            if (comptime isOptionalType(field.type)) {
+        inline for (row_info.field_names, row_info.field_types) |field_name, field_type| {
+            const col_idx = self.schema.columnIndex(field_name).?;
+            const value = @field(row, field_name);
+            if (comptime isOptionalType(field_type)) {
                 if (value) |v| {
                     try self.appendValue(col_idx, @TypeOf(v), v);
                 } else {
                     try self.appendNullToColumn(col_idx);
                 }
             } else {
-                try self.appendValue(col_idx, field.type, value);
+                try self.appendValue(col_idx, field_type, value);
             }
         }
         self.row_count += 1;

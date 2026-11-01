@@ -2325,7 +2325,7 @@ pub const Aggregate = struct {
     /// value's two's-complement bits zero-extend injectively into a u64, so
     /// distinct stored values map to distinct keys.
     inline fn insertCountRange(self: *Aggregate, comptime T: type, sl: []const T, n: usize) !void {
-        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const U = @Int(.unsigned, @bitSizeOf(T));
         const t = &self.count_table.?;
         try t.ensureFor(self.allocator, n);
         var r: usize = 0;
@@ -4487,7 +4487,7 @@ fn insertDistinctRange(
     row_start: u32,
     row_end: u32,
 ) void {
-    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const U = @Int(.unsigned, @bitSizeOf(T));
     const KeyT = std.meta.Elem(@TypeOf(set.slots));
     const D: u32 = 12;
     if (view.nulls == null) {
@@ -5712,7 +5712,7 @@ fn planInlineFor(
 /// u128, masked to the field width (two's-complement bit pattern, so packing is
 /// bijective with `unpackIntField`).
 inline fn fieldBits(comptime SignedT: type, v: SignedT, bits: u8) u128 {
-    const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(SignedT));
+    const UnsignedT = @Int(.unsigned, @bitSizeOf(SignedT));
     const u: UnsignedT = @bitCast(v);
     const mask: u128 = if (bits >= 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(bits)) - 1;
     return @as(u128, u) & mask;
@@ -5866,7 +5866,7 @@ inline fn inlineForLoop(
 /// `fieldBits`): mask out the field, then sign-extend through the matching
 /// signed integer type.
 inline fn unpackField(comptime SignedT: type, key: u128, f: IntKeyField) SignedT {
-    const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(SignedT));
+    const UnsignedT = @Int(.unsigned, @bitSizeOf(SignedT));
     const mask: u128 = if (f.bits >= 128) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(f.bits)) - 1;
     const raw: UnsignedT = @truncate((key >> @intCast(f.offset)) & mask);
     return @bitCast(raw);
@@ -6095,7 +6095,7 @@ fn writeFixedKeys(
     values: []const T,
 ) void {
     const width = @sizeOf(T);
-    const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
     for (spans, values[0..spans.len], 0..) |*s, v, r| {
         var c = s[0];
         if (nullable) {

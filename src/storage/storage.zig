@@ -674,7 +674,7 @@ test "FOR encoding round-trips narrow-range int/bigint incl. negatives + nulls" 
     const n_rows = 50;
     var ks: [n_rows]i32 = undefined;
     var ns: [n_rows]i64 = undefined;
-    var bm: [column.bitmapBytes(n_rows)]u8 = .{0} ** column.bitmapBytes(n_rows);
+    var bm: [column.bitmapBytes(n_rows)]u8 = @splat(0);
     for (0..n_rows) |i| {
         ks[i] = 1000 + @as(i32, @intCast(i % 7)); // [1000, 1006] → u8 deltas
         ns[i] = -500 + @as(i64, @intCast(i)); // negative base, [-500, -451]
@@ -885,7 +885,7 @@ test "dict encoding: NULL and empty string are distinct under codes" {
     // empty string is a real distinct dict value; the NULL is masked.
     const n = 120;
     var vals: [n][]const u8 = undefined;
-    var bm: [column.bitmapBytes(n)]u8 = .{0} ** column.bitmapBytes(n);
+    var bm: [column.bitmapBytes(n)]u8 = @splat(0);
     for (0..n) |i| {
         switch (i % 6) {
             0 => vals[i] = "", // NULL row (bytes irrelevant; validity bit left clear)
@@ -939,9 +939,9 @@ test "dict encoding: blob-like (avg len > 256) declines dict; stays raw with fss
     };
 
     // Only 3 distinct values (low card) but each ~300 bytes → avg-len gate trips.
-    const big_a = "A" ** 300;
-    const big_b = "B" ** 300;
-    const big_c = "C" ** 300;
+    const big_a = &@as([300]u8, @splat('A'));
+    const big_b = &@as([300]u8, @splat('B'));
+    const big_c = &@as([300]u8, @splat('C'));
     const n = 60;
     var vals: [n][]const u8 = undefined;
     for (0..n) |i| vals[i] = switch (i % 3) {
@@ -1125,7 +1125,7 @@ test "DictBlock.codeRangeInto matches the per-row range test at every width and 
     var prng = std.Random.DefaultPrng.init(0xd1c7);
     const rand = prng.random();
     inline for (.{ 1, 2, 4 }) |width| {
-        const T = std.meta.Int(.unsigned, width * 8);
+        const T = @Int(.unsigned, width * 8);
         // Code counts a width can hold, up to every code at width 1.
         const ndv: u32 = if (width == 1) 256 else 1000;
         for ([_]usize{ 0, 1, 3 }) |misalign| {
@@ -1176,7 +1176,7 @@ test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode 
     var num_vals: [n][]const u8 = undefined;
     var tag_vals: [n][]const u8 = undefined;
     var url_vals: [n][]const u8 = undefined;
-    var bm: [column.bitmapBytes(n)]u8 = .{0} ** column.bitmapBytes(n);
+    var bm: [column.bitmapBytes(n)]u8 = @splat(0);
     var tag_bytes: u64 = 0;
     for (0..n) |i| {
         const valid = i % 5 != 0;

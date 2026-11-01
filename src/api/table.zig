@@ -1732,7 +1732,7 @@ pub fn schemaFingerprint(schema: TableSchema) u64 {
     var hasher = std.hash.Wyhash.init(0);
     for (schema.columns) |c| {
         hasher.update(c.name);
-        const tag: u8 = @intFromEnum(@as(TypeTag, c.type));
+        const tag: u8 = @backingInt(@as(TypeTag, c.type));
         hasher.update(&[_]u8{tag});
         hasher.update(&[_]u8{@intFromBool(c.nullable)});
         hasher.update(&[_]u8{@intFromBool(c.auto_increment)});

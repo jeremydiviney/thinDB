@@ -150,7 +150,7 @@ pub const BudgetAllocator = struct {
 /// writing into a block would fault in pages nothing ever touched. Untracked
 /// frees, and any the list cannot grow to hold, are freed directly.
 pub const DeferredFrees = struct {
-    lanes: [MAX_LANES]Lane = [_]Lane{.{}} ** MAX_LANES,
+    lanes: [MAX_LANES]Lane = @splat(.{}),
     lane_count: usize = 1,
 
     pub const MAX_LANES = 16;

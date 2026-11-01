@@ -1295,7 +1295,7 @@ test "parallel scan: the next pull frees the materialized buffer the consumer wa
         for (&ids, 0..) |*id, i| id.* = @intCast(150 + i);
         break :blk ids;
     };
-    const materialize = @intFromEnum(exec.memory.Source.materialize);
+    const materialize = @backingInt(exec.memory.Source.materialize);
 
     inline for (.{ 1, 4 }) |dop| {
         // Physical tracking (the scan mints its own accountant from the table
@@ -1395,7 +1395,7 @@ test "parallel scan: a filtered drain past its wave bound hands over what it has
         try t.flush();
     }
     const survivors = 350;
-    const materialize = @intFromEnum(exec.memory.Source.materialize);
+    const materialize = @backingInt(exec.memory.Source.materialize);
 
     inline for (.{ 1, 4 }) |dop| {
         // A scan with no filter streams, so it buffers nothing ahead of its
@@ -2060,7 +2060,7 @@ test "parallel scan matches serial — byte-skewed string row groups" {
     const t = try db.table("t", schema, .{ .order_key = &.{"id"}, .row_group_size = 16 });
 
     const short: []const u8 = "z";
-    const long: []const u8 = "z" ** 250;
+    const long: []const u8 = &@as([250]u8, @splat('z'));
     // 128 rows → 8 row groups of 16. First 4 short, last 4 long → ~250× byte
     // skew across the segment's row groups. Flush, then a 16-row memtable tail.
     var rows: [128]struct { id: i64, s: []const u8 } = undefined;
@@ -2739,8 +2739,8 @@ test "aggregate: integer fast path — single bigint key, no ORDER BY, plain LIM
     defer q.deinit();
 
     // Recompute the expected per-group aggregates independently.
-    var exp_n: [700]i64 = [_]i64{0} ** 700;
-    var exp_s: [700]i64 = [_]i64{0} ** 700;
+    var exp_n: [700]i64 = @splat(0);
+    var exp_s: [700]i64 = @splat(0);
     i = 0;
     while (i < rows.len) : (i += 1) {
         const u: usize = @intCast(rows[i].user);
@@ -5006,13 +5006,13 @@ test "a key sample reads a small buffer whole, else a sixteenth of it in windows
     for (values, 0..) |*v, i| v.* = @intCast(i);
     const cases = .{
         // Small chunks within a row group's worth: read whole.
-        .{ .sizes = &([_]usize{5000} ** 12), .restart = false, .rows = 60_000, .complete = true },
+        .{ .sizes = &@as([12]usize, @splat(5000)), .restart = false, .rows = 60_000, .complete = true },
         // Many small chunks past it: windows across them, some chunks empty.
-        .{ .sizes = &([_]usize{ 5000, 0 } ** 100), .restart = false, .rows = 16 * (exec.KEY_SAMPLE_MIN_ROWS / 16), .complete = false },
+        .{ .sizes = &@as([200]usize, @bitCast(@as([100][2]usize, @splat(.{ 5000, 0 })))), .restart = false, .rows = 16 * (exec.KEY_SAMPLE_MIN_ROWS / 16), .complete = false },
         // One chunk of a mid-sized input: a sixteenth of it.
         .{ .sizes = &[_]usize{2_000_000}, .restart = false, .rows = 16 * (2_000_000 / 16 / 16), .complete = false },
         // A large input: no more than the cap. Its chunks repeat their keys.
-        .{ .sizes = &([_]usize{2_000_000} ** 10), .restart = true, .rows = exec.KEY_SAMPLE_MAX_ROWS, .complete = false },
+        .{ .sizes = &@as([10]usize, @splat(2_000_000)), .restart = true, .rows = exec.KEY_SAMPLE_MAX_ROWS, .complete = false },
     };
     inline for (cases) |c| {
         var sample = try exec.KeySample.init(alloc, 1);
@@ -5231,7 +5231,8 @@ test "scan: a pruning set counts only the values the scan's own filter can match
 test "scan: byte-length sidecar matches the stored bytes on every path" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const text = "http://example.com/category/a-long-shared-path-segment/" ** 4;
+    const segment = "http://example.com/category/a-long-shared-path-segment/";
+    const text = segment ++ segment ++ segment ++ segment;
     const c_pool = [_][]const u8{ "", "alpha", "beta-longer-value", "z" };
     const Row = struct { id: i64, u: []const u8, c: []const u8 };
     const uLen = struct {

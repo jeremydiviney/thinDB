@@ -376,7 +376,7 @@ fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: Column
             try key.appendSlice(allocator, &.{ 0, 0 });
         },
         inline .float, .double => |s| {
-            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
             const sign: Bits = @as(Bits, 1) << (@bitSizeOf(Bits) - 1);
             // -0.0 sorts as 0.0. Negative values invert entirely so a larger
             // magnitude sorts lower; positive ones only set the sign bit.
@@ -388,7 +388,7 @@ fn appendOrderKeyPart(allocator: Allocator, key: *std.ArrayList(u8), arg: Column
         // Dates, datetimes and decimals are signed integers too: with the sign
         // bit flipped, big-endian bytes sort like the values.
         inline .int, .bigint, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .decimal256 => |s| {
-            const Bits = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
+            const Bits = @Int(.unsigned, @bitSizeOf(@TypeOf(s[row])));
             const bits: Bits = @bitCast(s[row]);
             try appendBigEndian(allocator, key, bits ^ (@as(Bits, 1) << (@bitSizeOf(Bits) - 1)));
         },

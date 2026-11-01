@@ -388,8 +388,9 @@ fn commonNested(a: Type, b: Type) ?Type {
     if (a.structFields()) |af| {
         const bf = b.structFields() orelse return null;
         if (af.len != bf.len) return null;
-        var fallback = std.heap.stackFallback(16 * @sizeOf(types.StructField), std.heap.smp_allocator);
-        const allocator = fallback.get();
+        var fallback_buffer: [16 * @sizeOf(types.StructField)]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&fallback_buffer, std.heap.smp_allocator);
+        const allocator = fallback.allocator();
         const fields = allocator.alloc(types.StructField, af.len) catch return null;
         defer allocator.free(fields);
         for (fields, af, bf) |*f, x, y| f.* = .{ .name = x.name, .type = commonMember(x.type, y.type) orelse return null };

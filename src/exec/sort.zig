@@ -46,7 +46,7 @@ fn radixSortStringPerm(allocator: Allocator, perm: []u32, tmp: []u32, view: stor
     const offsets = view.offsets;
     const bytes = view.bytes;
 
-    var counts = [_]u32{0} ** 257;
+    var counts: [257]u32 = @splat(0);
     for (perm, 0..) |idx, pi| {
         if (pi % 4096 == 0) try exec.memory.checkCancelled(allocator);
         const start = offsets[idx];
