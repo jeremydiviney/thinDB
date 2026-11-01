@@ -804,6 +804,10 @@ const SeqStep = union(enum) {
     /// settled on the spot: as many as the bytes allow, or `min` when
     /// `shortest`. No later failure is helped by a different count.
     run: struct { class: CharClass, scan: StarScan, min: u32, max: ?u32, shortest: bool },
+    /// A run that ends `backoff` bytes before the first byte outside
+    /// `class`: the literal after it begins with `backoff` bytes of the
+    /// class and then one outside it, so that is the only count it fits.
+    run_backoff: struct { class: CharClass, scan: StarScan, min: u32, max: ?u32, backoff: u8 },
     optional: SeqOptional,
     save: u32,
     eol,
@@ -931,6 +935,20 @@ const SeqPlan = struct {
                         pos = end;
                         i += 1;
                         continue :step std.meta.activeTag(self.steps[i]);
+                    }
+                },
+                .run_backoff => {
+                    if (exhausted(budgeted, work)) return null;
+                    const r = &self.steps[i].run_backoff;
+                    const end = starRunEnd(r.scan, &r.class, input, pos);
+                    if (budgeted) work.* -|= end - pos;
+                    if (end - pos >= @as(usize, r.backoff) + r.min) {
+                        const count = end - pos - r.backoff;
+                        if (r.max == null or count <= r.max.?) {
+                            pos += count;
+                            i += 1;
+                            continue :step std.meta.activeTag(self.steps[i]);
+                        }
                     }
                 },
                 .optional => {
@@ -1214,19 +1232,25 @@ fn resolveSeq(steps: []SeqStep, parts: []const SeqPart, bytes: []const u8) bool 
                 empty = false;
             },
             .run => |*r| {
-                const varies = if (r.max) |m| r.min < m else true;
+                const run = r.*;
+                const varies = if (run.max) |m| run.min < m else true;
                 if (varies and !empty) {
-                    if (overlaps(&r.class, &first)) return false;
                     r.shortest = false;
+                    if (overlaps(&run.class, &first)) {
+                        const backoff = backoffBefore(&run.class, steps[i + 1 ..], bytes) orelse return false;
+                        steps[i] = .{ .run_backoff = .{ .class = run.class, .scan = run.scan, .min = run.min, .max = run.max, .backoff = backoff } };
+                    }
                 }
-                if (r.max == 0) continue;
-                if (r.min == 0) {
-                    for (&first.bits, r.class.bits) |*x, y| x.* |= y;
+                if (run.max == 0) continue;
+                if (run.min == 0) {
+                    for (&first.bits, run.class.bits) |*x, y| x.* |= y;
                 } else {
-                    first = r.class;
+                    first = run.class;
                     empty = false;
                 }
             },
+            // Made only from a `.run` above, once this walk has passed it.
+            .run_backoff => unreachable,
             .optional => |*o| {
                 const bf = bodyFirst(o, parts, bytes);
                 if (empty) {
@@ -1246,6 +1270,26 @@ fn resolveSeq(steps: []SeqStep, parts: []const SeqPart, bytes: []const u8) bool 
         }
     }
     return choices <= SEQ_MAX_CHOICES;
+}
+
+/// How many bytes a run of `class` must stop short of its first byte
+/// outside the class for the literal after it (past any saves) to fit:
+/// the literal begins with bytes that all lie in the class, then has one
+/// that can't. Null when what follows is no such literal.
+fn backoffBefore(class: *const CharClass, rest: []const SeqStep, bytes: []const u8) ?u8 {
+    const lit = for (rest) |step| switch (step) {
+        .save => {},
+        .literal => |lit| break lit,
+        else => return null,
+    } else return null;
+    for (bytes[lit.off..][0..lit.len], 0..) |b, k| {
+        var at: CharClass = .{};
+        at.add(b);
+        if (lit.fold) at.add(std.ascii.toUpper(b));
+        if (!overlaps(class, &at)) return if (k > 0 and k <= std.math.maxInt(u8)) @intCast(k) else null;
+        for (at.bits, class.bits) |x, y| if (x & ~y != 0) return null;
+    }
+    return null;
 }
 
 /// The bytes a body of nonzero width can begin on.
@@ -3276,6 +3320,12 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
         "[ab]?a",
         "(?:wd.)??w",
         "(?:(?:ab){2})?c",
+        "^([^-]+) - .*$",
+        "([^-]*) -",
+        "^([^/]+)a/",
+        "[^x]+ax",
+        "([^.]{1,3})ab\\.",
+        "^(?:www\\.)?([^/]+?)w/",
     };
     const unplanned = [_][]const u8{
         "(cat|dog)",
@@ -3290,13 +3340,15 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
         "(?:a*)?b",
         "(?:a|b)?c",
         "(?:(a)b)?c",
+        "^([^-]+)a?- ",
+        "[^x]+aa",
     };
     const option_sets = [_]Options{
         .{},
         .{ .dot_all = true, .case_insensitive = true },
     };
-    const fragments = [_][]const u8{ "http", "https", "://", "www.", "m.", "/", "ab", "a", "b", "wd", "w", ".", "x", "yz", "z", "id=", "12", " ", "\n", "colour", "c", "AB", "W" };
-    const alphabet = "abc/xyz12. \nwd_AB";
+    const fragments = [_][]const u8{ "http", "https", "://", "www.", "m.", "/", "ab", "a", "b", "wd", "w", ".", "x", "yz", "z", "id=", "12", " ", "\n", "colour", "c", "AB", "W", " - ", "-", "ax", "a/" };
+    const alphabet = "abc/xyz12. \nwd_AB-";
     var prng = std.Random.DefaultPrng.init(0x5E9_2026);
     const rnd = prng.random();
     var buf: [48]u8 = undefined;
