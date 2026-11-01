@@ -290,11 +290,43 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
     return .{ .seg = seg, .rg = f - seg_start[seg] };
 }
 
+/// Where each region of a staged-rows slab starts: the keys, each payload
+/// column, the rowrefs (when the layout has them), the weights (likewise),
+/// then the nullable inputs' validity bytes. Row loops read them per row, so
+/// a slab computes them once for its layout and capacity. The accessors that
+/// index `columns` take their rows by pointer: a by-value copy indexed at
+/// runtime can't stay in registers, so every call would copy the struct.
+const SlabOffsets = struct {
+    columns: [MAX_GROUP_PAYLOAD_COLUMNS]usize = @splat(0),
+    rowref: usize = 0,
+    weight: usize = 0,
+    valid: usize = 0,
+    bytes: usize = 0,
+
+    fn of(layout: GroupRowsLayout, capacity_rows: usize) SlabOffsets {
+        var offsets: SlabOffsets = .{};
+        var at = groupKeySize(layout.key_width) * capacity_rows;
+        for (layout.columns, 0..) |column, c| {
+            at = alignForward(at, groupColumnAlign(column.physical_type));
+            offsets.columns[c] = at;
+            at += groupColumnSize(column.physical_type) * capacity_rows;
+        }
+        offsets.rowref = alignForward(at, @alignOf(i64));
+        if (layout.has_rowref) at = offsets.rowref + @sizeOf(i64) * capacity_rows;
+        offsets.weight = alignForward(at, @alignOf(u32));
+        if (layout.has_weight) at = offsets.weight + @sizeOf(u32) * capacity_rows;
+        offsets.valid = at;
+        offsets.bytes = at + nullableInputCount(layout) * capacity_rows;
+        return offsets;
+    }
+};
+
 const RawRows = struct {
     slab: []align(16) u8 = &.{},
     len_rows: usize = 0,
     capacity_rows: usize = 0,
     layout: GroupRowsLayout = .{},
+    offsets: SlabOffsets = .{},
     // Variable-length string payload (string MIN/MAX only). Empty/unallocated
     // unless `layout.has_str_payload`, so numeric staging is unaffected.
     str: StrStore = .{},
@@ -308,93 +340,25 @@ const RawRows = struct {
     }
 
     fn slabBytes(layout: GroupRowsLayout, capacity_rows: usize) usize {
-        var bytes: usize = 0;
-        bytes = alignForward(bytes, groupKeyAlign(layout.key_width));
-        bytes += groupKeySize(layout.key_width) * capacity_rows;
-        for (layout.columns) |column| {
-            bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
-            bytes += groupColumnSize(column.physical_type) * capacity_rows;
-        }
-        if (layout.has_rowref) {
-            bytes = alignForward(bytes, @alignOf(i64));
-            bytes += @sizeOf(i64) * capacity_rows;
-        }
-        if (layout.has_weight) {
-            bytes = alignForward(bytes, @alignOf(u32));
-            bytes += @sizeOf(u32) * capacity_rows;
-        }
-        bytes += nullableInputCount(layout) * capacity_rows;
-        return bytes;
+        return SlabOffsets.of(layout, capacity_rows).bytes;
     }
 
     inline fn keyOffset(_: RawRows) usize {
         return 0;
     }
 
-    // Must mirror slabBytes exactly (see weightOffset).
-    fn validOffset(self: RawRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        if (self.layout.has_rowref) {
-            offset = alignForward(offset, @alignOf(i64));
-            offset += @sizeOf(i64) * self.capacity_rows;
-        }
-        if (self.layout.has_weight) {
-            offset = alignForward(offset, @alignOf(u32));
-            offset += @sizeOf(u32) * self.capacity_rows;
-        }
-        return offset;
-    }
-
     inline fn validAll(self: RawRows, valid_index: usize) []u8 {
-        return (self.slab.ptr + self.validOffset() + valid_index * self.capacity_rows)[0..self.capacity_rows];
-    }
-
-    fn rowrefOffset(self: RawRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        return alignForward(offset, @alignOf(i64));
+        return (self.slab.ptr + self.offsets.valid + valid_index * self.capacity_rows)[0..self.capacity_rows];
     }
 
     inline fn rowrefAll(self: RawRows) []i64 {
         std.debug.assert(self.layout.has_rowref);
-        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
-    }
-
-    // Must mirror slabBytes exactly: the rowref alignment step only happens
-    // when the region exists.
-    fn weightOffset(self: RawRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        if (self.layout.has_rowref) {
-            offset = alignForward(offset, @alignOf(i64));
-            offset += @sizeOf(i64) * self.capacity_rows;
-        }
-        return alignForward(offset, @alignOf(u32));
+        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.offsets.rowref)))[0..self.capacity_rows];
     }
 
     inline fn weightAll(self: RawRows) []u32 {
         std.debug.assert(self.layout.has_weight);
-        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.weightOffset())))[0..self.capacity_rows];
-    }
-
-    fn columnOffset(self: RawRows, column_index: usize) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        var i: usize = 0;
-        while (i < column_index) : (i += 1) {
-            offset = alignForward(offset, groupColumnAlign(self.layout.columns[i].physical_type));
-            offset += groupColumnSize(self.layout.columns[i].physical_type) * self.capacity_rows;
-        }
-        return alignForward(offset, groupColumnAlign(self.layout.columns[column_index].physical_type));
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.offsets.weight)))[0..self.capacity_rows];
     }
 
     inline fn keyU32All(self: RawRows) []u32 {
@@ -423,22 +387,25 @@ const RawRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnByteSlab(self: RawRows, column_index: usize) []u8 {
+    inline fn columnByteSlab(self: *const RawRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
-        return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
+        return (self.slab.ptr + self.offsets.columns[column_index])[0 .. sz * self.capacity_rows];
     }
 
     fn ensureTotalCapacity(self: *RawRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
+        if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
         if (!sameRowsLayout(self.layout, layout)) {
             self.deinit(allocator);
             self.layout = layout;
         }
         if (capacity_rows <= self.capacity_rows) return;
+        const offsets = SlabOffsets.of(layout, capacity_rows);
         var next: RawRows = .{
-            .slab = try allocator.alignedAlloc(u8, .@"16", slabBytes(layout, capacity_rows)),
+            .slab = try allocator.alignedAlloc(u8, .@"16", offsets.bytes),
             .len_rows = self.len_rows,
             .capacity_rows = capacity_rows,
             .layout = layout,
+            .offsets = offsets,
         };
         errdefer allocator.free(next.slab);
         if (self.len_rows != 0) {
@@ -1038,6 +1005,7 @@ const GroupRows = struct {
     len_rows: usize = 0,
     capacity_rows: usize = 0,
     layout: GroupRowsLayout = .{},
+    offsets: SlabOffsets = .{},
     // Variable-length string payload (string MIN/MAX only); see RawRows.str.
     str: StrStore = .{},
 
@@ -1050,92 +1018,25 @@ const GroupRows = struct {
     }
 
     fn slabBytes(layout: GroupRowsLayout, capacity_rows: usize) usize {
-        var bytes: usize = 0;
-        bytes = alignForward(bytes, groupKeyAlign(layout.key_width));
-        bytes += groupKeySize(layout.key_width) * capacity_rows;
-        for (layout.columns) |column| {
-            bytes = alignForward(bytes, groupColumnAlign(column.physical_type));
-            bytes += groupColumnSize(column.physical_type) * capacity_rows;
-        }
-        if (layout.has_rowref) {
-            bytes = alignForward(bytes, @alignOf(i64));
-            bytes += @sizeOf(i64) * capacity_rows;
-        }
-        if (layout.has_weight) {
-            bytes = alignForward(bytes, @alignOf(u32));
-            bytes += @sizeOf(u32) * capacity_rows;
-        }
-        bytes += nullableInputCount(layout) * capacity_rows;
-        return bytes;
+        return SlabOffsets.of(layout, capacity_rows).bytes;
     }
 
     inline fn keyOffset(_: GroupRows) usize {
         return 0;
     }
 
-    // Must mirror slabBytes exactly (see RawRows.validOffset).
-    fn validOffset(self: GroupRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        if (self.layout.has_rowref) {
-            offset = alignForward(offset, @alignOf(i64));
-            offset += @sizeOf(i64) * self.capacity_rows;
-        }
-        if (self.layout.has_weight) {
-            offset = alignForward(offset, @alignOf(u32));
-            offset += @sizeOf(u32) * self.capacity_rows;
-        }
-        return offset;
-    }
-
     inline fn validAll(self: GroupRows, valid_index: usize) []u8 {
-        return (self.slab.ptr + self.validOffset() + valid_index * self.capacity_rows)[0..self.capacity_rows];
-    }
-
-    fn rowrefOffset(self: GroupRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        return alignForward(offset, @alignOf(i64));
+        return (self.slab.ptr + self.offsets.valid + valid_index * self.capacity_rows)[0..self.capacity_rows];
     }
 
     inline fn rowrefAll(self: GroupRows) []i64 {
         std.debug.assert(self.layout.has_rowref);
-        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.rowrefOffset())))[0..self.capacity_rows];
-    }
-
-    // Must mirror slabBytes exactly (see RawRows.weightOffset).
-    fn weightOffset(self: GroupRows) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        for (self.layout.columns) |column| {
-            offset = alignForward(offset, groupColumnAlign(column.physical_type));
-            offset += groupColumnSize(column.physical_type) * self.capacity_rows;
-        }
-        if (self.layout.has_rowref) {
-            offset = alignForward(offset, @alignOf(i64));
-            offset += @sizeOf(i64) * self.capacity_rows;
-        }
-        return alignForward(offset, @alignOf(u32));
+        return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.offsets.rowref)))[0..self.capacity_rows];
     }
 
     inline fn weightAll(self: GroupRows) []u32 {
         std.debug.assert(self.layout.has_weight);
-        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.weightOffset())))[0..self.capacity_rows];
-    }
-
-    fn columnOffset(self: GroupRows, column_index: usize) usize {
-        var offset = groupKeySize(self.layout.key_width) * self.capacity_rows;
-        var i: usize = 0;
-        while (i < column_index) : (i += 1) {
-            offset = alignForward(offset, groupColumnAlign(self.layout.columns[i].physical_type));
-            offset += groupColumnSize(self.layout.columns[i].physical_type) * self.capacity_rows;
-        }
-        return alignForward(offset, groupColumnAlign(self.layout.columns[column_index].physical_type));
+        return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.offsets.weight)))[0..self.capacity_rows];
     }
 
     inline fn keyU32All(self: GroupRows) []u32 {
@@ -1164,13 +1065,13 @@ const GroupRows = struct {
         return @as([*]u128, @ptrCast(@alignCast(self.slab.ptr + self.keyOffset())))[0..self.capacity_rows];
     }
 
-    inline fn columnTypedAll(self: GroupRows, comptime T: type, column_index: usize) []T {
-        return @as([*]T, @ptrCast(@alignCast(self.slab.ptr + self.columnOffset(column_index))))[0..self.capacity_rows];
+    inline fn columnTypedAll(self: *const GroupRows, comptime T: type, column_index: usize) []T {
+        return @as([*]T, @ptrCast(@alignCast(self.slab.ptr + self.offsets.columns[column_index])))[0..self.capacity_rows];
     }
 
     // Read aggregate-input column `column_index` at `row` as i64 (integer
     // physical types, sign-extended) — the generic native-width group read.
-    inline fn columnIntAt(self: GroupRows, column_index: usize, row: usize) i64 {
+    inline fn columnIntAt(self: *const GroupRows, column_index: usize, row: usize) i64 {
         return switch (self.layout.columns[column_index].physical_type) {
             .i8 => self.columnTypedAll(i8, column_index)[row],
             .i16 => self.columnTypedAll(i16, column_index)[row],
@@ -1183,7 +1084,7 @@ const GroupRows = struct {
     // Read aggregate-input column `column_index` at `row` as f64 (float
     // physical types direct/widened; integer physical types converted) — the
     // float counterpart to columnIntAt for SUM/AVG/MIN/MAX over float inputs.
-    inline fn columnFloatAt(self: GroupRows, column_index: usize, row: usize) f64 {
+    inline fn columnFloatAt(self: *const GroupRows, column_index: usize, row: usize) f64 {
         return switch (self.layout.columns[column_index].physical_type) {
             .i8 => @floatFromInt(self.columnTypedAll(i8, column_index)[row]),
             .i16 => @floatFromInt(self.columnTypedAll(i16, column_index)[row]),
@@ -1194,22 +1095,25 @@ const GroupRows = struct {
         };
     }
 
-    inline fn columnByteSlab(self: GroupRows, column_index: usize) []u8 {
+    inline fn columnByteSlab(self: *const GroupRows, column_index: usize) []u8 {
         const sz = groupColumnSize(self.layout.columns[column_index].physical_type);
-        return (self.slab.ptr + self.columnOffset(column_index))[0 .. sz * self.capacity_rows];
+        return (self.slab.ptr + self.offsets.columns[column_index])[0 .. sz * self.capacity_rows];
     }
 
     fn ensureTotalCapacity(self: *GroupRows, allocator: Allocator, layout: GroupRowsLayout, capacity_rows: usize) !void {
+        if (layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
         if (!sameRowsLayout(self.layout, layout)) {
             self.deinit(allocator);
             self.layout = layout;
         }
         if (capacity_rows <= self.capacity_rows) return;
+        const offsets = SlabOffsets.of(layout, capacity_rows);
         var next: GroupRows = .{
-            .slab = try allocator.alignedAlloc(u8, .@"16", slabBytes(layout, capacity_rows)),
+            .slab = try allocator.alignedAlloc(u8, .@"16", offsets.bytes),
             .len_rows = self.len_rows,
             .capacity_rows = capacity_rows,
             .layout = layout,
+            .offsets = offsets,
         };
         errdefer allocator.free(next.slab);
         if (self.len_rows != 0) {
@@ -6159,6 +6063,7 @@ fn foldActiveRawRows(parts: *WorkerParts, shared: *PipeShared, scratch: *GroupSc
         .len_rows = staged.len_rows,
         .capacity_rows = staged.capacity_rows,
         .layout = staged.layout,
+        .offsets = staged.offsets,
         .str = staged.str,
     };
     try shared.buckets[0].fold_rows(shared.allocator, scratch, rows, shared.input_rows_per_bucket);
@@ -7502,9 +7407,9 @@ const GridDictEval = struct {
     partials: []DictPartial = &.{},
     /// Per staged column, its partial's folded values in the collapsed batch.
     partial_views: []?ColumnView = &.{},
-    /// Per dictionary code: rows using it, and one such row.
+    /// Per dictionary code: rows using it, and one such row's location.
     code_rows: std.ArrayListUnmanaged(u32) = .empty,
-    code_row: std.ArrayListUnmanaged(u32) = .empty,
+    code_loc: std.ArrayListUnmanaged(i64) = .empty,
     /// Per collapsed value: its row count and a row's location, its digest
     /// when the column is a hashed key, else the value bytes when the used
     /// codes aren't one contiguous run.
@@ -7543,7 +7448,7 @@ const GridDictEval = struct {
     fn deinit(self: *GridDictEval, allocator: Allocator) void {
         if (self.built_layers) |l| thindb.exec.Compute.deinitLayersOver(l.top, l.base);
         self.code_rows.deinit(allocator);
-        self.code_row.deinit(allocator);
+        self.code_loc.deinit(allocator);
         self.weights.deinit(allocator);
         self.locs.deinit(allocator);
         self.digests.deinit(allocator);
@@ -7848,11 +7753,14 @@ const GridDictEval = struct {
         const code_rows = self.code_rows.items;
         @memset(code_rows, 0);
         const row_locs: ?[]const i64 = if (self.loc_column) |lc| raw.values[lc].data.bigint else null;
-        if (row_locs != null) {
-            try self.code_row.resize(allocator, code_rows.len);
-            const code_row = self.code_row.items;
-            for (column.codes, 0..) |c, row| {
-                code_row[c] = @intCast(row);
+        // Each code keeps a row's location as the rows stream past: fetching
+        // it per used code instead lands a random read in the batch's whole
+        // location column.
+        if (row_locs) |rl| {
+            try self.code_loc.resize(allocator, code_rows.len);
+            const code_loc = self.code_loc.items;
+            for (column.codes, rl[0..column.codes.len]) |c, loc| {
+                code_loc[c] = loc;
                 code_rows[c] += 1;
             }
         } else {
@@ -7878,7 +7786,7 @@ const GridDictEval = struct {
         for (code_rows[lo..hi], lo..) |n, c| {
             if (n == 0) continue;
             self.weights.appendAssumeCapacity(n);
-            if (row_locs) |rl| self.locs.appendAssumeCapacity(rl[self.code_row.items[c]]);
+            if (row_locs != null) self.locs.appendAssumeCapacity(self.code_loc.items[c]);
             if (column.digests) |ds| self.digests.appendAssumeCapacity(ds[c]);
         }
 
@@ -9079,7 +8987,13 @@ fn keyLane(view: ColumnView, digests: ?[]const u128, typ: thindb.types.Type, lo:
     switch (view.data) {
         .string, .varchar, .char, .json, .nested, .bitmap => |sv| {
             if (digests) |ds| return ds[lo..][0..lane.len];
-            for (lane, lo..) |*p, r| p.* = thindb.exec.stringKeyDigest(sv.rowBytes(r));
+            // Adjacent rows often repeat a key (a collapsed batch's derived
+            // values follow their sorted source values), and a repeat costs
+            // a compare instead of a digest.
+            for (lane, 0..) |*p, j| {
+                const bytes = sv.rowBytes(lo + j);
+                p.* = if (j > 0 and std.mem.eql(u8, bytes, sv.rowBytes(lo + j - 1))) lane[j - 1] else thindb.exec.stringKeyDigest(bytes);
+            }
         },
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |vals| {
             if (readGenericKeyBits(view, typ, lo)) |_| {
@@ -9101,7 +9015,16 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
     const k = keys.len;
     for (layout.key_columns) |part| {
         if (!part.nullable) continue;
-        for (out, 0..) |*id, r| id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+        // A wide key compares several columns before a miss, so past its
+        // first 64 rows a batch whose rows repeat under one in eight stops
+        // checking.
+        var repeats: usize = 0;
+        for (out, 0..) |*id, r| {
+            if (r > 0 and (r < 64 or 8 * repeats >= r) and keyRowRepeats(layout, keys, r)) {
+                id.* = out[r - 1];
+                repeats += 1;
+            } else id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+        }
         return;
     }
     // A lone string key's digest is its identity, not a part to digest.
@@ -9130,6 +9053,26 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
             else => return error.UnsupportedOperatorForType,
         }
     }
+}
+
+/// Whether row `r` of `keys` holds row `r - 1`'s key, by the parts
+/// hashGenericKeyFromViews digests: adjacent rows often repeat a key (a
+/// collapsed batch's derived values follow their sorted source values), and
+/// a repeat takes the previous row's identity instead of its digests.
+fn keyRowRepeats(layout: GroupRowsLayout, keys: *const BatchKeys, r: usize) bool {
+    for (layout.key_columns, keys.views[0..keys.len], keys.digests[0..keys.len]) |part, view, digests| {
+        if (part.nullable) {
+            const valid = view.isValid(r);
+            if (valid != view.isValid(r - 1)) return false;
+            if (!valid) continue;
+        }
+        const same = switch (view.data) {
+            .string, .varchar, .char, .json, .nested, .bitmap => |sv| if (digests) |ds| ds[r] == ds[r - 1] else std.mem.eql(u8, sv.rowBytes(r), sv.rowBytes(r - 1)),
+            else => (readGenericKeyBits(view, part.typ, r) catch 0) == (readGenericKeyBits(view, part.typ, r - 1) catch 0),
+        };
+        if (!same) return false;
+    }
+    return true;
 }
 
 test "hashed identities filled by column match hashGenericKeyFromViews row by row" {
@@ -9177,6 +9120,8 @@ test "hashed identities filled by column match hashGenericKeyFromViews row by ro
         // Pairings readGenericKeyBits rejects key as part 0.
         .{ Key{ .view = minute, .typ = .bigint }, Key{ .view = .{ .data = .{ .double = ratios } }, .typ = .double }, Key{ .view = phrase, .typ = .string } },
         .{ Key{ .view = phrase, .typ = .string }, Key{ .view = .{ .data = .{ .bigint = users }, .nulls = &nulls }, .typ = .bigint, .nullable = true } },
+        .{Key{ .view = .{ .data = .{ .string = sv }, .nulls = &nulls }, .typ = .string, .nullable = true }},
+        .{Key{ .view = .{ .data = .{ .string = sv }, .nulls = &nulls }, .typ = .string, .nullable = true, .digests = true }},
     };
     var lanes: std.ArrayListUnmanaged(u128) = .empty;
     defer lanes.deinit(allocator);
