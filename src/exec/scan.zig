@@ -1813,16 +1813,6 @@ pub const Scan = struct {
         return arr;
     }
 
-    /// Accept a full predicate for scan-side in-place filtering. Declines
-    /// (returns false) only for the count-only scan (no columns to filter). The
-    /// late-materialization scan (`emit_loc`) IS now fused: the survivor-
-    /// compaction paths (`materializeSurvivors` / `evalAndCompact`) additionally
-    /// pack each survivor's `__rowloc` from the same mask, so the filter runs in
-    /// the scan and only survivors flow out — no separate Filter over all rows.
-    /// On acceptance the predicate's leaves must reference only columns this scan
-    /// projects — guaranteed when the fusing Filter sits directly above and
-    /// shares this scan's output schema. The expr is stored by value; its
-    /// backing memory is owned by the caller and must outlive this scan.
     /// True once a WHERE predicate has been fused into this scan (so `next()`
     /// emits compacted survivors, not raw row groups). ParallelScan reads this
     /// to choose its execution strategy.
@@ -1830,8 +1820,15 @@ pub const Scan = struct {
         return self.fused_filter != null;
     }
 
+    /// Accept a full predicate for scan-side in-place filtering. A scan that
+    /// projects no column (a filtered COUNT(*)) fuses too: its batches carry
+    /// survivor counts alone. The late-materialization scan (`emit_loc`) IS
+    /// now fused: the survivor-compaction paths (`materializeSurvivors` /
+    /// `evalAndCompact`) additionally pack each survivor's `__rowloc` from the
+    /// same mask, so the filter runs in the scan and only survivors flow out —
+    /// no separate Filter over all rows. The expr is stored by value; its
+    /// backing memory is owned by the caller and must outlive this scan.
     pub fn tryFuseFilter(self: *Scan, expr: PredicateExpr) !bool {
-        if (self.out_phys.len == 0) return false;
         // Coerce/validate the predicate's literals against the table schema
         // (e.g. a text date literal `'2013-07-01'` → a date value). The legacy
         // path does this in `Filter.create` before fusing; a directly-fused
@@ -1861,7 +1858,6 @@ pub const Scan = struct {
     /// its conjuncts ordered. `src` must outlive this scan.
     pub fn adoptFusedFilter(self: *Scan, src: *const Scan) !bool {
         const expr = src.fused_filter orelse return true;
-        if (self.out_phys.len == 0) return false;
         self.fused_filter = expr;
         self.filter_memo = null;
         try self.setupFilterEval(expr);
@@ -2246,7 +2242,7 @@ pub const Scan = struct {
         var hint = set;
         hint.rows = false;
         if (set.values.len <= ROW_SET_ZONEMAP_MAX) try self.addZonemapSet(hint);
-        if (self.fused_filter == null or self.out_phys.len == 0) {
+        if (self.fused_filter == null) {
             _ = try self.tryFuseFilter(.{ .in_set = hint });
             return;
         }
@@ -4826,8 +4822,13 @@ pub const Scan = struct {
     /// the rest from `pending_rows`. A row group that keeps most of its rows
     /// would otherwise reach the operators above as one row group of every
     /// projected column per worker, which at high DOP no longer fits the
-    /// shared L3, and every copy downstream then runs at DRAM speed.
+    /// shared L3, and every copy downstream then runs at DRAM speed. A scan
+    /// projecting no column only counts the survivors.
     fn materializeSurvivors(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, mask: []const bool) !usize {
+        if (self.out_phys.len == 0 and !self.emit_loc) {
+            _ = try self.ensureFilteredBuffers();
+            return simd.countTrue(mask);
+        }
         self.pending_rows = try self.survivorRows(mask);
         self.pending_rg = rg_idx;
         self.pending_rg_count = rg_count;

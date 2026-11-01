@@ -363,3 +363,63 @@ test "reads past the stats lane's row budget go to the scan path" {
     try std.testing.expectEqual([1]?i64{1}, try optionalInts(1, allocator, db, "SELECT MIN(k) FROM t"));
     try std.testing.expectEqual(@as(?usize, null), try metaBlocksDecoded(allocator, db, "SELECT MIN(k) FROM t"));
 }
+
+test "filtered COUNT(*) counts survivors across row-group ranges, tombstones and memtable rows" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "v0", "v1", "v2", "v3", "v4" };
+    const deleted = [_]i64{ 3, 64, 65, 500, 999 };
+    const Row = struct { id: i64, k: i64, s: []const u8 };
+    const cases = .{
+        .{ "SELECT COUNT(*) FROM t WHERE k = 3", struct {
+            fn keep(id: i64) bool {
+                return @mod(id, 7) == 3;
+            }
+        }.keep },
+        .{ "SELECT COUNT(*) FROM t WHERE k <> 0 AND id < 700", struct {
+            fn keep(id: i64) bool {
+                return @mod(id, 7) != 0 and id < 700;
+            }
+        }.keep },
+        .{ "SELECT COUNT(*) FROM t WHERE s LIKE 'v1%'", struct {
+            fn keep(id: i64) bool {
+                return @mod(id, 5) == 1;
+            }
+        }.keep },
+        .{ "SELECT COUNT(*) FROM t WHERE k = 1 OR s = 'v2'", struct {
+            fn keep(id: i64) bool {
+                return @mod(id, 7) == 1 or @mod(id, 5) == 2;
+            }
+        }.keep },
+        .{ "SELECT COUNT(*) FROM t WHERE id >= 0", struct {
+            fn keep(_: i64) bool {
+                return true;
+            }
+        }.keep },
+    };
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 64, .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, s VARCHAR(8) NOT NULL)");
+        const t = try db.openTable("t", .{});
+
+        var rows: [1000]Row = undefined;
+        for (&rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .k = @intCast(i % 7), .s = names[i % 5] };
+        try t.insert(&rows);
+        try t.flush();
+        try exec(allocator, db, "DELETE FROM t WHERE id IN (3, 64, 65, 500, 999)");
+        var mem_rows: [12]Row = undefined;
+        for (&mem_rows, 2000..) |*r, i| r.* = .{ .id = @intCast(i), .k = @intCast(i % 7), .s = names[i % 5] };
+        try t.insert(&mem_rows);
+
+        inline for (cases) |c| {
+            var expected: i64 = 0;
+            for (rows ++ mem_rows) |r| {
+                if (std.mem.indexOfScalar(i64, &deleted, r.id) == null and c[1](r.id)) expected += 1;
+            }
+            try std.testing.expectEqual(expected, try countVia(allocator, db, c[0]));
+        }
+    }
+}

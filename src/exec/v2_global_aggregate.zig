@@ -1189,11 +1189,11 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         try collectExprCols(allocator, &needed, table, d.expr);
     }
 
-    // A column-less COUNT(*) still needs ≥1 projected column for the scan to
-    // iterate row-groups with correct visibility (an empty projection neither
-    // counts correctly nor lets a WHERE fuse). Project the narrowest column to
-    // minimize the decode it's forced to do.
-    if (needed.items.len == 0) {
+    // A filtered column-less COUNT(*) projects nothing: the scan emits survivor
+    // counts alone. Unfiltered, an empty projection counts whole segments and
+    // ignores the row-group ranges the parallel lanes split the table by, so
+    // project the narrowest column to minimize the decode it's forced to do.
+    if (needed.items.len == 0 and (request.where_filter == null or request.derived.len > 0)) {
         _ = (try addNeeded(allocator, &needed, table, narrowestColumn(table))) orelse return declineFree(allocator, plans, &needed);
     }
 
