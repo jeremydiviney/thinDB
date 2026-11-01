@@ -5767,7 +5767,7 @@ inline fn weightFoldRow(parts: *WorkerParts, active: *RawRows, specs: []const We
 // Fold source row `src`, standing for `w` equal rows, into staged row `idx`:
 // a sum takes its value `w` times over (unless the value sums them already),
 // an extreme takes it once.
-fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
+inline fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, src: usize, w: u32, init: bool) void {
     if (w == 1) return weightFoldRange(active, specs, idx, src, src + 1, init);
     for (specs, 0..) |spec, c| {
         if (spec.op != .sum or spec.summed) {
@@ -5886,7 +5886,7 @@ fn weightFoldRange(active: *RawRows, specs: []const WeightFoldSpec, idx: usize, 
     for (specs, 0..) |spec, c| weightFoldOne(active, spec, c, idx, r0, r1, init);
 }
 
-fn weightFoldOne(active: *RawRows, spec: WeightFoldSpec, c: usize, idx: usize, r0: usize, r1: usize, init: bool) void {
+inline fn weightFoldOne(active: *RawRows, spec: WeightFoldSpec, c: usize, idx: usize, r0: usize, r1: usize, init: bool) void {
     {
         switch (spec.op) {
             inline else => |op| {
