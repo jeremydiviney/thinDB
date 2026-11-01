@@ -8,7 +8,7 @@
   </p>
   <p>
     <img alt="Status: technical preview" src="https://img.shields.io/badge/status-technical_preview-e67b5f" />
-    <img alt="Zig 0.16" src="https://img.shields.io/badge/Zig-0.16-f7a41d?logo=zig&amp;logoColor=white" />
+    <img alt="Zig 0.17" src="https://img.shields.io/badge/Zig-0.17-f7a41d?logo=zig&amp;logoColor=white" />
     <img alt="Version 0.1" src="https://img.shields.io/badge/version-0.1-51b89c" />
   </p>
 </div>
@@ -40,7 +40,7 @@ cost-based query optimizer.
 
 ## Quick start
 
-thinDB currently targets **Zig 0.16**.
+thinDB currently targets **Zig 0.17**.
 
 ```bash
 git clone https://github.com/jeremydiviney/thinDB.git

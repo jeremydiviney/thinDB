@@ -2341,7 +2341,7 @@ zig build -Doptimize=ReleaseFast
 zig build bench        # runs benchmarks
 ```
 
-Target Zig version: 0.16.
+Target Zig version: 0.17.
 
 ---
 
