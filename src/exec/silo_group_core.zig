@@ -9015,15 +9015,22 @@ fn hashedIdentities(allocator: Allocator, layout: GroupRowsLayout, keys: *const 
     const k = keys.len;
     for (layout.key_columns) |part| {
         if (!part.nullable) continue;
-        // A wide key compares several columns before a miss, so past its
-        // first 64 rows a batch whose rows repeat under one in eight stops
-        // checking.
+        // A wide key compares several columns before a miss, so while the
+        // checked rows repeat under one in eight, only every eighth row
+        // checks. Those keep checking: a collapsed batch's first sorted
+        // values often hold no repeats where the rest mostly do.
+        var checked: usize = 0;
         var repeats: usize = 0;
         for (out, 0..) |*id, r| {
-            if (r > 0 and (r < 64 or 8 * repeats >= r) and keyRowRepeats(layout, keys, r)) {
-                id.* = out[r - 1];
-                repeats += 1;
-            } else id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
+            if (r > 0 and (8 * repeats >= checked or r % 8 == 0)) {
+                checked += 1;
+                if (keyRowRepeats(layout, keys, r)) {
+                    id.* = out[r - 1];
+                    repeats += 1;
+                    continue;
+                }
+            }
+            id.* = hashGenericKeyFromViews(layout, keys.views[0..k], keys.digests[0..k], r);
         }
         return;
     }
