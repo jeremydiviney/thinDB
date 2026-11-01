@@ -4061,3 +4061,159 @@ fn sortedRowTexts(allocator: std.mem.Allocator, arena: std.mem.Allocator, db: *t
     std.mem.sort([]const u8, rows.items, {}, textLess);
     return rows.items;
 }
+
+const SxRow = struct { id: i64, g: i32, h: i32, v: i32, url: []const u8, ref: []const u8 };
+const SxKey = enum { g, h, ref_prefix };
+/// At most two string extremes keep a query on the V2 route.
+const SxAggs = enum { lo_url_hi_ref, hi_url_lo_ref, url_both, ref_both };
+const SxCase = struct { key: SxKey, where: []const u8, keep: *const fn (SxRow) bool, aggs: SxAggs };
+const SX_RAW_ROWS = 4096;
+
+/// The first row group's urls are all distinct, so it is stored raw; the
+/// others draw on a pool small enough to dictionary-encode. A raw url
+/// extends a pool value, so it lands between pool values. The keys spread
+/// too wide for the low-cardinality route.
+fn sxRow(arena: std.mem.Allocator, i: usize) !SxRow {
+    const site = (i * 7) % 13;
+    const path = (i / 3 * 37) % 29;
+    const url = if (i < SX_RAW_ROWS)
+        try std.fmt.allocPrint(arena, "http://site{d}.ru/p/{d}/{d:0>5}", .{ site, path, i })
+    else
+        try std.fmt.allocPrint(arena, "http://site{d}.ru/p/{d}", .{ site, path });
+    const ref = if (i % 41 == 0)
+        try std.fmt.allocPrint(arena, "https://ref{d}.org", .{(i * 31) % 17})
+    else
+        try std.fmt.allocPrint(arena, "https://ref{d}.org/{d}/x", .{ (i * 31) % 17, (i * 11) % 19 });
+    return .{
+        .id = @intCast(i),
+        .g = @intCast((if (i % 5 != 0) i % 3 else 3 + (i / 5) % 20) * 1_000_003),
+        .h = @intCast((i * 13) % 1499 * 7919),
+        .v = @intCast((i * 37) % 1000),
+        .url = url,
+        .ref = ref,
+    };
+}
+
+fn sxKeepAll(_: SxRow) bool {
+    return true;
+}
+
+fn sxKeepSmallV(r: SxRow) bool {
+    return r.v < 700;
+}
+
+fn sxKeepSite1(r: SxRow) bool {
+    return std.mem.indexOf(u8, r.url, "site1") != null;
+}
+
+fn sxKeepLateRef(r: SxRow) bool {
+    return std.mem.order(u8, r.ref, "https://ref3") == .gt;
+}
+
+fn checkStringExtremes(allocator: std.mem.Allocator, db: *thindb.Database, rows: []const SxRow, live: []const bool, c: SxCase) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const key_sql = switch (c.key) {
+        .g => "g",
+        .h => "h",
+        .ref_prefix => "SUBSTRING(ref, 1, 12) AS k",
+    };
+    const group_sql = if (c.key == .ref_prefix) "k" else key_sql;
+    const aggs_sql = switch (c.aggs) {
+        .lo_url_hi_ref => "COUNT(*), SUM(v), MIN(url), MAX(ref)",
+        .hi_url_lo_ref => "COUNT(*), SUM(v), MAX(url), MIN(ref)",
+        .url_both => "COUNT(*), SUM(v), MIN(url), MAX(url)",
+        .ref_both => "COUNT(*), MIN(ref), MAX(ref)",
+    };
+    const sql = try std.fmt.allocPrint(arena, "SELECT {s}, {s} FROM sx {s} GROUP BY {s}", .{ key_sql, aggs_sql, c.where, group_sql });
+    errdefer std.debug.print("query: {s}\n", .{sql});
+    try expectPlanRunsGroupTopN(allocator, db, sql);
+
+    const Agg = struct { n: i64, sum: i64, lo_url: []const u8, hi_url: []const u8, lo_ref: []const u8, hi_ref: []const u8 };
+    var groups: std.StringArrayHashMapUnmanaged(Agg) = .empty;
+    for (rows, live) |r, keep| {
+        if (!keep or !c.keep(r)) continue;
+        const key = switch (c.key) {
+            .g => try std.fmt.allocPrint(arena, "{d}", .{r.g}),
+            .h => try std.fmt.allocPrint(arena, "{d}", .{r.h}),
+            .ref_prefix => r.ref[0..12],
+        };
+        const e = try groups.getOrPut(arena, key);
+        if (!e.found_existing) e.value_ptr.* = .{ .n = 0, .sum = 0, .lo_url = r.url, .hi_url = r.url, .lo_ref = r.ref, .hi_ref = r.ref };
+        const agg = e.value_ptr;
+        agg.n += 1;
+        agg.sum += r.v;
+        if (std.mem.order(u8, r.url, agg.lo_url) == .lt) agg.lo_url = r.url;
+        if (std.mem.order(u8, r.url, agg.hi_url) == .gt) agg.hi_url = r.url;
+        if (std.mem.order(u8, r.ref, agg.lo_ref) == .lt) agg.lo_ref = r.ref;
+        if (std.mem.order(u8, r.ref, agg.hi_ref) == .gt) agg.hi_ref = r.ref;
+    }
+    var want: std.ArrayList([]const u8) = .empty;
+    for (groups.keys(), groups.values()) |k, g| {
+        const line = switch (c.aggs) {
+            .lo_url_hi_ref => try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{s}|{s}", .{ k, g.n, g.sum, g.lo_url, g.hi_ref }),
+            .hi_url_lo_ref => try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{s}|{s}", .{ k, g.n, g.sum, g.hi_url, g.lo_ref }),
+            .url_both => try std.fmt.allocPrint(arena, "{s}|{d}|{d}|{s}|{s}", .{ k, g.n, g.sum, g.lo_url, g.hi_url }),
+            .ref_both => try std.fmt.allocPrint(arena, "{s}|{d}|{s}|{s}", .{ k, g.n, g.lo_ref, g.hi_ref }),
+        };
+        try want.append(arena, line);
+    }
+    std.mem.sort([]const u8, want.items, {}, textLess);
+    const got = try sortedRowTexts(allocator, arena, db, sql);
+    try std.testing.expectEqual(want.items.len, got.len);
+    for (want.items, got) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "V2 string extremes over row-group dictionary codes match a row-by-row fold at DOP 1 and DOP 4" {
+    // MIN/MAX inputs nothing else reads arrive as codes into each row group's
+    // sorted dictionary, and staging copies just a batch's best value per
+    // staged row. Batches of the raw first row group, of the row group that
+    // loses rows to the DELETE and of the memtable carry values instead, and
+    // SUBSTRING(ref) collapses its batches per dictionary value. Some refs
+    // are a prefix of others.
+    const a = std.testing.allocator;
+    const n = 40_960;
+    const extra = 2_000;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const rows = try a.alloc(SxRow, n + extra);
+    defer a.free(rows);
+    for (rows, 0..) |*r, i| r.* = try sxRow(arena_state.allocator(), i);
+    const live = try a.alloc(bool, n + extra);
+    defer a.free(live);
+    @memset(live, true);
+    const cases = [_]SxCase{
+        .{ .key = .g, .where = "", .keep = sxKeepAll, .aggs = .lo_url_hi_ref },
+        .{ .key = .g, .where = "", .keep = sxKeepAll, .aggs = .hi_url_lo_ref },
+        .{ .key = .h, .where = "WHERE v < 700", .keep = sxKeepSmallV, .aggs = .url_both },
+        .{ .key = .g, .where = "WHERE url LIKE '%site1%'", .keep = sxKeepSite1, .aggs = .lo_url_hi_ref },
+        .{ .key = .h, .where = "WHERE ref > 'https://ref3'", .keep = sxKeepLateRef, .aggs = .hi_url_lo_ref },
+        .{ .key = .ref_prefix, .where = "", .keep = sxKeepAll, .aggs = .ref_both },
+    };
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        errdefer std.debug.print("dop {d}\n", .{dop});
+        @memset(live, true);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const table = try db.table("sx", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },  .{ .name = "g", .type = .int },
+                .{ .name = "h", .type = .int },      .{ .name = "v", .type = .int },
+                .{ .name = "url", .type = .string }, .{ .name = "ref", .type = .string },
+            },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = SX_RAW_ROWS });
+        try table.insert(rows[0..n]);
+        try table.flush();
+        for (cases) |c| try checkStringExtremes(a, db, rows[0..n], live[0..n], c);
+
+        try exec(a, db, "DELETE FROM sx WHERE id >= 8192 AND id < 12288 AND id % 7 = 0");
+        for (rows[0..n], live[0..n]) |r, *keep| keep.* = !(r.id >= 8192 and r.id < 12288 and @mod(r.id, 7) == 0);
+        try table.insert(rows[n..]);
+        for (cases) |c| try checkStringExtremes(a, db, rows, live, c);
+    }
+}
