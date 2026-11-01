@@ -9193,9 +9193,10 @@ fn filterKeeps(pass: CountSketchPass, identity: u128) bool {
 
 /// Where a tally records `batch`'s rows' counters or fingerprints: a row
 /// group's when the batch holds its rows, or a filter's survivors among
-/// them, in stored order, as the filter pass's scan meets them again.
+/// them, in stored order, as the filter pass's scan meets them again. A
+/// batch whose rows don't line up with the scan's (collapsed, distinct, or
+/// trimmed by a residual filter) holds just its filter's survivors.
 fn recordedSlots(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, weights: ?RowWeights) !?[]u32 {
-    if (weights != null or job.distinct != null) return null;
     const row_slots = switch (pass) {
         .tally => |sketch| if (sketch.row_slots) |*rs| rs else return null,
         .dup_tally => |dups| if (dups.row_slots) |*rs| rs else return null,
@@ -9203,8 +9204,18 @@ fn recordedSlots(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, w
     };
     const slice = job.scan.rowGroupSlice() orelse return null;
     const held = if (slice.survivors) |rows| rows.len else slice.len;
-    if (held != batch.row_count) return null;
+    if (weights != null or job.distinct != null or held != batch.row_count) {
+        try holdSurvivors(row_slots, slice);
+        return null;
+    }
     return try row_slots.record(slice.seg, slice.rg, slice.rows, slice.offset, slice.len, slice.survivors);
+}
+
+/// Hold the rows the scan's filter passed in `slice`, so the filter pass
+/// emits those without running its filter (a costly LIKE twice).
+fn holdSurvivors(row_slots: *count_topk_sketch.RowSlots, slice: thindb.exec.RowGroupSlice) !void {
+    const survivors = slice.survivors orelse return;
+    try row_slots.hold(slice.seg, slice.rg, slice.rows, slice.offset, slice.len, survivors);
 }
 
 /// A batch bound for the grid, with its rows' repeat counts when collapsed
@@ -9495,6 +9506,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
             },
             .filter, .dup_filter => (try keptRows(job, job.scan.allocator, pass, passed.batch, passed.weights)) orelse continue,
             .heavy_tally => |heavy| {
+                if (heavy.row_slots) |*rs| if (job.scan.rowGroupSlice()) |slice| try holdSurvivors(rs, slice);
                 try heavyTallyRows(job, heavy, passed.batch, passed.weights);
                 // A declined tally is thrown away, so its scan stops here.
                 if (heavy.declined()) {
@@ -9976,6 +9988,9 @@ pub const RunConfig = struct {
     offered_prunes: Scan.OfferedPrunes = .{},
     key_bound: ?thindb.exec.KeyBoundSpec = null,
     count_sketch: ?CountSketchPass = null,
+    /// The rows a sketch's tally saw pass the filter, which a grid over the
+    /// same snapshot and filter reads rather than filtering them again.
+    held_rows: ?*const count_topk_sketch.RowSlots = null,
     shared_stage_builders: bool = false,
     // Collapse each scanned batch to its distinct rows before the derived
     // columns evaluate, where `dictEvalColumn` allows it.
@@ -10552,8 +10567,20 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 .keep = dups.kept_bits,
                 .exact = dups.kept_fingerprints,
             }),
-            .tally, .heavy_tally, .heavy_filter, .dup_tally => {},
+            .heavy_filter => |heavy| if (heavy.row_slots) |rs| scans[i].setRowSieve(.{
+                .seg_first = rs.seg_first,
+                .held = rs.held,
+                .slots = rs.rows,
+                .keep = &.{},
+            }),
+            .tally, .heavy_tally, .dup_tally => {},
         };
+        if (cfg.held_rows) |rs| scans[i].setRowSieve(.{
+            .seg_first = rs.seg_first,
+            .held = rs.held,
+            .slots = null,
+            .keep = &.{},
+        });
         scans[i].setRange(0, 0, 0, 0, false);
     }
     const worker_setup_ticks = if ((PROFILING and cfg.trace_timing)) platform.nowTicks() - worker_setup_t0 else 0;
