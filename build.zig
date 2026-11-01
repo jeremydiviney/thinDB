@@ -24,18 +24,6 @@ fn runTestStandalone(b: *std.Build, quiet: *std.Build.Step.Compile, test_exe: *s
     return run;
 }
 
-/// The vectorized `memset` replacing compiler_rt's byte loop (see
-/// src/util/memset.zig). `no_builtin` keeps LLVM from compiling its store
-/// loops into a call to itself, which is why it is a module of its own.
-fn memsetModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{
-        .root_source_file = b.path("src/util/memset.zig"),
-        .target = target,
-        .optimize = optimize,
-        .no_builtin = true,
-    });
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -74,7 +62,6 @@ pub fn build(b: *std.Build) void {
     thindb_mod.linkLibrary(zstd_dep.artifact("zstd"));
     thindb_mod.linkLibrary(lz4_dep.artifact("lz4"));
     thindb_mod.addOptions("build_options", build_opts);
-    thindb_mod.addImport("memset", memsetModule(b, target, optimize));
 
     // ---- Library artifact (so we have something to `zig build`) ----
     const lib = b.addLibrary(.{
@@ -149,9 +136,6 @@ pub fn build(b: *std.Build) void {
     const config_tests = b.addTest(.{ .root_module = config_mod, .filters = test_filters });
     const run_config_tests = runTestStandalone(b, quiet, config_tests);
 
-    const memset_tests = b.addTest(.{ .root_module = memsetModule(b, target, optimize), .filters = test_filters });
-    const run_memset_tests = runTestStandalone(b, quiet, memset_tests);
-
     // ---- ClickBench TSV field decoding (bench/clickbench/tsv.zig, pure std) ----
     const clickbench_tsv_mod = b.createModule(.{
         .root_source_file = b.path("bench/clickbench/tsv.zig"),
@@ -166,7 +150,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_integration_client_tests.step);
     test_step.dependOn(&run_config_tests.step);
-    test_step.dependOn(&run_memset_tests.step);
     test_step.dependOn(&run_clickbench_tsv_tests.step);
 
     // ---- V2-engine integration tests: tests/integration/v2_group_topn_test.zig ----
@@ -198,7 +181,6 @@ pub fn build(b: *std.Build) void {
     thindb_fast.linkLibrary(fast_zstd.artifact("zstd"));
     thindb_fast.linkLibrary(lz4_dep.artifact("lz4"));
     thindb_fast.addOptions("build_options", build_opts);
-    thindb_fast.addImport("memset", memsetModule(b, target, .ReleaseFast));
 
     // ---- Benchmarks: bench/main.zig ----------------------------------------
     const bench_mod = b.createModule(.{
