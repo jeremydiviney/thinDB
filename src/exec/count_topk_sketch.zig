@@ -953,26 +953,14 @@ pub const HeavyKeys = struct {
         return self.declined_flat.load(.monotonic);
     }
 
-    /// Merges the workers' partials and picks the candidates. False when the
-    /// slack reaches τ (a key no unit reported might then rank) or the
-    /// candidates are too many to pay.
+    /// Merges the workers' partials of the keys that may place and picks
+    /// the candidates. False when the slack reaches τ (a key no unit
+    /// reported might then rank) or the candidates are too many to pay.
     pub fn settle(self: *HeavyKeys, allocator: Allocator) !bool {
         var slack: u64 = 0;
-        var reported: usize = 0;
-        for (self.workers) |*w| {
-            slack += w.slack;
-            reported += w.partials.count();
-        }
-        var merged: std.AutoHashMapUnmanaged(u128, Partial) = .empty;
+        for (self.workers) |*w| slack += w.slack;
+        var merged = try self.mergeReachable(allocator, slack);
         defer merged.deinit(allocator);
-        try merged.ensureTotalCapacity(allocator, @intCast(reported));
-        for (self.workers) |*w| {
-            var it = w.partials.iterator();
-            while (it.next()) |e| {
-                const gop = merged.getOrPutAssumeCapacity(e.key_ptr.*);
-                if (gop.found_existing) gop.value_ptr.count += e.value_ptr.count else gop.value_ptr.* = e.value_ptr.*;
-            }
-        }
         const counts = try allocator.alloc(u64, merged.count());
         defer allocator.free(counts);
         var i: usize = 0;
@@ -1008,6 +996,78 @@ pub const HeavyKeys = struct {
         std.sort.pdq(Candidate, sorted, {}, candidateBefore);
         self.sorted = sorted;
         return true;
+    }
+
+    /// The merged partials of the keys whose partials may reach τ - slack,
+    /// with τ the need-th best partial or `floor`: every key `settle` can
+    /// pick, and the need best when they reach it (τ is `floor` when they
+    /// don't). The workers' own best keys bound τ from below by `lower`,
+    /// and a key whose partial reaches lower - slack has a worker holding a
+    /// workers-th of that, so only such keys' partials merge; all of them
+    /// when that share is a row or less.
+    fn mergeReachable(self: *const HeavyKeys, allocator: Allocator, slack: u64) !std.AutoHashMapUnmanaged(u128, Partial) {
+        var merged: std.AutoHashMapUnmanaged(u128, Partial) = .empty;
+        errdefer merged.deinit(allocator);
+        const lower = @max(try self.bestKeysBound(allocator), self.floor);
+        const span = lower -| slack;
+        if (span <= self.workers.len) {
+            var reported: usize = 0;
+            for (self.workers) |*w| reported += w.partials.count();
+            try merged.ensureTotalCapacity(allocator, @intCast(reported));
+            for (self.workers) |*w| {
+                var it = w.partials.iterator();
+                while (it.next()) |e| {
+                    const gop = merged.getOrPutAssumeCapacity(e.key_ptr.*);
+                    if (gop.found_existing) {
+                        gop.value_ptr.count += e.value_ptr.count;
+                        if (gop.value_ptr.bytes == null) gop.value_ptr.bytes = e.value_ptr.bytes;
+                    } else gop.value_ptr.* = e.value_ptr.*;
+                }
+            }
+            return merged;
+        }
+        for (self.workers) |*w| {
+            var it = w.partials.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.count *| self.workers.len < span) continue;
+                const gop = try merged.getOrPut(allocator, e.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = self.mergedPartial(e.key_ptr.*);
+            }
+        }
+        return merged;
+    }
+
+    /// The need-th best merged partial of the keys some worker ranks among
+    /// its own `need` best (0 when they are fewer): at most τ, being the
+    /// need-th best of some of the keys.
+    fn bestKeysBound(self: *const HeavyKeys, allocator: Allocator) !u64 {
+        var seen: std.AutoHashMapUnmanaged(u128, void) = .empty;
+        defer seen.deinit(allocator);
+        try seen.ensureTotalCapacity(allocator, @intCast(self.top_keys.len));
+        const partials = try allocator.alloc(u64, self.top_keys.len);
+        defer allocator.free(partials);
+        var n: usize = 0;
+        for (self.workers) |*w| {
+            for (w.top_keys[0..w.top_len]) |key| {
+                if (seen.getOrPutAssumeCapacity(key).found_existing) continue;
+                partials[n] = self.mergedPartial(key).count;
+                n += 1;
+            }
+        }
+        var best: [MAX_NEED]u64 = undefined;
+        return kthLargest(u64, partials[0..n], best[0..self.need]);
+    }
+
+    /// `key`'s partials summed over the workers.
+    fn mergedPartial(self: *const HeavyKeys, key: u128) Partial {
+        var merged: Partial = .{ .count = 0, .signature = 0, .slot = NO_SLOT, .bytes = null };
+        for (self.workers) |*w| {
+            const p = w.partials.get(key) orelse continue;
+            merged.count += p.count;
+            merged.signature = p.signature;
+            if (merged.bytes == null) merged.bytes = p.bytes;
+        }
+        return merged;
     }
 
     /// Whether binary searches for the candidates beat signing every row of
@@ -1377,6 +1437,81 @@ test "heavy keys keep every key that can reach the top and prove the rest can't"
             if (i > 0) try std.testing.expect(std.mem.lessThan(u8, sorted[i - 1].bytes, c.bytes));
         }
     }
+}
+
+test "heavy keys merge only the partials that may place, picking what a full merge picks" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5e77);
+    const random = prng.random();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 96 units: keys 0..7 hot everywhere, keys 8..39 spread over every unit
+    // with totals straddling the cut, and one-offs. A spread key near the
+    // cut holds about the per-worker share on some workers and less on the
+    // others.
+    const units = try arena.alloc([]const [2]u64, 96);
+    var input_rows: u64 = 0;
+    var next_light: u64 = 1000;
+    for (units) |*unit| {
+        const keys = try arena.alloc([2]u64, 340);
+        for (keys, 0..) |*kc, i| {
+            kc.* = if (i < 8)
+                .{ i, 60 + random.uintLessThan(u64, 20) }
+            else if (i < 40)
+                .{ i, 40 + (i - 8) * 20 / 32 + random.uintLessThan(u64, 10) }
+            else blk: {
+                next_light += 1;
+                break :blk .{ next_light, 1 + random.uintLessThan(u64, 2) };
+            };
+            input_rows += kc[1];
+        }
+        unit.* = keys;
+    }
+
+    var settled: usize = 0;
+    inline for (.{ @as(usize, 1), @as(usize, 3), @as(usize, 8) }) |workers| {
+        for ([_]u64{ 0, 7600, 9000 }) |floor| {
+            var heavy = try HeavyKeys.init(allocator, 6, workers);
+            defer heavy.deinit(allocator);
+            heavy.floor = floor;
+            heavy.input_rows = input_rows;
+            try heavyTallyUnits(allocator, &heavy, units, workers);
+
+            var merged = std.AutoHashMap(u128, u64).init(allocator);
+            defer merged.deinit();
+            var slack: u64 = 0;
+            for (heavy.workers) |*w| {
+                slack += w.slack;
+                var it = w.partials.iterator();
+                while (it.next()) |e| {
+                    const gop = try merged.getOrPut(e.key_ptr.*);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += e.value_ptr.count;
+                }
+            }
+            var partials: std.ArrayList(u64) = .empty;
+            defer partials.deinit(allocator);
+            var values = merged.valueIterator();
+            while (values.next()) |p| try partials.append(allocator, p.*);
+            std.sort.pdq(u64, partials.items, {}, std.sort.desc(u64));
+            const tau = @max(partials.items[heavy.need - 1], floor);
+
+            try std.testing.expectEqual(tau > slack, try heavy.settle(allocator));
+            if (tau <= slack) continue;
+            settled += 1;
+            var expected: usize = 0;
+            var it = merged.iterator();
+            while (it.next()) |e| {
+                const can_place = e.value_ptr.* + slack >= tau;
+                expected += @intFromBool(can_place);
+                try std.testing.expectEqual(can_place, heavy.keeps(e.key_ptr.*));
+            }
+            try std.testing.expectEqual(expected, heavy.candidates.count());
+        }
+    }
+    try std.testing.expect(settled >= 6);
 }
 
 test "heavy keys decline when the slack reaches the need-th partial" {
