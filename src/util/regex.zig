@@ -101,6 +101,9 @@ const Parser = struct {
     arena: Allocator,
     next_group: u32 = 1, // group 0 is the whole match
     options: Options = .{},
+    /// Off only in tests, which check the factored alternations against
+    /// the ones written.
+    factor_alternations: bool = true,
 
     fn peek(self: *Parser) ?u8 {
         return if (self.pos < self.pat.len) self.pat[self.pos] else null;
@@ -131,7 +134,77 @@ const Parser = struct {
             try branches.append(self.arena, try self.parseConcat());
         }
         if (branches.items.len == 1) return branches.items[0];
-        return self.node(.{ .alt = try branches.toOwnedSlice(self.arena) });
+        if (!self.factor_alternations) return self.node(.{ .alt = try branches.toOwnedSlice(self.arena) });
+        return self.factorAlt(branches.items);
+    }
+
+    /// `branches` rewritten into the shapes the sequence plan takes, with
+    /// the same leftmost-first matches: the bytes every branch begins with
+    /// come first (`ab|ac` is `a(?:b|c)`), then a two-way choice with one
+    /// empty side is an optional (`X|` is `X?`, `|X` is `X??`) and
+    /// branches of one byte each are their class (`a|b` is `[ab]`: each
+    /// consumes the same byte and leaves the same rest to match).
+    fn factorAlt(self: *Parser, branches: []const *Node) Error!*Node {
+        const seqs = try self.arena.alloc([]const *Node, branches.len);
+        for (branches, seqs) |b, *seq| seq.* = switch (b.*) {
+            .concat => |parts| parts,
+            .empty => &.{},
+            else => try self.arena.dupe(*Node, &.{b}),
+        };
+        var shared: usize = 0;
+        prefix: while (shared < seqs[0].len) : (shared += 1) {
+            const head = switch (seqs[0][shared].*) {
+                .class => |*cc| cc,
+                else => break,
+            };
+            for (seqs[1..]) |seq| {
+                if (shared == seq.len) break :prefix;
+                switch (seq[shared].*) {
+                    .class => |*cc| if (!std.mem.eql(u8, &cc.bits, &head.bits)) break :prefix,
+                    else => break :prefix,
+                }
+            }
+        }
+        const rests = try self.arena.alloc(*Node, branches.len);
+        for (seqs, rests) |seq, *rest| rest.* = try self.sequence(seq[shared..]);
+        const choice = try self.choiceOf(rests);
+        if (shared == 0) return choice;
+        const parts = try self.arena.alloc(*Node, shared + 1);
+        @memcpy(parts[0..shared], seqs[0][0..shared]);
+        parts[shared] = choice;
+        return self.node(.{ .concat = parts });
+    }
+
+    fn sequence(self: *Parser, parts: []const *Node) Error!*Node {
+        return switch (parts.len) {
+            0 => self.node(.empty),
+            1 => parts[0],
+            else => self.node(.{ .concat = parts }),
+        };
+    }
+
+    fn choiceOf(self: *Parser, rests: []const *Node) Error!*Node {
+        var empties: usize = 0;
+        var classes: usize = 0;
+        for (rests) |r| switch (r.*) {
+            .empty => empties += 1,
+            .class => classes += 1,
+            else => {},
+        };
+        if (empties == rests.len) return rests[0];
+        if (rests.len == 2 and empties == 1) {
+            const present_first = rests[1].* == .empty;
+            const body = if (present_first) rests[0] else rests[1];
+            return self.node(.{ .repeat = .{ .node = body, .min = 0, .max = 1, .greedy = present_first } });
+        }
+        if (classes == rests.len) {
+            var cc: CharClass = .{};
+            for (rests) |r| {
+                for (&cc.bits, r.class.bits) |*x, y| x.* |= y;
+            }
+            return self.node(.{ .class = cc });
+        }
+        return self.node(.{ .alt = rests });
     }
 
     fn parseConcat(self: *Parser) Error!*Node {
@@ -492,9 +565,13 @@ fn computePrefilter(allocator: Allocator, prog: []const Inst) Error![]u8 {
 /// one explore step per byte.
 const StarScan = union(enum) {
     none,
-    /// At most four bytes leave C: memchr each, the earliest ends the run.
-    breakers: struct { n: u8, bytes: [4]u8 },
-    /// Too many bytes leave C for memchr: test membership byte by byte.
+    /// C holds every byte: the run takes the rest of the input.
+    all,
+    /// One to four bytes leave C, the first repeated to fill four, so one
+    /// loop without a branch on their count serves all: the earliest of
+    /// them ends the run.
+    breakers: [4]u8,
+    /// Too many bytes leave C for compares: test membership byte by byte.
     dense,
 };
 
@@ -519,14 +596,16 @@ fn starScanAt(prog: []const Inst, pc: usize) StarScan {
 /// How to find the end of a run of `cc` bytes.
 fn classScan(cc: *const CharClass) StarScan {
     var bytes: [4]u8 = undefined;
-    var n: u8 = 0;
+    var n: usize = 0;
     for (0..256) |b| {
         if (cc.contains(@intCast(b))) continue;
         if (n == bytes.len) return .dense;
         bytes[n] = @intCast(b);
         n += 1;
     }
-    return .{ .breakers = .{ .n = n, .bytes = bytes } };
+    if (n == 0) return .all;
+    @memset(bytes[n..], bytes[0]);
+    return .{ .breakers = bytes };
 }
 
 /// The one byte a class matches, or null when it matches several or none.
@@ -669,9 +748,10 @@ const BtPlan = struct {
 
 /// First index `>= from` whose byte is outside the star's class, or
 /// `input.len`.
-fn starRunEnd(scan: StarScan, cc: *const CharClass, input: []const u8, from: usize) usize {
-    switch (scan) {
-        .breakers => |*b| return findAnyByte(input, from, b.bytes[0..b.n]),
+fn starRunEnd(scan: *const StarScan, cc: *const CharClass, input: []const u8, from: usize) usize {
+    switch (scan.*) {
+        .breakers => |*b| return findAnyOf(4, input, from, b),
+        .all => return input.len,
         .dense => {
             var j = from;
             while (j < input.len and cc.contains(input[j])) j += 1;
@@ -682,29 +762,74 @@ fn starRunEnd(scan: StarScan, cc: *const CharClass, input: []const u8, from: usi
 }
 
 /// First index `>= from` holding any of `bytes`, or `input.len`, in one
-/// pass for all of them. The chunks are 16 bytes because values are short:
-/// `std.mem.indexOfScalarPos` uses the widest vector and finishes a short
-/// value byte by byte, while here the last chunk instead re-reads bytes
-/// overlapping the previous one.
+/// pass for all of them.
 fn findAnyByte(input: []const u8, from: usize, bytes: []const u8) usize {
-    const V = @Vector(16, u8);
-    if (input.len < 16) {
-        for (input[from..], from..) |c, j| {
-            for (bytes) |b| if (c == b) return j;
-        }
-        return input.len;
-    }
-    var i = from;
-    while (i < input.len) {
-        const at = @min(i, input.len - 16);
-        const chunk: V = input[at..][0..16].*;
-        var hits: u16 = 0;
-        for (bytes) |b| hits |= @as(u16, @bitCast(chunk == @as(V, @splat(b))));
-        hits &= ~@as(u16, 0) << @intCast(i - at);
-        if (hits != 0) return at + @ctz(hits);
-        i = at + 16;
+    return switch (bytes.len) {
+        0 => input.len,
+        inline 1...8 => |n| findAnyOf(n, input, from, bytes[0..n]),
+        else => std.mem.indexOfAnyPos(u8, input, from, bytes) orelse input.len,
+    };
+}
+
+/// The widest chunk the target compares in one instruction.
+const SCAN_WIDTH = @max(16, std.simd.suggestVectorLength(u8) orelse 16);
+
+/// `findAnyByte` for `n` bytes. `std.mem.indexOfScalarPos` finishes a
+/// short value byte by byte; here the last chunk instead re-reads bytes
+/// overlapping the previous one, and a value too short for a wide chunk
+/// takes narrow ones.
+inline fn findAnyOf(comptime n: usize, input: []const u8, from: usize, bytes: *const [n]u8) usize {
+    if (input.len >= SCAN_WIDTH) return findAnyIn(SCAN_WIDTH, n, input, from, bytes);
+    if (SCAN_WIDTH > 16 and input.len >= 16) return findAnyIn(16, n, input, from, bytes);
+    for (input[from..], from..) |c, j| {
+        inline for (bytes) |b| if (c == b) return j;
     }
     return input.len;
+}
+
+/// Scans `input.len >= width` bytes in `width`-byte chunks.
+fn findAnyIn(comptime width: usize, comptime n: usize, input: []const u8, from: usize, bytes: *const [n]u8) usize {
+    const V = @Vector(width, u8);
+    const Mask = @Int(.unsigned, width);
+    var i = from;
+    while (i < input.len) {
+        const at = @min(i, input.len - width);
+        const chunk: V = input[at..][0..width].*;
+        var hits: Mask = 0;
+        inline for (bytes) |b| hits |= @as(Mask, @bitCast(chunk == @as(V, @splat(b))));
+        hits &= ~@as(Mask, 0) << @intCast(i - at);
+        if (hits != 0) return at + @ctz(hits);
+        i = at + width;
+    }
+    return input.len;
+}
+
+/// Whether no byte of `input` is one of a star's `breakers`. Meant for a
+/// long buffer, which rarely holds one: it tests several chunks per
+/// branch, and each breaker once rather than as padding.
+fn holdsNoBreaker(input: []const u8, breakers: *const [4]u8) bool {
+    // `classScan` pads with the first breaker, so the distinct ones lead.
+    var n: usize = 1;
+    for (breakers[1..]) |b| n += @intFromBool(b != breakers[0]);
+    return switch (n) {
+        inline 1...3 => |k| holdsNoneOf(k, input, breakers[0..k]),
+        else => holdsNoneOf(4, input, breakers),
+    };
+}
+
+fn holdsNoneOf(comptime n: usize, input: []const u8, bytes: *const [n]u8) bool {
+    const V = @Vector(SCAN_WIDTH, u8);
+    const block = 4 * SCAN_WIDTH;
+    var i: usize = 0;
+    while (input.len - i >= block) : (i += block) {
+        var seen: V = @splat(0);
+        inline for (0..4) |k| {
+            const chunk: V = input[i + k * SCAN_WIDTH ..][0..SCAN_WIDTH].*;
+            inline for (bytes) |b| seen |= @select(u8, chunk == @as(V, @splat(b)), @as(V, @splat(0xff)), @as(V, @splat(0)));
+        }
+        if (@reduce(.Or, seen) != 0) return false;
+    }
+    return findAnyOf(n, input, i, bytes) == input.len;
 }
 
 /// The backtracker's pending jobs. It pushes one every few steps, so the
@@ -783,7 +908,23 @@ const SeqLiteral = struct {
     /// An ASCII letter also matches its other case; the plan stores it
     /// lower case.
     fold: bool,
+    /// A literal of at most 8 bytes as one little-endian word, set by
+    /// `packLiteral`: `mask` covers its bytes and `case_bits` holds 0x20
+    /// at each folded letter, the one bit its cases differ in.
+    word: u64 = 0,
+    mask: u64 = 0,
+    case_bits: u64 = 0,
 };
+
+fn packLiteral(lit: *SeqLiteral, bytes: []const u8) void {
+    if (lit.len > 8) return;
+    for (bytes[lit.off..][0..lit.len], 0..) |b, k| {
+        const shift: u6 = @intCast(8 * k);
+        lit.word |= @as(u64, b) << shift;
+        lit.mask |= @as(u64, 0xff) << shift;
+        if (lit.fold and std.ascii.isAlphabetic(b)) lit.case_bits |= @as(u64, 0x20) << shift;
+    }
+}
 
 const OptionalMode = enum {
     /// Present exactly when it matches here: what follows can't begin on
@@ -808,6 +949,9 @@ const SeqStep = union(enum) {
     /// `class`: the literal after it begins with `backoff` bytes of the
     /// class and then one outside it, so that is the only count it fits.
     run_backoff: struct { class: CharClass, scan: StarScan, min: u32, max: ?u32, backoff: u8 },
+    /// The plan's final run, which ends the match itself; with `to_end`
+    /// a `$` follows it, so it must reach the text's end.
+    tail_run: struct { class: CharClass, scan: StarScan, min: u32, max: ?u32, shortest: bool, to_end: bool },
     optional: SeqOptional,
     save: u32,
     eol,
@@ -861,6 +1005,24 @@ const SeqPlan = struct {
         if (anchored) nodes = nodes[1..];
         for (nodes) |n| if (!try b.add(n)) return null;
         if (!resolveSeq(b.steps.items, b.parts.items, b.bytes.items)) return null;
+        for (b.steps.items) |*step| switch (step.*) {
+            .literal => |*lit| packLiteral(lit, b.bytes.items),
+            .optional => |*o| packLiteral(&o.lead, b.bytes.items),
+            else => {},
+        };
+        for (b.parts.items) |*part| switch (part.*) {
+            .literal => |*lit| packLiteral(lit, b.bytes.items),
+            .class => {},
+        };
+        const n = b.steps.items.len;
+        const to_end = n >= 2 and b.steps.items[n - 1] == .eol and b.steps.items[n - 2] == .run;
+        if (to_end) b.steps.items.len -= 1;
+        if (b.steps.items.len > 0 and b.steps.items[b.steps.items.len - 1] == .run) {
+            const last = &b.steps.items[b.steps.items.len - 1];
+            const r = last.run;
+            // Before `$` only the count reaching the end fits, lazy or not.
+            last.* = .{ .tail_run = .{ .class = r.class, .scan = r.scan, .min = r.min, .max = r.max, .shortest = r.shortest and !to_end, .to_end = to_end } };
+        }
         try b.steps.append(allocator, .accept);
         const steps = try b.steps.toOwnedSlice(allocator);
         errdefer allocator.free(steps);
@@ -876,7 +1038,15 @@ const SeqPlan = struct {
     }
 
     inline fn literalAt(self: *const SeqPlan, lit: SeqLiteral, input: []const u8, pos: usize) bool {
+        if (lit.len <= 8 and input.len - pos >= 8) return wordIs(lit, input[pos..][0..8]);
         return input.len - pos >= lit.len and self.literalIs(lit, input[pos..][0..lit.len]);
+    }
+
+    /// A packed literal against the 8 bytes it begins: one compare, where
+    /// a byte loop's early exit is a branch on the text.
+    inline fn wordIs(lit: SeqLiteral, have: *const [8]u8) bool {
+        const word = std.mem.readInt(u64, have, .little);
+        return ((word | lit.case_bits) ^ lit.word) & lit.mask == 0;
     }
 
     inline fn literalIs(self: *const SeqPlan, lit: SeqLiteral, have: []const u8) bool {
@@ -887,7 +1057,9 @@ const SeqPlan = struct {
     }
 
     inline fn bodyAt(self: *const SeqPlan, o: *const SeqOptional, input: []const u8, pos: usize) bool {
-        if (input.len - pos < o.width or !self.literalIs(o.lead, input[pos..][0..o.lead.len])) return false;
+        if (input.len - pos < o.width) return false;
+        if (o.rest_len == 0 and o.lead.len <= 8 and input.len - pos >= 8) return wordIs(o.lead, input[pos..][0..8]);
+        if (!self.literalIs(o.lead, input[pos..][0..o.lead.len])) return false;
         var p = pos + o.lead.len;
         for (self.parts[o.rest..][0..o.rest_len]) |*part| switch (part.*) {
             .literal => |lit| {
@@ -895,16 +1067,32 @@ const SeqPlan = struct {
                 p += lit.len;
             },
             .class => |*c| {
-                if (starRunEnd(c.scan, &c.class, input[0 .. p + c.count], p) != p + c.count) return false;
+                if (starRunEnd(&c.scan, &c.class, input[0 .. p + c.count], p) != p + c.count) return false;
                 p += c.count;
             },
         };
         return true;
     }
 
+    /// Whether a final run reaches the end of any text inside `bytes`:
+    /// none of them is a byte it stops on.
+    fn tailClearIn(self: *const SeqPlan, bytes: []const u8) bool {
+        if (self.steps.len < 2) return false;
+        const r = switch (self.steps[self.steps.len - 2]) {
+            .tail_run => |*r| r,
+            else => return false,
+        };
+        return switch (r.scan) {
+            .all => true,
+            .breakers => |*b| holdsNoBreaker(bytes, b),
+            .dense, .none => false,
+        };
+    }
+
     /// End of the match starting at `sp`, with its captures in `slots`, or
-    /// null. With `budgeted`, also null once `work` runs out.
-    fn matchAt(self: *const SeqPlan, comptime budgeted: bool, input: []const u8, sp: usize, slots: []?usize, work: *usize) ?usize {
+    /// null. With `budgeted`, also null once `work` runs out. `tail_clear`
+    /// is `tailClearIn` over bytes holding `input`.
+    fn matchAt(self: *const SeqPlan, comptime budgeted: bool, input: []const u8, sp: usize, slots: []?usize, work: *usize, tail_clear: bool) ?usize {
         const Choice = struct { step: usize, pos: usize };
         var choices: [SEQ_MAX_CHOICES]Choice = undefined;
         var n_choices: usize = 0;
@@ -929,7 +1117,7 @@ const SeqPlan = struct {
                     if (exhausted(budgeted, work)) return null;
                     const r = &self.steps[i].run;
                     const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
-                    const end = starRunEnd(r.scan, &r.class, input[0..@min(input.len, limit)], pos);
+                    const end = starRunEnd(&r.scan, &r.class, input[0..@min(input.len, limit)], pos);
                     if (end - pos >= r.min) {
                         if (budgeted) work.* -|= end - pos;
                         pos = end;
@@ -940,7 +1128,7 @@ const SeqPlan = struct {
                 .run_backoff => {
                     if (exhausted(budgeted, work)) return null;
                     const r = &self.steps[i].run_backoff;
-                    const end = starRunEnd(r.scan, &r.class, input, pos);
+                    const end = starRunEnd(&r.scan, &r.class, input, pos);
                     if (budgeted) work.* -|= end - pos;
                     if (end - pos >= @as(usize, r.backoff) + r.min) {
                         const count = end - pos - r.backoff;
@@ -951,17 +1139,33 @@ const SeqPlan = struct {
                         }
                     }
                 },
+                .tail_run => {
+                    if (exhausted(budgeted, work)) return null;
+                    const r = &self.steps[i].tail_run;
+                    const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
+                    const bound = @min(input.len, limit);
+                    const end = if (tail_clear) bound else starRunEnd(&r.scan, &r.class, input[0..bound], pos);
+                    if (budgeted) work.* -|= end - pos;
+                    if (end - pos >= r.min and (!r.to_end or end == input.len)) return end;
+                },
                 .optional => {
                     if (exhausted(budgeted, work)) return null;
                     const o = &self.steps[i].optional;
-                    var present = o.mode != .never and self.bodyAt(o, input, pos);
-                    if (present and (o.mode == .greedy_choice or o.mode == .lazy_choice)) {
-                        choices[n_choices] = .{ .step = i, .pos = pos };
-                        n_choices += 1;
-                        if (o.mode == .lazy_choice) present = false;
-                    }
-                    setOptional(o.slot, slots, pos, if (present) o.width else null);
-                    if (present) pos += o.width;
+                    const present = o.mode != .never and self.bodyAt(o, input, pos);
+                    // Whether the body is there is data: it picks values
+                    // here rather than branches, whose misses cost more.
+                    const taken = switch (o.mode) {
+                        .greedy_choice, .lazy_choice => taken: {
+                            // At most one choice per earlier choice step is
+                            // pending, so this slot is free.
+                            choices[n_choices] = .{ .step = i, .pos = pos };
+                            n_choices += @intFromBool(present);
+                            break :taken present and o.mode == .greedy_choice;
+                        },
+                        .when_matched, .never => present,
+                    };
+                    setOptional(o.slot, slots, pos, if (taken) o.width else null);
+                    pos += if (taken) o.width else 0;
                     i += 1;
                     continue :step std.meta.activeTag(self.steps[i]);
                 },
@@ -1249,8 +1453,9 @@ fn resolveSeq(steps: []SeqStep, parts: []const SeqPart, bytes: []const u8) bool 
                     empty = false;
                 }
             },
-            // Made only from a `.run` above, once this walk has passed it.
-            .run_backoff => unreachable,
+            // Made from a `.run`, by this walk once it has passed it or
+            // by the plan after it.
+            .run_backoff, .tail_run => unreachable,
             .optional => |*o| {
                 const bf = bodyFirst(o, parts, bytes);
                 if (empty) {
@@ -1573,10 +1778,14 @@ pub const Regex = struct {
     }
 
     pub fn compileWith(allocator: Allocator, pattern: []const u8, options: Options) Error!Regex {
+        return compileParsed(allocator, pattern, options, true);
+    }
+
+    fn compileParsed(allocator: Allocator, pattern: []const u8, options: Options, factor_alternations: bool) Error!Regex {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
-        var parser = Parser{ .pat = pattern, .arena = arena.allocator(), .options = options };
+        var parser = Parser{ .pat = pattern, .arena = arena.allocator(), .options = options, .factor_alternations = factor_alternations };
         const root = try parser.parseAlt();
         if (parser.pos != pattern.len) return Error.RegexInvalidPattern; // trailing junk, e.g. unmatched ')'
 
@@ -1721,7 +1930,7 @@ pub const Regex = struct {
         var work: usize = 0;
         if (plan.anchored) {
             if (start > 0) return false;
-            const end = plan.matchAt(false, input, 0, slots, &work) orelse return false;
+            const end = plan.matchAt(false, input, 0, slots, &work, false) orelse return false;
             slots[0] = 0;
             slots[1] = end;
             return true;
@@ -1736,7 +1945,7 @@ pub const Regex = struct {
                 // A prefiltered pattern can't match empty.
                 if (sp == input.len) return false;
             }
-            if (plan.matchAt(true, input, sp, slots, &work)) |end| {
+            if (plan.matchAt(true, input, sp, slots, &work, false)) |end| {
                 slots[0] = sp;
                 slots[1] = end;
                 return true;
@@ -1907,7 +2116,7 @@ pub const Regex = struct {
                             }
                             pc = s.a;
                         },
-                        else => |scan| {
+                        else => |*scan| {
                             // Cross the run of class bytes in one scan; the
                             // continuation is then tried from the run's far end
                             // back to `pos`. With the memo, the loop head's pairs
@@ -2267,13 +2476,22 @@ pub const Regex = struct {
     ) Error![]const u8 {
         const out = &scratch.out_buf;
         out.clearRetainingCapacity();
-        try self.replaceInto(scratch.backing, out, input, template, scratch, start, occurrence);
+        try self.replaceInto(scratch.backing, out, input, template, scratch, start, occurrence, false);
         return out.items;
+    }
+
+    /// Whether a batch's texts, all lying inside `bytes`, may go to
+    /// `replaceInto` with `tail_clear`: the pattern ends in a class run to
+    /// the text's end, and no byte here stops that run. One scan over the
+    /// batch's packed texts then stands in for a scan of each one's tail.
+    pub fn tailClearIn(self: *const Regex, bytes: []const u8) bool {
+        if (self.seq) |*plan| return plan.tailClearIn(bytes);
+        return false;
     }
 
     /// `replaceScratch` appending the result to `out` rather than returning
     /// it, so a kernel writes each row's result straight into its output
-    /// column.
+    /// column. `tail_clear` is `tailClearIn` over bytes holding `input`.
     pub fn replaceInto(
         self: *const Regex,
         allocator: Allocator,
@@ -2283,6 +2501,7 @@ pub const Regex = struct {
         scratch: *Scratch,
         start: usize,
         occurrence: usize,
+        tail_clear: bool,
     ) Error!void {
         if (scratch.slots.len < self.n_slots) {
             scratch.slots = try scratch.backing.realloc(scratch.slots, self.n_slots);
@@ -2293,7 +2512,7 @@ pub const Regex = struct {
         // so the search loop below reduces to one plan run.
         if (self.seq) |*plan| if (plan.anchored and start == 0 and occurrence <= 1) {
             var work: usize = 0;
-            const end = plan.matchAt(false, input, 0, slots, &work) orelse return out.appendSlice(allocator, input);
+            const end = plan.matchAt(false, input, 0, slots, &work, tail_clear) orelse return out.appendSlice(allocator, input);
             slots[0] = 0;
             slots[1] = end;
             try expandTemplate(allocator, out, template, input, slots);
@@ -2823,6 +3042,77 @@ test "regex: a brace that starts no repeat is a literal brace, as in RE2" {
     try std.testing.expectError(Error.RegexInvalidPattern, Regex.compile(std.testing.allocator, "a|{1,3}"));
 }
 
+test "regex: factored alternations match as written" {
+    try expectReplace("^(?:https|http)://([^/]+)/.*$", "https://a.b/x", "\\1", "a.b");
+    try expectReplace("^(?:http|https)://([^/]+)/.*$", "http://a.b/x", "\\1", "a.b");
+    try expectReplace("^(?:http|https)://([^/]+)/.*$", "httpx://a.b/x", "\\1", "httpx://a.b/x");
+    try expectReplace("(a|ab)(c|bcd)(d*)", "abcd", "[\\1|\\2|\\3]", "[a|bcd|]");
+    try expectReplace("(ab|a)(c|bcd)(d*)", "abcd", "[\\1|\\2|\\3]", "[ab|c|d]");
+    try expectReplace("a(?:b|)", "ab", "X", "X");
+    try expectReplace("a(?:|b)", "ab", "X", "Xb");
+    try expectReplace("(?:|a)b", "ab", "X", "X");
+    try expectReplace("x(?:a|b|c)y", "xby xdy", "X", "X xdy");
+    try expectReplace("(?:ab|ab)c", "abc", "X", "X");
+    try expectReplace("(?:a(b)|a(c))", "ac", "[\\1|\\2]", "[|c]");
+    try expectReplace("(?:abc|abd|ab)(x?)", "abdx", "[\\1]", "[x]");
+}
+
+// A factored alternation must find what the alternation as written finds,
+// with the same captures, from every start.
+test "regex: factored alternations equal the written ones (fuzz)" {
+    const patterns = [_][]const u8{
+        "^(?:https|http)://(?:www\\.)?([^/]+)/.*$",
+        "^(?:http|https)://(?:www\\.|)([^/]+)/.*$",
+        "(a|ab)(c|bcd)(d*)",
+        "(ab|a)(c|bcd)",
+        "(?:ab|ac|a)b*",
+        "(?:a|b|c)+x",
+        "(?:|a|ab)c",
+        "(a|)+b",
+        "x(?:yz|y)z?",
+        "(?:ab|abc)(c*)",
+        "(?:a(b)|a(c)|a)d",
+        "(?:wd\\.|w)([^/]*)",
+        "^(?:a|b)(?:c|)$",
+        "(?:ab|AB|ab)x",
+    };
+    const option_sets = [_]Options{ .{}, .{ .case_insensitive = true } };
+    const alphabet = "abcdxyzw./hpst:AB";
+    var prng = std.Random.DefaultPrng.init(0xFAC7_2026);
+    const rnd = prng.random();
+    var buf: [24]u8 = undefined;
+
+    for (option_sets) |options| for (patterns) |pat| {
+        var factored = try Regex.compileWith(std.testing.allocator, pat, options);
+        defer factored.deinit();
+        var written = try Regex.compileParsed(std.testing.allocator, pat, options, false);
+        defer written.deinit();
+        var s_f = Scratch.init(std.testing.allocator);
+        defer s_f.deinit();
+        var s_w = Scratch.init(std.testing.allocator);
+        defer s_w.deinit();
+        const slots_f = try std.testing.allocator.alloc(?usize, factored.n_slots);
+        defer std.testing.allocator.free(slots_f);
+        const slots_w = try std.testing.allocator.alloc(?usize, written.n_slots);
+        defer std.testing.allocator.free(slots_w);
+
+        for (0..400) |_| {
+            const len = rnd.intRangeAtMost(usize, 0, buf.len);
+            for (buf[0..len]) |*b| b.* = alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)];
+            if (len > 8 and rnd.boolean()) @memcpy(buf[0..8], "https://");
+            const input = buf[0..len];
+            for (0..len + 1) |start| {
+                @memset(slots_f, null);
+                @memset(slots_w, null);
+                const got = try factored.findWith(&s_f, input, start, slots_f);
+                const want = try written.findWithImpl(false, &s_w, input, start, slots_w);
+                try std.testing.expectEqual(want, got);
+                if (want) try std.testing.expectEqualSlices(?usize, slots_w, slots_f);
+            }
+        }
+    };
+}
+
 test "regex: multi-way alternation + nested groups" {
     try expectMatch("^(red|green|blue)$", "green", true);
     try expectMatch("^(red|green|blue)$", "yellow", false);
@@ -3326,6 +3616,17 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
         "[^x]+ax",
         "([^.]{1,3})ab\\.",
         "^(?:www\\.)?([^/]+?)w/",
+        "(?:a|b)?c",
+        "^(?:https|http)://(?:www\\.|)([^/]+)/.*$",
+        "^(?:http|https)://([^/]+)",
+        "x(?:a|b|c)y",
+        "^https?://(?:www\\.)?([^/]+)/.*",
+        "x.*",
+        "^x.{2,}$",
+        "a[^/]{0,3}$",
+        "b[^/]*?$",
+        "^a[^/]+?",
+        "^w[^/]{2,5}",
     };
     const unplanned = [_][]const u8{
         "(cat|dog)",
@@ -3338,7 +3639,7 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
         "(?:x/.*)?y",
         "^(?:a)?(?:a)?(?:a)?(?:a)?(?:a)?a",
         "(?:a*)?b",
-        "(?:a|b)?c",
+        "(?:ab|cd)?e",
         "(?:(a)b)?c",
         "^([^-]+)a?- ",
         "[^x]+aa",
@@ -3354,6 +3655,7 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
     var buf: [48]u8 = undefined;
     var compared: u64 = 0;
     var handed_on: u64 = 0;
+    var tail_cleared: u64 = 0;
 
     for (unplanned) |pat| {
         var re = try Regex.compile(std.testing.allocator, pat);
@@ -3391,6 +3693,17 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
             }
             const input = buf[0..len];
 
+            if (re.tailClearIn(input)) for (0..len + 1) |sp| {
+                var work: usize = 0;
+                @memset(slots_ref, null);
+                @memset(slots_seq, null);
+                const scanned = re.seq.?.matchAt(false, input, sp, slots_ref, &work, false);
+                const skipped = re.seq.?.matchAt(false, input, sp, slots_seq, &work, true);
+                try std.testing.expectEqual(scanned, skipped);
+                try std.testing.expectEqualSlices(?usize, slots_ref, slots_seq);
+                tail_cleared += 1;
+            };
+
             var start: usize = 0;
             while (start <= len) : (start += 1) {
                 @memset(slots_ref, null);
@@ -3407,6 +3720,7 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
     };
     // Both ways an unanchored search ends were exercised.
     try std.testing.expect(handed_on > 0 and compared > 20 * handed_on);
+    try std.testing.expect(tail_cleared > 1000);
 }
 
 test "regex: an unanchored sequence hands pathological rows to the general engine" {
@@ -3443,6 +3757,27 @@ test "regex: findAnyByte finds the first of several bytes at every offset" {
                 const want = std.mem.indexOfAnyPos(u8, input, from, set) orelse len;
                 try std.testing.expectEqual(want, findAnyByte(input, from, set));
             }
+        }
+    }
+}
+
+test "regex: holdsNoBreaker finds one breaker anywhere in a long buffer" {
+    var prng = std.Random.DefaultPrng.init(0x401D_2026);
+    const rnd = prng.random();
+    var buf: [600]u8 = undefined;
+    const sets = [_][]const u8{ "/", "\n", "/?#", "abcd" };
+    for (sets) |set| {
+        var cc: CharClass = .{};
+        for (0..256) |c| if (std.mem.indexOfScalar(u8, set, @intCast(c)) == null) cc.add(@intCast(c));
+        const breakers = classScan(&cc).breakers;
+        var iter: usize = 0;
+        while (iter < 300) : (iter += 1) {
+            const len = rnd.intRangeAtMost(usize, 0, buf.len);
+            @memset(buf[0..len], 'x');
+            if (len > 0 and iter % 3 != 0) buf[rnd.intRangeLessThan(usize, 0, len)] = set[rnd.intRangeLessThan(usize, 0, set.len)];
+            const input = buf[0..len];
+            const want = std.mem.indexOfAny(u8, input, set) == null;
+            try std.testing.expectEqual(want, holdsNoBreaker(input, &breakers));
         }
     }
 }

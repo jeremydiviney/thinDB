@@ -63,6 +63,11 @@ pub fn regexpReplaceKernel(allocator: Allocator, args: []const ColumnView, out: 
     }
 }
 
+/// Rows whose texts are checked together for what lets a pattern skip a
+/// scan of each one: few enough that their bytes are still in L1 when
+/// the rows are matched.
+const TEXT_CHUNK_ROWS = 64;
+
 /// REGEXP_REPLACE where only the text varies by row: every row's result is
 /// written straight into the output column, and the result is NULL exactly
 /// where the text is.
@@ -78,24 +83,29 @@ fn replaceEachText(allocator: Allocator, a: RegexArgs, re: *const regex.Regex, s
     var last_text: ?[]const u8 = null;
     var last_lo: usize = 0;
     var last_hi: usize = 0;
-    for (0..row_count) |i| {
-        if (text_nulls != null and !a.views[0].isValid(i)) {
+    var lo: usize = 0;
+    while (lo < row_count) : (lo += TEXT_CHUNK_ROWS) {
+        const hi = @min(row_count, lo + TEXT_CHUNK_ROWS);
+        const tail_clear = re.tailClearIn(sv.bytes[sv.offsets[lo]..sv.offsets[hi]]);
+        for (lo..hi) |i| {
+            if (text_nulls != null and !a.views[0].isValid(i)) {
+                try strings.endValue(allocator);
+                continue;
+            }
+            const s = sv.rowBytes(i);
+            if (last_text) |t| if (std.mem.eql(u8, t, s)) {
+                try strings.bytes.ensureUnusedCapacity(allocator, last_hi - last_lo);
+                strings.bytes.appendSliceAssumeCapacity(strings.bytes.items[last_lo..last_hi]);
+                try strings.endValue(allocator);
+                continue;
+            };
+            const start = if (a.views.len > 3) try regexStart(s, a.bigint(3, 0), 1) else 0;
+            last_text = s;
+            last_lo = strings.bytes.items.len;
+            try re.replaceInto(allocator, &strings.bytes, s, template, scratch, start, occurrence, tail_clear);
+            last_hi = strings.bytes.items.len;
             try strings.endValue(allocator);
-            continue;
         }
-        const s = sv.rowBytes(i);
-        if (last_text) |t| if (std.mem.eql(u8, t, s)) {
-            try strings.bytes.ensureUnusedCapacity(allocator, last_hi - last_lo);
-            strings.bytes.appendSliceAssumeCapacity(strings.bytes.items[last_lo..last_hi]);
-            try strings.endValue(allocator);
-            continue;
-        };
-        const start = if (a.views.len > 3) try regexStart(s, a.bigint(3, 0), 1) else 0;
-        last_text = s;
-        last_lo = strings.bytes.items.len;
-        try re.replaceInto(allocator, &strings.bytes, s, template, scratch, start, occurrence);
-        last_hi = strings.bytes.items.len;
-        try strings.endValue(allocator);
     }
     try out.appendValidityRange(allocator, base, text_nulls, row_count);
 }
@@ -2687,5 +2697,54 @@ test "charCount counts UTF-8 characters at every length around the vector width"
         var want: usize = 0;
         for (s) |b| want += @intFromBool(isCharStart(b));
         try testing.expectEqual(want, charCount(s));
+    }
+}
+
+test "regexpReplaceKernel matches a per-row replace across chunks of texts" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const pattern = "^https?://(?:www\\.)?([^/]+)/.*$";
+    const template = "\\1";
+    // Only the first chunk holds a text with a line break, so the later
+    // ones skip their tails and the first does not.
+    const samples = [_][]const u8{ "https://www.a.com/x", "http://b.org/y/z", "ftp://d/e", "http://e.io/", "", "https://c.net/\nq" };
+    const rows = 3 * TEXT_CHUNK_ROWS + 5;
+    var offsets: [rows + 1]u32 = undefined;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    var nulls: [(rows + 7) / 8]u8 = @splat(0xff);
+    var prng = std.Random.DefaultPrng.init(0x7A11_2026);
+    const rnd = prng.random();
+    offsets[0] = 0;
+    for (0..rows) |r| {
+        const choices = if (r < TEXT_CHUNK_ROWS) samples.len else samples.len - 1;
+        try bytes.appendSlice(allocator, samples[rnd.intRangeLessThan(usize, 0, choices)]);
+        offsets[r + 1] = @intCast(bytes.items.len);
+        if (r % 17 == 0) nulls[r / 8] &= ~(@as(u8, 1) << @intCast(r % 8));
+    }
+    const text: ColumnView = .{ .data = .{ .string = .{ .offsets = &offsets, .bytes = bytes.items } }, .nulls = &nulls };
+    const pattern_offsets = [_]u32{ 0, pattern.len };
+    const template_offsets = [_]u32{ 0, template.len };
+    const args = [_]ColumnView{
+        text,
+        .{ .data = .{ .string = .{ .offsets = &pattern_offsets, .bytes = pattern } } },
+        .{ .data = .{ .string = .{ .offsets = &template_offsets, .bytes = template } } },
+    };
+    var out = try ColumnStore.initLike(allocator, text, true);
+    defer out.deinit(allocator);
+    try regexpReplaceKernel(allocator, &args, &out, rows);
+
+    var re = try regex.Regex.compile(allocator, pattern);
+    defer re.deinit();
+    try testing.expect(!re.tailClearIn(bytes.items[0..offsets[TEXT_CHUNK_ROWS]]));
+    try testing.expect(re.tailClearIn(bytes.items[offsets[TEXT_CHUNK_ROWS]..]));
+    var scratch = regex.Scratch.init(allocator);
+    defer scratch.deinit();
+    const got = out.view();
+    for (0..rows) |r| {
+        try testing.expectEqual(text.isValid(r), got.isValid(r));
+        if (!text.isValid(r)) continue;
+        const want = try re.replaceScratch(text.data.string.rowBytes(r), template, &scratch, 0, 0);
+        try testing.expectEqualStrings(want, got.data.string.rowBytes(r));
     }
 }
