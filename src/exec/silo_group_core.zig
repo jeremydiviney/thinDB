@@ -1471,6 +1471,11 @@ const WorkerParts = struct {
     fold_probes: u64 = 0,
     fold_hits: u64 = 0,
     fold_off: bool = false,
+    /// Weighted string-payload layouts: per staged row of the active chunk
+    /// and string column, the routed batch's row holding the best value so
+    /// far (see pendStr), and the staged rows holding one.
+    str_pending: []u32 = &.{},
+    str_touched: std.ArrayListUnmanaged(u32) = .empty,
     worker_index: usize = 0,
     raw_scan_lane: usize = 0,
     scanned_count: u64 = 0,
@@ -1548,6 +1553,8 @@ const WorkerParts = struct {
         self.flat_str_src.deinit(allocator);
         self.raw_active_rows.deinit(allocator);
         if (self.fold_slots.len > 0) allocator.free(self.fold_slots);
+        if (self.str_pending.len > 0) allocator.free(self.str_pending);
+        self.str_touched.deinit(allocator);
         if (self.flat_counts.len > 0) allocator.free(self.flat_counts);
         if (self.flat_offsets.len > 0) allocator.free(self.flat_offsets);
         if (self.flat_next.len > 0) allocator.free(self.flat_next);
@@ -1609,6 +1616,18 @@ const WorkerParts = struct {
         self.fold_probes = 0;
         self.fold_hits = 0;
         self.fold_off = false;
+        // A failed query can leave a batch's pending rows unsettled.
+        @memset(self.str_pending, NO_PENDING);
+        self.str_touched.clearRetainingCapacity();
+    }
+
+    fn ensureStrPending(self: *WorkerParts, allocator: Allocator, chunk_rows: usize, str_columns: usize) !void {
+        try self.str_touched.ensureTotalCapacity(allocator, chunk_rows);
+        if (self.str_pending.len >= chunk_rows * str_columns) return;
+        const grown = try allocator.alloc(u32, chunk_rows * str_columns);
+        @memset(grown, NO_PENDING);
+        if (self.str_pending.len > 0) allocator.free(self.str_pending);
+        self.str_pending = grown;
     }
 };
 
@@ -5196,29 +5215,19 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
 
     // String agg-input columns (string MIN/MAX). Bound once; carried into the
     // active chunk's StrStore per row. Empty for numeric-only queries, so every
-    // append path's `if (str_views.len != 0)` guard is a free no-op there.
-    var str_views_buf: [MAX_GROUP_STR_COLUMNS]StringView = undefined;
-    var str_nulls_buf: [MAX_GROUP_STR_COLUMNS]?[]const u8 = undefined;
-    var str_views: []const StringView = &.{};
-    var str_nulls: []const ?[]const u8 = &.{};
-    // String columns whose values ascend down the batch: an extreme staged
-    // from this batch is already settled against its later rows.
-    var ascending_str: StrColumnMask = 0;
+    // append path's `if (str_inputs.len != 0)` guard is a free no-op there.
+    var str_inputs_buf: [MAX_GROUP_STR_COLUMNS]StrInput = undefined;
+    var str_inputs: []const StrInput = &.{};
     if (layout.has_str_payload) {
         if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
         const ascending_column = if (row_weights) |rw| rw.ascending_column else null;
         for (layout.str_columns, 0..) |sc, i| {
             const ci = batch.columnIndex(sc.source_name) orelse return error.ColumnNotFound;
-            const view = batch.values[ci];
-            str_views_buf[i] = switch (view.data) {
-                .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv,
-                else => return error.TypeMismatch,
-            };
-            str_nulls_buf[i] = view.nulls;
-            if (ascending_column == ci) ascending_str |= @as(StrColumnMask, 1) << @intCast(i);
+            str_inputs_buf[i] = try StrInput.of(batch, ci, layout.aggregates, i);
+            str_inputs_buf[i].ascending = ascending_column == ci and !str_inputs_buf[i].json;
         }
-        str_views = str_views_buf[0..layout.str_columns.len];
-        str_nulls = str_nulls_buf[0..layout.str_columns.len];
+        str_inputs = str_inputs_buf[0..layout.str_columns.len];
+        if (layout.has_weight) try parts.ensureStrPending(shared.allocator, raw_chunk_rows, str_inputs.len);
     }
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
@@ -5264,7 +5273,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     // payload bytes with no validity-lane write. Their weighted forms collapse
     // numeric runs only; string extremes fold in the per-row loop.
     if (row_weights == null and !layout.has_rowref and !keys_nullable and !inputs_nullable and !(layout.has_weight and layout.has_str_payload)) {
-        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_views, str_nulls, raw_chunk_rows, profile)) return;
+        if (try appendBatchRawChunksGenericFast(parts, shared, batch, layout, key_views_buf[0..layout.key_columns.len], payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], weight_specs, str_inputs, raw_chunk_rows, profile)) return;
     }
 
     const rowref_col: []const i64 = if (layout.has_rowref) blk: {
@@ -5279,8 +5288,6 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     var accepted: u64 = 0;
     var probes: u64 = 0;
     var hits: u64 = 0;
-    // Staged rows from here on came from this batch.
-    var batch_first = parts.raw_active_rows.len();
     var r: usize = 0;
     while (r < batch.row_count) {
         var active = &parts.raw_active_rows;
@@ -5299,7 +5306,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
                 appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
-                if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+                if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
                 active.len_rows = idx + 1;
                 accepted += 1;
             }
@@ -5317,8 +5324,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 // A collapsed batch's row stands for `w` equal rows.
                 const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
                 if (idx > 0 and active.keyAt(idx - 1) == key and active.weightAll()[idx - 1] <= std.math.maxInt(u32) - w) {
-                    const settled = if (idx - 1 >= batch_first) ascending_str else 0;
-                    try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, settled, idx - 1, r, w);
+                    weightFoldRow(parts, active, weight_specs, str_inputs, idx - 1, r, w);
                     accepted += w;
                     continue;
                 }
@@ -5326,8 +5332,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                     const held = foldIndexProbe(parts, active, key, idx);
                     probes += 1;
                     if (held < idx and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
-                        const settled = if (held >= batch_first) ascending_str else 0;
-                        try weightFoldRow(active, shared.allocator, layout.aggregates, weight_specs, str_views, str_nulls, settled, held, r, w);
+                        weightFoldRow(parts, active, weight_specs, str_inputs, held, r, w);
                         hits += 1;
                         accepted += w;
                         continue;
@@ -5335,7 +5340,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 }
                 active.weightAll()[idx] = w;
                 weightFoldScaled(active, weight_specs, idx, r, w, true);
-                if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+                if (str_inputs.len != 0) {
+                    for (0..str_inputs.len) |c| active.str.appendNull(str_inputs.len, idx, c);
+                    pendStr(parts, str_inputs, idx, r);
+                }
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
@@ -5345,20 +5353,20 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             active.setKey(idx, key);
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+            if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
+        if (layout.has_weight and str_inputs.len != 0) try settleStrPending(parts, active, shared.allocator, str_inputs);
         // A folding chunk can take rows indefinitely; a string extreme that
         // keeps improving keeps appending bytes, so those bytes also close it.
         const full = active.len() == raw_chunk_rows or
-            (layout.has_weight and str_views.len != 0 and active.str.bytes.items.len >= FOLD_CHUNK_STR_BYTES);
+            (layout.has_weight and str_inputs.len != 0 and active.str.bytes.items.len >= FOLD_CHUNK_STR_BYTES);
         if (full) {
             noteFoldChunk(parts, probes, hits);
             probes = 0;
             hits = 0;
             try publishActiveRawRows(parts, shared, raw_chunk_rows);
-            batch_first = 0;
         }
     }
     parts.fold_probes += probes;
@@ -5463,8 +5471,7 @@ fn appendBatchRawChunksGenericFast(
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
-    str_views: []const StringView,
-    str_nulls: []const ?[]const u8,
+    str_inputs: []const StrInput,
     raw_chunk_rows: usize,
     profile: bool,
 ) !bool {
@@ -5475,7 +5482,7 @@ fn appendBatchRawChunksGenericFast(
                 .bigint => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKey1I64(parts, shared, batch.row_count, k0, payload_bytes, payload_elt, weight_specs, str_inputs, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -5495,7 +5502,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI16I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_inputs, raw_chunk_rows, profile);
             return true;
         }
 
@@ -5513,7 +5520,7 @@ fn appendBatchRawChunksGenericFast(
                 .date => |v| v,
                 else => return false,
             };
-            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_views, str_nulls, raw_chunk_rows, profile);
+            try appendBatchRawChunksGenericKeyI64I32(parts, shared, batch.row_count, k0, k1, payload_bytes, payload_elt, weight_specs, str_inputs, raw_chunk_rows, profile);
             return true;
         }
     }
@@ -5529,8 +5536,7 @@ fn appendBatchRawChunksGenericKey1I64(
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
-    str_views: []const StringView,
-    str_nulls: []const ?[]const u8,
+    str_inputs: []const StrInput,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -5541,7 +5547,7 @@ fn appendBatchRawChunksGenericKey1I64(
         // Decomposable programs: one (key, weight, partials) staged row per
         // source run — the run's inputs reduce in registers via the fold
         // specs. The weight gate guarantees no string payload rides along.
-        std.debug.assert(str_views.len == 0);
+        std.debug.assert(str_inputs.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const keys = active.keyU64All();
@@ -5578,7 +5584,7 @@ fn appendBatchRawChunksGenericKey1I64(
             const idx = active.len();
             keys[idx] = @as(u64, @bitCast(key0[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+            if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -5598,8 +5604,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
-    str_views: []const StringView,
-    str_nulls: []const ?[]const u8,
+    str_inputs: []const StrInput,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -5607,7 +5612,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
-        std.debug.assert(str_views.len == 0);
+        std.debug.assert(str_inputs.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const keys = active.keyU64All();
@@ -5646,7 +5651,7 @@ fn appendBatchRawChunksGenericKeyI16I32(
             keys[idx] = @as(u16, @bitCast(key0[r])) |
                 (@as(u64, @as(u32, @bitCast(key1[r]))) << 16);
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+            if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -5666,8 +5671,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     payload_bytes: []const []const u8,
     payload_elt: []const usize,
     weight_specs: []const WeightFoldSpec,
-    str_views: []const StringView,
-    str_nulls: []const ?[]const u8,
+    str_inputs: []const StrInput,
     raw_chunk_rows: usize,
     profile: bool,
 ) !void {
@@ -5675,7 +5679,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
     var accepted: u64 = 0;
     var r: usize = 0;
     if (parts.raw_active_rows.layout.has_weight) {
-        std.debug.assert(str_views.len == 0);
+        std.debug.assert(str_inputs.len == 0);
         while (r < row_count) {
             var active = &parts.raw_active_rows;
             const key_lo = active.keyU96LoAll();
@@ -5717,7 +5721,7 @@ fn appendBatchRawChunksGenericKeyI64I32(
             key_lo[idx] = @as(u64, @bitCast(key0[r]));
             key_hi[idx] = @as(u32, @bitCast(key1[r]));
             appendGenericPayload(active, payload_bytes, payload_elt, idx, r);
-            if (str_views.len != 0) try appendStrPayload(active, shared.allocator, str_views, str_nulls, idx, r);
+            if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -5850,10 +5854,10 @@ fn noteFoldChunk(parts: *WorkerParts, probes: u64, hits: u64) void {
     if (chunk_hits * 8 < chunk_probes) parts.fold_off = true;
 }
 
-inline fn weightFoldRow(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, specs: []const WeightFoldSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, settled: StrColumnMask, dst: usize, src: usize, w: u32) !void {
+inline fn weightFoldRow(parts: *WorkerParts, active: *RawRows, specs: []const WeightFoldSpec, str_inputs: []const StrInput, dst: usize, src: usize, w: u32) void {
     active.weightAll()[dst] += w;
     weightFoldScaled(active, specs, dst, src, w, false);
-    if (str_views.len != 0) try weightFoldStr(active, allocator, aggregates, str_views, str_nulls, settled, dst, src);
+    if (str_inputs.len != 0) pendStr(parts, str_inputs, dst, src);
 }
 
 // Fold source row `src`, standing for `w` equal rows, into staged row `idx`:
@@ -5876,31 +5880,99 @@ fn weightFoldScaled(active: *RawRows, specs: []const WeightFoldSpec, idx: usize,
     }
 }
 
-/// One bit per string agg-input column.
-const StrColumnMask = @Int(.unsigned, MAX_GROUP_STR_COLUMNS);
+/// A string extreme's input over one batch: its values, or row-group
+/// dictionary codes into `view`, a sorted dictionary (Batch.block_dicts),
+/// whose codes order the rows as their values do.
+const StrInput = struct {
+    view: StringView,
+    codes: ?[]const u32 = null,
+    nulls: ?[]const u8 = null,
+    /// The values strictly ascend row by row.
+    ascending: bool = false,
+    max: bool = false,
+    json: bool = false,
 
-// Fold source row `src`'s string extremes into staged row `dst`. A NULL input
-// changes nothing and a staged NULL takes the first valid value; a replaced
-// value's bytes stay in the chunk's store until the chunk recycles. A
-// `settled` column's staged value came from an earlier row of the same
-// ascending run, so a MIN keeps it and a MAX takes the source unchecked.
-fn weightFoldStr(active: *RawRows, allocator: Allocator, aggregates: []const GroupAggregateSpec, str_views: []const StringView, str_nulls: []const ?[]const u8, settled: StrColumnMask, dst: usize, src: usize) !void {
-    const k = str_views.len;
-    for (aggregates) |agg| {
-        if (!agg.is_string) continue;
-        const c = agg.str_input_index;
-        if (!thindb.storage.column.isValidBit(str_nulls[c], src)) continue;
-        if (!active.str.isNull(k, dst, c)) {
-            const ordered = !agg.is_json and settled & (@as(StrColumnMask, 1) << @intCast(c)) != 0;
-            if (ordered and agg.op == .min) continue;
-            if (!ordered) {
-                const cmp = json_binary.columnOrder(agg.is_json, str_views[c].rowBytes(src), active.str.get(k, dst, c));
-                const is_better = if (agg.op == .min) cmp == .lt else cmp == .gt;
-                if (!is_better) continue;
-            }
+    fn of(batch: thindb.Batch, ci: usize, aggregates: []const GroupAggregateSpec, column: usize) !StrInput {
+        var input: StrInput = .{ .view = undefined, .nulls = batch.values[ci].nulls };
+        for (aggregates) |agg| {
+            if (!agg.is_string or agg.str_input_index != column) continue;
+            input.max = agg.op == .max;
+            input.json = agg.is_json;
         }
-        try active.str.append(allocator, k, dst, c, str_views[c].rowBytes(src));
+        if (batch.block_dicts) |dicts| {
+            if (dicts[ci]) |d| if (d.digests == null and d.codes.len >= batch.row_count) {
+                input.view = d.dict;
+                input.codes = d.codes;
+                return input;
+            };
+        }
+        input.view = switch (batch.values[ci].data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |sv| sv,
+            else => return error.TypeMismatch,
+        };
+        return input;
     }
+
+    inline fn valid(self: StrInput, row: usize) bool {
+        return thindb.storage.column.isValidBit(self.nulls, row);
+    }
+
+    inline fn rowBytes(self: StrInput, row: usize) []const u8 {
+        return self.view.rowBytes(if (self.codes) |codes| codes[row] else row);
+    }
+
+    /// Whether row `row`'s value beats row `held`'s, both of this batch.
+    inline fn beats(self: StrInput, row: usize, held: usize) bool {
+        const order = if (self.codes) |codes|
+            std.math.order(codes[row], codes[held])
+        else if (self.ascending)
+            std.math.order(row, held)
+        else
+            json_binary.columnOrder(self.json, self.rowBytes(row), self.rowBytes(held));
+        return order == if (self.max) std.math.Order.gt else std.math.Order.lt;
+    }
+};
+
+const NO_PENDING: u32 = std.math.maxInt(u32);
+
+// Offer source row `src`'s string extremes to staged row `dst`: each column
+// keeps the batch's best row for it so far, compared within the batch and
+// never copied. A NULL input changes nothing. settleStrPending then folds
+// the winners into the staged values.
+inline fn pendStr(parts: *WorkerParts, inputs: []const StrInput, dst: usize, src: usize) void {
+    const slots = parts.str_pending[dst * inputs.len ..][0..inputs.len];
+    var idle = true;
+    for (slots) |slot| idle = idle and slot == NO_PENDING;
+    var offered = false;
+    for (inputs, slots) |input, *slot| {
+        if (!input.valid(src)) continue;
+        offered = true;
+        if (slot.* == NO_PENDING or input.beats(src, slot.*)) slot.* = @intCast(src);
+    }
+    if (idle and offered) parts.str_touched.appendAssumeCapacity(@intCast(dst));
+}
+
+// Fold each staged row's best value of the batch into its string extremes:
+// one compare and at most one copy per row and column, however many of the
+// batch's rows the row took. A staged NULL takes the value; a replaced
+// value's bytes stay in the chunk's store until the chunk recycles.
+fn settleStrPending(parts: *WorkerParts, active: *RawRows, allocator: Allocator, inputs: []const StrInput) !void {
+    const k = inputs.len;
+    for (parts.str_touched.items) |dst| {
+        const slots = parts.str_pending[dst * k ..][0..k];
+        for (inputs, slots, 0..) |input, *slot, c| {
+            const src = slot.*;
+            if (src == NO_PENDING) continue;
+            slot.* = NO_PENDING;
+            const bytes = input.rowBytes(src);
+            if (!active.str.isNull(k, dst, c)) {
+                const order = json_binary.columnOrder(input.json, bytes, active.str.get(k, dst, c));
+                if (order != if (input.max) std.math.Order.gt else std.math.Order.lt) continue;
+            }
+            try active.str.append(allocator, k, dst, c, bytes);
+        }
+    }
+    parts.str_touched.clearRetainingCapacity();
 }
 
 // Fold source rows [r0, r1) into staged row `idx`: reduce the range in a
@@ -6039,15 +6111,15 @@ fn weightFoldSpan(
 // Append the string agg-input values for source row `src` into the active
 // chunk's variable-length StrStore at staged index `dst`. Key-independent, so
 // every append path (generic + fast key kernels) calls it identically. A no-op
-// for numeric queries (`str_views.len == 0`), so the caller's guard keeps it off
+// for numeric queries (`str_inputs.len == 0`), so the caller's guard keeps it off
 // the hot path entirely.
-inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []const StringView, str_nulls: []const ?[]const u8, dst: usize, src: usize) !void {
-    for (str_views, 0..) |sv, col| {
-        if (!thindb.storage.column.isValidBit(str_nulls[col], src)) {
-            active.str.appendNull(str_views.len, dst, col);
+inline fn appendStrPayload(active: *RawRows, allocator: Allocator, inputs: []const StrInput, dst: usize, src: usize) !void {
+    for (inputs, 0..) |input, col| {
+        if (!input.valid(src)) {
+            active.str.appendNull(inputs.len, dst, col);
             continue;
         }
-        try active.str.append(allocator, str_views.len, dst, col, sv.rowBytes(src));
+        try active.str.append(allocator, inputs.len, dst, col, input.rowBytes(src));
     }
 }
 
@@ -7910,6 +7982,29 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
     defer filter_reads.deinit(allocator);
     if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
     return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items);
+}
+
+/// Marks for row-group dictionary emit (`Batch.block_dicts`) each string
+/// extreme's input that nothing else reads off the batch, so its rows compare
+/// by code (`StrInput`) and only the values that stay staged are copied out
+/// of their dictionaries. Derived columns, a residual filter and the
+/// sketches' row filters read the batch's values, so they keep the bytes.
+fn codeStringExtremes(cfg: RunConfig, scans: []const *Scan) !void {
+    const layout = cfg.group_rows_layout;
+    if (!layout.has_str_payload or cfg.derived.len != 0 or cfg.residual_filter != null or cfg.count_sketch != null) return;
+    if (cfg.filter_expr != null and !cfg.scan_filter) return;
+    for (layout.str_columns) |sc| {
+        const name = sc.source_name;
+        const read_elsewhere = for (layout.key_columns) |k| {
+            if (types_mod.columnNameEql(k.name, name)) break true;
+        } else for (layout.columns) |c| {
+            if (types_mod.columnNameEql(c.source_name, name)) break true;
+        } else nameListed(cfg.hash_key_columns, name) or nameListed(cfg.byte_length_columns, name);
+        if (read_elsewhere) continue;
+        for (scans) |scan| {
+            if (scan.blockDictColumnIndex(name)) |j| try scan.setBlockDictColumn(j);
+        }
+    }
 }
 
 /// Whether a heavy tally's units arrive counted: its lone key is the string
@@ -10705,6 +10800,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         kept = true;
         grid_distinct = evals;
     }
+    if (grid_distinct.len == 0) try codeStringExtremes(cfg, scans[0..n_workers]);
 
     // A heavy tally over keys that don't arrive counted would hash every row.
     if (cfg.count_sketch) |pass| {
