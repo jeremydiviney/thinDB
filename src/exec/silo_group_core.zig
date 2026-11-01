@@ -7987,12 +7987,14 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
 /// Marks for row-group dictionary emit (`Batch.block_dicts`) each string
 /// extreme's input that nothing else reads off the batch, so its rows compare
 /// by code (`StrInput`) and only the values that stay staged are copied out
-/// of their dictionaries. Derived columns, a residual filter and the
-/// sketches' row filters read the batch's values, so they keep the bytes.
+/// of their dictionaries. Derived columns and a residual filter read the
+/// batch's values, so they keep the bytes. A sketch's tally reads no
+/// aggregate input, so it takes neither codes nor values where it can.
 fn codeStringExtremes(cfg: RunConfig, scans: []const *Scan) !void {
     const layout = cfg.group_rows_layout;
-    if (!layout.has_str_payload or cfg.derived.len != 0 or cfg.residual_filter != null or cfg.count_sketch != null) return;
+    if (!layout.has_str_payload or cfg.derived.len != 0 or cfg.residual_filter != null) return;
     if (cfg.filter_expr != null and !cfg.scan_filter) return;
+    const tallies = if (cfg.count_sketch) |pass| pass.tallies() else false;
     for (layout.str_columns) |sc| {
         const name = sc.source_name;
         const read_elsewhere = for (layout.key_columns) |k| {
@@ -8002,7 +8004,9 @@ fn codeStringExtremes(cfg: RunConfig, scans: []const *Scan) !void {
         } else nameListed(cfg.hash_key_columns, name) or nameListed(cfg.byte_length_columns, name);
         if (read_elsewhere) continue;
         for (scans) |scan| {
-            if (scan.blockDictColumnIndex(name)) |j| try scan.setBlockDictColumn(j);
+            const j = scan.blockDictColumnIndex(name) orelse continue;
+            try scan.setBlockDictColumn(j);
+            if (tallies) scan.setBlockDictEntriesOnly(j);
         }
     }
 }
@@ -8872,6 +8876,8 @@ const SketchScratch = struct {
     hashed: []?[]const u128 = &.{},
     lengths: []std.ArrayListUnmanaged(u32) = &.{},
     byte_lengths: []?[]const u32 = &.{},
+    codes: []std.ArrayListUnmanaged(u32) = &.{},
+    block_dicts: []?thindb.exec.BlockDictColumn = &.{},
     /// A collapsed batch's per-staged-column partials, compacted.
     partial_ints: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(i64) = @splat(.empty),
     partial_floats: [MAX_GROUP_PAYLOAD_COLUMNS]std.ArrayListUnmanaged(f64) = @splat(.empty),
@@ -8903,12 +8909,17 @@ const SketchScratch = struct {
         for (self.lengths) |*l| l.deinit(allocator);
         if (self.lengths.len > 0) allocator.free(self.lengths);
         if (self.byte_lengths.len > 0) allocator.free(self.byte_lengths);
+        for (self.codes) |*c| c.deinit(allocator);
+        if (self.codes.len > 0) allocator.free(self.codes);
+        if (self.block_dicts.len > 0) allocator.free(self.block_dicts);
         self.stores = &.{};
         self.views = &.{};
         self.digests = &.{};
         self.hashed = &.{};
         self.lengths = &.{};
         self.byte_lengths = &.{};
+        self.codes = &.{};
+        self.block_dicts = &.{};
     }
 
     /// One store per column of `batch`, typed like its views. A worker's
@@ -8939,12 +8950,19 @@ const SketchScratch = struct {
         errdefer allocator.free(lengths);
         for (lengths) |*l| l.* = .empty;
         const byte_lengths = try allocator.alloc(?[]const u32, n);
+        errdefer allocator.free(byte_lengths);
+        const codes = try allocator.alloc(std.ArrayListUnmanaged(u32), n);
+        errdefer allocator.free(codes);
+        for (codes) |*c| c.* = .empty;
+        const block_dicts = try allocator.alloc(?thindb.exec.BlockDictColumn, n);
         self.stores = stores;
         self.views = views;
         self.digests = digests;
         self.hashed = hashed;
         self.lengths = lengths;
         self.byte_lengths = byte_lengths;
+        self.codes = codes;
+        self.block_dicts = block_dicts;
     }
 
     fn holds(self: *const SketchScratch, batch: thindb.Batch) bool {
@@ -9496,6 +9514,10 @@ fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, 
         scratch.views[ci] = scratch.stores[ci].view();
         scratch.hashed[ci] = null;
         scratch.byte_lengths[ci] = null;
+        scratch.block_dicts[ci] = null;
+        if (batch.block_dicts) |ds| if (ci < ds.len) if (ds[ci]) |d| if (d.codes.len >= batch.row_count) {
+            scratch.block_dicts[ci] = .{ .codes = try keepMasked(u32, allocator, d.codes, mask, kept, &scratch.codes[ci]), .dict = d.dict, .digests = d.digests };
+        };
         // A sidecar can be shorter than `values` (a drive appends derived
         // columns past the scan's).
         if (batch.byte_lengths) |ls| if (ci < ls.len) if (ls[ci]) |lengths| {
@@ -9522,6 +9544,7 @@ fn compactKept(job: SiloGridJob, scratch: *SketchScratch, allocator: Allocator, 
             .row_count = kept,
             .hashed = if (batch.hashed != null) scratch.hashed else null,
             .byte_lengths = if (batch.byte_lengths != null) scratch.byte_lengths else null,
+            .block_dicts = if (batch.block_dicts != null) scratch.block_dicts else null,
         },
         .weights = kept_weights,
         .ids = kept_ids,

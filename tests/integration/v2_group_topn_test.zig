@@ -4217,3 +4217,110 @@ test "V2 string extremes over row-group dictionary codes match a row-by-row fold
         for (cases) |c| try checkStringExtremes(a, db, rows, live, c);
     }
 }
+
+test "V2 COUNT top-K sketch keeps string extremes exact with and without its row sieve" {
+    // The sketch's tally reads no string input. Its filter pass reads the
+    // tally's kept rows through the scan's row sieve, or, where the budget
+    // can't hold the sieve, compacts each batch's kept rows together with
+    // their dictionary codes (`url`) or values (the nullable `ref`).
+    const a = std.testing.allocator;
+    const heavy_groups = 12;
+    const unique_rows = 245_000;
+    const heavy_rows = comptime blk: {
+        var n: usize = 0;
+        for (0..heavy_groups) |g| n += 6000 - 250 * g;
+        break :blk n;
+    };
+    const total = heavy_rows + unique_rows;
+    const Row = struct { id: i64, k: i64, v: i32, url: []const u8, ref: ?[]const u8 };
+    const Expected = struct { count: i64 = 0, kept: i64 = 0, lo_url: []const u8 = "", hi_url: []const u8 = "", kept_hi_url: []const u8 = "", hi_ref: ?[]const u8 = null };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const rows = try a.alloc(Row, total);
+    defer a.free(rows);
+    var expected: [heavy_groups]Expected = @splat(.{});
+    var i: usize = 0;
+    for (0..heavy_groups) |g| {
+        for (0..6000 - 250 * g) |_| {
+            const url = try std.fmt.allocPrint(arena.allocator(), "https://g{d}.example/{d}", .{ g, (i * 13) % 37 });
+            const ref = if (i % 9 == 0) null else try std.fmt.allocPrint(arena.allocator(), "r{d}", .{(i * 7) % 101});
+            const v: i32 = @intCast(i % 7);
+            rows[i] = .{ .id = 0, .k = @intCast(g), .v = v, .url = url, .ref = ref };
+            const e = &expected[g];
+            if (e.count == 0 or std.mem.order(u8, url, e.lo_url) == .lt) e.lo_url = url;
+            if (e.count == 0 or std.mem.order(u8, url, e.hi_url) == .gt) e.hi_url = url;
+            if (ref) |r| if (e.hi_ref == null or std.mem.order(u8, r, e.hi_ref.?) == .gt) {
+                e.hi_ref = r;
+            };
+            if (v != 3) {
+                if (e.kept == 0 or std.mem.order(u8, url, e.kept_hi_url) == .gt) e.kept_hi_url = url;
+                e.kept += 1;
+            }
+            e.count += 1;
+            i += 1;
+        }
+    }
+    for (0..unique_rows) |j| {
+        const url = try std.fmt.allocPrint(arena.allocator(), "https://u.example/{d}", .{j % 50});
+        rows[i] = .{ .id = 0, .k = @intCast(1000 + j), .v = @intCast(i % 7), .url = url, .ref = null };
+        i += 1;
+    }
+    // Ids scatter the heavy rows over the row groups.
+    for (rows, 0..) |*r, n| r.id = @intCast((n * 7919) % total);
+
+    const Run = struct { dop: usize, budget: ?usize };
+    for ([_]Run{ .{ .dop = 1, .budget = null }, .{ .dop = 4, .budget = null }, .{ .dop = 1, .budget = 9 << 20 } }) |run| {
+        errdefer std.debug.print("dop {d}, budget {?d}\n", .{ run.dop, run.budget });
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(a, std.testing.io, tmp.dir, .{ .max_dop = run.dop, .auto_flush_secs = 0, .memory_budget = run.budget });
+        defer db.close();
+        const t = try db.table("skewed_str", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "k", .type = .bigint },
+                .{ .name = "v", .type = .int },
+                .{ .name = "url", .type = .string },
+                .{ .name = "ref", .type = .string, .nullable = true },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+        try t.insert(rows);
+        try t.flush();
+        {
+            const sql = "SELECT k, COUNT(*) AS c, MIN(url), MAX(ref) FROM skewed_str GROUP BY k ORDER BY c DESC LIMIT 10";
+            try expectPlanRunsGroupTopN(a, db, sql);
+            var q = try runSql(a, db, sql);
+            defer q.deinit();
+            var rank: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const e = expected[rank];
+                    try std.testing.expectEqual(@as(i64, @intCast(rank)), batch.values[0].data.bigint[r]);
+                    try std.testing.expectEqual(e.count, batch.values[1].data.bigint[r]);
+                    try std.testing.expectEqualStrings(e.lo_url, batch.values[2].data.string.rowBytes(r));
+                    try std.testing.expectEqualStrings(e.hi_ref.?, batch.values[3].data.string.rowBytes(r));
+                    rank += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 10), rank);
+        }
+        {
+            const sql = "SELECT k, COUNT(*) AS c, MAX(url) FROM skewed_str WHERE v <> 3 GROUP BY k ORDER BY c DESC LIMIT 12";
+            var q = try runSql(a, db, sql);
+            defer q.deinit();
+            var rank: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const e = expected[rank];
+                    try std.testing.expectEqual(@as(i64, @intCast(rank)), batch.values[0].data.bigint[r]);
+                    try std.testing.expectEqual(e.kept, batch.values[1].data.bigint[r]);
+                    try std.testing.expectEqualStrings(e.kept_hi_url, batch.values[2].data.string.rowBytes(r));
+                    rank += 1;
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 12), rank);
+        }
+    }
+}

@@ -1107,10 +1107,10 @@ fn runHarness(
         .byte_length_columns = length_cols_buf[0..n_length_cols],
     };
     // The sketch's counters are u32, and a retried filter pass discards
-    // its rows, so string or per-group-allocated states rule it out.
+    // its rows, so per-group-allocated states rule it out.
     const need = shape.limit + shape.offset;
     if (shape.count_sketch and params.count_sketch and need > 0 and need <= count_topk_sketch.MAX_NEED and
-        snapshotRows(snapshot) <= std.math.maxInt(u32) and !group_rows_layout.has_str_payload and
+        snapshotRows(snapshot) <= std.math.maxInt(u32) and
         !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
         if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, rows)) return;
@@ -1181,7 +1181,7 @@ fn runCountSketch(
     const kth = needthCount(rows.items, need, rank);
     if (sketch.exact(need, found, kth)) return true;
 
-    rows.clearRetainingCapacity();
+    discardRows(allocator, rows);
     if (found < need or !sketch.retarget(kth)) return try groupHeldRows(allocator, table, cpus, grid, held);
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     return true;
@@ -1195,6 +1195,15 @@ fn sketchPasses(grid: SiloCore.RunConfig) SiloCore.RunConfig {
     var cfg = grid;
     cfg.having_bound = null;
     return cfg;
+}
+
+/// Empties `rows` for another pass, freeing the string results its rows
+/// own (see TopRows.deinit).
+fn discardRows(allocator: Allocator, rows: *std.ArrayListUnmanaged(SiloCore.TopRow)) void {
+    for (rows.items) |row| {
+        for (row.str) |s| if (s.len > 0) allocator.free(s);
+    }
+    rows.clearRetainingCapacity();
 }
 
 /// Groups every row by `grid` after a sketch's tally scanned and the sketch
@@ -1251,7 +1260,7 @@ fn runDupSketch(
     filter.count_sketch = .{ .dup_filter = &dups };
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     if (dups.exact(rows.items.len)) return true;
-    rows.clearRetainingCapacity();
+    discardRows(allocator, rows);
     return try groupHeldRows(allocator, table, cpus, grid, held);
 }
 
