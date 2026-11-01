@@ -6053,6 +6053,8 @@ inline fn appendStrPayload(active: *RawRows, allocator: Allocator, str_views: []
 
 fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
     if (shared.serial_fold_scratch) |scratch| return foldActiveRawRows(parts, shared, scratch);
+    const str_bytes = parts.raw_active_rows.str.bytes.items.len;
+    const str_rows = parts.raw_active_rows.len();
     if (shared.raw_scan_queues.len > 0) {
         if (shared.slot_bound) |bound| {
             if (bound.noteStaged(&parts.raw_active_rows)) shared.signalWork(std.math.maxInt(u32));
@@ -6063,6 +6065,18 @@ fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows
         try publishRawRows(shared, parts.worker_index, &parts.raw_active_rows, raw_chunk_rows, &parts.raw_queue_lock_ticks, &parts.raw_recycle_lock_ticks);
     }
     parts.published_chunks += 1;
+    try reserveStrBytes(&parts.raw_active_rows, shared.allocator, str_bytes, str_rows, raw_chunk_rows);
+}
+
+// A chunk's string store grown from empty copies its bytes again at each
+// growth step, which cost Q28's MIN(Referer) ~4% of its time. The next chunk
+// of the same scan takes about as many bytes a row as the last, which may
+// have been cut short at the end of a scan tile, so it starts with room for
+// a full chunk of those and a quarter more.
+fn reserveStrBytes(rows: *RawRows, allocator: Allocator, last_bytes: usize, last_rows: usize, chunk_rows: usize) !void {
+    if (last_bytes == 0) return;
+    const full = last_bytes / last_rows * chunk_rows;
+    try rows.str.bytes.ensureTotalCapacityPrecise(allocator, @min(full + full / 4, FOLD_CHUNK_STR_BYTES));
 }
 
 fn foldActiveRawRows(parts: *WorkerParts, shared: *PipeShared, scratch: *GroupScratch) !void {
