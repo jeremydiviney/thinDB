@@ -797,6 +797,10 @@ pub const Scan = struct {
         /// in place.
         offsets: std.ArrayListUnmanaged(u32) = .empty,
         digests: std.ArrayListUnmanaged(u128) = .empty,
+        /// Which of `digests` hold their entry's digest: all once
+        /// `digests_whole`, else those flagged in `digests_known`.
+        digests_whole: bool = false,
+        digests_known: std.ArrayListUnmanaged(bool) = .empty,
         /// The consumer reads only the dictionary's values when they all
         /// occur, so a whole row group skips decoding its codes.
         entries_only: bool = false,
@@ -820,6 +824,7 @@ pub const Scan = struct {
             self.codes.deinit(allocator);
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
+            self.digests_known.deinit(allocator);
         }
     };
 
@@ -1571,7 +1576,8 @@ pub const Scan = struct {
             const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
             if (hashed) {
                 try buf.digests.resize(self.allocator, db.ndv);
-                for (buf.digests.items, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+                buf.digests_whole = false;
+                buf.digests_known.clearRetainingCapacity();
             } else if (db.offsetsInPlace() == null) {
                 try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
                 for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
@@ -1584,8 +1590,36 @@ pub const Scan = struct {
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
-        if (hashed) return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
+        if (hashed) {
+            try self.digestBlockDict(buf, db, every_value);
+            return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
+        }
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
+    }
+
+    /// Fill the digests of the dictionary entries `buf.codes` reference. A
+    /// batch with fewer codes than the dictionary has entries hashes just the
+    /// entries they name, so a selective filter over a large dictionary
+    /// hashes a few survivors instead of the whole dictionary; any other
+    /// batch hashes every entry, once per held block.
+    fn digestBlockDict(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock, every_value: bool) !void {
+        if (buf.digests_whole) return;
+        const digests = buf.digests.items;
+        const codes = buf.codes.items;
+        if (every_value or codes.len >= db.ndv) {
+            for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            buf.digests_whole = true;
+            return;
+        }
+        if (buf.digests_known.items.len != db.ndv) {
+            try buf.digests_known.resize(self.allocator, db.ndv);
+            @memset(buf.digests_known.items, false);
+        }
+        const known = buf.digests_known.items;
+        for (codes) |c| if (!known[c]) {
+            known[c] = true;
+            digests[c] = exec.stringKeyDigest(db.dictValue(c));
+        };
     }
 
     /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when
@@ -5151,6 +5185,12 @@ pub const Scan = struct {
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
             const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            // Fewer survivors than entries: hashing each survivor's value
+            // costs less than hashing the whole dictionary.
+            if (rows.len < db.ndv) {
+                for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(db.dictValue(db.rowCode(row)));
+                return;
+            }
             const lut = try self.allocator.alloc(u128, db.ndv);
             defer self.allocator.free(lut);
             for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
