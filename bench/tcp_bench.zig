@@ -53,7 +53,7 @@ pub fn benchTcpScan(allocator: Allocator, io: Io, n_rows: usize) !void {
 
     // Seed via the in-process Database — we want to isolate scan-over-TCP
     // cost, not measure insert too.
-    const t = try server.db.table("t", schema, options);
+    const t = try server.db.?.table("t", schema, options);
     const rows = try buildRows(allocator, n_rows);
     defer allocator.free(rows);
     try t.insert(rows);
@@ -105,7 +105,7 @@ pub fn benchTcpInsert(allocator: Allocator, io: Io, n_rows: usize) !void {
     });
     defer server.close();
 
-    _ = try server.db.table("t", schema, options);
+    _ = try server.db.?.table("t", schema, options);
     const rows = try buildRows(allocator, n_rows);
     defer allocator.free(rows);
 
@@ -141,7 +141,7 @@ pub fn benchTcpInsertAndFlush(allocator: Allocator, io: Io, n_rows: usize) !void
     var server = try thindb.serveTcp(allocator, io, dir, addr, .{});
     defer server.close();
 
-    _ = try server.db.table("t", schema, options);
+    _ = try server.db.?.table("t", schema, options);
     const rows = try buildRows(allocator, n_rows);
     defer allocator.free(rows);
 

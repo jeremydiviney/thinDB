@@ -339,7 +339,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
             .bigint => |s| s.len * 8,
             .boolean => |s| s.len,
             .varchar => |sv| sv.offsets.len * 4 + sv.bytes.len,
-            .string, .json => |sv| sv.offsets.len * 4 + sv.bytes.len,
+            .string, .json, .nested, .bitmap => |sv| sv.offsets.len * 4 + sv.bytes.len,
             .float => |s| s.len * 4,
             .double => |s| s.len * 8,
             .date => |s| s.len * 4,
@@ -351,6 +351,7 @@ fn benchFlushPhases(allocator: Allocator, io: Io, n_rows: usize) !void {
             .decimal64 => |s| s.len * 8,
             .decimal128 => |s| s.len * 16,
             .uuid => |s| s.len * 16,
+            .decimal256 => |s| s.len * 32,
         };
     }
 
