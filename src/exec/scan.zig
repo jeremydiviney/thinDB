@@ -944,8 +944,14 @@ pub const Scan = struct {
 
         /// Drop the memtable and tombstone pins (not `segments`).
         pub fn release(self: Snapshot, table: *Table) void {
+            self.releaseWith(table.allocator);
+        }
+
+        /// `release` for a holder that may outlive the table, given the
+        /// table's allocator: the pins themselves outlive it.
+        pub fn releaseWith(self: Snapshot, table_allocator: Allocator) void {
             self.memtable_snap.release();
-            if (self.tomb_epoch) |epoch| SegmentHandles.unpinEpoch(table.allocator, epoch);
+            if (self.tomb_epoch) |epoch| SegmentHandles.unpinEpoch(table_allocator, epoch);
         }
 
         /// The same view with its own pins and, when `allocator` is
@@ -969,12 +975,15 @@ pub const Scan = struct {
         mutex: std.Io.Mutex = .init,
         tables: std.AutoHashMapUnmanaged(u64, Shared) = .empty,
 
-        const Shared = struct { table: *Table, snap: Snapshot };
+        /// The table's allocator rather than the table: the statement may
+        /// free a table it read before it ends, as CREATE OR REPLACE
+        /// MATERIALIZED VIEW does when its query reads the view it replaces.
+        const Shared = struct { table_allocator: Allocator, snap: Snapshot };
 
         pub fn deinit(self: *StatementSnapshots) void {
             var it = self.tables.valueIterator();
             while (it.next()) |shared| {
-                shared.snap.release(shared.table);
+                shared.snap.releaseWith(shared.table_allocator);
                 self.gpa.free(shared.snap.segments);
             }
             self.tables.deinit(self.gpa);
@@ -996,7 +1005,7 @@ pub const Scan = struct {
             }
             try self.tables.ensureUnusedCapacity(self.gpa, 1);
             const snap = try captureLocked(table, self.gpa);
-            self.tables.putAssumeCapacityNoClobber(uid, .{ .table = table, .snap = snap });
+            self.tables.putAssumeCapacityNoClobber(uid, .{ .table_allocator = table.allocator, .snap = snap });
             return snap.copy(allocator);
         }
 
