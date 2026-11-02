@@ -1191,6 +1191,24 @@ fn countCodes(comptime Code: type, comptime lanes: usize, codes: []const u8, row
     }
 }
 
+/// `countCodes`, also leaving in `rows[c]` the last row holding code c.
+fn countEntriesAs(comptime Code: type, comptime lanes: usize, codes: []const u8, row_count: usize, ndv: usize, counts: []u32, rows: []u32) void {
+    const width = @sizeOf(Code);
+    var row: usize = 0;
+    while (row + lanes <= row_count) : (row += lanes) {
+        inline for (0..lanes) |lane| {
+            const c = std.mem.readInt(Code, codes[(row + lane) * width ..][0..width], .little);
+            counts[lane * ndv + c] += 1;
+            rows[c] = @intCast(row + lane);
+        }
+    }
+    while (row < row_count) : (row += 1) {
+        const c = std.mem.readInt(Code, codes[row * width ..][0..width], .little);
+        counts[c] += 1;
+        rows[c] = @intCast(row);
+    }
+}
+
 /// A segment-local string dictionary block's regions, parsed in place over the
 /// decompressed payload (past any validity bitmap). `dict_bytes` holds the `ndv`
 /// distinct values concatenated in sorted order; `offsets_region` is the
@@ -1205,6 +1223,11 @@ pub const DictBlock = struct {
     offsets_region: []const u8,
     dict_bytes: []const u8,
     codes: []const u8,
+    /// Per value, its row count less one and its first row, `stat_width`
+    /// bytes each, when the block stores them (`format.DICT_ENTRY_STATS`).
+    entry_counts: []const u8 = &.{},
+    entry_rows: []const u8 = &.{},
+    stat_width: u8 = 0,
 
     /// Byte slice of distinct value at sorted index `code` (aliases `dict_bytes`).
     pub fn dictValue(self: DictBlock, code: u32) []const u8 {
@@ -1264,6 +1287,73 @@ pub const DictBlock = struct {
             else => for (rows, out) |row, *c| {
                 c.* = self.rowCode(row);
             },
+        }
+    }
+
+    pub fn hasEntryStats(self: DictBlock) bool {
+        return self.stat_width != 0;
+    }
+
+    /// The stored row count of each value into `counts` and its first row
+    /// into `rows`, as `countEntries` counts them, for a block with
+    /// `hasEntryStats`.
+    pub fn entryStatsInto(self: DictBlock, counts: []u32, rows: []u32) void {
+        switch (self.stat_width) {
+            inline 2, 4 => |w| {
+                const T = @Int(.unsigned, @as(u16, w) * 8);
+                for (counts, 0..) |*n, c| n.* = @as(u32, std.mem.readInt(T, self.entry_counts[c * w ..][0..w], .little)) + 1;
+                for (rows, 0..) |*r, c| r.* = std.mem.readInt(T, self.entry_rows[c * w ..][0..w], .little);
+            },
+            else => unreachable,
+        }
+    }
+
+    /// The rows holding the values `pass` flags, from the stored counts, for
+    /// a block with `hasEntryStats`.
+    pub fn rowsPassing(self: DictBlock, pass: []const bool) usize {
+        var rows: usize = 0;
+        switch (self.stat_width) {
+            inline 2, 4 => |w| {
+                const T = @Int(.unsigned, @as(u16, w) * 8);
+                for (pass, 0..) |p, c| {
+                    if (p) rows += @as(usize, std.mem.readInt(T, self.entry_counts[c * w ..][0..w], .little)) + 1;
+                }
+            },
+            else => unreachable,
+        }
+        return rows;
+    }
+
+    /// The counter arrays `countEntries` takes for `row_count` rows: separate
+    /// ones break the chain of increments a repeated code makes, which pays
+    /// where codes repeat often enough to cover the extra arrays.
+    pub fn entryCountLanes(self: DictBlock, row_count: u32) usize {
+        return if (self.code_width <= 2 and 2 * @as(usize, self.ndv) <= row_count) CODE_COUNT_LANES else 1;
+    }
+
+    /// Each code's row count into `counts[0..ndv]`, and into `rows[c]` a row
+    /// holding code c where any does. `counts` holds `entryCountLanes`
+    /// arrays of `ndv` counters, zeroed.
+    pub fn countEntries(self: DictBlock, row_count: u32, counts: []u32, rows: []u32) void {
+        const ndv: usize = self.ndv;
+        const lanes = self.entryCountLanes(row_count);
+        switch (self.code_width) {
+            inline 1, 2 => |w| {
+                const Code = @Int(.unsigned, @as(u16, w) * 8);
+                if (lanes == CODE_COUNT_LANES)
+                    countEntriesAs(Code, CODE_COUNT_LANES, self.codes, row_count, ndv, counts, rows)
+                else
+                    countEntriesAs(Code, 1, self.codes, row_count, ndv, counts, rows);
+            },
+            4 => countEntriesAs(u32, 1, self.codes, row_count, ndv, counts, rows),
+            else => for (0..row_count) |row| {
+                const c = self.rowCode(row);
+                counts[c] += 1;
+                rows[c] = @intCast(row);
+            },
+        }
+        for (1..lanes) |lane| {
+            for (counts[0..ndv], counts[lane * ndv ..][0..ndv]) |*total, count| total.* += count;
         }
     }
 
@@ -1339,13 +1429,22 @@ pub fn dictBlockOf(values: []const u8, row_count: u32) DictBlock {
     const dict_bytes = values[dict_start .. dict_start + dict_byte_count];
     const codes_start = dict_start + dict_byte_count;
     const codes = values[codes_start .. codes_start + @as(usize, row_count) * code_width];
-    return .{
+    var db: DictBlock = .{
         .ndv = ndv,
         .code_width = code_width,
         .offsets_region = offsets_region,
         .dict_bytes = dict_bytes,
         .codes = codes,
     };
+    if (values[5] & format.DICT_ENTRY_STATS != 0) {
+        const w = format.dictEntryStatWidth(row_count);
+        const stats_start = codes_start + codes.len;
+        const len = @as(usize, ndv) * w;
+        db.entry_counts = values[stats_start..][0..len];
+        db.entry_rows = values[stats_start + len ..][0..len];
+        db.stat_width = w;
+    }
+    return db;
 }
 
 /// Decode a dict-encoded string block into an OwnedColumn whose shape is
