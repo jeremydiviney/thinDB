@@ -786,6 +786,7 @@ pub const Scan = struct {
     len_cols_by_j: []bool = &.{},
     n_lengths: usize = 0,
     len_bufs: []std.ArrayListUnmanaged(u32) = &.{},
+    dict_lengths: []DictLengths = &.{},
     length_slots: []?[]const u32 = &.{},
     filtered_lengths: ?[]const ?[]const u32 = null,
     /// RLE run emit (`Batch.runs`): when requested, the unfiltered segment path
@@ -1509,13 +1510,15 @@ pub const Scan = struct {
         if (self.len_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
         @memset(flags, false);
-        const bufs = self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len) catch |e| {
-            self.allocator.free(flags);
-            return e;
-        };
+        errdefer self.allocator.free(flags);
+        const bufs = try self.allocator.alloc(std.ArrayListUnmanaged(u32), self.out_phys.len);
+        errdefer self.allocator.free(bufs);
+        const tables = try self.allocator.alloc(DictLengths, self.out_phys.len);
         for (bufs) |*b| b.* = .empty;
+        for (tables) |*t| t.* = .{};
         self.len_cols_by_j = flags;
         self.len_bufs = bufs;
+        self.dict_lengths = tables;
     }
 
     fn ensureLengthSlots(self: *Scan) ![]?[]const u32 {
@@ -1995,6 +1998,8 @@ pub const Scan = struct {
         if (self.hashed_slots.len > 0) self.allocator.free(self.hashed_slots);
         for (self.len_bufs) |*b| b.deinit(self.allocator);
         if (self.len_bufs.len > 0) self.allocator.free(self.len_bufs);
+        for (self.dict_lengths) |*t| t.lens.deinit(self.allocator);
+        if (self.dict_lengths.len > 0) self.allocator.free(self.dict_lengths);
         if (self.len_cols_by_j.len > 0) self.allocator.free(self.len_cols_by_j);
         if (self.length_slots.len > 0) self.allocator.free(self.length_slots);
         for (self.runs_v_bufs) |*b| b.deinit(self.allocator);
@@ -3172,7 +3177,10 @@ pub const Scan = struct {
         if (block.encoding == .dict) {
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
-            measureDictRows(storage.segment_reader.dictBlockOf(values, rg_count), rows, lens);
+            const db = storage.segment_reader.dictBlockOf(values, rg_count);
+            if (try self.dictLengthTable(seg, rg_idx, j, db, n)) |table| {
+                measureDictRowsByTable(db, table, rows, lens);
+            } else measureDictRows(db, rows, lens);
         } else if (block.encoding == .fsst) {
             const fv = try storage.segment_reader.fsstViewOf(block.bytes, rg_count, flags);
             if (rows) |r| {
@@ -3198,10 +3206,51 @@ pub const Scan = struct {
         return lens;
     }
 
-    /// Each row's length off its dictionary entry's two offsets. No per-entry
-    /// table: the filtered path measures a row group slice by slice, and a
-    /// table rebuilt per slice costs the dictionary's size each time, which
-    /// near-unique blocks make as large as the row group.
+    /// A row group's dictionary entry lengths for length-only column `j`,
+    /// measured once and kept across the slices the filtered path measures
+    /// the row group in. Null until the row group's slices have measured
+    /// enough rows to pay for a pass over the dictionary, and when an entry is
+    /// too long for two bytes; the rows then take their entries' offsets.
+    fn dictLengthTable(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, j: usize, db: storage.segment_reader.DictBlock, n: usize) !?[]const u16 {
+        const t = &self.dict_lengths[j];
+        const segment_id = seg.info.segment_id;
+        if (!t.seen or t.segment_id != segment_id or t.rg_idx != rg_idx) {
+            t.segment_id = segment_id;
+            t.rg_idx = rg_idx;
+            t.seen = true;
+            t.measured = false;
+            t.rows = 0;
+        }
+        if (t.measured) return if (t.fits) t.lens.items else null;
+        t.rows += n;
+        if (db.ndv == 0 or t.rows * DICT_LENGTHS_ENTRIES_PER_ROW < db.ndv) return null;
+        const offs = db.offsetsInPlace() orelse return null;
+        try t.lens.resize(self.allocator, db.ndv);
+        var widest: u32 = 0;
+        for (t.lens.items, offs[0..db.ndv], offs[1..][0..db.ndv]) |*l, lo, hi| {
+            widest |= hi - lo;
+            l.* = @truncate(hi - lo);
+        }
+        t.measured = true;
+        t.fits = widest <= std.math.maxInt(u16);
+        std.debug.print("DLTDBG ndv={d} fits={} rows={d}\n", .{ db.ndv, t.fits, t.rows });
+        return if (t.fits) t.lens.items else null;
+    }
+
+    fn measureDictRowsByTable(db: storage.segment_reader.DictBlock, table: []const u16, rows: ?[]const u32, lens: []u32) void {
+        switch (db.code_width) {
+            inline 1, 2, 4 => |w| if (rows) |r| {
+                for (r, lens) |row, *l| l.* = table[db.rowCodeAs(w, row)];
+            } else {
+                for (lens, 0..) |*l, row| l.* = table[db.rowCodeAs(w, row)];
+            },
+            else => for (lens, 0..) |*l, k| {
+                l.* = table[db.rowCode(if (rows) |r| r[k] else k)];
+            },
+        }
+    }
+
+    /// Each row's length off its dictionary entry's two offsets.
     fn measureDictRows(db: storage.segment_reader.DictBlock, rows: ?[]const u32, lens: []u32) void {
         switch (db.code_width) {
             inline 1, 2, 4 => |w| if (db.offsetsInPlace()) |offs| {
@@ -5581,6 +5630,27 @@ pub const Scan = struct {
             else => unreachable,
         }
     }
+
+    /// One row group's dictionary entry lengths (`dictLengthTable`). Two
+    /// bytes an entry, against the four-byte offset pair each row would
+    /// otherwise read from the block, so a near-unique dictionary's table
+    /// stays in the core's nearer caches while the rows gather from it.
+    const DictLengths = struct {
+        segment_id: u64 = 0,
+        rg_idx: usize = 0,
+        seen: bool = false,
+        measured: bool = false,
+        fits: bool = false,
+        /// Rows the row group's slices measured before the table was built.
+        rows: usize = 0,
+        lens: std.ArrayListUnmanaged(u16) = .empty,
+    };
+
+    // The table is built once a row group's slices have measured a row for
+    // at most this many dictionary entries: a pass over an entry costs a
+    // fraction of a row's gather, but a row group keeping few rows gathers
+    // them directly.
+    const DICT_LENGTHS_ENTRIES_PER_ROW: usize = 4;
 
     const Borrow = struct {
         blocks: []storage.ReadSegment.BorrowedBlock,
