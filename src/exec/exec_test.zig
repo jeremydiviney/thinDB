@@ -5614,6 +5614,114 @@ test "scan: a row group a predicate matched nothing of is skipped on the next sc
     try std.testing.expectEqual(@as(usize, 40), keys.items.len);
 }
 
+/// The `k` values `expr` keeps, and the row groups its scan started from
+/// condition-cache records.
+fn conditionScan(allocator: std.mem.Allocator, t: *api.Table, expr: PredicateExpr, out: *std.ArrayList(i64)) !u64 {
+    out.clearRetainingCapacity();
+    var base = try scan(allocator, t);
+    const scan_op = exec.queryAs(exec.Scan, base).?;
+    var q = try base.filter(expr);
+    defer q.deinit();
+    _ = try drainKeys(allocator, &q, scan_op, out);
+    return scan_op.rgs_condition_hits;
+}
+
+test "scan: an arm's matched rows are kept per row group, and a later scan sharing the arm starts from them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // With the memo off, row groups matching nothing are read too, and
+    // start from their records like the rest.
+    const opened = try openMemoTable(allocator, tmp.dir, false);
+    defer opened.db.close();
+    const t = opened.t;
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    const hit: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%hit%" } };
+
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, .{ .like = .{ .col = "S", .pattern = "%hit%" } }, &keys));
+
+    // An AND starts from its kept arm and evaluates the rest on what is left.
+    const odd: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 10 } } };
+    const odd_and_hit = [_]PredicateExpr{ odd, hit };
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, .{ .@"and" = &odd_and_hit }, &keys));
+    try std.testing.expectEqualSlices(i64, &.{29}, keys.items);
+
+    // Two kept arms intersect.
+    const t_end: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%t" } };
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, t_end, &keys));
+    const hit_and_t = [_]PredicateExpr{ t_end, hit };
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, .{ .@"and" = &hit_and_t }, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+
+    // Only an arm evaluated over every stored row is kept: `s LIKE '%x%'`
+    // after `n = 5` saw only the rows `n = 5` left.
+    const five: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 5 } } };
+    const x: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%x%" } };
+    const five_and_x = [_]PredicateExpr{ five, x };
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, .{ .@"and" = &five_and_x }, &keys));
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, x, &keys));
+    try std.testing.expectEqual(@as(usize, 37), keys.items.len);
+    // The whole AND is kept, though, and a repeat of it in any arm order
+    // starts from that record.
+    const x_and_five = [_]PredicateExpr{ x, five };
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, .{ .@"and" = &x_and_five }, &keys));
+    try std.testing.expectEqual(@as(usize, 0), keys.items.len);
+    // A numeric comparison is not kept: evaluating it costs no more than
+    // reading a record back.
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, five, &keys));
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, five, &keys));
+    try std.testing.expectEqualSlices(i64, &.{9}, keys.items);
+
+    // Records hold stored rows; a delete since is applied on top.
+    try std.testing.expectEqual(@as(usize, 1), try t.delete(.{ .col = "k", .op = .eq, .val = .{ .bigint = 29 } }));
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 30 }, keys.items);
+
+    // Unflushed rows are always evaluated.
+    var more: [1]MemoRow = .{.{ .k = 40, .s = "hit", .n = 0 }};
+    try t.insert(&more);
+    try std.testing.expectEqual(@as(u64, 10), try conditionScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 30, 40 }, keys.items);
+
+    // Compaction writes new segments, which start with no records.
+    try t.compact();
+    try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, hit, &keys));
+    try std.testing.expectEqualSlices(i64, &.{ 9, 30, 40 }, keys.items);
+    try std.testing.expect(try conditionScan(allocator, t, hit, &keys) > 0);
+    try std.testing.expectEqualSlices(i64, &.{ 9, 30, 40 }, keys.items);
+}
+
+test "scan: with the condition cache off no scan keeps or reuses an arm's rows, nor uses the predicate memo" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "s", .type = .{ .varchar = 8 } }, .{ .name = "n", .type = .int } },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 4, .condition_cache = false });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .row_group_size = 4 });
+    var rows: [40]MemoRow = undefined;
+    memoRows(&rows, 0);
+    try t.insert(&rows);
+    try t.flush();
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    const hit: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%hit%" } };
+    for (0..2) |_| {
+        try std.testing.expectEqual(@as(u64, 0), try conditionScan(allocator, t, hit, &keys));
+        try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
+        try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, t, hit, &keys));
+    }
+}
+
 test "scan: with the predicate memo off every scan reads every row group" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

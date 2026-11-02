@@ -385,6 +385,70 @@ pub fn fillMaskRun(mask: []bool, pos: usize, len: usize, value: bool) void {
     }
 }
 
+const PACK_LANES = 64;
+
+/// `mask` one bit per row into `bits` (`(mask.len + 7) / 8` bytes): row `i`
+/// is bit `i % 8` of `bits[i / 8]`, and a last byte's spare bits are zero.
+pub fn packMask(mask: []const bool, bits: []u8) void {
+    std.debug.assert(bits.len == (mask.len + 7) / 8);
+    const bytes: []const u8 = @ptrCast(mask);
+    const zero: @Vector(PACK_LANES, u8) = @splat(0);
+    var i: usize = 0;
+    while (i + PACK_LANES <= bytes.len) : (i += PACK_LANES) {
+        const v: @Vector(PACK_LANES, u8) = bytes[i..][0..PACK_LANES].*;
+        std.mem.writeInt(u64, bits[i / 8 ..][0..8], @bitCast(v != zero), .little);
+    }
+    @memset(bits[i / 8 ..], 0);
+    while (i < bytes.len) : (i += 1) bits[i / 8] |= bytes[i] << @intCast(i % 8);
+}
+
+/// `packMask` undone: `mask[i]` is bit `i % 8` of `bits[i / 8]`.
+pub fn unpackMask(bits: []const u8, mask: []bool) void {
+    std.debug.assert(bits.len == (mask.len + 7) / 8);
+    const out: []u8 = @ptrCast(mask);
+    const byte_of_lane: @Vector(PACK_LANES, i32) = comptime blk: {
+        var lanes_: [PACK_LANES]i32 = undefined;
+        for (&lanes_, 0..) |*l, j| l.* = j / 8;
+        break :blk lanes_;
+    };
+    const bit_of_lane: @Vector(PACK_LANES, u3) = comptime blk: {
+        var lanes_: [PACK_LANES]u3 = undefined;
+        for (&lanes_, 0..) |*l, j| l.* = j % 8;
+        break :blk lanes_;
+    };
+    const ones: @Vector(PACK_LANES, u8) = @splat(1);
+    var i: usize = 0;
+    while (i + PACK_LANES <= out.len) : (i += PACK_LANES) {
+        const word: @Vector(8, u8) = bits[i / 8 ..][0..8].*;
+        const spread = @shuffle(u8, word, undefined, byte_of_lane);
+        out[i..][0..PACK_LANES].* = (spread >> bit_of_lane) & ones;
+    }
+    while (i < out.len) : (i += 1) out[i] = (bits[i / 8] >> @intCast(i % 8)) & 1;
+}
+
+test "simd: unpackMask undoes packMask" {
+    var prng = std.Random.DefaultPrng.init(0x9ac4);
+    const random = prng.random();
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 1000, 4097 }) |len| {
+        const mask = try allocator.alloc(bool, len);
+        defer allocator.free(mask);
+        const back = try allocator.alloc(bool, len);
+        defer allocator.free(back);
+        const bits = try allocator.alloc(u8, (len + 7) / 8);
+        defer allocator.free(bits);
+        for ([_]u32{ 0, 3, 50, 100 }) |percent| {
+            for (mask) |*m| m.* = random.uintLessThan(u32, 100) < percent;
+            @memset(bits, 0xa5);
+            packMask(mask, bits);
+            for (mask, 0..) |m, i| try std.testing.expectEqual(m, (bits[i / 8] >> @intCast(i % 8)) & 1 == 1);
+            if (len % 8 != 0) try std.testing.expectEqual(@as(u8, 0), bits[len / 8] >> @intCast(len % 8));
+            unpackMask(bits, back);
+            try std.testing.expectEqualSlices(bool, mask, back);
+        }
+    }
+}
+
 test "simd: countTrue, maskIndices and fillMaskRun match the scalar loops" {
     var prng = std.Random.DefaultPrng.init(0x3a5c);
     const random = prng.random();

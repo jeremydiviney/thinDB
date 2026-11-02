@@ -218,6 +218,13 @@ pub const Config = struct {
     /// budget; under 4 KiB, 0 included, there is no memo.
     predicate_memo_bytes: ?usize = null,
 
+    /// The condition cache (DESIGN.md §6.4): scans keep, per row group of an
+    /// immutable segment, the stored rows an AND arm of their filter matched,
+    /// in the block cache, and a later scan sharing the arm starts from them.
+    /// Off also turns the predicate memo off, so no scan reuses what an
+    /// earlier statement learned of the data.
+    condition_cache: bool = true,
+
     /// The memory controller itself. Normally null in user-built Configs —
     /// the Catalog creates one from the sizes above at open, with the block
     /// cache under it, and threads the pointer through this field to every
@@ -316,7 +323,7 @@ pub fn memorySizes(config: Config) MemorySizes {
     return .{
         .budget = budget,
         .min_cache = config.min_cache_bytes orelse budget / 10,
-        .predicate_memo = config.predicate_memo_bytes orelse budget / 1024,
+        .predicate_memo = if (!config.condition_cache) 0 else config.predicate_memo_bytes orelse budget / 1024,
     };
 }
 
