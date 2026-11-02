@@ -401,8 +401,8 @@ inline fn read128(v: ValueView, row: usize) u128 {
     };
 }
 
-// String distinct keys are `exec.stringKeyDigest` values (128-bit two-seed
-// Wyhash — the same digest the scan's `Batch.hashed` sidecar carries, so the
+// String distinct keys are `exec.stringKeyDigest` values (keyed XXH3-128 —
+// the same digest the scan's `Batch.hashed` sidecar carries, so the
 // two sources interchange freely). At ~6M distinct values the birthday
 // collision probability against 2^128 is negligible, so the distinct count is
 // exact in practice without storing the string bytes in the set.
@@ -857,11 +857,12 @@ fn distinctDrainMain(job: *DistinctDrainJob) void {
 }
 
 fn distinctDrainRun(job: *DistinctDrainJob) !void {
-    var narrow_spare: NarrowDistinct.Spare = .{};
-    var wide_spare: WideDistinct.Spare = .{};
     for (job.shared) |slot| if (slot) |shared| switch (shared) {
-        .narrow => |set| while (try set.drainNext(&narrow_spare, null)) |_| {},
-        .wide => |set| while (try set.drainNext(&wide_spare, null)) |_| {},
+        inline else => |set| {
+            var spare: @TypeOf(set.*).Spare = .{};
+            defer spare.deinit(set);
+            while (try set.drainNext(&spare, null)) {}
+        },
     };
 }
 

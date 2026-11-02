@@ -913,6 +913,12 @@ pub const DistinctU64Set = struct {
         self.* = undefined;
     }
 
+    pub fn clearRetainingCapacity(self: *DistinctU64Set) void {
+        @memset(self.slots, SENTINEL);
+        self.len = 0;
+        self.has_sentinel = false;
+    }
+
     /// Reserve room for `additional` more keys so no grow fires mid-batch (slot
     /// addresses must stay stable across the caller's prefetch look-ahead).
     /// Allocates lazily on first use from the `empty` state.
@@ -1221,6 +1227,11 @@ pub const DistinctU128Set = struct {
     pub fn deinit(self: *DistinctU128Set, allocator: Allocator) void {
         if (self.slots.len != 0) allocator.free(self.slots);
         self.* = undefined;
+    }
+    pub fn clearRetainingCapacity(self: *DistinctU128Set) void {
+        @memset(self.slots, SENTINEL);
+        self.len = 0;
+        self.has_sentinel = false;
     }
     pub fn ensureFor(self: *DistinctU128Set, allocator: Allocator, additional: usize) !void {
         if (self.slots.len == 0) {
