@@ -4404,3 +4404,124 @@ test "V2 COUNT top-K sketch keeps string extremes exact with and without its row
         }
     }
 }
+
+const CkRow = struct { id: i64, ts: i32, se: i32, ae: i32, ref: []const u8, url: []const u8 };
+
+fn ckText(col: anytype, row: usize) ![]const u8 {
+    return switch (col.data) {
+        .string, .varchar, .char => |sv| sv.rowBytes(row),
+        else => error.TestUnexpectedType,
+    };
+}
+
+test "V2 group-topN: a CASE key choosing among string columns groups by its results' digests" {
+    // Such a key (ClickBench Q39's Src) never materializes while grouping:
+    // its rows carry their results' digests, a result column nothing else
+    // reads arrives as digests, and emit recomputes the key from rowrefs.
+    // The memtable's rows digest their bytes.
+    const allocator = std.testing.allocator;
+    const refs = [_][]const u8{ "", "http://a.example/", "http://b.example/x", "r3", "r4", "r5", "r6" };
+    const urls = [_][]const u8{ "u0", "u1/a/longer/path", "u2", "u3", "u4" };
+    var rows: [6000]CkRow = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{
+        .id = @intCast(i),
+        .ts = @intCast(i % 3),
+        .se = @intCast(i / 5 % 3),
+        .ae = @intCast(i / 11 % 2),
+        .ref = refs[i * 7 / 3 % refs.len],
+        .url = urls[i % urls.len],
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    const t = try db.table("ck", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "ts", .type = .int },
+            .{ .name = "se", .type = .int },
+            .{ .name = "ae", .type = .int },
+            .{ .name = "ref", .type = .string },
+            .{ .name = "url", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+    try t.insert(rows[0..5000]);
+    try t.flush();
+    try t.insert(rows[5000..]);
+
+    const cases = [_]struct { sql: []const u8, src: *const fn (CkRow) []const u8, keep: *const fn (CkRow) bool }{
+        .{
+            .sql = "SELECT ts, se, ae, CASE WHEN (se = 0 AND ae = 0) THEN ref ELSE '' END AS src, url AS dst, COUNT(*) AS c FROM ck WHERE id % 7 <> 3 GROUP BY ts, se, ae, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: CkRow) []const u8 {
+                    return if (r.se == 0 and r.ae == 0) r.ref else "";
+                }
+            }.f,
+            .keep = struct {
+                fn f(r: CkRow) bool {
+                    return @mod(r.id, 7) != 3;
+                }
+            }.f,
+        },
+        .{
+            .sql = "SELECT ts, se, ae, CASE WHEN se = 1 THEN ref WHEN ae = 1 THEN url ELSE 'none' END AS src, url AS dst, COUNT(*) AS c FROM ck GROUP BY ts, se, ae, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: CkRow) []const u8 {
+                    return if (r.se == 1) r.ref else if (r.ae == 1) r.url else "none";
+                }
+            }.f,
+            .keep = struct {
+                fn f(_: CkRow) bool {
+                    return true;
+                }
+            }.f,
+        },
+        .{
+            .sql = "SELECT ts, se, ae, CASE WHEN ref <> 'r4' THEN ref ELSE url END AS src, url AS dst, COUNT(*) AS c FROM ck WHERE id < 5500 GROUP BY ts, se, ae, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: CkRow) []const u8 {
+                    return if (!std.mem.eql(u8, r.ref, "r4")) r.ref else r.url;
+                }
+            }.f,
+            .keep = struct {
+                fn f(r: CkRow) bool {
+                    return r.id < 5500;
+                }
+            }.f,
+        },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("query: {s}\n", .{c.sql});
+        try expectPlanRunsGroupTopN(allocator, db, c.sql);
+        var want: std.StringHashMapUnmanaged(i64) = .empty;
+        defer {
+            var keys = want.keyIterator();
+            while (keys.next()) |k| allocator.free(k.*);
+            want.deinit(allocator);
+        }
+        for (rows) |r| if (c.keep(r)) {
+            const key = try std.fmt.allocPrint(allocator, "{d}|{d}|{d}|{s}|{s}", .{ r.ts, r.se, r.ae, c.src(r), r.url });
+            const slot = try want.getOrPut(allocator, key);
+            if (slot.found_existing) allocator.free(key) else slot.value_ptr.* = 0;
+            slot.value_ptr.* += 1;
+        };
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        var groups: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |row| {
+                var ints: [3]i64 = undefined;
+                for (&ints, 0..) |*v, ci| v.* = @intFromFloat((try cellNumber(batch.values[ci], row)).?);
+                const key = try std.fmt.allocPrint(allocator, "{d}|{d}|{d}|{s}|{s}", .{ ints[0], ints[1], ints[2], try ckText(batch.values[3], row), try ckText(batch.values[4], row) });
+                defer allocator.free(key);
+                errdefer std.debug.print("group: {s}\n", .{key});
+                try std.testing.expectEqual(want.get(key), @as(?i64, @intFromFloat((try cellNumber(batch.values[5], row)).?)));
+                groups += 1;
+            }
+        }
+        try std.testing.expectEqual(want.count(), groups);
+    }
+}
