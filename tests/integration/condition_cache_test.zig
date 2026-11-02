@@ -152,6 +152,132 @@ test "the condition cache answers as a scan with no cache does, through repeats,
     }
 }
 
+/// `slen(s)`: s's length in bytes, counting the rows it is called on.
+const Slen = struct {
+    rows: std.atomic.Value(usize) = .init(0),
+
+    fn kernel(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
+        const self: *Slen = @ptrCast(@alignCast(ctx.user_data.?));
+        _ = self.rows.fetchAdd(count, .monotonic);
+        for (0..count) |i| try out.data.bigint.append(ctx.allocator, @intCast(args[0].data.string.rowBytes(i).len));
+    }
+};
+
+test "a computed filter over a dictionary block computes once per entry, NULL included, or over just the rows left, and answers as row by row" {
+    const allocator = std.testing.allocator;
+    const words = [_][]const u8{ "ab", "Abc", "x", "zzzz", "" };
+    const rows = 12288;
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 4096, .max_dop = dop, .auto_flush_secs = 0, .condition_cache = false });
+        defer db.close();
+        var slen: Slen = .{};
+        try db.registerScalarUdf(.{ .name = "slen", .arg_types = &.{.string}, .return_type = .bigint, .volatility = .immutable, .kernel = Slen.kernel, .user_data = &slen });
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, s STRING NOT NULL, n STRING, u STRING NOT NULL)");
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(allocator);
+        var id: usize = 0;
+        while (id < rows) {
+            sql.clearRetainingCapacity();
+            try sql.appendSlice(allocator, "INSERT INTO t VALUES ");
+            for (0..1024) |b| {
+                if (b > 0) try sql.appendSlice(allocator, ", ");
+                try sql.print(allocator, "({d}, {d}, '{s}', ", .{ id, id % 100, words[id * 7 % words.len] });
+                if (id % 3 == 0) try sql.appendSlice(allocator, "NULL") else try sql.print(allocator, "'{s}'", .{words[id % 4]});
+                try sql.print(allocator, ", 'u{d}')", .{id % 1000});
+                id += 1;
+            }
+            try exec(allocator, db, sql.items);
+        }
+        try (try db.openTable("t", .{})).flush();
+
+        var want: [6]std.ArrayList(i64) = @splat(.empty);
+        defer for (&want) |*w| w.deinit(allocator);
+        for (0..rows) |r| {
+            const s = words[r * 7 % words.len];
+            const n: ?[]const u8 = if (r % 3 == 0) null else words[r % 4];
+            var u_buf: [8]u8 = undefined;
+            const u = try std.fmt.bufPrint(&u_buf, "u{d}", .{r % 1000});
+            const passes = [6]bool{
+                s.len == 2,
+                n == null,
+                n != null and std.ascii.eqlIgnoreCase(n.?, "abc"),
+                n == null or n.?.len > 2,
+                r % 100 == 7 and std.mem.endsWith(u8, u, "07"),
+                std.mem.indexOfScalar(u8, s, 'b') != null or (n != null and std.mem.indexOfScalar(u8, n.?, 'b') != null),
+            };
+            for (passes, &want) |p, *w| if (p) try w.append(allocator, @intCast(r));
+        }
+
+        const cases = [6][]const u8{
+            "SELECT id FROM t WHERE slen(s) = 2 ORDER BY id",
+            "SELECT id FROM t WHERE COALESCE(n, 'nil') = 'nil' ORDER BY id",
+            "SELECT id FROM t WHERE UPPER(n) = 'ABC' ORDER BY id",
+            "SELECT id FROM t WHERE n IS NULL OR LENGTH(n) > 2 ORDER BY id",
+            "SELECT id FROM t WHERE k = 7 AND RIGHT(u, 2) = '07' ORDER BY id",
+            "SELECT id FROM t WHERE CONCAT(s, COALESCE(n, '-')) LIKE '%b%' ORDER BY id",
+        };
+        for (cases, want) |q, w| {
+            const before = slen.rows.load(.monotonic);
+            const got = try collectBigints(allocator, db, q);
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, w.items, got) catch |err| {
+                std.debug.print("dop {d}: {s}\n", .{ dop, q });
+                return err;
+            };
+            // Each row group's dictionary holds five values.
+            if (std.mem.indexOf(u8, q, "slen") != null) try std.testing.expect(slen.rows.load(.monotonic) - before <= 3 * words.len);
+        }
+    }
+}
+
+test "a computed filter over row groups larger than its chunk keeps exactly the rows its expression passes" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5eedc4a1);
+    const random = prng.random();
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 20000, .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        var bucket: Bucket = .{};
+        try bucket.register(db, "bucket3", .immutable);
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, s VARCHAR(8) NOT NULL, u VARCHAR(8) NOT NULL)");
+        try insertRows(allocator, [_]*thindb.Database{db}, random, 0, 45000);
+        try (try db.openTable("t", .{})).flush();
+
+        const ids = try collectBigints(allocator, db, "SELECT id FROM t ORDER BY id");
+        defer allocator.free(ids);
+        const ks = try collectBigints(allocator, db, "SELECT k FROM t ORDER BY id");
+        defer allocator.free(ks);
+        var want_all: std.ArrayList(i64) = .empty;
+        defer want_all.deinit(allocator);
+        var want_low_k: std.ArrayList(i64) = .empty;
+        defer want_low_k.deinit(allocator);
+        for (ids, ks) |id, k| {
+            if (@mod(id, 3) != 1) continue;
+            try want_all.append(allocator, id);
+            if (k < 4) try want_low_k.append(allocator, id);
+        }
+
+        const cases = .{
+            .{ "SELECT id FROM t WHERE bucket3(id) = 1 ORDER BY id", want_all.items },
+            .{ "SELECT id FROM t WHERE bucket3(id) = 1 AND k < 4 ORDER BY id", want_low_k.items },
+        };
+        inline for (cases) |c| {
+            const got = try collectBigints(allocator, db, c[0]);
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, c[1], got) catch |err| {
+                std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });
+                return err;
+            };
+        }
+    }
+}
+
 test "a repeated filter over a computed value reads its verdicts back: an immutable UDF is not called again, a volatile one is" {
     const allocator = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x0b5e55ed);
@@ -171,19 +297,23 @@ test "a repeated filter over a computed value reads its verdicts back: an immuta
         try insertRows(allocator, dbs, random, 0, 2000);
         try (try db.openTable("t", .{})).flush();
 
+        // The first run computes once per row the plain conjuncts leave.
+        const all = "SELECT COUNT(*) FROM t";
         const cases = .{
-            .{ .sql = "SELECT id FROM t WHERE bucket3(k) = 1 ORDER BY id", .probe = &immutable, .repeat_calls = 0 },
-            .{ .sql = "SELECT COUNT(*) FROM t WHERE bucket3(id) = 2 AND s LIKE '%a%'", .probe = &immutable, .repeat_calls = 0 },
-            .{ .sql = "SELECT COUNT(*) FROM t WHERE vbucket3(id) = 2", .probe = &volatile_fn, .repeat_calls = 2000 },
-            .{ .sql = "SELECT k FROM t WHERE bucket3(id) = 1 GROUP BY k ORDER BY k", .probe = &immutable, .repeat_calls = 0 },
-            .{ .sql = "SELECT COUNT(*) FROM t WHERE bucket3(id) = 0 GROUP BY u ORDER BY 1 DESC LIMIT 5", .probe = &immutable, .repeat_calls = 0 },
+            .{ .sql = "SELECT id FROM t WHERE bucket3(k) = 1 ORDER BY id", .probe = &immutable, .reaching = all, .repeat_calls = 0 },
+            .{ .sql = "SELECT COUNT(*) FROM t WHERE bucket3(id) = 2 AND s LIKE '%a%'", .probe = &immutable, .reaching = "SELECT COUNT(*) FROM t WHERE s LIKE '%a%'", .repeat_calls = 0 },
+            .{ .sql = "SELECT COUNT(*) FROM t WHERE vbucket3(id) = 2", .probe = &volatile_fn, .reaching = all, .repeat_calls = 2000 },
+            .{ .sql = "SELECT k FROM t WHERE bucket3(id) = 1 GROUP BY k ORDER BY k", .probe = &immutable, .reaching = all, .repeat_calls = 0 },
+            .{ .sql = "SELECT COUNT(*) FROM t WHERE bucket3(id) = 0 GROUP BY u ORDER BY 1 DESC LIMIT 5", .probe = &immutable, .reaching = all, .repeat_calls = 0 },
         };
         inline for (cases) |c| {
             const before = c.probe.rows.load(.monotonic);
             const first = try collectBigints(allocator, db, c.sql);
             defer allocator.free(first);
             const first_calls = c.probe.rows.load(.monotonic) - before;
-            try std.testing.expect(first_calls > 0);
+            const reaching = try collectBigints(allocator, db, c.reaching);
+            defer allocator.free(reaching);
+            try std.testing.expectEqual(@as(usize, @intCast(reaching[0])), first_calls);
             const second = try collectBigints(allocator, db, c.sql);
             defer allocator.free(second);
             try std.testing.expectEqualSlices(i64, first, second);

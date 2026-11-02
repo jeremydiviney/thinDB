@@ -21,6 +21,7 @@ const ColumnView = storage.ColumnView;
 const engine = @import("../engine/engine.zig");
 const ColumnStore = engine.ColumnStore;
 const transform = @import("../engine/transform.zig");
+const simd = @import("../util/simd.zig");
 
 const exec = @import("exec.zig");
 const Query = exec.Query;
@@ -86,14 +87,41 @@ pub const DerivedFilter = struct {
     /// The computed columns' names and their expressions' digests, which
     /// stand in for the names wherever the filter is digested.
     columns: predicate.ColumnDigests,
-    /// Per input column: the view a row group's rows are read from, filled
-    /// by the scan before each `apply`.
-    input_views: []ColumnView,
+    /// Per input column: where a row group's rows are read from, filled by
+    /// the scan before each `apply`.
+    sources: []Source,
     /// The rows `apply` evaluates, gathered when they are not the whole batch.
     gathered: []ColumnStore,
     gathered_views: []ColumnView,
+    /// How many rows `apply` computes at a time: a row group's worth of
+    /// computed strings at once spills out of L2 and slows every core
+    /// sharing the memory bus, so the rows go in chunks as a scan emits
+    /// its sub-batches (`exec.autoScanBatch`).
+    chunk_rows: usize,
     rows: std.ArrayListUnmanaged(u32) = .empty,
     verdicts: std.ArrayListUnmanaged(bool) = .empty,
+    /// A dictionary block's entries as rows (`applyEntries`), and the
+    /// filter's verdict on each.
+    entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
+    entry_validity: std.ArrayListUnmanaged(u8) = .empty,
+    entry_verdicts: std.ArrayListUnmanaged(bool) = .empty,
+
+    /// Where `apply` reads an input column's rows: a view holding every row
+    /// of the batch, or a row group's encoded block, which yields just the
+    /// rows evaluated, never the whole row group decoded.
+    pub const Source = union(enum) {
+        view: ColumnView,
+        dict: Block,
+        fsst: storage.segment_reader.FsstView,
+        for_: storage.segment_reader.ForView,
+        rle: storage.segment_reader.RleView,
+
+        pub const Block = struct {
+            raw: []const u8,
+            row_count: u32,
+            flags: storage.format.ColumnBlockFlags,
+        };
+    };
 
     /// A filter over `conjuncts`, computing the entries of `derived` they
     /// read, directly or through other entries. Null when it can't stand in
@@ -179,6 +207,8 @@ pub const DerivedFilter = struct {
         const eval_schema = compute.outputSchema();
         var validated = conjuncts;
         try predicate.validateExpr(&validated, eval_schema);
+        var row_bytes: usize = 0;
+        for (eval_schema) |c| row_bytes += exec.memory.estimateColumnBytes(c.type);
 
         const gathered = try allocator.alloc(ColumnStore, phys.len);
         errdefer allocator.free(gathered);
@@ -190,8 +220,8 @@ pub const DerivedFilter = struct {
         }
         const gathered_views = try allocator.alloc(ColumnView, phys.len);
         errdefer allocator.free(gathered_views);
-        const input_views = try allocator.alloc(ColumnView, phys.len);
-        errdefer allocator.free(input_views);
+        const sources = try allocator.alloc(Source, phys.len);
+        errdefer allocator.free(sources);
 
         const self = try allocator.create(DerivedFilter);
         self.* = .{
@@ -203,9 +233,10 @@ pub const DerivedFilter = struct {
             .input_phys = phys,
             .input_schema = input_schema,
             .columns = columns,
-            .input_views = input_views,
+            .sources = sources,
             .gathered = gathered,
             .gathered_views = gathered_views,
+            .chunk_rows = exec.autoScanBatch(@max(row_bytes, 1)),
         };
         return self;
     }
@@ -226,37 +257,137 @@ pub const DerivedFilter = struct {
         allocator.free(self.input_phys);
         allocator.free(self.columns.names);
         allocator.free(self.columns.digests);
-        allocator.free(self.input_views);
+        allocator.free(self.sources);
         for (self.gathered) |*g| g.deinit(allocator);
         allocator.free(self.gathered);
         allocator.free(self.gathered_views);
         self.rows.deinit(allocator);
         self.verdicts.deinit(allocator);
+        self.entry_offsets.deinit(allocator);
+        self.entry_validity.deinit(allocator);
+        self.entry_verdicts.deinit(allocator);
         allocator.destroy(self);
     }
 
     /// Clears the rows of `mask` the filter fails, computing the expressions
-    /// over only the rows it holds set. `input_views` hold the batch's input
+    /// over only the rows it holds set. `sources` hold the batch's input
     /// columns, `mask.len` rows each.
     pub fn apply(self: *DerivedFilter, mask: []bool) !void {
+        const live = simd.countTrue(mask);
+        if (live == 0) return;
+        if (self.sources.len == 1 and self.sources[0] == .dict) {
+            if (try self.applyEntries(self.sources[0].dict, live, mask)) return;
+        }
+        try self.applyRows(mask, live);
+    }
+
+    /// `apply`, computing the expressions row by row over the `live` rows.
+    /// With every row live, the verdicts land straight in `mask`.
+    fn applyRows(self: *DerivedFilter, mask: []bool, live: usize) !void {
         const n = mask.len;
+        const whole = live == n;
         self.rows.clearRetainingCapacity();
-        try self.rows.ensureTotalCapacity(self.allocator, n);
-        for (mask, 0..) |m, r| if (m) self.rows.appendAssumeCapacity(@intCast(r));
-        const k = self.rows.items.len;
-        if (k == 0) return;
-        const batch: Batch = if (k == n) .{ .schema = self.input_schema, .values = self.input_views, .row_count = n } else blk: {
-            for (self.gathered, self.gathered_views, self.input_views) |*g, *gv, v| {
+        if (whole) {
+            try self.rows.ensureTotalCapacity(self.allocator, @min(n, self.chunk_rows));
+        } else {
+            try self.rows.ensureTotalCapacity(self.allocator, live);
+            for (mask, 0..) |m, r| if (m) self.rows.appendAssumeCapacity(@intCast(r));
+            try self.verdicts.resize(self.allocator, live);
+        }
+        const compute = exec.queryAs(Compute, self.compute).?;
+        var off: usize = 0;
+        while (off < live) : (off += self.chunk_rows) {
+            const len = @min(self.chunk_rows, live - off);
+            const rows = if (whole) blk: {
+                self.rows.items.len = len;
+                for (self.rows.items, off..) |*r, i| r.* = @intCast(i);
+                break :blk self.rows.items;
+            } else self.rows.items[off..][0..len];
+            for (self.sources, self.gathered, self.gathered_views) |source, *g, *gv| {
+                if (source == .view and whole) {
+                    gv.* = transform.subViewAligned(source.view, off, len);
+                    continue;
+                }
                 g.clear();
-                try transform.appendByIndices(self.allocator, v, self.rows.items, g);
+                switch (source) {
+                    .view => |v| try transform.appendByIndices(self.allocator, v, rows, g),
+                    .dict => |b| if (whole)
+                        try transform.appendDictRange(self.allocator, b.raw, b.row_count, b.flags, off, len, g)
+                    else
+                        try transform.appendDictRows(self.allocator, b.raw, b.row_count, b.flags, rows, g),
+                    .fsst => |fv| try transform.appendFsstRows(self.allocator, fv, rows, g),
+                    .for_ => |fv| try transform.appendForRows(self.allocator, fv, rows, g),
+                    .rle => |rv| try transform.appendRleRows(self.allocator, rv, rows, g),
+                }
                 gv.* = g.view();
             }
-            break :blk .{ .schema = self.input_schema, .values = self.gathered_views, .row_count = k };
+            const evaluated = try compute.evalBatch(.{ .schema = self.input_schema, .values = self.gathered_views, .row_count = len });
+            const verdicts = if (whole) mask[off..][0..len] else self.verdicts.items[off..][0..len];
+            try predicate.evaluateExprGuided(self.allocator, self.predicate, self.eval_schema, evaluated, verdicts, null);
+        }
+        if (!whole) for (self.rows.items, self.verdicts.items) |r, v| {
+            mask[r] = v;
         };
-        const evaluated = try exec.queryAs(Compute, self.compute).?.evalBatch(batch);
-        try self.verdicts.resize(self.allocator, k);
-        try predicate.evaluateExprGuided(self.allocator, self.predicate, self.eval_schema, evaluated, self.verdicts.items, null);
-        for (self.rows.items, self.verdicts.items) |r, v| mask[r] = v;
+    }
+
+    /// `apply` over a row group whose one input column is a dictionary
+    /// block: the filter runs once per entry, plus once over a NULL when the
+    /// column has them, and each row takes its entry's verdict, so its cost
+    /// follows the distinct values rather than the rows. False, changing
+    /// nothing, when the `live` rows are fewer than the entries.
+    fn applyEntries(self: *DerivedFilter, block: Source.Block, live: usize, mask: []bool) !bool {
+        var nulls: ?[]const u8 = null;
+        var values = block.raw;
+        if (block.flags.has_nulls) {
+            const bm_len = storage.column.bitmapBytes(block.row_count);
+            nulls = block.raw[0..bm_len];
+            values = block.raw[bm_len..];
+        }
+        const db = storage.segment_reader.dictBlockOf(values, block.row_count);
+        const entries = @as(usize, db.ndv) + @intFromBool(nulls != null);
+        if (live < entries) return false;
+
+        try self.entry_offsets.resize(self.allocator, entries + 1);
+        const offsets = self.entry_offsets.items;
+        if (db.offsetsInPlace()) |in_place| {
+            @memcpy(offsets[0 .. db.ndv + 1], in_place);
+        } else for (offsets[0 .. db.ndv + 1], 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+        var validity: ?[]const u8 = null;
+        if (nulls != null) {
+            offsets[entries] = offsets[db.ndv];
+            try self.entry_validity.resize(self.allocator, storage.column.bitmapBytes(entries));
+            @memset(self.entry_validity.items, 0);
+            for (0..db.ndv) |c| storage.column.setValidBit(self.entry_validity.items, c, true);
+            validity = self.entry_validity.items;
+        }
+        const strings: storage.StringView = .{ .offsets = offsets, .bytes = db.dict_bytes };
+        self.sources[0] = .{ .view = .{ .data = switch (self.input_schema[0].type) {
+            .varchar => .{ .varchar = strings },
+            .string => .{ .string = strings },
+            .char => .{ .char = strings },
+            .json => .{ .json = strings },
+            .nested => .{ .nested = strings },
+            .bitmap => .{ .bitmap = strings },
+            else => return false,
+        }, .nulls = validity } };
+        try self.entry_verdicts.resize(self.allocator, entries);
+        const verdicts = self.entry_verdicts.items;
+        @memset(verdicts, true);
+        try self.applyRows(verdicts, entries);
+
+        if (nulls) |bm| {
+            for (mask, 0..) |*m, i| {
+                if (m.*) m.* = if (storage.column.isValidBit(bm, i)) verdicts[db.rowCode(i)] else verdicts[db.ndv];
+            }
+        } else switch (db.code_width) {
+            inline 1, 2, 4 => |w| for (mask, 0..) |*m, i| {
+                if (m.*) m.* = verdicts[db.rowCodeAs(w, i)];
+            },
+            else => for (mask, 0..) |*m, i| {
+                if (m.*) m.* = verdicts[db.rowCode(i)];
+            },
+        }
+        return true;
     }
 };
 

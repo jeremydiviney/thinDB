@@ -821,6 +821,8 @@ pub const Scan = struct {
         /// `digests_whole`, else those flagged in `digests_known`.
         digests_whole: bool = false,
         digests_known: std.ArrayListUnmanaged(bool) = .empty,
+        digests_wanted: std.ArrayListUnmanaged(bool) = .empty,
+        digests_todo: std.ArrayListUnmanaged(u32) = .empty,
         /// The consumer reads only the dictionary's values when they all
         /// occur, so a whole row group skips decoding its codes.
         entries_only: bool = false,
@@ -851,6 +853,8 @@ pub const Scan = struct {
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
             self.digests_known.deinit(allocator);
+            self.digests_wanted.deinit(allocator);
+            self.digests_todo.deinit(allocator);
             self.entry_counts.deinit(allocator);
             self.entry_rows.deinit(allocator);
             self.entry_pass.deinit(allocator);
@@ -1784,16 +1788,16 @@ pub const Scan = struct {
         };
     }
 
-    /// Fill the digests of the dictionary entries `buf.codes` reference. A
-    /// batch with fewer codes than the dictionary has entries hashes just the
-    /// entries they name, so a selective filter over a large dictionary
-    /// hashes a few survivors instead of the whole dictionary; any other
-    /// batch hashes every entry, once per held block.
+    /// Fill the digests of the dictionary entries `buf.codes` reference,
+    /// each once per held block. A filtered batch hashes just the entries
+    /// its codes name, however many rows share them: a filter keeping a few
+    /// of a large dictionary's values hashes those few. Codes outnumbering
+    /// the entries mark theirs first and hash them in dictionary order.
     fn digestBlockDict(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock, every_value: bool) !void {
         if (buf.digests_whole) return;
         const digests = buf.digests.items;
         const codes = buf.codes.items;
-        if (every_value or codes.len >= db.ndv) {
+        if (every_value) {
             for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             buf.digests_whole = true;
             return;
@@ -1803,10 +1807,41 @@ pub const Scan = struct {
             @memset(buf.digests_known.items, false);
         }
         const known = buf.digests_known.items;
-        for (codes) |c| if (!known[c]) {
-            known[c] = true;
+        buf.digests_todo.clearRetainingCapacity();
+        try buf.digests_todo.ensureTotalCapacity(self.allocator, @min(codes.len, db.ndv));
+        if (codes.len < db.ndv) {
+            for (codes) |c| if (!known[c]) {
+                known[c] = true;
+                buf.digests_todo.appendAssumeCapacity(c);
+            };
+        } else {
+            try buf.digests_wanted.resize(self.allocator, db.ndv);
+            const wanted = buf.digests_wanted.items;
+            @memset(wanted, false);
+            for (codes) |c| wanted[c] = true;
+            for (wanted, known, 0..) |w, *k, c| if (w and !k.*) {
+                k.* = true;
+                buf.digests_todo.appendAssumeCapacity(@intCast(c));
+            };
+        }
+        digestEntries(db, buf.digests_todo.items, digests);
+    }
+
+    /// Hash the dictionary entries `todo` names into `digests`, fetching
+    /// each entry's bytes a few entries ahead: a filtered row group's
+    /// entries lie scattered over a dictionary nothing else has read (a
+    /// condition-cache hit evaluates no filter over it), and hashing them
+    /// one memory wait at a time costs several times the hashing itself.
+    fn digestEntries(db: storage.segment_reader.DictBlock, todo: []const u32, digests: []u128) void {
+        const ahead = 8;
+        for (todo, 0..) |c, i| {
+            if (i + ahead < todo.len) {
+                const coming = db.dictValue(todo[i + ahead]);
+                @prefetch(coming.ptr, .{});
+                if (coming.len > 64) @prefetch(coming.ptr + 64, .{});
+            }
             digests[c] = exec.stringKeyDigest(db.dictValue(c));
-        };
+        }
     }
 
     /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when
@@ -5666,10 +5701,13 @@ pub const Scan = struct {
         memtable,
     };
 
-    /// Clear the rows of `mask` the derived filter fails. `eval_views`, when
-    /// the caller holds the rows' views (`out_phys` columns, then
-    /// `filter_phys`), supply the input columns among them that hold their
-    /// values; the others are read here and released before returning.
+    /// Clear the rows of `mask` the derived filter fails. A row group's input
+    /// columns come off their blocks, which yield just the rows the filter
+    /// evaluates (a dictionary block, its entries) rather than the whole row
+    /// group decoded. `eval_views`, when the caller holds the rows' views
+    /// (`out_phys` columns, then `filter_phys`), stand in for the blocks
+    /// other than dictionaries whose values they hold. Every pin is
+    /// released before returning.
     fn applyDerivedFilter(self: *Scan, rows: DerivedRows, eval_views: ?[]const ColumnView, mask: []bool) !void {
         const df = self.derived_filter.?;
         if (std.mem.indexOfScalar(bool, mask, true) == null) return;
@@ -5679,21 +5717,34 @@ pub const Scan = struct {
         var owned: [DerivedFilter.MAX_INPUTS]storage.OwnedColumn = undefined;
         var n_owned: usize = 0;
         defer for (owned[0..n_owned]) |*c| c.deinit(self.allocator);
-        for (df.input_phys, df.input_views) |phys, *view| {
-            if (eval_views) |views| if (self.evalViewIndex(phys)) |i| if (i < views.len and (i >= self.out_phys.len or self.outViewHoldsValues(i))) {
-                view.* = views[i];
-                continue;
-            };
+        for (df.input_phys, df.sources) |phys, *source| {
+            const held: ?ColumnView = if (eval_views) |views| held: {
+                const i = self.evalViewIndex(phys) orelse break :held null;
+                break :held if (i < views.len and (i >= self.out_phys.len or self.outViewHoldsValues(i))) views[i] else null;
+            } else null;
             switch (rows) {
-                .memtable => view.* = self.memtable_snap.columns[phys].view(),
-                .segment => |at| if (try self.borrowColumn(at.seg, at.rg_idx, at.rg_count, phys)) |col| {
-                    blocks[n_blocks] = col.block;
+                .memtable => source.* = .{ .view = held orelse self.memtable_snap.columns[phys].view() },
+                .segment => |at| {
+                    blocks[n_blocks] = try at.seg.borrowColumnBlock(self.allocator, at.rg_idx, phys, self.table.cacheRef());
                     n_blocks += 1;
-                    view.* = col.view;
-                } else {
-                    owned[n_owned] = try at.seg.decodeColumnMaybeCached(self.allocator, self.table.schema, at.rg_idx, phys, self.table.cacheRef());
-                    n_owned += 1;
-                    view.* = owned[n_owned - 1].view();
+                    const block = blocks[n_blocks - 1];
+                    if (block.encoding != .dict) if (held) |v| {
+                        source.* = .{ .view = v };
+                        continue;
+                    };
+                    const column = self.table.schema.columns[phys];
+                    const flags = storage.format.ColumnBlockFlags{ .has_nulls = column.nullable };
+                    source.* = switch (block.encoding) {
+                        .dict => .{ .dict = .{ .raw = block.bytes, .row_count = at.rg_count, .flags = flags } },
+                        .fsst => .{ .fsst = try storage.segment_reader.fsstViewOf(block.bytes, at.rg_count, flags) },
+                        .for_ => .{ .for_ = storage.segment_reader.forViewOf(block.bytes, at.rg_count, flags) },
+                        .rle => .{ .rle = storage.segment_reader.rleViewOf(block.bytes, at.rg_count, flags) },
+                        .raw => .{ .view = storage.segment_reader.viewRawColumn(column.type, block.bytes, at.rg_count, flags, block.encoding) orelse decoded: {
+                            owned[n_owned] = try at.seg.decodeColumnMaybeCached(self.allocator, self.table.schema, at.rg_idx, phys, self.table.cacheRef());
+                            n_owned += 1;
+                            break :decoded owned[n_owned - 1].view();
+                        } },
+                    };
                 },
             }
         }
