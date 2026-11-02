@@ -702,6 +702,10 @@ const WState = struct {
     counts: std.ArrayListUnmanaged(u64) = .empty,
     slots: std.ArrayListUnmanaged(i128) = .empty,
     ns: std.ArrayListUnmanaged(u64) = .empty,
+    // A COUNT(col)/SUM/AVG whose batches have all been NULL-free counts every
+    // row of a group, so its `ns` entries are the group's `counts` and go
+    // unwritten until the first batch with NULLs copies them in.
+    ns_from_counts: [MAX_AGGS]bool = @splat(false),
     // Per distinct aggregate d: `producers[d]` feeds the shared set of an
     // int/float/coded input; a string input's n_distinct × parts sets are
     // `ssets`, indexed [d * parts + partition]. `new_counts[d]` tallies, by
@@ -736,6 +740,10 @@ const WState = struct {
     fn init(allocator: Allocator, scratch_allocator: Allocator, expected_groups: usize, direct: ?DirectRange, aggs: []const AggPlan, shared: []const ?SharedDistinct, dop_parts: usize) !WState {
         var self: WState = .{ .table = try GroupTable.init(allocator, expected_groups) };
         errdefer self.table.deinit(allocator);
+        for (aggs, 0..) |a, i| self.ns_from_counts[i] = switch (a.op) {
+            .count_col, .sum, .avg => true,
+            .count_star, .min, .max, .count_distinct => false,
+        };
         if (direct) |range| {
             self.direct_gids = try scratch_allocator.alloc(u32, range.span);
             @memset(self.direct_gids, group_table.EMPTY);
@@ -974,6 +982,14 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
     const allocator = w.allocator;
     const n_aggs = w.aggs.len;
 
+    // Ahead of `groupRows`, `counts` still holds only the rows earlier
+    // batches counted.
+    for (st.ns_from_counts[0..n_aggs], 0..) |*from_counts, i| {
+        if (!from_counts.* or pair.aggs.values[w.resolved_aggs[i].?].nulls == null) continue;
+        for (st.counts.items, 0..) |c, gid| st.ns.items[gid * n_aggs + i] = c;
+        from_counts.* = false;
+    }
+
     try st.run_gids_scratch.resize(w.scratch_allocator, n);
     try st.ends_scratch.resize(w.scratch_allocator, n + RUN_LANES);
     try st.keys_scratch.resize(w.scratch_allocator, n);
@@ -1000,13 +1016,14 @@ fn foldBatch(w: *Worker, pair: ScanSource.Pair) !void {
         const coded = a.op == .count_distinct and a.distinct_kind == .coded;
         const ci = w.resolved_aggs[i].?;
         const view = if (coded) batch.values[ci] else pair.aggs.values[ci];
+        const count_ns = !st.ns_from_counts[i];
         switch (a.op) {
             .count_star => unreachable,
-            .count_col => foldCountCol(view, run_gids, ends, ns, n_aggs, i),
+            .count_col => if (count_ns) foldCountCol(view, run_gids, ends, ns, n_aggs, i),
             .sum, .avg => if (a.is_float)
-                foldSumFloat(view, run_gids, ends, ns, slots, n_aggs, i)
+                foldSumFloat(view, run_gids, ends, ns, slots, n_aggs, i, count_ns)
             else
-                foldSumInt(view, run_gids, ends, ns, slots, n_aggs, i),
+                foldSumInt(view, run_gids, ends, ns, slots, n_aggs, i, count_ns),
             .min => if (a.is_float)
                 foldExtremeFloat(true, view, run_gids, ends, ns, slots, n_aggs, i)
             else
@@ -1200,10 +1217,15 @@ fn foldCountCol(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: 
     }
 }
 
-fn foldSumInt(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+// A batch with NULLs always counts `ns` (`foldBatch` stops deriving it from
+// `counts` first); `count_ns` matters only to a NULL-free one.
+fn foldSumInt(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize, count_ns: bool) void {
     switch (view.data) {
         inline .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => |s| {
-            if (view.nulls == null) return foldSumIntDense(@TypeOf(s[0]), s, run_gids, ends, ns, slots, stride, agg_i);
+            if (view.nulls == null) return if (count_ns)
+                foldSumIntDense(true, @TypeOf(s[0]), s, run_gids, ends, ns, slots, stride, agg_i)
+            else
+                foldSumIntDense(false, @TypeOf(s[0]), s, run_gids, ends, ns, slots, stride, agg_i);
             var lo: usize = 0;
             for (ends, run_gids) |end, gid| {
                 const hi: usize = end;
@@ -1228,7 +1250,7 @@ fn foldSumInt(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []
 
 // Without NULLs every row counts. A run of values 32 bits wide or less sums
 // in i64: no batch holds the 2^31 rows that could overflow it.
-fn foldSumIntDense(comptime T: type, s: []const T, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldSumIntDense(comptime count_ns: bool, comptime T: type, s: []const T, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
     const Acc = if (@bitSizeOf(T) <= 32) i64 else i128;
     var lo: usize = 0;
     for (ends, run_gids) |end, gid| {
@@ -1236,13 +1258,13 @@ fn foldSumIntDense(comptime T: type, s: []const T, run_gids: []const u32, ends: 
         var acc: Acc = 0;
         for (s[lo..hi]) |v| acc += v;
         const o = @as(usize, gid) * stride + agg_i;
-        ns[o] += hi - lo;
+        if (count_ns) ns[o] += hi - lo;
         slots[o] += acc;
         lo = hi;
     }
 }
 
-fn foldSumFloat(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize) void {
+fn foldSumFloat(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: []u64, slots: []i128, stride: usize, agg_i: usize, count_ns: bool) void {
     switch (view.data) {
         inline .float, .double => |s| {
             var lo: usize = 0;
@@ -1257,7 +1279,7 @@ fn foldSumFloat(view: ColumnView, run_gids: []const u32, ends: []const u32, ns: 
                 }
                 if (cnt != 0) {
                     const o = @as(usize, gid) * stride + agg_i;
-                    ns[o] += cnt;
+                    if (count_ns) ns[o] += cnt;
                     setSlotF64(&slots[o], slotF64(slots[o]) + acc);
                 }
                 lo = hi;
@@ -1940,7 +1962,7 @@ const LowCardGroup = struct {
                 merged.counts.items[mgid] += wst.counts.items[wgid];
                 if (lift_gids) wst.mgid_of[wgid] = mgid;
                 for (self.aggs, 0..) |a, i| {
-                    const w_ns = wst.ns.items[wgid * n_aggs + i];
+                    const w_ns = if (wst.ns_from_counts[i]) wst.counts.items[wgid] else wst.ns.items[wgid * n_aggs + i];
                     if (w_ns == 0) continue;
                     const w_slot = wst.slots.items[wgid * n_aggs + i];
                     const m_ns = &merged.ns.items[@as(usize, mgid) * n_aggs + i];
