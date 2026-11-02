@@ -1918,6 +1918,21 @@ const GroupAllocationProfile = struct {
     table_growths: usize = 0,
 };
 
+/// How a bucket starts: `expected_groups` caps the forecasts its table grows
+/// by, and the table starts sized for `initial_groups`, at the key width the
+/// query's rows need (a fold replaces a table of the wrong width).
+const BucketSizing = struct {
+    expected_groups: usize = 0,
+    initial_groups: usize = 0,
+    wide: bool = false,
+
+    // One batch bounds speculative memory while keeping small tables' page
+    // faults out of the scan/route/group workers' allocation traffic.
+    fn presized(expected_groups: usize, wide: bool) BucketSizing {
+        return .{ .expected_groups = expected_groups, .initial_groups = @min(expected_groups, PIPE_CHUNK_ROWS), .wide = wide };
+    }
+};
+
 const PipeBucket = struct {
     queue_lock: std.atomic.Mutex = .unlocked,
     agg_lock: std.atomic.Mutex = .unlocked,
@@ -1957,13 +1972,17 @@ const PipeBucket = struct {
     row_count: u64 = 0,
 
     fn init(allocator: Allocator, expected_groups: usize) !PipeBucket {
-        // One batch bounds speculative memory while keeping small tables'
-        // page faults out of the scan/route/group workers' allocation traffic.
-        const initial_groups = @min(expected_groups, PIPE_CHUNK_ROWS);
+        return initSized(allocator, BucketSizing.presized(expected_groups, false));
+    }
+
+    fn initSized(allocator: Allocator, sizing: BucketSizing) !PipeBucket {
         return .{
-            .table = .{ .narrow = try GroupTable.init(allocator, initial_groups) },
-            .expected_groups = expected_groups,
-            .states = .{ .reserve_hint = initial_groups },
+            .table = if (sizing.wide)
+                .{ .wide = try WideGroupTable.init(allocator, sizing.initial_groups) }
+            else
+                .{ .narrow = try GroupTable.init(allocator, sizing.initial_groups) },
+            .expected_groups = sizing.expected_groups,
+            .states = .{ .reserve_hint = sizing.initial_groups },
             .str_arena = std.heap.ArenaAllocator.init(allocator),
             .udf_arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -1991,6 +2010,17 @@ const PipeBucket = struct {
         try std.testing.expectEqual(group_table.capacityFor(PIPE_CHUNK_ROWS), bucket.table.slotCount());
         try std.testing.expectEqual(@as(usize, 0), bucket.states.cap);
         try std.testing.expectEqual(@as(u64, 0), bucket.observed_input_rows);
+    }
+
+    test "an unpresized bucket starts at the smallest table of its key width and keeps its forecast cap" {
+        const allocator = std.testing.allocator;
+        inline for (.{ false, true }) |wide| {
+            var bucket = try PipeBucket.initSized(allocator, .{ .expected_groups = 1_000_000, .wide = wide });
+            defer bucket.deinit(allocator);
+            try std.testing.expectEqual(wide, bucket.table == .wide);
+            try std.testing.expectEqual(group_table.capacityFor(0), bucket.table.slotCount());
+            try std.testing.expectEqual(@as(usize, 1_000_000), bucket.expected_groups);
+        }
     }
 
     fn allocation_failure_fixture(allocator: Allocator) !void {
@@ -3162,7 +3192,7 @@ pub const SiloGridWorkspace = struct {
     n_workers: usize = 0,
     bucket_count: usize = 0,
     local_reserve_per_bucket: usize = 0,
-    expected_groups_per_bucket: usize = 0,
+    sizing: BucketSizing = .{},
 
     pub fn ensure(
         self: *SiloGridWorkspace,
@@ -3170,17 +3200,17 @@ pub const SiloGridWorkspace = struct {
         n_workers: usize,
         bucket_count: usize,
         local_reserve_per_bucket: usize,
-        expected_groups_per_bucket: usize,
+        sizing: BucketSizing,
         cpus: []const usize,
         profile: ?*WorkspaceProfile,
     ) !void {
         if (self.parts.len != n_workers or
             self.buckets.len != bucket_count or
             self.local_reserve_per_bucket != local_reserve_per_bucket or
-            self.expected_groups_per_bucket != expected_groups_per_bucket)
+            !std.meta.eql(self.sizing, sizing))
         {
             self.deinit(allocator);
-            try self.initFresh(allocator, n_workers, bucket_count, local_reserve_per_bucket, expected_groups_per_bucket, cpus, profile);
+            try self.initFresh(allocator, n_workers, bucket_count, local_reserve_per_bucket, sizing, cpus, profile);
             return;
         }
         try self.resetParallel(allocator, n_workers, cpus);
@@ -3252,7 +3282,7 @@ pub const SiloGridWorkspace = struct {
         n_workers: usize,
         bucket_count: usize,
         local_reserve_per_bucket: usize,
-        expected_groups_per_bucket: usize,
+        sizing: BucketSizing,
         cpus: []const usize,
         profile: ?*WorkspaceProfile,
     ) !void {
@@ -3283,7 +3313,7 @@ pub const SiloGridWorkspace = struct {
             }
         }
 
-        try initWorkspaceFreshParallel(allocator, parts, buckets, bucket_inited, bucket_count, local_reserve_per_bucket, expected_groups_per_bucket, n_workers, cpus, profile);
+        try initWorkspaceFreshParallel(allocator, parts, buckets, bucket_inited, bucket_count, local_reserve_per_bucket, sizing, n_workers, cpus, profile);
 
         const assign_t0 = if (profile != null) platform.nowTicks() else 0;
         self.* = .{
@@ -3292,7 +3322,7 @@ pub const SiloGridWorkspace = struct {
             .n_workers = n_workers,
             .bucket_count = bucket_count,
             .local_reserve_per_bucket = local_reserve_per_bucket,
-            .expected_groups_per_bucket = expected_groups_per_bucket,
+            .sizing = sizing,
         };
         if (profile) |p| {
             p.setup_assign_ticks = platform.nowTicks() - assign_t0;
@@ -3395,7 +3425,7 @@ const WorkspaceFreshInitJob = struct {
     bucket_inited: []bool,
     bucket_count: usize,
     local_reserve_per_bucket: usize,
-    expected_groups_per_bucket: usize,
+    sizing: BucketSizing,
     worker_index: usize,
     worker_count: usize,
     profile: ?*WorkspaceProfile = null,
@@ -3409,7 +3439,7 @@ fn initWorkspaceFreshParallel(
     bucket_inited: []bool,
     bucket_count: usize,
     local_reserve_per_bucket: usize,
-    expected_groups_per_bucket: usize,
+    sizing: BucketSizing,
     n_workers: usize,
     cpus: []const usize,
     profile: ?*WorkspaceProfile,
@@ -3426,7 +3456,7 @@ fn initWorkspaceFreshParallel(
         const part_ticks = if (profile != null) platform.nowTicks() - part_t0 else 0;
         const bucket_t0 = if (profile != null) platform.nowTicks() else 0;
         for (buckets, 0..) |*bucket, i| {
-            bucket.* = try PipeBucket.init(allocator, expected_groups_per_bucket);
+            bucket.* = try PipeBucket.initSized(allocator, sizing);
             bucket_inited[i] = true;
             try bucket.chunks.ensureTotalCapacity(allocator, 8);
         }
@@ -3457,7 +3487,7 @@ fn initWorkspaceFreshParallel(
             .bucket_inited = bucket_inited,
             .bucket_count = bucket_count,
             .local_reserve_per_bucket = local_reserve_per_bucket,
-            .expected_groups_per_bucket = expected_groups_per_bucket,
+            .sizing = sizing,
             .worker_index = i,
             .worker_count = workers,
             .profile = profile,
@@ -3490,7 +3520,7 @@ fn workspaceFreshInitWorker(job: *WorkspaceFreshInitJob) void {
     const end = (job.worker_index + 1) * bucket_total / job.worker_count;
     var b = start;
     while (b < end) : (b += 1) {
-        job.buckets[b] = PipeBucket.init(job.allocator, job.expected_groups_per_bucket) catch |err| {
+        job.buckets[b] = PipeBucket.initSized(job.allocator, job.sizing) catch |err| {
             job.err = err;
             return;
         };
@@ -10357,7 +10387,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
     const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
-    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null or cfg.residual_filter != null or cfg.computed_where != null));
+    const has_filter = cfg.filter_expr != null or cfg.residual_filter != null or cfg.computed_where != null;
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, has_filter));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
@@ -10411,6 +10442,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         @max(@as(usize, 16), @min(expected_groups_per_bucket, cfg.group_init_cap))
     else
         expected_groups_per_bucket;
+    // A filter's selectivity is unknown until the scan, and presizing every
+    // bucket for the unfiltered bound zeroed ~160 MB for Q21's 677 groups.
+    // Its buckets start empty: the first fold sizes a table by its rows, and
+    // later folds by the observed group density, still capped by the bound.
+    const bucket_sizing: BucketSizing = if (has_filter)
+        .{ .expected_groups = init_groups_per_bucket, .wide = group_rows_layout.key_width == .u128 }
+    else
+        BucketSizing.presized(init_groups_per_bucket, group_rows_layout.key_width == .u128);
 
     const direct_final_local = !use_raw_group and !cfg.force_queue_publish and bucket_count >= n_workers * 8;
     const local_reserve_per_bucket = localReservePerBucket(total, n_workers, bucket_count, chunk_rows, route_block_rows);
@@ -10500,7 +10539,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     var parts: []WorkerParts = undefined;
     var buckets: []PipeBucket = undefined;
     if (cfg.workspace) |workspace| {
-        try workspace.ensure(allocator, n_workers, bucket_count, worker_local_reserve_per_bucket, init_groups_per_bucket, cpus, workspace_profile_ptr);
+        try workspace.ensure(allocator, n_workers, bucket_count, worker_local_reserve_per_bucket, bucket_sizing, cpus, workspace_profile_ptr);
         parts = workspace.parts;
         buckets = workspace.buckets;
         built_parts = parts.len;
@@ -10512,7 +10551,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         buckets = owned_buckets;
         var b: usize = 0;
         while (b < bucket_count) : (b += 1) {
-            buckets[b] = try PipeBucket.init(allocator, init_groups_per_bucket);
+            buckets[b] = try PipeBucket.initSized(allocator, bucket_sizing);
             built_buckets += 1;
             try buckets[b].chunks.ensureTotalCapacity(allocator, 8);
         }
