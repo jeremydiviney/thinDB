@@ -1422,7 +1422,7 @@ test "workspace teardown stops charging the query before its memory is back" {
     try account.retainGate(&gate);
     const allocator = try account.executionAllocator();
     var workspace: SiloCore.SiloGridWorkspace = .{};
-    try workspace.ensure(allocator, 4, 64, 256, 1024, &.{}, null);
+    try workspace.ensure(allocator, 4, 64, 256, .{ .expected_groups = 1024, .initial_groups = 1024 }, &.{}, null);
     try std.testing.expect(account.current_bytes > 0);
 
     _ = scheduleWorkspaceTeardown(allocator, &workspace, 4, &.{}, .{}, "teardown test");
