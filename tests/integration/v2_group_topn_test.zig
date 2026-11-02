@@ -2570,6 +2570,68 @@ test "V2 octet_length reads string lengths without the bytes" {
     }
 }
 
+// The scan measures a dictionary block's rows from a table of two-byte entry
+// lengths; a block holding a longer entry measures from its offsets instead.
+test "V2 octet_length over a dictionary entry longer than 64 KiB" {
+    const allocator = std.testing.allocator;
+    const n_rows = 3000;
+    const long = try allocator.alloc(u8, 70_000);
+    defer allocator.free(long);
+    @memset(long, 'x');
+    const short = [_][]const u8{ "", "a", "bb", "ccc", "dddd", "eeeee" };
+    const Row = struct { id: i64, g: i32, u: []const u8 };
+    const rows = try allocator.alloc(Row, n_rows);
+    defer allocator.free(rows);
+    for (rows, 0..) |*r, i| r.* = .{ .id = @intCast(i), .g = @intCast(i % 3), .u = if (i % 1000 == 7) long else short[i % short.len] };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    const t = try db.table("lng", .{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "g", .type = .int },
+            .{ .name = "u", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = true,
+    }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+    try t.insert(rows);
+    try t.flush();
+
+    const cases = [_]struct { sql: []const u8, keep: *const fn (Row) bool }{
+        .{ .sql = "SELECT SUM(octet_length(u)) AS a, COUNT(*) AS n FROM lng", .keep = struct {
+            fn f(_: Row) bool {
+                return true;
+            }
+        }.f },
+        .{ .sql = "SELECT SUM(octet_length(u)) AS a, COUNT(*) AS n FROM lng WHERE u <> ''", .keep = struct {
+            fn f(r: Row) bool {
+                return r.u.len != 0;
+            }
+        }.f },
+        .{ .sql = "SELECT SUM(octet_length(u)) AS a, COUNT(*) AS n FROM lng WHERE id % 500 = 7", .keep = struct {
+            fn f(r: Row) bool {
+                return @mod(r.id, 500) == 7;
+            }
+        }.f },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("query: {s}\n", .{c.sql});
+        var want = [2]i64{ 0, 0 };
+        for (rows) |r| if (c.keep(r)) {
+            want[0] += @intCast(r.u.len);
+            want[1] += 1;
+        };
+        var q = try runSql(allocator, db, c.sql);
+        defer q.deinit();
+        const batch = (try q.next()).?;
+        try std.testing.expectEqual(@as(usize, 1), batch.row_count);
+        for (want, 0..) |w, ci| try std.testing.expectEqual(@as(?f64, @floatFromInt(w)), try cellNumber(batch.values[ci], 0));
+    }
+}
+
 test "V2 COUNT top-K stays exact when the count sketch drops the small groups" {
     const allocator = std.testing.allocator;
     const heavy_groups = 12;
