@@ -563,6 +563,15 @@ pub const Scan = struct {
     /// Lazily allocated when a row group has rows tombstoned and we need to
     /// materialize a filtered batch. Reused across batches.
     filtered: ?[]ColumnStore = null,
+    /// Per filtered column, whether the batch's column is an empty-string
+    /// placeholder its consumer never reads (it reads the sidecar): the view
+    /// shares `placeholder_offsets` rather than the store writing a row's
+    /// offset apiece. Allocated with `filtered`, cleared as each batch
+    /// starts in `ensureFilteredBuffers`.
+    placeholders: []bool = &.{},
+    /// The zeroed offsets placeholder views share. Views die with their
+    /// batch, so it grows only between batches.
+    placeholder_offsets: []u32 = &.{},
 
     /// Late-mat (`emit_loc`) scratch holding the packed `__rowloc` values for
     /// the memtable batch. Owned; freed in `deinit`.
@@ -1704,7 +1713,7 @@ pub const Scan = struct {
         if (hashed) try self.digestCountedEntries(buf, db, counts);
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
-        try self.fillEmptyStrings(&filtered_cols[0], ndv);
+        try self.markPlaceholder(0, ndv);
         if (self.emit_loc) {
             const locs = try filtered_cols[1].data.bigint.addManyAsSlice(self.allocator, ndv);
             const base = rowloc.packSegment(self.cur_seg_idx, rg_idx, 0);
@@ -1773,7 +1782,7 @@ pub const Scan = struct {
 
     /// The batch `countRowGroup` filled, of its `n` entries.
     fn countedBatch(self: *Scan, n: usize) Batch {
-        for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+        self.viewFiltered(n);
         return .{ .schema = self.out_schema, .values = self.views, .row_count = n, .block_dicts = self.filtered_dicts };
     }
 
@@ -2020,7 +2029,9 @@ pub const Scan = struct {
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);
             self.allocator.free(arr);
+            self.allocator.free(self.placeholders);
         }
+        self.allocator.free(self.placeholder_offsets);
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
         if (self.segs.len > 0) self.allocator.free(@constCast(self.segs));
@@ -2062,7 +2073,13 @@ pub const Scan = struct {
     }
 
     fn ensureFilteredBuffers(self: *Scan) ![]ColumnStore {
-        if (self.filtered) |arr| return arr;
+        if (self.filtered) |arr| {
+            @memset(self.placeholders, false);
+            return arr;
+        }
+        const placeholders = try self.allocator.alloc(bool, self.out_schema.len);
+        errdefer self.allocator.free(placeholders);
+        @memset(placeholders, false);
         const arr = try self.allocator.alloc(ColumnStore, self.out_schema.len);
         errdefer self.allocator.free(arr);
         var inited: usize = 0;
@@ -2072,7 +2089,32 @@ pub const Scan = struct {
             inited += 1;
         }
         self.filtered = arr;
+        self.placeholders = placeholders;
         return arr;
+    }
+
+    /// Make filtered column `j` an empty-string placeholder for the batch's
+    /// `n` rows.
+    fn markPlaceholder(self: *Scan, j: usize, n: usize) !void {
+        if (self.placeholder_offsets.len < n + 1) {
+            const offsets = try self.allocator.alloc(u32, n + 1);
+            @memset(offsets, 0);
+            self.allocator.free(self.placeholder_offsets);
+            self.placeholder_offsets = offsets;
+        }
+        self.placeholders[j] = true;
+    }
+
+    /// Point `views` at the `n`-row batch in `filtered`.
+    fn viewFiltered(self: *Scan, n: usize) void {
+        for (self.filtered.?, self.placeholders, 0..) |c, placeholder, i| {
+            self.views[i] = c.view();
+            if (!placeholder) continue;
+            switch (self.views[i].data) {
+                inline .varchar, .string, .char, .json, .nested, .bitmap => |*sv| sv.offsets = self.placeholder_offsets[0 .. n + 1],
+                else => unreachable,
+            }
+        }
     }
 
     /// True once a WHERE predicate has been fused into this scan (so `next()`
@@ -3659,7 +3701,7 @@ pub const Scan = struct {
             const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             const n = try self.materializeNextSlice(self.cur_segment.?, self.mask_buf[0..self.pending_rg_count]);
             if (exec.prof.enabled) self.scan_materialize_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tm));
-            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            self.viewFiltered(n);
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
         }
 
@@ -3736,7 +3778,7 @@ pub const Scan = struct {
             if (self.coveredRows(this_rg, rg_count)) |record| {
                 const sifted = try self.siftRowGroup(seg, this_rg, rg_count, record);
                 if (sifted == 0) continue;
-                for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+                self.viewFiltered(sifted);
                 return Batch{ .schema = self.out_schema, .values = self.views, .row_count = sifted, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
             }
 
@@ -3746,7 +3788,7 @@ pub const Scan = struct {
             const matched = reused orelse try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             self.noteUnmatched(memo, seg, this_rg);
             if (matched == 0) continue;
-            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            self.viewFiltered(matched);
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
         }
 
@@ -3768,7 +3810,7 @@ pub const Scan = struct {
                 break :blk try self.evalAndCompact(self.filter_eval_views[0 .. oc + self.filter_phys.len], self.filter_eval_schema, oc, n, null, expr, .memtable);
             };
             if (matched == 0) return null;
-            for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+            self.viewFiltered(matched);
             return Batch{ .schema = self.out_schema, .values = self.views, .row_count = matched, .coded = self.filtered_coded, .hashed = self.filtered_hashed, .byte_lengths = self.filtered_lengths, .block_dicts = self.filtered_dicts };
         }
 
@@ -5274,7 +5316,7 @@ pub const Scan = struct {
                 dict_slots.?[j] = (try self.fillBlockDict(seg, rg_idx, phys, j, rg_count, rows)) orelse break :dict;
                 mat_kind = 4;
                 any_dict = true;
-                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                try self.markPlaceholder(j, matched);
                 continue;
             }
 
@@ -5285,7 +5327,7 @@ pub const Scan = struct {
             if (coding and self.coded_dicts_by_j[j] != null) {
                 mat_kind = 1;
                 try self.codeSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
-                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                try self.markPlaceholder(j, matched);
                 slots.?[j] = .{ .codes = self.code_bufs[j].items[0..matched], .dict = self.coded_dicts_by_j[j].? };
                 continue;
             }
@@ -5295,7 +5337,7 @@ pub const Scan = struct {
             if (hashing and self.hash_cols_by_j[j]) {
                 mat_kind = 2;
                 try self.hashSurvivorsFromBlock(seg, rg_idx, phys, j, rg_count, flags, rows);
-                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                try self.markPlaceholder(j, matched);
                 hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
                 any_hashed = true;
                 continue;
@@ -5305,7 +5347,7 @@ pub const Scan = struct {
             if (measuring and self.len_cols_by_j[j]) {
                 mat_kind = 2;
                 length_slots.?[j] = try self.fillByteLengths(seg, rg_idx, phys, j, rg_count, rows);
-                try self.fillEmptyStrings(&filtered_cols[j], matched);
+                try self.markPlaceholder(j, matched);
                 continue;
             }
 
@@ -5570,15 +5612,6 @@ pub const Scan = struct {
                 else => return error.TypeMismatch,
             };
             for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(sv.rowBytes(row));
-        }
-    }
-
-    /// Append `n` empty-string rows to `out` — the placeholder value column for a
-    /// coded group key (downstream reads the sidecar codes, not this column).
-    fn fillEmptyStrings(self: *Scan, out: *ColumnStore, n: usize) !void {
-        switch (out.data) {
-            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| try ss.appendEmpty(self.allocator, n),
-            else => unreachable,
         }
     }
 
@@ -5853,7 +5886,7 @@ pub const Scan = struct {
                     codes[k] = try memo.intern(self.allocator, sv.rowBytes(row));
                     k += 1;
                 };
-                try self.fillEmptyStrings(dst, matched);
+                try self.markPlaceholder(j, matched);
                 slots.?[j] = .{ .codes = codes, .dict = gdict };
                 continue;
             }
@@ -5872,7 +5905,7 @@ pub const Scan = struct {
                     digests[k] = exec.stringKeyDigest(sv.rowBytes(row));
                     k += 1;
                 };
-                try self.fillEmptyStrings(dst, matched);
+                try self.markPlaceholder(j, matched);
                 hash_slots.?[j] = digests;
                 continue;
             }
@@ -5888,7 +5921,7 @@ pub const Scan = struct {
                     lens[k] = @intCast(sv.rowBytes(row).len);
                     k += 1;
                 };
-                try self.fillEmptyStrings(dst, matched);
+                try self.markPlaceholder(j, matched);
                 length_slots.?[j] = lens;
                 continue;
             }
@@ -6257,7 +6290,11 @@ pub const Scan = struct {
             for (arr) |*c| c.deinit(self.allocator);
             self.allocator.free(arr);
             self.filtered = null;
+            self.allocator.free(self.placeholders);
+            self.placeholders = &.{};
         }
+        self.allocator.free(self.placeholder_offsets);
+        self.placeholder_offsets = &.{};
         inline for (.{ &self.mask_buf, &self.mask_buf2, &self.mask_buf3 }) |mask| {
             if (mask.len > 0) self.allocator.free(mask.*);
             mask.* = &.{};
