@@ -324,3 +324,51 @@ test "a repeated filter over a computed value reads its verdicts back: an immuta
         }
     }
 }
+
+test "under a random digest key, string and composite groups, distinct strings and kept filters answer as under the default key" {
+    const allocator = std.testing.allocator;
+    const keyed = queries ++ [_][]const u8{
+        "SELECT COUNT(*) FROM t GROUP BY s ORDER BY 1",
+        "SELECT MIN(id) FROM t GROUP BY s, u ORDER BY 1",
+        "SELECT COUNT(*) FROM t GROUP BY u, k, s ORDER BY 1 DESC LIMIT 20",
+        "SELECT COUNT(DISTINCT s) FROM t",
+        "SELECT COUNT(DISTINCT u) FROM t WHERE k < 5",
+        "SELECT COUNT(*) FROM t GROUP BY REPEAT(s, 80) ORDER BY 1",
+        "SELECT COUNT(DISTINCT REPEAT(u, 80)) FROM t",
+    };
+    var want: [keyed.len][]i64 = undefined;
+    var kept: usize = 0;
+    defer for (want[0..kept]) |w| allocator.free(w);
+    defer thindb.exec.setDigestSeed(0);
+
+    // A key holds for the whole of a database's life, so each key gets its own.
+    for ([_]u64{ 0, 0x9d1e_57a5_3c0f_b7e1 }) |seed| {
+        thindb.exec.setDigestSeed(seed);
+        var prng = std.Random.DefaultPrng.init(0xd16e57);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 64, .max_dop = 4, .auto_flush_secs = 0 });
+        defer db.close();
+        var bucket: Bucket = .{};
+        try bucket.register(db, "bucket3", .immutable);
+        try bucket.register(db, "vbucket3", .@"volatile");
+        try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, s VARCHAR(8) NOT NULL, u VARCHAR(8) NOT NULL)");
+        try insertRows(allocator, [_]*thindb.Database{db}, prng.random(), 0, 3000);
+        try (try db.openTable("t", .{})).flush();
+        try insertRows(allocator, [_]*thindb.Database{db}, prng.random(), 3000, 30);
+
+        for (keyed, 0..) |q, i| for (0..2) |_| {
+            const got = try collectBigints(allocator, db, q);
+            if (kept <= i) {
+                want[i] = got;
+                kept += 1;
+                continue;
+            }
+            defer allocator.free(got);
+            std.testing.expectEqualSlices(i64, want[i], got) catch |err| {
+                std.debug.print("seed {x}: {s}\n", .{ seed, q });
+                return err;
+            };
+        };
+    }
+}

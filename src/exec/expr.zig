@@ -299,7 +299,7 @@ comptime {
 fn nodeDigest(e: Expr, columns: ?*const predicate_mod.ColumnDigests, budget: *usize) ?u128 {
     if (budget.* == 0) return null;
     budget.* -= 1;
-    var d: predicate_mod.Digest = .{ .columns = columns };
+    var d: predicate_mod.Digest = .init(columns);
     d.int(@backingInt(std.meta.activeTag(e)));
     switch (e) {
         .col_ref => |name| d.column(name),

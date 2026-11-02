@@ -1819,17 +1819,48 @@ pub const BlockDictColumn = struct {
 /// batches without a sidecar. The digest (not the raw bytes) is what feeds a
 /// composite key hash, so per-column digests compose across mixed sources.
 pub fn stringKeyDigest(bytes: []const u8) u128 {
-    // One XXH3-128 pass yields both halves; two Wyhash seeds took two passes.
-    // Seed 0 keeps inputs past 240 bytes on the default secret instead of
-    // deriving one per call.
-    return xxh3.hash128(0, bytes);
+    return digest_key.hash128(bytes);
 }
 
 /// `stringKeyDigest` of `k` 16-byte key parts laid end to end, with the
 /// length dispatch resolved at compile time.
 pub fn keyPartsDigest(comptime k: usize, parts: [k]u128) u128 {
-    return xxh3.hash128Parts(0, k, parts);
+    return xxh3.hash128Parts(digest_key.seed, k, parts);
 }
+
+/// The key under every digest that stands in for a value no one compares
+/// byte for byte: `stringKeyDigest`, `keyPartsDigest`, `DigestStream`.
+/// Under a key no client knows, no stored value or query text can be built
+/// to collide with another. No such digest outlives the process, so drawing
+/// a fresh key per process (`setDigestSeed`) leaves stored data unchanged.
+var digest_key: xxh3.Seeded = .init(0);
+
+/// Draws the digest key from `seed`. Call it before any Database opens:
+/// digests taken under two keys never match, and every Database in the
+/// process shares the one key.
+pub fn setDigestSeed(seed: u64) void {
+    digest_key = .init(seed);
+}
+
+/// A 128-bit identity digest taken in pieces, keyed like `stringKeyDigest`:
+/// two XXH3-64 streams under seeds drawn from the digest key.
+pub const DigestStream = struct {
+    lo: std.hash.XxHash3,
+    hi: std.hash.XxHash3,
+
+    pub fn init() DigestStream {
+        return .{ .lo = .init(digest_key.seed), .hi = .init(digest_key.seed ^ 0xC2B2_AE3D_27D4_EB4F) };
+    }
+
+    pub fn update(self: *DigestStream, bytes: []const u8) void {
+        self.lo.update(bytes);
+        self.hi.update(bytes);
+    }
+
+    pub fn final(self: *DigestStream) u128 {
+        return @as(u128, self.hi.final()) << 64 | self.lo.final();
+    }
+};
 
 pub const sort_op = @import("sort.zig");
 pub const Sort = sort_op.Sort;

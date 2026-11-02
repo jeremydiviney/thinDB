@@ -299,7 +299,7 @@ comptime {
 fn nodeDigest(expr: PredicateExpr, columns: ?*const ColumnDigests, budget: *usize) ?u128 {
     if (budget.* == 0) return null;
     budget.* -= 1;
-    var d: Digest = .{ .columns = columns };
+    var d: Digest = .init(columns);
     d.int(@backingInt(std.meta.activeTag(expr)));
     switch (expr) {
         .leaf, .text_as_number => |p| d.leaf(p),
@@ -362,17 +362,19 @@ const ArmSum = struct {
 
 /// The hashing under `digest` and `expr.digest`.
 pub const Digest = struct {
-    lo: std.hash.Wyhash = .init(0x9E37_79B9_7F4A_7C15),
-    hi: std.hash.Wyhash = .init(0xC2B2_AE3D_27D4_EB4F),
-    columns: ?*const ColumnDigests = null,
+    stream: exec.DigestStream,
+    columns: ?*const ColumnDigests,
+
+    pub fn init(columns: ?*const ColumnDigests) Digest {
+        return .{ .stream = .init(), .columns = columns };
+    }
 
     pub fn final(self: *Digest) u128 {
-        return @as(u128, self.hi.final()) << 64 | self.lo.final();
+        return self.stream.final();
     }
 
     fn bytes(self: *Digest, b: []const u8) void {
-        self.lo.update(b);
-        self.hi.update(b);
+        self.stream.update(b);
     }
 
     pub fn int(self: *Digest, v: anytype) void {
