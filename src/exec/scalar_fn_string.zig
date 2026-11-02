@@ -78,6 +78,7 @@ fn replaceEachText(allocator: Allocator, a: RegexArgs, re: *const regex.Regex, s
     const text_nulls = if (a.nullable & 1 != 0) a.views[0].nulls else null;
     const strings = stringStoreOf(out);
     try strings.offsets.ensureUnusedCapacity(allocator, row_count);
+    var prefix = regex.PrefixReplace.init(re, template, a.views.len <= 3 or a.bigint(3, 0) == 1, occurrence);
     // The last computed row's text and where its result sits in `bytes`:
     // adjacent rows often hold the same value.
     var last_text: ?[]const u8 = null;
@@ -99,10 +100,14 @@ fn replaceEachText(allocator: Allocator, a: RegexArgs, re: *const regex.Regex, s
                 try strings.endValue(allocator);
                 continue;
             };
-            const start = if (a.views.len > 3) try regexStart(s, a.bigint(3, 0), 1) else 0;
             last_text = s;
             last_lo = strings.bytes.items.len;
-            try re.replaceInto(allocator, &strings.bytes, s, template, scratch, start, occurrence, tail_clear);
+            if (prefix.on) {
+                try prefix.replace(re, allocator, &strings.bytes, s, template, scratch, tail_clear);
+            } else {
+                const start = if (a.views.len > 3) try regexStart(s, a.bigint(3, 0), 1) else 0;
+                try re.replaceInto(allocator, &strings.bytes, s, template, scratch, start, occurrence, tail_clear);
+            }
             last_hi = strings.bytes.items.len;
             try strings.endValue(allocator);
         }
