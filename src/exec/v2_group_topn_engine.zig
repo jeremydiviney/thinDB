@@ -1037,6 +1037,31 @@ fn runHarness(
         }
     }
 
+    // A string key a CASE derives by choosing among string columns and
+    // literals carries its rows' digests rather than their bytes (see
+    // `exec.Derived.digest_only`), and a column only such keys read, only
+    // as a result, arrives as digests too: neither ever materializes.
+    const marked_derived = if (force_hash) try markDigestKeys(allocator, table, shape, derived, residual_filter) else null;
+    defer if (marked_derived) |m| allocator.free(m);
+    if (marked_derived) |marked| {
+        for (marked) |d| {
+            if (!d.digest_only) continue;
+            const cs = d.expr.case;
+            for (0..cs.branches.len + 1) |b| {
+                const result = if (b < cs.branches.len) cs.branches[b].then else cs.else_branch.?.*;
+                const name = switch (result) {
+                    .col_ref => |name| name,
+                    else => continue,
+                };
+                if (n_hash_keys == hash_key_cols_buf.len) break;
+                if (try digestResultHashes(allocator, shape, marked, residual_filter, hash_key_cols_buf[0..n_hash_keys], name)) {
+                    hash_key_cols_buf[n_hash_keys] = name;
+                    n_hash_keys += 1;
+                }
+            }
+        }
+    }
+
     // Scan-side byte lengths: a column the derived expressions read only
     // through `octet_length` (and no key, aggregate or residual filter
     // reads) arrives as per-row lengths off the cached block, never as bytes.
@@ -1083,7 +1108,7 @@ fn runHarness(
         .raw_batch_chunks = params.raw_batch_chunks,
         .group_rows_layout = group_rows_layout,
         .scan_columns = scan_columns,
-        .derived = derived,
+        .derived = marked_derived orelse derived,
         .udf_registry = udf_registry,
         .resources = resources,
         .filter_expr = filter_expr,
@@ -1325,6 +1350,70 @@ fn needthCount(rows: []const SiloCore.TopRow, need: usize, rank: ?CountRank) u64
 fn rankedCount(row: SiloCore.TopRow, rank: ?CountRank) u64 {
     const r = rank orelse return row.count;
     return r.value(r.ctx, row);
+}
+
+/// `derived` with `digest_only` set on each string key of a hashed layout
+/// that a CASE derives by choosing among string columns and literals
+/// (`compute_op.selectsStrings`) and that nothing reads past its key: no
+/// aggregate, derived column or residual filter. Null when none is; else
+/// owned by the caller.
+fn markDigestKeys(
+    allocator: Allocator,
+    table: *api.Table,
+    shape: Shape,
+    derived: []const exec.Derived,
+    residual_filter: ?exec.PredicateExpr,
+) !?[]exec.Derived {
+    var marked: ?[]exec.Derived = null;
+    errdefer if (marked) |m| allocator.free(m);
+    outer: for (derived, 0..) |d, di| {
+        for (shape.group_key_inputs) |input| {
+            if (types.columnNameEql(input.name, d.name)) break;
+        } else continue;
+        if (types.findColumn(table.schema.columns, d.name) != null) continue;
+        if (!exec.compute_op.selectsStrings(d.expr, table.schema.columns)) continue;
+        for (shape.aggregate_inputs) |ai| {
+            if (types.columnNameEql(ai.source_name, d.name)) continue :outer;
+        }
+        for (shape.string_aggregate_inputs) |si| {
+            if (types.columnNameEql(si.source_name, d.name)) continue :outer;
+        }
+        for (derived) |other| {
+            if (try derivedReadsColumn(allocator, other, d.name)) continue :outer;
+        }
+        if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, d.name)) continue;
+        if (marked == null) marked = try allocator.dupe(exec.Derived, derived);
+        marked.?[di].digest_only = true;
+    }
+    return marked;
+}
+
+/// Whether the scan can send column `name`, a digest-only key's result
+/// (`markDigestKeys`), as key digests: only such keys read it, never in a
+/// condition, and no aggregate or residual filter does.
+fn digestResultHashes(
+    allocator: Allocator,
+    shape: Shape,
+    derived: []const exec.Derived,
+    residual_filter: ?exec.PredicateExpr,
+    hashed: []const []const u8,
+    name: []const u8,
+) !bool {
+    for (hashed) |h| {
+        if (types.columnNameEql(h, name)) return false;
+    }
+    for (shape.aggregate_inputs) |ai| {
+        if (types.columnNameEql(ai.source_name, name)) return false;
+    }
+    for (shape.string_aggregate_inputs) |si| {
+        if (types.columnNameEql(si.source_name, name)) return false;
+    }
+    if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, name)) return false;
+    for (derived) |d| {
+        if (!try derivedReadsColumn(allocator, d, name)) continue;
+        if (!d.digest_only or try exec.compute_op.caseConditionsRead(allocator, d.expr.case, name)) return false;
+    }
+    return true;
 }
 
 fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !bool {

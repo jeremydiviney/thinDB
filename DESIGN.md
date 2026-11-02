@@ -1233,6 +1233,19 @@ nested-shape pool (§3): it is set before any database opens and every
 database shares it. An embedder that leaves it unset keeps seed 0. The
 `XX_HASH3_*` SQL functions keep StarRocks' fixed seeds.
 
+The V2 grouped engine never needs a hashed key's bytes before emit, which
+reads each group's values back from its first row (its rowref) and recomputes
+any derived key there. So a string key column nothing else reads reaches it as
+per-row digests taken off the column's block (`Batch.hashed`): a dictionary
+entry is digested once per row group, not once per row. A key derived as a
+CASE whose every result is a string column or a string literal (Q39's
+`CASE WHEN … THEN Referer ELSE '' END`) is grouped by digest as well
+(`Derived.digest_only`): the Compute picks each row's result digest, from the
+column's digests when it arrives as digests and from its bytes otherwise, and
+emits an empty placeholder column in place of the strings. A result column
+that only such keys read, and never in a condition, then arrives as digests
+too, so neither the column nor the key's strings are ever copied.
+
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the
 query's memory headroom. The price starts from the input's size: its row count
