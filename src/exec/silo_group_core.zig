@@ -10076,6 +10076,9 @@ pub const RunConfig = struct {
     /// The WHERE's conjuncts over `derived` columns, which filter each batch
     /// once the Compute has added them.
     residual_filter: ?thindb.exec.PredicateExpr = null,
+    /// The WHERE's conjuncts over computed columns, which each scan computes
+    /// and filters on itself.
+    computed_where: ?thindb.exec.ComputedWhere = null,
     /// Hints the consumer offered on scan columns, after the filter's own.
     offered_prunes: Scan.OfferedPrunes = .{},
     key_bound: ?thindb.exec.KeyBoundSpec = null,
@@ -10354,7 +10357,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // worker folds one table directly (see PipeShared.serial_fold_scratch).
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
     const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
-    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null or cfg.residual_filter != null));
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, cfg.filter_expr != null or cfg.residual_filter != null or cfg.computed_where != null));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
@@ -10558,7 +10561,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .stage_builders = stage_builders,
         .group_rows_layout = group_rows_layout,
         .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
-        .generic_filter_required = cfg.filter_expr != null,
+        .generic_filter_required = cfg.filter_expr != null or cfg.computed_where != null,
         .residual_filter = cfg.residual_filter,
         .count_sketch = cfg.count_sketch,
         .scan_threads = n_workers,
@@ -10639,6 +10642,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (cfg.scan_filter) {
             if (cfg.filter_expr) |expr| {
                 _ = try applyScanFilterExpr(scans[i], expr);
+            }
+            // The planner offers only conjuncts `DerivedFilter.accepts`.
+            if (cfg.computed_where) |cw| {
+                if (!try scans[i].tryFuseDerivedFilter(cw.predicate, cw.derived, cfg.udf_registry)) return error.UnsupportedOperatorForType;
             }
         }
         _ = try cfg.offered_prunes.apply(scans[i]);

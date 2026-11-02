@@ -270,6 +270,82 @@ pub fn eql(a: Expr, b: Expr) bool {
     };
 }
 
+/// A 128-bit digest of `e`, equal for two expressions that compute the same
+/// values from the same columns: names hash case-folded, literals by value,
+/// and the columns `columns` names as the digests it holds for them. Null
+/// when `e` holds a node whose values this cannot pin down: a subquery, a
+/// variable, a lambda (its parameters read as columns), a NULL of a nested
+/// type, or a CASE with more operands than it tracks. Whether each function
+/// it calls answers the same for the same arguments in every statement is
+/// the caller's to check (`compute.immutable`).
+pub fn digest(e: Expr, columns: ?*const predicate_mod.ColumnDigests) ?u128 {
+    var budget: usize = digest_budget;
+    return nodeDigest(e, columns, &budget);
+}
+
+const digest_budget = 4096;
+const DIGEST_MAX_CASE_OPERANDS = 16;
+
+// `digest` hashes every field of these. A field it skipped could let two
+// expressions that compute different values share one digest, so a new
+// field stops the build until the digest takes it in.
+comptime {
+    for (.{ .{ Expr.Call, 3 }, .{ Expr.Case, 3 }, .{ Expr.Branch, 2 }, .{ Expr.Operand, 2 }, .{ types.DecimalSpec, 2 } }) |known| {
+        if (@typeInfo(known[0]).@"struct".field_names.len != known[1])
+            @compileError(@typeName(known[0]) ++ " changed: hash the new field in expr.digest, then update its count here");
+    }
+}
+
+fn nodeDigest(e: Expr, columns: ?*const predicate_mod.ColumnDigests, budget: *usize) ?u128 {
+    if (budget.* == 0) return null;
+    budget.* -= 1;
+    var d: predicate_mod.Digest = .{ .columns = columns };
+    d.int(@backingInt(std.meta.activeTag(e)));
+    switch (e) {
+        .col_ref => |name| d.column(name),
+        .lit => |v| d.value(v),
+        .null_lit => |t| {
+            d.int(@backingInt(std.meta.activeTag(t)));
+            switch (t) {
+                .varchar, .char => |len| d.int(len),
+                .decimal64, .decimal128, .decimal256 => |spec| {
+                    d.int(spec.p);
+                    d.int(spec.s);
+                },
+                .nested => return null,
+                else => {},
+            }
+        },
+        .call => |c| {
+            d.foldedName(c.fn_name);
+            d.int(@intFromBool(c.from_statement));
+            d.int(@as(u64, c.args.len));
+            for (c.args) |a| d.int(nodeDigest(a, columns, budget) orelse return null);
+        },
+        .case => |cs| {
+            // The conditions read the operands by the CASE's own names, so
+            // those hash as the operands' expressions.
+            if (cs.operands.len > DIGEST_MAX_CASE_OPERANDS) return null;
+            var names: [DIGEST_MAX_CASE_OPERANDS][]const u8 = undefined;
+            var digests: [DIGEST_MAX_CASE_OPERANDS]u128 = undefined;
+            for (cs.operands, names[0..cs.operands.len], digests[0..cs.operands.len]) |o, *n, *od| {
+                n.* = o.name;
+                od.* = nodeDigest(o.expr, columns, budget) orelse return null;
+            }
+            const scope: predicate_mod.ColumnDigests = .{ .names = names[0..cs.operands.len], .digests = digests[0..cs.operands.len], .outer = columns };
+            d.int(@as(u64, cs.branches.len));
+            for (cs.branches) |b| {
+                d.int(predicate_mod.digestBudgeted(b.cond, &scope, budget) orelse return null);
+                d.int(nodeDigest(b.then, columns, budget) orelse return null);
+            }
+            d.int(@intFromBool(cs.else_branch != null));
+            if (cs.else_branch) |eb| d.int(nodeDigest(eb.*, columns, budget) orelse return null);
+        },
+        .scalar_subquery, .exists_subquery, .var_ref, .lambda => return null,
+    }
+    return d.final();
+}
+
 /// A decimal constant as the tree carries it: its digits cast to its own
 /// type, `to_decimal:<p>:<s>('<digits>')`. A decimal Value holds only a
 /// mantissa, so the digits keep the scale. The parser types a fractional
@@ -469,6 +545,44 @@ test "expr: eql is structural, case-insensitive on identifiers, exact on literal
     try std.testing.expect(eql(case_a, case_b));
     try std.testing.expect(!eql(case_a, case_c));
     try std.testing.expect(!eql(case_a, case_d));
+}
+
+test "expr: digest matches exactly when two expressions compute the same values, a computed column standing for its expression" {
+    const lower_name = Expr{ .call = .{ .fn_name = "lower", .args = &.{col("Name")} } };
+    const d = digest(lower_name, null).?;
+    try std.testing.expectEqual(d, digest(Expr{ .call = .{ .fn_name = "LOWER", .args = &.{col("name")} } }, null).?);
+    try std.testing.expect(d != digest(Expr{ .call = .{ .fn_name = "upper", .args = &.{col("name")} } }, null).?);
+    try std.testing.expect(d != digest(Expr{ .call = .{ .fn_name = "lower", .args = &.{col("title")} } }, null).?);
+    try std.testing.expect(digest(lit(.{ .text = "x" }), null).? != digest(lit(.{ .text = "X" }), null).?);
+    try std.testing.expect(digest(lit(.{ .int = 1 }), null).? != digest(lit(.{ .bigint = 1 }), null).?);
+    const ab = Expr{ .call = .{ .fn_name = "concat", .args = &.{ col("a"), col("b") } } };
+    const ba = Expr{ .call = .{ .fn_name = "concat", .args = &.{ col("b"), col("a") } } };
+    try std.testing.expect(digest(ab, null).? != digest(ba, null).?);
+
+    const cond = PredicateExpr{ .leaf = .{ .col = "qty", .op = .gt, .val = .{ .int = 1 } } };
+    const cond_other = PredicateExpr{ .leaf = .{ .col = "qty", .op = .gte, .val = .{ .int = 1 } } };
+    const case_a = Expr{ .case = .{ .branches = &.{.{ .cond = cond, .then = lit(.{ .text = "big" }) }}, .else_branch = null } };
+    const case_c = Expr{ .case = .{ .branches = &.{.{ .cond = cond_other, .then = lit(.{ .text = "big" }) }}, .else_branch = null } };
+    try std.testing.expectEqual(digest(case_a, null).?, digest(case_a, null).?);
+    try std.testing.expect(digest(case_a, null).? != digest(case_c, null).?);
+    const anchor: u8 = 0;
+    try std.testing.expect(digest(.{ .scalar_subquery = &anchor }, null) == null);
+
+    // Two statements' parsers name the same computed column apart.
+    const first: predicate_mod.ColumnDigests = .{ .names = &.{"__pred_expr_1"}, .digests = &.{d} };
+    const second: predicate_mod.ColumnDigests = .{ .names = &.{"__pred_expr_7"}, .digests = &.{d} };
+    const leaf_first = PredicateExpr{ .leaf = .{ .col = "__pred_expr_1", .op = .eq, .val = .{ .text = "x" } } };
+    const leaf_second = PredicateExpr{ .leaf = .{ .col = "__PRED_EXPR_7", .op = .eq, .val = .{ .text = "x" } } };
+    try std.testing.expectEqual(predicate_mod.digestWith(leaf_first, &first).?, predicate_mod.digestWith(leaf_second, &second).?);
+    try std.testing.expect(predicate_mod.digestWith(leaf_first, null).? != predicate_mod.digestWith(leaf_second, null).?);
+    const leaf_name = PredicateExpr{ .leaf = .{ .col = "name", .op = .eq, .val = .{ .text = "x" } } };
+    try std.testing.expect(predicate_mod.digestWith(leaf_first, &first).? != predicate_mod.digestWith(leaf_name, &first).?);
+
+    // However the WHERE splits into plain and computed conjuncts.
+    const plain = PredicateExpr{ .leaf = .{ .col = "qty", .op = .lt, .val = .{ .int = 9 } } };
+    const split = [_]PredicateExpr{ plain, leaf_first };
+    const swapped = [_]PredicateExpr{ leaf_second, plain };
+    try std.testing.expectEqual(predicate_mod.digestWith(.{ .@"and" = &split }, &first).?, predicate_mod.digestWith(.{ .@"and" = &swapped }, &second).?);
 }
 
 test "expr: deepClone produces an owned tree" {

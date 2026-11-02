@@ -748,7 +748,7 @@ fn buildUdafGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNPlan)
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived, .{ .group_cols = plan.group_by.group_cols, .aggs = plan.group_by.aggs });
     q = try q.udfGroupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs), registry);
     try finishOperatorGroupBy(input, &q, plan);
     return q;
@@ -794,7 +794,7 @@ fn buildOperatorGroupBy(input: CompileInput, table: *api.Table, plan: GroupTopNP
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived, .{ .group_cols = plan.group_by.group_cols, .aggs = plan.group_by.aggs });
     q = try q.groupBy(plan.group_by.group_cols, try mysqlAggInputs(input, &q, plan.group_by.aggs));
     try finishOperatorGroupBy(input, &q, plan);
     return q;
@@ -915,13 +915,21 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
     // The silo cores fuse the WHERE into the scan, below the Compute that
     // materializes hidden predicate anchors. The conjuncts over those anchors
     // filter the Compute's output instead, and keep the columns they read.
+    // When the scans can compute and filter on those conjuncts themselves,
+    // they do, and the Compute keeps only the columns the core reads.
     var residual: ?exec.PredicateExpr = null;
+    var computed_where: ?exec.ComputedWhere = null;
     if (eff_where) |w| {
         if (predicateRefsDerived(w, plan.derived)) {
             const split = (try splitResidual(input.node_arena, w, plan.derived)) orelse return try buildOperatorGroupBy(input, table, plan);
             eff_where = split.scan;
-            residual = split.residual;
-            eff_derived = try residualDerived(input.node_arena, plan.derived, eff_derived, split.residual);
+            if (try exec.DerivedFilter.accepts(input.allocator, table.schema.columns, split.residual, plan.derived, input.udf_registry)) {
+                computed_where = .{ .predicate = split.residual, .derived = plan.derived };
+                eff_derived = try derivedReadAbove(input.node_arena, eff_derived, .{ .group_cols = plan.group_by.group_cols, .aggs = eff_aggs });
+            } else {
+                residual = split.residual;
+                eff_derived = try residualDerived(input.node_arena, plan.derived, eff_derived, split.residual);
+            }
         }
     }
 
@@ -933,6 +941,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         .offset = if (post_sort) 0 else if (plan.limit) |l| @intCast(l.offset) else 0,
         .where_filter = eff_where,
         .residual_filter = residual,
+        .computed_where = computed_where,
         .having_filter = eff_having,
         .needed = needed,
         .derived = eff_derived,
@@ -956,7 +965,7 @@ fn buildGroupTopN(input: CompileInput, root: *const ir.Op) !?exec.Query {
         lowcard_request.offset = 0;
     }
     var having_outside = false;
-    var built_q = if (residual == null) try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, lowcard_request) else null;
+    var built_q = if (residual == null and computed_where == null) try v2_pipeline.tryBuildLowCardGroup(input.allocator, table, lowcard_request) else null;
     if (built_q != null) {
         having_outside = eff_having != null;
     } else {
@@ -1142,14 +1151,48 @@ fn markReadDerived(arena: std.mem.Allocator, derived: []const ir.Derived, marked
 }
 
 /// WHERE + row-local derived, ordered by dependency: the filter runs first so
-/// the exprs evaluate on survivors only, unless it reads a derived column.
-fn applyWhereAndDerived(input: CompileInput, q: *exec.Query, where: ?ir.Op.Filter, derived: []const ir.Derived) !void {
+/// the exprs evaluate on survivors only. One that reads a derived column goes
+/// to the scan with the derived columns' definitions
+/// (`tryFuseDerivedFilter`), which computes them for the filter itself, so it
+/// runs first too and the condition cache keeps what it matched; only when
+/// the scan declines does it filter the Compute's output. With the filter in
+/// the scan, the derived columns nothing above reads (`reads`, when known)
+/// are not computed again.
+fn applyWhereAndDerived(input: CompileInput, q: *exec.Query, where: ?ir.Op.Filter, derived: []const ir.Derived, reads: ?AboveReads) !void {
     const filter_last = if (where) |f| predicateRefsDerived(f.predicate, derived) else false;
+    if (filter_last and try q.tryFuseDerivedFilter(where.?.predicate, derived, input.udf_registry)) {
+        const rest = try derivedReadAbove(input.node_arena, derived, reads);
+        if (rest.len > 0) q.* = try computeDerivedFused(input.allocator, q.*, rest, input.udf_registry);
+        return;
+    }
     if (!filter_last) {
         if (where) |f| q.* = try q.*.filter(f.predicate);
     }
     if (derived.len > 0) q.* = try computeDerivedFused(input.allocator, q.*, derived, input.udf_registry);
     if (filter_last) q.* = try q.*.filter(where.?.predicate);
+}
+
+/// What the operators above a WHERE read of its input: group keys and
+/// aggregate inputs.
+const AboveReads = struct {
+    group_cols: []const []const u8 = &.{},
+    aggs: []const exec.AggSpec,
+};
+
+/// The entries of `derived` that `reads` reads, with the earlier ones they
+/// read in turn; all of them when `reads` is unknown.
+fn derivedReadAbove(arena: std.mem.Allocator, derived: []const ir.Derived, reads: ?AboveReads) ![]const ir.Derived {
+    const r = reads orelse return derived;
+    const used = try arena.alloc(bool, derived.len);
+    for (derived, used) |d, *u| {
+        u.* = nameInList(r.group_cols, d.name) or for (r.aggs) |a| {
+            if (a.readsColumn(d.name)) break true;
+        } else false;
+    }
+    try markReadDerived(arena, derived, used);
+    var out: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (derived, used) |d, u| if (u) try out.append(arena, d);
+    return out.items;
 }
 
 // Push the fusable subset of derived columns DOWN into the ParallelScan workers
@@ -1735,12 +1778,17 @@ fn buildScanSelect(input: CompileInput, root: *const ir.Op) !?exec.Query {
         if (on_scan[fi]) q = try q.filter(plan.filters[fi].filter.predicate);
     }
     try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], plan.compute_layer_count);
-    var compute_i = plan.compute_layer_count;
-    while (compute_i > 0) {
-        compute_i -= 1;
-        const derived = plan.compute_layers[compute_i];
-        if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
-        try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], compute_i);
+    if (try fuseScanSelectDerivedFilter(input, &q, plan, on_scan[0..plan.filter_count])) |rest| {
+        if (rest.len > 0) q = try computeDerivedFused(allocator, q, rest, input.udf_registry);
+        try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], 0);
+    } else {
+        var compute_i = plan.compute_layer_count;
+        while (compute_i > 0) {
+            compute_i -= 1;
+            const derived = plan.compute_layers[compute_i];
+            if (derived.len > 0) q = try computeDerivedFused(allocator, q, derived, input.udf_registry);
+            try applyLayerFilters(&q, plan, on_scan[0..plan.filter_count], compute_i);
+        }
     }
     // Innermost exclude first (they were collected outermost-first walking
     // down). Each is a complement-projection over the current schema, so a
@@ -1859,6 +1907,43 @@ fn filterReadsScan(allocator: std.mem.Allocator, table: *api.Table, plan: ScanSe
     return true;
 }
 
+/// Offer the scan, as `applyWhereAndDerived` does, a filter over the body's
+/// only compute layer that reads the columns it computes. Once the scan takes
+/// it (marked in `on_scan`), the layer computes only the entries the rest of
+/// the statement reads, which this returns.
+fn fuseScanSelectDerivedFilter(input: CompileInput, q: *exec.Query, plan: ScanSelectPlan, on_scan: []bool) !?[]const ir.Derived {
+    if (plan.compute_layer_count != 1) return null;
+    const derived = plan.compute_layers[0];
+    const fi = for (on_scan, 0..) |taken, i| {
+        if (!taken and plan.filters[i].layers_above == 0) break i;
+    } else return null;
+    const pred = plan.filters[fi].filter.predicate;
+    if (!predicateRefsDerived(pred, derived)) return null;
+    if (!try q.tryFuseDerivedFilter(pred, derived, input.udf_registry)) return null;
+    on_scan[fi] = true;
+    const used = try input.node_arena.alloc(bool, derived.len);
+    for (derived, used) |d, *u| u.* = scanSelectReads(plan, on_scan, d.name);
+    try markReadDerived(input.node_arena, derived, used);
+    var rest: std.ArrayListUnmanaged(ir.Derived) = .empty;
+    for (derived, used) |d, u| if (u) try rest.append(input.node_arena, d);
+    return rest.items;
+}
+
+/// Whether anything over the scan body's compute layer, other than the
+/// filters `on_scan` marks taken, reads its column `name`.
+fn scanSelectReads(plan: ScanSelectPlan, on_scan: []const bool, name: []const u8) bool {
+    const cols = plan.project_columns orelse return true;
+    if (nameInList(cols, name)) return true;
+    if (plan.order_by) |o| for (o.specs) |spec| {
+        if (types.columnNameEql(spec.col, name)) return true;
+    };
+    for (plan.excludes[0..plan.exclude_count]) |e| if (nameInList(e, name)) return true;
+    for (plan.filters[0..on_scan.len], on_scan) |f, taken| {
+        if (!taken and exec.predicate.touchesColumn(f.filter.predicate, name)) return true;
+    }
+    return false;
+}
+
 /// Apply, innermost first, the filters not already on the scan that sit
 /// right above compute layer `layer` (`compute_layer_count`: the scan).
 fn applyLayerFilters(q: *exec.Query, plan: ScanSelectPlan, on_scan: []const bool, layer: usize) !void {
@@ -1940,7 +2025,7 @@ fn buildGlobalOperatorAggregate(input: CompileInput, table: *api.Table, plan: Gl
         try exec.scanWithProjection(allocator, table, input.accountant, needed);
     errdefer q.deinit();
 
-    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived);
+    try applyWhereAndDerived(input, &q, plan.where_filter, plan.derived, .{ .aggs = plan.group_by.aggs });
     const aggs = try mysqlAggInputs(input, &q, plan.group_by.aggs);
     if (hasUdfAgg(aggs)) {
         const registry = input.udf_registry orelse return error.UnsupportedQueryShape;

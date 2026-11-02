@@ -226,9 +226,38 @@ pub const ColColPred = struct {
 /// Past `digest_budget` nodes and set values it declines too, which bounds
 /// its cost per call.
 pub fn digest(expr: PredicateExpr) ?u128 {
-    var budget: usize = digest_budget;
-    return nodeDigest(expr, &budget);
+    return digestWith(expr, null);
 }
+
+/// `digest` with the columns `columns` names hashed as the digests it
+/// holds for them.
+pub fn digestWith(expr: PredicateExpr, columns: ?*const ColumnDigests) ?u128 {
+    var budget: usize = digest_budget;
+    return nodeDigest(expr, columns, &budget);
+}
+
+/// `digestWith` drawing on a budget the caller shares across digests.
+pub fn digestBudgeted(expr: PredicateExpr, columns: ?*const ColumnDigests, budget: *usize) ?u128 {
+    return nodeDigest(expr, columns, budget);
+}
+
+/// Digests that stand in for column names. A computed column is only its
+/// query's name for an expression (`__pred_expr_0` holds a different one in
+/// every query), so it digests as that expression (`expr.digest`).
+pub const ColumnDigests = struct {
+    names: []const []const u8,
+    digests: []const u128,
+    /// The scope this one sits in; its names are found when none here is.
+    outer: ?*const ColumnDigests = null,
+
+    pub fn find(self: *const ColumnDigests, name: []const u8) ?u128 {
+        var at: ?*const ColumnDigests = self;
+        while (at) |scope| : (at = scope.outer) {
+            for (scope.names, scope.digests) |n, d| if (types.columnNameEql(n, name)) return d;
+        }
+        return null;
+    }
+};
 
 /// The digests of `expr`'s top-level AND arms (nested ANDs flattened; `expr`
 /// itself when it is no AND), in order, written to `out` until it is full.
@@ -267,10 +296,10 @@ comptime {
     };
 }
 
-fn nodeDigest(expr: PredicateExpr, budget: *usize) ?u128 {
+fn nodeDigest(expr: PredicateExpr, columns: ?*const ColumnDigests, budget: *usize) ?u128 {
     if (budget.* == 0) return null;
     budget.* -= 1;
-    var d: Digest = .{};
+    var d: Digest = .{ .columns = columns };
     d.int(@backingInt(std.meta.activeTag(expr)));
     switch (expr) {
         .leaf, .text_as_number => |p| d.leaf(p),
@@ -286,12 +315,12 @@ fn nodeDigest(expr: PredicateExpr, budget: *usize) ?u128 {
         },
         .@"and", .@"or" => |arms| {
             var sum: ArmSum = .{};
-            if (!sum.add(std.meta.activeTag(expr), arms, budget)) return null;
+            if (!sum.add(std.meta.activeTag(expr), arms, columns, budget)) return null;
             if (sum.count == 1) return sum.sum;
             d.int(sum.count);
             d.int(sum.sum);
         },
-        .not => |c| d.int(nodeDigest(c.*, budget) orelse return null),
+        .not => |c| d.int(nodeDigest(c.*, columns, budget) orelse return null),
         .in_set, .text_as_number_set => |s| {
             if (s.value_type != null or s.values.len > budget.*) return null;
             budget.* -= s.values.len;
@@ -314,28 +343,30 @@ const ArmSum = struct {
     sum: u128 = 0,
     count: u64 = 0,
 
-    fn add(self: *ArmSum, connective: std.meta.Tag(PredicateExpr), arms: []const PredicateExpr, budget: *usize) bool {
+    fn add(self: *ArmSum, connective: std.meta.Tag(PredicateExpr), arms: []const PredicateExpr, columns: ?*const ColumnDigests, budget: *usize) bool {
         for (arms) |arm| {
             const same_connective: ?[]const PredicateExpr = switch (arm) {
                 .@"and", .@"or" => |inner| if (std.meta.activeTag(arm) == connective) inner else null,
                 else => null,
             };
             if (same_connective) |inner| {
-                if (!self.add(connective, inner, budget)) return false;
+                if (!self.add(connective, inner, columns, budget)) return false;
                 continue;
             }
-            self.sum +%= nodeDigest(arm, budget) orelse return false;
+            self.sum +%= nodeDigest(arm, columns, budget) orelse return false;
             self.count += 1;
         }
         return true;
     }
 };
 
-const Digest = struct {
+/// The hashing under `digest` and `expr.digest`.
+pub const Digest = struct {
     lo: std.hash.Wyhash = .init(0x9E37_79B9_7F4A_7C15),
     hi: std.hash.Wyhash = .init(0xC2B2_AE3D_27D4_EB4F),
+    columns: ?*const ColumnDigests = null,
 
-    fn final(self: *Digest) u128 {
+    pub fn final(self: *Digest) u128 {
         return @as(u128, self.hi.final()) << 64 | self.lo.final();
     }
 
@@ -344,21 +375,33 @@ const Digest = struct {
         self.hi.update(b);
     }
 
-    fn int(self: *Digest, v: anytype) void {
+    pub fn int(self: *Digest, v: anytype) void {
         self.bytes(std.mem.asBytes(&v));
     }
 
-    fn text(self: *Digest, s: []const u8) void {
+    pub fn text(self: *Digest, s: []const u8) void {
         self.int(@as(u64, s.len));
         self.bytes(s);
     }
 
-    fn column(self: *Digest, name: []const u8) void {
-        self.int(@as(u64, name.len));
-        for (name) |c| self.int(std.ascii.toLower(c));
+    /// A name's length never reaches `maxInt(u64)`, so a column that hashes
+    /// as its stand-in digest never collides with one hashed by name.
+    pub fn column(self: *Digest, name: []const u8) void {
+        if (self.columns) |c| if (c.find(name)) |stand_in| {
+            self.int(@as(u64, std.math.maxInt(u64)));
+            self.int(stand_in);
+            return;
+        };
+        self.foldedName(name);
     }
 
-    fn value(self: *Digest, v: Value) void {
+    /// `n` case-folded, as names resolve.
+    pub fn foldedName(self: *Digest, n: []const u8) void {
+        self.int(@as(u64, n.len));
+        for (n) |c| self.int(std.ascii.toLower(c));
+    }
+
+    pub fn value(self: *Digest, v: Value) void {
         self.int(@backingInt(std.meta.activeTag(v)));
         switch (v) {
             .text => |t| self.text(t),
