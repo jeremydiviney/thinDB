@@ -411,6 +411,11 @@ pub fn main(init: std.process.Init) !u8 {
         try err_w.flush();
         return 1;
     }
+    // Clients send both the stored values and the queries, so the identity
+    // digests take a key none of them can know.
+    var digest_seed: [8]u8 = undefined;
+    io.random(&digest_seed);
+    thindb.exec.setDigestSeed(std.mem.readInt(u64, &digest_seed, .little));
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
         try err_w.flush();

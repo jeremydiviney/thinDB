@@ -2207,39 +2207,32 @@ pub const TableFnExec = struct {
     /// sort and the generic multi-input fallback, and across co-partitioned
     /// inputs (their digests align in the N-way group merge).
     fn keyDigestAt(views: []const ColumnView, key_idx: []const usize, row: usize) u128 {
-        var h1 = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
-        var h2 = std.hash.Wyhash.init(0x517cc1b727220a95);
+        var h: exec.DigestStream = .init();
         for (key_idx) |ki| {
             const v = views[ki];
             if (!v.isValid(row)) {
-                h1.update(&.{0});
-                h2.update(&.{0});
+                h.update(&.{0});
                 continue;
             }
-            h1.update(&.{1});
-            h2.update(&.{1});
+            h.update(&.{1});
             switch (v.data) {
                 .varchar, .string, .char, .json, .nested, .bitmap => |sv| {
                     const bytes = sv.rowBytes(row);
-                    h1.update(bytes);
-                    h2.update(bytes);
+                    h.update(bytes);
                     // Length delimiter: ("ab","c") must not collide
                     // with ("a","bc").
-                    h1.update(std.mem.asBytes(&bytes.len));
-                    h2.update(std.mem.asBytes(&bytes.len));
+                    h.update(std.mem.asBytes(&bytes.len));
                 },
                 inline .int, .bigint, .tinyint, .smallint, .date, .datetime, .largeint, .decimal64, .decimal128, .decimal256, .uuid, .boolean => |s| {
-                    h1.update(std.mem.asBytes(&s[row]));
-                    h2.update(std.mem.asBytes(&s[row]));
+                    h.update(std.mem.asBytes(&s[row]));
                 },
                 inline .float, .double => |s| {
                     const canonical = types.canonicalFloat(s[row]);
-                    h1.update(std.mem.asBytes(&canonical));
-                    h2.update(std.mem.asBytes(&canonical));
+                    h.update(std.mem.asBytes(&canonical));
                 },
             }
         }
-        return (@as(u128, h1.final()) << 64) | h2.final();
+        return h.final();
     }
 
     /// Generic multi-input comparator: partition DIGEST first (run

@@ -105,11 +105,13 @@ test "table UDF: partitioned running total with ORDER BY" {
     var res = try run(allocator, db,
         \\SELECT id, running
         \\FROM TABLE(running_total((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)
+        \\ORDER BY id
     );
     defer res.deinit();
 
-    // Group 1 in id order: 10, 30, 60. Group 2: 40, 90. Partition-major
-    // concat, ordered within each partition.
+    // Group 1 in id order: 10, 30, 60. Group 2: 40, 90. Partition order is
+    // unspecified (it follows the keyed partition digest), so the outer
+    // ORDER BY fixes it.
     var got_ids: std.ArrayList(i64) = .empty;
     defer got_ids.deinit(allocator);
     var got_running: std.ArrayList(i64) = .empty;
@@ -376,6 +378,7 @@ test "table UDF SDK: running total via struct row types" {
     var res = try run(allocator, db,
         \\SELECT id, running
         \\FROM TABLE(sdk_running_total((SELECT id, g, amt FROM t)) PARTITION BY g ORDER BY id)
+        \\ORDER BY id
     );
     defer res.deinit();
 
@@ -881,6 +884,7 @@ fn expectPassRunning(allocator: std.mem.Allocator, db: *thindb.Database) !void {
         \\FROM TABLE(sdk_pass_running((
         \\  SELECT id, g, amt, CASE WHEN g = 1 THEN 'one' END AS label, id * 10 AS factor FROM t
         \\)) PARTITION BY g ORDER BY id)
+        \\ORDER BY id
     );
     defer res.deinit();
 

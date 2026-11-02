@@ -80,9 +80,10 @@ Per-table mutexes serialize writes. Reads capture segment and memtable snapshots
 
 A nested type points to its shape (`types.internNested`), so a type stays
 one word and two types compare by pointer. The shapes live in one
-process-wide pool that is never freed. That pool is the library's only
-global state, a deliberate exception: shapes are immutable, so every
-`Database` in the process can share them.
+process-wide pool that is never freed. That pool is a deliberate exception
+to the library's rule of no global state: shapes are immutable, so every
+`Database` in the process can share them. The digest key (§6.3) is the
+other.
 
 `TYPEOF(x)` names x's type as StarRocks does: `varchar` for any text, a
 decimal by the width its precision implies (`decimal32(9, 2)`,
@@ -1217,6 +1218,20 @@ presize to the sampled groups, where a shortfall costs only a grow. The
 estimate never enters the propagated stats. Consumers that need an upper
 bound, such as an aggregate's own stats, the low-cardinality handler's gate
 and radix's cache-resident gate, keep the product.
+
+Some keys are never compared byte for byte: a 128-bit digest stands in for
+them. These are a string or wider-than-128-bit GROUP BY key in the V2 grouped
+engine, a global COUNT(DISTINCT) over text, a table function's PARTITION BY
+key, and the predicate digests that key the condition cache and the miss memo
+(§6.4). Two keys merge only if their digests collide, about n² / 2¹²⁹ for n
+keys. The digests are XXH3 under a per-process key (`exec.setDigestSeed`):
+the server draws it at startup, so no stored value or query text can be built
+to collide with another, while a fixed seed would let one be built off line.
+No digest outlives its process, so stored data doesn't depend on the key. The
+key is the library's second piece of global state, as deliberate as the
+nested-shape pool (§3): it is set before any database opens and every
+database shares it. An embedder that leaves it unset keeps seed 0. The
+`XX_HASH3_*` SQL functions keep StarRocks' fixed seeds.
 
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the

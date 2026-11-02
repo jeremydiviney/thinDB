@@ -37,7 +37,28 @@ const default_secret = [SECRET_LEN]u8{
 /// The XXH3-128 digest of `input` under `seed`, its high half in the high
 /// 64 bits.
 pub fn hash128(seed: u64, input: []const u8) u128 {
-    const halves = if (input.len == 0)
+    if (input.len > 240) return joined(long(input, &derivedSecret(seed)));
+    return shortHash128(seed, input);
+}
+
+/// A seed with its long-input secret derived once: `init(s).hash128(x)` is
+/// `hash128(s, x)` with no secret derived per call.
+pub const Seeded = struct {
+    seed: u64,
+    secret: [SECRET_LEN]u8,
+
+    pub fn init(seed: u64) Seeded {
+        return .{ .seed = seed, .secret = derivedSecret(seed) };
+    }
+
+    pub fn hash128(self: *const Seeded, input: []const u8) u128 {
+        if (input.len > 240) return joined(long(input, &self.secret));
+        return shortHash128(self.seed, input);
+    }
+};
+
+fn shortHash128(seed: u64, input: []const u8) u128 {
+    return joined(if (input.len == 0)
         empty(seed, &default_secret)
     else if (input.len <= 3)
         upTo3(seed, input, &default_secret)
@@ -47,10 +68,11 @@ pub fn hash128(seed: u64, input: []const u8) u128 {
         upTo16(seed, input, &default_secret)
     else if (input.len <= 128)
         upTo128(seed, input, &default_secret)
-    else if (input.len <= 240)
-        upTo240(seed, input, &default_secret)
     else
-        long(input, &derivedSecret(seed));
+        upTo240(seed, input, &default_secret));
+}
+
+fn joined(halves: Halves) u128 {
     return @as(u128, halves.high) << 64 | halves.low;
 }
 
@@ -61,8 +83,7 @@ pub fn hash128Parts(seed: u64, comptime k: usize, parts: [k]u128) u128 {
     comptime std.debug.assert(k >= 1 and k <= 8);
     var bytes: [16 * k]u8 = undefined;
     inline for (parts, 0..) |p, i| bytes[i * 16 ..][0..16].* = @bitCast(p);
-    const halves = if (k == 1) upTo16(seed, &bytes, &default_secret) else upTo128(seed, &bytes, &default_secret);
-    return @as(u128, halves.high) << 64 | halves.low;
+    return joined(if (k == 1) upTo16(seed, &bytes, &default_secret) else upTo128(seed, &bytes, &default_secret));
 }
 
 const Halves = struct { low: u64, high: u64 };
@@ -266,6 +287,14 @@ test "XXH3-128 over fixed-width parts matches the concatenated bytes" {
             inline for (.{ 0, 0x9E3779B185EBCA87 }) |seed| {
                 try std.testing.expectEqual(hash128(seed, &bytes), hash128Parts(seed, k, parts));
             }
+        }
+    }
+}
+
+test "a seed with its secret derived once digests as hash128 under that seed" {
+    inline for (.{ "", "a", "abcdefghi", ab8Times(16) ++ "x", ab8Times(30) ++ "x", ab8Times(375) }) |input| {
+        inline for (.{ 0, 7, 0x9E3779B185EBCA87 }) |seed| {
+            try std.testing.expectEqual(hash128(seed, input), Seeded.init(seed).hash128(input));
         }
     }
 }
