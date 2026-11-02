@@ -38,6 +38,15 @@ test "encoded machinery combines disk runs raw blocks and memtable with tombston
             try std.testing.expectEqual(sum - 2 * count, batch.values[2].data.bigint[0]);
             try std.testing.expectEqual(count, batch.values[3].data.bigint[0]);
             try std.testing.expect((try q.next()) == null);
+
+            // x: -4..3 in runs, then ±100 alternating raw, then the memtable's
+            // -7; y: 21 runs, the memtable's value among them. Deleting id 0
+            // leaves its x and y on other rows.
+            var d = try helpers.runSql(allocator, db, "SELECT COUNT(DISTINCT x), COUNT(DISTINCT y) FROM t");
+            defer d.deinit();
+            const distinct = (try d.next()).?;
+            try std.testing.expectEqual(@as(i64, 11), distinct.values[0].data.bigint[0]);
+            try std.testing.expectEqual(@as(i64, 21), distinct.values[1].data.bigint[0]);
         }
         var empty = try helpers.runSql(allocator, db, "SELECT SUM(x+1), SUM(x-2), COUNT(x) FROM t WHERE id < 0");
         defer empty.deinit();

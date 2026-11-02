@@ -891,7 +891,7 @@ const EncodedFold = struct {
 
     pub fn consume(self: *EncodedFold, batch: @import("scan.zig").EncodedBatch) !bool {
         for (self.plans) |p| {
-            if (p.is_udf or p.is_float or p.is_string or p.op == .count_distinct) return false;
+            if (!foldsEncoded(p)) return false;
             const idx = batch.column_index(p.input_name orelse continue) orelse return error.ColumnNotFound;
             const col = batch.schema[idx];
             const block = batch.blocks[idx];
@@ -907,11 +907,15 @@ const EncodedFold = struct {
             const col = batch.schema[idx];
             const block = batch.blocks[idx];
             if (block.encoding == .rle) {
-                try fold_run_aggregate(self.lane, p, i, col.type, storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{}).block, batch.row_count);
+                const runs = storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{}).block;
+                if (p.op == .count_distinct) {
+                    try foldDistinctRunsGlobal(self.lane, i, col.type, runs, batch.row_count);
+                } else try fold_run_aggregate(self.lane, p, i, col.type, runs, batch.row_count);
                 continue;
             }
             const view = storage.segment_reader.viewRawColumn(col.type, block.bytes, batch.row_count, .{ .has_nulls = col.nullable }, .raw).?;
             switch (p.op) {
+                .count_distinct => try foldDistinctGlobal(self.lane, p, i, view, null, null, batch.row_count),
                 .count_col => foldCountColGlobal(view, batch.row_count, &self.lane.ns[i]),
                 .sum, .avg => foldSumIntGlobal(view, batch.row_count, &self.lane.ns[i], &self.lane.isum[i]),
                 .min => foldExtremeIntGlobal(true, view, batch.row_count, &self.lane.ns[i], &self.lane.isum[i]),
@@ -967,8 +971,44 @@ fn fold_run_aggregate(lane: *Lane, p: AggPlan, i: usize, typ: Type, runs: storag
     }
 }
 
+// A distinct integer's runs are its candidate keys, so it reads a run block's
+// runs in place, as the other folds do, instead of expanding the block and
+// finding its runs again.
+fn foldDistinctRunsGlobal(lane: *Lane, i: usize, typ: Type, runs: storage.segment_reader.RleBlock, row_count: u32) !void {
+    if (i < lane.producers.len) if (lane.producers[i]) |producer| switch (producer) {
+        inline else => |prod| return pushRunValues(prod, &lane.ns[i], typ, runs, row_count),
+    };
+    var feed: DistinctFeed = .{ .set = &lane.dsets[i], .allocator = lane.allocator };
+    try pushRunValues(&feed, &lane.ns[i], typ, runs, row_count);
+    try feed.drain();
+}
+
+fn pushRunValues(sink: anytype, ns: *u64, typ: Type, runs: storage.segment_reader.RleBlock, row_count: u32) !void {
+    switch (runs.value_width) {
+        inline 1, 2, 4, 8 => |width| {
+            const T = @Int(.signed, width * 8);
+            var count: u64 = 0;
+            for (0..runs.n_runs) |r| {
+                const length = runs.runLength(r);
+                if (length == 0 or length > row_count -| count) return error.CorruptColumnBlockHeader;
+                count += length;
+                const value: i64 = if (typ == .boolean) runs.values[r] else std.mem.readInt(T, runs.values[r * width ..][0..width], .little);
+                try sink.push(@truncate(distinctIntKey(value)));
+            }
+            if (count != row_count) return error.CorruptColumnBlockHeader;
+            ns.* += count;
+        },
+        else => return error.CorruptColumnBlockHeader,
+    }
+}
+
+fn foldsEncoded(p: AggPlan) bool {
+    if (p.is_udf or p.is_float or p.is_string) return false;
+    return p.op != .count_distinct or p.dkind == .int;
+}
+
 fn can_fold_encoded(plans: []const AggPlan) bool {
-    for (plans) |p| if (p.is_udf or p.is_float or p.is_string or p.op == .count_distinct) return false;
+    for (plans) |p| if (!foldsEncoded(p)) return false;
     return true;
 }
 
@@ -1821,6 +1861,35 @@ test "encoded machinery folds integer runs with wide totals and unsigned boolean
         try std.testing.expectEqual(sum * 2, lane.isum[4]);
         try std.testing.expectEqual(@as(u64, 16), lane.count);
     }
+}
+
+test "encoded machinery counts distinct integers from runs and raw blocks" {
+    const plans = [_]AggPlan{
+        .{ .op = .count_distinct, .input_name = "x", .is_float = false, .dkind = .int, .output_type = .bigint, .name = "d" },
+        .{ .op = .count_col, .input_name = "x", .is_float = false, .output_type = .bigint, .name = "n" },
+    };
+    var lane = try Lane.init(std.testing.allocator, &plans);
+    defer lane.deinit(std.testing.allocator);
+    const schema = [_]Column{.{ .name = "x", .type = .int }};
+    var consumer = EncodedFold{ .lane = &lane, .plans = &plans };
+
+    // Runs -7 x3, 40 x1, -7 x4: a value whose runs aren't adjacent counts once.
+    var runs: [8 + 3 * 4 + 12]u8 align(16) = @splat(0);
+    std.mem.writeInt(u32, runs[0..4], 3, .little);
+    runs[4] = 4;
+    for ([_]i32{ -7, 40, -7 }, 0..) |v, k| std.mem.writeInt(i32, runs[8 + 4 * k ..][0..4], v, .little);
+    for ([_]u32{ 3, 1, 4 }, 0..) |l, k| std.mem.writeInt(u32, runs[20 + 4 * k ..][0..4], l, .little);
+    const rle_blocks = [_]storage.ReadSegment.BorrowedBlock{.{ .bytes = &runs, .encoding = .rle }};
+    try std.testing.expect(try consumer.consume(.{ .schema = &schema, .blocks = &rle_blocks, .row_count = 8 }));
+
+    const raw = [_]i32{ 40, 40, 9, -7, std.math.minInt(i32) };
+    const raw_blocks = [_]storage.ReadSegment.BorrowedBlock{.{ .bytes = std.mem.sliceAsBytes(&raw), .encoding = .raw }};
+    try std.testing.expect(try consumer.consume(.{ .schema = &schema, .blocks = &raw_blocks, .row_count = raw.len }));
+
+    try std.testing.expectEqual(@as(usize, 4), lane.dsets[0].count());
+    try std.testing.expectEqual(@as(u64, 13), lane.ns[0]);
+    try std.testing.expectEqual(@as(u64, 13), lane.ns[1]);
+    try std.testing.expectEqual(@as(u64, 13), lane.count);
 }
 
 test "encoded machinery decline leaves aggregate state unchanged and nullable sums stay exact" {
