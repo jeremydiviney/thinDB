@@ -221,8 +221,9 @@ pub const Config = struct {
     /// The condition cache (DESIGN.md §6.4): scans keep, per row group of an
     /// immutable segment, the stored rows an AND arm of their filter matched,
     /// in the block cache, and a later scan sharing the arm starts from them.
-    /// Off also turns the predicate memo off, so no scan reuses what an
-    /// earlier statement learned of the data.
+    /// Off also turns the predicate memo and the cached dictionary digests
+    /// off, so no scan reuses what an earlier statement learned of the data
+    /// or derived from its blocks.
     condition_cache: bool = true,
 
     /// The memory controller itself. Normally null in user-built Configs —

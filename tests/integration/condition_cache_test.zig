@@ -5,7 +5,9 @@
 //! after the records were kept, rows stay unflushed, and compaction writes
 //! new segments. Filters over computed values (functions, regular
 //! expressions, UDFs) are kept too, and a repeat computes none of them. A
-//! top-N over row groups in key order keeps and reads records too.
+//! top-N over row groups in key order keeps and reads records too. The
+//! dictionary digests the block cache keeps for hashed string keys, off with
+//! the condition cache, change no result either.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -374,5 +376,92 @@ test "under a random digest key, string and composite groups, distinct strings a
                 return err;
             };
         };
+    }
+}
+
+fn insertShortRows(allocator: std.mem.Allocator, dbs: anytype, random: std.Random, first_id: i64, n: usize) !void {
+    const rows = try allocator.alloc(Row, n);
+    defer allocator.free(rows);
+    const text = try allocator.alloc(u8, n * 5);
+    defer allocator.free(text);
+    for (rows, 0..) |*r, i| r.* = .{
+        .id = first_id + @as(i64, @intCast(i)),
+        .k = random.intRangeLessThan(i64, 0, 8),
+        .s = word(random, text[i * 5 ..][0..2]),
+        .u = word(random, text[i * 5 + 2 ..][0..3]),
+    };
+    for (dbs) |db| try (try db.openTable("t", .{})).insert(rows);
+}
+
+test "string keys hashed from the dictionary digests the block cache keeps answer as hashed afresh, cold and warm, through deletes, unflushed rows and compaction" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xd1c7d16e);
+    const random = prng.random();
+    const keyed = [_][]const u8{
+        "SELECT COUNT(DISTINCT s) FROM t",
+        "SELECT COUNT(DISTINCT u) FROM t WHERE k < 3",
+        "SELECT COUNT(DISTINCT u) FROM t WHERE s LIKE '%b%'",
+        "SELECT COUNT(*) FROM t GROUP BY s ORDER BY 1",
+        "SELECT MIN(id) FROM t GROUP BY s ORDER BY 1",
+        "SELECT MAX(id) FROM t WHERE s <> '' GROUP BY s ORDER BY 1",
+        "SELECT MIN(id) FROM t WHERE s LIKE 'a%' GROUP BY s ORDER BY 1",
+        "SELECT MAX(id) FROM t WHERE u LIKE '%b%' GROUP BY s ORDER BY 1",
+        "SELECT MIN(id) FROM t WHERE k < 2 GROUP BY u ORDER BY 1",
+        "SELECT MIN(id) FROM t GROUP BY s, u ORDER BY 1",
+        "SELECT MAX(id) FROM t GROUP BY u, k ORDER BY 1",
+        "SELECT MIN(id) FROM t WHERE k < 6 GROUP BY u, k ORDER BY 1",
+        "SELECT MAX(id) FROM t WHERE u LIKE '%a%' GROUP BY s, k ORDER BY 1",
+        "SELECT COUNT(*) FROM t GROUP BY u ORDER BY 1 DESC, MIN(id) LIMIT 5",
+    };
+
+    inline for (.{ 1, 4 }) |dop| {
+        var tmp_on = std.testing.tmpDir(.{});
+        defer tmp_on.cleanup();
+        var tmp_off = std.testing.tmpDir(.{});
+        defer tmp_off.cleanup();
+        const on = try thindb.Database.open(allocator, std.testing.io, tmp_on.dir, .{ .row_group_size = 64, .max_dop = dop, .auto_flush_secs = 0 });
+        defer on.close();
+        const off = try thindb.Database.open(allocator, std.testing.io, tmp_off.dir, .{ .row_group_size = 64, .max_dop = dop, .auto_flush_secs = 0, .condition_cache = false });
+        defer off.close();
+        const dbs = [_]*thindb.Database{ on, off };
+        for (dbs) |db| try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, s VARCHAR(8) NOT NULL, u VARCHAR(8) NOT NULL)");
+
+        var next_id: i64 = 0;
+        try insertShortRows(allocator, dbs, random, next_id, 3000);
+        next_id += 3000;
+        for (dbs) |db| try (try db.openTable("t", .{})).flush();
+
+        var sql: std.ArrayList(u8) = .empty;
+        defer sql.deinit(allocator);
+        for (0..4) |round| {
+            for (keyed) |q| {
+                const want = try collectBigints(allocator, off, q);
+                defer allocator.free(want);
+                for (0..2) |_| {
+                    const got = try collectBigints(allocator, on, q);
+                    defer allocator.free(got);
+                    std.testing.expectEqualSlices(i64, want, got) catch |err| {
+                        std.debug.print("round {d}, dop {d}: {s}\n", .{ round, dop, q });
+                        return err;
+                    };
+                }
+            }
+
+            sql.clearRetainingCapacity();
+            try sql.appendSlice(allocator, "DELETE FROM t WHERE id IN (");
+            for (0..40) |i| {
+                if (i > 0) try sql.appendSlice(allocator, ", ");
+                try sql.print(allocator, "{d}", .{random.intRangeLessThan(i64, 0, next_id)});
+            }
+            try sql.appendSlice(allocator, ")");
+            for (dbs) |db| try exec(allocator, db, sql.items);
+
+            try insertShortRows(allocator, dbs, random, next_id, 500);
+            next_id += 500;
+            for (dbs) |db| try (try db.openTable("t", .{})).flush();
+            try insertShortRows(allocator, dbs, random, next_id, 30);
+            next_id += 30;
+            if (round == 2) for (dbs) |db| try (try db.openTable("t", .{})).compact();
+        }
     }
 }

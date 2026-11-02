@@ -835,8 +835,15 @@ pub const Scan = struct {
         /// `digests_whole`, else those flagged in `digests_known`.
         digests_whole: bool = false,
         digests_known: std.ArrayListUnmanaged(bool) = .empty,
+        digests_known_count: usize = 0,
         digests_wanted: std.ArrayListUnmanaged(bool) = .empty,
         digests_todo: std.ArrayListUnmanaged(u32) = .empty,
+        /// Where the held block's digests are cached (`dictDigestsKey`);
+        /// null when they aren't.
+        digests_key: ?storage.cache.Key = null,
+        /// The cached digests of every entry of the held block, pinned until
+        /// it's released; `digests` goes unused while they're held.
+        digests_cached: ?*storage.cache.Cache.Entry = null,
         /// The consumer reads only the dictionary's values when they all
         /// occur, so a whole row group skips decoding its codes.
         entries_only: bool = false,
@@ -859,6 +866,12 @@ pub const Scan = struct {
             self.raw = null;
             if (self.block) |*b| b.release(allocator, cache);
             self.block = null;
+            if (self.digests_cached) |e| cache.cache.release(e);
+            self.digests_cached = null;
+        }
+
+        fn heldDigests(self: *const DictBuf) []const u128 {
+            return if (self.digests_cached) |e| e.digests() else self.digests.items;
         }
 
         fn deinit(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
@@ -1629,7 +1642,7 @@ pub const Scan = struct {
         if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
         if (hashed) {
             try self.digestBlockDict(buf, db, every_value);
-            return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
+            return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .every_value = every_value };
         }
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
     }
@@ -1652,9 +1665,15 @@ pub const Scan = struct {
             const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
             const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
             if (hashed) {
-                try buf.digests.resize(self.allocator, db.ndv);
                 buf.digests_whole = false;
                 buf.digests_known.clearRetainingCapacity();
+                buf.digests_known_count = 0;
+                buf.digests_key = self.dictDigestsKey(seg, rg_idx, phys, db);
+                if (buf.digests_key) |key| if (self.table.cache.acquireDerived(key)) |e| {
+                    buf.digests_cached = e;
+                    buf.digests_whole = true;
+                };
+                if (!buf.digests_whole) try buf.digests.resize(self.allocator, db.ndv);
             }
             // Counted entries test the filter on a hashed key's values too.
             if ((!hashed or buf.counted) and db.offsetsInPlace() == null) {
@@ -1724,7 +1743,7 @@ pub const Scan = struct {
         }
         const slots = try self.ensureDictSlots();
         slots[0] = if (hashed)
-            .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .counts = counts }
+            .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .counts = counts }
         else
             .{ .codes = &.{}, .dict = dict, .counts = counts };
         self.filtered_coded = null;
@@ -1801,7 +1820,9 @@ pub const Scan = struct {
         for (counts, known, buf.digests.items, 0..) |n, *k, *d, c| if (n > 0 and !k.*) {
             k.* = true;
             d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            buf.digests_known_count += 1;
         };
+        self.cacheHeldDigestsWhenMost(buf, db);
     }
 
     /// Fill the digests of the dictionary entries `buf.codes` reference,
@@ -1814,6 +1835,7 @@ pub const Scan = struct {
         const digests = buf.digests.items;
         const codes = buf.codes.items;
         if (every_value) {
+            if (self.cacheHeldDigests(buf, db)) return;
             for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             buf.digests_whole = true;
             return;
@@ -1841,6 +1863,77 @@ pub const Scan = struct {
             };
         }
         digestEntries(db, buf.digests_todo.items, digests);
+        buf.digests_known_count += buf.digests_todo.items.len;
+        self.cacheHeldDigestsWhenMost(buf, db);
+    }
+
+    /// The block-cache key of the digests of column `phys`'s dictionary
+    /// `db` in row group `rg_idx` (§6.4), or null when they aren't cached:
+    /// an empty dictionary, the condition cache off, or
+    /// `SET THINDB_NO_DICT_DIGESTS = 1`.
+    fn dictDigestsKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, phys: usize, db: storage.segment_reader.DictBlock) ?storage.cache.Key {
+        if (db.ndv == 0 or !self.table.cache.conditions or conditionsSwitchedOff() or dictDigestsSwitchedOff()) return null;
+        return .{ .table_uid = self.table.cache_uid, .segment_id = seg.info.segment_id, .row_group_idx = @intCast(rg_idx), .column_idx = @intCast(phys), .content = .dict_digests };
+    }
+
+    /// The bench hot-switch for the dictionary digests the block cache
+    /// keeps: `SET THINDB_NO_DICT_DIGESTS = 1` turns them off for the next
+    /// queries, `= 0` back on.
+    fn dictDigestsSwitchedOff() bool {
+        const v = getenv("THINDB_NO_DICT_DIGESTS") orelse return false;
+        return v[0] != '0';
+    }
+
+    /// `cacheHeldDigests` once the row group's batches have hashed at least
+    /// half the held dictionary's entries: hashing the rest once costs no
+    /// more than they did, and spares every later scan of the row group.
+    fn cacheHeldDigestsWhenMost(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock) void {
+        if (buf.digests_known_count * 2 >= db.ndv) _ = self.cacheHeldDigests(buf, db);
+    }
+
+    /// Cache the digest of every entry of the dictionary `buf` holds,
+    /// taking those it already hashed, and hold them in its place. False,
+    /// with `buf` unchanged, when they aren't cached or the cache can't take
+    /// them.
+    fn cacheHeldDigests(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock) bool {
+        const key = buf.digests_key orelse return false;
+        const known: ?[]const bool = if (buf.digests_known_count > 0) buf.digests_known.items else null;
+        buf.digests_cached = self.keepDictDigests(key, db, known, buf.digests.items) orelse return false;
+        buf.digests_whole = true;
+        return true;
+    }
+
+    /// The digests of every entry of `db`, inserted into the block cache
+    /// under `key` and returned pinned; the entries `known` flags are taken
+    /// from `hashed` rather than hashed again. Null when the cache can't take
+    /// them.
+    fn keepDictDigests(self: *Scan, key: storage.cache.Key, db: storage.segment_reader.DictBlock, known: ?[]const bool, hashed: []const u128) ?*storage.cache.Cache.Entry {
+        const cache = self.table.cache;
+        const digests = cache.blockAllocator().alloc(u128, db.ndv) catch return null;
+        if (known) |k| {
+            for (digests, k, hashed, 0..) |*d, have, h, c| d.* = if (have) h else exec.stringKeyDigest(db.dictValue(@intCast(c)));
+        } else for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+        return cache.insertPinned(key, std.mem.sliceAsBytes(digests), .raw) catch {
+            cache.blockAllocator().free(digests);
+            return null;
+        };
+    }
+
+    /// The cached digests of every entry of dictionary `db`, column `phys`
+    /// in row group `rg_idx`, pinned; on a miss, hashed and cached when
+    /// `fill`. Null when they aren't cached, nor filled.
+    fn cachedDictDigests(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, phys: usize, db: storage.segment_reader.DictBlock, fill: bool) ?*storage.cache.Cache.Entry {
+        const key = self.dictDigestsKey(seg, rg_idx, phys, db) orelse return null;
+        if (self.table.cache.acquireDerived(key)) |e| return e;
+        return if (fill) self.keepDictDigests(key, db, null, &.{}) else null;
+    }
+
+    /// The digests of every entry of `db`, a lookup table its codes index;
+    /// the caller frees it.
+    fn hashDictEntries(self: *Scan, db: storage.segment_reader.DictBlock) ![]u128 {
+        const lut = try self.allocator.alloc(u128, db.ndv);
+        for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+        return lut;
     }
 
     /// Hash the dictionary entries `todo` names into `digests`, fetching
@@ -3124,8 +3217,9 @@ pub const Scan = struct {
     }
 
     /// Fill `hash_bufs[j]` with per-row key digests for one row group's string
-    /// column, straight off the cached decompressed block: a dict block hashes
-    /// each distinct value once and translates rows through the LUT; a raw
+    /// column, straight off the cached decompressed block: a dict block takes
+    /// each distinct value's digest from the block cache, hashing and caching
+    /// them on a miss, and translates rows through them; a raw
     /// block hashes rows through an in-place view (no decode copy). Returns
     /// the placeholder value column.
     fn fillKeyHashes(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rg_count: u32, j: usize) !storage.OwnedColumn {
@@ -3141,9 +3235,10 @@ pub const Scan = struct {
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
             const db = storage.segment_reader.dictBlockOf(values, rg_count);
-            const lut = try self.allocator.alloc(u128, db.ndv);
-            defer self.allocator.free(lut);
-            for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            const cached = self.cachedDictDigests(seg, rg_idx, phys, db, true);
+            defer if (cached) |e| self.table.cache.release(e);
+            const lut: []const u128 = if (cached) |e| e.digests() else try self.hashDictEntries(db);
+            defer if (cached == null) self.allocator.free(lut);
             for (0..rg_count) |i| digests[i] = lut[db.rowCode(i)];
         } else if (block.encoding == .fsst) {
             // Plaintext digests off the compressed block via a one-value
@@ -5613,15 +5708,17 @@ pub const Scan = struct {
             var values = block.bytes;
             if (flags.has_nulls) values = block.bytes[storage.column.bitmapBytes(rg_count)..];
             const db = storage.segment_reader.dictBlockOf(values, rg_count);
-            // Fewer survivors than entries: hashing each survivor's value
-            // costs less than hashing the whole dictionary.
-            if (rows.len < db.ndv) {
+            // Fewer survivors than entries, and none cached: hashing each
+            // survivor's value costs less than hashing the whole dictionary.
+            const whole = rows.len >= db.ndv;
+            const cached = self.cachedDictDigests(seg, rg_idx, phys, db, whole);
+            defer if (cached) |e| self.table.cache.release(e);
+            if (cached == null and !whole) {
                 for (rows, digests) |row, *d| d.* = exec.stringKeyDigest(db.dictValue(db.rowCode(row)));
                 return;
             }
-            const lut = try self.allocator.alloc(u128, db.ndv);
-            defer self.allocator.free(lut);
-            for (lut, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+            const lut: []const u128 = if (cached) |e| e.digests() else try self.hashDictEntries(db);
+            defer if (cached == null) self.allocator.free(lut);
             for (rows, digests) |row, *d| d.* = lut[db.rowCode(row)];
         } else if (block.encoding == .fsst) {
             // Digest straight off the compressed rows: decode each survivor
@@ -6168,7 +6265,7 @@ pub const Scan = struct {
         var applied: u64 = 0;
         var fewest: usize = 0;
         var whole = false;
-        if (memo.cond_whole) |d| if (cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, d))) |e| {
+        if (memo.cond_whole) |d| if (cache.acquireDerived(self.conditionKey(seg, rg_idx, .matched_rows, d))) |e| {
             held[0] = e;
             n_held = 1;
             whole = true;
@@ -6180,7 +6277,7 @@ pub const Scan = struct {
         // With a derived filter, the whole filter's record is no plain
         // conjunct's, so a lone conjunct's record can seed the mask too.
         if (n_held == 0 and (expr == .@"and" or self.derived_filter != null)) for (memo.cond[0..memo.n_cond]) |arm| {
-            const e = cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, arm.digest)) orelse continue;
+            const e = cache.acquireDerived(self.conditionKey(seg, rg_idx, .matched_rows, arm.digest)) orelse continue;
             held[n_held] = e;
             if (condition_cache.matchedRows(e.bytes) < condition_cache.matchedRows(held[fewest].bytes)) fewest = n_held;
             n_held += 1;
@@ -6214,7 +6311,7 @@ pub const Scan = struct {
         if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
         const cache = self.table.cache;
         for ([_]storage.cache.Content{ .matched_rows, .matched_count }) |content| {
-            const e = cache.acquireCondition(self.conditionKey(seg, rg_idx, content, whole)) orelse continue;
+            const e = cache.acquireDerived(self.conditionKey(seg, rg_idx, content, whole)) orelse continue;
             defer cache.release(e);
             return condition_cache.matchedRows(e.bytes);
         }
