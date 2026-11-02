@@ -765,7 +765,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     // A condition-cache record of the row group stands in for the WHERE, and
     // the columns only the WHERE reads stay unloaded.
     const block_cache = z.table.cache;
-    const record = if (z.condition) |d| block_cache.acquireCondition(z.inner_scan.conditionKey(seg, ref.rg_idx, .matched_rows, d)) else null;
+    const record = if (z.condition) |d| block_cache.acquireDerived(z.inner_scan.conditionKey(seg, ref.rg_idx, .matched_rows, d)) else null;
     defer if (record) |e| block_cache.release(e);
     if (record) |e| if (condition_cache.matchedRows(e.bytes) == 0) return;
     for (0..z.probe_phys.len) |j| {

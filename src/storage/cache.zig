@@ -61,10 +61,24 @@ pub const Key = struct {
     predicate: u128 = 0,
 };
 
-/// What an entry holds: a column block, or a condition-cache entry (§6.4)
+/// What an entry holds: a column block; a condition-cache entry (§6.4)
 /// for one row group and one predicate, either the record of the stored rows
-/// it matched (`exec/condition_cache.zig`) or only how many it matched.
-pub const Content = enum(u8) { column, matched_rows, matched_count };
+/// it matched (`exec/condition_cache.zig`) or only how many it matched; or
+/// the `exec.stringKeyDigest` of each entry of a column block's dictionary
+/// (§6.5), which holds only for the process's digest key and so is never
+/// written anywhere.
+pub const Content = enum(u8) {
+    column,
+    matched_rows,
+    matched_count,
+    dict_digests,
+
+    /// Whether the entry is a condition-cache record, kept within the
+    /// records' share (`Cache.CONDITION_SHARE`).
+    pub fn isCondition(self: Content) bool {
+        return self == .matched_rows or self == .matched_count;
+    }
+};
 
 /// A table's handle into the shared block cache: the cache plus the table's
 /// uid namespace within it. Passed by value down the segment-read path so key
@@ -262,8 +276,8 @@ pub const Cache = struct {
     /// Row groups a scan predicate matched no stored row of. Its slots are
     /// charged to the controller's budget whole.
     predicate_memo: PredicateMemo,
-    /// Whether scans keep condition-cache entries here and use the
-    /// predicate memo (`Config.condition_cache`).
+    /// Whether scans keep condition-cache entries and dictionary digests
+    /// here and use the predicate memo (`Config.condition_cache`).
     conditions: bool = true,
 
     /// The condition-cache entries hold at most 1/CONDITION_SHARE of the
@@ -290,9 +304,15 @@ pub const Cache = struct {
         /// the decode path needs it to interpret `bytes` (raw vs FOR). Defaults
         /// to `.raw` so callers that don't set it (and tests) behave as before.
         encoding: format.Encoding = .raw,
-        /// Links in the condition-cache entries' list; null for a column block.
+        /// Links in the condition-cache entries' list; null for any other
+        /// entry.
         condition_prev: ?*Entry = null,
         condition_next: ?*Entry = null,
+
+        /// The digests a `.dict_digests` entry holds.
+        pub fn digests(self: *const Entry) []const u128 {
+            return std.mem.bytesAsSlice(u128, self.bytes);
+        }
     };
 
     /// A cache under `controller`'s budget, with a predicate memo of at most
@@ -410,9 +430,9 @@ pub const Cache = struct {
         return null;
     }
 
-    /// `acquire` for a condition-cache entry, left out of the hit and miss
-    /// counts, which measure column blocks.
-    pub fn acquireCondition(self: *Cache, key: Key) ?*Entry {
+    /// `acquire` for an entry derived from column blocks, left out of the
+    /// hit and miss counts, which measure column blocks.
+    pub fn acquireDerived(self: *Cache, key: Key) ?*Entry {
         std.debug.assert(key.content != .column);
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -444,7 +464,7 @@ pub const Cache = struct {
     /// `bytes` to the caller, when the records readers hold leave too little
     /// room, or on allocation failure.
     pub fn keepCondition(self: *Cache, key: Key, bytes: []align(16) u8) bool {
-        std.debug.assert(key.content != .column);
+        std.debug.assert(key.content.isCondition());
         const inserted = blk: {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -496,7 +516,7 @@ pub const Cache = struct {
         // bounds the pool's actual footprint (slab cells round up by class).
         // `miss_bytes` stays logical — it measures bytes decompressed per miss.
         const resident = self.countBlock(bytes, true);
-        if (key.content != .column) {
+        if (key.content.isCondition()) {
             self.linkConditionHead(entry);
             self.condition_bytes += resident;
         }
@@ -679,7 +699,7 @@ pub const Cache = struct {
         self.unlink(entry);
         _ = self.map.remove(entry.key);
         const cell = self.countBlock(entry.bytes, false);
-        if (entry.key.content != .column) {
+        if (entry.key.content.isCondition()) {
             self.unlinkCondition(entry);
             self.condition_bytes -= cell;
         }
@@ -688,7 +708,7 @@ pub const Cache = struct {
     }
 
     fn touch(self: *Cache, entry: *Entry) void {
-        if (entry.key.content != .column and self.condition_head != entry) {
+        if (entry.key.content.isCondition() and self.condition_head != entry) {
             self.unlinkCondition(entry);
             self.linkConditionHead(entry);
         }
@@ -789,16 +809,47 @@ test "condition records keep to their share, oldest out first, past no column bl
         try std.testing.expect(c.keepCondition(Rec.key(i), try allocator.alignedAlloc(u8, .@"16", record_len)));
     }
     try std.testing.expect(c.condition_bytes <= share);
-    try std.testing.expect(c.acquireCondition(Rec.key(0)) == null);
+    try std.testing.expect(c.acquireDerived(Rec.key(0)) == null);
     c.release(c.acquire(block).?);
 
     const kept = share / record_len;
     var pinned: [64]*Cache.Entry = undefined;
-    for (pinned[0..kept], records - kept..) |*e, i| e.* = c.acquireCondition(Rec.key(i)).?;
+    for (pinned[0..kept], records - kept..) |*e, i| e.* = c.acquireDerived(Rec.key(i)).?;
     defer for (pinned[0..kept]) |e| c.release(e);
     const refused = try allocator.alignedAlloc(u8, .@"16", record_len);
     defer allocator.free(refused);
     try std.testing.expect(!c.keepCondition(Rec.key(records), refused));
+}
+
+test "dictionary digests live with the column blocks: outside the condition share and the hit counts, freed with their table" {
+    const allocator = std.testing.allocator;
+    var controller = memory.MemoryPool.init(64 << 10);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
+    defer c.deinit();
+    const key: Key = .{ .table_uid = 9, .segment_id = 1, .row_group_idx = 0, .column_idx = 3, .content = .dict_digests };
+    const digests = try allocator.alloc(u128, 4);
+    for (digests, 0..) |*d, i| d.* = @as(u128, i) << 64 | i;
+    const e = try c.insertPinned(key, std.mem.sliceAsBytes(digests), .raw);
+    try std.testing.expectEqualSlices(u128, &.{ 0, 1 << 64 | 1, 2 << 64 | 2, 3 << 64 | 3 }, e.digests());
+    c.release(e);
+    try std.testing.expectEqual(@as(usize, 0), c.condition_bytes);
+    try std.testing.expect(c.condition_head == null);
+
+    c.release(c.acquireDerived(key).?);
+    try std.testing.expectEqual(@as(u64, 0), c.hits + c.misses);
+
+    // Records filling their share push out other records only.
+    const share = controller.cacheTarget() / Cache.CONDITION_SHARE;
+    for (0..share / 512 + 4) |i| {
+        const record: Key = .{ .table_uid = 9, .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0, .content = .matched_rows, .predicate = 7 };
+        try std.testing.expect(c.keepCondition(record, try allocator.alignedAlloc(u8, .@"16", 512)));
+    }
+    c.release(c.acquireDerived(key).?);
+
+    c.purgeTable(9);
+    try std.testing.expect(c.acquireDerived(key) == null);
+    try std.testing.expectEqual(@as(usize, 0), c.current_bytes);
 }
 
 test "predicate memo: at most its size, lossy per set, off when tiny" {
