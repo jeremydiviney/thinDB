@@ -813,6 +813,12 @@ pub const Scan = struct {
         /// The consumer reads only the dictionary's values when they all
         /// occur, so a whole row group skips decoding its codes.
         entries_only: bool = false,
+        /// The consumer takes a row group's rows counted by dictionary entry
+        /// (`BlockDictColumn.counts`) where the scan can count them.
+        counted: bool = false,
+        entry_counts: std.ArrayListUnmanaged(u32) = .empty,
+        entry_rows: std.ArrayListUnmanaged(u32) = .empty,
+        entry_pass: std.ArrayListUnmanaged(bool) = .empty,
         block: ?storage.ReadSegment.BorrowedBlock = null,
         /// The row group whose dictionary `block`, and `offsets` or
         /// `digests`, hold.
@@ -834,6 +840,9 @@ pub const Scan = struct {
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
             self.digests_known.deinit(allocator);
+            self.entry_counts.deinit(allocator);
+            self.entry_rows.deinit(allocator);
+            self.entry_pass.deinit(allocator);
         }
     };
 
@@ -1544,6 +1553,14 @@ pub const Scan = struct {
         self.dict_bufs[j].entries_only = true;
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as taken
+    /// counted by entry (`BlockDictColumn.counts`): a row group of a scan
+    /// reading that column alone, and filtering on it alone, then emits one
+    /// row per dictionary entry, testing the filter once per entry.
+    pub fn setBlockDictCounted(self: *Scan, j: usize) void {
+        self.dict_bufs[j].counted = true;
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1573,27 +1590,7 @@ pub const Scan = struct {
     fn fillBlockDict(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !?exec.BlockDictColumn {
         const buf = &self.dict_bufs[j];
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
-        const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
-        if (!holds) {
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
-            if (block.encoding != .dict) {
-                block.release(self.allocator, self.table.cacheRef());
-                return null;
-            }
-            buf.releaseBlock(self.allocator, self.table.cacheRef());
-            buf.block = block;
-            const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
-            if (hashed) {
-                try buf.digests.resize(self.allocator, db.ndv);
-                buf.digests_whole = false;
-                buf.digests_known.clearRetainingCapacity();
-            } else if (db.offsetsInPlace() == null) {
-                try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
-                for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
-            }
-            buf.held = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx };
-        }
-        const db = storage.segment_reader.dictBlockOf(buf.block.?.bytes, rg_count);
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count)) orelse return null;
         const every_value = rows == null;
         const codes_wanted = !(every_value and buf.entries_only);
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
@@ -1604,6 +1601,175 @@ pub const Scan = struct {
             return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .every_value = every_value };
         }
         return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
+    }
+
+    /// Column `j`'s dictionary block in row group `rg_idx`, pinned in
+    /// `dict_bufs[j]` with its offsets (a hashed key: room for its values'
+    /// digests) for the row group's later batches, or null when the block
+    /// isn't dictionary-coded.
+    fn holdDictBlock(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32) !?storage.segment_reader.DictBlock {
+        const buf = &self.dict_bufs[j];
+        const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
+        if (!holds) {
+            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            if (block.encoding != .dict) {
+                block.release(self.allocator, self.table.cacheRef());
+                return null;
+            }
+            buf.releaseBlock(self.allocator, self.table.cacheRef());
+            buf.block = block;
+            const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
+            const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
+            if (hashed) {
+                try buf.digests.resize(self.allocator, db.ndv);
+                buf.digests_whole = false;
+                buf.digests_known.clearRetainingCapacity();
+            }
+            // Counted entries test the filter on a hashed key's values too.
+            if ((!hashed or buf.counted) and db.offsetsInPlace() == null) {
+                try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
+                for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+            }
+            buf.held = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx };
+        }
+        return storage.segment_reader.dictBlockOf(buf.block.?.bytes, rg_count);
+    }
+
+    /// Whether a row group can arrive as counted dictionary entries
+    /// (`BlockDictColumn.counts`): the scan's one column is marked for them,
+    /// and any filter reads that column alone.
+    fn countsEntries(self: *const Scan) bool {
+        return self.out_phys.len == 1 and self.n_dicts == 1 and self.dict_bufs[0].counted and
+            self.filter_phys.len == 0 and self.n_coded == 0 and self.n_lengths == 0;
+    }
+
+    /// Emit row group `rg_idx` as its dictionary's entries, each counted by
+    /// its rows when `expr` (if any) passes its value, which is tested once
+    /// per entry. Returns the entries emitted, zero when no row passes, or
+    /// null when the column's block isn't dictionary-coded or tombstones, a
+    /// key bound or a sieve narrow the row group's rows.
+    fn countRowGroup(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_first: u32, rg_count: u32, expr: ?PredicateExpr) !?usize {
+        if (self.key_bound != null or self.sievedRows(rg_idx, rg_count) != null) return null;
+        if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
+        const phys = self.out_phys[0];
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, 0, rg_count)) orelse return null;
+        const buf = &self.dict_bufs[0];
+        const ndv: usize = db.ndv;
+        const dict: storage.StringView = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes };
+
+        try buf.entry_pass.resize(self.allocator, ndv);
+        const pass = buf.entry_pass.items;
+        if (expr) |e| {
+            if (!try self.testEntries(e, self.out_schema[0..1], dict, pass)) return null;
+            if (std.mem.indexOfScalar(bool, pass, true) == null) {
+                self.rg_unmatched = .whole;
+                return 0;
+            }
+        } else @memset(pass, true);
+
+        try buf.entry_rows.resize(self.allocator, ndv);
+        if (db.hasEntryStats()) {
+            try buf.entry_counts.resize(self.allocator, ndv);
+            db.entryStatsInto(buf.entry_counts.items, buf.entry_rows.items);
+        } else {
+            try buf.entry_counts.resize(self.allocator, db.entryCountLanes(rg_count) * ndv);
+            @memset(buf.entry_counts.items, 0);
+            db.countEntries(rg_count, buf.entry_counts.items, buf.entry_rows.items);
+        }
+        const counts = buf.entry_counts.items[0..ndv];
+        for (counts, pass) |*n, p| {
+            if (!p) n.* = 0;
+        }
+
+        const hashed = self.hash_cols_by_j.len > 0 and self.hash_cols_by_j[0];
+        if (hashed) try self.digestCountedEntries(buf, db, counts);
+        const filtered_cols = try self.ensureFilteredBuffers();
+        for (filtered_cols) |*c| c.clear();
+        try self.fillEmptyStrings(&filtered_cols[0], ndv);
+        if (self.emit_loc) {
+            const locs = try filtered_cols[1].data.bigint.addManyAsSlice(self.allocator, ndv);
+            const base = rowloc.packSegment(self.cur_seg_idx, rg_idx, 0);
+            for (locs, buf.entry_rows.items) |*loc, row| loc.* = base | @as(i64, row);
+        }
+        const slots = try self.ensureDictSlots();
+        slots[0] = if (hashed)
+            .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.digests.items, .counts = counts }
+        else
+            .{ .codes = &.{}, .dict = dict, .counts = counts };
+        self.filtered_coded = null;
+        self.filtered_hashed = null;
+        self.filtered_lengths = null;
+        self.filtered_dicts = slots;
+        self.rg_slice = null;
+        return ndv;
+    }
+
+    /// `expr`, which reads the one column of `schema`, tested on each value
+    /// of `dict` into `pass`; false when the column isn't a VARCHAR or
+    /// STRING.
+    fn testEntries(self: *Scan, expr: PredicateExpr, schema: []const Column, dict: storage.StringView, pass: []bool) !bool {
+        const view: ColumnView = .{ .data = switch (schema[0].type) {
+            .varchar => .{ .varchar = dict },
+            .string => .{ .string = dict },
+            else => return false,
+        } };
+        const entries = Batch{ .schema = schema, .values = (&view)[0..1], .row_count = dict.rowCount() };
+        try predicate.evaluateExprGuided(self.allocator, expr, schema, entries, pass, null);
+        return true;
+    }
+
+    /// Whether a scan that only counts its rows can count a row group by its
+    /// filter's column's dictionary entries: the filter reads one column.
+    fn countsFilterEntries(self: *const Scan) bool {
+        return self.out_phys.len == 0 and !self.emit_loc and self.filter_phys.len == 1;
+    }
+
+    /// The rows of row group `rg_idx` that `expr` passes, testing it once per
+    /// value of its column's dictionary block and summing the counts the
+    /// block stores; null when the block stores none, or tombstones, a key
+    /// bound or a sieve narrow the row group's rows.
+    fn countFilterEntries(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_first: u32, rg_count: u32, expr: PredicateExpr) !?usize {
+        if (self.key_bound != null or self.sievedRows(rg_idx, rg_count) != null) return null;
+        if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
+        const phys = self.filter_phys[0];
+        if (self.table.schema.columns[phys].nullable) return null;
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        defer block.release(self.allocator, self.table.cacheRef());
+        if (block.encoding != .dict) return null;
+        const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
+        if (!db.hasEntryStats()) return null;
+        const offsets = db.offsetsInPlace() orelse blk: {
+            try self.dict_entry_offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
+            for (self.dict_entry_offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
+            break :blk self.dict_entry_offsets.items;
+        };
+        try self.dict_entry_hits.resize(self.allocator, db.ndv);
+        const pass = self.dict_entry_hits.items;
+        if (!try self.testEntries(expr, self.filter_eval_schema[0..1], .{ .offsets = offsets, .bytes = db.dict_bytes }, pass)) return null;
+        const matched = db.rowsPassing(pass);
+        if (matched == 0) self.rg_unmatched = .whole;
+        return matched;
+    }
+
+    /// The batch `countRowGroup` filled, of its `n` entries.
+    fn countedBatch(self: *Scan, n: usize) Batch {
+        for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
+        return .{ .schema = self.out_schema, .values = self.views, .row_count = n, .block_dicts = self.filtered_dicts };
+    }
+
+    /// Fill the digests of the entries `counts` holds rows of, as
+    /// `digestBlockDict` does for a batch's codes.
+    fn digestCountedEntries(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock, counts: []const u32) !void {
+        if (buf.digests_whole) return;
+        if (buf.digests_known.items.len != db.ndv) {
+            try buf.digests_known.resize(self.allocator, db.ndv);
+            @memset(buf.digests_known.items, false);
+        }
+        const known = buf.digests_known.items;
+        for (counts, known, buf.digests.items, 0..) |n, *k, *d, c| if (n > 0 and !k.*) {
+            k.* = true;
+            d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
+        };
     }
 
     /// Fill the digests of the dictionary entries `buf.codes` reference. A
@@ -3121,6 +3287,13 @@ pub const Scan = struct {
             }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
+            if (self.countsEntries()) {
+                if (try self.countRowGroup(seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count, null)) |n| {
+                    self.cur_rg_idx += 1;
+                    if (n == 0) continue;
+                    return self.countedBatch(n);
+                }
+            }
 
             return try self.emitRowGroup(seg, rg.row_count);
         }
@@ -3421,7 +3594,27 @@ pub const Scan = struct {
             }
             self.rgs_scanned += 1;
             self.rows_scanned += rg.row_count;
+            if (self.countsEntries()) {
+                self.rg_unmatched = .none;
+                const tested: ?PredicateExpr = if (self.statsPassAll(rg, expr)) null else expr;
+                if (try self.countRowGroup(seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count, tested)) |n| {
+                    self.noteUnmatched(memo, seg, self.cur_rg_idx);
+                    self.cur_rg_idx += 1;
+                    if (n == 0) continue;
+                    return self.countedBatch(n);
+                }
+            }
             if (self.key_bound == null and self.sievedRows(self.cur_rg_idx, rg.row_count) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
+            if (self.countsFilterEntries()) {
+                self.rg_unmatched = .none;
+                if (try self.countFilterEntries(seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count, expr)) |n| {
+                    self.noteUnmatched(memo, seg, self.cur_rg_idx);
+                    self.cur_rg_idx += 1;
+                    if (n == 0) continue;
+                    _ = try self.ensureFilteredBuffers();
+                    return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n };
+                }
+            }
 
             const rg_first = self.cur_rg_first_row[self.cur_rg_idx];
             const rg_count = rg.row_count;

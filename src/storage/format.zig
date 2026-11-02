@@ -74,10 +74,19 @@ pub const Compression = enum(u8) {
 /// dict. The post-bitmap payload layout is:
 ///
 ///   [ndv: u32]                      number of distinct values `k`
-///   [code_width: u8][3 pad]         1 / 2 / 4 bytes, chosen by `k`
+///   [code_width: u8][flags: u8][2 pad]  1 / 2 / 4 bytes, chosen by `k`
 ///   [dict_offsets: (k+1) × u32]     byte offsets into `dict_bytes`, rebased to 0
 ///   [dict_bytes: …]                 the `k` distinct values, concatenated, SORTED
 ///   [codes: row_count × code_width] per-row index into the sorted dict
+///
+/// With `DICT_ENTRY_STATS` in `flags` (a non-nullable column's block), each
+/// value's rows follow, `dictEntryStatWidth` bytes per value per array:
+///
+///   [counts: k × w]                 rows holding the value, less one
+///   [first_rows: k × w]             the first such row
+///
+/// so a reader can take a block's rows counted by value without reading its
+/// codes.
 ///
 /// The dict is stored sorted so a later execution layer can binary-search it and
 /// derive ORDER BY from codes. NULL rows carry a placeholder code, masked by the
@@ -123,6 +132,15 @@ pub const Encoding = enum(u8) {
     rle = 3,
     fsst = 4,
 };
+
+/// `.dict` header flag: per-value row counts and first rows follow the codes.
+pub const DICT_ENTRY_STATS: u8 = 1;
+
+/// Bytes per value of a `.dict` block's counts and first rows: two cover a
+/// row group of up to 65536 rows, as a count is stored less one.
+pub fn dictEntryStatWidth(row_count: u32) u8 {
+    return if (row_count <= 65536) 2 else 4;
+}
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
 /// prefixed by a validity bitmap). Bit 1 was the v12 "cache compressed at

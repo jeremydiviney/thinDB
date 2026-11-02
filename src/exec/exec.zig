@@ -1782,6 +1782,12 @@ pub const BlockDictColumn = struct {
     /// consumer that asked for entries only (`Scan.setBlockDictEntriesOnly`)
     /// then gets no `codes`.
     every_value: bool = false,
+    /// Set when the scan counted its row group's rows by dictionary entry
+    /// (`Scan.setBlockDictCounted`): the batch holds one row per entry, in
+    /// code order, each standing for `counts[c]` rows the filter passes (none
+    /// for zero), and `codes` is empty. The entry's row location, if the
+    /// batch carries them, is one of those rows'.
+    counts: ?[]const u32 = null,
 
     pub fn valueCount(self: BlockDictColumn) usize {
         return if (self.digests) |d| d.len else self.dict.rowCount();

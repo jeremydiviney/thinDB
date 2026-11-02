@@ -915,6 +915,17 @@ test "dict encoding: NULL and empty string are distinct under codes" {
     defer seg.deinit();
 
     try std.testing.expectEqual(format.Encoding.dict, try blockEncodingOf(allocator, &seg, 0, 0));
+    {
+        // A nullable column's blocks store no per-value rows: nothing reads
+        // them counted.
+        var controller = memory.MemoryPool.init(1 << 20);
+        var c = cache.Cache.init(allocator, &controller, 0);
+        controller.shareCache(&c, controller.budget);
+        defer c.deinit();
+        var block = try seg.borrowColumnBlock(allocator, 0, 0, .{ .cache = &c, .table_uid = 0 });
+        defer block.release(allocator, .{ .cache = &c, .table_uid = 0 });
+        try std.testing.expect(!segment_reader.dictBlockOf(block.bytes[column.bitmapBytes(n)..], n).hasEntryStats());
+    }
 
     var c0 = try seg.decodeColumn(allocator, schema, 0, 0);
     defer c0.deinit(allocator);
@@ -1063,6 +1074,19 @@ test "dict block stores a lexicographically sorted dictionary" {
     for (0..n) |i| {
         try std.testing.expectEqualStrings(vals[i], db.dictValue(db.rowCode(i)));
     }
+    // The non-nullable block stores each value's row count and first row.
+    try std.testing.expect(db.hasEntryStats());
+    var stored: [4]u32 = undefined;
+    var first: [4]u32 = undefined;
+    db.entryStatsInto(&stored, &first);
+    var counted: [4 * 4]u32 = @splat(0);
+    var any_row: [4]u32 = undefined;
+    db.countEntries(n, counted[0 .. db.entryCountLanes(n) * 4], &any_row);
+    try std.testing.expectEqualSlices(u32, counted[0..4], &stored);
+    for (first, 0..) |row, code| {
+        try std.testing.expectEqual(@as(u32, @intCast(code)), db.rowCode(row));
+        for (0..row) |earlier| try std.testing.expect(db.rowCode(earlier) != code);
+    }
     // A cached block's offsets view in place, so the scan's dictionary
     // emit never copies them.
     if (comptime @import("builtin").cpu.arch.endian() == .little) {
@@ -1140,6 +1164,39 @@ test "DictBlock.codeRangeInto matches the per-row range test at every width and 
                         const code = db.rowCode(i);
                         try std.testing.expectEqual((code >= r[0] and code < r[1]) != outside, got);
                     }
+                }
+            }
+        }
+    }
+}
+
+test "DictBlock.countEntries counts each code's rows and names one, with one counter lane or several" {
+    var storage_bytes: [400 * 4 + 3]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const rand = prng.random();
+    inline for (.{ 1, 2, 4 }) |width| {
+        const T = @Int(.unsigned, width * 8);
+        // Few values per row take separate counter lanes; many take one.
+        for ([_]u32{ 5, if (width == 1) 256 else 300 }) |ndv| {
+            for ([_]u32{ 0, 1, 3, 400 }) |n| {
+                const codes = storage_bytes[n % 4 ..][0 .. n * width];
+                // Runs of a repeated code, as clustered columns hold.
+                var row: usize = 0;
+                while (row < n) {
+                    const code: T = @intCast(rand.uintLessThan(u32, ndv));
+                    const run = @min(n - row, rand.intRangeAtMost(usize, 1, 6));
+                    for (row..row + run) |r| std.mem.writeInt(T, codes[r * width ..][0..width], code, .little);
+                    row += run;
+                }
+                const db: segment_reader.DictBlock = .{ .ndv = ndv, .code_width = width, .offsets_region = &.{}, .dict_bytes = &.{}, .codes = codes };
+                var counts: [4 * 300]u32 = @splat(0);
+                var rows: [300]u32 = @splat(std.math.maxInt(u32));
+                db.countEntries(n, counts[0 .. db.entryCountLanes(n) * ndv], rows[0..ndv]);
+                var want: [300]u32 = @splat(0);
+                for (0..n) |r| want[db.rowCode(r)] += 1;
+                try std.testing.expectEqualSlices(u32, want[0..ndv], counts[0..ndv]);
+                for (want[0..ndv], rows[0..ndv], 0..) |w, at, c| {
+                    if (w > 0) try std.testing.expectEqual(@as(u32, @intCast(c)), db.rowCode(at));
                 }
             }
         }

@@ -7758,22 +7758,32 @@ const GridDictEval = struct {
     }
 
     fn collapse(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, column: thindb.exec.BlockDictColumn) !thindb.Batch {
-        try self.code_rows.resize(allocator, column.valueCount());
-        const code_rows = self.code_rows.items;
-        @memset(code_rows, 0);
         const row_locs: ?[]const i64 = if (self.loc_column) |lc| raw.values[lc].data.bigint else null;
-        // Each code keeps a row's location as the rows stream past: fetching
-        // it per used code instead lands a random read in the batch's whole
-        // location column.
-        if (row_locs) |rl| {
-            try self.code_loc.resize(allocator, code_rows.len);
-            const code_loc = self.code_loc.items;
-            for (column.codes, rl[0..column.codes.len]) |c, loc| {
-                code_loc[c] = loc;
-                code_rows[c] += 1;
-            }
+        var code_rows: []const u32 = undefined;
+        var code_loc: []const i64 = &.{};
+        if (column.counts) |counts| {
+            // Counted entries are the batch's rows, one per code.
+            code_rows = counts;
+            if (row_locs) |rl| code_loc = rl;
         } else {
-            for (column.codes) |c| code_rows[c] += 1;
+            try self.code_rows.resize(allocator, column.valueCount());
+            const rows = self.code_rows.items;
+            @memset(rows, 0);
+            // Each code keeps a row's location as the rows stream past:
+            // fetching it per used code instead lands a random read in the
+            // batch's whole location column.
+            if (row_locs) |rl| {
+                try self.code_loc.resize(allocator, rows.len);
+                const locs = self.code_loc.items;
+                for (column.codes, rl[0..column.codes.len]) |c, loc| {
+                    locs[c] = loc;
+                    rows[c] += 1;
+                }
+                code_loc = locs;
+            } else {
+                for (column.codes) |c| rows[c] += 1;
+            }
+            code_rows = rows;
         }
         for (self.partials) |*p| try p.accumulate(allocator, raw.values[p.column], column.codes, code_rows.len);
 
@@ -7792,12 +7802,15 @@ const GridDictEval = struct {
         try self.weights.ensureTotalCapacity(allocator, used);
         if (row_locs != null) try self.locs.ensureTotalCapacity(allocator, used);
         if (column.digests != null) try self.digests.ensureTotalCapacity(allocator, used);
+        var counted_rows: usize = 0;
         for (code_rows[lo..hi], lo..) |n, c| {
             if (n == 0) continue;
+            counted_rows += n;
             self.weights.appendAssumeCapacity(n);
-            if (row_locs != null) self.locs.appendAssumeCapacity(self.code_loc.items[c]);
+            if (row_locs != null) self.locs.appendAssumeCapacity(code_loc[c]);
             if (column.digests) |ds| self.digests.appendAssumeCapacity(ds[c]);
         }
+        if (column.counts != null) self.input_rows = counted_rows;
 
         const column_index = self.source.columns[0];
         const raw_values = switch (raw.values[column_index].data) {
@@ -10778,8 +10791,15 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 @memset(gd.partial_views, null);
             }
         }
+        // A lone string column with nothing folded beside it collapses from
+        // the scan's per-entry counts, where the scan can count them.
+        const counted = source.len == 1 and source.n_pre == 0 and n_partials == 0;
         for (scans[0..n_workers]) |sc| {
-            for (source.columns[0..source.strings]) |j| try sc.setBlockDictColumn(sc.blockDictColumnIndex(scan_schema[j].name).?);
+            for (source.columns[0..source.strings]) |j| {
+                const at = sc.blockDictColumnIndex(scan_schema[j].name).?;
+                try sc.setBlockDictColumn(at);
+                if (counted) sc.setBlockDictCounted(at);
+            }
         }
         kept = true;
         grid_distinct = evals;

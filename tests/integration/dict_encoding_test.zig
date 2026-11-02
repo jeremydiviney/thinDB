@@ -225,6 +225,13 @@ test "dict predicate pushdown returns correct rows (=, <>, range, LIKE)" {
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note = 'yes'", quarter);
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note <> ''", quarter * 2); // yes + no
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note LIKE 'y%'", quarter); // yes
+
+    // Deleted rows leave the counts a row group's dictionary stores: rows
+    // 0..799 cover three row groups whole and one in part, 200 of each color.
+    try exec(allocator, db, "DELETE FROM t WHERE id <= 800");
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color = 'red'", quarter - 200);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color <> 'red'", ROWS - 800 - (quarter - 200));
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE color LIKE '%re%'", 2 * (quarter - 200));
 }
 
 fn checkStringRanges(allocator: std.mem.Allocator, db: anytype) !void {

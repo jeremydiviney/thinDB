@@ -516,7 +516,7 @@ fn writeColumnBlock(
         .rle
     else if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
         .for_
-    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end))
+    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end, !nullable))
         .dict
     else if (table_compression == .lz4_fsst and
         try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, fsst_min_block_bytes, fsst_threads))
@@ -811,13 +811,16 @@ const dict_max_avg_len: usize = 256;
 /// `format.Encoding.dict`. Returns false (leaving `scratch` untouched past the
 /// bitmap) when the column is not a string, is blob-like, exceeds the NDV cap,
 /// is too high-cardinality to pay off, or doesn't shrink the body — the caller
-/// then writes a raw string block.
+/// then writes a raw string block. With `entry_stats` the body also carries
+/// each value's row count and first row where it stays under the raw body;
+/// they decide nothing about the encoding.
 fn tryEncodeDict(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
     view: ColumnView,
     row_start: usize,
     row_end: usize,
+    entry_stats: bool,
 ) !bool {
     const sv: StringView = switch (view.data) {
         .varchar, .string, .char, .json, .nested, .bitmap => |s| s,
@@ -884,13 +887,17 @@ fn tryEncodeDict(
     // Raw string body, per `writeStringBlock`: [u32 byte_count][(n+1) u32][bytes].
     const raw_body = 4 + (n + 1) * 4 + total_bytes;
     if (dict_body >= raw_body) return false;
+    const stat_width = format.dictEntryStatWidth(@intCast(n));
+    const stats_body = 2 * k * stat_width;
+    const with_stats = entry_stats and dict_body + stats_body < raw_body;
 
-    try scratch.ensureUnusedCapacity(allocator, dict_body);
+    try scratch.ensureUnusedCapacity(allocator, dict_body + if (with_stats) stats_body else 0);
     var b4: [4]u8 = undefined;
 
     format.writeU32(&b4, @intCast(k));
     scratch.appendSliceAssumeCapacity(&b4);
-    scratch.appendSliceAssumeCapacity(&[_]u8{ code_width, 0, 0, 0 });
+    const flags: u8 = if (with_stats) format.DICT_ENTRY_STATS else 0;
+    scratch.appendSliceAssumeCapacity(&[_]u8{ code_width, flags, 0, 0 });
 
     // dict_offsets in sorted order, rebased to 0 (k+1 entries).
     format.writeU32(&b4, 0);
@@ -911,6 +918,26 @@ fn tryEncodeDict(
         var b8: [8]u8 = undefined;
         std.mem.writeInt(u64, &b8, code, .little);
         scratch.appendSliceAssumeCapacity(b8[0..code_width]);
+    }
+    if (!with_stats) return true;
+
+    // Every value occurs, so a count is stored less one.
+    const counts = try allocator.alloc(u32, k);
+    defer allocator.free(counts);
+    const first_rows = try allocator.alloc(u32, k);
+    defer allocator.free(first_rows);
+    @memset(counts, 0);
+    for (row_codes, 0..) |ic, i| {
+        const code = ins_to_sorted[ic];
+        if (counts[code] == 0) first_rows[code] = @intCast(i);
+        counts[code] += 1;
+    }
+    for ([_][]const u32{ counts, first_rows }, [_]u32{ 1, 0 }) |values, less| {
+        for (values) |v| {
+            var b8: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b8, v - less, .little);
+            scratch.appendSliceAssumeCapacity(b8[0..stat_width]);
+        }
     }
     return true;
 }
