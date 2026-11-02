@@ -519,6 +519,10 @@ pub const Scan = struct {
     decoded: []storage.OwnedColumn,
     decoded_valid: bool = false,
     views: []ColumnView,
+    /// The zeroed offsets every empty-string placeholder in `decoded` views:
+    /// a row group's placeholders share them instead of each allocating and
+    /// zeroing its own, a row group's worth per string column.
+    zero_offsets: []u32 = &.{},
 
     /// Scan sub-batch cursor (active only when `exec.scan_sub_batch > 0`). The
     /// row group is decoded once; `sub_off`/`sub_count` walk it in sub-batches,
@@ -1965,6 +1969,7 @@ pub const Scan = struct {
         defer if (owned_accountant) |a| a.releaseOwner(owner_allocator);
         self.releaseBatch();
         self.closeCurSegment();
+        self.allocator.free(self.zero_offsets);
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
         if (self.mask_buf3.len > 0) self.allocator.free(self.mask_buf3);
@@ -2988,13 +2993,18 @@ pub const Scan = struct {
 
     /// Cheap empty-string placeholder for `values[code_col]` (a valid view for
     /// any non-code-aware consumer; the real values flow as codes via the
-    /// sidecar). Offsets all-zero, no bytes.
+    /// sidecar). Offsets all-zero, no bytes. It views `zero_offsets`, which
+    /// grow only between row groups: every placeholder of the last one was
+    /// released before this one's columns decode.
     fn emptyStringColumn(self: *Scan, col_type: types.Type, n: u32) !storage.OwnedColumn {
-        const offsets = try self.allocator.alloc(u32, @as(usize, n) + 1);
-        errdefer self.allocator.free(offsets);
-        @memset(offsets, 0);
-        const bytes = try self.allocator.alloc(u8, 0);
-        const sc = storage.OwnedStringColumn{ .offsets = offsets, .bytes = bytes };
+        const len = @as(usize, n) + 1;
+        if (self.zero_offsets.len < len) {
+            const offsets = try self.allocator.alloc(u32, len);
+            @memset(offsets, 0);
+            self.allocator.free(self.zero_offsets);
+            self.zero_offsets = offsets;
+        }
+        const sc = storage.OwnedStringColumn{ .offsets = self.zero_offsets[0..len], .bytes = &.{} };
         return switch (col_type) {
             .varchar => .{ .data = .{ .varchar = sc } },
             .string => .{ .data = .{ .string = sc } },
@@ -3423,7 +3433,7 @@ pub const Scan = struct {
     fn emitRowGroup(self: *Scan, seg: *storage.ReadSegment, rg_count: u32) !Batch {
         var decoded_cols: usize = 0;
         errdefer {
-            for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
+            for (self.decoded[0..decoded_cols]) |*c| self.deinitDecoded(c);
             // A later step (e.g. tombstone application) can fail after
             // `decoded_valid` is set; clear it so the deinit-time
             // `releaseBatch` doesn't free these columns a second time.
@@ -5666,7 +5676,7 @@ pub const Scan = struct {
     fn decodeOwnedViews(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, _: u32) ![]ColumnView {
         var decoded_cols: usize = 0;
         errdefer {
-            for (self.decoded[0..decoded_cols]) |*c| c.deinit(self.allocator);
+            for (self.decoded[0..decoded_cols]) |*c| self.deinitDecoded(c);
             self.decoded_valid = false;
         }
         for (self.out_phys, 0..) |phys, j| {
@@ -5686,9 +5696,17 @@ pub const Scan = struct {
 
     fn releaseDecoded(self: *Scan) void {
         if (self.decoded_valid) {
-            for (self.decoded[0..self.out_phys.len]) |*c| c.deinit(self.allocator);
+            for (self.decoded[0..self.out_phys.len]) |*c| self.deinitDecoded(c);
             self.decoded_valid = false;
         }
+    }
+
+    fn deinitDecoded(self: *Scan, c: *storage.OwnedColumn) void {
+        switch (c.data) {
+            inline .varchar, .string, .char, .json, .nested, .bitmap => |s| if (self.zero_offsets.len > 0 and s.offsets.ptr == self.zero_offsets.ptr) return,
+            else => {},
+        }
+        c.deinit(self.allocator);
     }
 
     /// Where a fused late-mat survivor's `__rowloc` comes from — the compaction
@@ -6249,7 +6267,7 @@ pub const Scan = struct {
 
     fn releaseBatch(self: *Scan) void {
         if (self.decoded_valid) {
-            for (self.decoded) |*c| c.deinit(self.allocator);
+            for (self.decoded) |*c| self.deinitDecoded(c);
             self.decoded_valid = false;
         }
         self.sub_off = 0;
