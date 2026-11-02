@@ -979,6 +979,38 @@ const SeqPart = union(enum) {
     class: struct { class: CharClass, scan: StarScan, count: u32 },
 };
 
+/// How much of a text an anchored `SeqPlan` run read to settle its
+/// outcome: a text that begins with the same `len` bytes settles the same
+/// way with the same captures, and its match ends at the same byte, or at
+/// its own end when `to_end`. `len` is `WHOLE` when the outcome turned on
+/// where the text ends.
+pub const Reach = struct {
+    len: usize = 0,
+    to_end: bool = false,
+
+    pub const WHOLE = std.math.maxInt(usize);
+
+    inline fn read(self: *Reach, upto: usize) void {
+        self.len = @max(self.len, upto);
+    }
+
+    inline fn whole(self: *Reach) void {
+        self.len = WHOLE;
+    }
+
+    /// A run over `input[pos..bound]` that ended at `end`; `open` when it
+    /// would have taken bytes past `bound` had the text held them.
+    inline fn run(self: *Reach, input_len: usize, end: usize, bound: usize, open: bool) void {
+        if (end < bound) {
+            self.read(end + 1);
+        } else if (open and end == input_len) {
+            self.whole();
+        } else {
+            self.read(end);
+        }
+    }
+};
+
 /// A pattern that is one straight sequence of literals, class runs,
 /// optional fixed-width pieces, captures and a final `$`, optionally
 /// `^`-anchored, with no `\b`, alternation or multiline. Such a pattern
@@ -1091,8 +1123,19 @@ const SeqPlan = struct {
 
     /// End of the match starting at `sp`, with its captures in `slots`, or
     /// null. With `budgeted`, also null once `work` runs out. `tail_clear`
-    /// is `tailClearIn` over bytes holding `input`.
-    fn matchAt(self: *const SeqPlan, comptime budgeted: bool, input: []const u8, sp: usize, slots: []?usize, work: *usize, tail_clear: bool) ?usize {
+    /// is `tailClearIn` over bytes holding `input`. With `track`, `reach`
+    /// gathers what the run read of `input` (`Reach`).
+    fn matchAt(
+        self: *const SeqPlan,
+        comptime budgeted: bool,
+        comptime track: bool,
+        input: []const u8,
+        sp: usize,
+        slots: []?usize,
+        work: *usize,
+        tail_clear: bool,
+        reach: if (track) *Reach else void,
+    ) ?usize {
         const Choice = struct { step: usize, pos: usize };
         var choices: [SEQ_MAX_CHOICES]Choice = undefined;
         var n_choices: usize = 0;
@@ -1107,6 +1150,9 @@ const SeqPlan = struct {
                 .literal => {
                     if (exhausted(budgeted, work)) return null;
                     const lit = self.steps[i].literal;
+                    if (track) {
+                        if (input.len - pos >= lit.len) reach.read(pos + lit.len) else reach.whole();
+                    }
                     if (self.literalAt(lit, input, pos)) {
                         pos += lit.len;
                         i += 1;
@@ -1117,7 +1163,9 @@ const SeqPlan = struct {
                     if (exhausted(budgeted, work)) return null;
                     const r = &self.steps[i].run;
                     const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
-                    const end = starRunEnd(&r.scan, &r.class, input[0..@min(input.len, limit)], pos);
+                    const bound = @min(input.len, limit);
+                    const end = starRunEnd(&r.scan, &r.class, input[0..bound], pos);
+                    if (track) reach.run(input.len, end, bound, (!r.shortest and r.max == null) or limit > input.len);
                     if (end - pos >= r.min) {
                         if (budgeted) work.* -|= end - pos;
                         pos = end;
@@ -1129,6 +1177,7 @@ const SeqPlan = struct {
                     if (exhausted(budgeted, work)) return null;
                     const r = &self.steps[i].run_backoff;
                     const end = starRunEnd(&r.scan, &r.class, input, pos);
+                    if (track) reach.run(input.len, end, input.len, true);
                     if (budgeted) work.* -|= end - pos;
                     if (end - pos >= @as(usize, r.backoff) + r.min) {
                         const count = end - pos - r.backoff;
@@ -1145,12 +1194,16 @@ const SeqPlan = struct {
                     const limit = if (r.shortest) pos +| r.min else if (r.max) |m| pos +| m else input.len;
                     const bound = @min(input.len, limit);
                     const end = if (tail_clear) bound else starRunEnd(&r.scan, &r.class, input[0..bound], pos);
+                    if (track) tailReach(r, reach, input.len, pos, end, bound, limit, tail_clear);
                     if (budgeted) work.* -|= end - pos;
                     if (end - pos >= r.min and (!r.to_end or end == input.len)) return end;
                 },
                 .optional => {
                     if (exhausted(budgeted, work)) return null;
                     const o = &self.steps[i].optional;
+                    if (track and o.mode != .never) {
+                        if (input.len - pos >= o.width) reach.read(pos + o.width) else reach.whole();
+                    }
                     const present = o.mode != .never and self.bodyAt(o, input, pos);
                     // Whether the body is there is data: it picks values
                     // here rather than branches, whose misses cost more.
@@ -1177,6 +1230,9 @@ const SeqPlan = struct {
                 },
                 .eol => {
                     if (exhausted(budgeted, work)) return null;
+                    if (track) {
+                        if (pos == input.len) reach.whole() else reach.read(pos + 1);
+                    }
                     if (pos == input.len) {
                         i += 1;
                         continue :step std.meta.activeTag(self.steps[i]);
@@ -1195,6 +1251,28 @@ const SeqPlan = struct {
             setOptional(o.slot, slots, c.pos, if (present) o.width else null);
             pos = if (present) c.pos + o.width else c.pos;
             i = c.step + 1;
+        }
+    }
+
+    /// What the final run `r`, which ended at `end`, read (`Reach`). With
+    /// `tail_clear` it read nothing: the bytes it took are known to be in
+    /// its class, and an unbounded one takes the text to its end.
+    inline fn tailReach(r: anytype, reach: *Reach, input_len: usize, pos: usize, end: usize, bound: usize, limit: usize, tail_clear: bool) void {
+        const unbounded = !r.shortest and r.max == null;
+        if (tail_clear and unbounded) {
+            if (input_len - pos < r.min) return reach.whole();
+            reach.read(pos + r.min);
+            reach.to_end = true;
+            return;
+        }
+        if (tail_clear) {
+            if (limit > input_len) return reach.whole();
+            reach.read(end);
+        } else {
+            reach.run(input_len, end, bound, unbounded or limit > input_len);
+        }
+        if (r.to_end) {
+            if (end == input_len) reach.whole() else reach.read(end + 1);
         }
     }
 
@@ -1930,7 +2008,7 @@ pub const Regex = struct {
         var work: usize = 0;
         if (plan.anchored) {
             if (start > 0) return false;
-            const end = plan.matchAt(false, input, 0, slots, &work, false) orelse return false;
+            const end = plan.matchAt(false, false, input, 0, slots, &work, false, {}) orelse return false;
             slots[0] = 0;
             slots[1] = end;
             return true;
@@ -1945,7 +2023,7 @@ pub const Regex = struct {
                 // A prefiltered pattern can't match empty.
                 if (sp == input.len) return false;
             }
-            if (plan.matchAt(true, input, sp, slots, &work, false)) |end| {
+            if (plan.matchAt(true, false, input, sp, slots, &work, false, {})) |end| {
                 slots[0] = sp;
                 slots[1] = end;
                 return true;
@@ -2512,7 +2590,7 @@ pub const Regex = struct {
         // so the search loop below reduces to one plan run.
         if (self.seq) |*plan| if (plan.anchored and start == 0 and occurrence <= 1) {
             var work: usize = 0;
-            const end = plan.matchAt(false, input, 0, slots, &work, tail_clear) orelse return out.appendSlice(allocator, input);
+            const end = plan.matchAt(false, false, input, 0, slots, &work, tail_clear, {}) orelse return out.appendSlice(allocator, input);
             slots[0] = 0;
             slots[1] = end;
             try expandTemplate(allocator, out, template, input, slots);
@@ -2570,6 +2648,120 @@ pub const Regex = struct {
         return false;
     }
 };
+
+/// REGEXP_REPLACE over texts that tend to share prefixes, as a sorted
+/// dictionary's do: a text that begins with every byte the last matched
+/// text's run read (`Reach`) takes that text's result without a match.
+/// Serves an anchored sequence plan replacing from the text's start,
+/// first match only (`on`); `replace` then stands in for `replaceInto`.
+/// Tracking what a run reads costs a little on every text, so where few
+/// texts share what their neighbour's run read, it pauses.
+pub const PrefixReplace = struct {
+    on: bool,
+    /// The template copies the whole match, which a `Reach.to_end` match
+    /// takes to each text's own end.
+    copies_match: bool,
+    occurrence: usize,
+    last: ?Last = null,
+    /// Texts in the current window, and how many took the last result.
+    window: u32 = 0,
+    reused: u32 = 0,
+    /// Texts left to replace untracked after a window that reused too few.
+    paused: u32 = 0,
+
+    /// Texts per judged window; reuse pays from about one in eight.
+    const WINDOW = 64;
+    const MIN_REUSED = WINDOW / 8;
+    const PAUSE = 1024;
+
+    const Last = struct {
+        text: []const u8,
+        reach: Reach,
+        tail_clear: bool,
+        /// Where the match ended; null when there was none.
+        end: ?usize,
+        /// The template's expansion, in `out`.
+        lo: usize,
+        hi: usize,
+    };
+
+    pub fn init(re: *const Regex, template: []const u8, from_start: bool, occurrence: usize) PrefixReplace {
+        const anchored = if (re.seq) |*plan| plan.anchored else false;
+        return .{
+            .on = anchored and from_start and occurrence <= 1,
+            .copies_match = templateUsesGroup(template, 0),
+            .occurrence = occurrence,
+        };
+    }
+
+    /// `re.replaceInto` of `input` from its start, appended to `out`,
+    /// which must hold every earlier call's result.
+    pub fn replace(
+        self: *PrefixReplace,
+        re: *const Regex,
+        allocator: Allocator,
+        out: *std.ArrayList(u8),
+        input: []const u8,
+        template: []const u8,
+        scratch: *Scratch,
+        tail_clear: bool,
+    ) Error!void {
+        if (self.paused > 0) {
+            self.paused -= 1;
+            return re.replaceInto(allocator, out, input, template, scratch, 0, self.occurrence, tail_clear);
+        }
+        self.window += 1;
+        defer if (self.window == WINDOW) {
+            if (self.reused < MIN_REUSED) self.paused = PAUSE;
+            self.window = 0;
+            self.reused = 0;
+        };
+        if (self.last) |l| if (l.reach.len <= input.len and (tail_clear or !l.tail_clear) and
+            bytesEqual(input[0..l.reach.len], l.text[0..l.reach.len]))
+        {
+            self.reused += 1;
+            const end = l.end orelse return out.appendSlice(allocator, input);
+            const rest = if (l.reach.to_end) input.len else end;
+            try out.ensureUnusedCapacity(allocator, l.hi - l.lo + input.len - rest);
+            out.appendSliceAssumeCapacity(out.items[l.lo..l.hi]);
+            out.appendSliceAssumeCapacity(input[rest..]);
+            return;
+        };
+        if (scratch.slots.len < re.n_slots) {
+            scratch.slots = try scratch.backing.realloc(scratch.slots, re.n_slots);
+        }
+        const slots = scratch.slots[0..re.n_slots];
+        var reach: Reach = .{};
+        var work: usize = 0;
+        const lo = out.items.len;
+        const found = re.seq.?.matchAt(false, true, input, 0, slots, &work, tail_clear, &reach);
+        if (found) |end| {
+            slots[0] = 0;
+            slots[1] = end;
+            try expandTemplate(allocator, out, template, input, slots);
+        }
+        const hi = out.items.len;
+        const rest = found orelse 0;
+        if (rest < input.len) try out.appendSlice(allocator, input[rest..]);
+        const reusable = reach.len != Reach.WHOLE and !(found != null and reach.to_end and self.copies_match);
+        self.last = if (reusable) .{ .text = input, .reach = reach, .tail_clear = tail_clear, .end = found, .lo = lo, .hi = hi } else null;
+    }
+};
+
+/// Whether `expandTemplate` copies capture group `group` into its output.
+fn templateUsesGroup(template: []const u8, group: u8) bool {
+    var i: usize = 0;
+    while (i < template.len) : (i += 1) {
+        const c = template[i];
+        if ((c == '\\' or c == '$') and i + 1 < template.len and template[i + 1] >= '0' and template[i + 1] <= '9') {
+            if (template[i + 1] - '0' == group) return true;
+            i += 1;
+        } else if (c == '\\' and i + 1 < template.len) {
+            i += 1;
+        }
+    }
+    return false;
+}
 
 /// Where the search after a match resumes: its end, or past the whole
 /// UTF-8 character after an empty match, so the next search can't find
@@ -3697,8 +3889,8 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
                 var work: usize = 0;
                 @memset(slots_ref, null);
                 @memset(slots_seq, null);
-                const scanned = re.seq.?.matchAt(false, input, sp, slots_ref, &work, false);
-                const skipped = re.seq.?.matchAt(false, input, sp, slots_seq, &work, true);
+                const scanned = re.seq.?.matchAt(false, false, input, sp, slots_ref, &work, false, {});
+                const skipped = re.seq.?.matchAt(false, false, input, sp, slots_seq, &work, true, {});
                 try std.testing.expectEqual(scanned, skipped);
                 try std.testing.expectEqualSlices(?usize, slots_ref, slots_seq);
                 tail_cleared += 1;
@@ -3721,6 +3913,208 @@ test "regex: sequence plan equals reference matcher (fuzz)" {
     // Both ways an unanchored search ends were exercised.
     try std.testing.expect(handed_on > 0 and compared > 20 * handed_on);
     try std.testing.expect(tail_cleared > 1000);
+}
+
+const reach_patterns = [_][]const u8{
+    "^https?://(?:www\\.)?([^/]+)/.*$",
+    "^https?://(?:www.)?([^/]+)/.*$",
+    "^https?://(?:www\\.)?(?:m\\.)?([^/]+)",
+    "^https?://(?:www\\.)?([^/]+)/.*",
+    "^([^/]+)/(.*)$",
+    "^ab?c?(?:ww\\.)?([^/]+)/.*$",
+    "^[^x]*x[^y]*y$",
+    "^[a-z]{2}[0-9]{1,3}$",
+    "^(ab)?a",
+    "^(?:wd)?(?:wd)?(wd)?w",
+    "^.{3}",
+    "^(?:[0-9]{2}\\.)?([0-9]+)$",
+    "^([^-]+) - .*$",
+    "^([^/]+)a/",
+    "^(?:www\\.)?([^/]+?)w/",
+    "^(?:https|http)://(?:www\\.|)([^/]+)/.*$",
+    "^x.{2,}$",
+    "^a[^/]+?",
+    "^w[^/]{2,5}",
+    "^a[^/]{0,3}$",
+    "^b[^/]*?$",
+    "^a.+$",
+    "^.*$",
+    "^",
+    "^$",
+    "^x*",
+    "a?(b?)c?\\.",
+    "x[ab]+y",
+    "colou?r",
+    "(?:ab)??a",
+    "x(?:yz)?(z)?",
+};
+
+fn reachText(rnd: std.Random, buf: []u8, from: usize) []u8 {
+    const fragments = [_][]const u8{ "http", "https", "://", "www.", "m.", "/", "ab", "a", "b", "wd", "w", ".", "x", "yz", "z", "12", " ", "\n", "colour", "c", "AB", " - ", "-", "a/" };
+    const alphabet = "abc/xyz12. \nwd_AB-";
+    var len = from;
+    if (rnd.boolean()) {
+        const n = rnd.intRangeAtMost(usize, 0, @min(16, buf.len - len));
+        for (buf[len..][0..n]) |*b| b.* = alphabet[rnd.intRangeLessThan(usize, 0, alphabet.len)];
+        len += n;
+    } else while (true) {
+        const f = fragments[rnd.intRangeLessThan(usize, 0, fragments.len)];
+        if (len + f.len > buf.len or rnd.intRangeLessThan(usize, 0, 6) == 0) break;
+        @memcpy(buf[len..][0..f.len], f);
+        len += f.len;
+    }
+    return buf[0..len];
+}
+
+test "regex: a text sharing what a sequence plan read settles the same way (fuzz)" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x2EAC_2026);
+    const rnd = prng.random();
+    var buf: [48]u8 = undefined;
+    var nbuf: [64]u8 = undefined;
+    var shared: u64 = 0;
+    var to_end: u64 = 0;
+    var whole: u64 = 0;
+    for ([_]Options{ .{}, .{ .dot_all = true, .case_insensitive = true } }) |options| for (reach_patterns) |pat| {
+        var re = try Regex.compileWith(allocator, pat, options);
+        defer re.deinit();
+        try std.testing.expect(re.seq != null);
+        const plan = &re.seq.?;
+        const slots_a = try allocator.alloc(?usize, re.n_slots);
+        defer allocator.free(slots_a);
+        const slots_b = try allocator.alloc(?usize, re.n_slots);
+        defer allocator.free(slots_b);
+        for (0..300) |_| {
+            const input = reachText(rnd, &buf, 0);
+            for ([_]bool{ false, true }) |tail_clear| {
+                if (tail_clear and !re.tailClearIn(input)) continue;
+                var reach: Reach = .{};
+                var work: usize = 0;
+                @memset(slots_a, null);
+                const end_a = plan.matchAt(false, true, input, 0, slots_a, &work, tail_clear, &reach);
+                if (reach.len == Reach.WHOLE) {
+                    whole += 1;
+                    continue;
+                }
+                try std.testing.expect(reach.len <= input.len);
+                if (end_a) |e| {
+                    if (reach.to_end) try std.testing.expectEqual(input.len, e) else try std.testing.expect(e <= reach.len);
+                    to_end += @intFromBool(reach.to_end);
+                }
+                for (0..8) |_| {
+                    @memcpy(nbuf[0..reach.len], input[0..reach.len]);
+                    const neighbor = reachText(rnd, &nbuf, reach.len);
+                    if (tail_clear and !re.tailClearIn(neighbor)) continue;
+                    @memset(slots_b, null);
+                    const end_b = plan.matchAt(false, false, neighbor, 0, slots_b, &work, tail_clear, {});
+                    try std.testing.expectEqual(end_a == null, end_b == null);
+                    if (end_a) |e| {
+                        try std.testing.expectEqual(if (reach.to_end) neighbor.len else e, end_b.?);
+                        try std.testing.expectEqualSlices(?usize, slots_a, slots_b);
+                    }
+                    shared += 1;
+                }
+            }
+        }
+    };
+    try std.testing.expect(shared > 100_000 and to_end > 400 and whole > 4000);
+}
+
+test "regex: PrefixReplace gives replaceInto's result over sorted and shuffled texts" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9F1C_2026);
+    const rnd = prng.random();
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(allocator);
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(allocator);
+    var buf: [48]u8 = undefined;
+    for (0..600) |_| {
+        try store.appendSlice(allocator, reachText(rnd, &buf, 0));
+        try ends.append(allocator, store.items.len);
+    }
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer texts.deinit(allocator);
+    for (ends.items, 0..) |e, i| try texts.append(allocator, store.items[if (i == 0) 0 else ends.items[i - 1]..e]);
+    std.mem.sortUnstable([]const u8, texts.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    var scratch = Scratch.init(allocator);
+    defer scratch.deinit();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(allocator);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(allocator);
+    var reused: u64 = 0;
+    const templates = [_][]const u8{ "\\1", "<\\0>", "X", "\\2|\\1", "$0." };
+    for (0..2) |order| {
+        if (order == 1) rnd.shuffle([]const u8, texts.items);
+        for ([_]Options{ .{}, .{ .dot_all = true, .case_insensitive = true } }) |options| for (reach_patterns) |pat| for (templates) |template| {
+            var re = try Regex.compileWith(allocator, pat, options);
+            defer re.deinit();
+            var prefix = PrefixReplace.init(&re, template, true, 0);
+            try std.testing.expectEqual(pat[0] == '^', prefix.on);
+            if (!prefix.on) continue;
+            got.clearRetainingCapacity();
+            var lo: usize = 0;
+            while (lo < texts.items.len) : (lo += 4) {
+                const chunk = texts.items[lo..@min(texts.items.len, lo + 4)];
+                var tail_clear = true;
+                for (chunk) |t| tail_clear = tail_clear and re.tailClearIn(t);
+                for (chunk) |t| {
+                    const at = got.items.len;
+                    const paused = prefix.paused > 0;
+                    try prefix.replace(&re, allocator, &got, t, template, &scratch, tail_clear);
+                    if (!paused) if (prefix.last) |l| {
+                        reused += @intFromBool(l.text.ptr != t.ptr);
+                    };
+                    want.clearRetainingCapacity();
+                    try re.replaceInto(allocator, &want, t, template, &scratch, 0, 0, false);
+                    try std.testing.expectEqualStrings(want.items, got.items[at..]);
+                }
+            }
+        };
+    }
+    try std.testing.expect(reused > 10_000);
+}
+
+test "regex: PrefixReplace pauses where texts rarely share what was read, not where they do" {
+    const allocator = std.testing.allocator;
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(allocator);
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(allocator);
+    // Sorted URLs: a few hosts, each with many paths.
+    for (0..8) |h| for (0..300) |p| {
+        try store.print(allocator, "https://www.host{d}.ru/page/{d:0>4}", .{ h, p });
+        try ends.append(allocator, store.items.len);
+    };
+    var scratch = Scratch.init(allocator);
+    defer scratch.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const cases = [_]struct { pattern: []const u8, pauses: bool }{
+        .{ .pattern = "^https?://(?:www\\.)?([^/]+)/.*$", .pauses = false },
+        // `$` after the captured run: every match reads the whole text.
+        .{ .pattern = "^(.)(.*)$", .pauses = true },
+    };
+    for (cases) |c| {
+        var re = try Regex.compile(allocator, c.pattern);
+        defer re.deinit();
+        var prefix = PrefixReplace.init(&re, "\\1", true, 0);
+        try std.testing.expect(prefix.on);
+        var paused = false;
+        var lo: usize = 0;
+        for (ends.items) |e| {
+            try prefix.replace(&re, allocator, &out, store.items[lo..e], "\\1", &scratch, re.tailClearIn(store.items[lo..e]));
+            paused = paused or prefix.paused > 0;
+            lo = e;
+        }
+        try std.testing.expectEqual(c.pauses, paused);
+    }
 }
 
 test "regex: an unanchored sequence hands pathological rows to the general engine" {
