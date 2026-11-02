@@ -3233,7 +3233,6 @@ pub const Scan = struct {
         }
         t.measured = true;
         t.fits = widest <= std.math.maxInt(u16);
-        std.debug.print("DLTDBG ndv={d} fits={} rows={d}\n", .{ db.ndv, t.fits, t.rows });
         return if (t.fits) t.lens.items else null;
     }
 
