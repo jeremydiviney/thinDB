@@ -1707,6 +1707,20 @@ pub const ParallelScan = struct {
         return fused;
     }
 
+    /// `Scan.tryFuseDerivedFilter` for every chunk scan, before anything is
+    /// fused per chunk.
+    pub fn tryFuseDerivedFilter(self: *ParallelScan, expr: predicate.PredicateExpr, derived: []const Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
+        if (self.mode != .unset or self.compute_fused or self.agg_fused or self.probe_sink != null or self.stage_deferred) return false;
+        if (self.workers.len == 0) return false;
+        for (self.workers) |w| if (w != .segment) return false;
+        // Every chunk scans the same table through the same projection, so
+        // each decides as the first does.
+        if (!try self.workers[0].segment.tryFuseDerivedFilter(expr, derived, registry)) return false;
+        for (self.workers[1..]) |w| _ = try w.segment.tryFuseDerivedFilter(expr, derived, registry);
+        try self.shrinkToSurvivors();
+        return true;
+    }
+
     /// Filter offered above the fused computes. A predicate on base columns
     /// commutes past each worker's Compute into its Scan. One that reads a
     /// derived column (`WHERE a % 32 = 0` lowers to a filter on a hidden

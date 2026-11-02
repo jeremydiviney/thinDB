@@ -690,6 +690,40 @@ pub fn appendDictRows(allocator: Allocator, raw: []const u8, row_count: u32, fla
     try appendRowsValidity(allocator, nulls, rows, out);
 }
 
+/// `appendDictRows` over the rows `[start, start + n)`, read in sequence
+/// with no row list.
+pub fn appendDictRange(allocator: Allocator, raw: []const u8, row_count: u32, flags: storage.format.ColumnBlockFlags, start: usize, n: usize, out: *ColumnStore) !void {
+    var values = raw;
+    var nulls: ?[]const u8 = null;
+    if (flags.has_nulls) {
+        const bm_len = storage.column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    const db = storage.segment_reader.dictBlockOf(values, row_count);
+    const dst_start = out.data.rowCount();
+    switch (out.data) {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| switch (db.code_width) {
+            inline 1, 2, 4 => |w| try appendDictRangeAs(allocator, w, db, start, n, ss),
+            else => try appendDictRangeAs(allocator, 0, db, start, n, ss),
+        },
+        else => unreachable, // the writer only dict-encodes string-family columns
+    }
+    try out.appendValidityRangeFrom(allocator, dst_start, nulls, start, n);
+}
+
+/// `appendDictRange`'s values, reading `width`-byte codes (any width: 0).
+fn appendDictRangeAs(allocator: Allocator, comptime width: u8, db: storage.segment_reader.DictBlock, start: usize, n: usize, ss: *StringStore) !void {
+    var total_bytes: usize = 0;
+    for (start..start + n) |row| total_bytes += db.dictValue(dictCodeAs(width, db, row)).len;
+    try ss.ensureUnusedValueCapacity(allocator, n, total_bytes);
+    for (start..start + n) |row| ss.appendValueAssumeCapacity(db.dictValue(dictCodeAs(width, db, row)));
+}
+
+inline fn dictCodeAs(comptime width: u8, db: storage.segment_reader.DictBlock, row: usize) u32 {
+    return if (width == 0) db.rowCode(row) else db.rowCodeAs(width, row);
+}
+
 /// Survivor-only FSST expansion: decode just the survivor rows off the
 /// cached compressed block — the full row-group string column never
 /// materializes. The scratch holds one decoded value at a time.

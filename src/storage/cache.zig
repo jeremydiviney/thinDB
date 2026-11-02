@@ -233,6 +233,13 @@ pub const Cache = struct {
     /// Doubly-linked LRU list. Head = most recently used; tail = LRU (next evict).
     head: ?*Entry = null,
     tail: ?*Entry = null,
+    /// The condition-cache entries alone, in the same order, so the records
+    /// past their share (`CONDITION_SHARE`) go oldest first without walking
+    /// past column blocks.
+    condition_head: ?*Entry = null,
+    condition_tail: ?*Entry = null,
+    /// The part of `current_bytes` the condition-cache entries hold.
+    condition_bytes: usize = 0,
 
     /// Guards every field below the allocator/capacity. Held only for O(1)
     /// bookkeeping; never across a decompress or decode.
@@ -259,6 +266,13 @@ pub const Cache = struct {
     /// predicate memo (`Config.condition_cache`).
     conditions: bool = true,
 
+    /// The condition-cache entries hold at most 1/CONDITION_SHARE of the
+    /// bytes the cache may hold. A record costs at most a bit per row, but
+    /// every filter that costs work per row keeps one per row group and per
+    /// AND arm, so without a share the records of one-off filters would push
+    /// out the column blocks every query reads.
+    pub const CONDITION_SHARE = 8;
+
     /// 32 ≈ max-dop workers × a few concurrently-expanded string columns; the
     /// pool self-bounds at the 32 largest hot block sizes (~5 MB each on the
     /// 100M ClickBench table → ~160 MB worst case, outside the cache budget).
@@ -276,6 +290,9 @@ pub const Cache = struct {
         /// the decode path needs it to interpret `bytes` (raw vs FOR). Defaults
         /// to `.raw` so callers that don't set it (and tests) behave as before.
         encoding: format.Encoding = .raw,
+        /// Links in the condition-cache entries' list; null for a column block.
+        condition_prev: ?*Entry = null,
+        condition_next: ?*Entry = null,
     };
 
     /// A cache under `controller`'s budget, with a predicate memo of at most
@@ -412,9 +429,35 @@ pub const Cache = struct {
     /// instead. On allocation failure the entry is not stored and `bytes` is left
     /// for the caller to free. Caller MUST `release`.
     pub fn insertPinned(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !*Entry {
-        const inserted = try self.insertPinnedLocked(key, bytes, encoding);
+        const inserted = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk try self.insertLocked(key, bytes, encoding);
+        };
         if (inserted.balance) self.controller.balance();
         return inserted.entry;
+    }
+
+    /// Keep condition-cache record `bytes` for `key`, ownership passing to
+    /// the cache, within the records' share of it (`CONDITION_SHARE`): the
+    /// least recently used records go to make room. Returns false, leaving
+    /// `bytes` to the caller, when the records readers hold leave too little
+    /// room, or on allocation failure.
+    pub fn keepCondition(self: *Cache, key: Key, bytes: []align(16) u8) bool {
+        std.debug.assert(key.content != .column);
+        const inserted = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const share = self.controller.cacheTarget() / CONDITION_SHARE;
+            const cell = huge_page.cellSize(bytes.len);
+            self.evictConditions(share -| cell);
+            if (self.condition_bytes + cell > share) return false;
+            const inserted = self.insertLocked(key, bytes, .raw) catch return false;
+            inserted.entry.pins -= 1;
+            break :blk inserted;
+        };
+        if (inserted.balance) self.controller.balance();
+        return true;
     }
 
     const Inserted = struct {
@@ -425,10 +468,8 @@ pub const Cache = struct {
         balance: bool = false,
     };
 
-    fn insertPinnedLocked(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !Inserted {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    /// Caller holds `mutex`.
+    fn insertLocked(self: *Cache, key: Key, bytes: []align(16) u8, encoding: format.Encoding) !Inserted {
         if (self.map.get(key)) |existing| {
             self.pool.allocator().free(bytes);
             existing.pins += 1;
@@ -455,6 +496,10 @@ pub const Cache = struct {
         // bounds the pool's actual footprint (slab cells round up by class).
         // `miss_bytes` stays logical — it measures bytes decompressed per miss.
         const resident = self.countBlock(bytes, true);
+        if (key.content != .column) {
+            self.linkConditionHead(entry);
+            self.condition_bytes += resident;
+        }
         _ = g_miss_bytes.fetchAdd(bytes.len, .monotonic);
         self.evictUnpinned(self.controller.cacheTarget(), 0);
         self.unbalanced_bytes += resident;
@@ -591,11 +636,7 @@ pub const Cache = struct {
             const prev = v.prev;
             if (v.pins == 0) {
                 if (self.current_bytes - huge_page.cellSize(v.bytes.len) < floor) break;
-                self.unlink(v);
-                _ = self.map.remove(v.key);
-                _ = self.countBlock(v.bytes, false);
-                self.pool.allocator().free(v.bytes);
-                self.allocator.destroy(v);
+                self.remove(v);
                 self.evictions += 1;
                 _ = g_evictions.fetchAdd(1, .monotonic);
             }
@@ -614,18 +655,43 @@ pub const Cache = struct {
         var cur = self.tail;
         while (cur) |e| {
             const prev = e.prev;
-            if (e.key.table_uid == table_uid and e.pins == 0) {
-                self.unlink(e);
-                _ = self.map.remove(e.key);
-                _ = self.countBlock(e.bytes, false);
-                self.pool.allocator().free(e.bytes);
-                self.allocator.destroy(e);
-            }
+            if (e.key.table_uid == table_uid and e.pins == 0) self.remove(e);
             cur = prev;
         }
     }
 
+    /// Evict unpinned condition-cache entries, least recently used first,
+    /// until they hold at most `target` bytes. Caller holds `mutex`.
+    fn evictConditions(self: *Cache, target: usize) void {
+        var victim = self.condition_tail;
+        while (self.condition_bytes > target) {
+            const v = victim orelse break;
+            victim = v.condition_prev;
+            if (v.pins == 0) {
+                self.remove(v);
+                self.evictions += 1;
+            }
+        }
+    }
+
+    /// Unlink, unmap and free unpinned `entry`. Caller holds `mutex`.
+    fn remove(self: *Cache, entry: *Entry) void {
+        self.unlink(entry);
+        _ = self.map.remove(entry.key);
+        const cell = self.countBlock(entry.bytes, false);
+        if (entry.key.content != .column) {
+            self.unlinkCondition(entry);
+            self.condition_bytes -= cell;
+        }
+        self.pool.allocator().free(entry.bytes);
+        self.allocator.destroy(entry);
+    }
+
     fn touch(self: *Cache, entry: *Entry) void {
+        if (entry.key.content != .column and self.condition_head != entry) {
+            self.unlinkCondition(entry);
+            self.linkConditionHead(entry);
+        }
         if (self.head == entry) return;
         self.unlink(entry);
         self.linkHead(entry);
@@ -644,6 +710,21 @@ pub const Cache = struct {
         if (entry.next) |n| n.prev = entry.prev else self.tail = entry.prev;
         entry.prev = null;
         entry.next = null;
+    }
+
+    fn linkConditionHead(self: *Cache, entry: *Entry) void {
+        entry.condition_prev = null;
+        entry.condition_next = self.condition_head;
+        if (self.condition_head) |h| h.condition_prev = entry;
+        self.condition_head = entry;
+        if (self.condition_tail == null) self.condition_tail = entry;
+    }
+
+    fn unlinkCondition(self: *Cache, entry: *Entry) void {
+        if (entry.condition_prev) |p| p.condition_next = entry.condition_next else self.condition_head = entry.condition_next;
+        if (entry.condition_next) |n| n.condition_prev = entry.condition_prev else self.condition_tail = entry.condition_prev;
+        entry.condition_prev = null;
+        entry.condition_next = null;
     }
 };
 
@@ -686,6 +767,38 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expectEqualStrings("hello", e2.bytes);
     try std.testing.expectEqual(@as(u64, 1), c.hits);
     c.release(e2);
+}
+
+test "condition records keep to their share, oldest out first, past no column block or pinned record" {
+    const allocator = std.testing.allocator;
+    var controller = memory.MemoryPool.init(64 << 10);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
+    defer c.deinit();
+    const share = controller.cacheTarget() / Cache.CONDITION_SHARE;
+    const record_len = 512;
+    const records = share / record_len + 4;
+    const block: Key = .{ .segment_id = 1, .row_group_idx = 0, .column_idx = 0 };
+    try put(&c, block, try adup(allocator, "block"));
+    const Rec = struct {
+        fn key(i: usize) Key {
+            return .{ .segment_id = 1, .row_group_idx = @intCast(i), .column_idx = 0, .content = .matched_rows, .predicate = 7 };
+        }
+    };
+    for (0..records) |i| {
+        try std.testing.expect(c.keepCondition(Rec.key(i), try allocator.alignedAlloc(u8, .@"16", record_len)));
+    }
+    try std.testing.expect(c.condition_bytes <= share);
+    try std.testing.expect(c.acquireCondition(Rec.key(0)) == null);
+    c.release(c.acquire(block).?);
+
+    const kept = share / record_len;
+    var pinned: [64]*Cache.Entry = undefined;
+    for (pinned[0..kept], records - kept..) |*e, i| e.* = c.acquireCondition(Rec.key(i)).?;
+    defer for (pinned[0..kept]) |e| c.release(e);
+    const refused = try allocator.alignedAlloc(u8, .@"16", record_len);
+    defer allocator.free(refused);
+    try std.testing.expect(!c.keepCondition(Rec.key(records), refused));
 }
 
 test "predicate memo: at most its size, lossy per set, off when tiny" {

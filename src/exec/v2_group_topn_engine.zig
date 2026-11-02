@@ -554,6 +554,8 @@ pub const RunRequest = struct {
     filter_expr: ?exec.PredicateExpr = null,
     /// Filters each batch once `derived` has added its columns.
     residual_filter: ?exec.PredicateExpr = null,
+    /// Computed and filtered on by each scan (`Scan.tryFuseDerivedFilter`).
+    computed_where: ?exec.ComputedWhere = null,
     /// Hints the consumer offered on scan columns; every scan gets them.
     offered_prunes: exec.Scan.OfferedPrunes = .{},
 };
@@ -668,7 +670,7 @@ fn runArenaWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     var workspace: SiloCore.SiloGridWorkspace = .{};
     var rows: std.ArrayListUnmanaged(SiloCore.TopRow) = .empty;
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.offered_prunes, &rows, &workspace);
+    try runHarness(arena_allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.computed_where, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -689,7 +691,7 @@ fn runFreshWorkspace(allocator: Allocator, request: RunRequest, cpus: []const us
     errdefer rows.deinit(allocator);
 
     const core_t0 = exec.prof.nowTicks();
-    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.offered_prunes, &rows, &workspace);
+    try runHarness(allocator, request.table, request.snapshot, cpus, request.shape, request.params, request.scan_columns, request.derived, request.udf_registry, exec.memory.accountantOf(allocator), request.filter_expr, request.residual_filter, request.computed_where, request.offered_prunes, &rows, &workspace);
     times.core_ticks = exec.prof.nowTicks() - core_t0;
 
     const copy_t0 = exec.prof.nowTicks();
@@ -803,6 +805,7 @@ fn runHarness(
     resources: ?*exec.memory.MemoryAccountant,
     filter_expr: ?exec.PredicateExpr,
     residual_filter: ?exec.PredicateExpr,
+    computed_where: ?exec.ComputedWhere,
     offered_prunes: exec.Scan.OfferedPrunes,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
     workspace: *SiloCore.SiloGridWorkspace,
@@ -1085,6 +1088,7 @@ fn runHarness(
         .resources = resources,
         .filter_expr = filter_expr,
         .residual_filter = residual_filter,
+        .computed_where = computed_where,
         .offered_prunes = offered_prunes,
         .shared_stage_builders = params.shared_stage_builders,
         .distinct_eval = params.distinct_eval,
@@ -1147,7 +1151,7 @@ fn runCountSketch(
         defer heavy.deinit(allocator);
         heavy.floor = floor;
         heavy.input_rows = snapshotRows(cfg.snapshot);
-        if (cfg.filter_expr != null and rowBitsFit(allocator, cfg.snapshot, 1)) {
+        if ((cfg.filter_expr != null or cfg.computed_where != null) and rowBitsFit(allocator, cfg.snapshot, 1)) {
             heavy.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
         }
         if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;

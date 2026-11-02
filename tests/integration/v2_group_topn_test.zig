@@ -3421,7 +3421,7 @@ test "V2 COUNT top-K: the sketch counts dictionary-collapsed rows by their repea
         // sketch, which counts and keeps only the rows that pass it.
         const where_sql = "SELECT REGEXP_REPLACE(url, '^https?://([^/]+)/.*$', '\\1') AS k, COUNT(*) AS c FROM hits WHERE w + 1 > 507 GROUP BY k ORDER BY c DESC LIMIT 10";
         errdefer std.debug.print("dop {d}: {s}\n", .{ dop, where_sql });
-        try std.testing.expect(try planContains(a, db, where_sql, "residual filter"));
+        try std.testing.expect(try planContains(a, db, where_sql, "computed filter in scan"));
         var wq = try runSql(a, db, where_sql);
         defer wq.deinit();
         var where_rank: usize = 0;
@@ -3918,14 +3918,22 @@ test "grouped engines collapse rows by string codes combined with other source c
     }
 }
 
-test "grouped engines filter on computed WHERE operands after the Compute" {
+/// `vplus1(x)`: x + 1, registered volatile, so a filter over it can't go to
+/// the scan.
+fn volatilePlusOne(ctx: *const thindb.udf.ScalarContext, args: []const thindb.storage.ColumnView, out: *thindb.engine.ColumnStore, count: usize) !void {
+    for (args[0].data.int[0..count]) |x| try out.data.bigint.append(ctx.allocator, @as(i64, x) + 1);
+}
+
+test "grouped engines filter on computed WHERE operands in the scan, or after the Compute" {
     // A WHERE conjunct over a computed operand (`x + 1 > 5`,
-    // `octet_length(u) > 1`) filters the Compute's output inside the grouped
-    // engine, while the other conjuncts still fuse into the scan. The rows
-    // it reads stay whole through a collapse, a hashed key it reads keeps
-    // its bytes, and an unordered LIMIT doesn't pick its groups from rows
-    // the filter would drop. A key over a column that arrives as byte
-    // lengths evaluates after the filter, on the lengths of the rows kept.
+    // `octet_length(u) > 1`) goes to the grouped engine's scans, which
+    // compute it themselves, alongside the conjuncts over table columns. One
+    // over a volatile function (`vplus1`) never does: it filters the
+    // Compute's output. Either way the rows it reads stay whole through a
+    // collapse, a hashed key it reads keeps its bytes, and an unordered LIMIT
+    // doesn't pick its groups from rows the filter would drop. A key over a
+    // column that arrives as byte lengths evaluates after the filter, on the
+    // lengths of the rows kept.
     const allocator = std.testing.allocator;
     const words = [_][]const u8{ "a", "bb", "cccc", "ddddd", "", "eeeeeeee" };
     const uppers = [_][]const u8{ "A", "BB", "CCCC", "DDDDD", "", "EEEEEEEE" };
@@ -3938,6 +3946,7 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
         var db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .row_group_size = 64, .auto_flush_secs = 0 });
         defer db.close();
         try exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT NOT NULL, s STRING NOT NULL, u STRING NOT NULL, x INT NOT NULL, w BIGINT NOT NULL, b INT NOT NULL)");
+        try db.registerScalarUdf(.{ .name = "vplus1", .arg_types = &.{.int}, .return_type = .bigint, .kernel = volatilePlusOne });
         var count_x: [words.len]i64 = @splat(0);
         var sum_x: [words.len]i64 = @splat(0);
         var count_qq_not1: [words.len]i64 = @splat(0);
@@ -3998,17 +4007,21 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
                 try want_wide.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{d}", .{ up, g, sum_w[si][g] }));
             }
         }
+        const in_scan = true;
+        const above = false;
         const cases = .{
-            .{ "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE x + 1 > 5 GROUP BY s ORDER BY c DESC LIMIT 100", &want_sum },
-            .{ "SELECT upper(s) AS k, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 AND g <> 1 GROUP BY k ORDER BY c DESC LIMIT 100", &want_mixed },
-            .{ "SELECT s, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 OR s = 'a' GROUP BY s ORDER BY c DESC LIMIT 100", &want_or },
-            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t WHERE upper(u) <> 'QQ' GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_strings },
-            .{ "SELECT upper(s) AS k, g, SUM(w) AS sw FROM t WHERE w DIV 1000003 >= 0 GROUP BY k, g ORDER BY sw DESC LIMIT 100", &want_wide },
-            .{ "SELECT octet_length(s) AS l, COUNT(*) AS c FROM t WHERE x + 1 > 5 GROUP BY l ORDER BY c DESC LIMIT 100", &want_lengths },
+            .{ "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE x + 1 > 5 GROUP BY s ORDER BY c DESC LIMIT 100", &want_sum, in_scan },
+            .{ "SELECT s, COUNT(*) AS c, SUM(x) AS sx FROM t WHERE vplus1(x) > 5 GROUP BY s ORDER BY c DESC LIMIT 100", &want_sum, above },
+            .{ "SELECT upper(s) AS k, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 AND g <> 1 GROUP BY k ORDER BY c DESC LIMIT 100", &want_mixed, in_scan },
+            .{ "SELECT s, COUNT(*) AS c FROM t WHERE octet_length(u) > 1 OR s = 'a' GROUP BY s ORDER BY c DESC LIMIT 100", &want_or, in_scan },
+            .{ "SELECT lower(s) AS a, u, COUNT(*) AS c FROM t WHERE upper(u) <> 'QQ' GROUP BY a, u ORDER BY c DESC LIMIT 100", &want_strings, in_scan },
+            .{ "SELECT upper(s) AS k, g, SUM(w) AS sw FROM t WHERE w DIV 1000003 >= 0 GROUP BY k, g ORDER BY sw DESC LIMIT 100", &want_wide, in_scan },
+            .{ "SELECT octet_length(s) AS l, COUNT(*) AS c FROM t WHERE x + 1 > 5 GROUP BY l ORDER BY c DESC LIMIT 100", &want_lengths, in_scan },
+            .{ "SELECT octet_length(s) AS l, COUNT(*) AS c FROM t WHERE vplus1(x) > 5 GROUP BY l ORDER BY c DESC LIMIT 100", &want_lengths, above },
         };
         inline for (cases) |c| {
             errdefer std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });
-            try std.testing.expect(try planContains(allocator, db, c[0], "residual filter"));
+            try std.testing.expectEqual(c[2], try planContains(allocator, db, c[0], "computed filter in scan"));
             const got = try sortedRowTexts(allocator, arena, db, c[0]);
             std.mem.sort([]const u8, c[1].items, {}, textLess);
             try std.testing.expectEqual(c[1].items.len, got.len);
@@ -4016,14 +4029,19 @@ test "grouped engines filter on computed WHERE operands after the Compute" {
         }
 
         // The first blocks in scan order all fail the filter.
-        const unordered = "SELECT b, COUNT(*) AS c FROM t WHERE b + 1 > 40 GROUP BY b LIMIT 1";
-        errdefer std.debug.print("dop {d}: {s}\n", .{ dop, unordered });
-        try std.testing.expect(try planContains(allocator, db, unordered, "residual filter"));
-        const got = try sortedRowTexts(allocator, arena, db, unordered);
-        try std.testing.expectEqual(@as(usize, 1), got.len);
-        var cells = std.mem.splitScalar(u8, got[0], '|');
-        try std.testing.expect(try std.fmt.parseInt(i64, cells.next().?, 10) >= 40);
-        try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{block_rows}), cells.next().?);
+        const unordered = .{
+            .{ "SELECT b, COUNT(*) AS c FROM t WHERE b + 1 > 40 GROUP BY b LIMIT 1", in_scan },
+            .{ "SELECT b, COUNT(*) AS c FROM t WHERE vplus1(b) > 40 GROUP BY b LIMIT 1", above },
+        };
+        inline for (unordered) |c| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, c[0] });
+            try std.testing.expectEqual(c[1], try planContains(allocator, db, c[0], "computed filter in scan"));
+            const got = try sortedRowTexts(allocator, arena, db, c[0]);
+            try std.testing.expectEqual(@as(usize, 1), got.len);
+            var cells = std.mem.splitScalar(u8, got[0], '|');
+            try std.testing.expect(try std.fmt.parseInt(i64, cells.next().?, 10) >= 40);
+            try std.testing.expectEqualStrings(std.fmt.comptimePrint("{d}", .{block_rows}), cells.next().?);
+        }
     }
 }
 

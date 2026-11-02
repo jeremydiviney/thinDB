@@ -319,6 +319,12 @@ pub const VTable = struct {
     /// its own masking. The borrowed view the Scan builds lives entirely
     /// inside one `next()` call — no cross-operator lifetime contract.
     tryFuseFilter: *const fn (ptr: *anyopaque, expr: predicate.PredicateExpr) anyerror!bool,
+    /// Offer a filter that reads computed columns (`derived`, over this
+    /// operator's output) to evaluate in place. A Scan accepts when every
+    /// column the computed ones read is a table column; it then computes
+    /// them itself, so the condition cache and the predicate memo cover the
+    /// filter. Every other operator declines.
+    tryFuseDerivedFilter: *const fn (ptr: *anyopaque, expr: predicate.PredicateExpr, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) anyerror!bool,
     /// Offer a projection Compute (derived columns) to this operator to run
     /// internally. ParallelScan accepts row-local derived (so the per-row
     /// scalar work — e.g. REGEXP_REPLACE — runs in its parallel workers); every
@@ -954,6 +960,11 @@ pub const Query = struct {
         return self.vtable.tryFuseFilter(self.ptr, expr);
     }
 
+    /// See `VTable.tryFuseDerivedFilter`.
+    pub fn tryFuseDerivedFilter(self: *Query, expr: predicate.PredicateExpr, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) !bool {
+        return self.vtable.tryFuseDerivedFilter(self.ptr, expr, derived, registry);
+    }
+
     /// Offer a projection Compute to this operator to absorb. Returns true if it
     /// took ownership (caller becomes a pass-through). See `VTable.tryFuseCompute`.
     pub fn tryFuseCompute(self: *Query, derived: []const @import("compute.zig").Derived) !bool {
@@ -1305,6 +1316,11 @@ fn OpWrapper(comptime Op: type) type {
             const o: *Op = @ptrCast(@alignCast(ptr));
             return o.tryFuseFilter(expr);
         }
+        fn tryFuseDerivedFilterWrap(ptr: *anyopaque, expr: predicate.PredicateExpr, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) anyerror!bool {
+            if (!@hasDecl(Op, "tryFuseDerivedFilter")) return false;
+            const o: *Op = @ptrCast(@alignCast(ptr));
+            return o.tryFuseDerivedFilter(expr, derived, registry);
+        }
         fn tryFuseComputeWrap(ptr: *anyopaque, derived: []const @import("compute.zig").Derived, registry: ?*const @import("../udf.zig").UdfRegistry) anyerror!bool {
             if (!@hasDecl(Op, "tryFuseCompute")) return false;
             const o: *Op = @ptrCast(@alignCast(ptr));
@@ -1391,6 +1407,7 @@ fn OpWrapper(comptime Op: type) type {
             .addPruneSet = addPruneSetWrap,
             .rowSetTargetRows = rowSetTargetRowsWrap,
             .tryFuseFilter = tryFuseFilterWrap,
+            .tryFuseDerivedFilter = tryFuseDerivedFilterWrap,
             .tryFuseCompute = tryFuseComputeWrap,
             .tryFuseAggregate = tryFuseAggregateWrap,
             .tryFuseProbe = tryFuseProbeWrap,
@@ -1743,6 +1760,8 @@ pub const statsOverlapPredicate = predicate.statsOverlapPredicate;
 
 pub const Scan = @import("scan.zig").Scan;
 pub const KeyBoundSpec = @import("scan.zig").KeyBoundSpec;
+pub const DerivedFilter = @import("derived_filter.zig").DerivedFilter;
+pub const ComputedWhere = @import("derived_filter.zig").ComputedWhere;
 pub const RowGroupSlice = @import("scan.zig").RowGroupSlice;
 pub const ParallelScan = @import("parallel_scan.zig").ParallelScan;
 /// True if a derived projection column is row-local (so a parallel scan can run

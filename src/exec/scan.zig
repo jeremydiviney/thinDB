@@ -78,6 +78,9 @@ const getenv = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const 
 const PredicateOp = predicate.PredicateOp;
 const filter_mod = @import("filter.zig");
 const condition_cache = @import("condition_cache.zig");
+const DerivedFilter = @import("derived_filter.zig").DerivedFilter;
+const Derived = @import("compute.zig").Derived;
+const UdfRegistry = @import("../udf.zig").UdfRegistry;
 
 const rowloc = @import("rowloc.zig");
 
@@ -585,6 +588,10 @@ pub const Scan = struct {
     /// compacted survivor batch. The expr's backing memory is owned by the
     /// fusing Filter (which outlives this Scan), so the Scan never frees it.
     fused_filter: ?PredicateExpr = null,
+    /// The filter's conjuncts that read computed columns
+    /// (`tryFuseDerivedFilter`): they apply after `fused_filter`, to the
+    /// rows it leaves. Owned.
+    derived_filter: ?*DerivedFilter = null,
     /// Set by `setKeyBound`: the guided filter path drops rows the bound
     /// rules out, and row groups whose stats it rules out are skipped. Other
     /// paths emit those rows; the consumer ranks what it gets either way.
@@ -814,6 +821,8 @@ pub const Scan = struct {
         /// `digests_whole`, else those flagged in `digests_known`.
         digests_whole: bool = false,
         digests_known: std.ArrayListUnmanaged(bool) = .empty,
+        digests_wanted: std.ArrayListUnmanaged(bool) = .empty,
+        digests_todo: std.ArrayListUnmanaged(u32) = .empty,
         /// The consumer reads only the dictionary's values when they all
         /// occur, so a whole row group skips decoding its codes.
         entries_only: bool = false,
@@ -844,6 +853,8 @@ pub const Scan = struct {
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
             self.digests_known.deinit(allocator);
+            self.digests_wanted.deinit(allocator);
+            self.digests_todo.deinit(allocator);
             self.entry_counts.deinit(allocator);
             self.entry_rows.deinit(allocator);
             self.entry_pass.deinit(allocator);
@@ -1644,7 +1655,7 @@ pub const Scan = struct {
     /// and any filter reads that column alone.
     fn countsEntries(self: *const Scan) bool {
         return self.out_phys.len == 1 and self.n_dicts == 1 and self.dict_bufs[0].counted and
-            self.filter_phys.len == 0 and self.n_coded == 0 and self.n_lengths == 0;
+            self.filter_phys.len == 0 and self.n_coded == 0 and self.n_lengths == 0 and self.derived_filter == null;
     }
 
     /// Emit row group `rg_idx` as its dictionary's entries, each counted by
@@ -1725,7 +1736,7 @@ pub const Scan = struct {
     /// Whether a scan that only counts its rows can count a row group by its
     /// filter's column's dictionary entries: the filter reads one column.
     fn countsFilterEntries(self: *const Scan) bool {
-        return self.out_phys.len == 0 and !self.emit_loc and self.filter_phys.len == 1;
+        return self.out_phys.len == 0 and !self.emit_loc and self.filter_phys.len == 1 and self.derived_filter == null;
     }
 
     /// The rows of row group `rg_idx` that `expr` passes, testing it once per
@@ -1777,16 +1788,16 @@ pub const Scan = struct {
         };
     }
 
-    /// Fill the digests of the dictionary entries `buf.codes` reference. A
-    /// batch with fewer codes than the dictionary has entries hashes just the
-    /// entries they name, so a selective filter over a large dictionary
-    /// hashes a few survivors instead of the whole dictionary; any other
-    /// batch hashes every entry, once per held block.
+    /// Fill the digests of the dictionary entries `buf.codes` reference,
+    /// each once per held block. A filtered batch hashes just the entries
+    /// its codes name, however many rows share them: a filter keeping a few
+    /// of a large dictionary's values hashes those few. Codes outnumbering
+    /// the entries mark theirs first and hash them in dictionary order.
     fn digestBlockDict(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock, every_value: bool) !void {
         if (buf.digests_whole) return;
         const digests = buf.digests.items;
         const codes = buf.codes.items;
-        if (every_value or codes.len >= db.ndv) {
+        if (every_value) {
             for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             buf.digests_whole = true;
             return;
@@ -1796,10 +1807,41 @@ pub const Scan = struct {
             @memset(buf.digests_known.items, false);
         }
         const known = buf.digests_known.items;
-        for (codes) |c| if (!known[c]) {
-            known[c] = true;
+        buf.digests_todo.clearRetainingCapacity();
+        try buf.digests_todo.ensureTotalCapacity(self.allocator, @min(codes.len, db.ndv));
+        if (codes.len < db.ndv) {
+            for (codes) |c| if (!known[c]) {
+                known[c] = true;
+                buf.digests_todo.appendAssumeCapacity(c);
+            };
+        } else {
+            try buf.digests_wanted.resize(self.allocator, db.ndv);
+            const wanted = buf.digests_wanted.items;
+            @memset(wanted, false);
+            for (codes) |c| wanted[c] = true;
+            for (wanted, known, 0..) |w, *k, c| if (w and !k.*) {
+                k.* = true;
+                buf.digests_todo.appendAssumeCapacity(@intCast(c));
+            };
+        }
+        digestEntries(db, buf.digests_todo.items, digests);
+    }
+
+    /// Hash the dictionary entries `todo` names into `digests`, fetching
+    /// each entry's bytes a few entries ahead: a filtered row group's
+    /// entries lie scattered over a dictionary nothing else has read (a
+    /// condition-cache hit evaluates no filter over it), and hashing them
+    /// one memory wait at a time costs several times the hashing itself.
+    fn digestEntries(db: storage.segment_reader.DictBlock, todo: []const u32, digests: []u128) void {
+        const ahead = 8;
+        for (todo, 0..) |c, i| {
+            if (i + ahead < todo.len) {
+                const coming = db.dictValue(todo[i + ahead]);
+                @prefetch(coming.ptr, .{});
+                if (coming.len > 64) @prefetch(coming.ptr + 64, .{});
+            }
             digests[c] = exec.stringKeyDigest(db.dictValue(c));
-        };
+        }
     }
 
     /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when
@@ -1966,6 +2008,7 @@ pub const Scan = struct {
         for (self.in_prunes.items) |hint| self.allocator.free(hint.values);
         self.in_prunes.deinit(self.allocator);
         self.key_in_sets.deinit(self.allocator);
+        if (self.derived_filter) |df| df.destroy();
         for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
         self.filter_rewritten.deinit(self.allocator);
         if (self.seg_skip) |s| self.allocator.free(s);
@@ -2031,7 +2074,7 @@ pub const Scan = struct {
     /// emits compacted survivors, not raw row groups). ParallelScan reads this
     /// to choose its execution strategy.
     pub fn fusedActive(self: *const Scan) bool {
-        return self.fused_filter != null;
+        return self.fused_filter != null or self.derived_filter != null;
     }
 
     /// Accept a full predicate for scan-side in-place filtering. A scan that
@@ -2065,6 +2108,51 @@ pub const Scan = struct {
         self.keyBloomPrunePass() catch {};
         try self.orderFusedConjuncts();
         return true;
+    }
+
+    /// Accept `expr`, a filter whose conjuncts may read the computed columns
+    /// `derived` defines over this scan's table: the conjuncts that read
+    /// none fuse as `tryFuseFilter` takes them, and the others become the
+    /// `derived_filter`, which computes what they read itself. Declines,
+    /// changing nothing, when no conjunct reads a computed column or
+    /// `DerivedFilter.create` declines them.
+    pub fn tryFuseDerivedFilter(self: *Scan, expr: PredicateExpr, derived: []const Derived, registry: ?*const UdfRegistry) !bool {
+        if (self.derived_filter != null) return false;
+        const conjuncts: []const PredicateExpr = switch (expr) {
+            .@"and" => |children| children,
+            else => (&expr)[0..1],
+        };
+        var computed: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer computed.deinit(self.allocator);
+        var plain: std.ArrayListUnmanaged(PredicateExpr) = .empty;
+        defer plain.deinit(self.allocator);
+        for (conjuncts) |c| {
+            const reads_derived = for (derived) |d| {
+                if (predicate.touchesColumn(c, d.name)) break true;
+            } else false;
+            try (if (reads_derived) &computed else &plain).append(self.allocator, c);
+        }
+        if (computed.items.len == 0) return false;
+        const computed_expr = try self.ownedConjunction(computed.items);
+        const df = (try DerivedFilter.create(self.allocator, self.table.schema.columns, computed_expr, derived, registry)) orelse return false;
+        errdefer df.destroy();
+        if (plain.items.len > 0 and !try self.tryFuseFilter(try self.ownedConjunction(plain.items))) {
+            df.destroy();
+            return false;
+        }
+        self.derived_filter = df;
+        self.filter_memo = null;
+        return true;
+    }
+
+    /// `arms` as one predicate, an AND when there are several, in memory
+    /// this scan owns.
+    fn ownedConjunction(self: *Scan, arms: []const PredicateExpr) !PredicateExpr {
+        if (arms.len == 1) return arms[0];
+        const owned = try self.allocator.dupe(PredicateExpr, arms);
+        errdefer self.allocator.free(owned);
+        try self.filter_rewritten.append(self.allocator, owned);
+        return .{ .@"and" = owned };
     }
 
     /// Evaluate `src`'s fused filter as `src` does: over the same table, with
@@ -3149,7 +3237,7 @@ pub const Scan = struct {
     /// The consumer must decline before changing its state. Borrowed blocks
     /// remain pinned only during consume; ordinary Batch lifetimes are unchanged.
     pub fn consume_encoded(self: *Scan, consumer: anytype) !bool {
-        if (self.fused_filter != null or self.emit_loc or self.n_coded != 0 or self.n_hashed != 0 or self.n_lengths != 0 or self.out_phys.len == 0) return false;
+        if (self.fused_filter != null or self.derived_filter != null or self.emit_loc or self.n_coded != 0 or self.n_hashed != 0 or self.n_lengths != 0 or self.out_phys.len == 0) return false;
         if (self.sub_off < self.sub_count) return false;
         self.releaseBatch();
         while (self.phase == .segments) {
@@ -3226,7 +3314,7 @@ pub const Scan = struct {
             if (ff == .always and !ff.always) return null;
             return self.nextFiltered();
         }
-        if (self.key_bound != null or self.row_sieve != null) return self.nextFiltered();
+        if (self.derived_filter != null or self.key_bound != null or self.row_sieve != null) return self.nextFiltered();
 
         // Scan sub-batch experiment: serve the next slice of the already-decoded
         // row group without releasing or re-decoding it.
@@ -3609,7 +3697,7 @@ pub const Scan = struct {
                     return self.countedBatch(n);
                 }
             }
-            if (self.key_bound == null and self.sievedRows(self.cur_rg_idx, rg.row_count) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
+            if (self.key_bound == null and self.derived_filter == null and self.sievedRows(self.cur_rg_idx, rg.row_count) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
             if (self.out_phys.len == 0 and !self.emit_loc) {
                 if (self.conditionCount(memo, seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count)) |n| {
                     self.rgs_condition_hits += 1;
@@ -3643,7 +3731,7 @@ pub const Scan = struct {
             }
 
             self.rg_unmatched = .none;
-            const reused = if (memo.n_cond > 0) try self.filterByConditions(memo, seg, this_rg, rg_first, rg_count, expr) else null;
+            const reused = if (memo.cond_whole != null) try self.filterByConditions(memo, seg, this_rg, rg_first, rg_count, expr) else null;
             if (reused != null) self.rgs_condition_hits += 1;
             const matched = reused orelse try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             self.noteUnmatched(memo, seg, this_rg);
@@ -3700,7 +3788,7 @@ pub const Scan = struct {
         rg_count: u32,
         expr: PredicateExpr,
     ) !usize {
-        if (try self.tryFusedLeafGather(seg, rg_idx, rg_count, expr)) |m| return m;
+        if (self.derived_filter == null) if (try self.tryFusedLeafGather(seg, rg_idx, rg_count, expr)) |m| return m;
         const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
         defer if (tomb_mask) |m| self.allocator.free(m);
 
@@ -3711,7 +3799,7 @@ pub const Scan = struct {
         // doesn't apply (non-comparison op, string/LIKE/sub-query leaf, an
         // un-projectable column), so the borrow / owned-decode paths below run
         // unchanged (and the borrow path is itself per-column FOR-aware now).
-        if (try self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, null)) |matched| {
+        if (try self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, null, false)) |matched| {
             return matched;
         }
 
@@ -3771,7 +3859,9 @@ pub const Scan = struct {
     /// `seeded` is set when the mask already holds condition-cache records
     /// (`filterByConditions`): for an AND, a bit per child they applied, and
     /// the other children are evaluated only on the rows they left; any
-    /// other filter is applied whole and nothing is evaluated.
+    /// other filter is applied whole and nothing is evaluated. `seeded_whole`
+    /// says the records were the whole filter's, the derived filter's
+    /// conjuncts included.
     fn tryFilterForGuided(
         self: *Scan,
         seg: *storage.ReadSegment,
@@ -3780,9 +3870,11 @@ pub const Scan = struct {
         tomb_mask: ?[]const bool,
         expr: PredicateExpr,
         seeded: ?u64,
+        seeded_whole: bool,
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
         const _tp = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        var note_whole = false;
         if (seeded == null or expr == .@"and") switch (expr) {
             // A key bound with no WHERE behind it.
             .always => |keep_all| {
@@ -3848,10 +3940,16 @@ pub const Scan = struct {
                 if (!live) self.rg_unmatched = if (steps == 1 and first_alone) .first_arm else .whole;
                 // Seeded or not, the mask is now the whole AND over every
                 // stored row; with no step, it is the records it started from.
-                if (steps > 0) self.noteWholeCondition(seg, rg_idx, mask[0..rg_count]);
+                note_whole = steps > 0;
             },
             else => return null,
         };
+        if (self.derived_filter != null and !seeded_whole) {
+            try self.applyDerivedFilter(.{ .segment = .{ .seg = seg, .rg_idx = rg_idx, .rg_count = rg_count } }, null, mask[0..rg_count]);
+            if (self.rg_unmatched == .none and std.mem.indexOfScalar(bool, mask[0..rg_count], true) == null) self.rg_unmatched = .whole;
+            note_whole = true;
+        }
+        if (note_whole) self.noteWholeCondition(seg, rg_idx, mask[0..rg_count]);
         self.rgs_guided += 1;
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
@@ -5597,6 +5695,81 @@ pub const Scan = struct {
     /// packs it from the same mask. Segment row group (by index) vs memtable.
     const SurvivorLoc = union(enum) { segment: usize, memtable };
 
+    /// The rows a mask handed to `applyDerivedFilter` covers.
+    const DerivedRows = union(enum) {
+        segment: struct { seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32 },
+        memtable,
+    };
+
+    /// Clear the rows of `mask` the derived filter fails. A row group's input
+    /// columns come off their blocks, which yield just the rows the filter
+    /// evaluates (a dictionary block, its entries) rather than the whole row
+    /// group decoded. `eval_views`, when the caller holds the rows' views
+    /// (`out_phys` columns, then `filter_phys`), stand in for the blocks
+    /// other than dictionaries whose values they hold. Every pin is
+    /// released before returning.
+    fn applyDerivedFilter(self: *Scan, rows: DerivedRows, eval_views: ?[]const ColumnView, mask: []bool) !void {
+        const df = self.derived_filter.?;
+        if (std.mem.indexOfScalar(bool, mask, true) == null) return;
+        var blocks: [DerivedFilter.MAX_INPUTS]storage.ReadSegment.BorrowedBlock = undefined;
+        var n_blocks: usize = 0;
+        defer for (blocks[0..n_blocks]) |*b| b.release(self.allocator, self.table.cacheRef());
+        var owned: [DerivedFilter.MAX_INPUTS]storage.OwnedColumn = undefined;
+        var n_owned: usize = 0;
+        defer for (owned[0..n_owned]) |*c| c.deinit(self.allocator);
+        for (df.input_phys, df.sources) |phys, *source| {
+            const held: ?ColumnView = if (eval_views) |views| held: {
+                const i = self.evalViewIndex(phys) orelse break :held null;
+                break :held if (i < views.len and (i >= self.out_phys.len or self.outViewHoldsValues(i))) views[i] else null;
+            } else null;
+            switch (rows) {
+                .memtable => source.* = .{ .view = held orelse self.memtable_snap.columns[phys].view() },
+                .segment => |at| {
+                    blocks[n_blocks] = try at.seg.borrowColumnBlock(self.allocator, at.rg_idx, phys, self.table.cacheRef());
+                    n_blocks += 1;
+                    const block = blocks[n_blocks - 1];
+                    if (block.encoding != .dict) if (held) |v| {
+                        source.* = .{ .view = v };
+                        continue;
+                    };
+                    const column = self.table.schema.columns[phys];
+                    const flags = storage.format.ColumnBlockFlags{ .has_nulls = column.nullable };
+                    source.* = switch (block.encoding) {
+                        .dict => .{ .dict = .{ .raw = block.bytes, .row_count = at.rg_count, .flags = flags } },
+                        .fsst => .{ .fsst = try storage.segment_reader.fsstViewOf(block.bytes, at.rg_count, flags) },
+                        .for_ => .{ .for_ = storage.segment_reader.forViewOf(block.bytes, at.rg_count, flags) },
+                        .rle => .{ .rle = storage.segment_reader.rleViewOf(block.bytes, at.rg_count, flags) },
+                        .raw => .{ .view = storage.segment_reader.viewRawColumn(column.type, block.bytes, at.rg_count, flags, block.encoding) orelse decoded: {
+                            owned[n_owned] = try at.seg.decodeColumnMaybeCached(self.allocator, self.table.schema, at.rg_idx, phys, self.table.cacheRef());
+                            n_owned += 1;
+                            break :decoded owned[n_owned - 1].view();
+                        } },
+                    };
+                },
+            }
+        }
+        const _td = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
+        try df.apply(mask);
+        if (exec.prof.enabled) exec.prof.add("scan.derived_filter", @intCast(@max(0, exec.prof.nowTicks() - _td)));
+    }
+
+    /// Whether output column `j`'s view holds its values, not the stand-in a
+    /// sidecar replaces them with (block dictionary, codes, digests, lengths).
+    fn outViewHoldsValues(self: *const Scan, j: usize) bool {
+        if (self.dict_cols_by_j.len > j and self.dict_cols_by_j[j]) return false;
+        if (self.coded_dicts_by_j.len > j and self.coded_dicts_by_j[j] != null) return false;
+        if (self.hash_cols_by_j.len > j and self.hash_cols_by_j[j]) return false;
+        return !(self.len_cols_by_j.len > j and self.len_cols_by_j[j]);
+    }
+
+    /// Where table column `phys` sits among a filtered row group's eval
+    /// views: the `out_phys` columns, then the `filter_phys` ones.
+    fn evalViewIndex(self: *const Scan, phys: usize) ?usize {
+        if (std.mem.indexOfScalar(usize, self.out_phys, phys)) |j| return j;
+        if (std.mem.indexOfScalar(usize, self.filter_phys, phys)) |k| return self.out_phys.len + k;
+        return null;
+    }
+
     /// Evaluate `expr` over `views` (a batch of `n` rows), AND in the optional
     /// `tomb_mask` (true = keep), and compact survivors into `filtered`. When
     /// late-mat (`emit_loc`), also packs each survivor's `__rowloc` per `loc`.
@@ -5610,6 +5783,13 @@ pub const Scan = struct {
         const batch = Batch{ .schema = eval_schema, .values = eval_views, .row_count = n };
         try predicate.evaluateExprGuided(self.allocator, expr, eval_schema, batch, mask, null);
         const segment_rg = loc == .segment;
+        if (self.derived_filter != null) {
+            const rows: DerivedRows = switch (loc) {
+                .segment => |rg| .{ .segment = .{ .seg = self.cur_segment.?, .rg_idx = rg, .rg_count = @intCast(n) } },
+                .memtable => .memtable,
+            };
+            try self.applyDerivedFilter(rows, eval_views, mask[0..n]);
+        }
         if (segment_rg) self.noteWholeCondition(self.cur_segment.?, loc.segment, mask[0..n]);
         if (tomb_mask) |tm| {
             if (segment_rg and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..n], true) == null) self.rg_unmatched = .whole;
@@ -5747,12 +5927,15 @@ pub const Scan = struct {
 
     fn buildFilterMemo(self: *const Scan) FilterMemo {
         var memo: FilterMemo = .{};
-        const expr = self.fused_filter orelse return memo;
+        if (self.fused_filter == null and self.derived_filter == null) return memo;
         if (!self.table.cache.conditions or conditionsSwitchedOff()) return memo;
-        memo.n_cond = self.conditionArms(expr, &memo.cond);
-        if (memo.n_cond > 0) memo.cond_whole = predicate.digest(expr);
+        const whole = self.wholeFilterDigest();
+        if (self.fused_filter) |expr| memo.n_cond = self.conditionArms(expr, &memo.cond);
+        // Computed conjuncts always cost work per row.
+        if (memo.n_cond > 0 or self.derived_filter != null) memo.cond_whole = whole;
         if (self.table.cache.predicate_memo.slot_count == 0 or memoSwitchedOff()) return memo;
-        memo.whole = predicate.digest(expr);
+        memo.whole = whole;
+        const expr = self.fused_filter orelse return memo;
         switch (expr) {
             .@"and" => |arms| if (arms.len >= 2) {
                 memo.first_arm = predicate.digest(arms[0]);
@@ -5761,6 +5944,18 @@ pub const Scan = struct {
             else => {},
         }
         return memo;
+    }
+
+    /// The digest of everything the scan filters on: `fused_filter` ANDed
+    /// with the derived filter's conjuncts, their computed columns hashed as
+    /// the expressions behind them. ANDs digest by their flattened arms, so
+    /// this equals the digest of the WHERE the scan was handed, however its
+    /// conjuncts were split.
+    fn wholeFilterDigest(self: *const Scan) ?u128 {
+        const df = self.derived_filter orelse return predicate.digest(self.fused_filter.?);
+        const plain = self.fused_filter orelse return predicate.digestWith(df.predicate, &df.columns);
+        const both = [_]PredicateExpr{ plain, df.predicate };
+        return predicate.digestWith(.{ .@"and" = &both }, &df.columns);
     }
 
     /// The bench hot-switch: `SET THINDB_NO_PREDICATE_MEMO = 1` turns the
@@ -5843,15 +6038,19 @@ pub const Scan = struct {
         defer for (held[0..n_held]) |e| cache.release(e);
         var applied: u64 = 0;
         var fewest: usize = 0;
+        var whole = false;
         if (memo.cond_whole) |d| if (cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, d))) |e| {
             held[0] = e;
             n_held = 1;
+            whole = true;
             applied = switch (expr) {
                 .@"and" => |children| (@as(u64, 1) << @intCast(children.len)) - 1,
                 else => 1,
             };
         };
-        if (n_held == 0 and expr == .@"and") for (memo.cond[0..memo.n_cond]) |arm| {
+        // With a derived filter, the whole filter's record is no plain
+        // conjunct's, so a lone conjunct's record can seed the mask too.
+        if (n_held == 0 and (expr == .@"and" or self.derived_filter != null)) for (memo.cond[0..memo.n_cond]) |arm| {
             const e = cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, arm.digest)) orelse continue;
             held[n_held] = e;
             if (condition_cache.matchedRows(e.bytes) < condition_cache.matchedRows(held[fewest].bytes)) fewest = n_held;
@@ -5873,7 +6072,7 @@ pub const Scan = struct {
         }
         const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
         defer if (tomb_mask) |m| self.allocator.free(m);
-        return self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, applied);
+        return self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, applied, whole);
     }
 
     /// For a scan that only counts its rows: how many rows of row group
@@ -5928,11 +6127,7 @@ pub const Scan = struct {
 
     fn keepCondition(self: *Scan, key: storage.cache.Key, record: []align(16) u8) void {
         const cache = self.table.cache;
-        const entry = cache.insertPinned(key, record, .raw) catch {
-            cache.blockAllocator().free(record);
-            return;
-        };
-        cache.release(entry);
+        if (!cache.keepCondition(key, record)) cache.blockAllocator().free(record);
     }
 
     /// Whether a row group the whole filter left empty would be noted, so the

@@ -1864,6 +1864,37 @@ pub fn mayVary(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
     }
 }
 
+/// Whether `e` computes the same value from the same column values in every
+/// statement, so which rows it matched may be kept for later statements:
+/// every function it calls is immutable and takes arguments (a nullary call
+/// may read the session or the clock, as DATABASE() and USER() do), and it
+/// holds no subquery, variable or lambda.
+pub fn immutable(e: Expr, registry: ?*const udf_mod.UdfRegistry) bool {
+    switch (e) {
+        .call => |call| {
+            if (call.args.len == 0) return false;
+            inline for (scalar_fn.builtins) |f| {
+                if (comptime f.volatility != .immutable) {
+                    if (std.ascii.eqlIgnoreCase(f.name, call.fn_name)) return false;
+                }
+            }
+            if (registry) |r| for (r.scalarEntries()) |entry| {
+                if (entry.volatility != .immutable and std.ascii.eqlIgnoreCase(entry.name, call.fn_name)) return false;
+            };
+            for (call.args) |arg| if (!immutable(arg, registry)) return false;
+            return true;
+        },
+        .case => |c| {
+            for (c.operands) |o| if (!immutable(o.expr, registry)) return false;
+            for (c.branches) |b| if (!immutable(b.then, registry)) return false;
+            if (c.else_branch) |e2| return immutable(e2.*, registry);
+            return true;
+        },
+        .col_ref, .lit, .null_lit => return true,
+        .lambda, .scalar_subquery, .exists_subquery, .var_ref => return false,
+    }
+}
+
 /// Whether arithmetic over a column of type `t` reads the stored value its
 /// min/max describe. A date or datetime reads as its YYYYMMDD[HHMMSS]
 /// number, not its stored day or microsecond count.
@@ -1921,6 +1952,29 @@ fn singleColIndex(c: Expr.Call, up_schema: []const Column) ?usize {
         else => return null, // nested call / case / subquery: can't prove single-col
     };
     return found;
+}
+
+test "immutable: a builtin or UDF call is immutable only when every function it reaches is" {
+    const Kernel = struct {
+        fn zero(ctx: *const udf_mod.ScalarContext, args: []const storage.ColumnView, out: *ColumnStore, row_count: usize) !void {
+            _ = args;
+            for (0..row_count) |_| try out.data.bigint.append(ctx.allocator, 0);
+        }
+    };
+    var registry = udf_mod.UdfRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.registerScalar(.{ .name = "pure_fn", .arg_types = &.{.bigint}, .return_type = .bigint, .volatility = .immutable, .kernel = Kernel.zero });
+    try registry.registerScalar(.{ .name = "fresh_fn", .arg_types = &.{.bigint}, .return_type = .bigint, .kernel = Kernel.zero });
+
+    const id = expr_mod.col("id");
+    const lower = Expr{ .call = .{ .fn_name = "LOWER", .args = &.{expr_mod.col("s")} } };
+    try std.testing.expect(immutable(lower, null));
+    try std.testing.expect(immutable(.{ .call = .{ .fn_name = "pure_fn", .args = &.{id} } }, &registry));
+    try std.testing.expect(!immutable(.{ .call = .{ .fn_name = "fresh_fn", .args = &.{id} } }, &registry));
+    try std.testing.expect(!immutable(.{ .call = .{ .fn_name = "uuid", .args = &.{id} } }, null));
+    try std.testing.expect(!immutable(.{ .call = .{ .fn_name = "rand", .args = &.{} } }, null));
+    const through_udf = Expr{ .call = .{ .fn_name = "upper", .args = &.{.{ .call = .{ .fn_name = "fresh_fn", .args = &.{id} } }} } };
+    try std.testing.expect(!immutable(through_udf, &registry));
 }
 
 test "NDV chains through deterministic functions (pigeonhole, never grows)" {

@@ -70,6 +70,10 @@ pub const Request = struct {
     // The WHERE's conjuncts over `derived` columns. `where_filter` fuses
     // into the scan; this filters each batch once the Compute has run.
     residual_filter: ?PredicateExpr = null,
+    // The WHERE's conjuncts over computed columns when each scan computes
+    // and filters on them itself, so the condition cache keeps what they
+    // matched; `derived` then lacks the columns only they read.
+    computed_where: ?exec.ComputedWhere = null,
     having_filter: ?PredicateExpr,
     needed: ?[]const []const u8,
     // Row-local derived columns (e.g. ClientIP - 1, DATE_TRUNC('minute',
@@ -597,6 +601,7 @@ const GroupTopNPipeline = struct {
         try exec.explainIndent(out, allocator, depth);
         try out.appendSlice(allocator, "HashAggregate (V2 group-topN: route/fold/order/limit");
         if (self.request.residual_filter != null) try out.appendSlice(allocator, ", residual filter");
+        if (self.request.computed_where != null) try out.appendSlice(allocator, ", computed filter in scan");
         if (self.request.key_bound) |kb| {
             try out.print(allocator, ", key bound {s} {s} {d}", .{ kb.col, if (kb.desc) "DESC" else "ASC", kb.keep });
         }
@@ -794,7 +799,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             .aggregate_inputs = aggregate_inputs[0..ctx.plan.aggregate_input_count],
             .string_aggregate_inputs = string_aggregate_inputs[0..ctx.plan.string_aggregate_input_count],
             .aggregate_program = aggregate_program[0..ctx.plan.aggregate_count],
-            .has_filter = ctx.request.where_filter != null or ctx.request.residual_filter != null,
+            .has_filter = ctx.request.where_filter != null or ctx.request.residual_filter != null or ctx.request.computed_where != null,
             .order_by_count_desc = true,
             .limit = ctx.request.limit,
             .offset = ctx.request.offset,
@@ -827,6 +832,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
         .udf_registry = ctx.request.udf_registry,
         .filter_expr = ctx.request.where_filter,
         .residual_filter = ctx.request.residual_filter,
+        .computed_where = ctx.request.computed_where,
         .offered_prunes = ctx.offered_prunes,
     });
 
@@ -959,11 +965,11 @@ const PICK_SHARE_DENOMINATOR: usize = 8;
 // those keys' rows instead of every group. Keys computed by an expression get
 // no set; distinct base-column values already make distinct groups. Null when
 // the shape doesn't qualify, the table has too few groups, or the picked keys
-// cover too much of the sample to be worth filtering on. A residual filter
-// disqualifies it: the read can't apply it, so a picked key might have no
-// rows that pass.
+// cover too much of the sample to be worth filtering on. A residual or
+// computed filter disqualifies it: the read can't apply it, so a picked key
+// might have no rows that pass.
 fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant, table: *api.Table, snapshot: Scan.Snapshot, request: Request, plan: ShapePlan) !?[]const exec.InSet {
-    if (request.order_specs.len != 0 or request.having_filter != null or request.residual_filter != null or request.limit == 0) return null;
+    if (request.order_specs.len != 0 or request.having_filter != null or request.residual_filter != null or request.computed_where != null or request.limit == 0) return null;
     const keep = request.limit + request.offset;
     if (keep > Scan.ROW_SET_ZONEMAP_MAX) return null;
 
