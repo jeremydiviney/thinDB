@@ -4,7 +4,8 @@
 //! share AND arms so one filter starts from another's records, deletes land
 //! after the records were kept, rows stay unflushed, and compaction writes
 //! new segments. Filters over computed values (functions, regular
-//! expressions, UDFs) are kept too, and a repeat computes none of them.
+//! expressions, UDFs) are kept too, and a repeat computes none of them. A
+//! top-N over row groups in key order keeps and reads records too.
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -44,6 +45,9 @@ const queries = [_][]const u8{
     "SELECT COUNT(*) FROM t WHERE bucket3(id) = 0 AND k > 1 GROUP BY u ORDER BY 1 DESC LIMIT 5",
     "SELECT SUM(id) FROM t WHERE REGEXP_LIKE(u, 'b.') GROUP BY k ORDER BY 1",
     "SELECT k FROM t WHERE UPPER(s) LIKE '%B%' AND LENGTH(u) > 1 GROUP BY k ORDER BY k",
+    "SELECT id FROM t WHERE s LIKE '%ab%' ORDER BY id DESC LIMIT 7",
+    "SELECT id, k FROM t WHERE u NOT LIKE '%c%' AND k < 6 ORDER BY k, id LIMIT 9",
+    "SELECT * FROM t WHERE s LIKE '%a%' ORDER BY id LIMIT 10 OFFSET 3",
 };
 
 /// `bucket3(x)`: x mod 3, counting the rows it is called on.

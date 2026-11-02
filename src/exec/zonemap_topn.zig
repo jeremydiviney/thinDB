@@ -68,6 +68,8 @@ const PredicateExpr = predicate.PredicateExpr;
 const SortSpec = @import("sort.zig").SortSpec;
 
 const rowloc = @import("rowloc.zig");
+const condition_cache = @import("condition_cache.zig");
+const simd = @import("../util/simd.zig");
 const Scan = @import("scan.zig").Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const platform = @import("../util/platform.zig");
@@ -110,6 +112,9 @@ pub const ZonemapTopN = struct {
     dict_filter_probe: ?usize,
     /// Per probe column: a dictionary-coded block may stay coded. Owned.
     dict_ok: []bool,
+    /// The digest the condition cache keeps `pred`'s per-row-group records
+    /// under; null when it keeps none.
+    condition: ?u128,
     /// Prunable prefix length: the longest leading run of ORDER BY keys with
     /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`).
     /// Only these keys drive row-group pruning; the rest still order rows in the
@@ -254,6 +259,7 @@ pub const ZonemapTopN = struct {
             .key_probe_idx = key_probe_idx,
             .dict_filter_probe = dict_filter_probe,
             .dict_ok = dict_ok,
+            .condition = scan_ptr.conditionDigest(validated),
             .prefix_len = prefix_len,
             .n = n,
             .offset = offset,
@@ -756,20 +762,33 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     } else {
         @memset(mask, true);
     }
+    // A condition-cache record of the row group stands in for the WHERE, and
+    // the columns only the WHERE reads stay unloaded.
+    const block_cache = z.table.cache;
+    const record = if (z.condition) |d| block_cache.acquireCondition(z.inner_scan.conditionKey(seg, ref.rg_idx, .matched_rows, d)) else null;
+    defer if (record) |e| block_cache.release(e);
+    if (record) |e| if (condition_cache.matchedRows(e.bytes) == 0) return;
     for (0..z.probe_phys.len) |j| {
-        if (j != lead) try loadProbeColumn(z, allocator, scratch, seg, ref, j);
+        if (j == lead or (record != null and std.mem.indexOfScalar(usize, z.key_probe_idx, j) == null)) continue;
+        try loadProbeColumn(z, allocator, scratch, seg, ref, j);
     }
 
     try scratch.pred_mask.resize(allocator, rg_count);
     const pred_mask = scratch.pred_mask.items;
-    const dict_filter: ?DictColumn = if (z.dict_filter_probe) |j| switch (scratch.cols[j]) {
-        .dict => |d| d,
-        .view => null,
-    } else null;
-    if (dict_filter) |df| {
-        try evalDictPredicate(z, allocator, scratch, df, rg_count, pred_mask);
+    if (record) |e| {
+        condition_cache.expand(e.bytes, pred_mask);
     } else {
-        try evalPredicate(z, allocator, scratch.views, rg_count, pred_mask, if (prefiltered) mask else null);
+        const dict_filter: ?DictColumn = if (z.dict_filter_probe) |j| switch (scratch.cols[j]) {
+            .dict => |d| d,
+            .view => null,
+        } else null;
+        if (dict_filter) |df| {
+            try evalDictPredicate(z, allocator, scratch, df, rg_count, pred_mask);
+            keepCondition(z, seg, ref.rg_idx, pred_mask);
+        } else {
+            try evalPredicate(z, allocator, scratch.views, rg_count, pred_mask, if (prefiltered) mask else null);
+            if (!prefiltered) keepCondition(z, seg, ref.rg_idx, pred_mask);
+        }
     }
     for (mask, pred_mask) |*m, p| m.* = m.* and p;
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
@@ -872,6 +891,16 @@ fn mapCodes(db: storage.segment_reader.DictBlock, hits: []const bool, mask: []bo
             m.* = hits[db.rowCode(i)];
         },
     }
+}
+
+/// Keep `verdicts`, the WHERE over every stored row of row group `rg_idx`,
+/// as the condition cache's record of it. Best effort: a record that cannot
+/// be allocated or kept is dropped.
+fn keepCondition(z: *const ZonemapTopN, seg: *const storage.ReadSegment, rg_idx: usize, verdicts: []const bool) void {
+    const d = z.condition orelse return;
+    const cache = z.table.cache;
+    const record = condition_cache.encode(cache.blockAllocator(), verdicts, simd.countTrue(verdicts)) catch return;
+    if (!cache.keepCondition(z.inner_scan.conditionKey(seg, rg_idx, .matched_rows, d), record)) cache.blockAllocator().free(record);
 }
 
 /// Evaluate the WHERE predicate over a probe batch into `mask` (true =

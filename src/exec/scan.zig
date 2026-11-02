@@ -6038,7 +6038,16 @@ pub const Scan = struct {
         return applied >> @intCast(child) & 1 == 1;
     }
 
-    fn conditionKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, content: storage.cache.Content, digest: u128) storage.cache.Key {
+    /// The digest the condition cache keeps records of `expr` under, as
+    /// another operator's whole filter over this scan's table; null when the
+    /// cache keeps none of it.
+    pub fn conditionDigest(self: *const Scan, expr: PredicateExpr) ?u128 {
+        if (!self.table.cache.conditions or conditionsSwitchedOff()) return null;
+        if (!self.costsPerRow(expr)) return null;
+        return predicate.digest(expr);
+    }
+
+    pub fn conditionKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, content: storage.cache.Content, digest: u128) storage.cache.Key {
         return .{ .table_uid = self.table.cache_uid, .segment_id = seg.info.segment_id, .row_group_idx = @intCast(rg_idx), .column_idx = 0, .content = content, .predicate = digest };
     }
 
