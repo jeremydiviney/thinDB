@@ -37,6 +37,11 @@ const CHUNK_KEYS: usize = 256;
 const QUEUE_FLOOR_KEYS: usize = 1 << 21;
 const QUEUE_CEILING_BYTES: usize = 512 << 20;
 const INSERT_PREFETCH: usize = 16;
+const LINE_BYTES: usize = 64;
+// How far ahead of its insert cursor a drain prefetches its chunks' keys.
+// Chunks are written long before they drain, so their keys come from DRAM,
+// and the list hops between chunks the hardware prefetcher can't predict.
+const KEY_LOOKAHEAD_BYTES: usize = 1024;
 // Publishes a producer lets pass without a relieve after one that found
 // nothing worth draining: every partition was empty, small, or taken.
 const RELIEVE_BACKOFF: u32 = 8;
@@ -166,8 +171,11 @@ pub fn PartitionedDistinct(comptime Key: type) type {
         // Once a chunk comes out mostly new keys, the set is sized for the rest
         // of the batch at that rate instead of doubling its way through it; a
         // batch of mostly repeats grows only as keys arrive, so a small set
-        // stays small.
-        noinline fn drain(self: *Self, p: usize, spare: *Spare, counts: ?*NewKeyCounts) !bool {
+        // stays small. A final drain of a partition no relieve has drained
+        // counts its keys in the drainer's scratch set instead: no later key
+        // can join that set, and one set reused while it stays in cache saves
+        // building (and first zeroing) a set per partition from DRAM.
+        noinline fn drain(self: *Self, p: usize, spare: *Spare, counts: ?*NewKeyCounts, final: bool) !bool {
             const part = &self.partitions[p];
             // Plain loads first: a relieve walks partitions that others have
             // just emptied, and a write to their lines would bounce them.
@@ -176,23 +184,30 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             defer part.draining.store(false, .release);
             var list: ?*Chunk = part.full.swap(null, .acquire) orelse return false;
             try memory.checkCancelled(self.allocator);
-            var remaining: usize = 0;
-            var walk = list;
-            while (walk) |ch| : (walk = ch.next) remaining += ch.len;
-            const queued = remaining;
-            const before = part.set.count();
+            // Each chunk is counted into `pending` before it goes on the list,
+            // so `pending` bounds the list's keys without walking it: a walk
+            // misses on every chunk's header in turn.
+            var remaining = part.pending.load(.monotonic);
+            var queued: usize = 0;
+            const set = if (final and part.set.slots.len == 0) spare.clearedScratch() else &part.set;
+            const before = set.count();
             var last_new: usize = 0;
             var last_len: usize = 0;
             while (list) |ch| {
-                remaining -= ch.len;
+                remaining -|= ch.len;
+                queued += ch.len;
+                const next: []const Key = if (ch.next) |n| next: {
+                    @prefetch(&n.next, .{});
+                    break :next &n.keys;
+                } else &.{};
                 const ahead = if (last_new * 2 > last_len) remaining * last_new / last_len else 0;
-                try part.set.ensureFor(self.pooled, ch.len + ahead);
-                const prior = part.set.count();
+                try set.ensureFor(self.pooled, ch.len + ahead);
+                const prior = set.count();
                 if (counts) |c| {
                     try c.table.ensureFor(c.allocator, ch.len);
-                    insertAll(true, &part.set, ch.keys[0..ch.len], c);
-                } else insertAll(false, &part.set, ch.keys[0..ch.len], {});
-                last_new = part.set.count() - prior;
+                    insertAll(true, set, ch.keys[0..ch.len], next, c);
+                } else insertAll(false, set, ch.keys[0..ch.len], next, {});
+                last_new = set.count() - prior;
                 last_len = ch.len;
                 list = ch.next;
                 spare.put(ch);
@@ -200,7 +215,7 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             _ = part.pending.fetchSub(queued, .monotonic);
             _ = self.queued.fetchSub(queued, .monotonic);
             _ = self.drained.fetchAdd(queued, .monotonic);
-            _ = self.in_sets.fetchAdd(part.set.count() - before, .monotonic);
+            _ = self.in_sets.fetchAdd(set.count() - before, .monotonic);
             return true;
         }
 
@@ -211,12 +226,15 @@ pub fn PartitionedDistinct(comptime Key: type) type {
         // The probe walks local copies of the set's fields: through `set`
         // they reload after every slot store, which may alias them. Each key's
         // hash is computed once, when its slot is prefetched. The tally, too,
-        // is a local copy, written back once.
-        fn insertAll(comptime counting: bool, set: *Set, keys: []const Key, counts: if (counting) *NewKeyCounts else void) void {
+        // is a local copy, written back once. The key prefetch runs on into
+        // `next`, the chunk drained after this one.
+        fn insertAll(comptime counting: bool, set: *Set, keys: []const Key, next: []const Key, counts: if (counting) *NewKeyCounts else void) void {
             const slots = set.slots;
             var tally = if (counting) counts.table else {};
             const shift = if (counting) counts.shift else {};
             const mask = slots.len - 1;
+            const line_keys = LINE_BYTES / @sizeOf(Key);
+            const lookahead = KEY_LOOKAHEAD_BYTES / @sizeOf(Key);
             var hashes: [INSERT_PREFETCH]u64 = undefined;
             for (keys[0..@min(keys.len, INSERT_PREFETCH)], 0..) |key, j| {
                 hashes[j] = hashOf(key);
@@ -225,6 +243,12 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             var added: u32 = 0;
             var sentinel = false;
             for (keys, 0..) |key, j| {
+                if (j % line_keys == 0) {
+                    const at = j + lookahead;
+                    if (at < keys.len) {
+                        @prefetch(&keys[at], .{});
+                    } else if (at - keys.len < next.len) @prefetch(&next[at - keys.len], .{});
+                }
                 const ring = j % INSERT_PREFETCH;
                 const h = hashes[ring];
                 if (j + INSERT_PREFETCH < keys.len) {
@@ -278,29 +302,40 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             while (tried < PARTITIONS and drains < RELIEVE_MAX_DRAINS and self.queued.load(.monotonic) > budget / 2) : (tried += 1) {
                 const p = (start + tried) % PARTITIONS;
                 if (self.partitions[p].pending.load(.monotonic) < share) continue;
-                if (try self.drain(p, spare, counts)) drains += 1;
+                if (try self.drain(p, spare, counts, false)) drains += 1;
             }
             return drains == 0;
         }
 
-        /// Drain the next partition once every producer has finished and
-        /// return its now-final set; null when none are left. Any number of
-        /// threads may call it, each with its own `spare` and `counts`.
-        pub fn drainNext(self: *Self, spare: *Spare, counts: ?*NewKeyCounts) !?*const Set {
+        /// Drain the next partition once every producer has finished; false
+        /// when none are left. Any number of threads may call it, each with
+        /// its own `spare` and `counts`.
+        pub fn drainNext(self: *Self, spare: *Spare, counts: ?*NewKeyCounts) !bool {
             const p = self.final_cursor.fetchAdd(1, .monotonic);
-            if (p >= PARTITIONS) return null;
-            _ = try self.drain(p, spare, counts);
-            return &self.partitions[p].set;
+            if (p >= PARTITIONS) return false;
+            _ = try self.drain(p, spare, counts, true);
+            return true;
         }
 
+        /// Exact once every partition has drained.
         pub fn count(self: *const Self) u64 {
-            var total: u64 = 0;
-            for (&self.partitions) |*part| total += part.set.count();
-            return total;
+            return self.in_sets.load(.monotonic);
         }
 
+        /// One thread's emptied chunks, plus the set its final drains count
+        /// partitions in; `deinit` frees that set.
         pub const Spare = struct {
             head: ?*Chunk = null,
+            scratch: Set = Set.empty,
+
+            pub fn deinit(self: *Spare, shared: *const Self) void {
+                self.scratch.deinit(shared.pooled);
+            }
+
+            fn clearedScratch(self: *Spare) *Set {
+                self.scratch.clearRetainingCapacity();
+                return &self.scratch;
+            }
 
             fn take(self: *Spare) ?*Chunk {
                 const ch = self.head orelse return null;
@@ -328,11 +363,17 @@ pub fn PartitionedDistinct(comptime Key: type) type {
             slab: ?*Slab = null,
             slab_used: usize = SLAB_CHUNKS,
 
+            // A key starting a line also prefetches the line after it: the
+            // partition's next keys arrive around a thousand pushes later,
+            // and an open chunk's lines are cold, so without the prefetch the
+            // first store to each line waits on its fetch.
             pub inline fn push(self: *Producer, key: Key) !void {
                 const p = partitionOf(key);
                 const ch = self.open[p] orelse try self.openChunk(p);
                 const at = self.fill[p];
                 ch.keys[at] = key;
+                const line_keys = LINE_BYTES / @sizeOf(Key);
+                if (at % line_keys == 0 and at + line_keys < CHUNK_KEYS) @prefetch(&ch.keys[at + line_keys], .{ .rw = .write });
                 if (at + 1 < CHUNK_KEYS) {
                     self.fill[p] = at + 1;
                     return;
@@ -387,13 +428,15 @@ fn pushAll(comptime Key: type, producer: *PartitionedDistinct(Key).Producer, key
 }
 
 test "partitioned distinct counts exactly through budget drains" {
-    inline for (.{ u64, u128 }) |Key| {
+    // A tiny floor makes producers drain mid-fold, so the final drains join
+    // sets; at the default floor nothing drains until the end, and every
+    // partition is counted in the drainer's scratch set.
+    inline for (.{ u64, u128 }) |Key| for ([_]usize{ 1000, QUEUE_FLOOR_KEYS }) |floor| {
         const PD = PartitionedDistinct(Key);
         const pd = try PD.create(std.testing.allocator);
         defer pd.destroy();
-        // A tiny floor makes producers drain mid-fold, not only at the end.
-        pd.queue_floor = 1000;
-        pd.queue_ceiling = 4000;
+        pd.queue_floor = floor;
+        pd.queue_ceiling = 4 * floor;
         var producers: [3]PD.Producer = @splat(.{ .shared = pd });
         var reference = std.AutoHashMap(Key, void).init(std.testing.allocator);
         defer reference.deinit();
@@ -408,9 +451,10 @@ test "partitioned distinct counts exactly through budget drains" {
         try reference.put(std.math.maxInt(Key), {});
         for (&producers) |*p| p.finish();
         var spare: PD.Spare = .{};
-        while (try pd.drainNext(&spare, null)) |_| {}
+        defer spare.deinit(pd);
+        while (try pd.drainNext(&spare, null)) {}
         try std.testing.expectEqual(@as(u64, reference.count()), pd.count());
-    }
+    };
 }
 
 test "partitioned distinct is exact with concurrent producers and drains" {
@@ -427,10 +471,11 @@ test "partitioned distinct is exact with concurrent producers and drains" {
         }
         fn drainAll(shared: *PD, err: *?anyerror) void {
             var spare: PD.Spare = .{};
+            defer spare.deinit(shared);
             while (shared.drainNext(&spare, null) catch |e| {
                 err.* = e;
                 return;
-            }) |_| {}
+            }) {}
         }
     };
     // Four overlapping ranges of 50_000 starting 20_000 apart: 110_000 values.
@@ -480,7 +525,8 @@ test "partitioned distinct tallies each new key by prefix in exactly one drainer
         }
         for (&producers) |*p| p.finish();
         var spare: PD.Spare = .{};
-        while (try pd.drainNext(&spare, &counts[3])) |_| {}
+        defer spare.deinit(pd);
+        while (try pd.drainNext(&spare, &counts[3])) {}
         var got = std.AutoHashMap(u64, u64).init(std.testing.allocator);
         defer got.deinit();
         for (counts) |c| {

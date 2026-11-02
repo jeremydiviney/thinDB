@@ -1524,7 +1524,8 @@ fn partMergeRun(job: *PartMergeJob) !void {
         switch (job.shared[d].?) {
             inline else => |set| {
                 var spare: @TypeOf(set.*).Spare = .{};
-                while (try set.drainNext(&spare, &job.counts[d])) |_| {}
+                defer spare.deinit(set);
+                while (try set.drainNext(&spare, &job.counts[d])) {}
             },
         }
     }
