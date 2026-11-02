@@ -55,7 +55,16 @@ pub const Key = struct {
     segment_id: u64,
     row_group_idx: u32,
     column_idx: u32,
+    content: Content = .column,
+    /// The digest of the predicate a condition-cache entry is of; 0 for a
+    /// column block.
+    predicate: u128 = 0,
 };
+
+/// What an entry holds: a column block, or a condition-cache entry (§6.4)
+/// for one row group and one predicate, either the record of the stored rows
+/// it matched (`exec/condition_cache.zig`) or only how many it matched.
+pub const Content = enum(u8) { column, matched_rows, matched_count };
 
 /// A table's handle into the shared block cache: the cache plus the table's
 /// uid namespace within it. Passed by value down the segment-read path so key
@@ -246,6 +255,9 @@ pub const Cache = struct {
     /// Row groups a scan predicate matched no stored row of. Its slots are
     /// charged to the controller's budget whole.
     predicate_memo: PredicateMemo,
+    /// Whether scans keep condition-cache entries here and use the
+    /// predicate memo (`Config.condition_cache`).
+    conditions: bool = true,
 
     /// 32 ≈ max-dop workers × a few concurrently-expanded string columns; the
     /// pool self-bounds at the 32 largest hot block sizes (~5 MB each on the
@@ -379,6 +391,18 @@ pub const Cache = struct {
         self.misses += 1;
         _ = g_misses.fetchAdd(1, .monotonic);
         return null;
+    }
+
+    /// `acquire` for a condition-cache entry, left out of the hit and miss
+    /// counts, which measure column blocks.
+    pub fn acquireCondition(self: *Cache, key: Key) ?*Entry {
+        std.debug.assert(key.content != .column);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const entry = self.map.get(key) orelse return null;
+        entry.pins += 1;
+        self.touch(entry);
+        return entry;
     }
 
     /// Insert `bytes` for `key` (ownership transfers to the cache) and return a

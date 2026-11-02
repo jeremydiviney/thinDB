@@ -77,6 +77,7 @@ const PredicateExpr = predicate.PredicateExpr;
 const getenv = @extern(*const fn (name: [*:0]const u8) callconv(.c) ?[*:0]const u8, .{ .name = "getenv", .library_name = "c" });
 const PredicateOp = predicate.PredicateOp;
 const filter_mod = @import("filter.zig");
+const condition_cache = @import("condition_cache.zig");
 
 const rowloc = @import("rowloc.zig");
 
@@ -705,6 +706,9 @@ pub const Scan = struct {
     /// Row groups the predicate-miss memo skipped (counted in
     /// `rgs_considered`, not in `rgs_scanned`).
     rgs_memo_skipped: u64 = 0,
+    /// Row groups whose filter started from condition-cache records (a
+    /// subset of `rgs_scanned`).
+    rgs_condition_hits: u64 = 0,
     rows_scanned: u64 = 0,
 
     /// Tight scan-kernel accounting (--profile-ops): ticks spent in the per-row-
@@ -1748,6 +1752,7 @@ pub const Scan = struct {
         if (!try self.testEntries(expr, self.filter_eval_schema[0..1], .{ .offsets = offsets, .bytes = db.dict_bytes }, pass)) return null;
         const matched = db.rowsPassing(pass);
         if (matched == 0) self.rg_unmatched = .whole;
+        self.noteConditionCount(seg, rg_idx, rg_count, matched);
         return matched;
     }
 
@@ -3605,6 +3610,15 @@ pub const Scan = struct {
                 }
             }
             if (self.key_bound == null and self.sievedRows(self.cur_rg_idx, rg.row_count) == null and self.statsPassAll(rg, expr)) return try self.emitRowGroup(seg, rg.row_count);
+            if (self.out_phys.len == 0 and !self.emit_loc) {
+                if (self.conditionCount(memo, seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count)) |n| {
+                    self.rgs_condition_hits += 1;
+                    self.cur_rg_idx += 1;
+                    if (n == 0) continue;
+                    _ = try self.ensureFilteredBuffers();
+                    return Batch{ .schema = self.out_schema, .values = self.views, .row_count = n };
+                }
+            }
             if (self.countsFilterEntries()) {
                 self.rg_unmatched = .none;
                 if (try self.countFilterEntries(seg, self.cur_rg_idx, self.cur_rg_first_row[self.cur_rg_idx], rg.row_count, expr)) |n| {
@@ -3629,7 +3643,9 @@ pub const Scan = struct {
             }
 
             self.rg_unmatched = .none;
-            const matched = try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
+            const reused = if (memo.n_cond > 0) try self.filterByConditions(memo, seg, this_rg, rg_first, rg_count, expr) else null;
+            if (reused != null) self.rgs_condition_hits += 1;
+            const matched = reused orelse try self.filterRowGroup(seg, this_rg, rg_first, rg_count, expr);
             self.noteUnmatched(memo, seg, this_rg);
             if (matched == 0) continue;
             for (self.filtered.?, 0..) |c, i| self.views[i] = c.view();
@@ -3695,7 +3711,7 @@ pub const Scan = struct {
         // doesn't apply (non-comparison op, string/LIKE/sub-query leaf, an
         // un-projectable column), so the borrow / owned-decode paths below run
         // unchanged (and the borrow path is itself per-column FOR-aware now).
-        if (try self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr)) |matched| {
+        if (try self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, null)) |matched| {
             return matched;
         }
 
@@ -3751,6 +3767,11 @@ pub const Scan = struct {
     /// state — when any leaf's shape doesn't fit (non-comparison op, string /
     /// LIKE / sub-query leaf, un-projectable column), so the caller's per-column
     /// borrow path (also FOR-aware) handles the row group instead.
+    ///
+    /// `seeded` is set when the mask already holds condition-cache records
+    /// (`filterByConditions`): for an AND, a bit per child they applied, and
+    /// the other children are evaluated only on the rows they left; any
+    /// other filter is applied whole and nothing is evaluated.
     fn tryFilterForGuided(
         self: *Scan,
         seg: *storage.ReadSegment,
@@ -3758,10 +3779,11 @@ pub const Scan = struct {
         rg_count: u32,
         tomb_mask: ?[]const bool,
         expr: PredicateExpr,
+        seeded: ?u64,
     ) !?usize {
         const mask = try self.ensureMask(rg_count);
         const _tp = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        switch (expr) {
+        if (seeded == null or expr == .@"and") switch (expr) {
             // A key bound with no WHERE behind it.
             .always => |keep_all| {
                 if (!keep_all) return null;
@@ -3770,13 +3792,14 @@ pub const Scan = struct {
             .leaf, .like, .not, .in_set, .@"or" => {
                 if (!guidedChildShape(expr)) return null;
                 if (!try self.buildGuidedChild(seg, rg_idx, rg_count, expr, null, mask[0..rg_count])) return null;
+                self.noteCondition(seg, rg_idx, 0, mask[0..rg_count]);
             },
             .@"and" => |children| {
                 if (children.len == 0) return null;
                 // Every child must be a comparison leaf, an IN-list, or a
                 // (NOT) LIKE we can evaluate block-sourced; otherwise decline
                 // the whole AND (mixed shapes fall back).
-                for (children) |c| if (!guidedChildShape(c)) return null;
+                for (children, 0..) |c, i| if (!childApplied(seeded, i) and !guidedChildShape(c)) return null;
 
                 // `col NOT IN (v1, ...)` parses to `col <> v` conjuncts: each
                 // column's run of them folds into one IN-list evaluation at
@@ -3784,7 +3807,7 @@ pub const Scan = struct {
                 var groups: [SET_FOLD_MAX_COLUMNS]SetArmGroup = undefined;
                 const n_groups = self.groupSetArms(.@"and", children, &groups);
                 var last: ?SetArmLookup = null;
-                var filled = false;
+                var filled = seeded != null;
                 var steps: usize = 0;
                 var first_alone = false;
                 // Empty-mask early exit: conjuncts arrive selectivity-
@@ -3792,9 +3815,10 @@ pub const Scan = struct {
                 // group — stop borrowing/evaluating the remaining columns'
                 // blocks the moment no row survives. Sound for an AND: the
                 // skipped leaves could only remove more rows.
-                var live = true;
-                for (children) |c| {
+                var live = !filled or std.mem.indexOfScalar(bool, mask[0..rg_count], true) != null;
+                for (children, 0..) |c, i| {
                     if (!live) break;
+                    if (childApplied(seeded, i)) continue;
                     // Later children receive the accumulated mask: an
                     // expensive leaf (LIKE over an FSST block) then
                     // decodes/tests ONLY the rows still alive.
@@ -3809,7 +3833,10 @@ pub const Scan = struct {
                             };
                         }
                         if (!try self.buildGuidedChild(seg, rg_idx, rg_count, c, act, dest)) return null;
-                        if (steps == 0) first_alone = true;
+                        if (steps == 0 and seeded == null) {
+                            first_alone = true;
+                            self.noteCondition(seg, rg_idx, i, dest);
+                        }
                     }
                     if (filled) simd.combineMaskInto(.@"and", mask[0..rg_count], dest);
                     live = std.mem.indexOfScalar(bool, mask[0..rg_count], true) != null;
@@ -3819,9 +3846,12 @@ pub const Scan = struct {
                 // The first step ran over every stored row: when it alone
                 // emptied the mask, that arm matches none of them by itself.
                 if (!live) self.rg_unmatched = if (steps == 1 and first_alone) .first_arm else .whole;
+                // Seeded or not, the mask is now the whole AND over every
+                // stored row; with no step, it is the records it started from.
+                if (steps > 0) self.noteWholeCondition(seg, rg_idx, mask[0..rg_count]);
             },
             else => return null,
-        }
+        };
         self.rgs_guided += 1;
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tp));
 
@@ -5580,6 +5610,7 @@ pub const Scan = struct {
         const batch = Batch{ .schema = eval_schema, .values = eval_views, .row_count = n };
         try predicate.evaluateExprGuided(self.allocator, expr, eval_schema, batch, mask, null);
         const segment_rg = loc == .segment;
+        if (segment_rg) self.noteWholeCondition(self.cur_segment.?, loc.segment, mask[0..n]);
         if (tomb_mask) |tm| {
             if (segment_rg and self.memoNotes() and std.mem.indexOfScalar(bool, mask[0..n], true) == null) self.rg_unmatched = .whole;
             for (mask[0..n], tm) |*m, keep| m.* = m.* and keep;
@@ -5694,13 +5725,32 @@ pub const Scan = struct {
         /// several (`predicate.conjunctDigests`).
         arms: [MEMO_MAX_ARMS]u128 = undefined,
         n_arms: usize = 0,
+        /// The arms the condition cache keeps records of: the filter itself
+        /// when it is no AND, else those of its AND children that cost work
+        /// per row (`costsPerRow`).
+        cond: [MEMO_MAX_ARMS]ConditionArm = undefined,
+        n_cond: usize = 0,
+        /// The whole filter's digest when the condition cache keeps any arm
+        /// of it. A repeated filter then reads one record, where its AND
+        /// arms alone would leave every arm after the first to evaluate.
+        cond_whole: ?u128 = null,
     };
     const MEMO_MAX_ARMS = 16;
     const Unmatched = enum { none, whole, first_arm };
 
+    const ConditionArm = struct {
+        digest: u128,
+        /// The arm's index among the filter's AND children; 0 for a filter
+        /// that is no AND.
+        child: usize,
+    };
+
     fn buildFilterMemo(self: *const Scan) FilterMemo {
         var memo: FilterMemo = .{};
         const expr = self.fused_filter orelse return memo;
+        if (!self.table.cache.conditions or conditionsSwitchedOff()) return memo;
+        memo.n_cond = self.conditionArms(expr, &memo.cond);
+        if (memo.n_cond > 0) memo.cond_whole = predicate.digest(expr);
         if (self.table.cache.predicate_memo.slot_count == 0 or memoSwitchedOff()) return memo;
         memo.whole = predicate.digest(expr);
         switch (expr) {
@@ -5718,6 +5768,171 @@ pub const Scan = struct {
     fn memoSwitchedOff() bool {
         const v = getenv("THINDB_NO_PREDICATE_MEMO") orelse return false;
         return v[0] != '0';
+    }
+
+    /// The bench hot-switch for `Config.condition_cache`:
+    /// `SET THINDB_NO_CONDITION_CACHE = 1` turns the condition cache and the
+    /// predicate memo off for the next queries, `= 0` back on.
+    fn conditionsSwitchedOff() bool {
+        const v = getenv("THINDB_NO_CONDITION_CACHE") orelse return false;
+        return v[0] != '0';
+    }
+
+    fn conditionArms(self: *const Scan, expr: PredicateExpr, out: []ConditionArm) usize {
+        const whole = [_]PredicateExpr{expr};
+        const arms: []const PredicateExpr = switch (expr) {
+            .@"and" => |children| children,
+            else => &whole,
+        };
+        if (arms.len > out.len) return 0;
+        var n: usize = 0;
+        for (arms, 0..) |arm, i| {
+            if (!self.costsPerRow(arm)) continue;
+            out[n] = .{ .digest = predicate.digest(arm) orelse continue, .child = i };
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Whether evaluating `expr` costs more per row than reading back a
+    /// record of its verdicts: anything over a text column, or past a plain
+    /// comparison. A numeric comparison runs about as fast as the record
+    /// expands, so keeping its verdicts would only take cache space.
+    fn costsPerRow(self: *const Scan, expr: PredicateExpr) bool {
+        return switch (expr) {
+            .leaf, .text_as_number => |l| self.textColumn(l.col),
+            .in_set, .text_as_number_set => |s| self.textColumn(s.col),
+            .leaf_col_col => |c| self.textColumn(c.left),
+            .is_null, .is_not_null, .always, .day_leaf => false,
+            .not => |inner| self.costsPerRow(inner.*),
+            .@"and", .@"or" => |arms| for (arms) |arm| {
+                if (self.costsPerRow(arm)) break true;
+            } else false,
+            else => true,
+        };
+    }
+
+    fn textColumn(self: *const Scan, name: []const u8) bool {
+        const phys = types.findColumn(self.table.schema.columns, name) orelse return true;
+        return switch (self.table.schema.columns[phys].type) {
+            .varchar, .string, .char, .json, .nested, .bitmap => true,
+            else => false,
+        };
+    }
+
+    fn childApplied(seeded: ?u64, child: usize) bool {
+        const applied = seeded orelse return false;
+        return applied >> @intCast(child) & 1 == 1;
+    }
+
+    fn conditionKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, content: storage.cache.Content, digest: u128) storage.cache.Key {
+        return .{ .table_uid = self.table.cache_uid, .segment_id = seg.info.segment_id, .row_group_idx = @intCast(rg_idx), .column_idx = 0, .content = content, .predicate = digest };
+    }
+
+    /// Filter row group `rg_idx` from condition-cache records: the whole
+    /// filter's when there is one, else its arms', where the record with the
+    /// fewest matched rows seeds the mask, the others are ANDed in, and the
+    /// arms with none are evaluated only on the rows left. Tombstones, the
+    /// key bound and the sieve then apply as on every path. Null, with
+    /// nothing changed, when no record is found or an arm without one isn't
+    /// a shape the guided filter evaluates.
+    fn filterByConditions(self: *Scan, memo: *const FilterMemo, seg: *storage.ReadSegment, rg_idx: usize, rg_first: u32, rg_count: u32, expr: PredicateExpr) !?usize {
+        const cache = self.table.cache;
+        var held: [MEMO_MAX_ARMS]*storage.cache.Cache.Entry = undefined;
+        var n_held: usize = 0;
+        defer for (held[0..n_held]) |e| cache.release(e);
+        var applied: u64 = 0;
+        var fewest: usize = 0;
+        if (memo.cond_whole) |d| if (cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, d))) |e| {
+            held[0] = e;
+            n_held = 1;
+            applied = switch (expr) {
+                .@"and" => |children| (@as(u64, 1) << @intCast(children.len)) - 1,
+                else => 1,
+            };
+        };
+        if (n_held == 0 and expr == .@"and") for (memo.cond[0..memo.n_cond]) |arm| {
+            const e = cache.acquireCondition(self.conditionKey(seg, rg_idx, .matched_rows, arm.digest)) orelse continue;
+            held[n_held] = e;
+            if (condition_cache.matchedRows(e.bytes) < condition_cache.matchedRows(held[fewest].bytes)) fewest = n_held;
+            n_held += 1;
+            applied |= @as(u64, 1) << @intCast(arm.child);
+        };
+        if (n_held == 0) return null;
+        if (expr == .@"and") for (expr.@"and", 0..) |c, i| {
+            if (!childApplied(applied, i) and !guidedChildShape(c)) return null;
+        };
+
+        const mask = (try self.ensureMask(rg_count))[0..rg_count];
+        condition_cache.expand(held[fewest].bytes, mask);
+        for (held[0..n_held], 0..) |e, i| {
+            if (i == fewest) continue;
+            const other = (try self.ensureMask2(rg_count))[0..rg_count];
+            condition_cache.expand(e.bytes, other);
+            simd.combineMaskInto(.@"and", mask, other);
+        }
+        const tomb_mask = try self.tombstoneMask(rg_first, rg_count);
+        defer if (tomb_mask) |m| self.allocator.free(m);
+        return self.tryFilterForGuided(seg, rg_idx, rg_count, tomb_mask, expr, applied);
+    }
+
+    /// For a scan that only counts its rows: how many rows of row group
+    /// `rg_idx` its filter passes, read off the whole filter's
+    /// condition-cache record alone. Null when there is none, or tombstones,
+    /// a key bound or a sieve narrow the row group's rows.
+    fn conditionCount(self: *Scan, memo: *const FilterMemo, seg: *storage.ReadSegment, rg_idx: usize, rg_first: u32, rg_count: u32) ?usize {
+        const whole = memo.cond_whole orelse return null;
+        if (self.key_bound != null or self.sievedRows(rg_idx, rg_count) != null) return null;
+        if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
+        const cache = self.table.cache;
+        for ([_]storage.cache.Content{ .matched_rows, .matched_count }) |content| {
+            const e = cache.acquireCondition(self.conditionKey(seg, rg_idx, content, whole)) orelse continue;
+            defer cache.release(e);
+            return condition_cache.matchedRows(e.bytes);
+        }
+        return null;
+    }
+
+    /// Keep `verdicts`, the filter's AND child `child` (0 for a filter that
+    /// is no AND) evaluated over every stored row of row group `rg_idx`, in
+    /// the condition cache, when the cache keeps that arm. Best effort: a
+    /// record that cannot be allocated is not kept.
+    fn noteCondition(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, child: usize, verdicts: []const bool) void {
+        const memo = if (self.filter_memo) |*m| m else return;
+        const arm = for (memo.cond[0..memo.n_cond]) |a| {
+            if (a.child == child) break a;
+        } else return;
+        self.keepVerdicts(seg, rg_idx, arm.digest, verdicts);
+    }
+
+    /// `noteCondition` for the whole filter, evaluated over every stored row
+    /// of row group `rg_idx`.
+    fn noteWholeCondition(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, verdicts: []const bool) void {
+        const memo = if (self.filter_memo) |*m| m else return;
+        self.keepVerdicts(seg, rg_idx, memo.cond_whole orelse return, verdicts);
+    }
+
+    /// `noteWholeCondition` for a count-only scan, which learns how many
+    /// stored rows of row group `rg_idx` its filter matched, not which.
+    fn noteConditionCount(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, rg_count: u32, matched: usize) void {
+        const memo = if (self.filter_memo) |*m| m else return;
+        const whole = memo.cond_whole orelse return;
+        const record = condition_cache.encodeCount(self.table.cache.blockAllocator(), matched, rg_count) catch return;
+        self.keepCondition(self.conditionKey(seg, rg_idx, .matched_count, whole), record);
+    }
+
+    fn keepVerdicts(self: *Scan, seg: *const storage.ReadSegment, rg_idx: usize, digest: u128, verdicts: []const bool) void {
+        const record = condition_cache.encode(self.table.cache.blockAllocator(), verdicts, simd.countTrue(verdicts)) catch return;
+        self.keepCondition(self.conditionKey(seg, rg_idx, .matched_rows, digest), record);
+    }
+
+    fn keepCondition(self: *Scan, key: storage.cache.Key, record: []align(16) u8) void {
+        const cache = self.table.cache;
+        const entry = cache.insertPinned(key, record, .raw) catch {
+            cache.blockAllocator().free(record);
+            return;
+        };
+        cache.release(entry);
     }
 
     /// Whether a row group the whole filter left empty would be noted, so the

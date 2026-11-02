@@ -1394,7 +1394,15 @@ The LRU cache is bounded by a configurable size (default **2 GB**, set at `Datab
 - **What gets noted.** A row group is noted when the filter matched none of its *stored* rows, judged before tombstones or a top-K key bound narrow the mask. Every snapshot sees a subset of the stored rows, so the entry holds for all of them. The memtable is never memoized.
 - **AND arms.** A scan also looks up each of its filter's AND arms, so a query reuses what any query sharing an arm learned. An arm is noted alone only when the guided AND evaluated it first, over every row, and it alone emptied the row group.
 - **Invalidation.** None is needed. Segments are immutable, compaction writes new segment ids, and ALTER, TRUNCATE and XA rollback re-mint the table generation. Dead keys age out as newer keys overwrite their set.
-- **Predictability.** The memo changes no plan and no order of evaluation; it only skips work already proven empty. Query time does depend on history, as with the block cache. `Config.predicate_memo_bytes = 0` (`--predicate-memo-size 0`) turns it off, and `SET THINDB_NO_PREDICATE_MEMO = 1` turns it off per query for benchmarking.
+- **Predictability.** The memo changes no plan and no order of evaluation; it only skips work already proven empty. Query time does depend on history, as with the block cache. `Config.predicate_memo_bytes = 0` (`--predicate-memo-size 0`) turns it off, and `SET THINDB_NO_PREDICATE_MEMO = 1` turns it off per query for benchmarking. Turning the condition cache off (below) turns the memo off too.
+
+**Condition cache.** A scan also keeps, per row group, *which* stored rows a costly filter matched, so a later scan with the same filter, or one sharing an AND arm with it, reads the rows instead of evaluating again. It keeps a record for the whole filter and, for an AND, one per top-level AND child, all keyed by `predicate.digest` as above, so arm order doesn't matter. Only arms whose evaluation costs per row are kept: those on text columns (comparisons, IN, LIKE), NOT, and anything that isn't a simple leaf. A numeric comparison is cheaper to evaluate than to look up, and zone maps already prune it. The whole filter is kept when any of its arms is.
+
+- **Storage.** A record is a block-cache entry keyed by `(table generation, segment, row group, predicate digest)` with a content tag that keeps it apart from column blocks, so records share the cache's LRU and its memory budget. A record holds the matched positions, the unmatched positions or a bitmap, whichever is smallest: never more than `rows / 8` bytes plus a 16-byte header. A scan that only counts rows keeps a header-only count record.
+- **What gets noted.** Like the memo, a record holds the *stored* rows matched before tombstones or a key bound, and is noted only for an evaluation over every stored row of the row group: the whole filter, or the first arm the guided AND evaluated. Later arms of a guided AND see only the rows earlier arms kept, so they are never noted alone. The memtable is always evaluated live.
+- **Reuse.** A scan first looks up the whole filter's record, which answers the row group outright. Failing that, it looks up every kept arm. When any is found, it seeds the row mask from the record with the fewest matched rows, intersects the other records into it, and evaluates the remaining arms over the surviving rows only. Either way, tombstones, the key bound and the sieve then apply as usual. A count-only scan whose filter has a record and that has no tombstones or key bound reads the count without touching a column.
+- **Invalidation.** None is needed, for the same reasons as the memo.
+- **Predictability.** The cache changes no plan and no result; it only skips evaluation already done. `Config.condition_cache = false` (`--no-condition-cache`) turns both it and the predicate-miss memo off for the database, and `SET THINDB_NO_CONDITION_CACHE = 1` turns both off per query, so a benchmark can run with no state carried between queries beyond decoded blocks.
 
 ---
 
@@ -2261,6 +2269,7 @@ Errors propagate to callers. Outside the XA commit protocol, an error is not a b
 | `memory_budget` | 65% of RAM | The one budget for statements, the block cache, its memo and idle pools (§8.3). |
 | `min_cache_bytes` | a tenth of the budget | The least of the budget the decoded row group cache keeps; statements share the rest, and the cache fills what they leave. |
 | `predicate_memo_bytes` | 1/1024 of the budget | Memo of row groups a scan predicate matched none of (§6.4); `0` turns it off. |
+| `condition_cache` | `true` | Keep the rows each costly filter, and each costly AND arm, matched per row group, in the block cache (§6.4); `false` turns it and the predicate-miss memo off. |
 | `memory_pool` | none | A pool to share across catalogs; one is minted from the fields above otherwise. |
 | `flush_interval_secs` | 5 | Time-based flush trigger. |
 | `min_time_flush_rows` | 1,000 | Guard against tiny flushes. |

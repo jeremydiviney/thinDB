@@ -2712,6 +2712,7 @@ pub const ParallelScan = struct {
         var considered: u64 = 0;
         var scanned: u64 = 0;
         var memo_skipped: u64 = 0;
+        var condition_hits: u64 = 0;
         var rows_in: u64 = 0;
         var max_rgs: u64 = 0;
         for (self.workers) |w| switch (w) {
@@ -2719,6 +2720,7 @@ pub const ParallelScan = struct {
                 considered += s.rgs_considered;
                 scanned += s.rgs_scanned;
                 memo_skipped += s.rgs_memo_skipped;
+                condition_hits += s.rgs_condition_hits;
                 rows_in += s.rows_scanned;
                 max_rgs = @max(max_rgs, s.rgs_scanned);
             },
@@ -2728,10 +2730,10 @@ pub const ParallelScan = struct {
             self.n_threads,                       self.eff_threads,                     self.workers.len,                                        self.prof_waves, drain_wall_ms, rows,
             exec.prof.ticksToMs(@intCast(min_t)), exec.prof.ticksToMs(@intCast(max_t)), exec.prof.ticksToMs(@intCast(sum_t / self.workers.len)),
         });
-        std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%) memo_skipped={d}  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
+        std.debug.print("[pscan] rowgroups: considered={d} scanned={d} pruned={d} ({d:.1}%) memo_skipped={d} condition_hits={d}  rows_decoded={d}  busiest_worker_rgs={d}\n", .{
             considered,                                                                                                               scanned,      considered - scanned,
-            if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0, memo_skipped, rows_in,
-            max_rgs,
+            if (considered > 0) @as(f64, @floatFromInt(considered - scanned)) * 100.0 / @as(f64, @floatFromInt(considered)) else 0.0, memo_skipped, condition_hits,
+            rows_in,                                                                                                                  max_rgs,
         });
         switch (self.workers[0]) {
             .segment => |w0| std.debug.print("[pscan] prune hints on worker0: leaf={d} in_set={d} seg_skip={}\n", .{

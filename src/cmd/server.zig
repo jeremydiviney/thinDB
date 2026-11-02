@@ -92,7 +92,10 @@ const usage_text =
     \\                          taken from --memory-budget (default: 1/1024 of the budget; 0
     \\                          turns it off). A repeated predicate, or one sharing an AND arm
     \\                          with an earlier one, skips those row groups unread.
-    \\  --file-root PATH        Enable SQL file scans for paths under PATH. Without this flag,
+    \\  --no-condition-cache    Don't keep, per row group, the rows a filter's AND arm matched
+    \\                          (default: on, in the block cache), and turn the predicate memo
+    \\                          off too: no query reuses what an earlier one learned of the data.
+    \\  --file-root PATH       Enable SQL file scans for paths under PATH. Without this flag,
     \\                          thindb-server rejects read_csv/read_json/read_parquet and
     \\                          FROM 'file.csv' sources.
     \\  --force-group-by S      Diagnostic: force GROUP BY path — auto (default) | hash | sort | radix.
@@ -199,6 +202,7 @@ pub fn main(init: std.process.Init) !u8 {
     // must not shed acknowledged rows. --no-wal for disposable bench dirs.
     var enable_wal: bool = true;
     var enable_fsync: bool = true;
+    var condition_cache: bool = true;
     var idle_timeout_secs: u32 = 0;
     var memory_budget: ?usize = null;
     var min_cache_bytes: ?usize = null;
@@ -298,6 +302,10 @@ pub fn main(init: std.process.Init) !u8 {
             enable_fsync = false;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--no-condition-cache")) {
+            condition_cache = false;
+            continue;
+        }
         if (try takeU32(arg, "--max-connections", &iter, err_w)) |v| {
             max_connections = v;
             continue;
@@ -382,6 +390,7 @@ pub fn main(init: std.process.Init) !u8 {
         .memory_budget = memory_budget,
         .min_cache_bytes = min_cache_bytes,
         .predicate_memo_bytes = predicate_memo_bytes,
+        .condition_cache = condition_cache,
         .max_dop = if (max_dop) |v| v else thindb.hardwareThreadCount(),
         .data_root_path = data_dir,
         // Server default is auto (half the cores) rather than the embedded

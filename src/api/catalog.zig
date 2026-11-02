@@ -165,6 +165,7 @@ pub const Catalog = struct {
             const sizes = api.memorySizes(sized);
             const bc = try allocator.create(storage.cache.Cache);
             bc.* = storage.cache.Cache.init(allocator, pool, sizes.predicate_memo);
+            bc.conditions = config.condition_cache;
             pool.shareCache(bc, sizes.min_cache);
             owned_block_cache = bc;
         }
