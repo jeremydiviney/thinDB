@@ -819,12 +819,19 @@ const DECLINE_MIN_UNITS: u64 = 64;
 /// at most the need-th best count, so a key whose partial + slack falls
 /// short of τ ranks strictly below the top `need`, ties included, and the
 /// filter pass counts only the candidates whose partial + slack reach τ.
-/// Its top `need` is exact; no retry is needed.
+/// Its top `need` is exact; no retry is needed. Exact group keys
+/// (`exact_keys`) group apart keys that share a digest, whose partials pool:
+/// τ may then pass the need-th best count, so `proves` checks the filter
+/// pass's own counts. Their partials hold every reported key's bytes, so a
+/// second key reported under a digest shows; one never reported holds at
+/// most slack < τ rows, so the filter may pass over it.
 pub const HeavyKeys = struct {
     need: usize,
     workers: []Worker,
     top_keys: []u128,
     top_counts: []u64,
+    /// Keys sharing a digest group apart (exact group keys).
+    exact_keys: bool = false,
     /// The fewest rows a group needs to place at all: `settle` passes over
     /// every key that can't reach it, as over those that can't reach τ.
     floor: u64 = 0,
@@ -852,6 +859,11 @@ pub const HeavyKeys = struct {
     signatures: []u64 = &.{},
     signature_bits: u6 = 0,
     sorted: ?[]Candidate = null,
+    /// After `settle`: τ, and (exact keys) whether two reported keys shared
+    /// a digest, which neither a signature nor a search over bytes then
+    /// tells apart from a candidate.
+    tau: u64 = 0,
+    shared: bool = false,
 
     pub const Worker = struct {
         partials: std.AutoHashMapUnmanaged(u128, Partial) = .empty,
@@ -868,6 +880,8 @@ pub const HeavyKeys = struct {
         rows: u64 = 0,
         /// Keys reported since the worker's unit opened.
         unit_reports: u64 = 0,
+        /// Exact keys only: the worker saw two keys share a digest.
+        shared_digest: bool = false,
 
         fn findLeast(self: *Worker) void {
             var least: usize = 0;
@@ -947,7 +961,10 @@ pub const HeavyKeys = struct {
         const worker = &self.workers[w];
         worker.unit_reports += 1;
         const gop = try worker.partials.getOrPut(allocator, key);
-        if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .signature = keySignature(bytes), .slot = NO_SLOT, .bytes = null };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 0, .signature = keySignature(bytes), .slot = NO_SLOT, .bytes = null };
+            if (self.exact_keys) gop.value_ptr.bytes = try worker.key_bytes.allocator().dupe(u8, bytes);
+        } else if (self.exact_keys and !std.mem.eql(u8, gop.value_ptr.bytes.?, bytes)) worker.shared_digest = true;
         const p = gop.value_ptr;
         p.count += count;
         if (p.bytes == null and p.count >= KEPT_BYTES_MIN_COUNT) p.bytes = try worker.key_bytes.allocator().dupe(u8, bytes);
@@ -971,6 +988,11 @@ pub const HeavyKeys = struct {
         worker.top_keys[worker.least] = key;
         worker.top_counts[worker.least] = p.count;
         worker.findLeast();
+    }
+
+    /// Notes that worker `w` saw two keys share a digest.
+    pub fn noteSharedDigest(self: *HeavyKeys, w: usize) void {
+        self.workers[w].shared_digest = true;
     }
 
     /// Closes worker `w`'s unit of `rows` rows, which reported every key it
@@ -1010,6 +1032,7 @@ pub const HeavyKeys = struct {
         var best: [MAX_NEED]u64 = undefined;
         const tau = @max(kthLargest(u64, counts, best[0..self.need]), self.floor);
         if (tau <= slack) return false;
+        self.tau = tau;
 
         var n: usize = 0;
         for (counts) |c| n += @intFromBool(c + slack >= tau);
@@ -1021,16 +1044,20 @@ pub const HeavyKeys = struct {
         const sorted = try allocator.alloc(Candidate, n);
         var j: usize = 0;
         var it = merged.iterator();
+        if (self.exact_keys) {
+            for (self.workers) |*w| self.shared = self.shared or w.shared_digest;
+        }
         while (it.next()) |e| {
             if (e.value_ptr.count + slack < tau) continue;
             self.candidates.putAssumeCapacity(e.key_ptr.*, {});
             self.addSignature(e.value_ptr.signature);
+            if (self.exact_keys and !self.shared) self.shared = self.heldApart(e.key_ptr.*);
             if (e.value_ptr.bytes) |bytes| {
                 sorted[j] = .{ .bytes = bytes, .key = e.key_ptr.* };
                 j += 1;
             }
         }
-        if (j < n) {
+        if (j < n or self.shared) {
             allocator.free(sorted);
             return true;
         }
@@ -1111,6 +1138,27 @@ pub const HeavyKeys = struct {
         return merged;
     }
 
+    /// Whether the workers' partials of `key` hold different keys' bytes.
+    fn heldApart(self: *const HeavyKeys, key: u128) bool {
+        var held: ?[]const u8 = null;
+        for (self.workers) |*w| {
+            const p = w.partials.get(key) orelse continue;
+            if (held) |bytes| if (!std.mem.eql(u8, bytes, p.bytes.?)) return true;
+            held = p.bytes;
+        }
+        return false;
+    }
+
+    /// Whether a filter pass that found `found` groups, the need-th best
+    /// holding `kth_count` rows, found the top `need`. Only exact keys'
+    /// pooled partials can lift τ past the need-th best count; every key
+    /// outside the candidates, and every unreported key sharing a
+    /// candidate's digest, holds fewer than τ rows.
+    pub fn proves(self: *const HeavyKeys, found: usize, kth_count: u64) bool {
+        if (!self.exact_keys or self.tau <= self.floor) return true;
+        return found >= self.need and kth_count >= self.tau;
+    }
+
     /// Whether binary searches for the candidates beat signing every row of
     /// a batch of `rows` ascending distinct keys.
     pub fn searchPays(self: *const HeavyKeys, rows: usize) bool {
@@ -1155,6 +1203,7 @@ pub const HeavyKeys = struct {
     /// Whether some candidate signs as `signature`: a key that doesn't is
     /// no candidate, and needs no digest to tell.
     pub fn maySign(self: *const HeavyKeys, signature: u64) bool {
+        if (self.shared) return true;
         const mask = self.signatures.len - 1;
         var i: usize = @intCast(signature >> @intCast(64 - @as(u7, self.signature_bits)));
         while (true) : (i = (i + 1) & mask) {
@@ -1687,6 +1736,45 @@ test "heavy keys search only when every candidate's bytes were kept" {
     try std.testing.expect(heavy.keeps(1) and heavy.keeps(2));
     try std.testing.expect(heavy.sorted == null);
     try std.testing.expect(!heavy.searchPays(1 << 20));
+}
+
+test "exact heavy keys sharing a digest neither search nor sign and prove the top by their own counts" {
+    const allocator = std.testing.allocator;
+    // Two keys of one signature, a (50 rows) and b (40), share digest 7, so
+    // their partials pool to τ = 90 and leave out "z" (60), which tops both.
+    const a = "aaaaaaaa1bbbbbbbb";
+    const b = "aaaaaaaa2bbbbbbbb";
+    try std.testing.expectEqual(keySignature(a), keySignature(b));
+    inline for (.{ false, true }) |apart| {
+        var heavy = try HeavyKeys.init(allocator, 1, 2);
+        defer heavy.deinit(allocator);
+        heavy.exact_keys = true;
+        try heavy.report(allocator, 0, 7, a, 50);
+        try heavy.report(allocator, if (apart) 1 else 0, 7, b, 40);
+        try heavy.report(allocator, 0, 9, "z", 60);
+        heavy.endUnit(0, 150, 1);
+        heavy.endUnit(1, 0, 1);
+        try std.testing.expect(try heavy.settle(allocator));
+        try std.testing.expect(heavy.keeps(7) and !heavy.keeps(9));
+        try std.testing.expect(heavy.shared and heavy.sorted == null);
+        try std.testing.expect(heavy.maySign(keySignature("z")));
+        try std.testing.expect(!heavy.proves(2, 50));
+        try std.testing.expect(heavy.proves(2, 90));
+    }
+}
+
+test "exact heavy keys that share no digest search by every candidate's bytes" {
+    const allocator = std.testing.allocator;
+    var heavy = try HeavyKeys.init(allocator, 1, 1);
+    defer heavy.deinit(allocator);
+    heavy.exact_keys = true;
+    try heavy.report(allocator, 0, 1, "a", 1);
+    try heavy.report(allocator, 0, 2, "b", 1);
+    try heavy.report(allocator, 0, 1, "a", 1);
+    heavy.endUnit(0, 3, 1);
+    try std.testing.expect(try heavy.settle(allocator));
+    try std.testing.expect(!heavy.shared and heavy.sorted != null);
+    try std.testing.expect(heavy.proves(1, 2));
 }
 
 test "dup sketch keeps every repeated identity and need groups of one" {

@@ -878,6 +878,12 @@ pub const GroupRowsLayout = struct {
     hashed_key: bool = false,
     // The program has GROUP_CONCAT aggregates: buckets maintain concat_states.
     has_concat: bool = false,
+    // Exact group keys: the hashed key's bytes ride as the LAST str column
+    // (a lone string key's own bytes, else `ExactKey`'s encoded parts), each
+    // group keeps the bytes it was created with, and a row joins a group
+    // only when its digest and its bytes both match. The digest only places
+    // the key; two keys sharing one never merge.
+    exact_key: bool = false,
     // COUNT-only programs (no payload/str columns, no distinct): each staged
     // row carries a u32 weight, and the scan emitter collapses a run of
     // adjacent-equal keys into ONE weighted row — route/stage/lane traffic
@@ -894,7 +900,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.exact_key != b.exact_key or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1965,6 +1971,7 @@ const PipeBucket = struct {
     // The running MIN/MAX copies, in `str_arena`: an improvement reuses the
     // block of the value it replaces, so the bytes stay bounded by the groups.
     str_bank: StringBank = .{},
+    key_bank: KeyBank,
     // One combined membership set per COUNT(DISTINCT) field. Indexed by the
     // aggregate's distinct_state_index; only the first `layout.distinct_slot_count`
     // are touched. Each holds (gid,value) keys for this bucket's groups.
@@ -1985,11 +1992,12 @@ const PipeBucket = struct {
             .states = .{ .reserve_hint = sizing.initial_groups },
             .str_arena = std.heap.ArenaAllocator.init(allocator),
             .udf_arena = std.heap.ArenaAllocator.init(allocator),
+            .key_bank = .init(allocator),
         };
     }
 
     fn fold_rows(self: *PipeBucket, allocator: Allocator, scratch: *GroupScratch, rows: GroupRows, input_rows: u64) !void {
-        try groupChunkRowsDirect(&self.table, &self.states, &self.str_states, &self.concat_states, &self.udf_states, self.udf_arena.allocator(), &self.distinct_sets, scratch, allocator, self.str_arena.allocator(), &self.str_bank, rows, self.expected_groups, input_rows, self.observed_input_rows, if (PROFILING) &self.allocation_profile else null);
+        try groupChunkRowsDirect(&self.table, &self.states, &self.str_states, &self.concat_states, &self.udf_states, self.udf_arena.allocator(), &self.distinct_sets, scratch, allocator, self.str_arena.allocator(), &self.str_bank, &self.key_bank, rows, self.expected_groups, input_rows, self.observed_input_rows, if (PROFILING) &self.allocation_profile else null);
         self.row_count += rows.len();
         if (rows.layout.has_weight) {
             var represented_rows: u64 = 0;
@@ -2218,6 +2226,7 @@ const PipeBucket = struct {
         self.str_states.deinit(allocator);
         self.concat_states.deinit(allocator);
         self.udf_states.deinit(allocator);
+        self.key_bank.deinit(allocator);
         self.distinct_sets.deinit(allocator);
         self.chunks.deinit(allocator);
         self.table.deinit(allocator);
@@ -2292,6 +2301,8 @@ const PipeShared = struct {
     defer_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Per-slot HAVING bounds the drains prune by once the scans settle them.
     slot_bound: ?*SlotBound = null,
+    // See RunConfig.key_digest_mask.
+    key_digest_mask: u128 = std.math.maxInt(u128),
 
     /// Every row sits in a group queue: scans are done, no raw chunk awaits
     /// a stage pass, and no stage builder holds a tail.
@@ -3605,6 +3616,7 @@ fn resetPipeBucket(bucket: *PipeBucket, allocator: Allocator) void {
     bucket.table.clearRetainingCapacity();
     bucket.states.clearRetainingCapacity();
     bucket.freeStrBytes();
+    bucket.key_bank.clear();
     bucket.str_states.clearRetainingCapacity();
     bucket.concat_states.clearRetainingCapacity();
     // UDAF states are destroyed synchronously after emit (while the layout is
@@ -5155,14 +5167,16 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     if (layout.has_str_payload) {
         if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
         const ascending_column = if (row_weights) |rw| rw.ascending_column else null;
-        for (layout.str_columns, 0..) |sc, i| {
+        const n_inputs = layout.str_columns.len - @intFromBool(layout.exact_key);
+        for (layout.str_columns[0..n_inputs], 0..) |sc, i| {
             const ci = batch.columnIndex(sc.source_name) orelse return error.ColumnNotFound;
             str_inputs_buf[i] = try StrInput.of(batch, ci, layout.aggregates, i);
             str_inputs_buf[i].ascending = ascending_column == ci and !str_inputs_buf[i].json;
         }
-        str_inputs = str_inputs_buf[0..layout.str_columns.len];
+        str_inputs = str_inputs_buf[0..n_inputs];
         if (layout.has_weight) try parts.ensureStrPending(shared.allocator, raw_chunk_rows, str_inputs.len);
     }
+    const exact: ?ExactKey = if (layout.exact_key) try ExactKey.of(layout, batch) else null;
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
     // string lane (if any) rides along via appendStrPayload inside each kernel.
@@ -5239,18 +5253,19 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             // so the weighted-collapse branch lives only in the other copy.
             std.debug.assert(!layout.has_weight);
             while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-                const key = if (hashed_ids) |ids| ids[r] else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+                const key = if (hashed_ids) |ids| ids[r] & shared.key_digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
                 const idx = active.len();
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
                 appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
                 if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
+                if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
                 active.len_rows = idx + 1;
                 accepted += 1;
             }
         } else while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-            const key = if (hashed_ids) |ids| ids[r] else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+            const key = if (hashed_ids) |ids| ids[r] & shared.key_digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             // Weighted collapse (decomposable programs): a key already staged
             // in the chunk — the previous row's, or one the fold index finds —
@@ -5262,7 +5277,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             if (layout.has_weight) {
                 // A collapsed batch's row stands for `w` equal rows.
                 const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
-                if (last < idx and last_key == key and active.weightAll()[last] <= std.math.maxInt(u32) - w) {
+                if (last < idx and last_key == key and (if (exact) |*ek| ek.heldBy(&active.str, layout.str_columns.len, last, r) else true) and active.weightAll()[last] <= std.math.maxInt(u32) - w) {
                     weightFoldRow(parts, active, weight_specs, str_inputs, last, r, w);
                     accepted += w;
                     continue;
@@ -5270,7 +5285,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 if (use_fold) {
                     const held = foldIndexProbe(parts, active, key, idx);
                     probes += 1;
-                    if (held < idx and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
+                    if (held < idx and (if (exact) |*ek| ek.heldBy(&active.str, layout.str_columns.len, held, r) else true) and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
                         weightFoldRow(parts, active, weight_specs, str_inputs, held, r, w);
                         last = held;
                         last_key = key;
@@ -5282,9 +5297,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 active.weightAll()[idx] = w;
                 weightFoldScaled(active, weight_specs, idx, r, w, true);
                 if (str_inputs.len != 0) {
-                    for (0..str_inputs.len) |c| active.str.appendNull(str_inputs.len, idx, c);
+                    for (0..str_inputs.len) |c| active.str.appendNull(layout.str_columns.len, idx, c);
                     pendStr(parts, str_inputs, idx, r);
                 }
+                if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
@@ -5297,6 +5313,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
             if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
+            if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -5843,7 +5860,7 @@ const StrInput = struct {
             input.json = agg.is_json;
         }
         if (batch.block_dicts) |dicts| {
-            if (dicts[ci]) |d| if (d.digests == null and d.codes.len >= batch.row_count) {
+            if (dicts[ci]) |d| if (d.holdsValues() and d.codes.len >= batch.row_count) {
                 input.view = d.dict;
                 input.codes = d.codes;
                 return input;
@@ -5900,9 +5917,9 @@ inline fn pendStr(parts: *WorkerParts, inputs: []const StrInput, dst: usize, src
 // batch's rows the row took. A staged NULL takes the value; a replaced
 // value's bytes stay in the chunk's store until the chunk recycles.
 fn settleStrPending(parts: *WorkerParts, active: *RawRows, allocator: Allocator, inputs: []const StrInput) !void {
-    const k = inputs.len;
+    const k = active.layout.str_columns.len;
     for (parts.str_touched.items) |dst| {
-        const slots = parts.str_pending[dst * k ..][0..k];
+        const slots = parts.str_pending[dst * inputs.len ..][0..inputs.len];
         for (inputs, slots, 0..) |input, *slot, c| {
             const src = slot.*;
             if (src == NO_PENDING) continue;
@@ -6057,14 +6074,208 @@ fn weightFoldSpan(
 // for numeric queries (`str_inputs.len == 0`), so the caller's guard keeps it off
 // the hot path entirely.
 inline fn appendStrPayload(active: *RawRows, allocator: Allocator, inputs: []const StrInput, dst: usize, src: usize) !void {
+    const k = active.layout.str_columns.len;
     for (inputs, 0..) |input, col| {
         if (!input.valid(src)) {
-            active.str.appendNull(inputs.len, dst, col);
+            active.str.appendNull(k, dst, col);
             continue;
         }
-        try active.str.append(allocator, inputs.len, dst, col, input.rowBytes(src));
+        try active.str.append(allocator, k, dst, col, input.rowBytes(src));
     }
 }
+
+/// A batch's group key, read for the bytes exact group keys compare (see
+/// `GroupRowsLayout.exact_key`): a lone string key's own bytes, else its
+/// parts in order, a nullable part behind a validity byte (a NULL part adds
+/// nothing more), a string part behind its u32 length and any other part in
+/// its type's own width.
+const ExactKey = struct {
+    parts: []const GroupKeyColumnSpec,
+    views: [MAX_GENERIC_GROUP_KEYS]ColumnView = undefined,
+    strs: [MAX_GENERIC_GROUP_KEYS]?StringView = undefined,
+    codes: [MAX_GENERIC_GROUP_KEYS]?[]const u32 = undefined,
+    /// A fixed-width part's values end to end, `widths[i]` bytes each.
+    fixed: [MAX_GENERIC_GROUP_KEYS][]const u8 = undefined,
+    widths: [MAX_GENERIC_GROUP_KEYS]usize = undefined,
+
+    fn of(layout: GroupRowsLayout, batch: thindb.Batch) !ExactKey {
+        if (layout.key_columns.len == 0 or layout.key_columns.len > MAX_GENERIC_GROUP_KEYS) return error.UnsupportedOperatorForType;
+        var key: ExactKey = .{ .parts = layout.key_columns };
+        for (layout.key_columns, 0..) |part, i| {
+            const ci = batch.columnIndex(part.name) orelse return error.ColumnNotFound;
+            key.views[i] = batch.values[ci];
+            key.codes[i] = null;
+            key.strs[i] = switch (batch.values[ci].data) {
+                .string, .varchar, .char, .json, .nested, .bitmap => |sv| sv,
+                else => null,
+            };
+            if (batch.block_dicts) |dicts| if (dicts[ci]) |d| if (d.holdsValues() and d.codes.len >= batch.row_count) {
+                key.strs[i] = d.dict;
+                key.codes[i] = d.codes;
+            };
+            if (key.strs[i] == null) {
+                const fixed = fixedKeyPart(batch.values[ci], part.typ) orelse return error.TypeMismatch;
+                key.fixed[i] = fixed.bytes;
+                key.widths[i] = fixed.width;
+            }
+        }
+        return key;
+    }
+
+    inline fn lone(self: *const ExactKey) bool {
+        return self.parts.len == 1 and self.strs[0] != null;
+    }
+
+    inline fn strBytes(self: *const ExactKey, i: usize, r: usize) []const u8 {
+        return self.strs[i].?.rowBytes(if (self.codes[i]) |codes| codes[r] else r);
+    }
+
+    inline fn fixedBytes(self: *const ExactKey, i: usize, r: usize) []const u8 {
+        const w = self.widths[i];
+        return self.fixed[i][r * w ..][0..w];
+    }
+
+    fn encodedLen(self: *const ExactKey, r: usize) usize {
+        var len: usize = 0;
+        for (self.parts, 0..) |part, i| {
+            if (part.nullable) {
+                len += 1;
+                if (!self.views[i].isValid(r)) continue;
+            }
+            len += if (self.strs[i] != null) @sizeOf(u32) + self.strBytes(i, r).len else self.widths[i];
+        }
+        return len;
+    }
+
+    /// Makes row `r`'s key staged row `dst`'s: the last of `store`'s
+    /// `cols` str columns.
+    fn stage(self: *const ExactKey, store: *StrStore, allocator: Allocator, cols: usize, dst: usize, r: usize) !void {
+        if (self.lone()) {
+            if (self.parts[0].nullable and !self.views[0].isValid(r)) return store.appendNull(cols, dst, cols - 1);
+            return store.append(allocator, cols, dst, cols - 1, self.strBytes(0, r));
+        }
+        const len = self.encodedLen(r);
+        try store.bytes.ensureUnusedCapacity(allocator, len);
+        const at = store.bytes.items.len;
+        for (self.parts, 0..) |part, i| {
+            if (part.nullable) {
+                const valid = self.views[i].isValid(r);
+                store.bytes.appendAssumeCapacity(@intFromBool(valid));
+                if (!valid) continue;
+            }
+            if (self.strs[i] != null) {
+                const bytes = self.strBytes(i, r);
+                const n: u32 = @intCast(bytes.len);
+                store.bytes.appendSliceAssumeCapacity(std.mem.asBytes(&n));
+                store.bytes.appendSliceAssumeCapacity(bytes);
+            } else store.bytes.appendSliceAssumeCapacity(self.fixedBytes(i, r));
+        }
+        store.refs[dst * cols + cols - 1] = .{ .off = @intCast(at), .len = @intCast(len) };
+    }
+
+    /// Whether staged row `held` of `store` holds row `r`'s key, compared
+    /// part by part against its encoding rather than encoding the row.
+    fn heldBy(self: *const ExactKey, store: *const StrStore, cols: usize, held: usize, r: usize) bool {
+        const held_null = store.isNull(cols, held, cols - 1);
+        if (self.lone()) {
+            if (self.parts[0].nullable and !self.views[0].isValid(r)) return held_null;
+            return !held_null and std.mem.eql(u8, store.get(cols, held, cols - 1), self.strBytes(0, r));
+        }
+        const enc = store.get(cols, held, cols - 1);
+        var at: usize = 0;
+        for (self.parts, 0..) |part, i| {
+            if (part.nullable) {
+                const valid = self.views[i].isValid(r);
+                if (enc[at] != @intFromBool(valid)) return false;
+                at += 1;
+                if (!valid) continue;
+            }
+            if (self.strs[i] != null) {
+                const bytes = self.strBytes(i, r);
+                if (std.mem.bytesToValue(u32, enc[at..][0..@sizeOf(u32)]) != bytes.len) return false;
+                at += @sizeOf(u32);
+                if (!std.mem.eql(u8, enc[at..][0..bytes.len], bytes)) return false;
+                at += bytes.len;
+            } else {
+                const bytes = self.fixedBytes(i, r);
+                if (!std.mem.eql(u8, enc[at..][0..bytes.len], bytes)) return false;
+                at += bytes.len;
+            }
+        }
+        return true;
+    }
+};
+
+const FixedKeyPart = struct { bytes: []const u8, width: usize };
+
+/// A fixed-width key column's values as bytes, for the views
+/// `readGenericKeyBits` reads under `typ`.
+fn fixedKeyPart(view: ColumnView, typ: thindb.types.Type) ?FixedKeyPart {
+    return switch (typ) {
+        .boolean => switch (view.data) {
+            .boolean => |v| .{ .bytes = std.mem.sliceAsBytes(v), .width = @sizeOf(bool) },
+            else => null,
+        },
+        .tinyint => switch (view.data) {
+            .tinyint => |v| .{ .bytes = std.mem.sliceAsBytes(v), .width = @sizeOf(i8) },
+            else => null,
+        },
+        .smallint => switch (view.data) {
+            .smallint => |v| .{ .bytes = std.mem.sliceAsBytes(v), .width = @sizeOf(i16) },
+            else => null,
+        },
+        .int, .date => switch (view.data) {
+            inline .int, .date => |v| .{ .bytes = std.mem.sliceAsBytes(v), .width = @sizeOf(@TypeOf(v[0])) },
+            else => null,
+        },
+        .bigint, .datetime, .decimal64 => switch (view.data) {
+            inline .bigint, .datetime, .decimal64 => |v| .{ .bytes = std.mem.sliceAsBytes(v), .width = @sizeOf(@TypeOf(v[0])) },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// Exact group keys' bytes by gid (null for a NULL key). The bytes live in
+/// `arena`, which never moves a key as it grows: a growing buffer copies
+/// every key it holds again at each step.
+const KeyBank = struct {
+    keys: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    arena: std.heap.ArenaAllocator,
+
+    fn init(allocator: Allocator) KeyBank {
+        return .{ .arena = .init(allocator) };
+    }
+
+    fn deinit(self: *KeyBank, allocator: Allocator) void {
+        self.keys.deinit(allocator);
+        self.arena.deinit();
+    }
+
+    fn clear(self: *KeyBank) void {
+        self.keys.clearRetainingCapacity();
+        _ = self.arena.reset(.free_all);
+    }
+
+    /// Adds the next group's key, with room for it already ensured.
+    fn add(self: *KeyBank, bytes: ?[]const u8) !void {
+        const held = if (bytes) |b| try self.arena.allocator().dupe(u8, b) else null;
+        self.keys.appendAssumeCapacity(held);
+    }
+};
+
+/// A group whose key bytes in `bank` are `bytes` (or NULL when not
+/// `valid`), for getOrPutMatching.
+const GroupKeyMatch = struct {
+    bank: []const ?[]const u8,
+    bytes: []const u8,
+    valid: bool,
+
+    pub inline fn matches(self: GroupKeyMatch, gid: u32) bool {
+        const held = self.bank[gid] orelse return !self.valid;
+        return self.valid and std.mem.eql(u8, held, self.bytes);
+    }
+};
 
 fn publishActiveRawRows(parts: *WorkerParts, shared: *PipeShared, raw_chunk_rows: usize) !void {
     if (shared.serial_fold_scratch) |scratch| return foldActiveRawRows(parts, shared, scratch);
@@ -6421,6 +6632,7 @@ fn groupChunkRowsDirect(
     allocator: Allocator,
     str_arena: Allocator,
     str_bank: *StringBank,
+    key_bank: ?*KeyBank,
     rows: GroupRows,
     expected_groups: usize,
     input_rows: u64,
@@ -6445,6 +6657,15 @@ fn groupChunkRowsDirect(
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
     const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
+    if (rows.layout.exact_key) {
+        const bank = key_bank orelse return error.UnsupportedOperatorForType;
+        if (rows.layout.key_width != .u128) return error.UnsupportedOperatorForType;
+        try bank.keys.ensureTotalCapacity(allocator, states.len + n);
+        switch (table.*) {
+            inline else => |*t| try groupChunkRowsExact(t, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, bank, &scratch.gids, allocator, rows.keyU128All()[0..n], rows, rowrefs),
+        }
+        return;
+    }
     if (countSumAvgProgram(rows.layout.aggregates, rows.layout.columns.len)) |program| blk: {
         // The CountSumAvg fast path reads inputs as i64; float inputs route to
         // the generic per-aggregate program path instead.
@@ -6942,6 +7163,243 @@ fn groupChunkRowsDirectKeysProgram(
     }
 
     if (has_distinct) try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
+}
+
+// Exact group keys' fold (see `GroupRowsLayout.exact_key`): a row joins a
+// group only when its key bytes (the rows' last str column) match the
+// group's in `key_bank`; a run of one digest ends where the bytes change.
+// Counts and the kernel aggregates fold as groupChunkRowsDirectKeys folds
+// them; a program the kernels can't express folds row by row, as
+// groupChunkRowsDirectKeysProgram does.
+fn groupChunkRowsExact(
+    table: anytype,
+    states: *StateSlab,
+    str_states: *std.ArrayListUnmanaged(StrAccRow),
+    concat_states: *std.ArrayListUnmanaged(ConcatRow),
+    udf_states: *std.ArrayListUnmanaged(UdfStateRow),
+    udf_arena: Allocator,
+    str_arena: Allocator,
+    str_bank: *StringBank,
+    distinct_sets: *DistinctSlots,
+    key_bank: *KeyBank,
+    gids_buf: *std.ArrayListUnmanaged(u32),
+    allocator: Allocator,
+    keys: []const u128,
+    rows: GroupRows,
+    rowrefs: []const i64,
+) !void {
+    const aggregates = rows.layout.aggregates;
+    const n = keys.len;
+    const cols = rows.layout.str_columns.len;
+    const key_col = cols - 1;
+    const has_str = hasStringResults(rows.layout);
+    const has_str_fold = hasStringExtreme(aggregates);
+    const has_concat = rows.layout.has_concat;
+    const has_udf = rows.layout.has_udf;
+    const has_distinct = rows.layout.distinct_slot_count > 0;
+    var kernels = !has_udf;
+    var has_extreme = false;
+    var has_mirror = false;
+    for (aggregates) |agg| {
+        if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
+        if (agg.state_index >= MAX_GROUP_AGG_STATES) return error.UnsupportedOperatorForType;
+        switch (agg.op) {
+            .count_star, .count_col => {
+                if (agg.state_index != 0) has_mirror = true;
+                if (agg.nullable) kernels = false;
+            },
+            .sum, .avg, .min, .max => {
+                if (agg.op == .min or agg.op == .max) has_extreme = true;
+                if (agg.state_index == 0) kernels = false;
+                if (agg.nullable and agg.valid_count_index == 0) kernels = false;
+            },
+            .welford => kernels = false,
+            .count_distinct, .concat, .udf => return error.UnsupportedOperatorForType,
+        }
+    }
+    const weights: []const u32 = if (rows.layout.has_weight) rows.weightAll()[0..n] else &.{};
+    // The per-row program counts rows, not weights.
+    if (!kernels and weights.len != 0) return error.UnsupportedOperatorForType;
+    const mark_new = kernels and has_extreme;
+    try gids_buf.resize(allocator, n);
+    const gids = gids_buf.items[0..n];
+
+    const prefetch = prefetchesSlots(table);
+    var r: usize = 0;
+    while (r < n) {
+        const pf = r + PREFETCH_DIST_BUCKET;
+        if (prefetch and pf < n) @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(keys[pf]))), .{ .rw = .write, .locality = 1 });
+
+        const key = keys[r];
+        const valid = !rows.str.isNull(cols, r, key_col);
+        const bytes = rows.str.get(cols, r, key_col);
+        var run_end = r + 1;
+        while (run_end < n and keys[run_end] == key and
+            !rows.str.isNull(cols, run_end, key_col) == valid and
+            std.mem.eql(u8, rows.str.get(cols, run_end, key_col), bytes)) run_end += 1;
+        const run_len: u64 = if (weights.len != 0) blk: {
+            var sum: u64 = 0;
+            for (weights[r..run_end]) |w| sum += w;
+            break :blk sum;
+        } else @intCast(run_end - r);
+
+        const probe = table.getOrPutMatching(@TypeOf(table.*).hashKey(key), key, GroupKeyMatch{ .bank = key_bank.keys.items, .bytes = bytes, .valid = valid });
+        var gid: u32 = probe.gid;
+        var tagged: u32 = probe.gid;
+        // The per-row program's first row initializes a new group's record.
+        var fold_from = r;
+        if (!probe.found) {
+            if (kernels) {
+                gid = states.pushAssumeCapacity();
+                const head = states.head(gid);
+                head.key = key;
+                head.count = run_len;
+            } else {
+                gid = try initGroupStateProgram(states, key, aggregates, rows, r);
+                fold_from = r + 1;
+            }
+            if (rowrefs.len != 0) states.head(gid).rowref = rowrefs[r];
+            table.commit(probe.slot, key, gid);
+            try key_bank.add(if (valid) bytes else null);
+            if (has_str) str_states.appendAssumeCapacity(@as([MAX_GROUP_STR_SLOTS]StrAcc, @splat(.{})));
+            if (has_concat) concat_states.appendAssumeCapacity(@as([MAX_GROUP_CONCAT_SLOTS]ConcatCell, @splat(.empty)));
+            if (has_udf) {
+                udf_states.appendAssumeCapacity(@as([MAX_GROUP_UDF_SLOTS]UdfCell, @splat(.{})));
+                try initUdfStatesRow(udf_states, udf_arena, gid, aggregates);
+            }
+            tagged = if (mark_new) gid | NEW_GID_BIT else gid;
+        } else if (kernels) {
+            states.head(gid).count += run_len;
+        }
+        if (!kernels) {
+            var rr = fold_from;
+            while (rr < run_end) : (rr += 1) try updateGroupStateProgram(states.ref(gid), aggregates, rows, rr);
+        }
+        var rr = r;
+        while (rr < run_end) : (rr += 1) {
+            if (has_str_fold) try foldGroupStr(str_states, str_bank, str_arena, gid, aggregates, rows, rr);
+            if (has_concat) try foldGroupConcat(concat_states, str_arena, gid, aggregates, rows, rr);
+            if (has_udf) try foldGroupUdf(udf_states, udf_arena, gid, aggregates, rows, rr, n);
+        }
+        if (kernels and has_mirror) mirrorCountSlots(states, gid, aggregates);
+        gids[r] = tagged;
+        if (run_end > r + 1) @memset(gids[r + 1 .. run_end], gid);
+        r = run_end;
+    }
+
+    if (kernels) {
+        for (aggregates) |agg| {
+            if (agg.is_string or agg.is_distinct or agg.is_concat or agg.is_udf) continue;
+            if (aggInputHasValidity(rows, agg))
+                foldAggregateKernel(true, states, gids, rows, agg)
+            else
+                foldAggregateKernel(false, states, gids, rows, agg);
+        }
+    }
+    if (has_distinct) {
+        if (mark_new) for (gids) |*g| {
+            g.* &= ~NEW_GID_BIT;
+        };
+        try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
+    }
+}
+
+test "exact group keys keep keys that share a digest in groups of their own" {
+    const allocator = std.testing.allocator;
+    const Row = struct { digest: u128, key: ?[]const u8, weight: u32 = 1 };
+    // "a", "b", "" and NULL all share digest 7; "c" has its own.
+    const chunks = [_][]const Row{
+        &.{ .{ .digest = 7, .key = "a" }, .{ .digest = 7, .key = "b" }, .{ .digest = 7, .key = "b", .weight = 3 }, .{ .digest = 7, .key = "a" }, .{ .digest = 9, .key = "c" } },
+        &.{ .{ .digest = 7, .key = null }, .{ .digest = 7, .key = "" }, .{ .digest = 7, .key = "b" }, .{ .digest = 7, .key = null, .weight = 2 }, .{ .digest = 9, .key = "c" } },
+    };
+    inline for (.{ false, true }) |weighted| {
+        const layout: GroupRowsLayout = .{
+            .key_width = .u128,
+            .columns = &.{},
+            .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+            .str_columns = &.{.{ .source_name = "k" }},
+            .has_str_payload = true,
+            .has_rowref = true,
+            .hashed_key = true,
+            .exact_key = true,
+            .has_weight = weighted,
+        };
+        var bucket = try PipeBucket.init(allocator, 16);
+        defer bucket.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var rows: GroupRows = .{};
+        defer rows.deinit(allocator);
+        try rows.ensureTotalCapacity(allocator, layout, 8);
+        for (chunks) |chunk| {
+            rows.clearRetainingCapacity();
+            for (chunk, 0..) |row, i| {
+                rows.setKey(i, row.digest);
+                rows.rowrefAll()[i] = @intCast(i);
+                if (weighted) rows.weightAll()[i] = row.weight;
+                if (row.key) |key| try rows.str.append(allocator, 1, i, 0, key) else rows.str.appendNull(1, i, 0);
+            }
+            rows.len_rows = chunk.len;
+            try bucket.fold_rows(allocator, &scratch, rows, 16);
+        }
+        const expected = [_]struct { key: ?[]const u8, count: u64 }{
+            .{ .key = "a", .count = 2 },
+            .{ .key = "b", .count = if (weighted) 5 else 3 },
+            .{ .key = "c", .count = 2 },
+            .{ .key = null, .count = if (weighted) 3 else 2 },
+            .{ .key = "", .count = 1 },
+        };
+        try std.testing.expectEqual(expected.len, bucket.states.len);
+        for (expected) |want| {
+            const gid = for (0..bucket.states.len) |g| {
+                const held = bucket.key_bank.keys.items[g];
+                if (want.key) |key| {
+                    if (held != null and std.mem.eql(u8, held.?, key)) break g;
+                } else if (held == null) break g;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(want.count, bucket.states.head(gid).count);
+        }
+    }
+}
+
+test "an exact key's staged bytes hold another row's key only when every part matches" {
+    const allocator = std.testing.allocator;
+    // (s, g): rows 0 and 1 share a key; 2 differs in s's bytes and length,
+    // 3 in g; 4's s is NULL and 5's is empty.
+    const schema = [_]thindb.types.Column{
+        .{ .name = "s", .type = .{ .varchar = 16 }, .nullable = true },
+        .{ .name = "g", .type = .bigint },
+    };
+    const s_valid = [_]u8{0b101111};
+    const views = [_]ColumnView{
+        .{ .data = .{ .varchar = .{ .offsets = &.{ 0, 2, 4, 5, 7, 7, 7 }, .bytes = "ababaab" } }, .nulls = &s_valid },
+        .{ .data = .{ .bigint = &.{ 1, 1, 1, 2, 1, 1 } } },
+    };
+    const batch: thindb.Batch = .{ .schema = &schema, .values = &views, .row_count = 6 };
+    const s_part: GroupKeyColumnSpec = .{ .name = "s", .typ = .{ .varchar = 16 }, .offset_bits = 0, .width_bits = 128, .nullable = true };
+    const g_part: GroupKeyColumnSpec = .{ .name = "g", .typ = .bigint, .offset_bits = 0, .width_bits = 64 };
+    const same = [_][2]usize{ .{ 0, 1 }, .{ 4, 4 }, .{ 5, 5 } };
+    const apart = [_][2]usize{ .{ 0, 2 }, .{ 0, 3 }, .{ 2, 0 }, .{ 4, 5 }, .{ 5, 4 }, .{ 0, 5 } };
+    inline for (.{ &[_]GroupKeyColumnSpec{ s_part, g_part }, &[_]GroupKeyColumnSpec{s_part} }) |parts| {
+        const key = try ExactKey.of(.{ .key_columns = parts, .hashed_key = true, .exact_key = true }, batch);
+        var store: StrStore = .{};
+        defer store.deinit(allocator);
+        try store.ensure(allocator, 1, batch.row_count, 0);
+        for (0..batch.row_count) |r| try key.stage(&store, allocator, 1, r, r);
+        for (same) |p| try std.testing.expect(key.heldBy(&store, 1, p[0], p[1]));
+        for (apart) |p| {
+            const lone_g_only = parts.len == 1 and p[0] == 0 and p[1] == 3;
+            try std.testing.expectEqual(lone_g_only, key.heldBy(&store, 1, p[0], p[1]));
+        }
+        if (parts.len == 2) {
+            // A validity byte, the u32 length and "ab", then g's 8 bytes.
+            try std.testing.expectEqual(@as(usize, 1 + 4 + 2 + 8), store.get(1, 0, 0).len);
+            try std.testing.expectEqual(@as(usize, 1 + 8), store.get(1, 4, 0).len);
+        } else {
+            try std.testing.expectEqualStrings("ab", store.get(1, 0, 0));
+            try std.testing.expect(store.isNull(1, 4, 0));
+        }
+    }
 }
 
 // Tags the gid of the row that CREATED its group, so the MIN/MAX kernels know
@@ -7451,14 +7909,17 @@ const GridDictEval = struct {
     code_loc: std.ArrayListUnmanaged(i64) = .empty,
     /// Per collapsed value: its row count and a row's location, its digest
     /// when the column is a hashed key, else the value bytes when the used
-    /// codes aren't one contiguous run.
+    /// codes aren't one contiguous run (an exact key: those codes, which
+    /// reach the staging with the dictionary in `dicts`).
     weights: std.ArrayListUnmanaged(u32) = .empty,
     locs: std.ArrayListUnmanaged(i64) = .empty,
     digests: std.ArrayListUnmanaged(u128) = .empty,
     offsets: std.ArrayListUnmanaged(u32) = .empty,
     bytes: std.ArrayListUnmanaged(u8) = .empty,
+    used_codes: std.ArrayListUnmanaged(u32) = .empty,
     views: []ColumnView = &.{},
     hashed: []?[]const u128 = &.{},
+    dicts: []?thindb.exec.BlockDictColumn = &.{},
     input_rows: usize = 0,
     collapsed: bool = false,
     /// The collapsed column reached the evaluated batch as the dictionary's
@@ -7493,8 +7954,10 @@ const GridDictEval = struct {
         self.digests.deinit(allocator);
         self.offsets.deinit(allocator);
         self.bytes.deinit(allocator);
+        self.used_codes.deinit(allocator);
         if (self.views.len > 0) allocator.free(self.views);
         if (self.hashed.len > 0) allocator.free(self.hashed);
+        if (self.dicts.len > 0) allocator.free(self.dicts);
         for (self.partials) |*p| p.deinit(allocator);
         if (self.partials.len > 0) allocator.free(self.partials);
         if (self.partial_views.len > 0) allocator.free(self.partial_views);
@@ -7522,7 +7985,7 @@ const GridDictEval = struct {
         const out = try self.evalLater(batch);
         // A derived column may take the collapsed column's name and slot;
         // hashed values are the scan's placeholders.
-        self.ascending = column.digests == null and sameStringView(out.values[column_index], batch.values[column_index]);
+        self.ascending = column.holdsValues() and sameStringView(out.values[column_index], batch.values[column_index]);
         return out;
     }
 
@@ -7666,13 +8129,14 @@ const GridDictEval = struct {
             try self.tuple_codes.resize(allocator, n);
             for (self.tuple_codes.items, first_rows) |*c, r| c.* = d.codes[r];
             if (d.digests) |ds| {
-                // A hashed key's value column stays the scan's placeholder.
                 const out = &self.source_digests[m];
                 try out.resize(allocator, n);
                 for (out.items, self.tuple_codes.items) |*o, c| o.* = ds[c];
                 self.hashed[j] = out.items;
                 any_hashed = true;
-            } else {
+            }
+            // A hashed key's value column stays the scan's placeholder.
+            if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
                 try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), self.tuple_codes.items, store);
                 self.views[j] = store.view();
@@ -7713,7 +8177,8 @@ const GridDictEval = struct {
                 for (out.items, codes) |*o, c| o.* = ds[c];
                 self.hashed[j] = out.items;
                 any_hashed = true;
-            } else {
+            }
+            if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
                 try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), codes, store);
                 self.views[j] = store.view();
@@ -7735,13 +8200,16 @@ const GridDictEval = struct {
     }
 
     fn ensureViews(self: *GridDictEval, allocator: Allocator, n: usize) !void {
-        if (self.views.len == n and self.hashed.len == n) return;
+        if (self.views.len == n and self.hashed.len == n and self.dicts.len == n) return;
         if (self.views.len > 0) allocator.free(self.views);
         if (self.hashed.len > 0) allocator.free(self.hashed);
+        if (self.dicts.len > 0) allocator.free(self.dicts);
         self.views = &.{};
         self.hashed = &.{};
+        self.dicts = &.{};
         self.views = try allocator.alloc(ColumnView, n);
         self.hashed = try allocator.alloc(?[]const u128, n);
+        self.dicts = try allocator.alloc(?thindb.exec.BlockDictColumn, n);
     }
 
     /// Source column `m`'s store, emptied, typed like `like`.
@@ -7849,13 +8317,25 @@ const GridDictEval = struct {
         };
         // A hashed key's value column is the scan's empty placeholder; else
         // a contiguous run of used codes is a slice of the dictionary itself,
-        // and a gapped one copies just the used values.
+        // and a gapped one copies just the used values. An exact key's
+        // staging copies its bytes from the dictionary (`ExactKey.of`), so
+        // a gapped run passes its codes instead, unless a derived column,
+        // whose evaluation drops the dictionary, reads the values.
         const dict = column.dict;
         var values: storage_mod.StringView = undefined;
-        if (column.digests != null) {
+        var through = false;
+        if (!column.holdsValues()) {
             values = .{ .offsets = raw_values.offsets[0 .. used + 1], .bytes = raw_values.bytes };
         } else if (used == hi - lo) {
             values = .{ .offsets = dict.offsets[lo .. hi + 1], .bytes = dict.bytes };
+        } else if (column.digests != null and self.compute == null) {
+            self.used_codes.clearRetainingCapacity();
+            try self.used_codes.ensureTotalCapacity(allocator, used);
+            for (code_rows[lo..hi], lo..) |n, c| {
+                if (n > 0) self.used_codes.appendAssumeCapacity(@intCast(c));
+            }
+            values = .{ .offsets = raw_values.offsets[0 .. used + 1], .bytes = raw_values.bytes };
+            through = true;
         } else {
             self.offsets.clearRetainingCapacity();
             self.bytes.clearRetainingCapacity();
@@ -7888,7 +8368,12 @@ const GridDictEval = struct {
             self.hashed[column_index] = self.digests.items;
             break :blk self.hashed;
         } else null;
-        return .{ .schema = raw.schema, .values = self.views, .row_count = used, .hashed = hashed };
+        const dicts: ?[]const ?thindb.exec.BlockDictColumn = if (through) blk: {
+            @memset(self.dicts, null);
+            self.dicts[column_index] = .{ .codes = self.used_codes.items, .dict = dict };
+            break :blk self.dicts;
+        } else null;
+        return .{ .schema = raw.schema, .values = self.views, .row_count = used, .hashed = hashed, .block_dicts = dicts };
     }
 
     fn rowWeights(self: *const GridDictEval) ?RowWeights {
@@ -9416,7 +9901,9 @@ fn heavyTallyRows(job: SiloGridJob, heavy: *HeavyKeys, batch: thindb.Batch, weig
     for (scratch.row_bins.items, 0..) |bin, r| {
         if (bin_counts[bin] < t) continue;
         const gop = try unit_keys.getOrPut(scratch_allocator, thindb.exec.stringKeyDigest(keys.rowBytes(r)));
-        if (!gop.found_existing) gop.value_ptr.* = .{ .count = 0, .row = @intCast(r) };
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .count = 0, .row = @intCast(r) };
+        } else if (heavy.exact_keys and !std.mem.eql(u8, keys.rowBytes(gop.value_ptr.row), keys.rowBytes(r))) heavy.noteSharedDigest(w);
         gop.value_ptr.count += 1;
     }
     var it = unit_keys.iterator();
@@ -9439,6 +9926,8 @@ fn heavyKeptRows(job: SiloGridJob, allocator: Allocator, heavy: *const HeavyKeys
     const mask = scratch.mask.items;
     const ids = scratch.ids.items;
     const ascending = if (weights) |rw| (if (rw.ascending_column) |ac| ac == key.index else false) else false;
+    // Exact keys search only where no two reported keys shared a digest
+    // (see HeavyKeys.shared).
     if (ascending and heavy.searchPays(batch.row_count)) {
         return compactKept(job, job.sketch_scratch, allocator, batch, weights, ids, heavy.findSorted(key.values, mask, ids));
     }
@@ -9843,7 +10332,7 @@ fn foldDeferredPart(
     if (transient) states.clearRetainingCapacity();
     const first_new = states.len;
     for (chunks) |chunk| {
-        try groupChunkRowsDirect(table, states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), &bucket.str_bank, chunk.rows, part_rows, part_rows, 0, null);
+        try groupChunkRowsDirect(table, states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), &bucket.str_bank, null, chunk.rows, part_rows, part_rows, 0, null);
     }
     if (top.items.len == 0) return;
     var gid = first_new;
@@ -10063,6 +10552,10 @@ pub const RunConfig = struct {
     // where the key bytes only return at emit via rowref late-mat. A scan
     // decline (or a sidecar-less batch) falls back to digesting bytes.
     hash_key_columns: []const []const u8 = &.{},
+    /// Keeps only these bits of each hashed key's digest where a row takes
+    /// its staged key, so keys collide as often as a digest this narrow
+    /// collides: a test of exact group keys under real collisions.
+    key_digest_mask: u128 = std.math.maxInt(u128),
     // Columns the derived expressions read only through `octet_length`,
     // which the worker scans emit as byte lengths (`Batch.byte_lengths`).
     byte_length_columns: []const []const u8 = &.{},
@@ -10600,6 +11093,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .stage_builders = stage_builders,
         .group_rows_layout = group_rows_layout,
         .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
+        .key_digest_mask = cfg.key_digest_mask,
         .generic_filter_required = cfg.filter_expr != null or cfg.computed_where != null,
         .residual_filter = cfg.residual_filter,
         .count_sketch = cfg.count_sketch,
@@ -10688,7 +11182,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             }
         }
         _ = try cfg.offered_prunes.apply(scans[i]);
-        for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
+        // A pass that groups exact keys compares their bytes, which a column
+        // the scan only digests never fills. A tally counts by digest, which
+        // can only count a key's rows with another's, never lose them.
+        const tallies = if (cfg.count_sketch) |pass| pass.tallies() else false;
+        if (!cfg.group_rows_layout.exact_key or tallies) {
+            for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
+        }
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
         if (cfg.count_sketch) |pass| switch (pass) {
@@ -10845,6 +11345,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 const at = sc.blockDictColumnIndex(scan_schema[j].name).?;
                 try sc.setBlockDictColumn(at);
                 if (counted) sc.setBlockDictCounted(at);
+                if (layout.exact_key and nameListed(cfg.hash_key_columns, scan_schema[j].name)) sc.setBlockDictDigests(at);
             }
         }
         kept = true;

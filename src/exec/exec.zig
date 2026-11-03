@@ -1792,6 +1792,7 @@ pub const RunsColumn = struct {
 /// is `dict.rowBytes(codes[r])`. The dictionary is sorted and distinct. A
 /// hashed key column (`Batch.hashed`) carries each value's `stringKeyDigest`
 /// in `digests` instead, and `dict` holds no values: the bytes never copy.
+/// An exact key's column (`Scan.setBlockDictDigests`) carries both.
 pub const BlockDictColumn = struct {
     codes: []const u32,
     dict: storage.StringView,
@@ -1810,6 +1811,10 @@ pub const BlockDictColumn = struct {
 
     pub fn valueCount(self: BlockDictColumn) usize {
         return if (self.digests) |d| d.len else self.dict.rowCount();
+    }
+
+    pub fn holdsValues(self: BlockDictColumn) bool {
+        return self.dict.rowCount() == self.valueCount();
     }
 };
 
