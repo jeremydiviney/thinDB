@@ -1,13 +1,15 @@
 name: ci-experimental
 
 # The same suite on Linux ARM64 and macOS Apple Silicon, on native runners.
-# They gate nothing until they prove green, so they live outside ci: release
-# chains on ci finishing, and a macOS run takes about twice as long as the
-# blocking jobs. Promote a target by moving its matrix entry into ci.yml.
+# They gate nothing, so they live outside ci: release chains on ci
+# finishing, and a macOS run takes about twice as long as the blocking jobs.
+# On demand only, to keep runner time on the gates while iterating:
+#   gh workflow run ci-experimental.yml --ref <branch>
+# Restore the push and pull_request triggers to run them on every push, or
+# promote a target by moving its matrix entry into ci.yml.
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-experimental-${{ github.ref }}

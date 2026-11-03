@@ -2,10 +2,10 @@ name: ci
 
 # Test suite on every push to every branch (and PRs). Windows and Linux
 # x86-64 are the blocking gates, and release chains on this workflow
-# finishing. Linux ARM64 and macOS Apple Silicon run the same suite in
-# ci-experimental.yml until they prove green, so their longer runs never
-# hold up a release. macOS Intel is build-only (runner class retired by
-# GitHub; least important target).
+# finishing. Linux ARM64 and macOS Apple Silicon run the same suite on
+# demand, in ci-experimental.yml, so their longer runs never hold up a
+# release. macOS Intel is build-only (runner class retired by GitHub; least
+# important target).
 
 on:
   push:
