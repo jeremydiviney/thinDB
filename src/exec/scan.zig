@@ -850,6 +850,8 @@ pub const Scan = struct {
         /// The consumer takes a row group's rows counted by dictionary entry
         /// (`BlockDictColumn.counts`) where the scan can count them.
         counted: bool = false,
+        /// The consumer takes the values' digests beside the values.
+        digested: bool = false,
         entry_counts: std.ArrayListUnmanaged(u32) = .empty,
         entry_rows: std.ArrayListUnmanaged(u32) = .empty,
         entry_pass: std.ArrayListUnmanaged(bool) = .empty,
@@ -1605,6 +1607,14 @@ pub const Scan = struct {
         self.dict_bufs[j].counted = true;
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as an exact
+    /// group key: its dictionary comes with its values' digests
+    /// (`BlockDictColumn.digests`), which place each key, and its values,
+    /// which tell keys sharing a digest apart.
+    pub fn setBlockDictDigests(self: *Scan, j: usize) void {
+        self.dict_bufs[j].digested = true;
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1629,8 +1639,9 @@ pub const Scan = struct {
 
     /// Column `j`'s codes for `rows` (every row when null) of row group
     /// `rg_idx`, against its block's dictionary (a hashed key: its values'
-    /// digests), or null when the block isn't dictionary-coded. `dict_bufs[j]`
-    /// keeps the block pinned for the row group's later sub-batches.
+    /// digests; an exact key: both), or null when the block isn't
+    /// dictionary-coded. `dict_bufs[j]` keeps the block pinned for the row
+    /// group's later sub-batches.
     fn fillBlockDict(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !?exec.BlockDictColumn {
         const buf = &self.dict_bufs[j];
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
@@ -1644,13 +1655,19 @@ pub const Scan = struct {
             try self.digestBlockDict(buf, db, every_value);
             return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .every_value = every_value };
         }
-        return .{ .codes = buf.codes.items, .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes }, .every_value = every_value };
+        if (buf.digested) try self.digestBlockDict(buf, db, every_value);
+        return .{
+            .codes = buf.codes.items,
+            .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes },
+            .digests = if (buf.digested) buf.heldDigests() else null,
+            .every_value = every_value,
+        };
     }
 
     /// Column `j`'s dictionary block in row group `rg_idx`, pinned in
     /// `dict_bufs[j]` with its offsets (a hashed key: room for its values'
-    /// digests) for the row group's later batches, or null when the block
-    /// isn't dictionary-coded.
+    /// digests instead; an exact key: both) for the row group's later
+    /// batches, or null when the block isn't dictionary-coded.
     fn holdDictBlock(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32) !?storage.segment_reader.DictBlock {
         const buf = &self.dict_bufs[j];
         const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
@@ -1664,7 +1681,7 @@ pub const Scan = struct {
             buf.block = block;
             const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
             const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
-            if (hashed) {
+            if (hashed or buf.digested) {
                 buf.digests_whole = false;
                 buf.digests_known.clearRetainingCapacity();
                 buf.digests_known_count = 0;
@@ -1732,7 +1749,7 @@ pub const Scan = struct {
         }
 
         const hashed = self.hash_cols_by_j.len > 0 and self.hash_cols_by_j[0];
-        if (hashed) try self.digestCountedEntries(buf, db, counts);
+        if (hashed or buf.digested) try self.digestCountedEntries(buf, db, counts);
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
         try self.markPlaceholder(0, ndv);
@@ -1745,7 +1762,7 @@ pub const Scan = struct {
         slots[0] = if (hashed)
             .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .counts = counts }
         else
-            .{ .codes = &.{}, .dict = dict, .counts = counts };
+            .{ .codes = &.{}, .dict = dict, .digests = if (buf.digested) buf.heldDigests() else null, .counts = counts };
         self.filtered_coded = null;
         self.filtered_hashed = null;
         self.filtered_lengths = null;

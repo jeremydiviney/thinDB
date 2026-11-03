@@ -832,6 +832,18 @@ pub fn IntKeyMemsetTable(comptime max_bits: u16) type {
             }
         }
 
+        /// `getOrPut`, where a slot of `key` is found only when its gid also
+        /// passes `same.matches`: keys that share `key` but not their bytes
+        /// each take a slot of their own, further along the probe.
+        pub fn getOrPutMatching(self: *Self, hash: u64, key: u128, same: anytype) Probe {
+            var i = self.bucketOf(hash);
+            while (true) : (i = (i + 1) & self.mask) {
+                const s = self.slots[i];
+                if (s.gid == EMPTY) return .{ .slot = i, .found = false, .gid = 0 };
+                if (keyEq(s, key) and same.matches(s.gid)) return .{ .slot = i, .found = true, .gid = s.gid };
+            }
+        }
+
         pub fn commit(self: *Self, slot: usize, key: u128, gid: u32) void {
             self.slots[slot] = storeKey(key, gid);
             self.len += 1;
