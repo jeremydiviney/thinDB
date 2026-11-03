@@ -161,6 +161,14 @@ pub const Config = struct {
     /// `thindb-server` passes auto unless `--compact-threads` says otherwise.
     compact_threads: usize = 1,
 
+    /// Memory a background merge may hold. A merge keeps every distinct
+    /// string value of its output until the output's end, so the compactor
+    /// leaves segments unmerged where their merge would pass this (their
+    /// size then grows with the box's RAM). `null` → a quarter of usable
+    /// memory, beside `memory_budget`'s ~65%; unbounded when the OS can't
+    /// report it.
+    compact_memory: ?u64 = null,
+
     /// Durability mode. `.per_flush` makes every acknowledged write survive
     /// an OS crash or power loss: each statement waits for its WAL fsync
     /// (group commit), and segments, tombstone files, the manifest and the
@@ -280,6 +288,12 @@ pub fn resolveCompactThreads(allocator: std.mem.Allocator, configured: usize) us
     if (configured != 0) return configured;
     const physical = physicalCoreCount(allocator);
     return @max(1, physical / 4);
+}
+
+pub fn resolveCompactMemory(configured: ?u64) u64 {
+    if (configured) |bytes| return bytes;
+    const total = totalMemoryBytes() orelse return std.math.maxInt(u64);
+    return total / 4;
 }
 
 /// Physical (non-SMT) core count, cross-OS. Re-exported for tools that size

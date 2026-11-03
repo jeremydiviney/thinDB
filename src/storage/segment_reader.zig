@@ -37,6 +37,7 @@ const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
 const fsst = @import("fsst.zig");
+const segment_strings = @import("segment_strings.zig");
 const storage_cache = @import("cache.zig");
 const simd_mod = @import("../util/simd.zig");
 const prof = @import("../util/prof.zig");
@@ -56,9 +57,11 @@ pub const ReadSegment = struct {
     pub fn deinit(self: *ReadSegment) void {
         for (self.info.row_groups) |rg| {
             self.allocator.free(rg.stats);
-            self.allocator.free(@constCast(rg.col_offsets));
+            self.allocator.free(rg.col_offsets);
+            self.allocator.free(rg.col_lengths);
         }
-        self.allocator.free(@constCast(self.info.row_groups));
+        self.allocator.free(self.info.row_groups);
+        format.freeStringTables(self.allocator, self.info.string_tables);
         self.file.close(self.io);
         self.* = undefined;
     }
@@ -109,7 +112,10 @@ pub const ReadSegment = struct {
 
         const block = try self.readColumnBlock(allocator, rg, column_idx);
         defer allocator.free(block);
-        return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
+        if (!isSegmentDictBlock(block)) return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
+        const payload = try self.rebuildSegmentDict(allocator, allocator, block, rg, column_idx, null);
+        defer allocator.free(payload);
+        return decodeColumnPayload(allocator, col_type, payload, rg.row_count, flags, .dict);
     }
 
     /// Cache-miss fill: pread the block, decompress it and insert it pinned,
@@ -128,12 +134,111 @@ pub const ReadSegment = struct {
     ) !*storage_cache.Cache.Entry {
         const block = try self.readColumnBlock(allocator, rg, column_idx);
         defer allocator.free(block);
-        const encoding = blockEncoding(block, 0);
         const block_alloc = cc.blockAllocator();
-        const raw = try getDecompressedBytes(block_alloc, block, 0);
+        const tc: storage_cache.TableCache = .{ .cache = cc, .table_uid = key.table_uid };
+        const raw = if (isSegmentDictBlock(block))
+            try self.rebuildSegmentDict(block_alloc, allocator, block, rg, column_idx, tc)
+        else
+            try getDecompressedBytes(block_alloc, block, 0);
         errdefer block_alloc.free(raw);
-        return cc.insertPinned(key, raw, encoding);
+        return cc.insertPinned(key, raw, blockEncoding(block, 0));
     }
+
+    /// Rebuilds a segment-dictionary block (`block`: header + payload as read)
+    /// into the `.dict` payload with segment ids, allocated from
+    /// `out_allocator`. Shared-string pages come through the cache when `c`
+    /// is set.
+    fn rebuildSegmentDict(
+        self: ReadSegment,
+        out_allocator: Allocator,
+        allocator: Allocator,
+        block: []const u8,
+        rg: RowGroupMeta,
+        column_idx: usize,
+        c: ?storage_cache.TableCache,
+    ) ![]align(16) u8 {
+        const table = self.info.stringTable(column_idx) orelse return format.Error.CorruptColumnBlockHeader;
+        var owned_raw: ?[]u8 = null;
+        defer if (owned_raw) |r| allocator.free(r);
+        const payload = try readBlockRaw(allocator, block, 0, &owned_raw);
+        var pages: SharedPages = .{ .seg = self, .allocator = allocator, .table = table, .c = c };
+        defer pages.release();
+        const has_nulls = format.ColumnBlockFlags.fromByte(block[1]).has_nulls;
+        return segment_strings.rebuildDict(out_allocator, payload, rg.row_count, has_nulls, table, &pages);
+    }
+
+    /// The shared-string pages one rebuild reads, each read (and through the
+    /// cache, pinned) at first use and held until `release`.
+    const SharedPages = struct {
+        seg: ReadSegment,
+        allocator: Allocator,
+        table: format.StringTable,
+        c: ?storage_cache.TableCache,
+        held: []?Held = &.{},
+
+        const Held = struct {
+            page: segment_strings.Page,
+            entry: ?*storage_cache.Cache.Entry,
+            owned: ?[]align(16) u8,
+        };
+
+        pub fn page(self: *SharedPages, p: u32) !segment_strings.Page {
+            if (p >= self.table.pages.len) return format.Error.CorruptColumnBlockHeader;
+            if (self.held.len == 0) {
+                self.held = try self.allocator.alloc(?Held, self.table.pages.len);
+                @memset(self.held, null);
+            }
+            if (self.held[p]) |h| return h.page;
+            const h = try self.load(p, segment_strings.pageValueCount(self.table.shared_count, p));
+            self.held[p] = h;
+            return h.page;
+        }
+
+        fn load(self: *SharedPages, p: u32, expected: u32) !Held {
+            const range = self.table.pages[p];
+            if (self.c) |tc| {
+                const key = storage_cache.Key{
+                    .table_uid = tc.table_uid,
+                    .segment_id = self.seg.info.segment_id,
+                    .row_group_idx = p,
+                    .column_idx = self.table.column_idx,
+                    .content = .shared_strings,
+                };
+                const entry = tc.cache.acquire(key) orelse filled: {
+                    const raw = try self.readPage(tc.cache.blockAllocator(), range);
+                    errdefer tc.cache.blockAllocator().free(raw);
+                    break :filled try tc.cache.insertPinned(key, raw, .raw);
+                };
+                errdefer tc.cache.release(entry);
+                return .{ .page = try segment_strings.Page.of(entry.bytes, expected), .entry = entry, .owned = null };
+            }
+            const raw = try self.readPage(self.allocator, range);
+            errdefer self.allocator.free(raw);
+            return .{ .page = try segment_strings.Page.of(raw, expected), .entry = null, .owned = raw };
+        }
+
+        fn readPage(self: *SharedPages, out_allocator: Allocator, range: format.FileRange) ![]align(16) u8 {
+            const block = try self.allocator.alloc(u8, range.length);
+            defer self.allocator.free(block);
+            if (try self.seg.file.readPositionalAll(self.seg.io, block, range.offset) != block.len) {
+                return format.Error.UnexpectedEof;
+            }
+            if (block.len < format.column_block_header_size or
+                block.len != format.column_block_header_size + format.readU32(block[8..12]))
+            {
+                return format.Error.CorruptColumnBlockHeader;
+            }
+            return getDecompressedBytes(out_allocator, block, 0);
+        }
+
+        fn release(self: *SharedPages) void {
+            for (self.held) |held| if (held) |h| {
+                if (h.entry) |e| self.c.?.cache.release(e);
+                if (h.owned) |o| self.allocator.free(o);
+            };
+            self.allocator.free(self.held);
+        }
+    };
 
     /// A pinned, decompressed column block borrowed for the duration of one
     /// scan `next()` call. `bytes` are the decompressed block bytes. Exactly
@@ -200,9 +305,11 @@ pub const ReadSegment = struct {
         }
         const block = try self.readColumnBlock(allocator, rg, column_idx);
         defer allocator.free(block);
-        const encoding = blockEncoding(block, 0);
-        const raw = try getDecompressedBytes(allocator, block, 0);
-        return .{ .bytes = raw, .encoding = encoding, .owned = raw };
+        const raw = if (isSegmentDictBlock(block))
+            try self.rebuildSegmentDict(allocator, allocator, block, rg, column_idx, null)
+        else
+            try getDecompressedBytes(allocator, block, 0);
+        return .{ .bytes = raw, .encoding = blockEncoding(block, 0), .owned = raw };
     }
 
     /// The string bytes one row group's block of a string column decodes to,
@@ -352,18 +459,17 @@ pub const ReadSegment = struct {
     }
 
     /// Read the raw on-disk bytes (header + payload) of one column's block in a
-    /// row group via a single positioned read. The block ends where the next
-    /// column's begins (or at the row group's end for the last column).
+    /// row group via a single positioned read.
     fn readColumnBlock(self: ReadSegment, allocator: Allocator, rg: RowGroupMeta, column_idx: usize) ![]u8 {
-        const start = rg.col_offsets[column_idx];
-        const end = if (column_idx + 1 < rg.col_offsets.len)
-            rg.col_offsets[column_idx + 1]
-        else
-            rg.offset + rg.length;
-        const buf = try allocator.alloc(u8, @intCast(end - start));
+        const buf = try allocator.alloc(u8, rg.col_lengths[column_idx]);
         errdefer allocator.free(buf);
-        if (try self.file.readPositionalAll(self.io, buf, start) != buf.len) {
+        if (try self.file.readPositionalAll(self.io, buf, rg.col_offsets[column_idx]) != buf.len) {
             return format.Error.UnexpectedEof;
+        }
+        if (buf.len < format.column_block_header_size or
+            buf.len != format.column_block_header_size + format.readU32(buf[8..12]))
+        {
+            return format.Error.CorruptColumnBlockHeader;
         }
         return buf;
     }
@@ -434,16 +540,17 @@ pub fn readSegment(
 
     const row_group_count = format.readU32(footer[0..4]);
     const ncols = schema.columns.len;
-    const per_rg = 16 + ncols * 56 + ncols * 8; // offset/len/rows + stats + col offsets
-    const expected_footer = 4 + @as(usize, row_group_count) * per_rg + format.footer_trailer_size;
-    if (expected_footer != footer_size) return format.Error.CorruptFooter;
+    const per_rg = 16 + ncols * 56 + ncols * 8 + ncols * 4; // offset/len/rows + stats + col offsets + col lengths
+    const tables_at = 4 + @as(usize, row_group_count) * per_rg;
+    if (tables_at + 4 + format.footer_trailer_size > footer_size) return format.Error.CorruptFooter;
 
     const row_groups = try allocator.alloc(RowGroupMeta, row_group_count);
     errdefer allocator.free(row_groups);
     var inited_rg: usize = 0;
     errdefer for (row_groups[0..inited_rg]) |rg| {
         allocator.free(rg.stats);
-        allocator.free(@constCast(rg.col_offsets));
+        allocator.free(rg.col_offsets);
+        allocator.free(rg.col_lengths);
     };
 
     var off: usize = 4;
@@ -470,13 +577,21 @@ pub fn readSegment(
         rg.stats = stats;
 
         const col_offsets = try allocator.alloc(u64, ncols);
+        errdefer allocator.free(col_offsets);
         for (col_offsets) |*co| {
             co.* = format.readU64(footer[off .. off + 8]);
             off += 8;
         }
+        const col_lengths = try allocator.alloc(u32, ncols);
+        for (col_lengths) |*cl| {
+            cl.* = format.readU32(footer[off .. off + 4]);
+            off += 4;
+        }
         rg.col_offsets = col_offsets;
+        rg.col_lengths = col_lengths;
         inited_rg += 1;
     }
+    const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols);
 
     return ReadSegment{
         .allocator = allocator,
@@ -488,17 +603,62 @@ pub fn readSegment(
             .schema_fingerprint = schema_fingerprint,
             .byte_size = file_size,
             .row_groups = row_groups,
+            .string_tables = string_tables,
         },
     };
+}
+
+/// Parse the footer's string-table directory (`bytes` runs from its count
+/// to the footer trailer, exactly).
+fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize) ![]const format.StringTable {
+    if (bytes.len < 4) return format.Error.CorruptFooter;
+    const count = format.readU32(bytes[0..4]);
+    if (count > ncols) return format.Error.CorruptFooter;
+    const tables = try allocator.alloc(format.StringTable, count);
+    var inited: usize = 0;
+    errdefer {
+        for (tables[0..inited]) |t| allocator.free(t.pages);
+        allocator.free(tables);
+    }
+    var off: usize = 4;
+    for (tables) |*t| {
+        if (bytes.len < off + 24) return format.Error.CorruptFooter;
+        const column_idx = format.readU32(bytes[off..][0..4]);
+        const shared_count = format.readU32(bytes[off + 4 ..][0..4]);
+        const value_count = format.readU32(bytes[off + 8 ..][0..4]);
+        const page_count = format.readU32(bytes[off + 12 ..][0..4]);
+        const value_bytes = format.readU64(bytes[off + 16 ..][0..8]);
+        off += 24;
+        if (column_idx >= ncols or shared_count > value_count or page_count != segment_strings.pageCount(shared_count)) {
+            return format.Error.CorruptFooter;
+        }
+        if (bytes.len < off + @as(usize, page_count) * 12) return format.Error.CorruptFooter;
+        const pages = try allocator.alloc(format.FileRange, page_count);
+        for (pages) |*p| {
+            p.* = .{ .offset = format.readU64(bytes[off..][0..8]), .length = format.readU32(bytes[off + 8 ..][0..4]) };
+            off += 12;
+        }
+        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages };
+        inited += 1;
+    }
+    if (off != bytes.len) return format.Error.CorruptFooter;
+    return tables;
 }
 
 // ---------------------------------------------------------------------------
 // Block decoding
 // ---------------------------------------------------------------------------
 
-/// Read the per-block `encoding` byte from a column-block header at `offset`.
+fn isSegmentDictBlock(block: []const u8) bool {
+    return block[format.column_block_encoding_offset] == format.segment_dict_encoding;
+}
+
+/// The encoding of the payload a column block reads as: its header's
+/// `encoding` byte, with a segment-dictionary block reading as the `.dict`
+/// payload the reader rebuilds it into.
 fn blockEncoding(bytes: []const u8, offset: usize) format.Encoding {
     const b = bytes[offset + format.column_block_encoding_offset];
+    if (b == format.segment_dict_encoding) return .dict;
     // Unknown encodings degrade to raw; the writer fully controls this byte and
     // an unknown value would be caught by a downstream decode mismatch, but we
     // keep the reader total here rather than introducing a new error path for a
@@ -1228,6 +1388,9 @@ pub const DictBlock = struct {
     entry_counts: []const u8 = &.{},
     entry_rows: []const u8 = &.{},
     stat_width: u8 = 0,
+    /// Each value's segment id (`ndv` × u32), when the block was rebuilt from
+    /// a segment string table (`format.DICT_SEGMENT_IDS`).
+    segment_ids: []const u8 = &.{},
 
     /// Byte slice of distinct value at sorted index `code` (aliases `dict_bytes`).
     pub fn dictValue(self: DictBlock, code: u32) []const u8 {
@@ -1292,6 +1455,16 @@ pub const DictBlock = struct {
 
     pub fn hasEntryStats(self: DictBlock) bool {
         return self.stat_width != 0;
+    }
+
+    pub fn hasSegmentIds(self: DictBlock) bool {
+        return self.segment_ids.len != 0;
+    }
+
+    /// The segment id of the value at sorted index `code`, for a block with
+    /// `hasSegmentIds`.
+    pub fn segmentId(self: DictBlock, code: u32) u32 {
+        return format.readU32(self.segment_ids[@as(usize, code) * 4 ..][0..4]);
     }
 
     /// The stored row count of each value into `counts` and its first row
@@ -1436,14 +1609,16 @@ pub fn dictBlockOf(values: []const u8, row_count: u32) DictBlock {
         .dict_bytes = dict_bytes,
         .codes = codes,
     };
+    var stats_end = codes_start + codes.len;
     if (values[5] & format.DICT_ENTRY_STATS != 0) {
         const w = format.dictEntryStatWidth(row_count);
-        const stats_start = codes_start + codes.len;
         const len = @as(usize, ndv) * w;
-        db.entry_counts = values[stats_start..][0..len];
-        db.entry_rows = values[stats_start + len ..][0..len];
+        db.entry_counts = values[stats_end..][0..len];
+        db.entry_rows = values[stats_end + len ..][0..len];
         db.stat_width = w;
+        stats_end += 2 * len;
     }
+    if (values[5] & format.DICT_SEGMENT_IDS != 0) db.segment_ids = values[stats_end..][0 .. @as(usize, ndv) * 4];
     return db;
 }
 

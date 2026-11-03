@@ -18,6 +18,7 @@ pub const schema_file = @import("schema_file.zig");
 pub const tombstone = @import("tombstone.zig");
 pub const compression = @import("compression.zig");
 pub const fsst = @import("fsst.zig");
+pub const segment_strings = @import("segment_strings.zig");
 pub const cache = @import("cache.zig");
 
 pub const ColumnView = column.ColumnView;
@@ -326,7 +327,7 @@ test "lz4 string blocks: large raw block is cached decompressed and borrowed in 
         .{ .data = .{ .bigint = ids } },
         .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } } },
     };
-    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 3, 0x124, 4096, &columns, false, 1);
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "seg.dat", schema, 3, 0x124, 4096, &columns, false, 1, 0);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
@@ -397,7 +398,7 @@ test "MergedSegmentWriter: parallel encode output is byte-identical to serial" {
     const file_names = [_][]const u8{ "serial.dat", "parallel.dat" };
     const thread_counts = [_]usize{ 1, 8 };
     for (file_names, thread_counts) |file_name, n_threads| {
-        var w = try MergedSegmentWriter.begin(allocator, schema, 7, 0x99, rg_rows, &.{}, n_threads);
+        var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, file_name, schema, 7, 0x99, rg_rows, &.{}, n_threads);
         errdefer w.deinit();
 
         var prng = std.Random.DefaultPrng.init(42);
@@ -429,7 +430,7 @@ test "MergedSegmentWriter: parallel encode output is byte-identical to serial" {
             try w.writeRowGroup(&columns);
         }
 
-        var info = try w.finish(io, tmp.dir, file_name, false);
+        var info = try w.finish(false);
         info.deinit(allocator);
     }
 
@@ -501,7 +502,7 @@ test "fsst encoding: high-NDV string block round-trips, dict-sized stays dict" {
         .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } }, .nulls = nulls },
     };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "seg.dat", schema, 9, 0xF557, 1024, &columns, false, 1);
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "seg.dat", schema, 9, 0xF557, 1024, &columns, false, 1, 0);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
@@ -846,7 +847,7 @@ test "dict encoding: low-card string → dict, high-card → raw, both round-tri
 
     const columns = [_]ColumnView{ color.view(null), uniq.view(null) };
 
-    var info = try writeSegment(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false, 1);
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false, 1, 0);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "dict.dat", schema);
@@ -965,7 +966,7 @@ test "dict encoding: blob-like (avg len > 256) declines dict; stays raw with fss
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false, 1);
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false, 1, 0);
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "blob.dat", schema);
@@ -1000,7 +1001,7 @@ test "dict encoding: NDV beyond the cap abandons mid-build → raw fallback, rou
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try writeSegment(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false, 1);
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false, 1, 0);
     defer info.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), info.row_groups.len);
 
@@ -1093,6 +1094,170 @@ test "dict block stores a lexicographically sorted dictionary" {
         const offsets = db.offsetsInPlace().?;
         for (0..db.ndv) |k2| try std.testing.expectEqualStrings(db.dictValue(@intCast(k2)), db.dict_bytes[offsets[k2]..offsets[k2 + 1]]);
     }
+}
+
+/// Rows of the segment-string-table tests: three row groups of four. pear,
+/// fig and kiwi recur across row groups (shared); date, apple and the empty
+/// string occur in one (local); rows 2 and 9 are NULL.
+const sst_vals = [_][]const u8{ "pear", "fig", "", "kiwi", "fig", "date", "apple", "kiwi", "pear", "", "", "fig" };
+const sst_nulls = [_]u8{ 0b1111_1011, 0b0000_1101 };
+const sst_schema = TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .int },
+        .{ .name = "s", .type = .string, .nullable = true },
+    },
+    .order_key = &.{"id"},
+    .unique = false,
+};
+
+/// Reads every row group of column 1 back, checks each row against
+/// `sst_vals`, and checks that row groups the table took give each distinct
+/// value one segment id below the table's `value_count`. Returns how many
+/// row groups carried segment ids.
+fn expectSegmentStrings(allocator: Allocator, seg: *ReadSegment) !usize {
+    var controller = memory.MemoryPool.init(1 << 20);
+    var c = cache.Cache.init(allocator, &controller, 0);
+    controller.shareCache(&c, controller.budget);
+    defer c.deinit();
+    const tc: cache.TableCache = .{ .cache = &c, .table_uid = 0 };
+
+    var id_of: std.StringHashMapUnmanaged(u32) = .empty;
+    defer id_of.deinit(allocator);
+    var value_of: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer value_of.deinit(allocator);
+    var with_ids: usize = 0;
+    var row: usize = 0;
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        var col = try seg.decodeColumn(allocator, sst_schema, rg_idx, 1);
+        defer col.deinit(allocator);
+        var cached = try seg.decodeColumnMaybeCached(allocator, sst_schema, rg_idx, 1, tc);
+        defer cached.deinit(allocator);
+        var block = try seg.borrowColumnBlock(allocator, rg_idx, 1, tc);
+        defer block.release(allocator, tc);
+        const nulls = block.bytes[0..column.bitmapBytes(rg.row_count)];
+        const db: ?segment_reader.DictBlock = if (block.encoding == .dict)
+            segment_reader.dictBlockOf(block.bytes[nulls.len..], rg.row_count)
+        else
+            null;
+        if (db != null and db.?.hasSegmentIds()) with_ids += 1;
+        for (0..rg.row_count) |r| {
+            const valid = column.isValidBit(&sst_nulls, row);
+            try std.testing.expectEqual(valid, col.view().isValid(r));
+            try std.testing.expectEqual(valid, column.isValidBit(nulls, r));
+            if (valid) {
+                try std.testing.expectEqualStrings(sst_vals[row], col.view().data.string.rowBytes(r));
+                try std.testing.expectEqualStrings(sst_vals[row], cached.view().data.string.rowBytes(r));
+                if (db) |d| if (d.hasSegmentIds()) {
+                    const id = d.segmentId(d.rowCode(r));
+                    try std.testing.expect(id < seg.info.stringTable(1).?.value_count);
+                    const by_value = try id_of.getOrPut(allocator, sst_vals[row]);
+                    if (by_value.found_existing) try std.testing.expectEqual(by_value.value_ptr.*, id) else by_value.value_ptr.* = id;
+                    const by_id = try value_of.getOrPut(allocator, id);
+                    if (by_id.found_existing) try std.testing.expectEqualStrings(by_id.value_ptr.*, sst_vals[row]) else by_id.value_ptr.* = sst_vals[row];
+                };
+            }
+            row += 1;
+        }
+    }
+    return with_ids;
+}
+
+test "segment string tables: one id per distinct value across row groups; blocks round-trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var ids: [sst_vals.len]i32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i);
+    var s = try buildStringCol(allocator, &sst_vals);
+    defer s.deinit(allocator);
+    const columns = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(&sst_nulls) };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "sst.dat", sst_schema, 1, 0, 4, &columns, false, 2);
+    defer info.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), info.string_tables.len);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "sst.dat", sst_schema);
+    defer seg.deinit();
+    const table = seg.info.stringTable(1).?;
+    // pear, fig, kiwi shared; date, apple, "" local.
+    try std.testing.expectEqual(@as(u32, 3), table.shared_count);
+    try std.testing.expectEqual(@as(u32, 6), table.value_count);
+    try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
+}
+
+test "segment string tables: past the cap a column's later row groups keep their own encodings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var ids: [sst_vals.len]i32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i);
+    var s = try buildStringCol(allocator, &sst_vals);
+    defer s.deinit(allocator);
+    const columns = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(&sst_nulls) };
+
+    // Row group 0 holds three values; row group 1's date and apple pass four.
+    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "cap.dat", sst_schema, 1, 0, 4, &columns, false, 1, 4);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "cap.dat", sst_schema);
+    defer seg.deinit();
+    const table = seg.info.stringTable(1).?;
+    try std.testing.expectEqual(@as(u32, 0), table.shared_count);
+    try std.testing.expectEqual(@as(u32, 3), table.value_count);
+    try std.testing.expectEqual(@as(usize, 1), try expectSegmentStrings(allocator, &seg));
+}
+
+test "segment string tables: MergedSegmentWriter writes them too" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, "merged.dat", sst_schema, 2, 0, 4, &.{}, 2);
+    var finished = false;
+    defer if (!finished) w.deinit();
+    for (0..3) |g| {
+        var ids: [4]i32 = undefined;
+        for (&ids, 0..) |*v, i| v.* = @intCast(g * 4 + i);
+        var s = try buildStringCol(allocator, sst_vals[g * 4 ..][0..4]);
+        defer s.deinit(allocator);
+        var nulls: [1]u8 = .{0};
+        for (0..4) |i| column.setValidBit(&nulls, i, column.isValidBit(&sst_nulls, g * 4 + i));
+        try w.writeRowGroup(&.{ .{ .data = .{ .int = &ids } }, s.view(&nulls) });
+    }
+    var info = try w.finish(false);
+    finished = true;
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "merged.dat", sst_schema);
+    defer seg.deinit();
+    try std.testing.expectEqual(@as(u32, 3), seg.info.stringTable(1).?.shared_count);
+    try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
+}
+
+test "MergedSegmentWriter: an abandoned writer deletes its partial file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, "abandoned.dat", sst_schema, 2, 0, 4, &.{}, 2);
+    var abandoned = false;
+    defer if (!abandoned) w.deinit();
+    var ids = [_]i32{ 0, 1, 2, 3 };
+    var s = try buildStringCol(allocator, sst_vals[0..4]);
+    defer s.deinit(allocator);
+    var nulls: [1]u8 = .{0};
+    for (0..4) |i| column.setValidBit(&nulls, i, column.isValidBit(&sst_nulls, i));
+    try w.writeRowGroup(&.{ .{ .data = .{ .int = &ids } }, s.view(&nulls) });
+    try tmp.dir.access(io, "abandoned.dat", .{});
+    w.deinit();
+    abandoned = true;
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "abandoned.dat", .{}));
 }
 
 test "DictBlock.offsetsInPlace views u32-aligned offsets and declines misaligned ones" {
@@ -1292,5 +1457,6 @@ test {
     _ = schema_file;
     _ = tombstone;
     _ = compression;
+    _ = segment_strings;
     _ = cache;
 }

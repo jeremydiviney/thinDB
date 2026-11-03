@@ -3931,19 +3931,17 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
 }
 
 /// On-disk byte weight of one row group for partitioning: the summed block
-/// length of the PROJECTED columns (`proj` = their schema indices), or the whole
-/// row group's `length` when projecting all columns (`proj == null`). A column's
-/// block runs from its `col_offsets[ci]` to the next column's offset (the last
-/// column ends at `rg.offset + rg.length`). Falls back to whole-RG `length` if
-/// the footer didn't carry per-column offsets.
+/// length of the PROJECTED columns (`proj` = their schema indices), or of every
+/// column when projecting all (`proj == null`). Falls back to the row group's
+/// `length` if the footer didn't carry per-column lengths.
 fn rgWeight(rg: storage.RowGroupMeta, proj: ?[]const usize, ncols: usize) u64 {
-    const cols = proj orelse return rg.length;
-    if (cols.len == 0 or rg.col_offsets.len < ncols) return rg.length;
+    if (rg.col_lengths.len < ncols) return rg.length;
     var sum: u64 = 0;
-    for (cols) |ci| {
-        const start = rg.col_offsets[ci];
-        const end = if (ci + 1 < ncols) rg.col_offsets[ci + 1] else rg.offset + rg.length;
-        sum += end - start;
+    if (proj) |cols| {
+        if (cols.len == 0) return rg.length;
+        for (cols) |ci| sum += rg.col_lengths[ci];
+    } else {
+        for (rg.col_lengths[0..ncols]) |len| sum += len;
     }
     return sum;
 }

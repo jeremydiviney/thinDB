@@ -79,6 +79,9 @@ const usage_text =
     \\                          hardware threads that concurrent queries share.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
+    \\  --compact-memory B      Memory a compaction merge may hold (default: auto, a quarter of
+    \\                          usable RAM). Segments whose merge would need more stay unmerged,
+    \\                          so the largest segments grow with the box's RAM.
     \\  --memory-budget B       The server's one memory budget (default: auto, ~65% of usable RAM,
     \\                          floored at 256 MiB). Running queries, the block cache of every
     \\                          table, its predicate memo and idle scratch buffers all share it:
@@ -209,6 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
     var predicate_memo_bytes: ?usize = null;
     var max_dop: ?u32 = null;
     var compact_threads: ?u32 = null;
+    var compact_memory: ?u64 = null;
     var file_root: ?[]const u8 = null;
     var mysql_password: ?[]const u8 = null;
     var pg_password: ?[]const u8 = null;
@@ -322,6 +326,14 @@ pub fn main(init: std.process.Init) !u8 {
             compact_threads = v;
             continue;
         }
+        if (try takeValue(arg, "--compact-memory", &iter, err_w)) |v| {
+            compact_memory = parseSize(v) catch {
+                try err_w.print("thindb-server: invalid --compact-memory: {s} (use bytes, or a K/M/G suffix)\n", .{v});
+                try err_w.flush();
+                return 1;
+            };
+            continue;
+        }
         if (try takeValue(arg, "--memory-budget", &iter, err_w)) |v| {
             memory_budget = parseSize(v) catch {
                 try err_w.print("thindb-server: invalid --memory-budget: {s} (use bytes, or a K/M/G suffix)\n", .{v});
@@ -396,6 +408,7 @@ pub fn main(init: std.process.Init) !u8 {
         // Server default is auto (half the cores) rather than the embedded
         // library's serial default — background merges are the server's job.
         .compact_threads = if (compact_threads) |v| v else 0,
+        .compact_memory = compact_memory,
         .file_scan_access = if (file_root) |root| .{ .root = root } else .disabled,
         .wal_enabled = enable_wal,
         // A server's clients take an ack as durable, unlike the embedded

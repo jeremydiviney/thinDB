@@ -875,14 +875,18 @@ Each `.dat` file is a self-describing columnar container. Rows within a segment 
 │ ┌─ Column 1 block ─┐ … one per column             │
 ├─ Row group 2 ─────────────────────────────────────┤
 │ …                                                 │
+├─ Segment string tables (string columns) ──────────┤
+│ per column: shared-string pages, then the row     │
+│ groups' segment-dictionary blocks                 │
 ├─ Footer ──────────────────────────────────────────┤
 │ row group offsets, per-row-group per-column stats │
-│ (min/max/sum/null_count), checksums, footer       │
-│ length, magic "tDBS"                              │
+│ (min/max/sum/null_count), per-column block offset │
+│ + length, string-table directory, footer length,  │
+│ magic "tDBS"                                      │
 └───────────────────────────────────────────────────┘
 ```
 
-Footer is read first (via the trailing length + magic). Row group offsets in the footer let scans skip to the relevant byte ranges without parsing the whole file.
+Footer is read first (via the trailing length + magic). Row group offsets in the footer let scans skip to the relevant byte ranges without parsing the whole file. Every column block is located by its own footer offset and length, so a block need not sit inside its row group's byte range: segment-dictionary blocks (§4.4) are written after the last row group, grouped by column.
 
 Per-row-group per-column stats are small materialized aggregates: min/max (zone maps, per-type i128 encoding), an exact `null_count`, and a per-type `sum` slot (integer sum; f64 sum for floats; for strings, the blank-excluded min prefix used by ORDER BY pruning). A bare global `SUM` / `AVG` / `COUNT(col)` / `MIN` / `MAX` over a tombstone-free table answers from these without touching data; any tombstone or unflushed memtable row makes the stats-dependent lane fall back to the scan path.
 
@@ -894,13 +898,25 @@ Encoding is chosen per row group at flush time based on the column's data charac
 |---|---|---|
 | **Plain** | Fixed-width numeric types, fallback for strings | Raw values back-to-back |
 | **RLE** (run-length) | Repetitive low-cardinality data | `(value, run_length)` pairs |
-| **Dictionary** | Strings with < 128 distinct values in the block | Dictionary + integer indexes |
+| **Segment dictionary** | `VARCHAR`/`STRING`/`CHAR` row groups, while the segment's column holds ≤ 2^26 distinct values | Row-group dictionary whose values are either stored in the block (values no other row group of the segment holds) or referenced in the segment's shared-string table; every distinct value of the segment's column has one segment id (see below) |
+| **Dictionary** | Other strings (JSON, nested, bitmap; string row groups past the segment cap) with ≤ 65,536 distinct values that shrink the block | Sorted dictionary + 1/2-byte codes |
 | **Frame-of-reference** | Integer columns where `max - min` is small | Min value + bit-packed deltas |
 | **FSST** | High-NDV strings dict declines, when it saves ≥ 12.5% | Block-local symbol table + per-row compressed slices (random access preserved; stays compressed in cache, decoded only at materialization) |
 | **Fixed-width** | `CHAR(N)` always | N bytes per row |
 | **Offsets + bytes** | `VARCHAR(N)`/`STRING` when dictionary is not chosen | `u32` offsets + flat byte buffer (Arrow-style) |
 
-After encoding, each column block is **zstd-compressed** as a final pass. Both the encoding and the zstd-compressed size are recorded in the block header.
+After encoding, each column block is compressed per the table's `compression` option (LZ4HC by default, zstd, or none) when that shrinks it. Both the encoding and the compressed size are recorded in the block header.
+
+**Segment string tables.** Within one segment, each distinct value of a string column gets a **segment id**, so a reader can group or count distinct values of that column exactly without hashing them. The writer keeps the column's distinct values for the whole segment and defers the column's row-group blocks to the end of the file; everything else streams to the file as it encodes (flush and compaction both write this way, and a writer that fails or is abandoned deletes its partial file):
+
+- A value held by two or more row groups is **shared**: it is stored once, in the column's shared-string table, sorted. Its segment id is its rank there (`0 .. shared_count`).
+- A value held by one row group is **local**: it stays in that row group's block. Local values take the ids after the shared ones, row group by row group, in dictionary order.
+- Each row-group block keeps the sorted per-row-group dictionary and its 1/2/4-byte per-row codes (so every per-row-group dictionary kernel is unchanged). Per dictionary value it stores either the local value's bytes or the shared value's rank, as 3 bytes when the shared table holds ≤ 2^24 values, else 4.
+- The shared table is split into pages of 65,536 values, each compressed and cached on its own.
+- Cap: past 2^26 (67,108,864) distinct values in one segment's column, the column's later row groups fall back to the per-row-group encodings above.
+- A `lz4_fsst` table chose FSST for its large string blocks, so its string columns keep the per-row-group encodings.
+
+The reader rebuilds a segment-dictionary block into an ordinary dictionary block at cache fill, appending each value's segment id (`DICT_SEGMENT_IDS`). Most distinct values of a high-cardinality column live in one row group (ClickBench: 85% of URL's), so the shared table stays small and a row group reads mostly its own block; the duplicates the shared table removes are the values row groups repeat.
 
 ### 4.5 Tombstone files
 
@@ -1872,6 +1888,8 @@ Steps:
 4. Stream into a new `<seg_id>.dat` file with the same encoding logic as flush.
 5. Update the manifest: remove the inputs, add the output.
 6. Schedule the input `.dat` and `.tomb` files for deletion. Files are deleted after a grace period (default 30 seconds) to let in-flight readers finish.
+
+A merge holds every distinct string value of its output until the output's end, for the segment string tables (§4.4). Each segment's string-table directory records its distinct values' bytes, so the background compactor estimates a merge's memory from its inputs' footers (their values, as though no two inputs shared one, plus 32 bytes of bookkeeping per value and half a byte per row of each string column; then a quarter more plus 512 MiB for the merge's decode and encode buffers and allocator slack) and skips any group that would pass `Config.compact_memory` (default a quarter of usable memory, beside the ~65% memory budget). Segments whose merge would pass it stay unmerged, so the largest segment a box produces grows with its RAM. `Table.compact()` merges everything regardless.
 
 ### 7.3 Concurrency
 
