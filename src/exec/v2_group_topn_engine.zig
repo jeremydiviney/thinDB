@@ -537,6 +537,11 @@ pub const Params = struct {
     sync_teardown: bool = false,
     count_sketch: bool = true,
     having_bound: bool = true,
+    /// Group hashed keys by their bytes, the digest only placing them (see
+    /// `SiloCore.GroupRowsLayout.exact_key`).
+    exact_group_keys: bool = false,
+    /// The hashed key digest's width (`SiloCore.RunConfig.key_digest_mask`).
+    key_digest_bits: u8 = 128,
 };
 
 pub const RunRequest = struct {
@@ -610,6 +615,8 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
+        .exact_group_keys = if (getenv("THINDB_EXACT_GROUP_KEYS")) |v| v[0] != 0 and v[0] != '0' else false,
+        .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 128), 1), 128)),
     };
 }
 
@@ -989,13 +996,20 @@ fn runHarness(
     for (shape.aggregate_program) |agg| {
         if (agg.is_concat) has_concat = true;
     }
+    const exact_keys = force_hash and params.exact_group_keys;
+    if (exact_keys) {
+        if (n_str_columns == group_str_columns_buf.len) return error.UnsupportedOperatorForType;
+        group_str_columns_buf[n_str_columns] = .{ .source_name = group_key_columns_buf[0].name };
+        n_str_columns += 1;
+    }
     const group_rows_layout = SiloCore.GroupRowsLayout{
         .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..n_columns],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
         .str_columns = group_str_columns_buf[0..n_str_columns],
-        .has_str_payload = shape.string_aggregate_inputs.len > 0,
+        .has_str_payload = shape.string_aggregate_inputs.len > 0 or exact_keys,
+        .exact_key = exact_keys,
         .distinct_slot_count = distinct_slot_count,
         // GROUP_CONCAT carries per-row rowrefs (emission order) even under
         // packed keys; only force_hash makes the key itself a hash.
@@ -1041,7 +1055,8 @@ fn runHarness(
     // literals carries its rows' digests rather than their bytes (see
     // `exec.Derived.digest_only`), and a column only such keys read, only
     // as a result, arrives as digests too: neither ever materializes.
-    const marked_derived = if (force_hash) try markDigestKeys(allocator, table, shape, derived, residual_filter) else null;
+    // Exact keys compare those bytes, so they keep them.
+    const marked_derived = if (force_hash and !exact_keys) try markDigestKeys(allocator, table, shape, derived, residual_filter) else null;
     defer if (marked_derived) |m| allocator.free(m);
     if (marked_derived) |marked| {
         for (marked) |d| {
@@ -1134,6 +1149,7 @@ fn runHarness(
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
         .byte_length_columns = length_cols_buf[0..n_length_cols],
+        .key_digest_mask = @as(u128, std.math.maxInt(u128)) >> @intCast(128 - @as(u16, params.key_digest_bits)),
     };
     // The sketch's counters are u32, and a retried filter pass discards
     // its rows, so per-group-allocated states rule it out.
@@ -1142,7 +1158,7 @@ fn runHarness(
         snapshotRows(snapshot) <= std.math.maxInt(u32) and
         !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
-        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, rows)) return;
+        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, n_hash_keys == 1, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
 }
@@ -1166,20 +1182,27 @@ fn runCountSketch(
     need: usize,
     rank: ?CountRank,
     floor: u64,
+    identity_key: bool,
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
 ) !bool {
     const cfg = sketchPasses(grid);
-    // A lone string key read only as identity may arrive as row-group
-    // dictionary codes, which a heavy tally counts without hashing.
-    if (cfg.distinct_eval and cfg.derived.len == 0 and cfg.hash_key_columns.len == 1 and cfg.group_rows_layout.key_columns.len == 1) {
+    // A lone string key read only as identity (`identity_key`) may arrive
+    // as row-group dictionary codes, which a heavy tally counts without
+    // hashing.
+    if (cfg.distinct_eval and cfg.derived.len == 0 and identity_key and cfg.group_rows_layout.key_columns.len == 1) {
         var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
         defer heavy.deinit(allocator);
         heavy.floor = floor;
         heavy.input_rows = snapshotRows(cfg.snapshot);
+        heavy.exact_keys = cfg.group_rows_layout.exact_key;
         if ((cfg.filter_expr != null or cfg.computed_where != null) and rowBitsFit(allocator, cfg.snapshot, 1)) {
             heavy.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
         }
-        if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) return true;
+        if (try runHeavyKeys(allocator, table, cpus, cfg, &heavy)) {
+            if (heavy.proves(rows.items.len, needthCount(rows.items, need, null))) return true;
+            discardRows(allocator, rows);
+            return false;
+        }
         if (heavy.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, grid, need, rows);
         if (heavy.declined_small) return false;
     }

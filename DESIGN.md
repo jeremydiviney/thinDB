@@ -1262,6 +1262,42 @@ emits an empty placeholder column in place of the strings. A result column
 that only such keys read, and never in a condition, then arrives as digests
 too, so neither the column nor the key's strings are ever copied.
 
+**Exact group keys.** `SET THINDB_EXACT_GROUP_KEYS = 1` (off by default)
+makes the V2 grouped engine decide its hashed keys' groups by their bytes:
+two keys share a group only if their bytes are equal, whatever their digests.
+The digest still places a key (its partition, bucket and hash slot); its
+bytes decide among the keys found there.
+
+- **Staging.** Each staged row carries its key's bytes as the last string
+  column (`GroupRowsLayout.exact_key`): a lone string key's bytes, or a
+  composite key's encoding (a validity byte per nullable part, a length and
+  the bytes per string part, the native bytes per fixed-width part). A
+  staged row that folds another row in, the weighted collapse's, compares
+  their bytes first.
+- **Buckets.** A bucket keeps each group's key bytes (`KeyBank`) and
+  compares them on every digest match (`getOrPutMatching`); keys that share
+  a digest take groups of their own.
+- **Scans.** A dictionary-coded key column arrives with both its digests and
+  its dictionary (`Scan.setBlockDictDigests`). A dictionary collapse whose
+  used codes leave gaps hands the staging the codes rather than a copy of
+  their values, and the staging copies each key from the dictionary. Keys
+  derived as a CASE (above) keep their bytes, as no comparison could read a
+  digest-only column.
+- **Count top-K.** The heavy-keys sketch keeps each reported key's bytes. A
+  second key reported under one digest marks the digest shared: the filter
+  pass then keeps every row under a candidate digest, and the answer stands
+  only if its own counts prove it (`HeavyKeys.proves`); else the full plan
+  runs. A key never reported holds at most the slack, below τ.
+- **HAVING.** Scan-time slot bounds (above) stay sound: a slot's count
+  bounds every key in it from above, however many keys share its digest.
+  HAVING itself reads the exact groups.
+
+`THINDB_V2_KEY_DIGEST_BITS` narrows the staged digest so that keys collide
+on purpose: tests check exact keys under real collisions with it. On
+ClickBench's hashed GROUP BY queries exact keys cost about 16% locally (sum
+418 → 486 ms, 11-03), mostly on keys of a few hundred thousand groups and
+on composite keys over long strings.
+
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the
 query's memory headroom. The price starts from the input's size: its row count
