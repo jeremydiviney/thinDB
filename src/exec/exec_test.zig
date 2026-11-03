@@ -5735,3 +5735,28 @@ test "scan: with the predicate memo off every scan reads every row group" {
     try std.testing.expectEqual(@as(u64, 10), try memoScan(allocator, opened.t, hit, &keys));
     try std.testing.expectEqualSlices(i64, &.{ 9, 29, 30 }, keys.items);
 }
+
+test "DigestStream: the digest of an input is the same however update splits it, and differs between inputs" {
+    var bytes: [3 * 512 + 7]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xd16e57);
+    const random = prng.random();
+    random.bytes(&bytes);
+    for ([_]usize{ 0, 1, 240, 241, 511, 512, 513, 1024, 1100, bytes.len }) |len| {
+        var whole: exec.DigestStream = .init();
+        whole.update(bytes[0..len]);
+        for (0..8) |_| {
+            var pieces: exec.DigestStream = .init();
+            var at: usize = 0;
+            while (at < len) {
+                const n = @min(len - at, 1 + random.uintAtMost(usize, 700));
+                pieces.update(bytes[at..][0..n]);
+                at += n;
+            }
+            try std.testing.expectEqual(whole.final(), pieces.final());
+        }
+        if (len == 0) continue;
+        var shorter: exec.DigestStream = .init();
+        shorter.update(bytes[0 .. len - 1]);
+        try std.testing.expect(shorter.final() != whole.final());
+    }
+}
