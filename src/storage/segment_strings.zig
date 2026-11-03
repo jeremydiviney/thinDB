@@ -61,20 +61,27 @@ const SortCtx = struct {
     }
 };
 
-/// A column's distinct values, their bytes packed into fixed-size chunks: a
-/// segment holds every distinct value until its end, and a growing arena's
-/// newest block can leave a third of what it holds unused.
+/// A column's distinct values, their bytes packed into chunks: a segment holds
+/// every distinct value until its end, and a growing arena's newest block can
+/// leave a third of what it holds unused. Chunks grow 4x up to
+/// `max_chunk_size`, past glibc's largest mmap threshold (32 MiB), so a big
+/// column's chunks are mapped straight from the OS and go back to it when the
+/// segment is written; smaller ones stay in malloc's heap once freed, which a
+/// merge of tens of millions of rows leaves holding gigabytes it no longer
+/// uses.
 const ValueStore = struct {
     chunks: std.ArrayList([]u8) = .empty,
     refs: std.ArrayList(Ref) = .empty,
     /// The chunk taking new values, and its bytes used.
     open: ?u32 = null,
     open_used: usize = 0,
+    next_chunk_size: usize = first_chunk_size,
 
-    const chunk_size: usize = 4 << 20;
-    /// Larger values each take a chunk of their own size, so a chunk's unused
-    /// tail stays under this.
-    const inline_limit: usize = chunk_size / 16;
+    const first_chunk_size: usize = 64 << 10;
+    const max_chunk_size: usize = 64 << 20;
+    /// Larger values each take a chunk of their own size, so any other value
+    /// fits a new chunk, and a chunk's unused tail stays under this.
+    const inline_limit: usize = first_chunk_size;
 
     const Ref = struct { chunk: u32, offset: u32, len: u32 };
 
@@ -103,9 +110,10 @@ const ValueStore = struct {
             self.refs.appendAssumeCapacity(.{ .chunk = @intCast(self.chunks.items.len - 1), .offset = 0, .len = @intCast(bytes.len) });
             return;
         }
-        if (self.open == null or self.open_used + bytes.len > chunk_size) {
+        if (self.open == null or self.open_used + bytes.len > self.chunks.items[self.open.?].len) {
             try self.chunks.ensureUnusedCapacity(allocator, 1);
-            self.chunks.appendAssumeCapacity(try allocator.alloc(u8, chunk_size));
+            self.chunks.appendAssumeCapacity(try allocator.alloc(u8, self.next_chunk_size));
+            self.next_chunk_size = @min(self.next_chunk_size * 4, max_chunk_size);
             self.open = @intCast(self.chunks.items.len - 1);
             self.open_used = 0;
         }
@@ -724,8 +732,13 @@ test "ValueStore packs values into chunks and gives large ones their own" {
     try store.refs.ensureUnusedCapacity(allocator, lens.len);
     for (lens, 0..) |n, i| try store.appendAssumeRefCapacity(allocator, buf[i % 7 ..][0..@min(n, buf.len - i % 7)]);
 
-    // 300 values of 20 KiB fill two 4 MiB chunks; the large value has its own.
-    try std.testing.expectEqual(@as(usize, 3), store.chunks.items.len);
+    // 300 values of 20 KiB fill chunks of 64 KiB, 256 KiB, 1 MiB and 4 MiB,
+    // then start one of 16 MiB; the large value has its own.
+    try std.testing.expectEqual(@as(usize, 6), store.chunks.items.len);
+    var sizes: [6]usize = undefined;
+    for (store.chunks.items, &sizes) |c, *s| s.* = c.len;
+    try std.testing.expectEqualSlices(usize, &.{ 64 << 10, large, 256 << 10, 1 << 20, 4 << 20, 16 << 20 }, &sizes);
+    try std.testing.expectEqual(ValueStore.max_chunk_size, store.next_chunk_size);
     for (lens, 0..) |n, i| try std.testing.expectEqualSlices(u8, buf[i % 7 ..][0..@min(n, buf.len - i % 7)], store.value(@intCast(i)));
 }
 
