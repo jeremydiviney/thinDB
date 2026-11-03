@@ -16,8 +16,11 @@ const c = struct {
 };
 
 const lz4c = struct {
+    const LZ4_streamHC_t = opaque {};
     extern fn LZ4_compressBound(input_size: c_int) c_int;
-    extern fn LZ4_compress_HC(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int, compression_level: c_int) c_int;
+    extern fn LZ4_createStreamHC() ?*LZ4_streamHC_t;
+    extern fn LZ4_freeStreamHC(state: *LZ4_streamHC_t) c_int;
+    extern fn LZ4_compress_HC_extStateHC_fastReset(state: *LZ4_streamHC_t, src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int, compression_level: c_int) c_int;
     extern fn LZ4_compress_default(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int) c_int;
     extern fn LZ4_decompress_safe(src: [*]const u8, dst: [*]u8, compressed_size: c_int, dst_capacity: c_int) c_int;
 };
@@ -34,14 +37,18 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Reusable zstd compression context. A CCtx allocates ~1-2 MB of internal
-/// hash tables, FSE/Huffman state, and staging buffers; reusing one across
-/// many small compress calls (e.g. one per column block in a flush) avoids
-/// paying that setup cost on every call.
+/// Reusable zstd and LZ4HC compression contexts. A CCtx allocates ~1-2 MB of
+/// internal hash tables, FSE/Huffman state, and staging buffers, and an
+/// LZ4HC state is ~256 KB of hash chains that a one-shot `LZ4_compress_HC`
+/// allocates and zeroes on every call; reusing them across many small
+/// compress calls (e.g. one per column block in a flush) avoids paying that
+/// setup cost on every call.
 ///
 /// Not thread-safe — give each thread its own Compressor.
 pub const Compressor = struct {
     cctx: *c.ZSTD_CCtx,
+    /// Created on first use, since most contexts compress only one way.
+    lz4hc: ?*lz4c.LZ4_streamHC_t = null,
 
     pub fn init() !Compressor {
         const cctx = c.ZSTD_createCCtx() orelse return Error.OutOfMemory;
@@ -50,7 +57,29 @@ pub const Compressor = struct {
 
     pub fn deinit(self: *Compressor) void {
         _ = c.ZSTD_freeCCtx(self.cctx);
+        if (self.lz4hc) |state| _ = lz4c.LZ4_freeStreamHC(state);
         self.* = undefined;
+    }
+
+    /// Compress `input` with LZ4HC into a freshly-allocated slice, on this
+    /// context's state: the same bytes a fresh state writes, since a reused
+    /// one ignores what its earlier inputs left in its tables. Caller owns
+    /// the result.
+    pub fn compressLz4HC(self: *Compressor, allocator: Allocator, input: []const u8) ![]u8 {
+        if (self.lz4hc == null) self.lz4hc = lz4c.LZ4_createStreamHC() orelse return Error.OutOfMemory;
+        const bound: usize = @intCast(lz4c.LZ4_compressBound(@intCast(input.len)));
+        const dst = try allocator.alloc(u8, bound);
+        errdefer allocator.free(dst);
+        const written = lz4c.LZ4_compress_HC_extStateHC_fastReset(
+            self.lz4hc.?,
+            input.ptr,
+            dst.ptr,
+            @intCast(input.len),
+            @intCast(dst.len),
+            lz4hc_level,
+        );
+        if (written <= 0) return Error.Lz4EncodeFailed;
+        return try allocator.realloc(dst, @intCast(written));
     }
 
     /// Compress `input` into a freshly-allocated byte slice using this
@@ -101,6 +130,13 @@ pub fn decompress(allocator: Allocator, input: []const u8, uncompressed_size: us
     return dst;
 }
 
+/// Decompress `input` into `dst`, which must be exactly the uncompressed
+/// length.
+pub fn decompressInto(input: []const u8, dst: []u8) !void {
+    const written = c.ZSTD_decompress(dst.ptr, dst.len, input.ptr, input.len);
+    if (c.ZSTD_isError(written) != 0 or written != dst.len) return Error.ZstdDecodeFailed;
+}
+
 /// Like `decompress` but the result buffer is 16-byte aligned. The row-group
 /// cache stores blocks through this so the scan can build zero-copy typed views
 /// (string offset arrays, fixed-width columns) directly over the cached bytes —
@@ -129,26 +165,9 @@ pub fn decompressAligned(allocator: Allocator, input: []const u8, uncompressed_s
 /// flush and compaction throughput win over the marginal disk savings.
 const lz4hc_level: c_int = 3;
 
-/// Compress `input` with LZ4HC into a freshly-allocated slice. Caller owns
-/// the result.
-pub fn lz4CompressHC(allocator: Allocator, input: []const u8) ![]u8 {
-    const bound: usize = @intCast(lz4c.LZ4_compressBound(@intCast(input.len)));
-    const dst = try allocator.alloc(u8, bound);
-    errdefer allocator.free(dst);
-    const written = lz4c.LZ4_compress_HC(
-        input.ptr,
-        dst.ptr,
-        @intCast(input.len),
-        @intCast(dst.len),
-        lz4hc_level,
-    );
-    if (written <= 0) return Error.Lz4EncodeFailed;
-    return try allocator.realloc(dst, @intCast(written));
-}
-
 /// Compress `input` with plain LZ4, for bytes held only until they are
-/// written: several times faster than `lz4CompressHC`. Caller owns the
-/// result.
+/// written: several times faster than `Compressor.compressLz4HC`. Caller
+/// owns the result.
 pub fn lz4CompressFast(allocator: Allocator, input: []const u8) ![]u8 {
     const bound: usize = @intCast(lz4c.LZ4_compressBound(@intCast(input.len)));
     const dst = try allocator.alloc(u8, bound);
@@ -184,9 +203,18 @@ test "lz4 round-trips and beats raw on redundant data" {
     const line = "https://example.com/products/widgets?id=12345&ref=search ";
     const payload: *const [64 * line.len]u8 = &@bitCast(@as([64][line.len]u8, @splat(line.*)));
 
-    const compressed = try lz4CompressHC(allocator, payload);
+    var compressor = try Compressor.init();
+    defer compressor.deinit();
+    const compressed = try compressor.compressLz4HC(allocator, payload);
     defer allocator.free(compressed);
     try std.testing.expect(compressed.len < payload.len / 2);
+
+    // A reused state writes what a fresh one does, even after other input.
+    const other = try compressor.compressLz4HC(allocator, payload[line.len..]);
+    allocator.free(other);
+    const again = try compressor.compressLz4HC(allocator, payload);
+    defer allocator.free(again);
+    try std.testing.expectEqualSlices(u8, compressed, again);
 
     const back = try lz4DecompressAligned(allocator, compressed, payload.len);
     defer allocator.free(back);

@@ -54,6 +54,23 @@ pub const Error = error{
     RecoveryRequired,
     DurabilityUncertain,
     DatabaseClosed,
+    /// A bulk load's file lacks the Parquet magic or footer.
+    NotParquet,
+    /// A Parquet file's metadata or pages don't decode.
+    CorruptParquet,
+    /// A Parquet feature the reader doesn't take: nested or repeated
+    /// columns, an encoding or codec it lacks, or a logical type such as
+    /// DECIMAL it can't convert yet.
+    UnsupportedParquet,
+    /// A Parquet value doesn't fit its column's type.
+    ParquetValueOutOfRange,
+    /// A table column has no Parquet column to read: none of its name, or,
+    /// pairing them by position, the file's column count differs from the
+    /// table's.
+    ParquetColumnMissing,
+    /// A bulk load targeted a table with a unique order key, whose upserts
+    /// resolve row by row through the memtable.
+    BulkLoadUniqueTable,
 };
 
 pub const SyncMode = enum { none, per_flush };
@@ -163,9 +180,10 @@ pub const Config = struct {
 
     /// Memory a background merge may hold. A merge keeps every distinct
     /// string value of its output until the output's end, so the compactor
-    /// leaves segments unmerged where their merge would pass this (their
-    /// size then grows with the box's RAM). `null` → a quarter of usable
-    /// memory, beside `memory_budget`'s ~65%; unbounded when the OS can't
+    /// leaves segments unmerged where their merge would pass this, and a
+    /// bulk load sizes its segments to stay unmerged. `null` →
+    /// `default_compact_memory`, or a quarter of usable memory where that's
+    /// less (beside `memory_budget`'s ~65%); unbounded when the OS can't
     /// report it.
     compact_memory: ?u64 = null,
 
@@ -290,10 +308,15 @@ pub fn resolveCompactThreads(allocator: std.mem.Allocator, configured: usize) us
     return @max(1, physical / 4);
 }
 
+/// Fixed rather than a share of RAM, so segments come out the same size on
+/// every machine with the memory for it (`hits`: 4 segments of 25M rows).
+/// A deployment with larger tables raises it for larger segments.
+pub const default_compact_memory: u64 = 8 << 30;
+
 pub fn resolveCompactMemory(configured: ?u64) u64 {
     if (configured) |bytes| return bytes;
     const total = totalMemoryBytes() orelse return std.math.maxInt(u64);
-    return total / 4;
+    return @min(default_compact_memory, total / 4);
 }
 
 /// Physical (non-SMT) core count, cross-OS. Re-exported for tools that size
@@ -357,6 +380,7 @@ pub const OpenOptions = struct {
 };
 
 pub const Table = @import("table.zig").Table;
+pub const bulk_load = @import("bulk_load.zig");
 pub const schemaFingerprint = @import("table.zig").schemaFingerprint;
 pub const Schema = @import("schema.zig").Schema;
 pub const TableBuild = @import("schema.zig").TableBuild;
@@ -516,6 +540,7 @@ test {
     _ = @import("table.zig");
     _ = @import("api_test.zig");
     _ = @import("compact.zig");
+    _ = @import("bulk_load.zig");
     _ = @import("delete.zig");
     _ = @import("upsert.zig");
 }

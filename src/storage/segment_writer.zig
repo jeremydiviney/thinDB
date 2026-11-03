@@ -5,6 +5,7 @@
 //! (call `.deinit(allocator)`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -35,9 +36,13 @@ const SegmentFile = struct {
     file: Io.File,
     /// Bytes already in the file.
     written: u64 = 0,
+    /// Bytes whose writeback has started.
+    written_back: u64 = 0,
     pending: std.ArrayList(u8) = .empty,
 
     const pending_limit: usize = 4 << 20;
+    /// Bytes written between writeback starts.
+    const writeback_step: u64 = 16 << 20;
 
     fn create(io: Io, dir: Io.Dir, file_name: []const u8) !SegmentFile {
         return .{ .io = io, .file = try dir.createFile(io, file_name, .{}) };
@@ -52,7 +57,7 @@ const SegmentFile = struct {
         if (self.pending.items.len + bytes.len > pending_limit) try self.drain();
         if (bytes.len >= pending_limit) {
             try self.file.writePositionalAll(self.io, bytes, self.written);
-            self.written += bytes.len;
+            self.wrote(bytes.len);
             return;
         }
         try self.pending.appendSlice(allocator, bytes);
@@ -61,8 +66,22 @@ const SegmentFile = struct {
     fn drain(self: *SegmentFile) !void {
         if (self.pending.items.len == 0) return;
         try self.file.writePositionalAll(self.io, self.pending.items, self.written);
-        self.written += self.pending.items.len;
+        self.wrote(self.pending.items.len);
         self.pending.clearRetainingCapacity();
+    }
+
+    /// Counts `n` bytes written, starting the writeback of each
+    /// `writeback_step` that lands. A segment is fsynced at close, and the
+    /// kernel would otherwise keep its pages dirty until then, so the fsync
+    /// would write the whole file while the writer waits; started as the
+    /// file grows, the writeback leaves the fsync only the tail.
+    fn wrote(self: *SegmentFile, n: usize) void {
+        self.written += n;
+        if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8 or !@hasField(std.os.linux.SYS, "sync_file_range")) return;
+        if (self.written - self.written_back < writeback_step) return;
+        const sync_file_range_write = 2;
+        _ = std.os.linux.syscall4(.sync_file_range, @intCast(self.file.handle), self.written_back, self.written - self.written_back, sync_file_range_write);
+        self.written_back = self.written;
     }
 
     fn close(self: *SegmentFile, allocator: Allocator) void {
@@ -97,7 +116,7 @@ fn hashCell(view: ColumnView, row: usize) u64 {
 
 /// Per-column HyperLogLog sketches over all rows, concatenated (column
 /// `ci` at `[ci*hll.m .. (ci+1)*hll.m]`). Caller owns the returned slice.
-fn computeSketches(allocator: Allocator, columns: []const ColumnView, row_count: usize) ![]u8 {
+pub fn computeSketches(allocator: Allocator, columns: []const ColumnView, row_count: usize) ![]u8 {
     const buf = try allocator.alloc(u8, columns.len * hll.m);
     errdefer allocator.free(buf);
     for (columns, 0..) |view, ci| {
@@ -192,7 +211,13 @@ pub fn writeSegmentWithStringCap(
         row_offset += rows_in_group;
     }
 
-    const string_tables = try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads);
+    var tables: std.ArrayList(format.StringTable) = .empty;
+    errdefer {
+        for (tables.items) |t| allocator.free(t.pages);
+        tables.deinit(allocator);
+    }
+    try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads, &tables);
+    const string_tables = try tables.toOwnedSlice(allocator);
     errdefer format.freeStringTables(allocator, string_tables);
     try writeFooter(allocator, &out, row_groups.items, string_tables);
     try out.drain();
@@ -219,9 +244,7 @@ fn freeRowGroupMeta(allocator: Allocator, rg: RowGroupMeta) void {
 /// Encodes rows `row_start..row_end` of `columns` as one row group appended
 /// to `out`: every column block in parallel (each into its own buffer), then
 /// appended in column order — byte-identical to the serial path regardless
-/// of thread count. A string column whose segment string table takes the
-/// rows gets no block here; `writeStringTables` writes it and sets its
-/// offset and length.
+/// of thread count.
 fn encodeRowGroup(
     allocator: Allocator,
     out: *SegmentFile,
@@ -233,15 +256,12 @@ fn encodeRowGroup(
     rg_idx: u32,
     encode_threads: usize,
 ) !RowGroupMeta {
-    const blocks = try allocator.alloc(std.ArrayList(u8), columns.len);
+    const blocks = try allocator.alloc(ColumnBlock, columns.len);
     defer {
         for (blocks) |*b| b.deinit(allocator);
         allocator.free(blocks);
     }
-    for (blocks) |*b| b.* = .empty;
-
-    const stats = try allocator.alloc(format.Stats, columns.len);
-    errdefer allocator.free(stats);
+    @memset(blocks, .{});
 
     var job = BlockEncodeJob{
         .allocator = allocator,
@@ -250,45 +270,122 @@ fn encodeRowGroup(
         .row_start = row_start,
         .row_end = row_end,
         .blocks = blocks,
-        .stats = stats,
         .strings = strings,
         .rg_idx = rg_idx,
     };
     try job.run(encode_threads);
+    return appendRowGroupBlocks(allocator, out, blocks, row_end - row_start);
+}
+
+/// One column of one row group, encoded apart from the others: its block,
+/// or, for a column with a string table, its rows readied for the table.
+pub const ColumnBlock = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    stats: format.Stats = undefined,
+    strings: ?segment_strings.Prepared = null,
+
+    pub fn deinit(self: *ColumnBlock, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+        if (self.strings) |*p| p.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Encodes rows `row_start..row_end` of column `ci` into `out`: its block,
+/// or, when `to_table` and the rows hold a string, the rows readied for the
+/// column's string table, which `commitBlock` hands them to.
+fn encodeBlock(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    schema: TableSchema,
+    ci: usize,
+    to_table: bool,
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+    fsst_threads: usize,
+    out: *ColumnBlock,
+) !void {
+    const nullable = schema.columns[ci].nullable;
+    out.stats = computeStats(view, row_start, row_end);
+    if (to_table) {
+        var bitmap: std.ArrayList(u8) = .empty;
+        defer bitmap.deinit(allocator);
+        if (nullable) try writeValidityBitmap(allocator, &bitmap, view, row_start, row_end);
+        out.strings = try segment_strings.prepare(allocator, view, row_start, row_end, bitmap.items, !nullable);
+        if (out.strings != null) return;
+    }
+    try writeColumnBlock(allocator, compressor, &out.bytes, view, nullable, schema.compression, row_start, row_end, fsst_threads);
+}
+
+/// Hands `block`'s readied rows to column `ci`'s string table `cs` as row
+/// group `rg_idx`, or, once the table can take no more values, encodes them
+/// as a block of their own. Per column, row groups commit in order.
+fn commitBlock(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    schema: TableSchema,
+    ci: usize,
+    cs: *segment_strings.ColumnStrings,
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+    rg_idx: u32,
+    fsst_threads: usize,
+    block: *ColumnBlock,
+) !void {
+    var p = block.strings orelse return;
+    block.strings = null;
+    const taken = cs.commit(&p, rg_idx) catch |e| {
+        p.deinit(allocator);
+        return e;
+    };
+    if (taken) return;
+    p.deinit(allocator);
+    try writeColumnBlock(allocator, compressor, &block.bytes, view, schema.columns[ci].nullable, schema.compression, row_start, row_end, fsst_threads);
+}
+
+/// Appends one row group of `rows` rows to `out`: its header, then each
+/// column's block in column order. A column whose string table took its
+/// rows has no block here; `writeStringTable` sets its offset and length.
+fn appendRowGroupBlocks(allocator: Allocator, out: *SegmentFile, blocks: []const ColumnBlock, rows: usize) !RowGroupMeta {
+    const stats = try allocator.alloc(format.Stats, blocks.len);
+    errdefer allocator.free(stats);
+    for (stats, blocks) |*s, b| s.* = b.stats;
 
     const rg_file_offset = out.offset();
     var rg_header: [8]u8 = undefined;
-    format.writeU32(rg_header[0..4], @intCast(row_end - row_start));
+    format.writeU32(rg_header[0..4], @intCast(rows));
     format.writeU32(rg_header[4..8], 0); // padding
     try out.append(allocator, &rg_header);
 
     // Each column block's own offset and length let the reader pread one
     // column without loading the whole segment.
-    const col_offsets = try allocator.alloc(u64, columns.len);
+    const col_offsets = try allocator.alloc(u64, blocks.len);
     errdefer allocator.free(col_offsets);
-    const col_lengths = try allocator.alloc(u32, columns.len);
+    const col_lengths = try allocator.alloc(u32, blocks.len);
     errdefer allocator.free(col_lengths);
     for (blocks, 0..) |b, ci| {
         col_offsets[ci] = out.offset();
-        col_lengths[ci] = @intCast(b.items.len);
-        try out.append(allocator, b.items);
+        col_lengths[ci] = @intCast(b.bytes.items.len);
+        try out.append(allocator, b.bytes.items);
     }
 
     return .{
         .offset = rg_file_offset,
         .length = @intCast(out.offset() - rg_file_offset),
-        .row_count = @intCast(row_end - row_start),
+        .row_count = @intCast(rows),
         .stats = stats,
         .col_offsets = col_offsets,
         .col_lengths = col_lengths,
     };
 }
 
-/// Writes each string column's segment string table to `out` — its
-/// shared-string pages, then the row-group blocks it took, grouped by column
-/// — and points those row groups' column offsets and lengths at the blocks.
-/// Frees each column's builder once written. Caller owns the returned
-/// directory.
+/// Writes each string column's segment string table still in `strings` to
+/// `out` — its shared-string pages, then the row-group blocks it took,
+/// grouped by column — onto `tables`, and points those row groups' column
+/// offsets and lengths at the blocks. Frees each column's builder once
+/// written.
 fn writeStringTables(
     allocator: Allocator,
     out: *SegmentFile,
@@ -296,12 +393,8 @@ fn writeStringTables(
     row_groups: []RowGroupMeta,
     table_compression: types.TableCompression,
     threads: usize,
-) ![]const format.StringTable {
-    var tables: std.ArrayList(format.StringTable) = .empty;
-    errdefer {
-        for (tables.items) |t| allocator.free(t.pages);
-        tables.deinit(allocator);
-    }
+    tables: *std.ArrayList(format.StringTable),
+) !void {
     var compressor = try compression_mod.Compressor.init();
     defer compressor.deinit();
     var payload: std.ArrayList(u8) = .empty;
@@ -352,7 +445,8 @@ fn writeStringTables(
             first += chunk.len;
         }
 
-        try tables.append(allocator, .{
+        try tables.ensureUnusedCapacity(allocator, 1);
+        tables.appendAssumeCapacity(.{
             .column_idx = @intCast(ci),
             .shared_count = cs.sharedCount(),
             .value_count = cs.valueCount(),
@@ -360,8 +454,40 @@ fn writeStringTables(
             .pages = pages,
         });
     }
-    return tables.toOwnedSlice(allocator);
 }
+
+/// Encodes string-table block `b` of `cs` onto `out`, after `assignIds`.
+fn encodeStringBlock(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    cs: *const segment_strings.ColumnStrings,
+    b: segment_strings.ColumnStrings.Block,
+    table_compression: types.TableCompression,
+    out: *std.ArrayList(u8),
+) !void {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    try cs.blockPayload(allocator, b, &payload);
+    try appendBlock(allocator, compressor, out, payload.items, format.segment_dict_encoding, b.bitmap.len > 0, table_compression);
+}
+
+/// One column's string table, laid out apart from its segment file in
+/// pieces that encode in parallel: its shared-string pages, then its
+/// row-group blocks. `MergedSegmentWriter.appendStringTable` places it.
+pub const StringTableBuild = struct {
+    strings: segment_strings.ColumnStrings,
+    column_idx: u32,
+    page_count: usize,
+    /// Each piece's encoded bytes, pages first.
+    pieces: []std.ArrayList(u8),
+
+    pub fn deinit(self: *StringTableBuild, allocator: Allocator) void {
+        for (self.pieces) |*p| p.deinit(allocator);
+        allocator.free(self.pieces);
+        self.strings.deinit();
+        self.* = undefined;
+    }
+};
 
 /// Encodes some of one string column's deferred row-group blocks, each into
 /// its own buffer.
@@ -373,11 +499,7 @@ const StringBlockJob = struct {
     encoded: []std.ArrayList(u8),
 
     fn encode(self: *StringBlockJob, compressor: *compression_mod.Compressor, i: usize) !void {
-        const b = self.blocks[i];
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        try self.strings.blockPayload(self.allocator, b, &payload);
-        try appendBlock(self.allocator, compressor, &self.encoded[i], payload.items, format.segment_dict_encoding, b.bitmap.len > 0, self.table_compression);
+        try encodeStringBlock(self.allocator, compressor, self.strings, self.blocks[i], self.table_compression, &self.encoded[i]);
     }
 };
 
@@ -445,6 +567,17 @@ fn appendFooter(
 /// Usage: `begin`, then `writeRowGroup` per sorted row-group (≤ `row_group_size`
 /// rows), then `finish`. On any error before `finish`, call `deinit`, which
 /// also deletes the partial file.
+///
+/// A caller with its own workers can instead take `writeRowGroup` and the
+/// string tables apart: `encodeColumn` per column of each row group, on any
+/// thread and in any order; `commitColumn`, in row-group order per column;
+/// `appendRowGroup`, in row-group order. Once a column's row groups have all
+/// committed, `beginStringTable` takes its table, `encodeStringTablePiece`
+/// encodes the table's pieces in parallel, and `appendStringTable` places it
+/// after every row group, in column order, before `finish`. Or, column by
+/// column: `beginRowGroups` starts every row group, `appendColumnBlock`
+/// appends each column's blocks, and `appendStringTable` places a table
+/// once its column's blocks are appended.
 pub const MergedSegmentWriter = struct {
     allocator: Allocator,
     schema: TableSchema,
@@ -462,6 +595,8 @@ pub const MergedSegmentWriter = struct {
     row_groups: std.ArrayList(RowGroupMeta),
     row_count: u64,
     strings: segment_strings.SegmentStrings,
+    /// String tables `appendStringTable` placed.
+    string_tables: std.ArrayList(format.StringTable),
 
     pub fn begin(
         allocator: Allocator,
@@ -506,6 +641,7 @@ pub const MergedSegmentWriter = struct {
             .row_groups = .empty,
             .row_count = 0,
             .strings = strings,
+            .string_tables = .empty,
         };
     }
 
@@ -546,13 +682,145 @@ pub const MergedSegmentWriter = struct {
         self.row_count += @intCast(rows);
     }
 
+    /// Encodes column `ci` of a row group into `out`, apart from the writer's
+    /// other work. A column with a string table comes back readied for
+    /// `commitColumn`, and `view` must outlive that commit.
+    pub fn encodeColumn(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, ci: usize, view: ColumnView, out: *ColumnBlock) !void {
+        try encodeBlock(self.allocator, compressor, self.schema, ci, self.strings.columns[ci] != null, view, 0, view.rowCount(), 1, out);
+    }
+
+    /// Hands column `ci`'s readied rows to its string table as row group
+    /// `rg_idx`, the index `appendRowGroup` will give it; a no-op for a block
+    /// already encoded. Per column, row groups commit in order; columns
+    /// commit in parallel.
+    pub fn commitColumn(self: *MergedSegmentWriter, compressor: *compression_mod.Compressor, ci: usize, rg_idx: u32, view: ColumnView, block: *ColumnBlock) !void {
+        const cs = if (self.strings.columns[ci]) |*c| c else return;
+        try commitBlock(self.allocator, compressor, self.schema, ci, cs, view, 0, view.rowCount(), rg_idx, 1, block);
+    }
+
+    /// Appends the next row group of `rows` rows from its column blocks,
+    /// each encoded and committed.
+    pub fn appendRowGroup(self: *MergedSegmentWriter, blocks: []const ColumnBlock, rows: usize) !void {
+        if (blocks.len != self.schema.columns.len) return format.Error.SchemaMismatch;
+        if (rows == 0 or rows > self.row_group_size) return format.Error.InvalidRowGroupSize;
+        try self.row_groups.ensureUnusedCapacity(self.allocator, 1);
+        self.row_groups.appendAssumeCapacity(try appendRowGroupBlocks(self.allocator, &self.out, blocks, rows));
+        self.row_count += @intCast(rows);
+    }
+
+    /// Starts every row group of a segment of `rows` rows at once, writing
+    /// their headers, for `appendColumnBlock` to append their blocks in
+    /// place of `appendRowGroup`.
+    pub fn beginRowGroups(self: *MergedSegmentWriter, rows: usize) !void {
+        if (rows == 0 or self.row_groups.items.len > 0) return format.Error.InvalidRowGroupSize;
+        const columns = self.schema.columns.len;
+        const count = (rows + self.row_group_size - 1) / self.row_group_size;
+        try self.row_groups.ensureTotalCapacity(self.allocator, count);
+        for (0..count) |r| {
+            const rg_rows = @min(self.row_group_size, rows - r * self.row_group_size);
+            const stats = try self.allocator.alloc(format.Stats, columns);
+            errdefer self.allocator.free(stats);
+            @memset(stats, std.mem.zeroes(format.Stats));
+            const col_offsets = try self.allocator.alloc(u64, columns);
+            errdefer self.allocator.free(col_offsets);
+            @memset(col_offsets, 0);
+            const col_lengths = try self.allocator.alloc(u32, columns);
+            @memset(col_lengths, 0);
+            var header: [8]u8 = undefined;
+            format.writeU32(header[0..4], @intCast(rg_rows));
+            format.writeU32(header[4..8], 0);
+            self.row_groups.appendAssumeCapacity(.{
+                .offset = self.out.offset(),
+                .length = header.len,
+                .row_count = @intCast(rg_rows),
+                .stats = stats,
+                .col_offsets = col_offsets,
+                .col_lengths = col_lengths,
+            });
+            try self.out.append(self.allocator, &header);
+        }
+        self.row_count = rows;
+    }
+
+    /// Appends row group `rg`'s block of column `ci`, encoded and
+    /// committed, after `beginRowGroups`. A block a string table took is
+    /// empty until `appendStringTable` places the table.
+    pub fn appendColumnBlock(self: *MergedSegmentWriter, rg: usize, ci: usize, block: *const ColumnBlock) !void {
+        const meta = &self.row_groups.items[rg];
+        @constCast(meta.stats)[ci] = block.stats;
+        @constCast(meta.col_offsets)[ci] = self.out.offset();
+        @constCast(meta.col_lengths)[ci] = @intCast(block.bytes.items.len);
+        meta.length += @intCast(block.bytes.items.len);
+        try self.out.append(self.allocator, block.bytes.items);
+    }
+
+    /// Starts column `ci`'s string table, once its row groups have all
+    /// committed, taking over the column's builder; null when the column has
+    /// none. Its pieces then encode in parallel with `encodeStringTablePiece`.
+    pub fn beginStringTable(self: *MergedSegmentWriter, ci: usize) !?StringTableBuild {
+        const slot = &self.strings.columns[ci];
+        var cs = slot.* orelse return null;
+        slot.* = null;
+        errdefer cs.deinit();
+        if (cs.blocks.items.len == 0) {
+            cs.deinit();
+            return null;
+        }
+        try cs.assignIds();
+        const page_count = segment_strings.pageCount(cs.sharedCount());
+        const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len);
+        @memset(pieces, .empty);
+        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .pieces = pieces };
+    }
+
+    /// Encodes piece `i` of `build` into its own buffer, apart from the
+    /// writer's other work and the build's other pieces.
+    pub fn encodeStringTablePiece(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, build: *StringTableBuild, i: usize) !void {
+        const cs = &build.strings;
+        if (i >= build.page_count) return encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        try cs.pagePayload(self.allocator, @intCast(i), &payload);
+        try appendBlock(self.allocator, compressor, &build.pieces[i], payload.items, @backingInt(format.Encoding.raw), false, self.schema.compression);
+    }
+
+    /// Places `build`'s string table at the file's end, pointing its row
+    /// groups' column offsets and lengths at its blocks, and frees the build.
+    /// Tables place in column order: after every row group, or after their
+    /// own column's blocks once the row groups began together.
+    pub fn appendStringTable(self: *MergedSegmentWriter, build: *StringTableBuild) !void {
+        defer build.deinit(self.allocator);
+        const cs = &build.strings;
+        try self.string_tables.ensureUnusedCapacity(self.allocator, 1);
+        const pages = try self.allocator.alloc(format.FileRange, build.page_count);
+        errdefer self.allocator.free(pages);
+        for (pages, build.pieces[0..build.page_count]) |*page, piece| {
+            page.* = .{ .offset = self.out.offset(), .length = @intCast(piece.items.len) };
+            try self.out.append(self.allocator, piece.items);
+        }
+        for (cs.blocks.items, build.pieces[build.page_count..]) |b, piece| {
+            const rg = self.row_groups.items[b.rg_idx];
+            @constCast(rg.col_offsets)[build.column_idx] = self.out.offset();
+            @constCast(rg.col_lengths)[build.column_idx] = @intCast(piece.items.len);
+            try self.out.append(self.allocator, piece.items);
+        }
+        self.string_tables.appendAssumeCapacity(.{
+            .column_idx = build.column_idx,
+            .shared_count = cs.sharedCount(),
+            .value_count = cs.valueCount(),
+            .value_bytes = cs.valueBytes(),
+            .pages = pages,
+        });
+    }
+
     /// Write the string tables and footer, fill in the header's row count,
     /// close the file, and return the `SegmentInfo` (which takes ownership of
     /// `column_sketches` and the row-group metadata). After a successful
     /// `finish` the writer is spent; do not call `deinit`. After a failed one,
     /// call `deinit`.
     pub fn finish(self: *MergedSegmentWriter, sync_on_close: bool) !SegmentInfo {
-        const string_tables = try writeStringTables(self.allocator, &self.out, &self.strings, self.row_groups.items, self.schema.compression, self.encode_threads);
+        try writeStringTables(self.allocator, &self.out, &self.strings, self.row_groups.items, self.schema.compression, self.encode_threads, &self.string_tables);
+        const string_tables = try self.string_tables.toOwnedSlice(self.allocator);
         errdefer format.freeStringTables(self.allocator, string_tables);
         try writeFooter(self.allocator, &self.out, self.row_groups.items, string_tables);
         try self.out.drain();
@@ -585,6 +853,8 @@ pub const MergedSegmentWriter = struct {
         for (self.row_groups.items) |rg| freeRowGroupMeta(self.allocator, rg);
         self.row_groups.deinit(self.allocator);
         self.strings.deinit();
+        for (self.string_tables.items) |t| self.allocator.free(t.pages);
+        self.string_tables.deinit(self.allocator);
         if (self.column_sketches.len > 0) self.allocator.free(@constCast(self.column_sketches));
         const io = self.out.io;
         self.out.close(self.allocator);
@@ -595,18 +865,17 @@ pub const MergedSegmentWriter = struct {
 };
 
 /// One row-group's block encode: column `ci`'s complete on-disk block
-/// (header + payload) into `blocks[ci]`, plus its `stats[ci]` — or, for a
-/// string column its segment string table takes, no block. The expensive
-/// part per column is the compress call, so the column grain load-balances
-/// well even when a few string columns dwarf the rest.
+/// (header + payload) and stats into `blocks[ci]` — or, for a string column
+/// its segment string table takes, no block. The expensive part per column
+/// is the compress call, so the column grain load-balances well even when a
+/// few string columns dwarf the rest.
 const BlockEncodeJob = struct {
     allocator: Allocator,
     columns: []const ColumnView,
     schema: TableSchema,
     row_start: usize,
     row_end: usize,
-    blocks: []std.ArrayList(u8),
-    stats: []format.Stats,
+    blocks: []ColumnBlock,
     strings: []?segment_strings.ColumnStrings,
     rg_idx: u32,
     fsst_threads: usize = 1,
@@ -623,25 +892,10 @@ const BlockEncodeJob = struct {
 
     fn encode(self: *BlockEncodeJob, compressor: *compression_mod.Compressor, ci: usize) !void {
         const view = self.columns[ci];
-        const nullable = self.schema.columns[ci].nullable;
-        const deferred = if (self.strings[ci]) |*cs| absorbed: {
-            var bitmap: std.ArrayList(u8) = .empty;
-            defer bitmap.deinit(self.allocator);
-            if (nullable) try writeValidityBitmap(self.allocator, &bitmap, view, self.row_start, self.row_end);
-            break :absorbed try cs.absorb(view, self.row_start, self.row_end, self.rg_idx, bitmap.items, !nullable);
-        } else false;
-        if (!deferred) try writeColumnBlock(
-            self.allocator,
-            compressor,
-            &self.blocks[ci],
-            view,
-            nullable,
-            self.schema.compression,
-            self.row_start,
-            self.row_end,
-            self.fsst_threads,
-        );
-        self.stats[ci] = computeStats(view, self.row_start, self.row_end);
+        const cs: ?*segment_strings.ColumnStrings = if (self.strings[ci]) |*c| c else null;
+        const to_table = if (cs) |c| !c.full else false;
+        try encodeBlock(self.allocator, compressor, self.schema, ci, to_table, view, self.row_start, self.row_end, self.fsst_threads, &self.blocks[ci]);
+        if (cs) |c| try commitBlock(self.allocator, compressor, self.schema, ci, c, view, self.row_start, self.row_end, self.rg_idx, self.fsst_threads, &self.blocks[ci]);
     }
 };
 
@@ -781,7 +1035,7 @@ fn appendBlock(
             kind = if (compressed.?.len < payload.len) .zstd else .none;
         },
         .lz4, .lz4_fsst => {
-            compressed = try compression_mod.lz4CompressHC(allocator, payload);
+            compressed = try compressor.compressLz4HC(allocator, payload);
             kind = if (compressed.?.len < payload.len) .lz4 else .none;
         },
     }

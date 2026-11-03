@@ -86,6 +86,8 @@ const NOT_SUPPORTED = [_][]const u8{
     "JoinUnsupportedType",
     "ComputeUnsupportedExpr",
     "FileScanUnsupportedParquet",
+    "UnsupportedParquet",
+    "BulkLoadUniqueTable",
     "CopyFileNotSupported",
     "SqlOnNonEquiUnsupported",
     "SqlCopyFileNotSupported",

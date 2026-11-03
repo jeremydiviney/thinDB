@@ -60,6 +60,29 @@ pub const FileScan = struct {
         return exec.makeQuery(allocator, self);
     }
 
+    /// Whether `spec` reads a Parquet file: `read_parquet`, or a path
+    /// ending in `.parquet` or `.pq`.
+    pub fn readsParquet(spec: ir.FileScan) bool {
+        var csv_options = spec.options.csv;
+        const format = resolveFormat(spec.format, spec.path, &csv_options) catch return false;
+        return format == .parquet;
+    }
+
+    /// The directory `path` resolves in under `access`: the process's
+    /// working directory, or the file root, which the caller closes.
+    pub fn openDir(io: Io, access: api.FileScanAccess, path: []const u8) !Io.Dir {
+        switch (access) {
+            .disabled => return error.FileScanDisabled,
+            .process => return Io.Dir.cwd(),
+            .root => |root| {
+                if (std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, ':') != null or hasParentTraversal(path)) {
+                    return error.FileScanPathOutsideRoot;
+                }
+                return Io.Dir.cwd().openDir(io, root, .{});
+            },
+        }
+    }
+
     pub fn next(self: *FileScan) !?Batch {
         if (self.emitted) return null;
         self.emitted = true;
@@ -324,18 +347,9 @@ fn resolveFormat(format: ir.FileFormat, path: []const u8, csv_options: *ir.CsvOp
 }
 
 fn readFileBytes(allocator: Allocator, io: Io, access: api.FileScanAccess, path: []const u8) ![]u8 {
-    switch (access) {
-        .disabled => return error.FileScanDisabled,
-        .process => return Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited),
-        .root => |root| {
-            if (std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, ':') != null or hasParentTraversal(path)) {
-                return error.FileScanPathOutsideRoot;
-            }
-            var dir = try Io.Dir.cwd().openDir(io, root, .{});
-            defer dir.close(io);
-            return dir.readFileAlloc(io, path, allocator, .unlimited);
-        },
-    }
+    var dir = try FileScan.openDir(io, access, path);
+    defer if (access == .root) dir.close(io);
+    return dir.readFileAlloc(io, path, allocator, .unlimited);
 }
 
 fn hasParentTraversal(path: []const u8) bool {

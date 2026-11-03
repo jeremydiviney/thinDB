@@ -79,9 +79,10 @@ const usage_text =
     \\                          hardware threads that concurrent queries share.
     \\  --compact-threads N     Worker threads for block encode+compress inside a compaction merge
     \\                          (default 0 = auto: ~25% of the physical cores; 1 = serial).
-    \\  --compact-memory B      Memory a compaction merge may hold (default: auto, a quarter of
-    \\                          usable RAM). Segments whose merge would need more stay unmerged,
-    \\                          so the largest segments grow with the box's RAM.
+    \\  --compact-memory B      Memory a compaction merge may hold (default: 8G, or a quarter of
+    \\                          usable RAM where that's less). Segments whose merge would need
+    \\                          more stay unmerged; bulk loads size segments to stay unmerged.
+    \\                          Raise it for larger segments on large tables.
     \\  --memory-budget B       The server's one memory budget (default: auto, ~65% of usable RAM,
     \\                          floored at 256 MiB). Running queries, the block cache of every
     \\                          table, its predicate memo and idle scratch buffers all share it:

@@ -3519,7 +3519,10 @@ fn runKeyedDeleteBatch(
 
 fn isXaStageable(op: ir.Op) bool {
     return switch (op) {
-        .insert, .insert_select, .delete_op, .update_op => true,
+        // A bulk load runs at once, as DDL does: its segments go straight
+        // into the manifest, past the WAL a branch's replay commits through.
+        .insert_select => |i| local.bulkLoadSource(i) == null,
+        .insert, .delete_op, .update_op => true,
         else => false,
     };
 }

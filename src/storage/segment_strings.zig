@@ -250,107 +250,41 @@ pub const ColumnStrings = struct {
         entry_stats: bool,
     ) !bool {
         if (self.full) return false;
-        const sv: StringView = switch (view.data) {
-            .varchar, .string, .char => |s| s,
-            else => return false,
+        var p = try prepare(self.allocator, view, row_start, row_end, bitmap, entry_stats) orelse return false;
+        const taken = self.commit(&p, rg_idx) catch |e| {
+            p.deinit(self.allocator);
+            return e;
         };
+        if (!taken) p.deinit(self.allocator);
+        return taken;
+    }
+
+    /// Takes `p` as row group `rg_idx`'s block, deferred to the segment's
+    /// end; the block keeps what it needs of `p` and frees the rest. False,
+    /// leaving `p` to the caller, when the segment's values would pass `cap`.
+    /// Row groups commit in order.
+    pub fn commit(self: *ColumnStrings, p: *Prepared, rg_idx: u32) !bool {
+        if (self.full) return false;
         const allocator = self.allocator;
-        const n = row_end - row_start;
-
-        var local: std.StringHashMapUnmanaged(u32) = .empty;
-        defer local.deinit(allocator);
-        var distinct: std.ArrayList([]const u8) = .empty;
-        defer distinct.deinit(allocator);
-        const row_codes = try allocator.alloc(u32, n);
-        defer allocator.free(row_codes);
-        for (row_codes, row_start..) |*code, r| {
-            if (!view.isValid(r)) {
-                code.* = 0;
-                continue;
-            }
-            const s = sv.rowBytes(r);
-            const gop = try local.getOrPut(allocator, s);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = @intCast(distinct.items.len);
-                try distinct.append(allocator, s);
-            }
-            code.* = gop.value_ptr.*;
-        }
-        const k = distinct.items.len;
-        if (k == 0) return false;
-
-        const order = try allocator.alloc(u32, k);
-        defer allocator.free(order);
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.sort.pdq(u32, order, SortCtx{ .items = distinct.items }, SortCtx.lessThan);
-
-        const entries = try allocator.alloc(u32, k);
+        const entries = try allocator.alloc(u32, p.distinct.len);
         errdefer allocator.free(entries);
-        if (!try self.intern(distinct.items, order, rg_idx, entries)) {
+        if (!try self.intern(p.distinct, p.order, rg_idx, entries)) {
             allocator.free(entries);
             return false;
         }
-
-        const ins_to_sorted = try allocator.alloc(u32, k);
-        defer allocator.free(ins_to_sorted);
-        for (order, 0..) |ins, p| ins_to_sorted[ins] = @intCast(p);
-
-        const code_width: u8 = if (k <= 256) 1 else if (k <= 65536) 2 else 4;
-        const codes_len = n * code_width;
-        var dict_bytes: usize = 0;
-        for (distinct.items) |s| dict_bytes += s.len;
-        const stat_width = format.dictEntryStatWidth(@intCast(n));
-        // The same rule as a `.dict` block: stats only while the block with
-        // them stays under the raw layout, so a near-unique block skips them.
-        const dict_body = 8 + (k + 1) * 4 + dict_bytes + codes_len;
-        const raw_body = 4 + (n + 1) * 4 + (sv.offsets[row_end] - sv.offsets[row_start]);
-        const with_stats = entry_stats and dict_body + 2 * k * stat_width < raw_body;
-        const stats_len = if (with_stats) 2 * k * stat_width else 0;
-        const raw = try allocator.alloc(u8, codes_len + stats_len);
-        defer allocator.free(raw);
-        const codes = raw[0..codes_len];
-        const stats = raw[codes_len..];
-        for (row_codes, 0..) |ic, i| {
-            var b4: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b4, ins_to_sorted[ic], .little);
-            @memcpy(codes[i * code_width ..][0..code_width], b4[0..code_width]);
-        }
-
-        if (with_stats) {
-            const counts = try allocator.alloc(u32, k);
-            defer allocator.free(counts);
-            const first_rows = try allocator.alloc(u32, k);
-            defer allocator.free(first_rows);
-            @memset(counts, 0);
-            for (row_codes, 0..) |ic, i| {
-                const code = ins_to_sorted[ic];
-                if (counts[code] == 0) first_rows[code] = @intCast(i);
-                counts[code] += 1;
-            }
-            // Every value occurs, so a count is stored less one.
-            for (counts, first_rows, 0..) |count, first, e| {
-                var b4: [4]u8 = undefined;
-                std.mem.writeInt(u32, &b4, count - 1, .little);
-                @memcpy(stats[e * stat_width ..][0..stat_width], b4[0..stat_width]);
-                std.mem.writeInt(u32, &b4, first, .little);
-                @memcpy(stats[(k + e) * stat_width ..][0..stat_width], b4[0..stat_width]);
-            }
-        }
-
-        const held = try compression.lz4CompressFast(allocator, raw);
-        errdefer allocator.free(held);
-        const bitmap_copy = try allocator.dupe(u8, bitmap);
-        errdefer allocator.free(bitmap_copy);
         try self.blocks.append(allocator, .{
             .rg_idx = rg_idx,
-            .row_count = @intCast(n),
+            .row_count = p.row_count,
             .values = entries,
-            .bitmap = bitmap_copy,
-            .code_width = code_width,
-            .codes_len = @intCast(codes_len),
-            .stats_len = @intCast(stats_len),
-            .held = held,
+            .bitmap = p.bitmap,
+            .code_width = p.code_width,
+            .codes_len = p.codes_len,
+            .stats_len = p.stats_len,
+            .held = p.held,
         });
+        allocator.free(p.distinct);
+        allocator.free(p.order);
+        p.* = undefined;
         return true;
     }
 
@@ -504,6 +438,139 @@ pub const ColumnStrings = struct {
         out.items.len += tail.len;
     }
 };
+
+/// One row group's rows of a string column, readied for
+/// `ColumnStrings.commit`. Its distinct values, codes and entry stats need
+/// only the row group, so row groups ready in parallel and just the commit
+/// touches the segment's values.
+pub const Prepared = struct {
+    /// The distinct values in first-seen order, borrowed from the row
+    /// group's view, which must outlive the commit.
+    distinct: [][]const u8,
+    /// `distinct` indices in value order.
+    order: []u32,
+    row_count: u32,
+    bitmap: []u8,
+    code_width: u8,
+    codes_len: u32,
+    stats_len: u32,
+    /// The codes then the entry stats, LZ4-compressed, as `Block.held`.
+    held: []u8,
+
+    pub fn deinit(self: *Prepared, allocator: Allocator) void {
+        allocator.free(self.distinct);
+        allocator.free(self.order);
+        allocator.free(self.bitmap);
+        allocator.free(self.held);
+        self.* = undefined;
+    }
+};
+
+/// Readies rows `row_start..row_end` of `view` for a string table. Null
+/// when the view holds no strings or every row is NULL. `bitmap` is the
+/// block's validity prefix, empty for a non-nullable column.
+pub fn prepare(
+    allocator: Allocator,
+    view: ColumnView,
+    row_start: usize,
+    row_end: usize,
+    bitmap: []const u8,
+    entry_stats: bool,
+) !?Prepared {
+    const sv: StringView = switch (view.data) {
+        .varchar, .string, .char => |s| s,
+        else => return null,
+    };
+    const n = row_end - row_start;
+
+    var local: std.StringHashMapUnmanaged(u32) = .empty;
+    defer local.deinit(allocator);
+    var distinct: std.ArrayList([]const u8) = .empty;
+    defer distinct.deinit(allocator);
+    const row_codes = try allocator.alloc(u32, n);
+    defer allocator.free(row_codes);
+    for (row_codes, row_start..) |*code, r| {
+        if (!view.isValid(r)) {
+            code.* = 0;
+            continue;
+        }
+        const s = sv.rowBytes(r);
+        const gop = try local.getOrPut(allocator, s);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = @intCast(distinct.items.len);
+            try distinct.append(allocator, s);
+        }
+        code.* = gop.value_ptr.*;
+    }
+    const k = distinct.items.len;
+    if (k == 0) return null;
+
+    const order = try allocator.alloc(u32, k);
+    errdefer allocator.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.sort.pdq(u32, order, SortCtx{ .items = distinct.items }, SortCtx.lessThan);
+
+    const ins_to_sorted = try allocator.alloc(u32, k);
+    defer allocator.free(ins_to_sorted);
+    for (order, 0..) |ins, p| ins_to_sorted[ins] = @intCast(p);
+
+    const code_width: u8 = if (k <= 256) 1 else if (k <= 65536) 2 else 4;
+    const codes_len = n * code_width;
+    var dict_bytes: usize = 0;
+    for (distinct.items) |s| dict_bytes += s.len;
+    const stat_width = format.dictEntryStatWidth(@intCast(n));
+    // The same rule as a `.dict` block: stats only while the block with
+    // them stays under the raw layout, so a near-unique block skips them.
+    const dict_body = 8 + (k + 1) * 4 + dict_bytes + codes_len;
+    const raw_body = 4 + (n + 1) * 4 + (sv.offsets[row_end] - sv.offsets[row_start]);
+    const with_stats = entry_stats and dict_body + 2 * k * stat_width < raw_body;
+    const stats_len = if (with_stats) 2 * k * stat_width else 0;
+    const raw = try allocator.alloc(u8, codes_len + stats_len);
+    defer allocator.free(raw);
+    const codes = raw[0..codes_len];
+    const stats = raw[codes_len..];
+    for (row_codes, 0..) |ic, i| {
+        var b4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b4, ins_to_sorted[ic], .little);
+        @memcpy(codes[i * code_width ..][0..code_width], b4[0..code_width]);
+    }
+
+    if (with_stats) {
+        const counts = try allocator.alloc(u32, k);
+        defer allocator.free(counts);
+        const first_rows = try allocator.alloc(u32, k);
+        defer allocator.free(first_rows);
+        @memset(counts, 0);
+        for (row_codes, 0..) |ic, i| {
+            const code = ins_to_sorted[ic];
+            if (counts[code] == 0) first_rows[code] = @intCast(i);
+            counts[code] += 1;
+        }
+        // Every value occurs, so a count is stored less one.
+        for (counts, first_rows, 0..) |count, first, e| {
+            var b4: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b4, count - 1, .little);
+            @memcpy(stats[e * stat_width ..][0..stat_width], b4[0..stat_width]);
+            std.mem.writeInt(u32, &b4, first, .little);
+            @memcpy(stats[(k + e) * stat_width ..][0..stat_width], b4[0..stat_width]);
+        }
+    }
+
+    const held = try compression.lz4CompressFast(allocator, raw);
+    errdefer allocator.free(held);
+    const bitmap_copy = try allocator.dupe(u8, bitmap);
+    errdefer allocator.free(bitmap_copy);
+    return .{
+        .distinct = try distinct.toOwnedSlice(allocator),
+        .order = order,
+        .row_count = @intCast(n),
+        .bitmap = bitmap_copy,
+        .code_width = code_width,
+        .codes_len = @intCast(codes_len),
+        .stats_len = @intCast(stats_len),
+        .held = held,
+    };
+}
 
 fn appendU32(out: *std.ArrayList(u8), v: u32) void {
     var b4: [4]u8 = undefined;
