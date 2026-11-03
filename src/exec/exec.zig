@@ -1842,23 +1842,42 @@ pub fn setDigestSeed(seed: u64) void {
     digest_key = .init(seed);
 }
 
-/// A 128-bit identity digest taken in pieces, keyed like `stringKeyDigest`:
-/// two XXH3-64 streams under seeds drawn from the digest key.
+/// A 128-bit identity digest taken in pieces, keyed like `stringKeyDigest`.
+/// The input is cut into blocks at fixed offsets, each block's digest
+/// chained into the next, so how `update` splits the input doesn't change
+/// the result. std's streaming XXH3 takes ~0.2 GB/s past 240 bytes (Zig
+/// 0.17); this keeps `xxh3`'s full speed.
 pub const DigestStream = struct {
-    lo: std.hash.XxHash3,
-    hi: std.hash.XxHash3,
+    chain: u128 = 0,
+    blocks: u64 = 0,
+    buffered: usize = 0,
+    buffer: [block_len]u8 = undefined,
+
+    const block_len: usize = 512;
 
     pub fn init() DigestStream {
-        return .{ .lo = .init(digest_key.seed), .hi = .init(digest_key.seed ^ 0xC2B2_AE3D_27D4_EB4F) };
+        return .{};
     }
 
     pub fn update(self: *DigestStream, bytes: []const u8) void {
-        self.lo.update(bytes);
-        self.hi.update(bytes);
+        var rest = bytes;
+        while (rest.len > 0) {
+            const n = @min(rest.len, block_len - self.buffered);
+            @memcpy(self.buffer[self.buffered..][0..n], rest[0..n]);
+            self.buffered += n;
+            rest = rest[n..];
+            if (self.buffered == block_len) {
+                self.chain = xxh3.hash128Parts(digest_key.seed, 2, .{ self.chain, digest_key.hash128(&self.buffer) });
+                self.blocks += 1;
+                self.buffered = 0;
+            }
+        }
     }
 
-    pub fn final(self: *DigestStream) u128 {
-        return @as(u128, self.hi.final()) << 64 | self.lo.final();
+    pub fn final(self: *const DigestStream) u128 {
+        const tail = digest_key.hash128(self.buffer[0..self.buffered]);
+        if (self.blocks == 0) return tail;
+        return xxh3.hash128Parts(digest_key.seed, 3, .{ self.chain, tail, self.blocks });
     }
 };
 
