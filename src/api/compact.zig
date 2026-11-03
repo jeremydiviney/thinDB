@@ -121,6 +121,18 @@ fn mergeCharge(string_bytes: u64) u64 {
     return string_bytes +| string_bytes / 4 +| merge_fixed_bytes;
 }
 
+/// The most string bytes a merge may hold within `budget`: what
+/// `mergeCharge` charges no more than `budget` for.
+pub fn mergeStringCapacity(budget: u64) u64 {
+    return (budget -| merge_fixed_bytes) / 5 * 4;
+}
+
+/// What a merge holds for one string table of `value_count` distinct
+/// values of `value_bytes` over `rows` rows.
+pub fn stringTableMergeBytes(value_bytes: u64, value_count: u64, rows: u64) u64 {
+    return value_bytes + value_count * merge_bytes_per_value + rows / merge_rows_per_held_byte;
+}
+
 /// Whether merging a run of `metas` fits `Table.compact_memory`. Reads each
 /// segment's footer at most once per pick.
 const MergeBudget = struct {
@@ -157,9 +169,7 @@ fn segmentMergeBytes(t: *Table, id: u64) !u64 {
     defer t.releaseSegment(entry);
     const info = entry.seg.info;
     var bytes: u64 = 0;
-    for (info.string_tables) |st| {
-        bytes += st.value_bytes + st.value_count * merge_bytes_per_value + info.row_count / merge_rows_per_held_byte;
-    }
+    for (info.string_tables) |st| bytes += stringTableMergeBytes(st.value_bytes, st.value_count, info.row_count);
     return bytes;
 }
 
@@ -1372,6 +1382,15 @@ test "MergeBudget charges a segment its string values from the footer" {
     try std.testing.expect(try budget.fits(0, 1));
     t.compact_memory = expected - 1;
     try std.testing.expect(!try budget.fits(0, 1));
+}
+
+test "mergeStringCapacity is the most string bytes mergeCharge fits in a budget" {
+    try std.testing.expectEqual(@as(u64, 0), mergeStringCapacity(merge_fixed_bytes - 1));
+    inline for (.{ merge_fixed_bytes, merge_fixed_bytes + 7, 8 << 30, 8_225_939_456 }) |budget| {
+        const capacity = mergeStringCapacity(budget);
+        try std.testing.expect(mergeCharge(capacity) <= budget);
+        try std.testing.expect(mergeCharge(capacity + 4) > budget);
+    }
 }
 
 test "segmentTier buckets row counts logarithmically" {

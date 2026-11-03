@@ -17,6 +17,7 @@ pub const manifest = @import("manifest.zig");
 pub const schema_file = @import("schema_file.zig");
 pub const tombstone = @import("tombstone.zig");
 pub const compression = @import("compression.zig");
+pub const snappy = @import("snappy.zig");
 pub const fsst = @import("fsst.zig");
 pub const segment_strings = @import("segment_strings.zig");
 pub const cache = @import("cache.zig");
@@ -1239,6 +1240,112 @@ test "segment string tables: MergedSegmentWriter writes them too" {
     try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
 }
 
+test "MergedSegmentWriter: the step API writes the bytes writeRowGroup writes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var compressor = try compression.Compressor.init();
+    defer compressor.deinit();
+    const file_names = [_][]const u8{ "rows.dat", "steps.dat" };
+    for (file_names, [_]bool{ false, true }) |file_name, steps| {
+        var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, file_name, sst_schema, 2, 0, 4, &.{}, 2);
+        var finished = false;
+        defer if (!finished) w.deinit();
+        for (0..3) |g| {
+            var ids: [4]i32 = undefined;
+            for (&ids, 0..) |*v, i| v.* = @intCast(g * 4 + i);
+            var s = try buildStringCol(allocator, sst_vals[g * 4 ..][0..4]);
+            defer s.deinit(allocator);
+            var nulls: [1]u8 = .{0};
+            for (0..4) |i| column.setValidBit(&nulls, i, column.isValidBit(&sst_nulls, g * 4 + i));
+            const views = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(&nulls) };
+            if (!steps) {
+                try w.writeRowGroup(&views);
+                continue;
+            }
+            var blocks: [views.len]segment_writer.ColumnBlock = @splat(.{});
+            defer for (&blocks) |*b| b.deinit(allocator);
+            for (views, &blocks, 0..) |view, *block, ci| {
+                try w.encodeColumn(&compressor, ci, view, block);
+                try w.commitColumn(&compressor, ci, @intCast(g), view, block);
+            }
+            try w.appendRowGroup(&blocks, ids.len);
+        }
+        if (steps) for (0..sst_schema.columns.len) |ci| {
+            var build = (try w.beginStringTable(ci)) orelse continue;
+            for (0..build.pieces.len) |i| w.encodeStringTablePiece(&compressor, &build, i) catch |e| {
+                build.deinit(allocator);
+                return e;
+            };
+            try w.appendStringTable(&build);
+        };
+        var info = try w.finish(false);
+        finished = true;
+        info.deinit(allocator);
+    }
+
+    const rows_bytes = try tmp.dir.readFileAlloc(io, "rows.dat", allocator, .unlimited);
+    defer allocator.free(rows_bytes);
+    const steps_bytes = try tmp.dir.readFileAlloc(io, "steps.dat", allocator, .unlimited);
+    defer allocator.free(steps_bytes);
+    try std.testing.expectEqualSlices(u8, rows_bytes, steps_bytes);
+}
+
+test "MergedSegmentWriter: a segment written column by column reads back its rows" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var compressor = try compression.Compressor.init();
+    defer compressor.deinit();
+    var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, "columns.dat", sst_schema, 2, 0, 4, &.{}, 1);
+    var finished = false;
+    defer if (!finished) w.deinit();
+    var blocks: [3][2]segment_writer.ColumnBlock = @splat(@splat(.{}));
+    defer for (&blocks) |*row_group| for (row_group) |*b| b.deinit(allocator);
+    for (&blocks, 0..) |*row_group, g| {
+        var ids: [4]i32 = undefined;
+        for (&ids, 0..) |*v, i| v.* = @intCast(g * 4 + i);
+        var s = try buildStringCol(allocator, sst_vals[g * 4 ..][0..4]);
+        defer s.deinit(allocator);
+        var nulls: [1]u8 = .{0};
+        for (0..4) |i| column.setValidBit(&nulls, i, column.isValidBit(&sst_nulls, g * 4 + i));
+        const views = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(&nulls) };
+        for (views, row_group, 0..) |view, *block, ci| {
+            try w.encodeColumn(&compressor, ci, view, block);
+            try w.commitColumn(&compressor, ci, @intCast(g), view, block);
+        }
+    }
+    try w.beginRowGroups(sst_vals.len);
+    for (0..sst_schema.columns.len) |ci| {
+        for (&blocks, 0..) |*row_group, g| try w.appendColumnBlock(g, ci, &row_group[ci]);
+        var build = (try w.beginStringTable(ci)) orelse continue;
+        for (0..build.pieces.len) |i| w.encodeStringTablePiece(&compressor, &build, i) catch |e| {
+            build.deinit(allocator);
+            return e;
+        };
+        try w.appendStringTable(&build);
+    }
+    var info = try w.finish(false);
+    finished = true;
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "columns.dat", sst_schema);
+    defer seg.deinit();
+    try std.testing.expectEqual(@as(u64, sst_vals.len), seg.info.row_count);
+    for (seg.info.row_groups, 0..) |rg, g| {
+        try std.testing.expectEqual(@as(u32, 4), rg.row_count);
+        var ids = try seg.decodeColumn(allocator, sst_schema, g, 0);
+        defer ids.deinit(allocator);
+        for (ids.view().data.int, 0..) |id, i| try std.testing.expectEqual(@as(i32, @intCast(g * 4 + i)), id);
+    }
+    try std.testing.expectEqual(@as(u32, 3), seg.info.stringTable(1).?.shared_count);
+    try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
+}
+
 test "MergedSegmentWriter: an abandoned writer deletes its partial file" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1450,6 +1557,7 @@ test "stringBlockBytes counts the string bytes raw, dict and FSST blocks decode 
 
 test {
     _ = column;
+    _ = snappy;
     _ = format;
     _ = segment_writer;
     _ = segment_reader;

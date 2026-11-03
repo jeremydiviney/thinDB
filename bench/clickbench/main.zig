@@ -19,8 +19,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Defaults. CLI: first positional = TSV path, second = max rows.
-    // Flags: --data-dir PATH, --database NAME, --wipe / --no-wipe, --threads N.
+    // Defaults. CLI: first positional = TSV or .parquet path, second = max
+    // rows (TSV only). Flags: --data-dir PATH, --database NAME, --wipe /
+    // --no-wipe, --threads N, --fsync (sync segments and the manifest, as
+    // thindb-server does); a .parquet path bulk-loads, with --lanes N and
+    // --segment-rows N.
     var tsv_path: []const u8 = "bench/clickbench/data/hits.tsv";
     var max_rows: usize = 0;
     var data_dir_path: []const u8 = ".clickbench-db";
@@ -28,6 +31,8 @@ pub fn main(init: std.process.Init) !u8 {
     var wipe: bool = true;
     var threads: usize = 0;
     var compression: thindb.types.TableCompression = thindb.types.default_table_compression;
+    var bulk: thindb.api.bulk_load.Options = .{};
+    var sync_mode: thindb.SyncMode = .none;
 
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();
@@ -42,9 +47,17 @@ pub fn main(init: std.process.Init) !u8 {
             wipe = false;
         } else if (std.mem.eql(u8, arg, "--wipe")) {
             wipe = true;
+        } else if (std.mem.eql(u8, arg, "--fsync")) {
+            sync_mode = .per_flush;
         } else if (std.mem.eql(u8, arg, "--threads")) {
             const v = args_iter.next() orelse return error.MissingFlagValue;
             threads = std.fmt.parseInt(usize, v, 10) catch return error.BadFlagValue;
+        } else if (std.mem.eql(u8, arg, "--lanes")) {
+            const v = args_iter.next() orelse return error.MissingFlagValue;
+            bulk.lanes = std.fmt.parseInt(usize, v, 10) catch return error.BadFlagValue;
+        } else if (std.mem.eql(u8, arg, "--segment-rows")) {
+            const v = args_iter.next() orelse return error.MissingFlagValue;
+            bulk.segment_rows = std.fmt.parseInt(usize, v, 10) catch return error.BadFlagValue;
         } else if (std.mem.eql(u8, arg, "--compression")) {
             const v = args_iter.next() orelse return error.MissingFlagValue;
             compression = std.meta.stringToEnum(thindb.types.TableCompression, v) orelse return error.BadFlagValue;
@@ -89,6 +102,7 @@ pub fn main(init: std.process.Init) !u8 {
         // Bulk import of reimportable bench data: WAL would double the
         // write volume for nothing (a failed load reruns with --wipe).
         .wal_enabled = false,
+        .sync_mode = sync_mode,
     });
     defer catalog.close();
     const db = try catalog.createOrOpenDatabase(database_name);
@@ -104,6 +118,10 @@ pub fn main(init: std.process.Init) !u8 {
         schema_mod.order_key[3],
         schema_mod.order_key[4],
     });
+    if (std.mem.endsWith(u8, tsv_path, ".parquet")) {
+        bulk.threads = threads;
+        return loadParquet(io, t, tsv_path, bulk);
+    }
     std.debug.print("Loading…  (progress prints every 500K rows)\n\n", .{});
 
     const stats = loader.loadTsv(allocator, io, t, tsv_path, .{
@@ -128,6 +146,30 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("Bytes read : {d:.2} MB\n", .{@as(f64, @floatFromInt(stats.bytes_read)) / (1024.0 * 1024.0)});
     std.debug.print("Wall time  : {d:.2} s\n", .{seconds});
     std.debug.print("Throughput : {d:.0} rows/s,  {d:.1} MB/s\n", .{ rows_per_sec, mb_per_sec });
+    std.debug.print("Segments   : {d}\n", .{t.segmentCount()});
+    std.debug.print("--------------------------------------------------------------------------------\n\n", .{});
+    return 0;
+}
+
+/// Bulk-loads `path` straight into final-size segments: no memtable, WAL
+/// or compaction, so the table is settled when this returns.
+fn loadParquet(io: std.Io, t: *thindb.Table, path: []const u8, options: thindb.api.bulk_load.Options) !u8 {
+    if (options.segment_rows) |rows| {
+        std.debug.print("Bulk load : {d} lanes of {d} rows, {d} threads\n\n", .{ options.lanes, rows, options.threads });
+    } else {
+        std.debug.print("Bulk load : {d} lanes of segments sized to memory, {d} threads\n\n", .{ options.lanes, options.threads });
+    }
+    const start = std.Io.Clock.awake.now(io);
+    const stats = thindb.api.bulk_load.loadParquet(t, std.Io.Dir.cwd(), path, options) catch |err| {
+        std.debug.print("load error: {t}\n", .{err});
+        return err;
+    };
+    const seconds = @as(f64, @floatFromInt(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e9;
+
+    std.debug.print("--------------------------------------------------------------------------------\n", .{});
+    std.debug.print("Loaded     : {d} rows\n", .{stats.rows});
+    std.debug.print("Wall time  : {d:.2} s\n", .{seconds});
+    std.debug.print("Throughput : {d:.0} rows/s\n", .{@as(f64, @floatFromInt(stats.rows)) / seconds});
     std.debug.print("Segments   : {d}\n", .{t.segmentCount()});
     std.debug.print("--------------------------------------------------------------------------------\n\n", .{});
     return 0;

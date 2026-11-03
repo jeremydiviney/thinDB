@@ -3004,6 +3004,9 @@ fn insertAll(source: *Query, t: *ApiTable) !usize {
 fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     const catalog = ctx.catalog;
     const t = try resolveTable(catalog, ctx.session.*, op.table);
+    // An AUTO_INCREMENT column's counter advances row by row, as
+    // INSERT ... VALUES advances it.
+    if (bulkLoadSource(op)) |scan| if (@import("../api/table.zig").autoIncrementColumnIndex(t.schema) == null) return compileBulkLoad(ctx, t, scan);
     const tbl_columns = t.schema.columns;
 
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -3052,6 +3055,37 @@ fn compileInsertSelect(ctx: *CompileCtx, op: ir.InsertSelect) anyerror!Query {
     if (staged.row_count > 0) total_rows += try staged.write(ctx, aa, t, rule);
     ctx.affected_rows = @intCast(total_rows);
     return try EmptyOp.createWithCount(ctx.allocator, @intCast(total_rows));
+}
+
+/// The Parquet file a plain `INSERT INTO t SELECT * FROM read_parquet(...)`
+/// reads, which bulk-loads; null for any other INSERT ... SELECT.
+pub fn bulkLoadSource(op: ir.InsertSelect) ?ir.FileScan {
+    if (op.mode != .insert or op.columns != null or op.on_duplicate != null) return null;
+    // A file source has no table name, so the parser wraps even a bare
+    // `SELECT *` over it in a star projection.
+    const source = switch (op.source.*) {
+        .select => |s| if (s.columns.len == 1 and std.mem.eql(u8, s.columns[0], "*") and s.outputs == null and
+            s.star_skip_trailing == 0 and s.column_list == null) s.upstream else return null,
+        else => op.source,
+    };
+    const scan = switch (source.*) {
+        .file_scan => |f| f,
+        else => return null,
+    };
+    return if (exec.FileScan.readsParquet(scan)) scan else null;
+}
+
+/// Bulk-loads `scan`'s file into `t` (`bulk_load.loadParquet`), its
+/// columns paired with the table's by position, as INSERT ... SELECT *
+/// pairs them.
+fn compileBulkLoad(ctx: *CompileCtx, t: *ApiTable, scan: ir.FileScan) !Query {
+    const io = ctx.catalog.io;
+    const access = ctx.catalog.config.file_scan_access;
+    var dir = try exec.FileScan.openDir(io, access, scan.path);
+    defer if (access == .root) dir.close(io);
+    const stats = try thindb_api.bulk_load.loadParquet(t, dir, scan.path, .{ .match = .position });
+    ctx.affected_rows = @intCast(stats.rows);
+    return try EmptyOp.createWithCount(ctx.allocator, @intCast(stats.rows));
 }
 
 /// Write one INSERT ... SELECT batch. A table with an AUTO_INCREMENT column

@@ -121,6 +121,19 @@ pub const Workers = struct {
     count: usize = 1,
     /// Helper threads counted in `busy` (`count - 1` when budgeted, else 0).
     held: usize = 0,
+    /// Whether a statement's thread took the grant: `refit` sizes by its
+    /// rule, whichever thread calls it.
+    admitted: bool = false,
+
+    /// Resizes the grant to what a fan-out of `wanted` threads may run now,
+    /// by the rule `reserveWorkers` grants by, for a fan-out that runs long
+    /// enough for statements to come and go: a lone statement grows back to
+    /// every hardware thread, and one that a newcomer joins shrinks to its
+    /// share. A no-op on an unbudgeted grant.
+    pub fn refit(self: *Workers, wanted: usize) void {
+        const sched = self.sched orelse return;
+        sched.refitWorkers(self, wanted);
+    }
 
     pub fn release(self: *Workers) void {
         const sched = self.sched orelse return;
@@ -201,7 +214,17 @@ pub const CoreScheduler = struct {
         defer self.lock.unlock();
         const n = @min(wanted, self.workerBudget(thread_admitted));
         self.busy += n - 1;
-        return .{ .sched = self, .count = n, .held = n - 1 };
+        return .{ .sched = self, .count = n, .held = n - 1, .admitted = thread_admitted };
+    }
+
+    fn refitWorkers(self: *CoreScheduler, workers: *Workers, wanted: usize) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.busy -|= workers.held;
+        const n = @max(1, @min(wanted, self.workerBudget(workers.admitted)));
+        self.busy += n - 1;
+        workers.count = n;
+        workers.held = n - 1;
     }
 
     fn releaseWorkers(self: *CoreScheduler, held: usize) void {
@@ -453,6 +476,36 @@ test "reserved workers count against later fan-outs until released" {
     var e = s.reserveWorkers(100);
     try std.testing.expectEqual(@as(usize, 100), e.count);
     e.release();
+}
+
+test "a refit grant follows its share as statements come and go" {
+    var s: CoreScheduler = .{ .cores = &.{}, .all_mask = 0, .allocator = std.testing.allocator, .hardware_threads = 16 };
+    s.statements = 1;
+    s.busy = 1;
+    var a: Workers = .{ .sched = &s, .admitted = true };
+    a.refit(16);
+    try std.testing.expectEqual(@as(usize, 16), a.count);
+    try std.testing.expectEqual(@as(usize, 16), s.busy);
+    s.statements = 2;
+    s.busy += 1;
+    var b: Workers = .{ .sched = &s, .admitted = true };
+    b.refit(16);
+    try std.testing.expectEqual(@as(usize, 8), b.count);
+    a.refit(16);
+    try std.testing.expectEqual(@as(usize, 8), a.count);
+    try std.testing.expectEqual(@as(usize, 16), s.busy);
+    b.release();
+    s.statements = 1;
+    s.busy -= 1;
+    a.refit(16);
+    try std.testing.expectEqual(@as(usize, 16), a.count);
+    a.refit(4);
+    try std.testing.expectEqual(@as(usize, 4), a.count);
+    a.release();
+    try std.testing.expectEqual(@as(usize, 1), s.busy);
+    var unbudgeted: Workers = .{ .count = 3 };
+    unbudgeted.refit(16);
+    try std.testing.expectEqual(@as(usize, 3), unbudgeted.count);
 }
 
 test "admission leases count statements and their threads" {
