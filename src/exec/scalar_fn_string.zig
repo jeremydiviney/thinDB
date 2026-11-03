@@ -1088,7 +1088,7 @@ pub fn xxHash3_64Kernel(allocator: Allocator, args: []const ColumnView, out: *Co
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
         var hash: u64 = 0;
-        for (args) |arg| hash = std.hash.XxHash3.hash(hash, stringViewOf(arg).rowBytes(i));
+        for (args) |arg| hash = xxh3.hash64(hash, stringViewOf(arg).rowBytes(i));
         try out.data.bigint.append(allocator, @bitCast(hash));
     }
 }

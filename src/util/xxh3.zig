@@ -41,6 +41,14 @@ pub fn hash128(seed: u64, input: []const u8) u128 {
     return shortHash128(seed, input);
 }
 
+/// The XXH3-64 digest of `input` under `seed`. Past 240 bytes XXH3-64 is
+/// XXH3-128's low half; std's XXH3-64 takes ~0.2 GB/s there (Zig 0.17)
+/// against ~15 GB/s for `long`.
+pub fn hash64(seed: u64, input: []const u8) u64 {
+    if (input.len > 240) return long(input, &derivedSecret(seed)).low;
+    return std.hash.XxHash3.hash(seed, input);
+}
+
 /// A seed with its long-input secret derived once: `init(s).hash128(x)` is
 /// `hash128(s, x)` with no secret derived per call.
 pub const Seeded = struct {
@@ -303,6 +311,17 @@ test "XXH3-128's low half is XXH3-64 where the specification says so" {
     inline for (.{ "a", "abc", ab8Times(30) ++ "x", ab8Times(375) }) |input| {
         inline for (.{ 0, 7, 0x9E3779B185EBCA87 }) |seed| {
             try std.testing.expectEqual(std.hash.XxHash3.hash(seed, input), @as(u64, @truncate(hash128(seed, input))));
+        }
+    }
+}
+
+test "hash64 is std's XXH3-64 at every length through several blocks" {
+    var bytes: [2 * BLOCK_LEN + STRIPE_LEN + 1]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x64);
+    prng.random().bytes(&bytes);
+    for (0..bytes.len + 1) |len| {
+        inline for (.{ 0, 7, 0x9E3779B185EBCA87 }) |seed| {
+            try std.testing.expectEqual(std.hash.XxHash3.hash(seed, bytes[0..len]), hash64(seed, bytes[0..len]));
         }
     }
 }
