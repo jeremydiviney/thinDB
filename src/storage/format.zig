@@ -1,6 +1,6 @@
 //! On-disk segment file format constants and metadata structs.
 //!
-//! Layout (v0.1, plain encoding, no compression):
+//! Layout:
 //!
 //!   [Header — 32 bytes]
 //!     magic "tDBS"            (4)
@@ -14,8 +14,11 @@
 //!     For each row group:
 //!       row_count u32         (4)
 //!       _padding u32          (4 — reserved, written 0)
-//!       For each column in schema order:
-//!         column block content (see column.zig)
+//!       For each column in schema order whose block isn't deferred:
+//!         12-byte block header + payload
+//!
+//!   [Segment string tables — per string column (segment_strings.zig)]
+//!     shared-string pages, then the column's row-group blocks
 //!
 //!   [Footer]
 //!     row_group_count u32     (4)
@@ -23,6 +26,12 @@
 //!       offset_from_start u64 (8)
 //!       length u32            (4)
 //!       row_count u32         (4)
+//!       per column: stats     (56 each)
+//!       per column: block offset u64, then per column: block length u32
+//!     string_table_count u32  (4)
+//!     For each string table:
+//!       column_idx, shared_count, value_count, page_count  (u32 each)
+//!       per page: offset u64, length u32
 //!     footer_size u32         (4 — total footer bytes incl. itself + trailing magic)
 //!     magic "tDBS"            (4)
 
@@ -49,7 +58,11 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// blocks stay COMPRESSED in the block cache (the cache stores the on-disk
 /// payload; every access decompresses the whole block at LZ4 speed), so the
 /// resident set shrinks while consumers still see plain raw bytes.
-pub const segment_version: u16 = 12;
+///
+/// v12→v13: segment string tables (DESIGN.md §4.4, `segment_strings.zig`).
+/// String columns' row-group blocks move after the last row group, so the
+/// footer gains each column block's length and a string-table directory.
+pub const segment_version: u16 = 13;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -125,6 +138,11 @@ pub const Compression = enum(u8) {
 ///
 /// NULL rows encode whatever placeholder bytes the raw stream held
 /// (normally empty), masked by the validity bitmap as everywhere else.
+///
+/// On disk, a string column's block may instead carry
+/// `segment_dict_encoding`: a row-group dictionary over the segment's string
+/// table (`segment_strings.zig`). The reader rebuilds it into a `.dict`
+/// payload before anything decodes or caches it, so it is no `Encoding`.
 pub const Encoding = enum(u8) {
     raw = 0,
     for_ = 1,
@@ -135,6 +153,13 @@ pub const Encoding = enum(u8) {
 
 /// `.dict` header flag: per-value row counts and first rows follow the codes.
 pub const DICT_ENTRY_STATS: u8 = 1;
+/// `.dict` header flag: each value's segment id (`ndv` × u32, unaligned)
+/// follows the entry stats. Set only on a block rebuilt from a segment string
+/// table: equal ids are equal values within the segment.
+pub const DICT_SEGMENT_IDS: u8 = 2;
+
+/// On-disk encoding byte of a row-group block over the segment's string table.
+pub const segment_dict_encoding: u8 = 5;
 
 /// Bytes per value of a `.dict` block's counts and first rows: two cover a
 /// row group of up to 65536 rows, as a count is stored less one.
@@ -285,11 +310,31 @@ pub const RowGroupMeta = struct {
     stats: []const Stats,
     /// Absolute file offset of each column's block within this row group, one
     /// per schema column (column-index order). Lets the reader pread just the
-    /// columns a query needs instead of the whole segment file. A block's
-    /// length is the next column's offset minus this one (the last column ends
-    /// at `offset + length`). Empty on the writer-built `SegmentInfo` (only the
-    /// footer carries them); populated by `readSegment`.
+    /// columns a query needs instead of the whole segment file.
     col_offsets: []const u64 = &.{},
+    /// Byte length of each column's block (header included), parallel to
+    /// `col_offsets`. A segment-dictionary block lies past the last row group,
+    /// so a block's length can't come from its neighbour's offset.
+    col_lengths: []const u32 = &.{},
+};
+
+/// A byte range of the segment file.
+pub const FileRange = struct {
+    offset: u64,
+    length: u32,
+};
+
+/// One string column's segment string table (DESIGN.md §4.4).
+pub const StringTable = struct {
+    column_idx: u32,
+    /// Values held by two or more row groups, stored in `pages` by rank.
+    shared_count: u32,
+    /// Distinct values of the column in the segment: ids `0 .. value_count`.
+    value_count: u32,
+    /// The distinct values' bytes, which a merge taking this segment holds
+    /// until its output's end.
+    value_bytes: u64,
+    pages: []const FileRange,
 };
 
 pub const SegmentInfo = struct {
@@ -310,17 +355,30 @@ pub const SegmentInfo = struct {
     /// existence probe skip a whole segment when a key definitely isn't in it.
     /// Empty on non-unique tables.
     key_bloom: []const u8 = &.{},
+    string_tables: []const StringTable = &.{},
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
         for (self.row_groups) |rg| {
             allocator.free(rg.stats);
             if (rg.col_offsets.len > 0) allocator.free(rg.col_offsets);
+            if (rg.col_lengths.len > 0) allocator.free(rg.col_lengths);
         }
         allocator.free(self.row_groups);
         if (self.column_sketches.len > 0) allocator.free(self.column_sketches);
         if (self.key_bloom.len > 0) allocator.free(self.key_bloom);
+        freeStringTables(allocator, self.string_tables);
+    }
+
+    pub fn stringTable(self: SegmentInfo, column_idx: usize) ?StringTable {
+        for (self.string_tables) |t| if (t.column_idx == column_idx) return t;
+        return null;
     }
 };
+
+pub fn freeStringTables(allocator: std.mem.Allocator, tables: []const StringTable) void {
+    for (tables) |t| allocator.free(t.pages);
+    if (tables.len > 0) allocator.free(tables);
+}
 
 /// True iff a column of this type carries meaningful min/max in the
 /// per-row-group `Stats` slot (and in the manifest entry). Stats are

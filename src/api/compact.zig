@@ -89,40 +89,103 @@ pub fn execCompact(t: *Table) !void {
 pub fn pickTieredGroup(t: *Table, tomb_threshold: f32) !?[]u64 {
     const metas = try snapshotSegMeta(t);
     defer t.allocator.free(metas);
+    var budget = try MergeBudget.init(t, metas);
+    defer budget.deinit();
 
     // 1. Tombstone pressure first.
     if (tomb_threshold <= 1.0) {
-        if (try pickTombstonePressuredGroup(t, metas, tomb_threshold)) |ids| return ids;
+        if (try pickTombstonePressuredGroup(t, metas, tomb_threshold, &budget)) |ids| return ids;
     }
     // 2. Tier-0 sweep: collapse a run of small staging segments into one
     // ~2M (tier-1) segment in a single merge, ahead of the 4-wide picker.
     if (try pickTier0Group(t.allocator, metas)) |ids| return ids;
     // 3. Tier-based count trigger (tier 1+).
-    return pickCompactionGroup(t.allocator, metas);
+    return pickCompactionGroup(t.allocator, metas, &budget);
+}
+
+/// Bytes a merge's segment string tables hold per distinct value beyond the
+/// value's own bytes: its ref, owner and hash-index slot, its row groups'
+/// dictionary entries, and its id once the column is written.
+const merge_bytes_per_value: u64 = 32;
+/// Rows of a string column per byte a merge holds for their row groups'
+/// compressed dictionary codes (ClickBench's `hits`: 0.43 GB over 30.6M rows
+/// of 28 string columns).
+const merge_rows_per_held_byte: u64 = 2;
+/// A merge's memory beyond its string tables is a quarter of theirs plus this:
+/// its inputs' decoded row groups, its output's encode buffers, and allocator
+/// slack. ClickBench's `hits` peaked at 1.22-1.37x its string tables in
+/// 30M-row merges.
+const merge_fixed_bytes: u64 = 512 << 20;
+
+fn mergeCharge(string_bytes: u64) u64 {
+    return string_bytes +| string_bytes / 4 +| merge_fixed_bytes;
+}
+
+/// Whether merging a run of `metas` fits `Table.compact_memory`. Reads each
+/// segment's footer at most once per pick.
+const MergeBudget = struct {
+    t: *Table,
+    metas: []const SegMeta,
+    bytes: []?u64,
+
+    fn init(t: *Table, metas: []const SegMeta) !MergeBudget {
+        const bytes = try t.allocator.alloc(?u64, metas.len);
+        @memset(bytes, null);
+        return .{ .t = t, .metas = metas, .bytes = bytes };
+    }
+
+    fn deinit(self: *MergeBudget) void {
+        self.t.allocator.free(self.bytes);
+    }
+
+    fn fits(self: *MergeBudget, lo: usize, hi: usize) !bool {
+        if (self.t.compact_memory == std.math.maxInt(u64)) return true;
+        var total: u64 = 0;
+        for (self.bytes[lo..hi], self.metas[lo..hi]) |*bytes, meta| {
+            if (bytes.* == null) bytes.* = try segmentMergeBytes(self.t, meta.id);
+            total +|= bytes.*.?;
+        }
+        return mergeCharge(total) <= self.t.compact_memory;
+    }
+};
+
+/// What a merge taking segment `id` holds for it until the output's end: its
+/// string columns' distinct values, as though no other input held any of
+/// them, and their bookkeeping.
+fn segmentMergeBytes(t: *Table, id: u64) !u64 {
+    const entry = try t.acquireSegment(id);
+    defer t.releaseSegment(entry);
+    const info = entry.seg.info;
+    var bytes: u64 = 0;
+    for (info.string_tables) |st| {
+        bytes += st.value_bytes + st.value_count * merge_bytes_per_value + info.row_count / merge_rows_per_held_byte;
+    }
+    return bytes;
 }
 
 /// Find the first segment whose tombstone fraction exceeds `threshold`
 /// and return it together with adjacent same-tier neighbors (up to
-/// `tier_target_count` total). If no neighbors share the tier, returns
-/// just the single segment (a "rewrite to drop tombs" compaction).
-/// Caller owns the returned slice.
-fn pickTombstonePressuredGroup(t: *Table, metas: []const SegMeta, threshold: f32) !?[]u64 {
+/// `tier_target_count` total) while their merge fits `budget`. If no
+/// neighbors share the tier, returns just the single segment (a "rewrite to
+/// drop tombs" compaction). Caller owns the returned slice.
+fn pickTombstonePressuredGroup(t: *Table, metas: []const SegMeta, threshold: f32, budget: anytype) !?[]u64 {
     for (metas, 0..) |meta, i| {
         if (meta.rows == 0) continue;
         const dead = try t.tombstoneCount(meta.id);
         if (dead == 0) continue;
         const ratio = @as(f32, @floatFromInt(dead)) / @as(f32, @floatFromInt(meta.rows));
         if (ratio < threshold) continue;
+        if (!try budget.fits(i, i + 1)) continue;
 
         // Found a heavily-tombstoned segment. Grow to a run of adjacent
         // same-tier neighbors so the merged output stays on tier.
         const tier = segmentTier(meta.rows);
         var lo: usize = i;
         var hi: usize = i + 1;
-        while (lo > 0 and segmentTier(metas[lo - 1].rows) == tier and (hi - lo) < tier_target_count) {
+        while (lo > 0 and segmentTier(metas[lo - 1].rows) == tier and (hi - lo) < tier_target_count and try budget.fits(lo - 1, hi)) {
             lo -= 1;
         }
-        while (hi < metas.len and segmentTier(metas[hi].rows) == tier and (hi - lo) < tier_target_count) {
+        while (hi < metas.len and segmentTier(metas[hi].rows) == tier and (hi - lo) < tier_target_count and try budget.fits(lo, hi + 1)) {
             hi += 1;
         }
         const out = try t.allocator.alloc(u64, hi - lo);
@@ -133,43 +196,34 @@ fn pickTombstonePressuredGroup(t: *Table, metas: []const SegMeta, threshold: f32
 }
 
 /// Walk a segment snapshot looking for `tier_target_count` adjacent-by-
-/// position segments at the same tier. Returns owned slice of segment IDs
-/// to merge, or null if no run qualifies. Prefers the smallest tier (most
-/// segments to absorb early).
+/// position segments at the same tier whose merge fits `budget`. Returns
+/// owned slice of segment IDs to merge, or null if no run qualifies. Prefers
+/// the smallest tier (most segments to absorb early).
 pub fn pickCompactionGroup(
     allocator: std.mem.Allocator,
     segments: []const SegMeta,
+    budget: anytype,
 ) !?[]u64 {
     if (segments.len < tier_target_count) return null;
 
-    // Scan for the first run of tier_target_count adjacent segments at
-    // the same tier. Prefer lower tiers by walking from smallest tier up.
     var best_tier: ?u8 = null;
     var best_start: usize = 0;
     var run_start: usize = 0;
-    var run_tier: u8 = segmentTier(segments[0].rows);
-    for (segments[1..], 1..) |seg, i| {
-        const t = segmentTier(seg.rows);
-        if (t != run_tier) {
-            // Close out the previous run.
-            const run_len = i - run_start;
-            if (run_len >= tier_target_count) {
-                if (best_tier == null or run_tier < best_tier.?) {
+    while (run_start < segments.len) {
+        const run_tier = segmentTier(segments[run_start].rows);
+        var run_end = run_start + 1;
+        while (run_end < segments.len and segmentTier(segments[run_end].rows) == run_tier) run_end += 1;
+        if (best_tier == null or run_tier < best_tier.?) {
+            var start = run_start;
+            while (start + tier_target_count <= run_end) : (start += 1) {
+                if (try budget.fits(start, start + tier_target_count)) {
                     best_tier = run_tier;
-                    best_start = run_start;
+                    best_start = start;
+                    break;
                 }
             }
-            run_start = i;
-            run_tier = t;
         }
-    }
-    // Final run.
-    const final_run_len = segments.len - run_start;
-    if (final_run_len >= tier_target_count) {
-        if (best_tier == null or run_tier < best_tier.?) {
-            best_tier = run_tier;
-            best_start = run_start;
-        }
+        run_start = run_end;
     }
 
     if (best_tier == null) return null;
@@ -455,10 +509,10 @@ fn preempted(preempt: ?*const std.atomic.Value(u32)) bool {
 /// one new segment, dropping tombstoned rows. Returns the written segment's
 /// `SegmentInfo` (caller owns), or null when every input row was tombstoned
 /// (no segment is written). Holds at most one decoded row-group per input plus
-/// one output row-group plus the in-flight segment buffer — never all rows.
-/// Returns `error.MergePreempted`, having written nothing, once `preempt`
-/// reads nonzero before an input opens, an output row group encodes, or the
-/// output file is written.
+/// one output row-group — never all rows; the output streams to its file.
+/// Returns `error.MergePreempted`, leaving no file, once `preempt` reads
+/// nonzero before an input opens, an output row group encodes, or the output
+/// file is finished.
 fn streamMerge(
     t: *Table,
     seg_ids: []const u64,
@@ -508,6 +562,9 @@ fn streamMerge(
 
     var writer = try storage.MergedSegmentWriter.begin(
         t.allocator,
+        t.io,
+        t.segments_dir,
+        file_name,
         t.schema,
         new_seg_id,
         t.schema_fingerprint,
@@ -516,7 +573,8 @@ fn streamMerge(
         t.compact_threads,
     );
     sketches_owned_here = false; // writer.deinit / finish now owns out_sketches
-    errdefer writer.deinit();
+    var writer_finished = false;
+    errdefer if (!writer_finished) writer.deinit();
 
     // Output row-group accumulator: one ColumnStore per column, reused across
     // row-groups (cleared, capacity retained). Flushed to `writer` each time it
@@ -593,7 +651,8 @@ fn streamMerge(
     opened = 0;
 
     if (preempted(preempt)) return error.MergePreempted;
-    var out_info = try writer.finish(t.io, t.segments_dir, file_name, sync);
+    var out_info = try writer.finish(sync);
+    writer_finished = true;
     errdefer out_info.deinit(t.allocator);
     // Attach the compound-key Bloom over the merged rows (unique tables), so the
     // merged segment stays prunable by the upsert probe after compaction.
@@ -801,6 +860,7 @@ pub fn mergeAside(t: *Table, seg_ids_in: []const u64, preempt: ?*const std.atomi
         var maybe_info = try streamMerge(t, seg_ids, new_seg_id, file_name, sync, preempt);
         if (maybe_info) |*info| {
             defer info.deinit(t.allocator);
+            errdefer t.deleteSegmentFiles(new_seg_id) catch {};
             // Persist the merged Bloom as the segment's sidecar (#140) —
             // written once here, never rewritten. A crash before commit
             // leaves .dat+.bloom orphans the open-time sweep reclaims.
@@ -1276,6 +1336,44 @@ test "a background merge abandons its commit when readers outlast the deadline" 
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3, 4 }, ids.items);
 }
 
+test "MergeBudget charges a segment its string values from the footer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "id", .type = .bigint },
+            .{ .name = "s", .type = .string },
+        },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    var db = try api.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 2 });
+    defer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"id"} });
+    try t.insert(&.{
+        .{ .id = @as(i64, 1), .s = "ab" },
+        .{ .id = @as(i64, 2), .s = "cde" },
+        .{ .id = @as(i64, 3), .s = "ab" },
+        .{ .id = @as(i64, 4), .s = "f" },
+    });
+    try t.flush();
+
+    const metas = try snapshotSegMeta(t);
+    defer allocator.free(metas);
+    var budget = try MergeBudget.init(t, metas);
+    defer budget.deinit();
+    // Three distinct values of 6 bytes in all, over 4 rows.
+    const expected = mergeCharge(6 + 3 * merge_bytes_per_value + 4 / merge_rows_per_held_byte);
+    t.compact_memory = expected;
+    try std.testing.expect(try budget.fits(0, 1));
+    t.compact_memory = expected - 1;
+    try std.testing.expect(!try budget.fits(0, 1));
+}
+
 test "segmentTier buckets row counts logarithmically" {
     // tier-1 floor is 2^19 (524,288); each tier is 4x the previous.
     try std.testing.expectEqual(@as(u8, 0), segmentTier(0));
@@ -1327,7 +1425,7 @@ test "pickCompactionGroup picks 4 adjacent same-tier segments (tier 1+)" {
         .{ .id = 4, .rows = 600_000 },
         .{ .id = 5, .rows = 600_000 },
     };
-    const got = (try pickCompactionGroup(a, &metas)).?;
+    const got = (try pickCompactionGroup(a, &metas, unlimited_budget)).?;
     defer a.free(got);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, got);
 
@@ -1337,5 +1435,52 @@ test "pickCompactionGroup picks 4 adjacent same-tier segments (tier 1+)" {
         .{ .id = 2, .rows = 600_000 },
         .{ .id = 3, .rows = 600_000 },
     };
-    try std.testing.expectEqual(@as(?[]u64, null), try pickCompactionGroup(a, &metas2));
+    try std.testing.expectEqual(@as(?[]u64, null), try pickCompactionGroup(a, &metas2, unlimited_budget));
+}
+
+const unlimited_budget = struct {
+    fn fits(_: @This(), _: usize, _: usize) !bool {
+        return true;
+    }
+}{};
+
+test "pickCompactionGroup skips groups whose merge passes the memory budget" {
+    const a = std.testing.allocator;
+    const metas = [_]SegMeta{
+        .{ .id = 1, .rows = 600_000 },
+        .{ .id = 2, .rows = 600_000 },
+        .{ .id = 3, .rows = 600_000 },
+        .{ .id = 4, .rows = 600_000 },
+        .{ .id = 5, .rows = 600_000 },
+        .{ .id = 6, .rows = 2_100_000 },
+        .{ .id = 7, .rows = 2_100_000 },
+        .{ .id = 8, .rows = 2_100_000 },
+        .{ .id = 9, .rows = 2_100_000 },
+    };
+    // Segment 1's merge alone would take the whole budget.
+    const without_first = struct {
+        fn fits(_: @This(), lo: usize, _: usize) !bool {
+            return lo > 0;
+        }
+    }{};
+    const got = (try pickCompactionGroup(a, &metas, without_first)).?;
+    defer a.free(got);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 3, 4, 5 }, got);
+
+    // Past the budget everywhere in tier 1, the picker moves up a tier.
+    const tier_two_only = struct {
+        fn fits(_: @This(), lo: usize, _: usize) !bool {
+            return lo >= 5;
+        }
+    }{};
+    const got2 = (try pickCompactionGroup(a, &metas, tier_two_only)).?;
+    defer a.free(got2);
+    try std.testing.expectEqualSlices(u64, &.{ 6, 7, 8, 9 }, got2);
+
+    const none = struct {
+        fn fits(_: @This(), _: usize, _: usize) !bool {
+            return false;
+        }
+    }{};
+    try std.testing.expectEqual(@as(?[]u64, null), try pickCompactionGroup(a, &metas, none));
 }

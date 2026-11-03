@@ -18,6 +18,7 @@ const c = struct {
 const lz4c = struct {
     extern fn LZ4_compressBound(input_size: c_int) c_int;
     extern fn LZ4_compress_HC(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int, compression_level: c_int) c_int;
+    extern fn LZ4_compress_default(src: [*]const u8, dst: [*]u8, src_size: c_int, dst_capacity: c_int) c_int;
     extern fn LZ4_decompress_safe(src: [*]const u8, dst: [*]u8, compressed_size: c_int, dst_capacity: c_int) c_int;
 };
 
@@ -141,6 +142,18 @@ pub fn lz4CompressHC(allocator: Allocator, input: []const u8) ![]u8 {
         @intCast(dst.len),
         lz4hc_level,
     );
+    if (written <= 0) return Error.Lz4EncodeFailed;
+    return try allocator.realloc(dst, @intCast(written));
+}
+
+/// Compress `input` with plain LZ4, for bytes held only until they are
+/// written: several times faster than `lz4CompressHC`. Caller owns the
+/// result.
+pub fn lz4CompressFast(allocator: Allocator, input: []const u8) ![]u8 {
+    const bound: usize = @intCast(lz4c.LZ4_compressBound(@intCast(input.len)));
+    const dst = try allocator.alloc(u8, bound);
+    errdefer allocator.free(dst);
+    const written = lz4c.LZ4_compress_default(input.ptr, dst.ptr, @intCast(input.len), @intCast(dst.len));
     if (written <= 0) return Error.Lz4EncodeFailed;
     return try allocator.realloc(dst, @intCast(written));
 }

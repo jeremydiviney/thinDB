@@ -63,15 +63,17 @@ pub const Key = struct {
 
 /// What an entry holds: a column block; a condition-cache entry (§6.4)
 /// for one row group and one predicate, either the record of the stored rows
-/// it matched (`exec/condition_cache.zig`) or only how many it matched; or
-/// the `exec.stringKeyDigest` of each entry of a column block's dictionary
+/// it matched (`exec/condition_cache.zig`) or only how many it matched; the
+/// `exec.stringKeyDigest` of each entry of a column block's dictionary
 /// (§6.5), which holds only for the process's digest key and so is never
-/// written anywhere.
+/// written anywhere; or one page of a segment string table's shared values
+/// (§4.4), keyed by page index in `row_group_idx`.
 pub const Content = enum(u8) {
     column,
     matched_rows,
     matched_count,
     dict_digests,
+    shared_strings,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).

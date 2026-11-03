@@ -66,6 +66,8 @@ pub const Table = struct {
     /// Encoder threads for compaction merges (resolved from
     /// Config.compact_threads at open; ≥1).
     compact_threads: usize,
+    /// Config.compact_memory, resolved at open.
+    compact_memory: u64,
 
     /// Durability mode (copied from Database.Config at open time).
     sync_mode: SyncMode,
@@ -293,6 +295,7 @@ pub const Table = struct {
             .auto_flush_min_bytes = cfg.auto_flush_min_bytes,
             .memory_pool = memory_pool,
             .compact_threads = api.resolveCompactThreads(allocator, cfg.compact_threads),
+            .compact_memory = api.resolveCompactMemory(cfg.compact_memory),
             .sync_mode = cfg.sync_mode,
             .table_dir = table_dir,
             .segments_dir = segments_dir,
