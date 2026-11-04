@@ -1262,7 +1262,9 @@ fn countsRowsOnly(cfg: SiloCore.RunConfig) bool {
     if (cfg.filter_expr) |expr| {
         if (!exec.predicate.readsOnlyColumn(expr, layout.key_columns[0].name)) return false;
     }
-    if (layout.has_str_payload or layout.distinct_slot_count != 0) return false;
+    // Exact keys carry the key's own bytes as the last string column, which
+    // the segment ids, compared by bytes across segments, don't need.
+    if (layout.str_columns.len > @intFromBool(layout.exact_key) or layout.distinct_slot_count != 0) return false;
     for (layout.aggregates) |agg| {
         if (agg.op != .count_star or agg.is_distinct or agg.is_udf or agg.is_concat) return false;
     }
@@ -1583,6 +1585,27 @@ test "workspace teardown stops charging the query before its memory is back" {
     try std.testing.expectEqual(@as(usize, 0), charged_on_return);
     try std.testing.expectEqual(@as(usize, 0), pool.inUse());
     try std.testing.expectEqual(@as(usize, 0), workspace.parts.len);
+}
+
+test "exact group keys still answer a COUNT top-K from segment string ids" {
+    const key_columns = [_]SiloCore.GroupKeyColumnSpec{.{ .name = "s", .typ = .string, .offset_bits = 0, .width_bits = 128 }};
+    const count_star = [_]SiloCore.GroupAggregateSpec{.{ .op = .count_star, .state_index = 0 }};
+    const str_columns = [_]SiloCore.GroupStrColumnSpec{.{ .source_name = "s" }};
+    var cfg: SiloCore.RunConfig = .{ .dop = 1, .bucket_count = 1, .snapshot = undefined, .group_rows_layout = .{
+        .key_width = .u128,
+        .key_columns = &key_columns,
+        .aggregates = &count_star,
+        .str_columns = &str_columns,
+        .has_str_payload = true,
+        .exact_key = true,
+        .has_rowref = true,
+        .hashed_key = true,
+    } };
+    try std.testing.expect(countsRowsOnly(cfg));
+    // The same column as a string aggregate's input is a payload the
+    // per-value counts can't fold.
+    cfg.group_rows_layout.exact_key = false;
+    try std.testing.expect(!countsRowsOnly(cfg));
 }
 
 fn asyncWorkspaceTeardown(task: *AsyncWorkspaceTeardownTask) void {
