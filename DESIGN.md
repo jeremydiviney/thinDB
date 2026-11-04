@@ -877,7 +877,7 @@ Each `.dat` file is a self-describing columnar container. Rows within a segment 
 │ …                                                 │
 ├─ Segment string tables (string columns) ──────────┤
 │ per column: shared-string pages, then the row     │
-│ groups' segment-dictionary blocks                 │
+│ groups' segment-dictionary blocks, each in parts  │
 ├─ Footer ──────────────────────────────────────────┤
 │ row group offsets, per-row-group per-column stats │
 │ (min/max/sum/null_count), per-column block offset │
@@ -930,11 +930,18 @@ A zstd-1 trial on the array's first 8,192 values picks the form. The array stays
 - A value held by two or more row groups is **shared**: it is stored once, in the column's shared-string table, sorted. Its segment id is its rank there (`0 .. shared_count`).
 - A value held by one row group is **local**: it stays in that row group's block. Local values take the ids after the shared ones, row group by row group, in dictionary order.
 - Each row-group block keeps the sorted per-row-group dictionary and its 1/2/4-byte per-row codes (so every per-row-group dictionary kernel is unchanged). Per dictionary value it stores either the local value's bytes or the shared value's rank, as 3 bytes when the shared table holds ≤ 2^24 values, else 4.
-- The shared table is split into pages of 65,536 values, each compressed and cached on its own.
+- The shared table is split into pages of 65,536 values, each cached on its own.
+- **Parts** (segment v15). A row-group block is up to four column blocks, each compressed on its own and laid end to end: the **codes**; the **index** (the validity bitmap, the dictionary header, which values are shared, their ranks, and the local values' offsets); the local values' **bytes**; and the **entry stats**. An empty part is left out. A shared-string page is two blocks, its offsets and then its bytes. The footer's string-table directory gives every block's part lengths and every page's two lengths. The point is that a query can read only the parts it needs, and the order keeps the useful sets contiguous: value lengths need the codes and index; per-value counts need the index, bytes and stats.
 - Cap: past 2^26 (67,108,864) distinct values in one segment's column, the column's later row groups fall back to the per-row-group encodings above.
 - A `lz4_fsst` table chose FSST for its large string blocks, so its string columns keep the per-row-group encodings.
 
-The reader rebuilds a segment-dictionary block into an ordinary dictionary block at cache fill, appending each value's segment id (`DICT_SEGMENT_IDS`). Most distinct values of a high-cardinality column live in one row group (ClickBench: 85% of URL's), so the shared table stays small and a row group reads mostly its own block; the duplicates the shared table removes are the values row groups repeat.
+The reader rebuilds a segment-dictionary block into an ordinary dictionary block at cache fill, appending each value's segment id (`DICT_SEGMENT_IDS`). A scan lane that needs only some parts asks for a **form**, read with one positioned read of the parts' contiguous range, and caches the result apart from the whole block:
+- **no bytes** (codes + index; shared pages' offsets only): value lengths, and comparisons with the empty string, which sorts first, so lengths alone place it. Only for a column the scan reads for nothing else; otherwise these share the whole block, so no part is read twice.
+- **no codes** (index + bytes + stats): per-value counts (the scan's counted entries, a filter counted per value) and a whole row group's distinct values alone. It reads whole when the block stores no stats, since counts then come from the codes.
+
+The rebuilt block carries the full offsets and segment ids, with `DICT_NO_BYTES` or `DICT_NO_CODES` set and the missing region left empty. A cached whole block serves any form in its place, so caching one frees its partial blocks (and a whole shared page frees its cached offsets). A late scan after a counted scan fetches its rows from the cached no-codes block: the counted scan locates each value by its first row, which the stats store, so those rows need no read; any other row takes its code from the no-bytes form.
+
+Most distinct values of a high-cardinality column live in one row group (ClickBench: 85% of URL's), so the shared table stays small and a row group reads mostly its own block; the duplicates the shared table removes are the values row groups repeat.
 
 ### 4.5 Tombstone files
 

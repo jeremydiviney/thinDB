@@ -215,7 +215,7 @@ pub fn writeSegmentWithStringCap(
 
     var tables: std.ArrayList(format.StringTable) = .empty;
     errdefer {
-        for (tables.items) |t| allocator.free(t.pages);
+        for (tables.items) |t| freeStringTable(allocator, t);
         tables.deinit(allocator);
     }
     try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads, &tables);
@@ -235,6 +235,11 @@ pub fn writeSegmentWithStringCap(
         .column_sketches = column_sketches,
         .string_tables = string_tables,
     };
+}
+
+fn freeStringTable(allocator: Allocator, t: format.StringTable) void {
+    allocator.free(t.pages);
+    allocator.free(t.blocks);
 }
 
 fn freeRowGroupMeta(allocator: Allocator, rg: RowGroupMeta) void {
@@ -399,8 +404,10 @@ fn writeStringTables(
 ) !void {
     var compressor = try compression_mod.Compressor.init();
     defer compressor.deinit();
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
+    var page_index: std.ArrayList(u8) = .empty;
+    defer page_index.deinit(allocator);
+    var page_bytes: std.ArrayList(u8) = .empty;
+    defer page_bytes.deinit(allocator);
     var page_block: std.ArrayList(u8) = .empty;
     defer page_block.deinit(allocator);
 
@@ -413,16 +420,19 @@ fn writeStringTables(
         if (cs.blocks.items.len == 0) continue;
         try cs.assignIds();
 
-        const pages = try allocator.alloc(format.FileRange, segment_strings.pageCount(cs.sharedCount()));
+        const pages = try allocator.alloc(format.SharedPage, segment_strings.pageCount(cs.sharedCount()));
         errdefer allocator.free(pages);
         for (pages, 0..) |*page, p| {
-            payload.clearRetainingCapacity();
-            const offsets = try cs.pagePayload(allocator, @intCast(p), &payload);
+            page_index.clearRetainingCapacity();
+            page_bytes.clearRetainingCapacity();
             page_block.clearRetainingCapacity();
-            try appendBlock(allocator, &compressor, &page_block, payload.items, &.{offsets}, @backingInt(format.Encoding.raw), false, table_compression);
-            page.* = .{ .offset = out.offset(), .length = @intCast(page_block.items.len) };
+            const lengths = try encodeSharedPage(allocator, &compressor, cs, @intCast(p), table_compression, &page_index, &page_bytes, &page_block);
+            page.* = .{ .offset = out.offset(), .index_length = lengths.index, .bytes_length = lengths.bytes };
             try out.append(allocator, page_block.items);
         }
+        const blocks = try allocator.alloc(format.StringBlockParts, row_groups.len);
+        errdefer allocator.free(blocks);
+        @memset(blocks, .{});
 
         // Encoded a few blocks per thread at a time, so a column's encoded
         // blocks never all sit in memory at once.
@@ -432,16 +442,19 @@ fn writeStringTables(
             allocator.free(encoded);
         }
         for (encoded) |*e| e.* = .empty;
+        const parts = try allocator.alloc(format.StringBlockParts, encoded.len);
+        defer allocator.free(parts);
         var first: usize = 0;
         while (first < cs.blocks.items.len) {
             const chunk = cs.blocks.items[first..@min(first + encoded.len, cs.blocks.items.len)];
             for (encoded) |*e| e.clearRetainingCapacity();
-            var job = StringBlockJob{ .allocator = allocator, .strings = cs, .blocks = chunk, .table_compression = table_compression, .encoded = encoded };
+            var job = StringBlockJob{ .allocator = allocator, .strings = cs, .blocks = chunk, .table_compression = table_compression, .encoded = encoded, .parts = parts };
             try encodeParallel(allocator, threads, chunk.len, &job);
-            for (chunk, encoded[0..chunk.len]) |b, e| {
+            for (chunk, encoded[0..chunk.len], parts[0..chunk.len]) |b, e, p| {
                 const rg = row_groups[b.rg_idx];
                 @constCast(rg.col_offsets)[ci] = out.offset();
                 @constCast(rg.col_lengths)[ci] = @intCast(e.items.len);
+                blocks[b.rg_idx] = p;
                 try out.append(allocator, e.items);
             }
             first += chunk.len;
@@ -454,11 +467,34 @@ fn writeStringTables(
             .value_count = cs.valueCount(),
             .value_bytes = cs.valueBytes(),
             .pages = pages,
+            .blocks = blocks,
         });
     }
 }
 
-/// Encodes string-table block `b` of `cs` onto `out`, after `assignIds`.
+/// Encodes shared-string page `p` of `cs` onto `out` as its two blocks,
+/// its count and offsets then its bytes, building their payloads in
+/// `index` and `bytes`, and returns their lengths.
+fn encodeSharedPage(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    cs: *const segment_strings.ColumnStrings,
+    p: u32,
+    table_compression: types.TableCompression,
+    index: *std.ArrayList(u8),
+    bytes: *std.ArrayList(u8),
+    out: *std.ArrayList(u8),
+) !struct { index: u32, bytes: u32 } {
+    const offsets = try cs.pagePayload(allocator, p, index, bytes);
+    const start = out.items.len;
+    try appendBlock(allocator, compressor, out, index.items, &.{offsets}, @backingInt(format.Encoding.raw), false, table_compression);
+    const index_length: u32 = @intCast(out.items.len - start);
+    try appendBlock(allocator, compressor, out, bytes.items, &.{}, @backingInt(format.Encoding.raw), false, table_compression);
+    return .{ .index = index_length, .bytes = @intCast(out.items.len - start - index_length) };
+}
+
+/// Encodes string-table block `b` of `cs` onto `out`, after `assignIds`,
+/// as its parts, and returns their lengths.
 fn encodeStringBlock(
     allocator: Allocator,
     compressor: *compression_mod.Compressor,
@@ -466,13 +502,20 @@ fn encodeStringBlock(
     b: segment_strings.ColumnStrings.Block,
     table_compression: types.TableCompression,
     out: *std.ArrayList(u8),
-) !void {
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(allocator);
-    var streams: Streams = .empty;
-    defer streams.deinit(allocator);
-    try cs.blockPayload(allocator, b, &payload, &streams);
-    try appendBlock(allocator, compressor, out, payload.items, streams.items, format.segment_dict_encoding, b.bitmap.len > 0, table_compression);
+) !format.StringBlockParts {
+    var payloads: segment_strings.PartPayloads = .initFill(.{});
+    defer for (&payloads.values) |*p| p.deinit(allocator);
+    try cs.blockPayload(allocator, b, &payloads);
+    var parts: format.StringBlockParts = .{};
+    for (std.enums.values(format.StringBlockPart)) |part| {
+        const payload = payloads.getPtr(part);
+        if (payload.bytes.items.len == 0) continue;
+        const start = out.items.len;
+        const has_nulls = part == .index and b.bitmap.len > 0;
+        try appendBlock(allocator, compressor, out, payload.bytes.items, payload.streams.items, format.segment_dict_encoding, has_nulls, table_compression);
+        parts.lengths.set(part, @intCast(out.items.len - start));
+    }
+    return parts;
 }
 
 /// One column's string table, laid out apart from its segment file in
@@ -484,10 +527,13 @@ pub const StringTableBuild = struct {
     page_count: usize,
     /// Each piece's encoded bytes, pages first.
     pieces: []std.ArrayList(u8),
+    /// Each piece's part lengths; a page's are its index and bytes.
+    parts: []format.StringBlockParts,
 
     pub fn deinit(self: *StringTableBuild, allocator: Allocator) void {
         for (self.pieces) |*p| p.deinit(allocator);
         allocator.free(self.pieces);
+        allocator.free(self.parts);
         self.strings.deinit();
         self.* = undefined;
     }
@@ -501,9 +547,10 @@ const StringBlockJob = struct {
     blocks: []const segment_strings.ColumnStrings.Block,
     table_compression: types.TableCompression,
     encoded: []std.ArrayList(u8),
+    parts: []format.StringBlockParts,
 
     fn encode(self: *StringBlockJob, compressor: *compression_mod.Compressor, i: usize) !void {
-        try encodeStringBlock(self.allocator, compressor, self.strings, self.blocks[i], self.table_compression, &self.encoded[i]);
+        self.parts[i] = try encodeStringBlock(self.allocator, compressor, self.strings, self.blocks[i], self.table_compression, &self.encoded[i]);
     }
 };
 
@@ -549,8 +596,10 @@ fn appendFooter(
         try appendU64(allocator, buf, t.value_bytes);
         for (t.pages) |p| {
             try appendU64(allocator, buf, p.offset);
-            try appendU32(allocator, buf, p.length);
+            try appendU32(allocator, buf, p.index_length);
+            try appendU32(allocator, buf, p.bytes_length);
         }
+        for (t.blocks) |b| for (b.lengths.values) |len| try appendU32(allocator, buf, len);
     }
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);
     try appendU32(allocator, buf, footer_size);
@@ -773,19 +822,28 @@ pub const MergedSegmentWriter = struct {
         try cs.assignIds();
         const page_count = segment_strings.pageCount(cs.sharedCount());
         const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len);
+        errdefer self.allocator.free(pieces);
         @memset(pieces, .empty);
-        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .pieces = pieces };
+        const parts = try self.allocator.alloc(format.StringBlockParts, pieces.len);
+        @memset(parts, .{});
+        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .pieces = pieces, .parts = parts };
     }
 
     /// Encodes piece `i` of `build` into its own buffer, apart from the
     /// writer's other work and the build's other pieces.
     pub fn encodeStringTablePiece(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, build: *StringTableBuild, i: usize) !void {
         const cs = &build.strings;
-        if (i >= build.page_count) return encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        const offsets = try cs.pagePayload(self.allocator, @intCast(i), &payload);
-        try appendBlock(self.allocator, compressor, &build.pieces[i], payload.items, &.{offsets}, @backingInt(format.Encoding.raw), false, self.schema.compression);
+        if (i >= build.page_count) {
+            build.parts[i] = try encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
+            return;
+        }
+        var index: std.ArrayList(u8) = .empty;
+        defer index.deinit(self.allocator);
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(self.allocator);
+        const lengths = try encodeSharedPage(self.allocator, compressor, cs, @intCast(i), self.schema.compression, &index, &bytes, &build.pieces[i]);
+        build.parts[i].lengths.set(.index, lengths.index);
+        build.parts[i].lengths.set(.bytes, lengths.bytes);
     }
 
     /// Places `build`'s string table at the file's end, pointing its row
@@ -796,16 +854,20 @@ pub const MergedSegmentWriter = struct {
         defer build.deinit(self.allocator);
         const cs = &build.strings;
         try self.string_tables.ensureUnusedCapacity(self.allocator, 1);
-        const pages = try self.allocator.alloc(format.FileRange, build.page_count);
+        const pages = try self.allocator.alloc(format.SharedPage, build.page_count);
         errdefer self.allocator.free(pages);
-        for (pages, build.pieces[0..build.page_count]) |*page, piece| {
-            page.* = .{ .offset = self.out.offset(), .length = @intCast(piece.items.len) };
+        const blocks = try self.allocator.alloc(format.StringBlockParts, self.row_groups.items.len);
+        errdefer self.allocator.free(blocks);
+        @memset(blocks, .{});
+        for (pages, build.pieces[0..build.page_count], build.parts[0..build.page_count]) |*page, piece, parts| {
+            page.* = .{ .offset = self.out.offset(), .index_length = parts.lengths.get(.index), .bytes_length = parts.lengths.get(.bytes) };
             try self.out.append(self.allocator, piece.items);
         }
-        for (cs.blocks.items, build.pieces[build.page_count..]) |b, piece| {
+        for (cs.blocks.items, build.pieces[build.page_count..], build.parts[build.page_count..]) |b, piece, parts| {
             const rg = self.row_groups.items[b.rg_idx];
             @constCast(rg.col_offsets)[build.column_idx] = self.out.offset();
             @constCast(rg.col_lengths)[build.column_idx] = @intCast(piece.items.len);
+            blocks[b.rg_idx] = parts;
             try self.out.append(self.allocator, piece.items);
         }
         self.string_tables.appendAssumeCapacity(.{
@@ -814,6 +876,7 @@ pub const MergedSegmentWriter = struct {
             .value_count = cs.valueCount(),
             .value_bytes = cs.valueBytes(),
             .pages = pages,
+            .blocks = blocks,
         });
     }
 
@@ -857,7 +920,7 @@ pub const MergedSegmentWriter = struct {
         for (self.row_groups.items) |rg| freeRowGroupMeta(self.allocator, rg);
         self.row_groups.deinit(self.allocator);
         self.strings.deinit();
-        for (self.string_tables.items) |t| self.allocator.free(t.pages);
+        for (self.string_tables.items) |t| freeStringTable(self.allocator, t);
         self.string_tables.deinit(self.allocator);
         if (self.column_sketches.len > 0) self.allocator.free(@constCast(self.column_sketches));
         const io = self.out.io;

@@ -106,15 +106,15 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
+            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, column_idx);
             defer cc.release(entry);
             return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
         }
 
-        const block = try self.readColumnBlock(allocator, rg, column_idx);
+        const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
         if (!isSegmentDictBlock(block)) return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
-        const payload = try self.rebuildSegmentDict(allocator, allocator, block, rg, column_idx, null);
+        const payload = try self.rebuildSegmentDict(allocator, allocator, block, 0, row_group_idx, column_idx, null, .full);
         defer allocator.free(payload);
         return decodeColumnPayload(allocator, col_type, payload, rg.row_count, flags, .dict);
     }
@@ -130,42 +130,139 @@ pub const ReadSegment = struct {
         allocator: Allocator,
         cc: *storage_cache.Cache,
         key: storage_cache.Key,
-        rg: RowGroupMeta,
         column_idx: usize,
     ) !*storage_cache.Cache.Entry {
-        const block = try self.readColumnBlock(allocator, rg, column_idx);
+        const block = try self.readColumnBlock(allocator, key.row_group_idx, column_idx);
         defer allocator.free(block);
         const block_alloc = cc.blockAllocator();
         const tc: storage_cache.TableCache = .{ .cache = cc, .table_uid = key.table_uid };
         const raw = if (isSegmentDictBlock(block))
-            try self.rebuildSegmentDict(block_alloc, allocator, block, rg, column_idx, tc)
+            try self.rebuildSegmentDict(block_alloc, allocator, block, 0, key.row_group_idx, column_idx, tc, .full)
         else
             try getDecompressedBytes(block_alloc, allocator, block, 0);
         errdefer block_alloc.free(raw);
         return cc.insertPinned(key, raw, blockEncoding(block, 0));
     }
 
-    /// Rebuilds a segment-dictionary block (`block`: header + payload as read)
-    /// into the `.dict` payload with segment ids, allocated from
-    /// `out_allocator`. Shared-string pages come through the cache when `c`
-    /// is set.
+    /// `borrowColumnBlock` for a reader that needs only some of a string
+    /// column's block: a row group the column's string table took reads
+    /// only the parts `form` asks for (`.no_codes` only where the block
+    /// stores entry stats, which stand in for the codes' counts), rebuilt
+    /// with the `.dict` flags marking what it leaves out and cached apart
+    /// from the whole block, which serves the read instead when cached. Any
+    /// other block reads whole.
+    pub fn borrowStringBlock(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        c: ?storage_cache.TableCache,
+        form: segment_strings.Form,
+    ) !BorrowedBlock {
+        const parts = self.stringBlockParts(row_group_idx, column_idx) orelse
+            return self.borrowColumnBlock(allocator, row_group_idx, column_idx, c);
+        if (form == .full or (form == .no_codes and parts.lengths.get(.stats) == 0)) {
+            return self.borrowColumnBlock(allocator, row_group_idx, column_idx, c);
+        }
+        if (c) |tc| {
+            var key = storage_cache.Key{
+                .table_uid = tc.table_uid,
+                .segment_id = self.info.segment_id,
+                .row_group_idx = @intCast(row_group_idx),
+                .column_idx = @intCast(column_idx),
+            };
+            if (tc.cache.acquire(key)) |entry| return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
+            key.content = partialContent(form);
+            const entry = tc.cache.acquireDerived(key) orelse filled: {
+                const read = try self.readStringParts(allocator, row_group_idx, column_idx, parts, form);
+                defer allocator.free(read.bytes);
+                const raw = try self.rebuildSegmentDict(tc.cache.blockAllocator(), allocator, read.bytes, read.start, row_group_idx, column_idx, tc, form);
+                errdefer tc.cache.blockAllocator().free(raw);
+                break :filled try tc.cache.insertPinned(key, raw, .dict);
+            };
+            return .{ .bytes = entry.bytes, .encoding = .dict, .entry = entry, .form = form };
+        }
+        const read = try self.readStringParts(allocator, row_group_idx, column_idx, parts, form);
+        defer allocator.free(read.bytes);
+        const raw = try self.rebuildSegmentDict(allocator, allocator, read.bytes, read.start, row_group_idx, column_idx, null, form);
+        return .{ .bytes = raw, .encoding = .dict, .owned = raw, .form = form };
+    }
+
+    /// Row group `row_group_idx`'s block parts of column `column_idx`, when
+    /// the column's string table took the row group.
+    fn stringBlockParts(self: ReadSegment, row_group_idx: usize, column_idx: usize) ?format.StringBlockParts {
+        const table = self.info.stringTable(column_idx) orelse return null;
+        const parts = table.blocks[row_group_idx];
+        return if (parts.isSplit()) parts else null;
+    }
+
+    /// The block `borrowStringBlock` cached for row group `row_group_idx` of
+    /// column `column_idx` in form `form` (not `.full`), when the cache
+    /// holds it; else null, reading nothing.
+    pub fn cachedStringBlock(
+        self: ReadSegment,
+        row_group_idx: usize,
+        column_idx: usize,
+        c: ?storage_cache.TableCache,
+        form: segment_strings.Form,
+    ) ?BorrowedBlock {
+        const tc = c orelse return null;
+        const entry = tc.cache.acquireDerived(.{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+            .content = partialContent(form),
+        }) orelse return null;
+        return .{ .bytes = entry.bytes, .encoding = .dict, .entry = entry, .form = form };
+    }
+
+    fn partialContent(form: segment_strings.Form) storage_cache.Content {
+        return switch (form) {
+            .full => .column,
+            .no_codes => .dict_no_codes,
+            .no_bytes => .dict_no_bytes,
+        };
+    }
+
+    /// Rebuilds the parts `form` reads of a segment-dictionary block
+    /// (`block`: those parts as read, from `start` bytes into the block) into
+    /// the `.dict` payload with segment ids, allocated from `out_allocator`.
+    /// Shared-string pages come through the cache when `c` is set.
     fn rebuildSegmentDict(
         self: ReadSegment,
         out_allocator: Allocator,
         allocator: Allocator,
         block: []const u8,
-        rg: RowGroupMeta,
+        start: u32,
+        row_group_idx: usize,
         column_idx: usize,
         c: ?storage_cache.TableCache,
+        form: segment_strings.Form,
     ) ![]align(16) u8 {
         const table = self.info.stringTable(column_idx) orelse return format.Error.CorruptColumnBlockHeader;
-        var owned_raw: ?[]u8 = null;
-        defer if (owned_raw) |r| allocator.free(r);
-        const payload = try readBlockRaw(allocator, block, 0, &owned_raw);
-        var pages: SharedPages = .{ .seg = self, .allocator = allocator, .table = table, .c = c };
+        const parts = self.stringBlockParts(row_group_idx, column_idx) orelse return format.Error.CorruptColumnBlockHeader;
+        var payload_len: usize = 0;
+        for (std.enums.values(format.StringBlockPart)) |part| {
+            if (form.reads(part) and parts.lengths.get(part) > 0) payload_len += format.readU32(block[parts.offset(part) - start + 4 ..][0..4]);
+        }
+        const payload = try allocator.alloc(u8, payload_len);
+        defer allocator.free(payload);
+        var payloads: segment_strings.BlockParts = .initFill(&.{});
+        var at: usize = 0;
+        for (std.enums.values(format.StringBlockPart)) |part| {
+            const len = parts.lengths.get(part);
+            if (!form.reads(part) or len == 0) continue;
+            const frame = block[parts.offset(part) - start ..][0..len];
+            const out = payload[at..][0..format.readU32(frame[4..8])];
+            try decompressBlockInto(allocator, frame, out);
+            payloads.set(part, out);
+            at += out.len;
+        }
+        var pages: SharedPages = .{ .seg = self, .allocator = allocator, .table = table, .c = c, .with_bytes = form.reads(.bytes) };
         defer pages.release();
-        const has_nulls = format.ColumnBlockFlags.fromByte(block[1]).has_nulls;
-        return segment_strings.rebuildDict(out_allocator, payload, rg.row_count, has_nulls, table, &pages);
+        const has_nulls = format.ColumnBlockFlags.fromByte(block[parts.offset(.index) - start + 1]).has_nulls;
+        return segment_strings.rebuildDict(out_allocator, payloads, self.info.row_groups[row_group_idx].row_count, has_nulls, table, &pages, form);
     }
 
     /// The shared-string pages one rebuild reads, each read (and through the
@@ -175,6 +272,8 @@ pub const ReadSegment = struct {
         allocator: Allocator,
         table: format.StringTable,
         c: ?storage_cache.TableCache,
+        /// Whether the pages' bytes are read, or only their offsets.
+        with_bytes: bool,
         held: []?Held = &.{},
 
         const Held = struct {
@@ -195,41 +294,58 @@ pub const ReadSegment = struct {
             return h.page;
         }
 
+        /// Page `p`, through the cache when set: the whole page when cached,
+        /// else, reading only its offsets unless `with_bytes`, cached apart
+        /// from the whole page.
         fn load(self: *SharedPages, p: u32, expected: u32) !Held {
             const range = self.table.pages[p];
             if (self.c) |tc| {
-                const key = storage_cache.Key{
+                var key = storage_cache.Key{
                     .table_uid = tc.table_uid,
                     .segment_id = self.seg.info.segment_id,
                     .row_group_idx = p,
                     .column_idx = self.table.column_idx,
                     .content = .shared_strings,
                 };
-                const entry = tc.cache.acquire(key) orelse filled: {
-                    const raw = try self.readPage(tc.cache.blockAllocator(), range);
+                const entry = tc.cache.acquire(key) orelse cached: {
+                    if (!self.with_bytes) {
+                        key.content = .shared_offsets;
+                        if (tc.cache.acquireDerived(key)) |e| break :cached e;
+                    }
+                    const raw = try self.readPage(tc.cache.blockAllocator(), range, self.with_bytes);
                     errdefer tc.cache.blockAllocator().free(raw);
-                    break :filled try tc.cache.insertPinned(key, raw, .raw);
+                    break :cached try tc.cache.insertPinned(key, raw, .raw);
                 };
                 errdefer tc.cache.release(entry);
-                return .{ .page = try segment_strings.Page.of(entry.bytes, expected), .entry = entry, .owned = null };
+                const with_bytes = entry.key.content == .shared_strings;
+                return .{ .page = try segment_strings.Page.of(entry.bytes, expected, with_bytes), .entry = entry, .owned = null };
             }
-            const raw = try self.readPage(self.allocator, range);
+            const raw = try self.readPage(self.allocator, range, self.with_bytes);
             errdefer self.allocator.free(raw);
-            return .{ .page = try segment_strings.Page.of(raw, expected), .entry = null, .owned = raw };
+            return .{ .page = try segment_strings.Page.of(raw, expected, self.with_bytes), .entry = null, .owned = raw };
         }
 
-        fn readPage(self: *SharedPages, out_allocator: Allocator, range: format.FileRange) ![]align(16) u8 {
-            const block = try self.allocator.alloc(u8, range.length);
+        /// Reads a page's offsets block, and its bytes block when
+        /// `with_bytes`, into one buffer, as `segment_strings.Page.of` takes
+        /// it.
+        fn readPage(self: *SharedPages, out_allocator: Allocator, range: format.SharedPage, with_bytes: bool) ![]align(16) u8 {
+            const read_len = @as(usize, range.index_length) + if (with_bytes) range.bytes_length else 0;
+            const block = try self.allocator.alloc(u8, read_len);
             defer self.allocator.free(block);
             if (try self.seg.file.readPositionalAll(self.seg.io, block, range.offset) != block.len) {
                 return format.Error.UnexpectedEof;
             }
-            if (block.len < format.column_block_header_size or
-                block.len != format.column_block_header_size + format.readU32(block[8..12]))
-            {
-                return format.Error.CorruptColumnBlockHeader;
-            }
-            return getDecompressedBytes(out_allocator, self.allocator, block, 0);
+            const index = block[0..range.index_length];
+            const bytes = block[range.index_length..];
+            try checkFrame(index);
+            if (with_bytes) try checkFrame(bytes);
+            const index_len = format.readU32(index[4..8]);
+            const bytes_len: usize = if (with_bytes) format.readU32(bytes[4..8]) else 0;
+            const out = try out_allocator.alignedAlloc(u8, .@"16", @as(usize, index_len) + bytes_len);
+            errdefer out_allocator.free(out);
+            try decompressBlockInto(self.allocator, index, out[0..index_len]);
+            if (with_bytes) try decompressBlockInto(self.allocator, bytes, out[index_len..]);
+            return out;
         }
 
         fn release(self: *SharedPages) void {
@@ -265,6 +381,9 @@ pub const ReadSegment = struct {
         /// borrow path so a single FOR column doesn't force the whole row group
         /// onto the owned-decode path. Freed on `release`. Null for raw blocks.
         expanded: ?OwnedColumn = null,
+        /// The parts of a segment-dictionary block `bytes` holds
+        /// (`borrowStringBlock`).
+        form: segment_strings.Form = .full,
 
         pub fn release(self: *BorrowedBlock, allocator: Allocator, c: ?storage_cache.TableCache) void {
             if (self.entry) |e| {
@@ -292,7 +411,6 @@ pub const ReadSegment = struct {
         column_idx: usize,
         c: ?storage_cache.TableCache,
     ) !BorrowedBlock {
-        const rg = self.info.row_groups[row_group_idx];
         if (c) |tc| {
             const cc = tc.cache;
             const key = storage_cache.Key{
@@ -301,13 +419,13 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, rg, column_idx);
+            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, column_idx);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
-        const block = try self.readColumnBlock(allocator, rg, column_idx);
+        const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
         const raw = if (isSegmentDictBlock(block))
-            try self.rebuildSegmentDict(allocator, allocator, block, rg, column_idx, null)
+            try self.rebuildSegmentDict(allocator, allocator, block, 0, row_group_idx, column_idx, null, .full)
         else
             try getDecompressedBytes(allocator, allocator, block, 0);
         return .{ .bytes = raw, .encoding = blockEncoding(block, 0), .owned = raw };
@@ -346,7 +464,7 @@ pub const ReadSegment = struct {
                 if (payload < framing + offsets) return format.Error.CorruptColumnBlockHeader;
                 return payload - framing - offsets;
             }
-            break :miss try self.fillCacheEntry(allocator, c.cache, key, rg, column_idx);
+            break :miss try self.fillCacheEntry(allocator, c.cache, key, column_idx);
         };
         defer c.cache.release(entry);
         const values = if (nullable) entry.bytes[column.bitmapBytes(rg.row_count)..] else entry.bytes;
@@ -459,20 +577,52 @@ pub const ReadSegment = struct {
         return bytes;
     }
 
-    /// Read the raw on-disk bytes (header + payload) of one column's block in a
-    /// row group via a single positioned read.
-    fn readColumnBlock(self: ReadSegment, allocator: Allocator, rg: RowGroupMeta, column_idx: usize) ![]u8 {
+    /// Read the raw on-disk bytes (header + payload, or a segment-dictionary
+    /// block's parts) of one column's block in a row group via a single
+    /// positioned read.
+    fn readColumnBlock(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize) ![]u8 {
+        const rg = self.info.row_groups[row_group_idx];
         const buf = try allocator.alloc(u8, rg.col_lengths[column_idx]);
         errdefer allocator.free(buf);
         if (try self.file.readPositionalAll(self.io, buf, rg.col_offsets[column_idx]) != buf.len) {
             return format.Error.UnexpectedEof;
         }
-        if (buf.len < format.column_block_header_size or
-            buf.len != format.column_block_header_size + format.readU32(buf[8..12]))
-        {
-            return format.Error.CorruptColumnBlockHeader;
+        if (self.stringBlockParts(row_group_idx, column_idx)) |parts| {
+            try checkStringParts(buf, 0, parts, .full);
+        } else {
+            try checkFrame(buf);
+            if (isSegmentDictBlock(buf)) return format.Error.CorruptColumnBlockHeader;
         }
         return buf;
+    }
+
+    /// The parts `form` reads of row group `row_group_idx`'s
+    /// segment-dictionary block of column `column_idx`, by one positioned
+    /// read of the range they lie in, from `start` bytes into the block.
+    fn readStringParts(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        parts: format.StringBlockParts,
+        form: segment_strings.Form,
+    ) !struct { bytes: []u8, start: u32 } {
+        var start: ?u32 = null;
+        var end: u32 = 0;
+        for (std.enums.values(format.StringBlockPart)) |part| {
+            if (!form.reads(part) or parts.lengths.get(part) == 0) continue;
+            if (start == null) start = parts.offset(part);
+            end = parts.offset(part) + parts.lengths.get(part);
+        }
+        const first = start orelse return format.Error.CorruptColumnBlockHeader;
+        const buf = try allocator.alloc(u8, end - first);
+        errdefer allocator.free(buf);
+        const block_offset = self.info.row_groups[row_group_idx].col_offsets[column_idx];
+        if (try self.file.readPositionalAll(self.io, buf, block_offset + first) != buf.len) {
+            return format.Error.UnexpectedEof;
+        }
+        try checkStringParts(buf, first, parts, form);
+        return .{ .bytes = buf, .start = first };
     }
 };
 
@@ -592,7 +742,7 @@ pub fn readSegment(
         rg.col_lengths = col_lengths;
         inited_rg += 1;
     }
-    const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols);
+    const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols, row_groups);
 
     return ReadSegment{
         .allocator = allocator,
@@ -611,14 +761,17 @@ pub fn readSegment(
 
 /// Parse the footer's string-table directory (`bytes` runs from its count
 /// to the footer trailer, exactly).
-fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize) ![]const format.StringTable {
+fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_groups: []const RowGroupMeta) ![]const format.StringTable {
     if (bytes.len < 4) return format.Error.CorruptFooter;
     const count = format.readU32(bytes[0..4]);
     if (count > ncols) return format.Error.CorruptFooter;
     const tables = try allocator.alloc(format.StringTable, count);
     var inited: usize = 0;
     errdefer {
-        for (tables[0..inited]) |t| allocator.free(t.pages);
+        for (tables[0..inited]) |t| {
+            allocator.free(t.pages);
+            allocator.free(t.blocks);
+        }
         allocator.free(tables);
     }
     var off: usize = 4;
@@ -633,13 +786,29 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize) ![]co
         if (column_idx >= ncols or shared_count > value_count or page_count != segment_strings.pageCount(shared_count)) {
             return format.Error.CorruptFooter;
         }
-        if (bytes.len < off + @as(usize, page_count) * 12) return format.Error.CorruptFooter;
-        const pages = try allocator.alloc(format.FileRange, page_count);
+        const parts_len = std.enums.values(format.StringBlockPart).len * 4;
+        if (bytes.len < off + @as(usize, page_count) * 16 + row_groups.len * parts_len) return format.Error.CorruptFooter;
+        const pages = try allocator.alloc(format.SharedPage, page_count);
+        errdefer allocator.free(pages);
         for (pages) |*p| {
-            p.* = .{ .offset = format.readU64(bytes[off..][0..8]), .length = format.readU32(bytes[off + 8 ..][0..4]) };
-            off += 12;
+            p.* = .{
+                .offset = format.readU64(bytes[off..][0..8]),
+                .index_length = format.readU32(bytes[off + 8 ..][0..4]),
+                .bytes_length = format.readU32(bytes[off + 12 ..][0..4]),
+            };
+            off += 16;
         }
-        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages };
+        const blocks = try allocator.alloc(format.StringBlockParts, row_groups.len);
+        errdefer allocator.free(blocks);
+        for (blocks, row_groups) |*b, rg| {
+            for (&b.lengths.values) |*len| {
+                len.* = format.readU32(bytes[off..][0..4]);
+                off += 4;
+            }
+            if (!b.isSplit() and b.total() != 0) return format.Error.CorruptFooter;
+            if (b.isSplit() and b.total() != rg.col_lengths[column_idx]) return format.Error.CorruptFooter;
+        }
+        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages, .blocks = blocks };
         inited += 1;
     }
     if (off != bytes.len) return format.Error.CorruptFooter;
@@ -652,6 +821,49 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize) ![]co
 
 fn isSegmentDictBlock(block: []const u8) bool {
     return block[format.column_block_encoding_offset] == format.segment_dict_encoding;
+}
+
+/// Checks that `frame` is exactly one column block: its header, then the
+/// stored bytes the header sizes.
+fn checkFrame(frame: []const u8) !void {
+    if (frame.len < format.column_block_header_size or
+        frame.len != format.column_block_header_size + format.readU32(frame[8..12]))
+    {
+        return format.Error.CorruptColumnBlockHeader;
+    }
+}
+
+/// Checks each part `form` reads of a segment-dictionary block, `buf`
+/// holding the block from `start` bytes in, is one column block of that
+/// encoding.
+fn checkStringParts(buf: []const u8, start: u32, parts: format.StringBlockParts, form: segment_strings.Form) !void {
+    for (std.enums.values(format.StringBlockPart)) |part| {
+        const len = parts.lengths.get(part);
+        if (!form.reads(part) or len == 0) continue;
+        const frame = buf[parts.offset(part) - start ..][0..len];
+        try checkFrame(frame);
+        if (!isSegmentDictBlock(frame)) return format.Error.CorruptColumnBlockHeader;
+    }
+}
+
+/// Decompresses the column block `frame` (header, then its stored bytes)
+/// into `out`, its payload's size. `scratch` holds an `int_streams`
+/// block's stored form while it is restored.
+fn decompressBlockInto(scratch: Allocator, frame: []const u8, out: []u8) !void {
+    const kind_byte = frame[0];
+    if (kind_byte > @backingInt(format.Compression.lz4)) return format.Error.UnknownCompression;
+    const kind: format.Compression = @fromBackingInt(@intCast(kind_byte));
+    if (format.readU32(frame[4..8]) != out.len) return format.Error.CorruptColumnBlockHeader;
+    const body = frame[format.column_block_header_size..];
+    if (format.ColumnBlockFlags.fromByte(frame[1]).int_streams) return restoreIntStreams(scratch, kind, body, out);
+    switch (kind) {
+        .none => {
+            if (body.len != out.len) return format.Error.CorruptColumnBlockHeader;
+            @memcpy(out, body);
+        },
+        .zstd => try compression_mod.decompressInto(body, out),
+        .lz4 => try compression_mod.lz4DecompressInto(body, out),
+    }
 }
 
 /// The encoding of the payload a column block reads as: its header's
@@ -1426,6 +1638,14 @@ pub const DictBlock = struct {
     /// a segment string table (`format.DICT_SEGMENT_IDS`).
     segment_ids: []const u8 = &.{},
 
+    /// Byte length of distinct value at sorted index `code`, which a block
+    /// rebuilt without its values' bytes (`format.DICT_NO_BYTES`) still has.
+    pub fn valueLen(self: DictBlock, code: u32) u32 {
+        const a = format.readU32(self.offsets_region[@as(usize, code) * 4 ..][0..4]);
+        const b = format.readU32(self.offsets_region[(@as(usize, code) + 1) * 4 ..][0..4]);
+        return b - a;
+    }
+
     /// Byte slice of distinct value at sorted index `code` (aliases `dict_bytes`).
     pub fn dictValue(self: DictBlock, code: u32) []const u8 {
         const a = format.readU32(self.offsets_region[@as(usize, code) * 4 ..][0..4]);
@@ -1513,6 +1733,34 @@ pub const DictBlock = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// Into `entries`, the value each of `rows` (ascending) is the first row
+    /// of, from the stored first rows alone, for a block with
+    /// `hasEntryStats`; false when a row is no value's first row.
+    pub fn firstRowEntries(self: DictBlock, rows: []const u32, entries: []u32) bool {
+        const order = struct {
+            fn f(target: u32, item: u32) std.math.Order {
+                return std.math.order(target, item);
+            }
+        }.f;
+        var matched: usize = 0;
+        switch (self.stat_width) {
+            inline 2, 4 => |w| {
+                const T = @Int(.unsigned, @as(u16, w) * 8);
+                for (0..self.ndv) |c| {
+                    if (matched == rows.len) break;
+                    const first: u32 = std.mem.readInt(T, self.entry_rows[c * w ..][0..w], .little);
+                    var j = std.sort.lowerBound(u32, rows, first, order);
+                    while (j < rows.len and rows[j] == first) : (j += 1) {
+                        entries[j] = @intCast(c);
+                        matched += 1;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        return matched == rows.len;
     }
 
     /// The rows holding the values `pass` flags, from the stored counts, for
@@ -1631,11 +1879,15 @@ pub fn dictBlockOf(values: []const u8, row_count: u32) DictBlock {
     const off_start = 8;
     const off_bytes = (@as(usize, ndv) + 1) * 4;
     const offsets_region = values[off_start .. off_start + off_bytes];
-    const dict_byte_count = format.readU32(values[off_start + @as(usize, ndv) * 4 ..][0..4]);
+    const dict_byte_count: usize = if (values[5] & format.DICT_NO_BYTES != 0)
+        0
+    else
+        format.readU32(values[off_start + @as(usize, ndv) * 4 ..][0..4]);
     const dict_start = off_start + off_bytes;
     const dict_bytes = values[dict_start .. dict_start + dict_byte_count];
     const codes_start = dict_start + dict_byte_count;
-    const codes = values[codes_start .. codes_start + @as(usize, row_count) * code_width];
+    const codes_len: usize = if (values[5] & format.DICT_NO_CODES != 0) 0 else @as(usize, row_count) * code_width;
+    const codes = values[codes_start .. codes_start + codes_len];
     var db: DictBlock = .{
         .ndv = ndv,
         .code_width = code_width,

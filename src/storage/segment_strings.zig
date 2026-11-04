@@ -5,20 +5,23 @@
 //! end. The reader rebuilds each row-group block into an ordinary `.dict`
 //! payload that also carries every value's segment id.
 //!
-//! Row-group block payload, past the validity bitmap (on-disk encoding byte
-//! `format.segment_dict_encoding`):
+//! A row-group block is up to four parts (`format.StringBlockPart`), each a
+//! column block of its own (on-disk encoding byte
+//! `format.segment_dict_encoding`), so a query reads only the parts it needs:
 //!
-//!   [ndv: u32]
-//!   [code_width: u8][flags: u8][rank_width: u8][pad]
-//!   [local_count: u32][local_first_id: u32]
-//!   [shared: ceil(ndv/8)]                bit e set when value e is shared
-//!   [ranks: (ndv-local_count) × rank_width]  shared values' table ranks
-//!   [local_offsets: (local_count+1) × u32]
-//!   [local_bytes]                        the block's own values, in order
-//!   [codes: row_count × code_width]      as `.dict`
-//!   [entry stats]                        as `.dict`, per `flags`
+//!   codes:  [codes: row_count × code_width]      as `.dict`
+//!   index:  [validity bitmap, when the block has nulls]
+//!           [ndv: u32]
+//!           [code_width: u8][flags: u8][rank_width: u8][pad]
+//!           [local_count: u32][local_first_id: u32]
+//!           [shared: ceil(ndv/8)]                bit e set when value e is shared
+//!           [ranks: (ndv-local_count) × rank_width]  shared values' table ranks
+//!           [local_offsets: (local_count+1) × u32]
+//!   bytes:  [local_bytes]                        the block's own values, in order
+//!   stats:  [entry stats]                        as `.dict`, per `flags`
 //!
-//! Shared-string page payload: [count: u32][(count+1) × u32 offsets][bytes].
+//! A shared-string page is two blocks: [count: u32][(count+1) × u32
+//! offsets], then its [bytes].
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,6 +53,42 @@ pub fn eligible(t: types.Type) bool {
 pub fn rankWidth(shared_count: u32) u8 {
     return if (shared_count <= narrow_rank_limit) 3 else 4;
 }
+
+/// One part's payload and its integer arrays, for `int_streams`.
+pub const PartPayload = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    streams: std.ArrayList(int_streams.Stream) = .empty,
+
+    pub fn deinit(self: *PartPayload, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+        self.streams.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PartPayloads = std.EnumArray(format.StringBlockPart, PartPayload);
+
+/// A row-group block's decompressed parts, empty where left out.
+pub const BlockParts = std.EnumArray(format.StringBlockPart, []const u8);
+
+/// What a read of a row-group block rebuilds: the whole `.dict` payload, or
+/// one without the per-row codes (`format.DICT_NO_CODES`), for readers that
+/// count values by the entry stats, or without the values' bytes
+/// (`format.DICT_NO_BYTES`), for readers of lengths. Each form's parts lie
+/// together on disk, so a read of one is one range.
+pub const Form = enum {
+    full,
+    no_codes,
+    no_bytes,
+
+    pub fn reads(form: Form, part: format.StringBlockPart) bool {
+        return switch (form) {
+            .full => true,
+            .no_codes => part != .codes,
+            .no_bytes => part == .codes or part == .index,
+        };
+    }
+};
 
 pub fn pageCount(shared_count: u32) u32 {
     return @intCast((@as(u64, shared_count) + page_values - 1) / page_values);
@@ -379,34 +418,30 @@ pub const ColumnStrings = struct {
         return bytes;
     }
 
-    /// Appends shared-string page `p`'s payload to `out` and returns its
-    /// offsets array.
-    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, out: *std.ArrayList(u8)) !int_streams.Stream {
+    /// Appends shared-string page `p`'s count and offsets to `index`,
+    /// returning the offsets array, and its values to `bytes`.
+    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, index: *std.ArrayList(u8), bytes: *std.ArrayList(u8)) !int_streams.Stream {
         const lo = @as(usize, p) * page_values;
         const hi = @min(self.shared.len, lo + page_values);
-        var bytes: usize = 0;
-        for (self.shared[lo..hi]) |v| bytes += self.value(v).len;
-        try out.ensureUnusedCapacity(allocator, 4 + (hi - lo + 1) * 4 + bytes);
-        appendU32(out, @intCast(hi - lo));
-        appendU32(out, 0);
+        var byte_count: usize = 0;
+        for (self.shared[lo..hi]) |v| byte_count += self.value(v).len;
+        try index.ensureUnusedCapacity(allocator, 4 + (hi - lo + 1) * 4);
+        try bytes.ensureUnusedCapacity(allocator, byte_count);
+        appendU32(index, @intCast(hi - lo));
+        const offsets_at = index.items.len;
+        appendU32(index, 0);
         var acc: u32 = 0;
         for (self.shared[lo..hi]) |v| {
             acc += @intCast(self.value(v).len);
-            appendU32(out, acc);
+            appendU32(index, acc);
         }
-        for (self.shared[lo..hi]) |v| out.appendSliceAssumeCapacity(self.value(v));
-        return .{ .offset = @intCast(out.items.len - bytes - (hi - lo + 1) * 4), .count = @intCast(hi - lo + 1), .width = 4 };
+        for (self.shared[lo..hi]) |v| bytes.appendSliceAssumeCapacity(self.value(v));
+        return .{ .offset = @intCast(offsets_at), .count = @intCast(hi - lo + 1), .width = 4 };
     }
 
-    /// Appends block `b`'s payload to `out`, after `assignIds`, and its
-    /// integer arrays to `streams`.
-    pub fn blockPayload(
-        self: ColumnStrings,
-        allocator: Allocator,
-        b: Block,
-        out: *std.ArrayList(u8),
-        streams: *std.ArrayList(int_streams.Stream),
-    ) !void {
+    /// Appends block `b`'s parts, after `assignIds`, each with its integer
+    /// arrays, to `parts`.
+    pub fn blockPayload(self: ColumnStrings, allocator: Allocator, b: Block, parts: *PartPayloads) !void {
         const k = b.values.len;
         var local_count: usize = 0;
         var local_bytes: usize = 0;
@@ -418,8 +453,10 @@ pub const ColumnStrings = struct {
         };
         const rank_width = rankWidth(self.sharedCount());
         const shared_bits = (k + 7) / 8;
+        const out = &parts.getPtr(.index).bytes;
+        const streams = &parts.getPtr(.index).streams;
         try out.ensureUnusedCapacity(allocator, b.bitmap.len + block_header_bytes + shared_bits +
-            (k - local_count) * rank_width + (local_count + 1) * 4 + local_bytes + b.codes_len + b.stats_len);
+            (k - local_count) * rank_width + (local_count + 1) * 4);
 
         out.appendSliceAssumeCapacity(b.bitmap);
         appendU32(out, @intCast(k));
@@ -430,7 +467,7 @@ pub const ColumnStrings = struct {
 
         const bits_at = out.items.len;
         out.appendNTimesAssumeCapacity(0, shared_bits);
-        try streams.ensureUnusedCapacity(allocator, 5);
+        try streams.ensureUnusedCapacity(allocator, 2);
         streams.appendAssumeCapacity(.{ .offset = @intCast(out.items.len), .count = @intCast(k - local_count), .width = rank_width });
         for (b.values, 0..) |v, e| if (self.owners.items[v] == shared_owner) {
             out.items[bits_at + e / 8] |= @as(u8, 1) << @intCast(e % 8);
@@ -445,18 +482,24 @@ pub const ColumnStrings = struct {
             acc += @intCast(self.value(v).len);
             appendU32(out, acc);
         };
-        for (b.values) |v| if (self.owners.items[v] != shared_owner) out.appendSliceAssumeCapacity(self.value(v));
-        const tail_at = out.items.len;
-        const tail = out.unusedCapacitySlice()[0 .. b.codes_len + b.stats_len];
-        try compression.lz4DecompressInto(b.held, tail);
-        out.items.len += tail.len;
-        streams.appendAssumeCapacity(.{ .offset = @intCast(tail_at), .count = b.row_count, .width = b.code_width });
+        const local = &parts.getPtr(.bytes).bytes;
+        try local.ensureUnusedCapacity(allocator, local_bytes);
+        for (b.values) |v| if (self.owners.items[v] != shared_owner) local.appendSliceAssumeCapacity(self.value(v));
+
+        // `held` is the codes and the entry stats, compressed together.
+        const codes = parts.getPtr(.codes);
+        try codes.bytes.resize(allocator, b.codes_len + b.stats_len);
+        try compression.lz4DecompressInto(b.held, codes.bytes.items);
+        try codes.streams.append(allocator, .{ .offset = 0, .count = b.row_count, .width = b.code_width });
         if (b.stats_len > 0) {
+            const stats = parts.getPtr(.stats);
+            try stats.bytes.appendSlice(allocator, codes.bytes.items[b.codes_len..]);
             const stat_width: u8 = @intCast(b.stats_len / (2 * k));
-            const stats_at = tail_at + b.codes_len;
-            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at), .count = @intCast(k), .width = stat_width });
-            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at + k * stat_width), .count = @intCast(k), .width = stat_width });
+            try stats.streams.ensureUnusedCapacity(allocator, 2);
+            stats.streams.appendAssumeCapacity(.{ .offset = 0, .count = @intCast(k), .width = stat_width });
+            stats.streams.appendAssumeCapacity(.{ .offset = @intCast(k * stat_width), .count = @intCast(k), .width = stat_width });
         }
+        codes.bytes.shrinkRetainingCapacity(b.codes_len);
     }
 };
 
@@ -603,9 +646,12 @@ fn appendU32(out: *std.ArrayList(u8), v: u32) void {
 pub const Page = struct {
     count: u32,
     offsets: []const u8,
+    /// Empty when the page was read for its values' lengths alone.
     bytes: []const u8,
 
-    pub fn of(payload: []const u8, expected_count: u32) !Page {
+    /// `payload` holds the page's count and offsets, then its bytes when
+    /// `with_bytes`.
+    pub fn of(payload: []const u8, expected_count: u32, with_bytes: bool) !Page {
         if (payload.len < 8) return format.Error.CorruptColumnBlockHeader;
         const count = format.readU32(payload[0..4]);
         if (count != expected_count) return format.Error.CorruptColumnBlockHeader;
@@ -622,14 +668,21 @@ pub const Page = struct {
             if (o < prev) return format.Error.CorruptColumnBlockHeader;
             prev = o;
         }
-        if (prev != page.bytes.len) return format.Error.CorruptColumnBlockHeader;
+        if (page.bytes.len != if (with_bytes) prev else 0) return format.Error.CorruptColumnBlockHeader;
         return page;
     }
 
+    /// Value `i`, of a page read with its bytes.
     pub fn value(self: Page, i: u32) []const u8 {
         const a = format.readU32(self.offsets[@as(usize, i) * 4 ..][0..4]);
         const b = format.readU32(self.offsets[(@as(usize, i) + 1) * 4 ..][0..4]);
         return self.bytes[a..b];
+    }
+
+    pub fn valueLen(self: Page, i: u32) u32 {
+        const a = format.readU32(self.offsets[@as(usize, i) * 4 ..][0..4]);
+        const b = format.readU32(self.offsets[(@as(usize, i) + 1) * 4 ..][0..4]);
+        return b - a;
     }
 };
 
@@ -638,22 +691,25 @@ pub fn pageValueCount(shared_count: u32, p: u32) u32 {
     return @min(page_values, shared_count - p * page_values);
 }
 
-/// Rebuilds a row-group block's decompressed payload (validity bitmap first
-/// when `has_nulls`) into a `.dict` payload with `format.DICT_SEGMENT_IDS`,
-/// allocated 16-aligned from `allocator`. `pages.page(p)` yields shared page
-/// `p` of the column's table.
+/// Rebuilds a row-group block's decompressed parts (the index's validity
+/// bitmap first when `has_nulls`), the ones `form` reads, into a `.dict`
+/// payload with `format.DICT_SEGMENT_IDS`, allocated 16-aligned from
+/// `allocator`. `pages.page(p)` yields shared page `p` of the column's
+/// table, with its bytes unless `form` is `.no_bytes`.
 pub fn rebuildDict(
     allocator: Allocator,
-    payload: []const u8,
+    parts: BlockParts,
     row_count: u32,
     has_nulls: bool,
     table: format.StringTable,
     pages: anytype,
+    form: Form,
 ) ![]align(16) u8 {
     const corrupt = format.Error.CorruptColumnBlockHeader;
+    const index = parts.get(.index);
     const bitmap_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
-    if (payload.len < bitmap_len + block_header_bytes) return corrupt;
-    const values = payload[bitmap_len..];
+    if (index.len < bitmap_len + block_header_bytes) return corrupt;
+    const values = index[bitmap_len..];
     const k = format.readU32(values[0..4]);
     const code_width = values[4];
     const flags = values[5];
@@ -667,22 +723,22 @@ pub fn rebuildDict(
     const shared_bits_len = (@as(usize, k) + 7) / 8;
     const ranks_len = @as(usize, k - local_count) * rank_width;
     const local_offsets_len = (@as(usize, local_count) + 1) * 4;
-    var at: usize = block_header_bytes;
-    if (values.len < at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
+    const at: usize = block_header_bytes;
+    if (values.len != at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
     const shared_bits = values[at..][0..shared_bits_len];
-    at += shared_bits_len;
-    const ranks = values[at..][0..ranks_len];
-    at += ranks_len;
-    const local_offsets = values[at..][0..local_offsets_len];
-    at += local_offsets_len;
+    const ranks = values[at + shared_bits_len ..][0..ranks_len];
+    const local_offsets = values[at + shared_bits_len + ranks_len ..][0..local_offsets_len];
     const local_byte_count = format.readU32(local_offsets[local_count * 4 ..][0..4]);
-    if (values.len < at + local_byte_count) return corrupt;
-    const local_bytes = values[at..][0..local_byte_count];
-    at += local_byte_count;
-    const stats_len: usize = if (flags & format.DICT_ENTRY_STATS != 0) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
-    const tail_len = @as(usize, row_count) * code_width + stats_len;
-    if (values.len != at + tail_len) return corrupt;
-    const tail = values[at..];
+    const local_bytes = parts.get(.bytes);
+    const with_bytes = form.reads(.bytes);
+    if (local_bytes.len != if (with_bytes) local_byte_count else 0) return corrupt;
+    const codes = parts.get(.codes);
+    const stats = parts.get(.stats);
+    const with_stats = flags & format.DICT_ENTRY_STATS != 0 and form.reads(.stats);
+    const stats_len: usize = if (with_stats) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
+    const codes_len: usize = if (form.reads(.codes)) @as(usize, row_count) * code_width else 0;
+    if (codes.len != codes_len or stats.len != stats_len) return corrupt;
+    const tail_len = codes_len + stats_len;
 
     const Entries = struct {
         shared_bits: []const u8,
@@ -690,6 +746,7 @@ pub fn rebuildDict(
         rank_width: u8,
         local_offsets: []const u8,
         local_bytes: []const u8,
+        local_byte_count: u32,
         table: format.StringTable,
 
         fn isShared(e: @This(), i: usize) bool {
@@ -702,11 +759,14 @@ pub fn rebuildDict(
             if (v >= e.table.shared_count) return format.Error.CorruptColumnBlockHeader;
             return v;
         }
-        fn local(e: @This(), l: usize) ![]const u8 {
+        fn localStart(e: @This(), l: usize) !u32 {
             const a = format.readU32(e.local_offsets[l * 4 ..][0..4]);
             const b = format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]);
-            if (a > b or b > e.local_bytes.len) return format.Error.CorruptColumnBlockHeader;
-            return e.local_bytes[a..b];
+            if (a > b or b > e.local_byte_count) return format.Error.CorruptColumnBlockHeader;
+            return a;
+        }
+        fn localLen(e: @This(), l: usize) u32 {
+            return format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]) - format.readU32(e.local_offsets[l * 4 ..][0..4]);
         }
     };
     const entries: Entries = .{
@@ -715,6 +775,7 @@ pub fn rebuildDict(
         .rank_width = rank_width,
         .local_offsets = local_offsets,
         .local_bytes = local_bytes,
+        .local_byte_count = local_byte_count,
         .table = table,
     };
 
@@ -727,49 +788,60 @@ pub fn rebuildDict(
         var r: usize = 0;
         for (0..k) |e| if (entries.isShared(e)) {
             const rank = try entries.rank(r);
-            dict_bytes += (try pages.page(rank / page_values)).value(rank % page_values).len;
+            dict_bytes += (try pages.page(rank / page_values)).valueLen(rank % page_values);
             r += 1;
         };
     }
     if (dict_bytes > std.math.maxInt(u32)) return corrupt;
+    const stored_bytes = if (with_bytes) dict_bytes else 0;
 
-    const out_len = bitmap_len + 8 + (@as(usize, k) + 1) * 4 + dict_bytes + tail_len + @as(usize, k) * 4;
+    var out_flags = flags | format.DICT_SEGMENT_IDS;
+    if (!with_stats) out_flags &= ~format.DICT_ENTRY_STATS;
+    if (!form.reads(.codes)) out_flags |= format.DICT_NO_CODES;
+    if (!with_bytes) out_flags |= format.DICT_NO_BYTES;
+
+    const out_len = bitmap_len + 8 + (@as(usize, k) + 1) * 4 + stored_bytes + tail_len + @as(usize, k) * 4;
     const out = try allocator.alignedAlloc(u8, .@"16", out_len);
     errdefer allocator.free(out);
-    @memcpy(out[0..bitmap_len], payload[0..bitmap_len]);
+    @memcpy(out[0..bitmap_len], index[0..bitmap_len]);
     var o: usize = bitmap_len;
     format.writeU32(out[o..][0..4], k);
     out[o + 4] = code_width;
-    out[o + 5] = flags | format.DICT_SEGMENT_IDS;
+    out[o + 5] = out_flags;
     out[o + 6] = 0;
     out[o + 7] = 0;
     o += 8;
     const offsets_at = o;
     const bytes_at = offsets_at + (@as(usize, k) + 1) * 4;
-    const tail_at = bytes_at + dict_bytes;
+    const tail_at = bytes_at + stored_bytes;
     const ids_at = tail_at + tail_len;
     format.writeU32(out[offsets_at..][0..4], 0);
     var acc: usize = 0;
     var r: usize = 0;
     var l: usize = 0;
     for (0..k) |e| {
-        const bytes, const id = if (entries.isShared(e)) shared: {
+        const len, const id = if (entries.isShared(e)) shared: {
             const rank = try entries.rank(r);
             r += 1;
-            break :shared .{ (try pages.page(rank / page_values)).value(rank % page_values), rank };
+            const page = try pages.page(rank / page_values);
+            const len = page.valueLen(rank % page_values);
+            if (with_bytes) @memcpy(out[bytes_at + acc ..][0..len], page.value(rank % page_values));
+            break :shared .{ len, rank };
         } else local: {
+            const start = try entries.localStart(l);
+            const len = entries.localLen(l);
+            if (with_bytes) @memcpy(out[bytes_at + acc ..][0..len], local_bytes[start..][0..len]);
             const id: u32 = local_first_id + @as(u32, @intCast(l));
-            const bytes = try entries.local(l);
             l += 1;
-            break :local .{ bytes, id };
+            break :local .{ len, id };
         };
-        @memcpy(out[bytes_at + acc ..][0..bytes.len], bytes);
-        acc += bytes.len;
+        acc += len;
         format.writeU32(out[offsets_at + (e + 1) * 4 ..][0..4], @intCast(acc));
         format.writeU32(out[ids_at + e * 4 ..][0..4], id);
     }
     if (acc != dict_bytes) return corrupt;
-    @memcpy(out[tail_at..][0..tail_len], tail);
+    @memcpy(out[tail_at..][0..codes_len], codes);
+    @memcpy(out[tail_at + codes_len ..][0..stats_len], stats);
     return out;
 }
 

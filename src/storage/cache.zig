@@ -66,19 +66,35 @@ pub const Key = struct {
 /// it matched (`exec/condition_cache.zig`) or only how many it matched; the
 /// `exec.stringKeyDigest` of each entry of a column block's dictionary
 /// (§6.5), which holds only for the process's digest key and so is never
-/// written anywhere; or one page of a segment string table's shared values
-/// (§4.4), keyed by page index in `row_group_idx`.
+/// written anywhere; one page of a segment string table's shared values
+/// (§4.4), keyed by page index in `row_group_idx`, or only its offsets; or a
+/// segment-dictionary column block rebuilt without its codes or without its
+/// values' bytes (`segment_strings.Form`), which a whole `.column` entry
+/// serves in its place.
 pub const Content = enum(u8) {
     column,
     matched_rows,
     matched_count,
     dict_digests,
     shared_strings,
+    shared_offsets,
+    dict_no_codes,
+    dict_no_bytes,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).
     pub fn isCondition(self: Content) bool {
         return self == .matched_rows or self == .matched_count;
+    }
+
+    /// The partial contents of one block or page that an entry of this
+    /// content serves in their place.
+    pub fn partials(self: Content) []const Content {
+        return switch (self) {
+            .column => &.{ .dict_no_codes, .dict_no_bytes },
+            .shared_strings => &.{.shared_offsets},
+            else => &.{},
+        };
     }
 };
 
@@ -512,6 +528,15 @@ pub const Cache = struct {
         };
 
         try self.map.put(self.allocator, key, entry);
+        // A partial cached before its whole block only holds memory now:
+        // readers ask for the whole block first. A pinned one ages out.
+        for (key.content.partials()) |content| {
+            var partial_key = key;
+            partial_key.content = content;
+            if (self.map.get(partial_key)) |partial| {
+                if (partial.pins == 0) self.remove(partial);
+            }
+        }
 
         self.linkHead(entry);
         // Account the resident cell, not the logical payload, so the capacity
@@ -991,6 +1016,36 @@ test "shared cache evicts globally: oldest block goes regardless of table" {
     try std.testing.expectEqualStrings("BBBBBBBBBB", b0.bytes);
     c.release(b0);
     try std.testing.expectEqual(@as(u64, 1), c.evictions);
+}
+
+test "a whole block or page cached frees its unpinned partials, leaving pinned ones and other blocks" {
+    const allocator = std.testing.allocator;
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
+    defer c.deinit();
+
+    const block: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 0, .column_idx = 2 };
+    const no_codes: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 0, .column_idx = 2, .content = .dict_no_codes };
+    const no_bytes: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 0, .column_idx = 2, .content = .dict_no_bytes };
+    const other: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 1, .column_idx = 2, .content = .dict_no_codes };
+    try put(&c, no_codes, try adup(allocator, "CCCC"));
+    const pinned = try c.insertPinned(no_bytes, try adup(allocator, "BBBB"), .raw);
+    try put(&c, other, try adup(allocator, "OOOO"));
+
+    try put(&c, block, try adup(allocator, "WHOLE"));
+    try std.testing.expect(c.acquireDerived(no_codes) == null);
+    try std.testing.expectEqualStrings("BBBB", pinned.bytes);
+    c.release(pinned);
+    c.release(c.acquireDerived(no_bytes).?);
+    c.release(c.acquireDerived(other).?);
+
+    const page: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 0, .column_idx = 2, .content = .shared_strings };
+    const offsets: Key = .{ .table_uid = 3, .segment_id = 1, .row_group_idx = 0, .column_idx = 2, .content = .shared_offsets };
+    try put(&c, offsets, try adup(allocator, "OFFS"));
+    try put(&c, page, try adup(allocator, "PAGE"));
+    try std.testing.expect(c.acquireDerived(offsets) == null);
+    c.release(c.acquireDerived(page).?);
 }
 
 test "purgeTable frees one table's unpinned entries, leaves other tables and pins" {

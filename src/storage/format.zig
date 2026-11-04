@@ -66,7 +66,13 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v13→v14: integer-stream transforms (`int_streams.zig`). A block whose
 /// flags set `int_streams` stores its payload with integer arrays rewritten
 /// before compression.
-pub const segment_version: u16 = 14;
+///
+/// v14→v15: split string-table blocks. A row group's block over a segment
+/// string table is four separately compressed parts (codes, index, bytes,
+/// entry stats) and a shared-string page two (offsets, bytes), so a reader
+/// reads only the parts a query needs; the footer's string-table directory
+/// gives each part's length.
+pub const segment_version: u16 = 15;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -161,6 +167,12 @@ pub const DICT_ENTRY_STATS: u8 = 1;
 /// follows the entry stats. Set only on a block rebuilt from a segment string
 /// table: equal ids are equal values within the segment.
 pub const DICT_SEGMENT_IDS: u8 = 2;
+/// `.dict` header flags of a block rebuilt from some of a segment-dictionary
+/// block's parts (`segment_strings.Form`), only ever in the block cache: the
+/// codes are left out, or the values' bytes are (`dict_offsets` still give
+/// their lengths).
+pub const DICT_NO_CODES: u8 = 4;
+pub const DICT_NO_BYTES: u8 = 8;
 
 /// On-disk encoding byte of a row-group block over the segment's string table.
 pub const segment_dict_encoding: u8 = 5;
@@ -330,6 +342,48 @@ pub const FileRange = struct {
     length: u32,
 };
 
+/// The parts of a row group's block over a segment string table
+/// (`segment_strings.zig`), in their on-disk order.
+pub const StringBlockPart = enum { codes, index, bytes, stats };
+
+/// One row group's block of a string column over its segment string table:
+/// each part a column block of its own (header, then its payload compressed
+/// per the table), laid end to end in `StringBlockPart` order from the
+/// block's offset. A part with no payload is left out (length 0). All zero
+/// marks a row group whose block is an ordinary one, past the table's value
+/// cap.
+pub const StringBlockParts = struct {
+    lengths: std.EnumArray(StringBlockPart, u32) = .initFill(0),
+
+    pub fn isSplit(self: StringBlockParts) bool {
+        return self.lengths.get(.index) != 0;
+    }
+
+    pub fn total(self: StringBlockParts) u64 {
+        var sum: u64 = 0;
+        for (self.lengths.values) |len| sum += len;
+        return sum;
+    }
+
+    /// Part `part`'s offset from the block's.
+    pub fn offset(self: StringBlockParts, part: StringBlockPart) u32 {
+        var at: u32 = 0;
+        for (std.enums.values(StringBlockPart)) |p| {
+            if (p == part) break;
+            at += self.lengths.get(p);
+        }
+        return at;
+    }
+};
+
+/// One shared-string page: its offsets, then its bytes, each a column block
+/// of its own, from `offset`.
+pub const SharedPage = struct {
+    offset: u64,
+    index_length: u32,
+    bytes_length: u32,
+};
+
 /// One string column's segment string table (DESIGN.md §4.4).
 pub const StringTable = struct {
     column_idx: u32,
@@ -340,7 +394,9 @@ pub const StringTable = struct {
     /// The distinct values' bytes, which a merge taking this segment holds
     /// until its output's end.
     value_bytes: u64,
-    pages: []const FileRange,
+    pages: []const SharedPage,
+    /// Each row group's block parts, by row-group index.
+    blocks: []const StringBlockParts,
 };
 
 pub const SegmentInfo = struct {
@@ -382,7 +438,10 @@ pub const SegmentInfo = struct {
 };
 
 pub fn freeStringTables(allocator: std.mem.Allocator, tables: []const StringTable) void {
-    for (tables) |t| allocator.free(t.pages);
+    for (tables) |t| {
+        allocator.free(t.pages);
+        allocator.free(t.blocks);
+    }
     if (tables.len > 0) allocator.free(tables);
 }
 

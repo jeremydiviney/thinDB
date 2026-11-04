@@ -1202,6 +1202,9 @@ fn expectSegmentStrings(allocator: Allocator, seg: *ReadSegment) !usize {
         else
             null;
         if (db != null and db.?.hasSegmentIds()) with_ids += 1;
+        const parts = seg.info.stringTable(1).?.blocks[rg_idx];
+        try std.testing.expectEqual(db != null and db.?.hasSegmentIds(), parts.isSplit());
+        if (parts.isSplit()) try std.testing.expectEqual(@as(u64, rg.col_lengths[1]), parts.total());
         for (0..rg.row_count) |r| {
             const valid = column.isValidBit(&sst_nulls, row);
             try std.testing.expectEqual(valid, col.view().isValid(r));
@@ -1247,6 +1250,134 @@ test "segment string tables: one id per distinct value across row groups; blocks
     try std.testing.expectEqual(@as(u32, 3), table.shared_count);
     try std.testing.expectEqual(@as(u32, 6), table.value_count);
     try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
+    // Only row group 1 has local bytes (row group 2's one local value is
+    // empty), so the others leave their bytes part out; a nullable column's
+    // blocks carry no entry stats.
+    for (table.blocks, [_]bool{ false, true, false }) |parts, has_bytes| {
+        try std.testing.expectEqual(has_bytes, parts.lengths.get(.bytes) != 0);
+        try std.testing.expectEqual(@as(u32, 0), parts.lengths.get(.stats));
+    }
+}
+
+test "segment string tables: blocks read without their codes or their values' bytes match the whole block" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Three row groups of sixteen: three values recur in each (shared), and
+    // every fourth row holds one local to its row group, row group 0's
+    // empty. Not nullable, and repeating enough for each block to store its
+    // entry stats.
+    const shared = [_][]const u8{ "pear orchard row", "fig orchard row", "kiwi orchard row" };
+    const local = [_][]const u8{ "", "date palm grove", "apple tree lane" };
+    var vals: [48][]const u8 = undefined;
+    for (&vals, 0..) |*v, i| v.* = if (i % 4 == 3) local[i / 16] else shared[i % 4];
+    var ids: [vals.len]i32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i);
+    var s = try buildStringCol(allocator, &vals);
+    defer s.deinit(allocator);
+    const schema = TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .int }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const columns = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(null) };
+    var info = try writeSegment(allocator, io, tmp.dir, "parts.dat", schema, 1, 0, 16, &columns, false, 2);
+    defer info.deinit(allocator);
+    var seg = try readSegment(allocator, io, tmp.dir, "parts.dat", schema);
+    defer seg.deinit();
+
+    var controller = memory.MemoryPool.init(1 << 20);
+    var c = cache.Cache.init(allocator, &controller, 0);
+    controller.shareCache(&c, controller.budget);
+    defer c.deinit();
+    const tc: cache.TableCache = .{ .cache = &c, .table_uid = 0 };
+
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        try std.testing.expect(seg.info.stringTable(1).?.blocks[rg_idx].lengths.get(.stats) != 0);
+        var whole = try seg.borrowColumnBlock(allocator, rg_idx, 1, null);
+        defer whole.release(allocator, null);
+        const full = segment_reader.dictBlockOf(whole.bytes, rg.row_count);
+        for ([_]?cache.TableCache{ null, tc }) |ctc| {
+            for ([_]segment_strings.Form{ .no_bytes, .no_codes }) |form| {
+                var part = try seg.borrowStringBlock(allocator, rg_idx, 1, ctc, form);
+                defer part.release(allocator, ctc);
+                try std.testing.expectEqual(form, part.form);
+                const db = segment_reader.dictBlockOf(part.bytes, rg.row_count);
+                try std.testing.expectEqual(full.ndv, db.ndv);
+                try std.testing.expectEqualSlices(u8, full.offsets_region, db.offsets_region);
+                try std.testing.expectEqualSlices(u8, full.segment_ids, db.segment_ids);
+                switch (form) {
+                    .no_bytes => {
+                        try std.testing.expectEqual(@as(usize, 0), db.dict_bytes.len);
+                        try std.testing.expectEqualSlices(u8, full.codes, db.codes);
+                        try std.testing.expect(!db.hasEntryStats());
+                        for (0..full.ndv) |code| try std.testing.expectEqual(full.dictValue(@intCast(code)).len, db.valueLen(@intCast(code)));
+                    },
+                    .no_codes => {
+                        try std.testing.expectEqualSlices(u8, full.dict_bytes, db.dict_bytes);
+                        try std.testing.expectEqual(@as(usize, 0), db.codes.len);
+                        try std.testing.expectEqualSlices(u8, full.entry_counts, db.entry_counts);
+                        try std.testing.expectEqualSlices(u8, full.entry_rows, db.entry_rows);
+                    },
+                    .full => unreachable,
+                }
+            }
+        }
+    }
+
+    // The two partial forms share code space and offsets: a row's code from
+    // one names its value in the other, as the late scan reads them.
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        var whole = try seg.borrowColumnBlock(allocator, rg_idx, 1, null);
+        defer whole.release(allocator, null);
+        const full = segment_reader.dictBlockOf(whole.bytes, rg.row_count);
+        var values_block = seg.cachedStringBlock(rg_idx, 1, tc, .no_codes).?;
+        defer values_block.release(allocator, tc);
+        var codes_block = seg.cachedStringBlock(rg_idx, 1, tc, .no_bytes).?;
+        defer codes_block.release(allocator, tc);
+        const values = segment_reader.dictBlockOf(values_block.bytes, rg.row_count);
+        const codes = segment_reader.dictBlockOf(codes_block.bytes, rg.row_count);
+        for (0..rg.row_count) |r| {
+            try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], full.dictValue(full.rowCode(r)));
+            try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], values.dictValue(codes.rowCode(r)));
+        }
+        // Rows 0-3 each hold a value first; row 4 repeats row 0's.
+        const first_rows = [_]u32{ 0, 1, 2, 3 };
+        var entries: [first_rows.len]u32 = undefined;
+        try std.testing.expect(values.firstRowEntries(&first_rows, &entries));
+        for (first_rows, entries) |r, e| try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], values.dictValue(e));
+        try std.testing.expect(!values.firstRowEntries(&[_]u32{ 0, 4 }, entries[0..2]));
+    }
+
+    // On a fresh cache: a read without bytes caches its shared page's offsets
+    // alone; a read without codes then caches the whole page, which frees
+    // them; and the whole block, cached, frees both partial blocks and
+    // serves either form in their place.
+    var fresh_controller = memory.MemoryPool.init(1 << 20);
+    var fresh = cache.Cache.init(allocator, &fresh_controller, 0);
+    fresh_controller.shareCache(&fresh, fresh_controller.budget);
+    defer fresh.deinit();
+    const ftc: cache.TableCache = .{ .cache = &fresh, .table_uid = 0 };
+    const page_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .shared_strings };
+    const offsets_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .shared_offsets };
+    var no_bytes = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_bytes);
+    no_bytes.release(allocator, ftc);
+    fresh.release(fresh.acquireDerived(offsets_key).?);
+    try std.testing.expect(fresh.acquireDerived(page_key) == null);
+    var no_codes = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_codes);
+    no_codes.release(allocator, ftc);
+    fresh.release(fresh.acquireDerived(page_key).?);
+    try std.testing.expect(fresh.acquireDerived(offsets_key) == null);
+
+    var cached = try seg.borrowColumnBlock(allocator, 0, 1, ftc);
+    cached.release(allocator, ftc);
+    try std.testing.expect(seg.cachedStringBlock(0, 1, ftc, .no_bytes) == null);
+    try std.testing.expect(seg.cachedStringBlock(0, 1, ftc, .no_codes) == null);
+    var served = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_bytes);
+    defer served.release(allocator, ftc);
+    try std.testing.expectEqual(segment_strings.Form.full, served.form);
 }
 
 test "segment string tables: past the cap a column's later row groups keep their own encodings" {

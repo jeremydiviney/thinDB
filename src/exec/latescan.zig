@@ -304,6 +304,21 @@ pub const LateScan = struct {
             const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
             const out = &self.output_columns[out_idx];
 
+            // A scan that counted the block's values cached it without its
+            // codes and located each value by its first row, which the
+            // block's stats resolve with no read; other rows' codes come from
+            // the block without its values' bytes, a fraction of the whole
+            // block's fill.
+            if (seg.cachedStringBlock(rg_idx, phys, self.table.cacheRef(), .no_codes)) |cached| {
+                var values = cached;
+                defer values.release(self.allocator, self.table.cacheRef());
+                if (try engine.transform.appendDictFirstRows(self.allocator, values.bytes, rc, flags, offsets, out)) continue;
+                var codes = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), .no_bytes);
+                defer codes.release(self.allocator, self.table.cacheRef());
+                try engine.transform.appendDictRowsOf(self.allocator, codes.bytes, values.bytes, rc, flags, offsets, out);
+                continue;
+            }
+
             var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
             defer bb.release(self.allocator, self.table.cacheRef());
 

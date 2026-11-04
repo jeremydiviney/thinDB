@@ -122,6 +122,29 @@ fn collectPredicateColumns(
     }
 }
 
+/// Whether `expr` reads column `phys` only through comparisons with the
+/// empty string.
+fn comparesOnlyWithEmpty(expr: PredicateExpr, schema: []const Column, phys: usize) bool {
+    const t = @import("../types.zig");
+    return switch (expr) {
+        .leaf => |p| t.findColumn(schema, p.col) != phys or switch (p.val) {
+            .text => |s| s.len == 0,
+            else => false,
+        },
+        .day_leaf, .text_as_number => |p| t.findColumn(schema, p.col) != phys,
+        .leaf_col_col => |lc| t.findColumn(schema, lc.left) != phys and t.findColumn(schema, lc.right) != phys,
+        .is_null, .is_not_null => |col_name| t.findColumn(schema, col_name) != phys,
+        .like => |lp| t.findColumn(schema, lp.col) != phys,
+        .in_set, .text_as_number_set => |s| t.findColumn(schema, s.col) != phys,
+        .@"and", .@"or" => |children| for (children) |child| {
+            if (!comparesOnlyWithEmpty(child, schema, phys)) break false;
+        } else true,
+        .not => |child| comparesOnlyWithEmpty(child.*, schema, phys),
+        .always => true,
+        else => false,
+    };
+}
+
 fn addPredicateColumn(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(usize), idx_opt: ?usize) !void {
     const idx = idx_opt orelse return;
     for (out.items) |e| if (e == idx) return;
@@ -1645,9 +1668,9 @@ pub const Scan = struct {
     fn fillBlockDict(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !?exec.BlockDictColumn {
         const buf = &self.dict_bufs[j];
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
-        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count)) orelse return null;
         const every_value = rows == null;
         const codes_wanted = !(every_value and buf.entries_only);
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, if (codes_wanted) .full else .no_codes)) orelse return null;
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
@@ -1664,15 +1687,19 @@ pub const Scan = struct {
         };
     }
 
-    /// Column `j`'s dictionary block in row group `rg_idx`, pinned in
-    /// `dict_bufs[j]` with its offsets (a hashed key: room for its values'
-    /// digests instead; an exact key: both) for the row group's later
-    /// batches, or null when the block isn't dictionary-coded.
-    fn holdDictBlock(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32) !?storage.segment_reader.DictBlock {
+    /// Column `j`'s dictionary block in row group `rg_idx`, with at least
+    /// the parts `form` reads, pinned in `dict_bufs[j]` with its offsets (a
+    /// hashed key: room for its values' digests instead; an exact key: both)
+    /// for the row group's later batches, or null when the block isn't
+    /// dictionary-coded.
+    fn holdDictBlock(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, form: storage.segment_strings.Form) !?storage.segment_reader.DictBlock {
         const buf = &self.dict_bufs[j];
-        const holds = if (buf.held) |h| h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx else false;
+        const holds = if (buf.held) |h|
+            h.seg_idx == self.cur_seg_idx and h.rg_idx == rg_idx and (buf.block.?.form == .full or buf.block.?.form == form)
+        else
+            false;
         if (!holds) {
-            var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+            var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), form);
             if (block.encoding != .dict) {
                 block.release(self.allocator, self.table.cacheRef());
                 return null;
@@ -1719,7 +1746,7 @@ pub const Scan = struct {
         if (self.key_bound != null or self.sievedRows(rg_idx, rg_count) != null) return null;
         if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
         const phys = self.out_phys[0];
-        const db = (try self.holdDictBlock(seg, rg_idx, phys, 0, rg_count)) orelse return null;
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, 0, rg_count, .no_codes)) orelse return null;
         const buf = &self.dict_bufs[0];
         const ndv: usize = db.ndv;
         const dict: storage.StringView = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes };
@@ -1800,7 +1827,7 @@ pub const Scan = struct {
         if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
         const phys = self.filter_phys[0];
         if (self.table.schema.columns[phys].nullable) return null;
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), .no_codes);
         defer block.release(self.allocator, self.table.cacheRef());
         if (block.encoding != .dict) return null;
         const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
@@ -3325,7 +3352,8 @@ pub const Scan = struct {
         const lens = self.len_bufs[j].items[0..n];
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
+        const form: storage.segment_strings.Form = if (self.readsLengthsOnly(phys)) .no_bytes else .full;
+        var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), form);
         defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
@@ -3358,6 +3386,21 @@ pub const Scan = struct {
             measureRows(sv, rows, lens);
         }
         return lens;
+    }
+
+    /// Whether the scan reads column `phys` for its values' lengths alone:
+    /// projected, if at all, only as lengths, and filtered only by
+    /// comparisons with the empty string, which lengths place too. Its
+    /// blocks are then read without the values' bytes; any other column's
+    /// lengths and empty-string leaves share the whole block the scan reads
+    /// anyway.
+    fn readsLengthsOnly(self: *const Scan, phys: usize) bool {
+        if (self.derived_filter != null) return false;
+        for (self.out_phys, 0..) |p, j| {
+            if (p == phys and !(self.len_cols_by_j.len > j and self.len_cols_by_j[j])) return false;
+        }
+        const filter = self.fused_filter orelse return true;
+        return comparesOnlyWithEmpty(filter, self.table.schema.columns, phys);
     }
 
     /// A row group's dictionary entry lengths for length-only column `j`,
@@ -3419,10 +3462,10 @@ pub const Scan = struct {
                     }
                 }
             } else {
-                for (lens, 0..) |*l, k| l.* = @intCast(db.dictValue(db.rowCodeAs(w, if (rows) |r| r[k] else k)).len);
+                for (lens, 0..) |*l, k| l.* = db.valueLen(db.rowCodeAs(w, if (rows) |r| r[k] else k));
             },
             else => for (lens, 0..) |*l, k| {
-                l.* = @intCast(db.dictValue(db.rowCode(if (rows) |r| r[k] else k)).len);
+                l.* = db.valueLen(db.rowCode(if (rows) |r| r[k] else k));
             },
         }
     }
@@ -4216,7 +4259,12 @@ pub const Scan = struct {
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
-        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef());
+        // `dictBound` places the empty string by entry lengths alone.
+        const form: storage.segment_strings.Form = switch (leaf.val) {
+            .text => |t| if (t.len == 0 and self.readsLengthsOnly(pred_phys)) .no_bytes else .full,
+            else => .full,
+        };
+        var block = try seg.borrowStringBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef(), form);
         defer block.release(self.allocator, self.table.cacheRef());
         if (exec.prof.enabled) exec.prof.add("scan.leaf.borrow_block", @intCast(@max(0, exec.prof.nowTicks() - _tb)));
 
@@ -4386,6 +4434,7 @@ pub const Scan = struct {
     /// The first code whose entry orders after `literal` (`strict`), or at
     /// or after it, in a dictionary sorted ascending by bytes.
     fn dictBound(db: storage.segment_reader.DictBlock, literal: []const u8, strict: bool) u32 {
+        if (literal.len == 0) return @intFromBool(strict and db.ndv > 0 and db.valueLen(0) == 0);
         var lo: u32 = 0;
         var hi: u32 = db.ndv;
         while (lo < hi) {
