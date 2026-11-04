@@ -252,3 +252,76 @@ test "exact group keys keep keys whose digests collide in groups of their own" {
         try expectHavingPair(allocator, db, groups, copies);
     }
 }
+
+test "exact group keys keep colliding values apart in the count top-K by segment ids" {
+    // Segments alone, past the lowcard engine's groups in fillers held twice
+    // each, so the count top-K runs on the segment string ids. Its two best
+    // values share a narrowed digest and every row group of every segment.
+    const allocator = std.testing.allocator;
+    const sql = "SELECT s, COUNT(*) AS c FROM ids GROUP BY s ORDER BY c DESC LIMIT 2";
+    const rg_rows = 1024;
+    const rg_count = 64;
+    const segment_count = 3;
+    const pair = try collidingPair(allocator, stringDigest);
+    var names: [2][16]u8 = undefined;
+    const keys = [2][]const u8{ keyName(&names[0], pair[0]), keyName(&names[1], pair[1]) };
+    const per_rg = [2]usize{ 4, 3 };
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Row = struct { id: i64, s: []const u8 };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .auto_flush_secs = 0 });
+    defer db.close();
+    const t = try db.table("ids", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"}, .row_group_size = rg_rows });
+    var id: i64 = 0;
+    for (0..segment_count) |seg| {
+        var rows: std.ArrayList(Row) = .empty;
+        for (0..rg_count) |rg| {
+            for (keys, per_rg) |key, n| {
+                for (0..n) |_| {
+                    try rows.append(arena, .{ .id = id, .s = key });
+                    id += 1;
+                }
+            }
+            var f: usize = 0;
+            while (rows.items.len < (rg + 1) * rg_rows) : (f += 1) {
+                const filler = try std.fmt.allocPrint(arena, "f{d}-{d}-{d}", .{ seg, rg, f });
+                for (0..@min(2, (rg + 1) * rg_rows - rows.items.len)) |_| {
+                    try rows.append(arena, .{ .id = id, .s = filler });
+                    id += 1;
+                }
+            }
+        }
+        try t.insert(rows.items);
+        try t.flush();
+    }
+
+    setMode(true);
+    defer clearMode();
+    var plan = try runSql(allocator, db, "EXPLAIN " ++ sql);
+    defer plan.deinit();
+    var grouped = false;
+    while (try plan.next()) |batch| {
+        for (0..batch.row_count) |r| {
+            if (std.mem.indexOf(u8, batch.values[0].data.string.rowBytes(r), "V2 group-topN") != null) grouped = true;
+        }
+    }
+    try std.testing.expect(grouped);
+
+    var result = try runGroups(allocator, db, sql);
+    defer freeResult(allocator, &result);
+    try std.testing.expectEqual(@as(usize, 2), result.count());
+    for (keys, per_rg) |key, n| {
+        const result_key = try resultKey(allocator, 0, key);
+        defer allocator.free(result_key);
+        try std.testing.expectEqual(@as(i64, @intCast(segment_count * rg_count * n)), result.get(result_key) orelse return error.TestExpectedEqual);
+    }
+}

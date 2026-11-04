@@ -1341,7 +1341,10 @@ bytes decide among the keys found there.
   second key reported under one digest marks the digest shared: the filter
   pass then keeps every row under a candidate digest, and the answer stands
   only if its own counts prove it (`HeavyKeys.proves`); else the full plan
-  runs. A key never reported holds at most the slack, below τ.
+  runs. A key never reported holds at most the slack, below τ. The count
+  top-K by segment ids (§4.4) runs unchanged: it tells values apart by id
+  within a segment and by bytes across segments, so its digests only label
+  the rows it returns.
 - **HAVING.** Scan-time slot bounds (above) stay sound: a slot's count
   bounds every key in it from above, however many keys share its digest.
   HAVING itself reads the exact groups.
