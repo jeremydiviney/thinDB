@@ -40,6 +40,52 @@ pub fn ticksToMs(ticks: i64, freq: i64) f64 {
     return @as(f64, @floatFromInt(ticks)) * 1000.0 / @as(f64, @floatFromInt(freq));
 }
 
+/// Linux 5.14's MADV_POPULATE_READ, which `std.os.linux.MADV` lacks.
+const MADV_POPULATE_READ: u32 = 22;
+
+/// What `lockExecutable` did with the executable's loaded segments.
+pub const ExecutableLock = union(enum) {
+    /// Read in and pinned in memory: the bytes locked.
+    locked: usize,
+    /// Read in but not pinned, because mlock was refused (no CAP_IPC_LOCK and
+    /// an RLIMIT_MEMLOCK below the segments' size): the bytes read.
+    unlocked: usize,
+    /// Not Linux: the code loads on demand.
+    unsupported,
+};
+
+/// Reads the executable's loaded segments into memory and pins them there, as
+/// ClickHouse's `mlock_executable` does. A server started over a cold page cache
+/// otherwise faults its code in from disk a page at a time, one wait each,
+/// inside its first queries, and heavy scan I/O can later evict that code
+/// again. When mlock is refused the segments are still read in, without the
+/// pin; an older kernel without MADV_POPULATE_READ gets the asynchronous
+/// MADV_WILLNEED read-ahead instead.
+pub fn lockExecutable() ExecutableLock {
+    if (builtin.os.tag != .linux) return .unsupported;
+    const linux = std.os.linux;
+    const phdrs = std.posix.getSelfPhdrs();
+    const base = for (phdrs) |phdr| {
+        if (phdr.type == .PHDR) break @intFromPtr(phdrs.ptr) - phdr.vaddr;
+    } else return .unsupported;
+    const page = std.heap.pageSize();
+    var bytes: usize = 0;
+    var all_locked = true;
+    for (phdrs) |phdr| {
+        if (phdr.type != .LOAD or phdr.filesz == 0) continue;
+        const start = std.mem.alignBackward(usize, base + phdr.vaddr, page);
+        const len = base + phdr.vaddr + phdr.filesz - start;
+        const ptr: [*]u8 = @ptrFromInt(start);
+        bytes += len;
+        if (linux.errno(linux.mlock(ptr, len)) == .SUCCESS) continue;
+        all_locked = false;
+        if (linux.errno(linux.madvise(ptr, len, MADV_POPULATE_READ)) != .SUCCESS) {
+            _ = linux.madvise(ptr, len, linux.MADV.WILLNEED);
+        }
+    }
+    return if (all_locked) .{ .locked = bytes } else .{ .unlocked = bytes };
+}
+
 const WinAffinity = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn GetLogicalProcessorInformation(buf: ?[*]LogicalProcInfo, len: *u32) callconv(.winapi) win.BOOL;
 } else struct {};

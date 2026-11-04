@@ -430,6 +430,7 @@ pub fn main(init: std.process.Init) !u8 {
     var digest_seed: [8]u8 = undefined;
     io.random(&digest_seed);
     thindb.exec.setDigestSeed(std.mem.readInt(u64, &digest_seed, .little));
+    const executable_lock = thindb.lockExecutable();
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
         try err_w.flush();
@@ -460,6 +461,11 @@ pub fn main(init: std.process.Init) !u8 {
     });
     try out_w.print("  threads:  max-dop {d}, hardware threads {d}\n", .{ cfg.max_dop, thindb.hardwareThreadCount() });
     try printMemoryBanner(out_w, catalog.config);
+    switch (executable_lock) {
+        .locked => |n| try out_w.print("  code:     {d} MiB locked in memory\n", .{n >> 20}),
+        .unlocked => |n| try out_w.print("  code:     {d} MiB read in, not locked (mlock needs CAP_IPC_LOCK or a higher RLIMIT_MEMLOCK)\n", .{n >> 20}),
+        .unsupported => {},
+    }
 
     var listeners: [3]Listener = undefined;
     var n_listeners: usize = 0;
