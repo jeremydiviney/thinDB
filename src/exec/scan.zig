@@ -122,6 +122,29 @@ fn collectPredicateColumns(
     }
 }
 
+/// Whether `expr` reads column `phys` only through comparisons with the
+/// empty string.
+fn comparesOnlyWithEmpty(expr: PredicateExpr, schema: []const Column, phys: usize) bool {
+    const t = @import("../types.zig");
+    return switch (expr) {
+        .leaf => |p| t.findColumn(schema, p.col) != phys or switch (p.val) {
+            .text => |s| s.len == 0,
+            else => false,
+        },
+        .day_leaf, .text_as_number => |p| t.findColumn(schema, p.col) != phys,
+        .leaf_col_col => |lc| t.findColumn(schema, lc.left) != phys and t.findColumn(schema, lc.right) != phys,
+        .is_null, .is_not_null => |col_name| t.findColumn(schema, col_name) != phys,
+        .like => |lp| t.findColumn(schema, lp.col) != phys,
+        .in_set, .text_as_number_set => |s| t.findColumn(schema, s.col) != phys,
+        .@"and", .@"or" => |children| for (children) |child| {
+            if (!comparesOnlyWithEmpty(child, schema, phys)) break false;
+        } else true,
+        .not => |child| comparesOnlyWithEmpty(child.*, schema, phys),
+        .always => true,
+        else => false,
+    };
+}
+
 fn addPredicateColumn(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(usize), idx_opt: ?usize) !void {
     const idx = idx_opt orelse return;
     for (out.items) |e| if (e == idx) return;
@@ -3329,7 +3352,8 @@ pub const Scan = struct {
         const lens = self.len_bufs[j].items[0..n];
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
-        var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), .no_bytes);
+        const form: storage.segment_strings.Form = if (self.readsLengthsOnly(phys)) .no_bytes else .full;
+        var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.table.cacheRef(), form);
         defer block.release(self.allocator, self.table.cacheRef());
 
         if (block.encoding == .dict) {
@@ -3362,6 +3386,21 @@ pub const Scan = struct {
             measureRows(sv, rows, lens);
         }
         return lens;
+    }
+
+    /// Whether the scan reads column `phys` for its values' lengths alone:
+    /// projected, if at all, only as lengths, and filtered only by
+    /// comparisons with the empty string, which lengths place too. Its
+    /// blocks are then read without the values' bytes; any other column's
+    /// lengths and empty-string leaves share the whole block the scan reads
+    /// anyway.
+    fn readsLengthsOnly(self: *const Scan, phys: usize) bool {
+        if (self.derived_filter != null) return false;
+        for (self.out_phys, 0..) |p, j| {
+            if (p == phys and !(self.len_cols_by_j.len > j and self.len_cols_by_j[j])) return false;
+        }
+        const filter = self.fused_filter orelse return true;
+        return comparesOnlyWithEmpty(filter, self.table.schema.columns, phys);
     }
 
     /// A row group's dictionary entry lengths for length-only column `j`,
@@ -4222,7 +4261,7 @@ pub const Scan = struct {
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         // `dictBound` places the empty string by entry lengths alone.
         const form: storage.segment_strings.Form = switch (leaf.val) {
-            .text => |t| if (t.len == 0) .no_bytes else .full,
+            .text => |t| if (t.len == 0 and self.readsLengthsOnly(pred_phys)) .no_bytes else .full,
             else => .full,
         };
         var block = try seg.borrowStringBlock(self.allocator, rg_idx, pred_phys, self.table.cacheRef(), form);
