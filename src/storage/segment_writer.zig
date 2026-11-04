@@ -1038,10 +1038,12 @@ fn appendBlock(
     table_compression: types.TableCompression,
 ) !void {
     const raw_size: u32 = @intCast(payload.len);
+    var directory: std.ArrayList(u8) = .empty;
+    defer directory.deinit(allocator);
     var rewritten: std.ArrayList(u8) = .empty;
     defer rewritten.deinit(allocator);
     const rewrite = table_compression != .none and streams.len > 0 and
-        try int_streams.transform(allocator, compressor, payload, streams, &rewritten);
+        try int_streams.transform(allocator, compressor, payload, streams, &directory, &rewritten);
     const source = if (rewrite) rewritten.items else payload;
     var compressed: ?[]u8 = null;
     defer if (compressed) |c| allocator.free(c);
@@ -1058,12 +1060,11 @@ fn appendBlock(
         },
     }
     const stored = if (kind != .none) compressed.? else source;
-    const stored_prefix: usize = if (rewrite) 4 else 0;
 
     const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls, .int_streams = rewrite };
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
-    try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + stored_prefix + stored.len);
+    try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + directory.items.len + stored.len);
     buf.appendAssumeCapacity(@backingInt(kind));
     buf.appendAssumeCapacity(flags.toByte());
     buf.appendAssumeCapacity(encoding_byte);
@@ -1071,12 +1072,9 @@ fn appendBlock(
     var b4: [4]u8 = undefined;
     format.writeU32(&b4, raw_size);
     buf.appendSliceAssumeCapacity(&b4);
-    format.writeU32(&b4, @intCast(stored_prefix + stored.len));
+    format.writeU32(&b4, @intCast(directory.items.len + stored.len));
     buf.appendSliceAssumeCapacity(&b4);
-    if (rewrite) {
-        format.writeU32(&b4, @intCast(source.len));
-        buf.appendSliceAssumeCapacity(&b4);
-    }
+    buf.appendSliceAssumeCapacity(directory.items);
     buf.appendSliceAssumeCapacity(stored);
 }
 

@@ -8,8 +8,9 @@
 //! restores the exact payload right after decompressing it, so the block
 //! cache and every decoder past it see what the encoder wrote.
 //!
-//! Stored payload of a block whose header sets `ColumnBlockFlags.int_streams`:
+//! Stored bytes of a block whose header sets `ColumnBlockFlags.int_streams`:
 //!
+//!   the directory, uncompressed:
 //!   [stream_count: u32]
 //!   per rewritten array, `entry_size` bytes:
 //!     [offset: u32]        its byte offset in the payload
@@ -20,13 +21,15 @@
 //!                          never more than `width`
 //!     [pad: u8]
 //!     [base: u64][factor: u64][first: u64]
-//!   the payload, each rewritten array replaced by its stored values
+//!   the codec frame of the stored payload: the payload, each rewritten array
+//!   replaced by its stored values
 //!
-//! At most `max_streams` arrays are rewritten, and the stored form is never
-//! longer than the payload. With every array stored no wider than it was,
-//! the reader can decompress the stored form into the tail of the payload's
-//! own buffer and restore front to back in place: what it writes never
-//! overtakes what it has yet to read.
+//! Every array is stored no wider than it was, so the stored payload is never
+//! longer than the payload, by as much as the directory says. The reader
+//! decompresses it into the tail of the payload's own buffer and restores
+//! front to back in place: what it writes never overtakes what it has yet to
+//! read. Keeping the directory out of the frame keeps that true for an array
+//! that only changes form (byte planes at its own width).
 //!
 //! Arithmetic is modulo 2^64 and every value is written back truncated to
 //! `width` bytes, so restoring is exact for any input (a stored value
@@ -57,7 +60,6 @@ pub const Stream = struct {
 pub const Method = enum(u8) { plain = 0, frame = 1, delta = 2 };
 pub const shuffled_bit: u8 = 0x80;
 pub const entry_size: usize = 36;
-pub const max_streams: usize = 8;
 
 /// Values a trial compresses per candidate form: enough to rank forms as
 /// well as a trial on the whole array, at a fraction of its cost.
@@ -78,15 +80,17 @@ const Form = struct {
 
 const Rewrite = struct { stream: Stream, form: Form };
 
-/// Appends `payload` to `out` with each of `streams` (in payload order, not
-/// overlapping) rewritten in the form a trial compresses smallest, and
-/// returns true; or returns false, leaving `out` as it was, when every array
-/// is smallest as it is.
+/// Appends to `directory` and `out` the directory and stored payload of
+/// `payload` with each of `streams` (in payload order, not overlapping)
+/// rewritten in the form a trial compresses smallest, and returns true; or
+/// returns false, leaving both as they were, when every array is smallest as
+/// it is.
 pub fn transform(
     allocator: Allocator,
     compressor: *compression.Compressor,
     payload: []const u8,
     streams: []const Stream,
+    directory: *std.ArrayList(u8),
     out: *std.ArrayList(u8),
 ) !bool {
     var rewrites: std.ArrayList(Rewrite) = .empty;
@@ -99,7 +103,6 @@ pub fn transform(
     defer allocator.free(window);
 
     for (streams) |s| {
-        if (rewrites.items.len == max_streams) break;
         if (s.count < min_values) continue;
         const bytes = payload[s.offset..][0 .. @as(usize, s.count) * s.width];
         const n: usize = @min(s.count, trial_values);
@@ -109,12 +112,14 @@ pub fn transform(
     }
     if (rewrites.items.len == 0) return false;
 
+    const directory_start = directory.items.len;
+    errdefer directory.shrinkRetainingCapacity(directory_start);
     const start = out.items.len;
     errdefer out.shrinkRetainingCapacity(start);
-    try out.ensureUnusedCapacity(allocator, 4 + rewrites.items.len * entry_size);
-    appendU32Assume(out, @intCast(rewrites.items.len));
-    const entries_at = out.items.len;
-    out.appendNTimesAssumeCapacity(0, rewrites.items.len * entry_size);
+    try directory.ensureUnusedCapacity(allocator, 4 + rewrites.items.len * entry_size);
+    appendU32Assume(directory, @intCast(rewrites.items.len));
+    const entries_at = directory.items.len;
+    directory.appendNTimesAssumeCapacity(0, rewrites.items.len * entry_size);
 
     var at: usize = 0;
     for (rewrites.items, 0..) |*r, i| {
@@ -130,37 +135,51 @@ pub fn transform(
         r.form = fit(values, r.form.method, s).?;
         r.form.shuffled = shuffled;
         try appendStored(allocator, out, values, r.form);
-        writeEntry(out.items[entries_at + i * entry_size ..][0..entry_size], s, r.form);
+        writeEntry(directory.items[entries_at + i * entry_size ..][0..entry_size], s, r.form);
         at = s.offset + @as(usize, s.count) * s.width;
     }
     try out.appendSlice(allocator, payload[at..]);
-    if (out.items.len - start > payload.len) {
-        out.shrinkRetainingCapacity(start);
-        return false;
-    }
     return true;
 }
 
-/// Rebuilds the payload filling `buf` from its stored form, which fills
-/// `buf[stored_at..]`, in place. `allocator` holds a byte-plane array while
-/// it is restored.
-pub fn restore(allocator: Allocator, buf: []u8, stored_at: usize) !void {
-    const corrupt = format.Error.CorruptColumnBlockHeader;
-    const stored_len = buf.len - stored_at;
-    if (stored_len < 4) return corrupt;
-    const n = format.readU32(buf[stored_at..][0..4]);
-    if (n > max_streams) return corrupt;
-    const dir_end = 4 + @as(usize, n) * entry_size;
-    if (dir_end > stored_len) return corrupt;
-    // The restore overwrites the directory first.
-    var entries: [max_streams]Entry = undefined;
-    for (entries[0..n], 0..) |*e, i| e.* = try readEntry(buf[stored_at + 4 + i * entry_size ..][0..entry_size]);
+/// The directory heading a block's stored bytes.
+pub const Directory = struct {
+    /// `stream_count`, then the entries.
+    bytes: []const u8,
+    /// Bytes of the stored payload in the codec frame after the directory.
+    stored_len: usize,
+};
 
+/// Reads the directory at the start of `stored`, the stored bytes of a
+/// payload of `payload_len` bytes.
+pub fn readDirectory(stored: []const u8, payload_len: usize) !Directory {
+    const corrupt = format.Error.CorruptColumnBlockHeader;
+    if (stored.len < 4) return corrupt;
+    const n = format.readU32(stored[0..4]);
+    if (n > (stored.len - 4) / entry_size) return corrupt;
+    const bytes = stored[0 .. 4 + @as(usize, n) * entry_size];
+    var shed: usize = 0;
+    for (0..n) |i| {
+        const e = try readEntry(bytes[4 + i * entry_size ..][0..entry_size]);
+        shed += @as(usize, e.stream.count) * e.stream.width - storedCount(e.stream.count, e.form.method) * e.form.stored_width;
+    }
+    if (shed > payload_len) return corrupt;
+    return .{ .bytes = bytes, .stored_len = payload_len - shed };
+}
+
+/// Rebuilds the payload filling `buf` in place from its stored payload,
+/// which fills `buf[buf.len - directory.stored_len ..]`. `allocator` holds a
+/// byte-plane array while it is restored.
+pub fn restore(allocator: Allocator, directory: Directory, buf: []u8) !void {
+    const corrupt = format.Error.CorruptColumnBlockHeader;
+    if (directory.stored_len > buf.len) return corrupt;
     var planes: []u8 = &.{};
     defer allocator.free(planes);
-    var src: usize = stored_at + dir_end;
+    var src: usize = buf.len - directory.stored_len;
     var dst: usize = 0;
-    for (entries[0..n]) |e| {
+    const n = (directory.bytes.len - 4) / entry_size;
+    for (0..n) |i| {
+        const e = try readEntry(directory.bytes[4 + i * entry_size ..][0..entry_size]);
         const len = @as(usize, e.stream.count) * e.stream.width;
         if (e.stream.offset < dst or e.stream.offset + len > buf.len) return corrupt;
         const gap = e.stream.offset - dst;
@@ -482,27 +501,31 @@ fn expectRoundTrip(payload: []const u8, streams: []const Stream) !bool {
     const allocator = std.testing.allocator;
     var compressor = try compression.Compressor.init();
     defer compressor.deinit();
+    var directory: std.ArrayList(u8) = .empty;
+    defer directory.deinit(allocator);
     var stored: std.ArrayList(u8) = .empty;
     defer stored.deinit(allocator);
-    const rewritten = try transform(allocator, &compressor, payload, streams, &stored);
+    const rewritten = try transform(allocator, &compressor, payload, streams, &directory, &stored);
     if (!rewritten) {
+        try std.testing.expectEqual(@as(usize, 0), directory.items.len);
         try std.testing.expectEqual(@as(usize, 0), stored.items.len);
         return false;
     }
-    const out = try restoreCopy(stored.items, payload.len);
+    const out = try restoreCopy(directory.items, stored.items, payload.len);
     defer allocator.free(out);
     try std.testing.expectEqualSlices(u8, payload, out);
     return true;
 }
 
 /// `stored` restored into a fresh buffer of `len` bytes, as a reader does.
-fn restoreCopy(stored: []const u8, len: usize) ![]u8 {
+fn restoreCopy(directory_bytes: []const u8, stored: []const u8, len: usize) ![]u8 {
     const allocator = std.testing.allocator;
-    if (stored.len > len) return format.Error.CorruptColumnBlockHeader;
+    const directory = try readDirectory(directory_bytes, len);
+    if (stored.len != directory.stored_len) return format.Error.CorruptColumnBlockHeader;
     const out = try allocator.alloc(u8, len);
     errdefer allocator.free(out);
     @memcpy(out[len - stored.len ..], stored);
-    try restore(allocator, out, len - stored.len);
+    try restore(allocator, directory, out);
     return out;
 }
 
@@ -572,14 +595,18 @@ test "int_streams restore rejects truncated and malformed stored forms" {
     defer compressor.deinit();
     const count = 1000;
     var payload: [count * 8]u8 = undefined;
-    for (0..count) |i| storeValues(&payload, 8, i, &.{1_700_000_000 + i * 60});
+    // Not all one difference: a zero-width stored payload has no byte to cut.
+    for (0..count) |i| storeValues(&payload, 8, i, &.{1_700_000_000 + i * 60 + i % 7});
+    var directory: std.ArrayList(u8) = .empty;
+    defer directory.deinit(allocator);
     var stored: std.ArrayList(u8) = .empty;
     defer stored.deinit(allocator);
-    try std.testing.expect(try transform(allocator, &compressor, &payload, &.{.{ .offset = 0, .count = count, .width = 8 }}, &stored));
+    try std.testing.expect(try transform(allocator, &compressor, &payload, &.{.{ .offset = 0, .count = count, .width = 8 }}, &directory, &stored));
     const corrupt = format.Error.CorruptColumnBlockHeader;
-    try std.testing.expectError(corrupt, restoreCopy(stored.items[0 .. stored.items.len - 1], payload.len));
-    try std.testing.expectError(corrupt, restoreCopy(stored.items[0..2], payload.len));
-    try std.testing.expectError(corrupt, restoreCopy(stored.items, payload.len - 1));
-    stored.items[4 + 8] = 5;
-    try std.testing.expectError(corrupt, restoreCopy(stored.items, payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(directory.items, stored.items[0 .. stored.items.len - 1], payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(directory.items[0 .. directory.items.len - 1], stored.items, payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(directory.items[0..2], stored.items, payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(directory.items, stored.items, 16));
+    directory.items[4 + 8] = 5;
+    try std.testing.expectError(corrupt, restoreCopy(directory.items, stored.items, payload.len));
 }

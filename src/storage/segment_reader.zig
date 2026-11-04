@@ -760,23 +760,22 @@ fn getDecompressedBytes(
     }
 }
 
-/// Decompresses an `int_streams` block's stored bytes, `body`, into the
-/// tail of `out` and restores its payload there in place.
+/// Decompresses the stored payload of an `int_streams` block, whose stored
+/// bytes are `body`, into the tail of `out` and restores its payload there
+/// in place.
 fn restoreIntStreams(allocator: Allocator, kind: format.Compression, body: []const u8, out: []u8) !void {
-    if (body.len < 4) return format.Error.CorruptColumnBlockHeader;
-    const stored_size = format.readU32(body[0..4]);
-    if (stored_size > out.len) return format.Error.CorruptColumnBlockHeader;
-    const frame = body[4..];
-    const stored_at = out.len - stored_size;
+    const directory = try int_streams.readDirectory(body, out.len);
+    const frame = body[directory.bytes.len..];
+    const stored = out[out.len - directory.stored_len ..];
     switch (kind) {
         .none => {
-            if (frame.len != stored_size) return format.Error.CorruptColumnBlockHeader;
-            @memcpy(out[stored_at..], frame);
+            if (frame.len != stored.len) return format.Error.CorruptColumnBlockHeader;
+            @memcpy(stored, frame);
         },
-        .zstd => try compression_mod.decompressInto(frame, out[stored_at..]),
-        .lz4 => try compression_mod.lz4DecompressInto(frame, out[stored_at..]),
+        .zstd => try compression_mod.decompressInto(frame, stored),
+        .lz4 => try compression_mod.lz4DecompressInto(frame, stored),
     }
-    try int_streams.restore(allocator, out, stored_at);
+    try int_streams.restore(allocator, directory, out);
 }
 
 /// Decode a decompressed block payload into an OwnedColumn, dispatching on the
