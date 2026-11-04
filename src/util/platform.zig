@@ -47,8 +47,8 @@ const MADV_POPULATE_READ: u32 = 22;
 pub const ExecutableLock = union(enum) {
     /// Read in and pinned in memory: the bytes locked.
     locked: usize,
-    /// Read in but not pinned, because mlock was refused (no CAP_IPC_LOCK and
-    /// an RLIMIT_MEMLOCK below the segments' size): the bytes read.
+    /// Read in, but mlock was refused for some of it (no CAP_IPC_LOCK and an
+    /// RLIMIT_MEMLOCK below the segments' size): the bytes read.
     unlocked: usize,
     /// Not Linux: the code loads on demand.
     unsupported,

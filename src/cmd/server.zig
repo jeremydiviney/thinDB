@@ -463,7 +463,7 @@ pub fn main(init: std.process.Init) !u8 {
     try printMemoryBanner(out_w, catalog.config);
     switch (executable_lock) {
         .locked => |n| try out_w.print("  code:     {d} MiB locked in memory\n", .{n >> 20}),
-        .unlocked => |n| try out_w.print("  code:     {d} MiB read in, not locked (mlock needs CAP_IPC_LOCK or a higher RLIMIT_MEMLOCK)\n", .{n >> 20}),
+        .unlocked => |n| try out_w.print("  code:     {d} MiB read in, not all locked (mlock needs CAP_IPC_LOCK or a higher RLIMIT_MEMLOCK)\n", .{n >> 20}),
         .unsupported => {},
     }
 
