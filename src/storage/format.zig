@@ -62,7 +62,11 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v12→v13: segment string tables (DESIGN.md §4.4, `segment_strings.zig`).
 /// String columns' row-group blocks move after the last row group, so the
 /// footer gains each column block's length and a string-table directory.
-pub const segment_version: u16 = 13;
+///
+/// v13→v14: integer-stream transforms (`int_streams.zig`). A block whose
+/// flags set `int_streams` stores its payload with integer arrays rewritten
+/// before compression.
+pub const segment_version: u16 = 14;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -168,12 +172,14 @@ pub fn dictEntryStatWidth(row_count: u32) u8 {
 }
 
 /// Per-column-block flags (u8). Bit 0 = has_nulls (decompressed payload is
-/// prefixed by a validity bitmap). Bit 1 was the v12 "cache compressed at
-/// rest" hint; the cache now decompresses every block at fill, so the reader
-/// ignores it and the writer leaves it clear. Remaining bits reserved.
+/// prefixed by a validity bitmap). Bit 1 = int_streams: the stored bytes are
+/// `[stored_size: u32]` and then the compressed `int_streams` form of the
+/// payload, which decompresses to `stored_size` bytes and restores to the
+/// header's `uncompressed_size`. Remaining bits reserved.
 pub const ColumnBlockFlags = packed struct(u8) {
     has_nulls: bool = false,
-    _reserved: u7 = 0,
+    int_streams: bool = false,
+    _reserved: u6 = 0,
 
     pub fn toByte(self: ColumnBlockFlags) u8 {
         return @bitCast(self);

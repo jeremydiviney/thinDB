@@ -36,6 +36,7 @@ const TableSchema = types.TableSchema;
 const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
+const int_streams = @import("int_streams.zig");
 const fsst = @import("fsst.zig");
 const segment_strings = @import("segment_strings.zig");
 const storage_cache = @import("cache.zig");
@@ -139,7 +140,7 @@ pub const ReadSegment = struct {
         const raw = if (isSegmentDictBlock(block))
             try self.rebuildSegmentDict(block_alloc, allocator, block, rg, column_idx, tc)
         else
-            try getDecompressedBytes(block_alloc, block, 0);
+            try getDecompressedBytes(block_alloc, allocator, block, 0);
         errdefer block_alloc.free(raw);
         return cc.insertPinned(key, raw, blockEncoding(block, 0));
     }
@@ -228,7 +229,7 @@ pub const ReadSegment = struct {
             {
                 return format.Error.CorruptColumnBlockHeader;
             }
-            return getDecompressedBytes(out_allocator, block, 0);
+            return getDecompressedBytes(out_allocator, self.allocator, block, 0);
         }
 
         fn release(self: *SharedPages) void {
@@ -308,7 +309,7 @@ pub const ReadSegment = struct {
         const raw = if (isSegmentDictBlock(block))
             try self.rebuildSegmentDict(allocator, allocator, block, rg, column_idx, null)
         else
-            try getDecompressedBytes(allocator, block, 0);
+            try getDecompressedBytes(allocator, allocator, block, 0);
         return .{ .bytes = raw, .encoding = blockEncoding(block, 0), .owned = raw };
     }
 
@@ -700,6 +701,13 @@ fn readBlockRaw(
     const payload_start = offset + format.column_block_header_size;
     const payload = bytes[payload_start .. payload_start + compressed_size];
 
+    if (format.ColumnBlockFlags.fromByte(bytes[offset + 1]).int_streams) {
+        const r = try allocator.alloc(u8, uncompressed_size);
+        errdefer allocator.free(r);
+        try restoreIntStreams(allocator, kind, payload, r);
+        owned_raw.* = r;
+        return r;
+    }
     switch (kind) {
         .none => return payload,
         .zstd => {
@@ -719,9 +727,11 @@ fn readBlockRaw(
 
 /// Like `readBlockRaw` but ALWAYS returns owned, 16-byte-aligned bytes (caller
 /// frees), so it can be inserted into the cache and viewed zero-copy. For
-/// uncompressed blocks, allocates an aligned copy.
+/// uncompressed blocks, allocates an aligned copy. `scratch` holds an
+/// `int_streams` block's stored form while it is restored.
 fn getDecompressedBytes(
     allocator: Allocator,
+    scratch: Allocator,
     bytes: []const u8,
     offset: usize,
 ) ![]align(16) u8 {
@@ -733,6 +743,12 @@ fn getDecompressedBytes(
     const payload_start = offset + format.column_block_header_size;
     const payload = bytes[payload_start .. payload_start + compressed_size];
 
+    if (format.ColumnBlockFlags.fromByte(bytes[offset + 1]).int_streams) {
+        const dst = try allocator.alignedAlloc(u8, .@"16", uncompressed_size);
+        errdefer allocator.free(dst);
+        try restoreIntStreams(scratch, kind, payload, dst);
+        return dst;
+    }
     switch (kind) {
         .none => {
             const dst = try allocator.alignedAlloc(u8, .@"16", payload.len);
@@ -742,6 +758,29 @@ fn getDecompressedBytes(
         .zstd => return compression_mod.decompressAligned(allocator, payload, uncompressed_size),
         .lz4 => return compression_mod.lz4DecompressAligned(allocator, payload, uncompressed_size),
     }
+}
+
+/// Decompresses an `int_streams` block's stored bytes, `body`, and restores
+/// its payload into `out`.
+fn restoreIntStreams(allocator: Allocator, kind: format.Compression, body: []const u8, out: []u8) !void {
+    if (body.len < 4) return format.Error.CorruptColumnBlockHeader;
+    const frame = body[4..];
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| allocator.free(o);
+    const stored: []const u8 = switch (kind) {
+        .none => frame,
+        .zstd, .lz4 => decompressed: {
+            const buf = try allocator.alloc(u8, format.readU32(body[0..4]));
+            owned = buf;
+            if (kind == .zstd) {
+                try compression_mod.decompressInto(frame, buf);
+            } else {
+                try compression_mod.lz4DecompressInto(frame, buf);
+            }
+            break :decompressed buf;
+        },
+    };
+    try int_streams.restore(stored, out);
 }
 
 /// Decode a decompressed block payload into an OwnedColumn, dispatching on the

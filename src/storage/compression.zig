@@ -108,7 +108,20 @@ pub const Compressor = struct {
 
         return try allocator.realloc(dst, written);
     }
+
+    /// The size `input` compresses to at zstd `level`, compressing into
+    /// `dst` (at least `compressBound(input.len)` bytes).
+    pub fn compressedSize(self: *Compressor, dst: []u8, input: []const u8, level: c_int) !usize {
+        const written = c.ZSTD_compressCCtx(self.cctx, dst.ptr, dst.len, input.ptr, input.len, level);
+        if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
+        return written;
+    }
 };
+
+/// Largest zstd frame `size` input bytes can compress to.
+pub fn compressBound(size: usize) usize {
+    return c.ZSTD_compressBound(size);
+}
 
 /// One-shot compress at `default_level`: convenience wrapper around
 /// `Compressor.compress` that creates a fresh CCtx for a single call. Use

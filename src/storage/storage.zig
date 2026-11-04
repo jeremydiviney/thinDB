@@ -709,6 +709,67 @@ test "FOR encoding round-trips narrow-range int/bigint incl. negatives + nulls" 
     }
 }
 
+test "integer-stream transforms: a wide datetime block stores rewritten and reads back exactly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const schema = TableSchema{
+        .columns = &.{
+            .{ .name = "ts", .type = .datetime },
+            .{ .name = "tag", .type = .string },
+        },
+        .order_key = &.{"ts"},
+        .unique = false,
+    };
+
+    const n_rows = 4096;
+    var ts: [n_rows]i64 = undefined;
+    var tag_offsets: [n_rows + 1]u32 = undefined;
+    var tag_bytes: std.ArrayList(u8) = .empty;
+    defer tag_bytes.deinit(allocator);
+    tag_offsets[0] = 0;
+    for (0..n_rows) |i| {
+        // A span past u32 keeps the block raw (FOR declines), and a common
+        // step leaves the rewrite plenty to save.
+        ts[i] = 1_700_000_000_000_000 + @as(i64, @intCast(i)) * 2_000_003 + @as(i64, @intCast(i % 3));
+        try tag_bytes.print(allocator, "tag-{d}", .{i % 37});
+        tag_offsets[i + 1] = @intCast(tag_bytes.items.len);
+    }
+    const columns = [_]ColumnView{
+        .{ .data = .{ .datetime = &ts } },
+        .{ .data = .{ .string = .{ .offsets = &tag_offsets, .bytes = tag_bytes.items } } },
+    };
+
+    var info = try writeSegment(allocator, io, tmp.dir, "ints.dat", schema, 3, 0, n_rows, &columns, false, 1);
+    defer info.deinit(allocator);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "ints.dat", schema);
+    defer seg.deinit();
+
+    const file = try tmp.dir.readFileAlloc(io, "ints.dat", allocator, .unlimited);
+    defer allocator.free(file);
+    const ts_block = seg.info.row_groups[0].col_offsets[0];
+    try std.testing.expect(format.ColumnBlockFlags.fromByte(file[ts_block + 1]).int_streams);
+
+    var owned_ts = try seg.decodeColumn(allocator, schema, 0, 0);
+    defer owned_ts.deinit(allocator);
+    try std.testing.expectEqualSlices(i64, &ts, owned_ts.data.datetime);
+
+    var owned_tag = try seg.decodeColumn(allocator, schema, 0, 1);
+    defer owned_tag.deinit(allocator);
+    for (0..n_rows) |i| {
+        try std.testing.expectEqualStrings(tag_bytes.items[tag_offsets[i]..tag_offsets[i + 1]], owned_tag.view().data.string.rowBytes(i));
+    }
+
+    var block = try seg.borrowColumnBlock(allocator, 0, 0, null);
+    defer block.release(allocator, null);
+    try std.testing.expectEqual(format.Encoding.raw, block.encoding);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ts), block.bytes);
+}
+
 test "forBlockOf parses base/width/codes (2B narrow accessor)" {
     // A FOR block over [10, 13]: base = 10, width = 1, deltas {0,3,1}.
     const row_count: u32 = 3;

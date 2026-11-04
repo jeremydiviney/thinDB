@@ -16,10 +16,12 @@ const format = @import("format.zig");
 const column = @import("column.zig");
 const compression_mod = @import("compression.zig");
 const fsst = @import("fsst.zig");
+const int_streams = @import("int_streams.zig");
 const segment_strings = @import("segment_strings.zig");
 const hll = @import("../util/hll.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
+const Streams = std.ArrayList(int_streams.Stream);
 const RowGroupMeta = format.RowGroupMeta;
 const SegmentInfo = format.SegmentInfo;
 
@@ -415,9 +417,9 @@ fn writeStringTables(
         errdefer allocator.free(pages);
         for (pages, 0..) |*page, p| {
             payload.clearRetainingCapacity();
-            try cs.pagePayload(allocator, @intCast(p), &payload);
+            const offsets = try cs.pagePayload(allocator, @intCast(p), &payload);
             page_block.clearRetainingCapacity();
-            try appendBlock(allocator, &compressor, &page_block, payload.items, @backingInt(format.Encoding.raw), false, table_compression);
+            try appendBlock(allocator, &compressor, &page_block, payload.items, &.{offsets}, @backingInt(format.Encoding.raw), false, table_compression);
             page.* = .{ .offset = out.offset(), .length = @intCast(page_block.items.len) };
             try out.append(allocator, page_block.items);
         }
@@ -467,8 +469,10 @@ fn encodeStringBlock(
 ) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
-    try cs.blockPayload(allocator, b, &payload);
-    try appendBlock(allocator, compressor, out, payload.items, format.segment_dict_encoding, b.bitmap.len > 0, table_compression);
+    var streams: Streams = .empty;
+    defer streams.deinit(allocator);
+    try cs.blockPayload(allocator, b, &payload, &streams);
+    try appendBlock(allocator, compressor, out, payload.items, streams.items, format.segment_dict_encoding, b.bitmap.len > 0, table_compression);
 }
 
 /// One column's string table, laid out apart from its segment file in
@@ -780,8 +784,8 @@ pub const MergedSegmentWriter = struct {
         if (i >= build.page_count) return encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
-        try cs.pagePayload(self.allocator, @intCast(i), &payload);
-        try appendBlock(self.allocator, compressor, &build.pieces[i], payload.items, @backingInt(format.Encoding.raw), false, self.schema.compression);
+        const offsets = try cs.pagePayload(self.allocator, @intCast(i), &payload);
+        try appendBlock(self.allocator, compressor, &build.pieces[i], payload.items, &.{offsets}, @backingInt(format.Encoding.raw), false, self.schema.compression);
     }
 
     /// Places `build`'s string table at the file's end, pointing its row
@@ -978,6 +982,8 @@ fn writeColumnBlock(
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
+    var streams: Streams = .empty;
+    defer streams.deinit(allocator);
 
     // Validity bitmap prefix. We emit it whenever the column is declared
     // nullable, even if no rows are actually null in this block — the reader
@@ -993,25 +999,31 @@ fn writeColumnBlock(
     // only when its run body beats BOTH raw and this block's FOR candidate, so
     // the chain order encodes "pick the smallest". Dict (strings) is mutually
     // exclusive with the int-family encoders by column type.
-    const encoding: format.Encoding = if (try tryEncodeRle(allocator, &scratch, view, row_start, row_end))
+    const encoding: format.Encoding = if (try tryEncodeRle(allocator, &scratch, &streams, view, row_start, row_end))
         .rle
-    else if (try tryEncodeFor(allocator, &scratch, view, row_start, row_end))
+    else if (try tryEncodeFor(allocator, &scratch, &streams, view, row_start, row_end))
         .for_
-    else if (try tryEncodeDict(allocator, &scratch, view, row_start, row_end, !nullable))
+    else if (try tryEncodeDict(allocator, &scratch, &streams, view, row_start, row_end, !nullable))
         .dict
     else if (table_compression == .lz4_fsst and
-        try tryEncodeFsst(allocator, &scratch, view, row_start, row_end, fsst_min_block_bytes, fsst_threads))
+        try tryEncodeFsst(allocator, &scratch, &streams, view, row_start, row_end, fsst_min_block_bytes, fsst_threads))
         .fsst
     else blk: {
-        try writeRawColumnBlock(allocator, &scratch, view, row_start, row_end);
+        try writeRawColumnBlock(allocator, &scratch, &streams, view, row_start, row_end);
         break :blk .raw;
     };
 
-    try appendBlock(allocator, compressor, buf, scratch.items, @backingInt(encoding), has_nulls, table_compression);
+    try appendBlock(allocator, compressor, buf, scratch.items, streams.items, @backingInt(encoding), has_nulls, table_compression);
+}
+
+fn addStream(allocator: Allocator, streams: *Streams, offset: usize, count: usize, width: u8, signed: bool) !void {
+    try streams.append(allocator, .{ .offset = @intCast(offset), .count = @intCast(count), .width = width, .signed = signed });
 }
 
 /// Appends one block — the 12-byte header, then `payload` compressed per the
 /// table's `compression` option (kept only when that shrinks it) — to `buf`.
+/// A compressed table first rewrites the payload's integer arrays, `streams`,
+/// where that compresses smaller (`int_streams`).
 /// Every block, any algorithm, decompresses once at cache fill. Under
 /// `.lz4_fsst` the cache holds the FSST bytes (decompressed once at fill if
 /// the on-disk LZ4 wrapper shrank them), never the raw expansion.
@@ -1020,31 +1032,38 @@ fn appendBlock(
     compressor: *compression_mod.Compressor,
     buf: *std.ArrayList(u8),
     payload: []const u8,
+    streams: []const int_streams.Stream,
     encoding_byte: u8,
     has_nulls: bool,
     table_compression: types.TableCompression,
 ) !void {
     const raw_size: u32 = @intCast(payload.len);
+    var rewritten: std.ArrayList(u8) = .empty;
+    defer rewritten.deinit(allocator);
+    const rewrite = table_compression != .none and streams.len > 0 and
+        try int_streams.transform(allocator, compressor, payload, streams, &rewritten);
+    const source = if (rewrite) rewritten.items else payload;
     var compressed: ?[]u8 = null;
     defer if (compressed) |c| allocator.free(c);
     var kind: format.Compression = .none;
     switch (table_compression) {
         .none => {},
         .zstd => {
-            compressed = try compressor.compress(allocator, payload, compression_mod.block_level);
-            kind = if (compressed.?.len < payload.len) .zstd else .none;
+            compressed = try compressor.compress(allocator, source, compression_mod.block_level);
+            kind = if (compressed.?.len < source.len) .zstd else .none;
         },
         .lz4, .lz4_fsst => {
-            compressed = try compressor.compressLz4HC(allocator, payload);
-            kind = if (compressed.?.len < payload.len) .lz4 else .none;
+            compressed = try compressor.compressLz4HC(allocator, source);
+            kind = if (compressed.?.len < source.len) .lz4 else .none;
         },
     }
-    const stored = if (kind != .none) compressed.? else payload;
+    const stored = if (kind != .none) compressed.? else source;
+    const stored_prefix: usize = if (rewrite) 4 else 0;
 
-    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls };
+    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls, .int_streams = rewrite };
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
-    try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + stored.len);
+    try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + stored_prefix + stored.len);
     buf.appendAssumeCapacity(@backingInt(kind));
     buf.appendAssumeCapacity(flags.toByte());
     buf.appendAssumeCapacity(encoding_byte);
@@ -1052,8 +1071,12 @@ fn appendBlock(
     var b4: [4]u8 = undefined;
     format.writeU32(&b4, raw_size);
     buf.appendSliceAssumeCapacity(&b4);
-    format.writeU32(&b4, @intCast(stored.len));
+    format.writeU32(&b4, @intCast(stored_prefix + stored.len));
     buf.appendSliceAssumeCapacity(&b4);
+    if (rewrite) {
+        format.writeU32(&b4, @intCast(source.len));
+        buf.appendSliceAssumeCapacity(&b4);
+    }
     buf.appendSliceAssumeCapacity(stored);
 }
 
@@ -1078,16 +1101,17 @@ fn appendBlock(
 fn tryEncodeRle(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     row_start: usize,
     row_end: usize,
 ) !bool {
     return switch (view.data) {
-        .int, .date => |d| rleEncode(i32, allocator, scratch, view, d, row_start, row_end),
-        .bigint, .datetime, .decimal64 => |d| rleEncode(i64, allocator, scratch, view, d, row_start, row_end),
-        .smallint => |d| rleEncode(i16, allocator, scratch, view, d, row_start, row_end),
-        .tinyint => |d| rleEncode(i8, allocator, scratch, view, d, row_start, row_end),
-        .boolean => |d| rleEncode(u8, allocator, scratch, view, d, row_start, row_end),
+        .int, .date => |d| rleEncode(i32, allocator, scratch, streams, view, d, row_start, row_end),
+        .bigint, .datetime, .decimal64 => |d| rleEncode(i64, allocator, scratch, streams, view, d, row_start, row_end),
+        .smallint => |d| rleEncode(i16, allocator, scratch, streams, view, d, row_start, row_end),
+        .tinyint => |d| rleEncode(i8, allocator, scratch, streams, view, d, row_start, row_end),
+        .boolean => |d| rleEncode(u8, allocator, scratch, streams, view, d, row_start, row_end),
         // Same eligibility set as FOR; variable-width and 16-byte types stay out.
         else => false,
     };
@@ -1097,6 +1121,7 @@ fn rleEncode(
     comptime T: type,
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     data: []const T,
     row_start: usize,
@@ -1143,6 +1168,8 @@ fn rleEncode(
     std.mem.writeInt(u32, &b4, @intCast(n_runs), .little);
     scratch.appendSliceAssumeCapacity(&b4);
     scratch.appendSliceAssumeCapacity(&[_]u8{ native, 0, 0, 0 });
+    try addStream(allocator, streams, scratch.items.len, n_runs, native, @typeInfo(T).int.signedness == .signed);
+    try addStream(allocator, streams, scratch.items.len + n_runs * native, n_runs, 4, false);
 
     // Pass 2: run values, native little-endian.
     var bv: [@sizeOf(T)]u8 = undefined;
@@ -1179,16 +1206,17 @@ fn rleEncode(
 fn tryEncodeFor(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     row_start: usize,
     row_end: usize,
 ) !bool {
     return switch (view.data) {
-        .int, .date => |d| forEncode(i32, allocator, scratch, view, d, row_start, row_end),
-        .bigint, .datetime, .decimal64 => |d| forEncode(i64, allocator, scratch, view, d, row_start, row_end),
-        .smallint => |d| forEncode(i16, allocator, scratch, view, d, row_start, row_end),
-        .tinyint => |d| forEncode(i8, allocator, scratch, view, d, row_start, row_end),
-        .boolean => |d| forEncode(u8, allocator, scratch, view, d, row_start, row_end),
+        .int, .date => |d| forEncode(i32, allocator, scratch, streams, view, d, row_start, row_end),
+        .bigint, .datetime, .decimal64 => |d| forEncode(i64, allocator, scratch, streams, view, d, row_start, row_end),
+        .smallint => |d| forEncode(i16, allocator, scratch, streams, view, d, row_start, row_end),
+        .tinyint => |d| forEncode(i8, allocator, scratch, streams, view, d, row_start, row_end),
+        .boolean => |d| forEncode(u8, allocator, scratch, streams, view, d, row_start, row_end),
         // largeint / decimal128 / uuid / float / double / strings are not FOR-eligible.
         else => false,
     };
@@ -1212,6 +1240,7 @@ fn forEncode(
     comptime T: type,
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     data: []const T,
     row_start: usize,
@@ -1249,6 +1278,7 @@ fn forEncode(
     format.writeI128(&b16, lo);
     scratch.appendSliceAssumeCapacity(&b16);
     scratch.appendSliceAssumeCapacity(&[_]u8{ width, 0, 0, 0 });
+    try addStream(allocator, streams, scratch.items.len, n, width, false);
 
     for (data[row_start..row_end], row_start..) |v, r| {
         // A NULL slot's placeholder value can sit outside [lo, hi]; clamp its
@@ -1299,6 +1329,7 @@ const dict_max_avg_len: usize = 256;
 fn tryEncodeDict(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     row_start: usize,
     row_end: usize,
@@ -1382,6 +1413,7 @@ fn tryEncodeDict(
     scratch.appendSliceAssumeCapacity(&[_]u8{ code_width, flags, 0, 0 });
 
     // dict_offsets in sorted order, rebased to 0 (k+1 entries).
+    try addStream(allocator, streams, scratch.items.len, k + 1, 4, false);
     format.writeU32(&b4, 0);
     scratch.appendSliceAssumeCapacity(&b4);
     var acc: u32 = 0;
@@ -1395,6 +1427,7 @@ fn tryEncodeDict(
     for (order) |ins_idx| scratch.appendSliceAssumeCapacity(distinct.items[ins_idx]);
 
     // codes: per-row sorted-dict index.
+    try addStream(allocator, streams, scratch.items.len, n, code_width, false);
     for (row_codes) |ic| {
         const code = ins_to_sorted[ic];
         var b8: [8]u8 = undefined;
@@ -1415,6 +1448,7 @@ fn tryEncodeDict(
         counts[code] += 1;
     }
     for ([_][]const u32{ counts, first_rows }, [_]u32{ 1, 0 }) |values, less| {
+        try addStream(allocator, streams, scratch.items.len, k, stat_width, false);
         for (values) |v| {
             var b8: [8]u8 = undefined;
             std.mem.writeInt(u64, &b8, v - less, .little);
@@ -1449,6 +1483,7 @@ const fsst_accept_den: usize = 8;
 fn tryEncodeFsst(
     allocator: Allocator,
     scratch: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     row_start: usize,
     row_end: usize,
@@ -1523,6 +1558,7 @@ fn tryEncodeFsst(
     scratch.appendSliceAssumeCapacity(&b4);
     format.writeU32(&b4, @intCast(comp.items.len));
     scratch.appendSliceAssumeCapacity(&b4);
+    try addStream(allocator, streams, scratch.items.len, n + 1, 4, false);
     for (offsets) |off| {
         format.writeU32(&b4, off);
         scratch.appendSliceAssumeCapacity(&b4);
@@ -1661,10 +1697,19 @@ fn writeValidityBitmap(
 fn writeRawColumnBlock(
     allocator: Allocator,
     buf: *std.ArrayList(u8),
+    streams: *Streams,
     view: ColumnView,
     row_start: usize,
     row_end: usize,
 ) !void {
+    const integer_width: ?u8 = switch (view.data) {
+        .int, .date => 4,
+        .bigint, .datetime, .decimal64 => 8,
+        .smallint => 2,
+        .tinyint => 1,
+        else => null,
+    };
+    if (integer_width) |w| try addStream(allocator, streams, buf.items.len, row_end - row_start, w, true);
     switch (view.data) {
         .int => |data| {
             const slice = data[row_start..row_end];
@@ -1687,8 +1732,8 @@ fn writeRawColumnBlock(
         .boolean => |data| {
             try buf.appendSlice(allocator, data[row_start..row_end]);
         },
-        .varchar => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
-        .string => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
+        .varchar => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
+        .string => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
         .float => |data| {
             const slice = data[row_start..row_end];
             try buf.ensureUnusedCapacity(allocator, slice.len * 4);
@@ -1748,10 +1793,10 @@ fn writeRawColumnBlock(
                 buf.appendSliceAssumeCapacity(&b);
             }
         },
-        .char => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
-        .json => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
-        .nested => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
-        .bitmap => |sv| try writeStringBlock(allocator, buf, sv, row_start, row_end),
+        .char => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
+        .json => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
+        .nested => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
+        .bitmap => |sv| try writeStringBlock(allocator, buf, streams, sv, row_start, row_end),
         .decimal64 => |data| {
             const slice = data[row_start..row_end];
             try buf.ensureUnusedCapacity(allocator, slice.len * 8);
@@ -1919,6 +1964,7 @@ fn computeStringStats(view: ColumnView, sv: StringView, row_start: usize, row_en
 fn writeStringBlock(
     allocator: Allocator,
     buf: *std.ArrayList(u8),
+    streams: *Streams,
     sv: StringView,
     row_start: usize,
     row_end: usize,
@@ -1938,6 +1984,7 @@ fn writeStringBlock(
     buf.appendSliceAssumeCapacity(&b4);
 
     // offsets (rebased to 0)
+    try addStream(allocator, streams, buf.items.len, n + 1, 4, false);
     for (sv.offsets[row_start .. row_end + 1]) |off| {
         format.writeU32(&b4, off - byte_start);
         buf.appendSliceAssumeCapacity(&b4);

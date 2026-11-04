@@ -907,6 +907,24 @@ Encoding is chosen per row group at flush time based on the column's data charac
 
 After encoding, each column block is compressed per the table's `compression` option (zstd level 6 by default, LZ4HC, or none) when that shrinks it. The default is zstd because a cold scan is bound by the bytes it reads. zstd decodes level-6 frames at least as fast as level-3 ones, and hot scans read the decompressed cache either way, so the level only trades write CPU for size. On ClickBench (100M rows, c6a.4xlarge), zstd-6 against LZ4HC-3 takes the table from 9.95 to 7.72 GB and the cold run from 49.1 to 37.2 s, with hot runs unchanged and the load at 71.9 s against 69.4 s (zstd-3: 8.13 GB, 40.2 s cold, 56.4 s load). Both the encoding and the compressed size are recorded in the block header.
 
+**Integer-stream transforms** (segment v14, `storage/int_streams.zig`). A compressing table first rewrites the integer arrays of a block's payload where that makes it compress smaller. These arrays include:
+- raw integer, date, datetime and decimal values;
+- RLE run values and lengths;
+- FOR deltas;
+- dictionary offsets, codes and entry stats (counts, first rows);
+- FSST and raw-string offsets;
+- segment-dictionary ranks, local offsets, codes and entry stats;
+- shared-string page offsets.
+
+Each array becomes one of:
+- **plain**: unchanged;
+- **frame**: offsets from its minimum;
+- **delta**: successive differences less their minimum.
+
+Either rewritten form is then divided by the values' common factor and stored at the narrowest of 0/1/2/4/8 bytes. Any form may be split into byte planes (all low bytes, then the next bytes, and so on).
+
+A zstd-1 trial on the array's first 8,192 values picks the form. The array stays as it is unless a rewrite compresses smaller after paying its 36-byte entry. Such a block sets the `int_streams` header flag. Its stored bytes are `[stored_size: u32]` and then the codec frame of the rewritten payload. The header's uncompressed size stays the original payload's, so size-only readers (the raw string byte count) are unchanged. The reader restores the payload right after decompressing it, so the block cache and every decoder see exactly what the encoder wrote, and hot scans are unaffected.
+
 **Segment string tables.** Within one segment, each distinct value of a string column gets a **segment id**, so a reader can group or count distinct values of that column exactly without hashing them. The writer keeps the column's distinct values for the whole segment and defers the column's row-group blocks to the end of the file; everything else streams to the file as it encodes (flush and compaction both write this way, and a writer that fails or is abandoned deletes its partial file):
 
 - A value held by two or more row groups is **shared**: it is stored once, in the column's shared-string table, sorted. Its segment id is its rank there (`0 .. shared_count`).
