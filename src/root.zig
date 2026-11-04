@@ -42,6 +42,7 @@ pub const totalMemoryBytes = api.totalMemoryBytes;
 pub const hardwareThreadCount = api.hardwareThreadCount;
 pub const lockExecutable = @import("util/platform.zig").lockExecutable;
 pub const ExecutableLock = @import("util/platform.zig").ExecutableLock;
+pub const sleepUnlessStopped = @import("util/platform.zig").sleepUnlessStopped;
 pub const memorySizes = api.memorySizes;
 pub const FileScanAccess = api.FileScanAccess;
 pub const SyncMode = api.SyncMode;
@@ -135,6 +136,7 @@ test {
     _ = @import("util/stats.zig");
     _ = @import("util/like.zig");
     _ = @import("util/affinity.zig");
+    _ = @import("util/platform.zig");
     _ = @import("util/core_scheduler.zig");
     _ = @import("util/huge_page.zig");
     _ = @import("util/buffer_pool.zig");

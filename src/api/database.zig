@@ -24,6 +24,7 @@ const CatalogMod = @import("catalog.zig");
 const Catalog = CatalogMod.Catalog;
 
 const snapshot = @import("../util/snapshot.zig");
+const platform = @import("../util/platform.zig");
 const storage = @import("../storage/storage.zig");
 
 pub const default_schema_name: []const u8 = "public";
@@ -363,8 +364,7 @@ pub const Database = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
-            if (should_stop.load(.acquire)) return;
+            if (!platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
             self.backgroundFlushSweep() catch {};
         }
     }
@@ -392,7 +392,7 @@ pub const Database = struct {
         while (!should_stop.load(.acquire)) {
             const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
+            if (!worked and !platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
         }
     }
 };

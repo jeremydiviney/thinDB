@@ -40,6 +40,23 @@ pub fn ticksToMs(ticks: i64, freq: i64) f64 {
     return @as(f64, @floatFromInt(ticks)) * 1000.0 / @as(f64, @floatFromInt(freq));
 }
 
+/// How often `sleepUnlessStopped` reads its stop flag.
+const STOP_CHECK_NS: i96 = 50 * std.time.ns_per_ms;
+
+/// Sleeps `duration`, reading `stop` every STOP_CHECK_NS: false as soon as
+/// it is set (or the sleep is canceled), true once the whole duration has
+/// passed. A background loop's poll can be seconds long, and a shutdown
+/// joins every such loop, so one plain sleep holds the stop for its rest.
+pub fn sleepUnlessStopped(io: std.Io, duration: std.Io.Duration, stop: *const std.atomic.Value(bool)) bool {
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + duration.nanoseconds;
+    while (!stop.load(.acquire)) {
+        const left = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+        if (left <= 0) return true;
+        std.Io.sleep(io, .{ .nanoseconds = @min(left, STOP_CHECK_NS) }, .awake) catch return false;
+    }
+    return false;
+}
+
 /// Linux 5.14's MADV_POPULATE_READ, which `std.os.linux.MADV` lacks.
 const MADV_POPULATE_READ: u32 = 22;
 
@@ -147,4 +164,21 @@ pub fn cpuLayout(allocator: Allocator) !CpuLayout {
         .order = try primaries.toOwnedSlice(allocator),
         .physical_count = physical_count,
     };
+}
+
+test "sleepUnlessStopped ends when its stop flag is set, not when its duration does" {
+    const io = std.testing.io;
+    var stop: std.atomic.Value(bool) = .init(false);
+    try std.testing.expect(sleepUnlessStopped(io, .fromMilliseconds(20), &stop));
+    const setter = try std.Thread.spawn(.{}, struct {
+        fn run(flag: *std.atomic.Value(bool), sleeper_io: std.Io) void {
+            std.Io.sleep(sleeper_io, .fromMilliseconds(20), .awake) catch {};
+            flag.store(true, .release);
+        }
+    }.run, .{ &stop, io });
+    defer setter.join();
+    const start = std.Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expect(!sleepUnlessStopped(io, .fromSeconds(60), &stop));
+    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - start < 10 * std.time.ns_per_s);
+    try std.testing.expect(!sleepUnlessStopped(io, .fromSeconds(60), &stop));
 }

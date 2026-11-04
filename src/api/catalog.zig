@@ -17,6 +17,7 @@ const SchemaMod = @import("schema.zig");
 const Schema = SchemaMod.Schema;
 
 const snapshot = @import("../util/snapshot.zig");
+const platform = @import("../util/platform.zig");
 const udf_mod = @import("../udf.zig");
 const scalar_fn = @import("../exec/scalar_fn.zig");
 const zigfn = @import("zigfn.zig");
@@ -854,8 +855,7 @@ pub const Catalog = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
-            if (should_stop.load(.acquire)) return;
+            if (!platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
             self.backgroundFlushSweep() catch {};
             _ = self.xa.gcSweep(); // roll back orphaned prepared XA branches
         }
@@ -891,7 +891,7 @@ pub const Catalog = struct {
         while (!should_stop.load(.acquire)) {
             const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
+            if (!worked and !platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
         }
     }
 };
