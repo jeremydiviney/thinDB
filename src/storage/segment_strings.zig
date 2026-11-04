@@ -707,83 +707,21 @@ pub fn rebuildDict(
 ) ![]align(16) u8 {
     const corrupt = format.Error.CorruptColumnBlockHeader;
     const index = parts.get(.index);
-    const bitmap_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
-    if (index.len < bitmap_len + block_header_bytes) return corrupt;
-    const values = index[bitmap_len..];
-    const k = format.readU32(values[0..4]);
-    const code_width = values[4];
-    const flags = values[5];
-    const rank_width = values[6];
-    const local_count = format.readU32(values[8..12]);
-    const local_first_id = format.readU32(values[12..16]);
-    if (local_count > k or (code_width != 1 and code_width != 2 and code_width != 4)) return corrupt;
-    if (rank_width != 3 and rank_width != 4) return corrupt;
-    if (local_count > 0 and (local_first_id < table.shared_count or @as(u64, local_first_id) + local_count > table.value_count)) return corrupt;
-
-    const shared_bits_len = (@as(usize, k) + 7) / 8;
-    const ranks_len = @as(usize, k - local_count) * rank_width;
-    const local_offsets_len = (@as(usize, local_count) + 1) * 4;
-    const at: usize = block_header_bytes;
-    if (values.len != at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
-    const shared_bits = values[at..][0..shared_bits_len];
-    const ranks = values[at + shared_bits_len ..][0..ranks_len];
-    const local_offsets = values[at + shared_bits_len + ranks_len ..][0..local_offsets_len];
-    const local_byte_count = format.readU32(local_offsets[local_count * 4 ..][0..4]);
+    const entries = try BlockIndex.parse(index, row_count, has_nulls, table);
+    const bitmap_len = entries.bitmap_len;
+    const k = entries.k;
     const local_bytes = parts.get(.bytes);
     const with_bytes = form.reads(.bytes);
-    if (local_bytes.len != if (with_bytes) local_byte_count else 0) return corrupt;
+    if (local_bytes.len != if (with_bytes) entries.local_byte_count else 0) return corrupt;
     const codes = parts.get(.codes);
     const stats = parts.get(.stats);
-    const with_stats = flags & format.DICT_ENTRY_STATS != 0 and form.reads(.stats);
-    const stats_len: usize = if (with_stats) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
-    const codes_len: usize = if (form.reads(.codes)) @as(usize, row_count) * code_width else 0;
+    const with_stats = form.reads(.stats) and entries.hasStats();
+    const stats_len: usize = if (with_stats) entries.statsLen(row_count) else 0;
+    const codes_len: usize = if (form.reads(.codes)) @as(usize, row_count) * entries.code_width else 0;
     if (codes.len != codes_len or stats.len != stats_len) return corrupt;
     const tail_len = codes_len + stats_len;
 
-    const Entries = struct {
-        shared_bits: []const u8,
-        ranks: []const u8,
-        rank_width: u8,
-        local_offsets: []const u8,
-        local_bytes: []const u8,
-        local_byte_count: u32,
-        table: format.StringTable,
-
-        fn isShared(e: @This(), i: usize) bool {
-            return e.shared_bits[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
-        }
-        fn rank(e: @This(), r: usize) !u32 {
-            var b4: [4]u8 = .{ 0, 0, 0, 0 };
-            @memcpy(b4[0..e.rank_width], e.ranks[r * e.rank_width ..][0..e.rank_width]);
-            const v = std.mem.readInt(u32, &b4, .little);
-            if (v >= e.table.shared_count) return format.Error.CorruptColumnBlockHeader;
-            return v;
-        }
-        fn localStart(e: @This(), l: usize) !u32 {
-            const a = format.readU32(e.local_offsets[l * 4 ..][0..4]);
-            const b = format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]);
-            if (a > b or b > e.local_byte_count) return format.Error.CorruptColumnBlockHeader;
-            return a;
-        }
-        fn localLen(e: @This(), l: usize) u32 {
-            return format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]) - format.readU32(e.local_offsets[l * 4 ..][0..4]);
-        }
-    };
-    const entries: Entries = .{
-        .shared_bits = shared_bits,
-        .ranks = ranks,
-        .rank_width = rank_width,
-        .local_offsets = local_offsets,
-        .local_bytes = local_bytes,
-        .local_byte_count = local_byte_count,
-        .table = table,
-    };
-
-    var shared_seen: usize = 0;
-    for (0..k) |e| shared_seen += @intFromBool(entries.isShared(e));
-    if (shared_seen != k - local_count) return corrupt;
-
-    var dict_bytes: usize = local_byte_count;
+    var dict_bytes: usize = entries.local_byte_count;
     {
         var r: usize = 0;
         for (0..k) |e| if (entries.isShared(e)) {
@@ -795,7 +733,7 @@ pub fn rebuildDict(
     if (dict_bytes > std.math.maxInt(u32)) return corrupt;
     const stored_bytes = if (with_bytes) dict_bytes else 0;
 
-    var out_flags = flags | format.DICT_SEGMENT_IDS;
+    var out_flags = entries.flags | format.DICT_SEGMENT_IDS;
     if (!with_stats) out_flags &= ~format.DICT_ENTRY_STATS;
     if (!form.reads(.codes)) out_flags |= format.DICT_NO_CODES;
     if (!with_bytes) out_flags |= format.DICT_NO_BYTES;
@@ -806,7 +744,7 @@ pub fn rebuildDict(
     @memcpy(out[0..bitmap_len], index[0..bitmap_len]);
     var o: usize = bitmap_len;
     format.writeU32(out[o..][0..4], k);
-    out[o + 4] = code_width;
+    out[o + 4] = entries.code_width;
     out[o + 5] = out_flags;
     out[o + 6] = 0;
     out[o + 7] = 0;
@@ -831,7 +769,7 @@ pub fn rebuildDict(
             const start = try entries.localStart(l);
             const len = entries.localLen(l);
             if (with_bytes) @memcpy(out[bytes_at + acc ..][0..len], local_bytes[start..][0..len]);
-            const id: u32 = local_first_id + @as(u32, @intCast(l));
+            const id: u32 = entries.local_first_id + @as(u32, @intCast(l));
             l += 1;
             break :local .{ len, id };
         };
@@ -842,6 +780,187 @@ pub fn rebuildDict(
     if (acc != dict_bytes) return corrupt;
     @memcpy(out[tail_at..][0..codes_len], codes);
     @memcpy(out[tail_at + codes_len ..][0..stats_len], stats);
+    return out;
+}
+
+/// A row-group block's index part, checked against its table.
+const BlockIndex = struct {
+    bitmap_len: usize,
+    k: u32,
+    code_width: u8,
+    flags: u8,
+    rank_width: u8,
+    local_count: u32,
+    local_first_id: u32,
+    shared_bits: []const u8,
+    ranks: []const u8,
+    local_offsets: []const u8,
+    local_byte_count: u32,
+    table: format.StringTable,
+
+    fn parse(index: []const u8, row_count: u32, has_nulls: bool, table: format.StringTable) !BlockIndex {
+        const corrupt = format.Error.CorruptColumnBlockHeader;
+        const bitmap_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
+        if (index.len < bitmap_len + block_header_bytes) return corrupt;
+        const values = index[bitmap_len..];
+        const k = format.readU32(values[0..4]);
+        const code_width = values[4];
+        const rank_width = values[6];
+        const local_count = format.readU32(values[8..12]);
+        const local_first_id = format.readU32(values[12..16]);
+        if (local_count > k or (code_width != 1 and code_width != 2 and code_width != 4)) return corrupt;
+        if (rank_width != 3 and rank_width != 4) return corrupt;
+        if (local_count > 0 and (local_first_id < table.shared_count or @as(u64, local_first_id) + local_count > table.value_count)) return corrupt;
+
+        const shared_bits_len = (@as(usize, k) + 7) / 8;
+        const ranks_len = @as(usize, k - local_count) * rank_width;
+        const local_offsets_len = (@as(usize, local_count) + 1) * 4;
+        const at: usize = block_header_bytes;
+        if (values.len != at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
+        const local_offsets = values[at + shared_bits_len + ranks_len ..][0..local_offsets_len];
+        const self: BlockIndex = .{
+            .bitmap_len = bitmap_len,
+            .k = k,
+            .code_width = code_width,
+            .flags = values[5],
+            .rank_width = rank_width,
+            .local_count = local_count,
+            .local_first_id = local_first_id,
+            .shared_bits = values[at..][0..shared_bits_len],
+            .ranks = values[at + shared_bits_len ..][0..ranks_len],
+            .local_offsets = local_offsets,
+            .local_byte_count = format.readU32(local_offsets[local_count * 4 ..][0..4]),
+            .table = table,
+        };
+        var shared_seen: usize = 0;
+        for (0..k) |e| shared_seen += @intFromBool(self.isShared(e));
+        if (shared_seen != k - local_count) return corrupt;
+        return self;
+    }
+
+    fn isShared(self: BlockIndex, e: usize) bool {
+        return self.shared_bits[e / 8] & (@as(u8, 1) << @intCast(e % 8)) != 0;
+    }
+
+    /// The table rank of the block's `r`-th shared value.
+    fn rank(self: BlockIndex, r: usize) !u32 {
+        var b4: [4]u8 = .{ 0, 0, 0, 0 };
+        @memcpy(b4[0..self.rank_width], self.ranks[r * self.rank_width ..][0..self.rank_width]);
+        const v = std.mem.readInt(u32, &b4, .little);
+        if (v >= self.table.shared_count) return format.Error.CorruptColumnBlockHeader;
+        return v;
+    }
+
+    fn localStart(self: BlockIndex, l: usize) !u32 {
+        const a = format.readU32(self.local_offsets[l * 4 ..][0..4]);
+        const b = format.readU32(self.local_offsets[(l + 1) * 4 ..][0..4]);
+        if (a > b or b > self.local_byte_count) return format.Error.CorruptColumnBlockHeader;
+        return a;
+    }
+
+    fn localLen(self: BlockIndex, l: usize) u32 {
+        return format.readU32(self.local_offsets[(l + 1) * 4 ..][0..4]) - format.readU32(self.local_offsets[l * 4 ..][0..4]);
+    }
+
+    fn hasStats(self: BlockIndex) bool {
+        return self.flags & format.DICT_ENTRY_STATS != 0;
+    }
+
+    fn statsLen(self: BlockIndex, row_count: u32) usize {
+        return 2 * @as(usize, self.k) * format.dictEntryStatWidth(row_count);
+    }
+};
+
+/// A row-group block's values by segment id alone, with the row count and
+/// first row its stats store for each: what a reader counting values by id
+/// takes from the block's index and stats parts, reading neither its codes
+/// nor its values' bytes. Laid out as [ndv: u32][stat_width: u8][pad: 3],
+/// then each value's id (ndv × u32), then the stats as stored.
+pub const EntryCounts = struct {
+    ndv: u32,
+    segment_ids: []const u8,
+    entry_counts: []const u8,
+    entry_rows: []const u8,
+    stat_width: u8,
+
+    pub fn of(payload: []const u8) EntryCounts {
+        const ndv = format.readU32(payload[0..4]);
+        const w: usize = payload[4];
+        const ids_len = @as(usize, ndv) * 4;
+        return .{
+            .ndv = ndv,
+            .segment_ids = payload[8..][0..ids_len],
+            .entry_counts = payload[8 + ids_len ..][0 .. ndv * w],
+            .entry_rows = payload[8 + ids_len + ndv * w ..][0 .. ndv * w],
+            .stat_width = @intCast(w),
+        };
+    }
+
+    pub fn id(self: EntryCounts, e: usize) u32 {
+        return format.readU32(self.segment_ids[e * 4 ..][0..4]);
+    }
+
+    pub fn count(self: EntryCounts, e: usize) u32 {
+        return self.stat(self.entry_counts, e) + 1;
+    }
+
+    pub fn firstRow(self: EntryCounts, e: usize) u32 {
+        return self.stat(self.entry_rows, e);
+    }
+
+    fn stat(self: EntryCounts, values: []const u8, e: usize) u32 {
+        return switch (self.stat_width) {
+            inline 2, 4 => |w| std.mem.readInt(@Int(.unsigned, @as(u16, w) * 8), values[e * w ..][0..w], .little),
+            else => unreachable,
+        };
+    }
+
+    /// Every value's row count into `counts` and first row into `rows`.
+    pub fn statsInto(self: EntryCounts, counts: []u32, rows: []u32) void {
+        switch (self.stat_width) {
+            inline 2, 4 => |w| {
+                const T = @Int(.unsigned, @as(u16, w) * 8);
+                for (counts, 0..) |*n, e| n.* = @as(u32, std.mem.readInt(T, self.entry_counts[e * w ..][0..w], .little)) + 1;
+                for (rows, 0..) |*r, e| r.* = std.mem.readInt(T, self.entry_rows[e * w ..][0..w], .little);
+            },
+            else => unreachable,
+        }
+    }
+};
+
+/// A row-group block's decompressed index and stats parts as an
+/// `EntryCounts` payload, allocated 16-aligned from `allocator`; null when
+/// the block stores no stats.
+pub fn rebuildEntryCounts(
+    allocator: Allocator,
+    index_part: []const u8,
+    stats: []const u8,
+    row_count: u32,
+    has_nulls: bool,
+    table: format.StringTable,
+) !?[]align(16) u8 {
+    const index = try BlockIndex.parse(index_part, row_count, has_nulls, table);
+    if (!index.hasStats()) return null;
+    if (stats.len != index.statsLen(row_count)) return format.Error.CorruptColumnBlockHeader;
+    const ids_len = @as(usize, index.k) * 4;
+    const out = try allocator.alignedAlloc(u8, .@"16", 8 + ids_len + stats.len);
+    errdefer allocator.free(out);
+    format.writeU32(out[0..4], index.k);
+    out[4] = format.dictEntryStatWidth(row_count);
+    @memset(out[5..8], 0);
+    var r: usize = 0;
+    var l: u32 = 0;
+    for (0..index.k) |e| {
+        const id = if (index.isShared(e)) shared: {
+            r += 1;
+            break :shared try index.rank(r - 1);
+        } else local: {
+            l += 1;
+            break :local index.local_first_id + l - 1;
+        };
+        format.writeU32(out[8 + e * 4 ..][0..4], id);
+    }
+    @memcpy(out[8 + ids_len ..], stats);
     return out;
 }
 

@@ -18,6 +18,7 @@ const storage = @import("../storage/storage.zig");
 
 const SiloCore = exec.silo_group_core;
 const count_topk_sketch = @import("count_topk_sketch.zig");
+const segment_id_topk = @import("segment_id_topk.zig");
 const platform = @import("../util/platform.zig");
 const udf_mod = @import("../udf.zig");
 
@@ -1190,6 +1191,19 @@ fn runCountSketch(
     // as row-group dictionary codes, which a heavy tally counts without
     // hashing.
     if (cfg.distinct_eval and cfg.derived.len == 0 and identity_key and cfg.group_rows_layout.key_columns.len == 1) {
+        if (rank == null and countsRowsOnly(cfg) and try segment_id_topk.run(allocator, .{
+            .table = table,
+            .snapshot = cfg.snapshot,
+            .column = cfg.group_rows_layout.key_columns[0].name,
+            .filter = cfg.filter_expr,
+            .need = need,
+            .floor = floor,
+            .workers = cpus.len,
+            .key_digest_mask = cfg.key_digest_mask,
+        }, rows)) {
+            fillCountSlots(cfg.group_rows_layout.aggregates, rows.items);
+            return true;
+        }
         var heavy = try count_topk_sketch.HeavyKeys.init(allocator, need, cpus.len);
         defer heavy.deinit(allocator);
         heavy.floor = floor;
@@ -1237,6 +1251,31 @@ fn runCountSketch(
     if (found < need or !sketch.retarget(kth)) return try groupHeldRows(allocator, table, cpus, grid, held);
     try SiloCore.runSiloGrid(allocator, table, cpus, filter);
     return true;
+}
+
+/// Whether `cfg` keeps every row, or those of the key values a filter on
+/// the key alone passes, and aggregates only their count, so the segment
+/// string tables' per-value counts answer it (segment_id_topk.zig).
+fn countsRowsOnly(cfg: SiloCore.RunConfig) bool {
+    if (cfg.residual_filter != null or cfg.computed_where != null or cfg.key_bound != null) return false;
+    const layout = cfg.group_rows_layout;
+    if (cfg.filter_expr) |expr| {
+        if (!exec.predicate.readsOnlyColumn(expr, layout.key_columns[0].name)) return false;
+    }
+    if (layout.has_str_payload or layout.distinct_slot_count != 0) return false;
+    for (layout.aggregates) |agg| {
+        if (agg.op != .count_star or agg.is_distinct or agg.is_udf or agg.is_concat) return false;
+    }
+    return true;
+}
+
+/// Copies each row's count into the slots of the COUNT(*)s kept outside
+/// the row's own count.
+fn fillCountSlots(aggregates: []const SiloCore.GroupAggregateSpec, rows: []SiloCore.TopRow) void {
+    for (aggregates) |agg| {
+        if (agg.state_index == 0) continue;
+        for (rows) |*row| row.slots[agg.state_index - 1] = @intCast(row.count);
+    }
 }
 
 /// `grid` for a sketch's passes. A HAVING here filters the best groups

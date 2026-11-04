@@ -1270,7 +1270,7 @@ fn collisionCeiling(rows: u64, bits: u6) f64 {
 
 /// The `best.len`-th largest of `values` (0 when there are fewer), using
 /// `best` as scratch kept in descending order.
-fn kthLargest(comptime T: type, values: []const T, best: []T) T {
+pub fn kthLargest(comptime T: type, values: []const T, best: []T) T {
     const k = best.len;
     var len: usize = 0;
     for (values) |v| {
