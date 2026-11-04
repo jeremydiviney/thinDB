@@ -25,9 +25,16 @@ const lz4c = struct {
     extern fn LZ4_decompress_safe(src: [*]const u8, dst: [*]u8, compressed_size: c_int, dst_capacity: c_int) c_int;
 };
 
-/// Default zstd compression level. 3 is the upstream default — Pareto-optimal
-/// speed/ratio for analytics-shaped data. Range is 1 (fastest) to 22.
+/// zstd level for transient bytes (wire frames). 3 is the upstream default —
+/// Pareto-optimal speed/ratio for analytics-shaped data. Range is 1 (fastest)
+/// to 22.
 pub const default_level: c_int = 3;
+
+/// zstd level for segment column blocks. Cold scans are bound by bytes read,
+/// and level-6 frames decode at least as fast as level-3 ones, so blocks pay
+/// level 6's slower writes (ClickBench's load: a third more CPU) for 5% fewer
+/// bytes on disk.
+pub const block_level: c_int = 6;
 
 pub const Error = error{
     ZstdEncodeFailed,
@@ -82,9 +89,9 @@ pub const Compressor = struct {
         return try allocator.realloc(dst, @intCast(written));
     }
 
-    /// Compress `input` into a freshly-allocated byte slice using this
-    /// context's persistent state. Caller owns the returned slice.
-    pub fn compress(self: *Compressor, allocator: Allocator, input: []const u8) ![]u8 {
+    /// Compress `input` at zstd `level` into a freshly-allocated byte slice
+    /// using this context's persistent state. Caller owns the returned slice.
+    pub fn compress(self: *Compressor, allocator: Allocator, input: []const u8, level: c_int) ![]u8 {
         const bound = c.ZSTD_compressBound(input.len);
         const dst = try allocator.alloc(u8, bound);
         errdefer allocator.free(dst);
@@ -95,7 +102,7 @@ pub const Compressor = struct {
             dst.len,
             input.ptr,
             input.len,
-            default_level,
+            level,
         );
         if (c.ZSTD_isError(written) != 0) return Error.ZstdEncodeFailed;
 
@@ -103,13 +110,13 @@ pub const Compressor = struct {
     }
 };
 
-/// One-shot compress: convenience wrapper around `Compressor.compress` that
-/// creates a fresh CCtx for a single call. Use `Compressor` directly in hot
-/// paths that compress many blocks back-to-back.
+/// One-shot compress at `default_level`: convenience wrapper around
+/// `Compressor.compress` that creates a fresh CCtx for a single call. Use
+/// `Compressor` directly in hot paths that compress many blocks back-to-back.
 pub fn compress(allocator: Allocator, input: []const u8) ![]u8 {
     var ctx = try Compressor.init();
     defer ctx.deinit();
-    return ctx.compress(allocator, input);
+    return ctx.compress(allocator, input, default_level);
 }
 
 /// Decompress `input` and return a freshly-allocated slice of exactly
