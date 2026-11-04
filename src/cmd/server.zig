@@ -657,7 +657,7 @@ const ReaperCtx = struct {
     fn run(self: *ReaperCtx) void {
         const poll: Io.Duration = .fromMilliseconds(5000);
         while (!stop_flag.load(.acquire)) {
-            Io.sleep(self.io, poll, .awake) catch return;
+            if (!thindb.sleepUnlessStopped(self.io, poll, &stop_flag)) return;
             const now_ns = Io.Clock.awake.now(self.io).nanoseconds;
             const now_ms: u64 = @intCast(@divTrunc(@max(now_ns, 0), std.time.ns_per_ms));
             _ = self.registry.reapStalledTransfers(self.io, now_ms, self.limits);
@@ -682,7 +682,7 @@ const HeapReleaseCtx = struct {
         const poll: Io.Duration = .fromMilliseconds(5000);
         var idle: thindb.memory.IdleRelease = .{ .quiet_checks_needed = 6 };
         while (!stop_flag.load(.acquire)) {
-            Io.sleep(self.io, poll, .awake) catch return;
+            if (!thindb.sleepUnlessStopped(self.io, poll, &stop_flag)) return;
             const resident = thindb.memory.processResidentBytes() orelse continue;
             if (resident >= pool.reliefLine()) {
                 idle.settle(pool.relieve(resident));
@@ -811,10 +811,7 @@ test "parseSize handles plain bytes and K/M/G suffixes" {
 // ---------------------------------------------------------------------------
 
 fn waitForStop(io: Io) void {
-    const duration: Io.Duration = .fromMilliseconds(200);
-    while (!stop_flag.load(.acquire)) {
-        Io.sleep(io, duration, .awake) catch return;
-    }
+    while (thindb.sleepUnlessStopped(io, .fromSeconds(60), &stop_flag)) {}
 }
 
 fn installSignalHandler() void {

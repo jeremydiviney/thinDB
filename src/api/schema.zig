@@ -24,6 +24,7 @@ const Catalog = api.Catalog;
 const schemaFingerprint = api.schemaFingerprint;
 
 const snapshot = @import("../util/snapshot.zig");
+const platform = @import("../util/platform.zig");
 const StatementGate = @import("../util/statement_gate.zig").StatementGate;
 const compact = @import("compact.zig");
 const alter = @import("alter.zig");
@@ -437,8 +438,7 @@ pub const Schema = struct {
     ) void {
         const duration: Io.Duration = .fromMilliseconds(@intCast(poll_ms));
         while (!should_stop.load(.acquire)) {
-            Io.sleep(sleeper_io, duration, .awake) catch return;
-            if (should_stop.load(.acquire)) return;
+            if (!platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
             self.backgroundFlushSweep() catch {};
         }
     }
@@ -512,7 +512,7 @@ pub const Schema = struct {
             // sleep the poll interval once a sweep finds nothing to merge.
             const worked = self.backgroundCompactSweep() catch false;
             if (should_stop.load(.acquire)) return;
-            if (!worked) Io.sleep(sleeper_io, duration, .awake) catch return;
+            if (!worked and !platform.sleepUnlessStopped(sleeper_io, duration, should_stop)) return;
         }
     }
 
