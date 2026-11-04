@@ -40,6 +40,7 @@ pub const Table = api.Table;
 pub const Config = api.Config;
 pub const totalMemoryBytes = api.totalMemoryBytes;
 pub const hardwareThreadCount = api.hardwareThreadCount;
+pub const prefaultExecutable = @import("util/platform.zig").prefaultExecutable;
 pub const memorySizes = api.memorySizes;
 pub const FileScanAccess = api.FileScanAccess;
 pub const SyncMode = api.SyncMode;

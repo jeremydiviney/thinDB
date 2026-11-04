@@ -430,6 +430,7 @@ pub fn main(init: std.process.Init) !u8 {
     var digest_seed: [8]u8 = undefined;
     io.random(&digest_seed);
     thindb.exec.setDigestSeed(std.mem.readInt(u64, &digest_seed, .little));
+    thindb.prefaultExecutable();
     var catalog = thindb.Catalog.open(gpa, io, data_root, cfg) catch |err| {
         try err_w.print("thindb-server: failed to open catalog at '{s}': {t}\n", .{ data_dir, err });
         try err_w.flush();
