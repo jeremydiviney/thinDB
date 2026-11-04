@@ -299,6 +299,7 @@ fn flatToCoord(f: usize, seg_start: []const usize, segment_count: usize, total: 
 const SlabOffsets = struct {
     columns: [MAX_GROUP_PAYLOAD_COLUMNS]usize = @splat(0),
     rowref: usize = 0,
+    key_ref: usize = 0,
     weight: usize = 0,
     valid: usize = 0,
     bytes: usize = 0,
@@ -313,6 +314,9 @@ const SlabOffsets = struct {
         }
         offsets.rowref = alignForward(at, @alignOf(i64));
         if (layout.has_rowref) at = offsets.rowref + @sizeOf(i64) * capacity_rows;
+        // A stage lane moves 16-byte values as u128s.
+        offsets.key_ref = alignForward(at, @alignOf(u128));
+        if (layout.key_refs) at = offsets.key_ref + @sizeOf(KeyRef) * capacity_rows;
         offsets.weight = alignForward(at, @alignOf(u32));
         if (layout.has_weight) at = offsets.weight + @sizeOf(u32) * capacity_rows;
         offsets.valid = at;
@@ -354,6 +358,11 @@ const RawRows = struct {
     inline fn rowrefAll(self: RawRows) []i64 {
         std.debug.assert(self.layout.has_rowref);
         return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.offsets.rowref)))[0..self.capacity_rows];
+    }
+
+    inline fn keyRefAll(self: RawRows) []KeyRef {
+        std.debug.assert(self.layout.key_refs);
+        return @as([*]KeyRef, @ptrCast(@alignCast(self.slab.ptr + self.offsets.key_ref)))[0..self.capacity_rows];
     }
 
     inline fn weightAll(self: RawRows) []u32 {
@@ -417,6 +426,7 @@ const RawRows = struct {
                 @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
+            if (layout.key_refs) @memcpy(next.keyRefAll()[0..self.len_rows], self.keyRefAll()[0..self.len_rows]);
             if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
             var vi: usize = 0;
             const nv = nullableInputCount(layout);
@@ -884,6 +894,11 @@ pub const GroupRowsLayout = struct {
     // only when its digest and its bytes both match. The digest only places
     // the key; two keys sharing one never merge.
     exact_key: bool = false,
+    // An exact key whose bytes a scan worker copies once into its
+    // `KeyArena`, each row carrying a `KeyRef` lane instead of a str column:
+    // a deferred grid holds every staged row until it folds, so the bytes
+    // stay put while the rows move.
+    key_refs: bool = false,
     // COUNT-only programs (no payload/str columns, no distinct): each staged
     // row carries a u32 weight, and the scan emitter collapses a run of
     // adjacent-equal keys into ONE weighted row — route/stage/lane traffic
@@ -900,7 +915,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.exact_key != b.exact_key or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.exact_key != b.exact_key or a.key_refs != b.key_refs or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1040,6 +1055,11 @@ const GroupRows = struct {
         return @as([*]i64, @ptrCast(@alignCast(self.slab.ptr + self.offsets.rowref)))[0..self.capacity_rows];
     }
 
+    inline fn keyRefAll(self: GroupRows) []KeyRef {
+        std.debug.assert(self.layout.key_refs);
+        return @as([*]KeyRef, @ptrCast(@alignCast(self.slab.ptr + self.offsets.key_ref)))[0..self.capacity_rows];
+    }
+
     inline fn weightAll(self: GroupRows) []u32 {
         std.debug.assert(self.layout.has_weight);
         return @as([*]u32, @ptrCast(@alignCast(self.slab.ptr + self.offsets.weight)))[0..self.capacity_rows];
@@ -1131,6 +1151,7 @@ const GroupRows = struct {
                 @memcpy(next.columnByteSlab(col)[0 .. sz * self.len_rows], self.columnByteSlab(col)[0 .. sz * self.len_rows]);
             }
             if (layout.has_rowref) @memcpy(next.rowrefAll()[0..self.len_rows], self.rowrefAll()[0..self.len_rows]);
+            if (layout.key_refs) @memcpy(next.keyRefAll()[0..self.len_rows], self.keyRefAll()[0..self.len_rows]);
             if (layout.has_weight) @memcpy(next.weightAll()[0..self.len_rows], self.weightAll()[0..self.len_rows]);
             var vi: usize = 0;
             const nv = nullableInputCount(layout);
@@ -1179,6 +1200,7 @@ const GroupRows = struct {
             @memcpy(self.columnByteSlab(col)[old_len * sz .. new_len * sz], rows.columnByteSlab(col)[start * sz .. (start + count) * sz]);
         }
         if (self.layout.has_rowref) @memcpy(self.rowrefAll()[old_len..new_len], rows.rowrefAll()[start .. start + count]);
+        if (self.layout.key_refs) @memcpy(self.keyRefAll()[old_len..new_len], rows.keyRefAll()[start .. start + count]);
         if (self.layout.has_weight) @memcpy(self.weightAll()[old_len..new_len], rows.weightAll()[start .. start + count]);
         {
             var vi: usize = 0;
@@ -1360,12 +1382,16 @@ const WorkerParts = struct {
     flat_offsets: []u32 = &.{},
     flat_next: []u32 = &.{},
     /// A deferred bucket fold's chunks, each row's part, the parts, and the
-    /// cache-sized table and transient states each part folds into.
+    /// cache-sized table, transient states and exact keys each part folds
+    /// into.
     defer_chunks: std.ArrayListUnmanaged(GroupChunk) = .empty,
     defer_part_ids: std.ArrayListUnmanaged(u8) = .empty,
     defer_parts: std.ArrayListUnmanaged(GroupRows) = .empty,
     defer_table: ?BucketTable = null,
     defer_states: StateSlab = .{},
+    defer_keys: ?KeyBank = null,
+    /// Exact keys' bytes this worker's scans staged under `key_refs`.
+    key_arena: KeyArena = .{},
     raw_active_rows: RawRows = .{},
     /// Weighted layouts: staged-row index of the active raw chunk by key
     /// hash, so a key that repeats anywhere in the chunk folds into its one
@@ -1474,6 +1500,7 @@ const WorkerParts = struct {
         if (self.route_offsets.len > 0) allocator.free(self.route_offsets);
         self.route_touched.deinit(allocator);
         self.releaseDeferScratch(allocator);
+        self.key_arena.deinit(allocator);
         self.* = .{};
     }
 
@@ -1498,6 +1525,8 @@ const WorkerParts = struct {
         self.defer_table = null;
         self.defer_states.deinit(allocator);
         self.defer_states = .{};
+        if (self.defer_keys) |*k| k.deinit(allocator);
+        self.defer_keys = null;
     }
 
     fn ensureWideBucketScratch(self: *WorkerParts, allocator: Allocator, bucket_count: usize) !void {
@@ -2769,8 +2798,117 @@ test "a deferred bucket fold matches each group's rows, split into parts or not"
     }
 }
 
+test "a deferred bucket fold keeps exact keys that share a digest apart, split into parts or not" {
+    const allocator = std.testing.allocator;
+    const cases = .{
+        .{ .rows = 1_500, .top_k = 0 },
+        .{ .rows = 1_500, .top_k = 10 },
+        .{ .rows = 40_000, .top_k = 0 },
+        .{ .rows = 40_000, .top_k = 10 },
+    };
+    inline for (cases) |c| {
+        const group_count = c.rows / 3;
+        var buckets = [_]PipeBucket{try PipeBucket.init(allocator, 16)};
+        defer buckets[0].deinit(allocator);
+        var local: WorkerParts = .{};
+        defer local.deinit(allocator);
+        var scratch: GroupScratch = .{};
+        defer scratch.deinit(allocator);
+        var shared = PipeShared{
+            .allocator = allocator,
+            .buckets = &buckets,
+            .bucket_count = 1,
+            .input_rows_per_bucket = c.rows,
+            .scan_threads = 1,
+            .group_rows_layout = keyRefLayout(.{
+                .key_width = .u128,
+                .columns = &.{},
+                .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
+                .str_columns = &.{.{ .source_name = "k" }},
+                .has_str_payload = true,
+                .has_rowref = true,
+                .hashed_key = true,
+                .exact_key = true,
+            }),
+            .defer_fold = true,
+        };
+        defer deinitRawQueues(&shared);
+        shared.raw_scan_queues = try allocator.alloc(RawQueue, 1);
+        shared.raw_scan_queues[0] = .{};
+        shared.raw_group_queues = try allocator.alloc(GroupQueue, 1);
+        shared.raw_group_queues[0] = .{};
+        shared.stage_builders = try allocator.alloc(StageBucketBuilder, 1);
+        shared.stage_builders[0] = .{};
+
+        // Groups 2d and 2d + 1 share digest d; group 0's key is NULL and
+        // group 1's empty. A row's group follows from its rowref.
+        const groupOf = struct {
+            fn of(row: usize) usize {
+                return (row * 7919) % group_count;
+            }
+        }.of;
+        const expected = try allocator.alloc(u64, group_count);
+        defer allocator.free(expected);
+        @memset(expected, 0);
+        var arena: KeyArena = .{};
+        defer arena.deinit(allocator);
+        var source: RawRows = .{};
+        defer source.deinit(allocator);
+        try source.resize(allocator, shared.group_rows_layout, c.rows);
+        for (0..c.rows) |i| {
+            const g = groupOf(i);
+            source.setKey(i, 5 | (@as(u128, g / 2) << 96));
+            source.rowrefAll()[i] = @intCast(i);
+            var buf: [16]u8 = undefined;
+            source.keyRefAll()[i] = if (g == 0) KeyRef.null_key else ref: {
+                const bytes = if (g == 1) "" else try std.fmt.bufPrint(&buf, "{d}", .{g});
+                const held = try arena.take(allocator, bytes.len);
+                @memcpy(held, bytes);
+                break :ref KeyRef.of(held);
+            };
+            expected[g] += 1;
+        }
+        try publishRawRowsToQueue(&shared, &shared.raw_scan_queues[0], 0, &source, 4096, &shared.outstanding_chunks, &shared.pending_group_rows, null, null);
+        shared.scans_done.store(1, .release);
+        try std.testing.expect(claimRawQueueLaneExact(shared.raw_scan_queues, 0));
+        try std.testing.expect(try drainRawDedicatedStageSharedBuilders(allocator, &shared, &local, 0, 4096, 4096, 4, false));
+        _ = try flushSharedStageBuilders(&shared, &local, false);
+        try std.testing.expect(shared.stage_complete());
+
+        var top = if (c.top_k == 0) TopSet{} else try TopSet.init(allocator, c.top_k);
+        defer top.deinit(allocator);
+        var ticks: i64 = 0;
+        var chunks: u64 = 0;
+        try std.testing.expect(try foldDeferredBucket(&shared, &local, &scratch, 0, &top, &ticks, &chunks, false));
+        try std.testing.expectEqual(@as(u64, c.rows), buckets[0].row_count);
+
+        const seen = try allocator.alloc(bool, group_count);
+        defer allocator.free(seen);
+        @memset(seen, false);
+        const found = if (c.top_k == 0) buckets[0].states.len else top.len;
+        try std.testing.expectEqual(if (c.top_k == 0) group_count else c.top_k, found);
+        if (c.top_k != 0) try top.sortBestFirst(allocator);
+        for (0..found) |i| {
+            const row = if (c.top_k == 0) topRowFromState(buckets[0].states.ref(i)) else top.rowAt(i);
+            const g = groupOf(@intCast(row.rowref));
+            try std.testing.expect(!seen[g]);
+            seen[g] = true;
+            try std.testing.expectEqual(5 | (@as(u128, g / 2) << 96), row.key);
+            try std.testing.expectEqual(expected[g], row.count);
+        }
+        if (c.top_k != 0) {
+            const last = top.rowAt(top.len - 1);
+            for (expected, seen, 0..) |count, kept, g| {
+                const key = 5 | (@as(u128, g / 2) << 96);
+                if (count > last.count or (count == last.count and key < last.key)) try std.testing.expect(kept);
+            }
+        }
+    }
+}
+
 test "a grid defers its folds only for many groups per bucket and staging within the budget" {
     // 8-byte staged rows against a 64 MiB budget: up to 2M rows may stage.
+    // An exact key adds its KeyRef and 8 key bytes: up to 512K rows.
     var pool = thindb.exec.memory.MemoryPool.init(64 * 1024 * 1024);
     var resources = thindb.exec.memory.MemoryAccountant.init(&pool);
     const cases = .{
@@ -2782,16 +2920,23 @@ test "a grid defers its folds only for many groups per bucket and staging within
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = false, .shape = .plain },
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .str_payload },
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .distinct },
+        .{ .want = true, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024, .budget = true, .shape = .exact_key },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024 + 1, .budget = true, .shape = .exact_key },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1024, .budget = true, .shape = .exact_key_and_str },
     };
+    const str_columns = [_]GroupStrColumnSpec{ .{ .source_name = "s" }, .{ .source_name = "k" } };
     inline for (cases) |c| {
+        const exact = c.shape == .exact_key or c.shape == .exact_key_and_str;
         const layout = GroupRowsLayout{
             .key_width = .u64,
             .columns = &.{},
             .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
-            .has_str_payload = c.shape == .str_payload,
+            .str_columns = if (c.shape == .exact_key) str_columns[1..] else if (exact or c.shape == .str_payload) &str_columns else &.{},
+            .has_str_payload = exact or c.shape == .str_payload,
+            .exact_key = exact,
             .distinct_slot_count = if (c.shape == .distinct) 1 else 0,
         };
-        try std.testing.expectEqual(c.want, deferBucketFolds(layout, c.workers, c.staged, c.groups, c.rows, if (c.budget) &resources else null));
+        try std.testing.expectEqual(c.want, deferBucketFolds(layout, c.workers, c.staged, c.groups, c.rows, 8, if (c.budget) &resources else null));
     }
 }
 
@@ -5260,7 +5405,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
                 appendPayloadValidity(active, layout, payload_valid[0..layout.columns.len], idx, r);
                 if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
-                if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
+                if (exact) |*ek| try ek.stageInto(active, &parts.key_arena, shared.allocator, idx, r);
                 active.len_rows = idx + 1;
                 accepted += 1;
             }
@@ -5277,7 +5422,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             if (layout.has_weight) {
                 // A collapsed batch's row stands for `w` equal rows.
                 const w: u32 = if (row_weights) |rw| rw.counts[r] else 1;
-                if (last < idx and last_key == key and (if (exact) |*ek| ek.heldBy(&active.str, layout.str_columns.len, last, r) else true) and active.weightAll()[last] <= std.math.maxInt(u32) - w) {
+                if (last < idx and last_key == key and (if (exact) |*ek| ek.heldIn(active, last, r) else true) and active.weightAll()[last] <= std.math.maxInt(u32) - w) {
                     weightFoldRow(parts, active, weight_specs, str_inputs, last, r, w);
                     accepted += w;
                     continue;
@@ -5285,7 +5430,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 if (use_fold) {
                     const held = foldIndexProbe(parts, active, key, idx);
                     probes += 1;
-                    if (held < idx and (if (exact) |*ek| ek.heldBy(&active.str, layout.str_columns.len, held, r) else true) and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
+                    if (held < idx and (if (exact) |*ek| ek.heldIn(active, held, r) else true) and active.weightAll()[held] <= std.math.maxInt(u32) - w) {
                         weightFoldRow(parts, active, weight_specs, str_inputs, held, r, w);
                         last = held;
                         last_key = key;
@@ -5300,7 +5445,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                     for (0..str_inputs.len) |c| active.str.appendNull(layout.str_columns.len, idx, c);
                     pendStr(parts, str_inputs, idx, r);
                 }
-                if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
+                if (exact) |*ek| try ek.stageInto(active, &parts.key_arena, shared.allocator, idx, r);
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
                 active.len_rows = idx + 1;
@@ -5313,7 +5458,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
             appendGenericPayload(active, payload_bytes[0..layout.columns.len], payload_elt[0..layout.columns.len], idx, r);
             if (str_inputs.len != 0) try appendStrPayload(active, shared.allocator, str_inputs, idx, r);
-            if (exact) |*ek| try ek.stage(&active.str, shared.allocator, layout.str_columns.len, idx, r);
+            if (exact) |*ek| try ek.stageInto(active, &parts.key_arena, shared.allocator, idx, r);
             active.len_rows = idx + 1;
             accepted += 1;
         }
@@ -6157,31 +6302,78 @@ const ExactKey = struct {
         const len = self.encodedLen(r);
         try store.bytes.ensureUnusedCapacity(allocator, len);
         const at = store.bytes.items.len;
-        for (self.parts, 0..) |part, i| {
-            if (part.nullable) {
-                const valid = self.views[i].isValid(r);
-                store.bytes.appendAssumeCapacity(@intFromBool(valid));
-                if (!valid) continue;
-            }
-            if (self.strs[i] != null) {
-                const bytes = self.strBytes(i, r);
-                const n: u32 = @intCast(bytes.len);
-                store.bytes.appendSliceAssumeCapacity(std.mem.asBytes(&n));
-                store.bytes.appendSliceAssumeCapacity(bytes);
-            } else store.bytes.appendSliceAssumeCapacity(self.fixedBytes(i, r));
-        }
+        self.encode(store.bytes.addManyAsSliceAssumeCapacity(len), r);
         store.refs[dst * cols + cols - 1] = .{ .off = @intCast(at), .len = @intCast(len) };
     }
 
-    /// Whether staged row `held` of `store` holds row `r`'s key, compared
-    /// part by part against its encoding rather than encoding the row.
-    fn heldBy(self: *const ExactKey, store: *const StrStore, cols: usize, held: usize, r: usize) bool {
-        const held_null = store.isNull(cols, held, cols - 1);
+    /// Makes row `r`'s key staged row `dst`'s KeyRef, its bytes copied into
+    /// `arena`.
+    fn stageRef(self: *const ExactKey, arena: *KeyArena, allocator: Allocator, refs: []KeyRef, dst: usize, r: usize) !void {
         if (self.lone()) {
-            if (self.parts[0].nullable and !self.views[0].isValid(r)) return held_null;
-            return !held_null and std.mem.eql(u8, store.get(cols, held, cols - 1), self.strBytes(0, r));
+            if (self.parts[0].nullable and !self.views[0].isValid(r)) {
+                refs[dst] = KeyRef.null_key;
+                return;
+            }
+            const bytes = self.strBytes(0, r);
+            const held = try arena.take(allocator, bytes.len);
+            @memcpy(held, bytes);
+            refs[dst] = .of(held);
+            return;
         }
-        const enc = store.get(cols, held, cols - 1);
+        const held = try arena.take(allocator, self.encodedLen(r));
+        self.encode(held, r);
+        refs[dst] = .of(held);
+    }
+
+    /// Row `r`'s parts' encoding, `encodedLen(r)` bytes, into `out`.
+    fn encode(self: *const ExactKey, out: []u8, r: usize) void {
+        var at: usize = 0;
+        for (self.parts, 0..) |part, i| {
+            if (part.nullable) {
+                const valid = self.views[i].isValid(r);
+                out[at] = @intFromBool(valid);
+                at += 1;
+                if (!valid) continue;
+            }
+            const bytes = if (self.strs[i] != null) bytes: {
+                const s = self.strBytes(i, r);
+                const n: u32 = @intCast(s.len);
+                @memcpy(out[at..][0..@sizeOf(u32)], std.mem.asBytes(&n));
+                at += @sizeOf(u32);
+                break :bytes s;
+            } else self.fixedBytes(i, r);
+            @memcpy(out[at..][0..bytes.len], bytes);
+            at += bytes.len;
+        }
+    }
+
+    /// Makes row `r`'s key staged row `dst`'s of `rows`, as a KeyRef under
+    /// `key_refs`.
+    fn stageInto(self: *const ExactKey, rows: *RawRows, arena: *KeyArena, allocator: Allocator, dst: usize, r: usize) !void {
+        if (rows.layout.key_refs) return self.stageRef(arena, allocator, rows.keyRefAll(), dst, r);
+        return self.stage(&rows.str, allocator, rows.layout.str_columns.len, dst, r);
+    }
+
+    /// Whether staged row `held` of `rows` holds row `r`'s key.
+    fn heldIn(self: *const ExactKey, rows: *const RawRows, held: usize, r: usize) bool {
+        if (rows.layout.key_refs) return self.holds(rows.keyRefAll()[held].bytes(), r);
+        return self.heldBy(&rows.str, rows.layout.str_columns.len, held, r);
+    }
+
+    /// Whether staged row `held` of `store` holds row `r`'s key.
+    fn heldBy(self: *const ExactKey, store: *const StrStore, cols: usize, held: usize, r: usize) bool {
+        return self.holds(if (store.isNull(cols, held, cols - 1)) null else store.get(cols, held, cols - 1), r);
+    }
+
+    /// Whether a staged key, NULL or its bytes `held`, is row `r`'s,
+    /// compared part by part against its encoding rather than encoding the
+    /// row.
+    fn holds(self: *const ExactKey, held: ?[]const u8, r: usize) bool {
+        if (self.lone()) {
+            if (self.parts[0].nullable and !self.views[0].isValid(r)) return held == null;
+            return if (held) |bytes| std.mem.eql(u8, bytes, self.strBytes(0, r)) else false;
+        }
+        const enc = held orelse return false;
         var at: usize = 0;
         for (self.parts, 0..) |part, i| {
             if (part.nullable) {
@@ -6242,6 +6434,12 @@ fn fixedKeyPart(view: ColumnView, typ: thindb.types.Type) ?FixedKeyPart {
 const KeyBank = struct {
     keys: std.ArrayListUnmanaged(?[]const u8) = .empty,
     arena: std.heap.ArenaAllocator,
+    /// The gid `keys[0]` holds: a deferred part's table holds only the
+    /// groups that part adds.
+    base: u32 = 0,
+    /// Whether `add` keeps the rows' own bytes rather than a copy, for rows
+    /// that outlive every lookup (a deferred part's).
+    borrows: bool = false,
 
     fn init(allocator: Allocator) KeyBank {
         return .{ .arena = .init(allocator) };
@@ -6259,20 +6457,67 @@ const KeyBank = struct {
 
     /// Adds the next group's key, with room for it already ensured.
     fn add(self: *KeyBank, bytes: ?[]const u8) !void {
-        const held = if (bytes) |b| try self.arena.allocator().dupe(u8, b) else null;
+        const held = if (bytes) |b| (if (self.borrows) b else try self.arena.allocator().dupe(u8, b)) else null;
         self.keys.appendAssumeCapacity(held);
     }
 };
 
-/// A group whose key bytes in `bank` are `bytes` (or NULL when not
-/// `valid`), for getOrPutMatching.
+/// A staged exact key's bytes in a scan worker's `KeyArena` (see
+/// `GroupRowsLayout.key_refs`), or a NULL key.
+const KeyRef = extern struct {
+    // 16 bytes on every target: a stage lane moves it as a u128.
+    ptr: [*]const u8 align(16),
+    len: u32,
+    valid: u32,
+
+    const null_key: KeyRef = .{ .ptr = "".ptr, .len = 0, .valid = 0 };
+
+    fn of(held: []const u8) KeyRef {
+        return .{ .ptr = held.ptr, .len = @intCast(held.len), .valid = 1 };
+    }
+
+    inline fn bytes(self: KeyRef) ?[]const u8 {
+        return if (self.valid != 0) self.ptr[0..self.len] else null;
+    }
+};
+
+const KEY_ARENA_BLOCK_BYTES: usize = 1024 * 1024;
+
+/// A scan worker's exact key bytes under `GroupRowsLayout.key_refs`, in
+/// blocks that never move, freed once every bucket has folded.
+const KeyArena = struct {
+    blocks: std.ArrayListUnmanaged([]u8) = .empty,
+    rest: []u8 = &.{},
+
+    fn take(self: *KeyArena, allocator: Allocator, len: usize) ![]u8 {
+        if (self.rest.len < len) {
+            const block = try allocator.alloc(u8, @max(len, KEY_ARENA_BLOCK_BYTES));
+            errdefer allocator.free(block);
+            try self.blocks.append(allocator, block);
+            self.rest = block;
+        }
+        const out = self.rest[0..len];
+        self.rest = self.rest[len..];
+        return out;
+    }
+
+    fn deinit(self: *KeyArena, allocator: Allocator) void {
+        for (self.blocks.items) |block| allocator.free(block);
+        self.blocks.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+/// A group whose key bytes in `bank` (from gid `base`) are `bytes` (or
+/// NULL when not `valid`), for getOrPutMatching.
 const GroupKeyMatch = struct {
     bank: []const ?[]const u8,
+    base: u32,
     bytes: []const u8,
     valid: bool,
 
     pub inline fn matches(self: GroupKeyMatch, gid: u32) bool {
-        const held = self.bank[gid] orelse return !self.valid;
+        const held = self.bank[gid - self.base] orelse return !self.valid;
         return self.valid and std.mem.eql(u8, held, self.bytes);
     }
 };
@@ -6660,7 +6905,7 @@ fn groupChunkRowsDirect(
     if (rows.layout.exact_key) {
         const bank = key_bank orelse return error.UnsupportedOperatorForType;
         if (rows.layout.key_width != .u128) return error.UnsupportedOperatorForType;
-        try bank.keys.ensureTotalCapacity(allocator, states.len + n);
+        try bank.keys.ensureTotalCapacity(allocator, states.len - bank.base + n);
         switch (table.*) {
             inline else => |*t| try groupChunkRowsExact(t, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, bank, &scratch.gids, allocator, rows.keyU128All()[0..n], rows, rowrefs),
         }
@@ -7190,8 +7435,6 @@ fn groupChunkRowsExact(
 ) !void {
     const aggregates = rows.layout.aggregates;
     const n = keys.len;
-    const cols = rows.layout.str_columns.len;
-    const key_col = cols - 1;
     const has_str = hasStringResults(rows.layout);
     const has_str_fold = hasStringExtreme(aggregates);
     const has_concat = rows.layout.has_concat;
@@ -7231,19 +7474,18 @@ fn groupChunkRowsExact(
         if (prefetch and pf < n) @prefetch(table.slotAddr(table.bucketOf(@TypeOf(table.*).hashKey(keys[pf]))), .{ .rw = .write, .locality = 1 });
 
         const key = keys[r];
-        const valid = !rows.str.isNull(cols, r, key_col);
-        const bytes = rows.str.get(cols, r, key_col);
+        const held = exactKeyBytes(rows, r);
+        const valid = held != null;
+        const bytes = held orelse "";
         var run_end = r + 1;
-        while (run_end < n and keys[run_end] == key and
-            !rows.str.isNull(cols, run_end, key_col) == valid and
-            std.mem.eql(u8, rows.str.get(cols, run_end, key_col), bytes)) run_end += 1;
+        while (run_end < n and keys[run_end] == key and sameKeyBytes(exactKeyBytes(rows, run_end), held)) run_end += 1;
         const run_len: u64 = if (weights.len != 0) blk: {
             var sum: u64 = 0;
             for (weights[r..run_end]) |w| sum += w;
             break :blk sum;
         } else @intCast(run_end - r);
 
-        const probe = table.getOrPutMatching(@TypeOf(table.*).hashKey(key), key, GroupKeyMatch{ .bank = key_bank.keys.items, .bytes = bytes, .valid = valid });
+        const probe = table.getOrPutMatching(@TypeOf(table.*).hashKey(key), key, GroupKeyMatch{ .bank = key_bank.keys.items, .base = key_bank.base, .bytes = bytes, .valid = valid });
         var gid: u32 = probe.gid;
         var tagged: u32 = probe.gid;
         // The per-row program's first row initializes a new group's record.
@@ -7302,6 +7544,21 @@ fn groupChunkRowsExact(
         };
         try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
     }
+}
+
+/// Staged row `r`'s exact key bytes, null for a NULL key: its KeyRef under
+/// `key_refs`, else the rows' last str column.
+inline fn exactKeyBytes(rows: GroupRows, r: usize) ?[]const u8 {
+    if (rows.layout.key_refs) return rows.keyRefAll()[r].bytes();
+    const cols = rows.layout.str_columns.len;
+    if (rows.str.isNull(cols, r, cols - 1)) return null;
+    return rows.str.get(cols, r, cols - 1);
+}
+
+inline fn sameKeyBytes(a: ?[]const u8, b: ?[]const u8) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return std.mem.eql(u8, x, y);
 }
 
 test "exact group keys keep keys that share a digest in groups of their own" {
@@ -8801,7 +9058,7 @@ fn stageBucketIds(comptime key_width: GroupKeyWidth, chunks: []const RawChunk, b
     }
 }
 
-const MAX_STAGE_LANES: usize = 4 + 2 * MAX_GROUP_PAYLOAD_COLUMNS;
+const MAX_STAGE_LANES: usize = 5 + 2 * MAX_GROUP_PAYLOAD_COLUMNS;
 
 /// One fixed-width lane of a staged row slab.
 const StageLane = union(enum) {
@@ -8810,6 +9067,7 @@ const StageLane = union(enum) {
     key_hi,
     column: usize,
     rowref,
+    key_ref,
     weight,
     valid: usize,
 
@@ -8828,6 +9086,10 @@ const StageLane = union(enum) {
         }
         if (layout.has_rowref) {
             buf[n] = .rowref;
+            n += 1;
+        }
+        if (layout.key_refs) {
+            buf[n] = .key_ref;
             n += 1;
         }
         if (layout.has_weight) {
@@ -8851,6 +9113,7 @@ const StageLane = union(enum) {
             .key_hi => @sizeOf(u32),
             .column => |c| groupColumnSize(layout.columns[c].physical_type),
             .rowref => @sizeOf(i64),
+            .key_ref => @sizeOf(KeyRef),
             .weight => @sizeOf(u32),
             .valid => 1,
         };
@@ -8868,6 +9131,7 @@ const StageLane = union(enum) {
             .key_hi => std.mem.sliceAsBytes(rows.keyU96HiAll()),
             .column => |c| rows.columnByteSlab(c),
             .rowref => std.mem.sliceAsBytes(rows.rowrefAll()),
+            .key_ref => std.mem.sliceAsBytes(rows.keyRefAll()),
             .weight => std.mem.sliceAsBytes(rows.weightAll()),
             .valid => |v| rows.validAll(v),
         };
@@ -10280,13 +10544,20 @@ fn foldDeferredBucket(
     const g0 = if (profile) platform.nowTicks() else 0;
 
     const layout = shared.group_rows_layout;
+    // Parts scatter fixed lanes only: runSiloGrid stages a deferred exact key
+    // as a KeyRef (keyRefLayout).
+    std.debug.assert(!layout.has_str_payload);
     if (local.defer_table == null) local.defer_table = .{ .narrow = try GroupTable.init(allocator, DEFER_PART_ROWS) };
     const table = &local.defer_table.?;
     const transient = top.items.len != 0 and layout.distinct_slot_count == 0;
     const states = if (transient) &local.defer_states else &bucket.states;
+    const keys: ?*KeyBank = if (layout.exact_key) keys: {
+        if (local.defer_keys == null) local.defer_keys = .{ .arena = .init(allocator), .borrows = true };
+        break :keys &local.defer_keys.?;
+    } else null;
     const part_count = deferPartCount(total_rows);
     if (part_count == 1) {
-        try foldDeferredPart(allocator, scratch, bucket, table, states, transient, top, chunks, total_rows);
+        try foldDeferredPart(allocator, scratch, bucket, table, states, keys, transient, top, chunks, total_rows);
     } else {
         try local.defer_part_ids.resize(allocator, total_rows);
         const part_ids = local.defer_part_ids.items;
@@ -10301,7 +10572,7 @@ fn foldDeferredBucket(
         for (StageLane.all(layout, &lanes)) |stage_lane| try scatterPartLane(layout, parts, chunks, part_ids, stage_lane);
         for (parts) |part| {
             if (part.len() == 0) continue;
-            try foldDeferredPart(allocator, scratch, bucket, table, states, transient, top, &.{.{ .rows = part, .owner_worker = 0, .bucket_idx = lane }}, part.len());
+            try foldDeferredPart(allocator, scratch, bucket, table, states, keys, transient, top, &.{.{ .rows = part, .owner_worker = 0, .bucket_idx = lane }}, part.len());
         }
     }
     bucket.row_count += total_rows;
@@ -10323,6 +10594,7 @@ fn foldDeferredPart(
     bucket: *PipeBucket,
     table: *BucketTable,
     states: *StateSlab,
+    keys: ?*KeyBank,
     transient: bool,
     top: *TopSet,
     chunks: []const GroupChunk,
@@ -10331,8 +10603,12 @@ fn foldDeferredPart(
     try table.resetFor(allocator, part_rows);
     if (transient) states.clearRetainingCapacity();
     const first_new = states.len;
+    if (keys) |bank| {
+        bank.keys.clearRetainingCapacity();
+        bank.base = @intCast(first_new);
+    }
     for (chunks) |chunk| {
-        try groupChunkRowsDirect(table, states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), &bucket.str_bank, null, chunk.rows, part_rows, part_rows, 0, null);
+        try groupChunkRowsDirect(table, states, &bucket.str_states, &bucket.concat_states, &bucket.udf_states, bucket.udf_arena.allocator(), &bucket.distinct_sets, scratch, allocator, bucket.str_arena.allocator(), &bucket.str_bank, keys, chunk.rows, part_rows, part_rows, 0, null);
     }
     if (top.items.len == 0) return;
     var gid = first_new;
@@ -10518,16 +10794,67 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
 
 /// Whether the grid defers every bucket's fold until all rows are staged (see
 /// DEFER_FOLD_MIN_GROUPS). Staging then holds every input row at once, so it
-/// must fit well within the memory budget. String payloads and per-group
-/// finalized aggregates keep folding as rows arrive. So does COUNT(DISTINCT):
-/// a bucket's distinct members share one (gid, value) set that parts don't
-/// split, so deferring would add the staging copy and keep the set's misses.
-fn deferBucketFolds(layout: GroupRowsLayout, n_workers: usize, staged: bool, expected_groups_per_bucket: usize, input_rows: u64, resources: ?*thindb.exec.memory.MemoryAccountant) bool {
+/// must fit well within the memory budget; an exact key's staged bytes are
+/// priced at `key_row_bytes` a row. String payloads other than that key and
+/// per-group finalized aggregates keep folding as rows arrive. So does
+/// COUNT(DISTINCT): a bucket's distinct members share one (gid, value) set
+/// that parts don't split, so deferring would add the staging copy and keep
+/// the set's misses.
+fn deferBucketFolds(layout: GroupRowsLayout, n_workers: usize, staged: bool, expected_groups_per_bucket: usize, input_rows: u64, key_row_bytes: u64, resources: ?*thindb.exec.memory.MemoryAccountant) bool {
     if (!staged or n_workers < 2 or expected_groups_per_bucket < DEFER_FOLD_MIN_GROUPS) return false;
-    if (layout.has_str_payload or hasStringResults(layout) or layout.has_concat or layout.has_udf or layout.distinct_slot_count != 0) return false;
+    const key_only = layout.exact_key and layout.str_columns.len == 1;
+    if ((layout.has_str_payload and !key_only) or hasStringResults(layout) or layout.has_concat or layout.has_udf or layout.distinct_slot_count != 0) return false;
     const accountant = resources orelse return false;
-    const staged_bytes = std.math.mul(u64, input_rows, GroupRows.slabBytes(layout, 1)) catch return false;
+    const row_bytes = GroupRows.slabBytes(layout, 1) + if (layout.has_str_payload) @sizeOf(KeyRef) + key_row_bytes else 0;
+    const staged_bytes = std.math.mul(u64, input_rows, row_bytes) catch return false;
     return staged_bytes <= accountant.pool.budget / DEFER_FOLD_BUDGET_DIVISOR;
+}
+
+/// A string key part's bytes a row when no segment string table measures
+/// them (a computed key).
+const GUESSED_KEY_STRING_WIDTH: u64 = 32;
+
+/// `layout` with its exact key staged as a KeyRef (see
+/// `GroupRowsLayout.key_refs`); deferBucketFolds admits no other string.
+fn keyRefLayout(layout: GroupRowsLayout) GroupRowsLayout {
+    std.debug.assert(layout.exact_key and layout.str_columns.len == 1);
+    var staged = layout;
+    staged.str_columns = &.{};
+    staged.has_str_payload = false;
+    staged.key_refs = true;
+    return staged;
+}
+
+/// The bytes `ExactKey.stage` stages a row, pricing a string part at its
+/// mean distinct width in the snapshot's segment string tables: no block is
+/// read, and a value on most rows (an empty string) pulls the row mean below
+/// it, so a skewed column is overpriced rather than under-.
+fn exactKeyRowBytes(table: *thindb.api.Table, snap: Scan.Snapshot, parts: []const GroupKeyColumnSpec) u64 {
+    var bytes: u64 = 0;
+    for (parts) |part| {
+        bytes += @intFromBool(part.nullable);
+        if (!part.typ.isVarlen()) {
+            bytes += thindb.exec.memory.estimateColumnBytes(part.typ);
+            continue;
+        }
+        bytes += @sizeOf(u32) + stringTableWidth(table, snap, part.name);
+    }
+    return bytes;
+}
+
+fn stringTableWidth(table: *thindb.api.Table, snap: Scan.Snapshot, name: []const u8) u64 {
+    const col = thindb.types.findColumn(table.schema.columns, name) orelse return GUESSED_KEY_STRING_WIDTH;
+    var value_bytes: u64 = 0;
+    var values: u64 = 0;
+    for (snap.segments) |entry| {
+        const handle = table.acquireSegment(entry.segment_id) catch return GUESSED_KEY_STRING_WIDTH;
+        defer table.releaseSegment(handle);
+        const strings = handle.seg.info.stringTable(col) orelse return GUESSED_KEY_STRING_WIDTH;
+        value_bytes += strings.value_bytes;
+        values += strings.value_count;
+    }
+    if (values == 0) return GUESSED_KEY_STRING_WIDTH;
+    return (value_bytes + values - 1) / values;
 }
 
 pub const RunConfig = struct {
@@ -11081,6 +11408,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (stage_builders) |*builder| builder.* = .{};
     }
 
+    const defer_fold = deferBucketFolds(group_rows_layout, n_workers, use_dedicated_raw_stage, expectedGroupsPerBucket(defer_groups, bucket_count), stats_scan.stats().upper_rows, if (group_rows_layout.exact_key) exactKeyRowBytes(table, snap, group_rows_layout.key_columns) else 0, resources);
+    // A deferred fold reads keys only once every row is staged, so a worker's
+    // KeyArena can hold each exact key's bytes from the scan to the last fold.
+    const staged_layout = if (defer_fold and group_rows_layout.exact_key) keyRefLayout(group_rows_layout) else group_rows_layout;
     var shared = PipeShared{
         .resources = resources,
         .allocator = allocator,
@@ -11091,8 +11422,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .input_rows_per_bucket = total / bucket_count + @intFromBool(total % bucket_count != 0),
         .raw_group_queues = raw_group_queues,
         .stage_builders = stage_builders,
-        .group_rows_layout = group_rows_layout,
-        .recycle_byte_limit = if (group_rows_layout.has_str_payload) stringRecycleLimit(resources) else null,
+        .group_rows_layout = staged_layout,
+        .recycle_byte_limit = if (staged_layout.has_str_payload) stringRecycleLimit(resources) else null,
         .key_digest_mask = cfg.key_digest_mask,
         .generic_filter_required = cfg.filter_expr != null or cfg.computed_where != null,
         .residual_filter = cfg.residual_filter,
@@ -11105,7 +11436,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .direct_final_local = direct_final_local,
         .local_parts = parts,
         .shared_scan_buffers = shared_scan_buffers_ptr,
-        .defer_fold = deferBucketFolds(group_rows_layout, n_workers, use_dedicated_raw_stage, expectedGroupsPerBucket(defer_groups, bucket_count), total, resources),
+        .defer_fold = defer_fold,
     };
     defer shared.scan_tiles.deinit(allocator);
     raw_queues_moved_to_shared = true;
@@ -11143,10 +11474,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         if (use_flat_scan_partitions) try parts[i].enableFlatScanPartitions(allocator, bucket_count, flat_reserve_per_worker);
         if (use_raw_group) {
             try parts[i].ensureWideBucketScratch(allocator, bucket_count);
-            try parts[i].raw_active_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, raw_chunk_rows);
+            try parts[i].raw_active_rows.ensureTotalCapacity(allocator, staged_layout, raw_chunk_rows);
             if (cfg.group_rows_layout.has_weight) try parts[i].prepareFoldIndex(allocator, raw_chunk_rows);
             const stage_scratch_rows = if (cfg.shared_stage_builders) raw_chunk_rows * @max(@as(usize, 1), @min(raw_batch_chunks, MAX_RAW_BATCH_CHUNKS)) else raw_chunk_rows;
-            try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, cfg.group_rows_layout, stage_scratch_rows);
+            try parts[i].flat_raw_rows.ensureTotalCapacity(allocator, staged_layout, stage_scratch_rows);
             try parts[i].flat_bucket_ids.ensureTotalCapacity(allocator, stage_scratch_rows);
         }
         const locates = cfg.group_rows_layout.has_rowref and !(if (cfg.count_sketch) |pass| pass.tallies() else false);
@@ -11441,6 +11772,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     }
     i = 0;
     while (i < n_workers) : (i += 1) threads[i].join();
+    defer for (parts[0..n_workers]) |*p| p.key_arena.deinit(allocator);
     const worker_wall_ticks = platform.nowTicks() - total_t0;
     for (errs) |maybe_err| if (maybe_err) |e| return e;
     if (PROFILING and cfg.trace_timing) if (shared.slot_bound) |bound| {
