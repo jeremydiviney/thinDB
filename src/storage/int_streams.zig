@@ -16,13 +16,21 @@
 //!     [count: u32]         values
 //!     [width: u8]          bytes per value in the payload: 1, 2, 3, 4 or 8
 //!     [method: u8]         `Method`, plus `shuffled_bit` for byte planes
-//!     [stored_width: u8]   bytes per stored value: 0, 1, 2, 4 or 8
+//!     [stored_width: u8]   bytes per stored value: 0, 1, 2, 3, 4 or 8,
+//!                          never more than `width`
 //!     [pad: u8]
 //!     [base: u64][factor: u64][first: u64]
 //!   the payload, each rewritten array replaced by its stored values
 //!
+//! At most `max_streams` arrays are rewritten, and the stored form is never
+//! longer than the payload. With every array stored no wider than it was,
+//! the reader can decompress the stored form into the tail of the payload's
+//! own buffer and restore front to back in place: what it writes never
+//! overtakes what it has yet to read.
+//!
 //! Arithmetic is modulo 2^64 and every value is written back truncated to
-//! `width` bytes, so restoring is exact for any input:
+//! `width` bytes, so restoring is exact for any input (a stored value
+//! truncated to `width` bytes too):
 //!   .plain   value_i = stored_i
 //!   .frame   value_i = base + stored_i * factor
 //!   .delta   value_0 = first,
@@ -49,6 +57,7 @@ pub const Stream = struct {
 pub const Method = enum(u8) { plain = 0, frame = 1, delta = 2 };
 pub const shuffled_bit: u8 = 0x80;
 pub const entry_size: usize = 36;
+pub const max_streams: usize = 8;
 
 /// Values a trial compresses per candidate form: enough to rank forms as
 /// well as a trial on the whole array, at a fraction of its cost.
@@ -90,6 +99,7 @@ pub fn transform(
     defer allocator.free(window);
 
     for (streams) |s| {
+        if (rewrites.items.len == max_streams) break;
         if (s.count < min_values) continue;
         const bytes = payload[s.offset..][0 .. @as(usize, s.count) * s.width];
         const n: usize = @min(s.count, trial_values);
@@ -124,35 +134,60 @@ pub fn transform(
         at = s.offset + @as(usize, s.count) * s.width;
     }
     try out.appendSlice(allocator, payload[at..]);
+    if (out.items.len - start > payload.len) {
+        out.shrinkRetainingCapacity(start);
+        return false;
+    }
     return true;
 }
 
-/// Rebuilds a payload of `out.len` bytes from its stored form.
-pub fn restore(stored: []const u8, out: []u8) !void {
+/// Rebuilds the payload filling `buf` from its stored form, which fills
+/// `buf[stored_at..]`, in place. `allocator` holds a byte-plane array while
+/// it is restored.
+pub fn restore(allocator: Allocator, buf: []u8, stored_at: usize) !void {
     const corrupt = format.Error.CorruptColumnBlockHeader;
-    if (stored.len < 4) return corrupt;
-    const n = format.readU32(stored[0..4]);
+    const stored_len = buf.len - stored_at;
+    if (stored_len < 4) return corrupt;
+    const n = format.readU32(buf[stored_at..][0..4]);
+    if (n > max_streams) return corrupt;
     const dir_end = 4 + @as(usize, n) * entry_size;
-    if (dir_end > stored.len) return corrupt;
-    var src: usize = dir_end;
+    if (dir_end > stored_len) return corrupt;
+    // The restore overwrites the directory first.
+    var entries: [max_streams]Entry = undefined;
+    for (entries[0..n], 0..) |*e, i| e.* = try readEntry(buf[stored_at + 4 + i * entry_size ..][0..entry_size]);
+
+    var planes: []u8 = &.{};
+    defer allocator.free(planes);
+    var src: usize = stored_at + dir_end;
     var dst: usize = 0;
-    for (0..n) |i| {
-        const e = try readEntry(stored[4 + i * entry_size ..][0..entry_size]);
+    for (entries[0..n]) |e| {
         const len = @as(usize, e.stream.count) * e.stream.width;
-        if (e.stream.offset < dst or e.stream.offset + len > out.len) return corrupt;
+        if (e.stream.offset < dst or e.stream.offset + len > buf.len) return corrupt;
         const gap = e.stream.offset - dst;
-        if (src + gap > stored.len) return corrupt;
-        @memcpy(out[dst..e.stream.offset], stored[src..][0..gap]);
+        if (src + gap > buf.len) return corrupt;
+        @memmove(buf[dst..e.stream.offset], buf[src..][0..gap]);
         src += gap;
         dst = e.stream.offset;
-        const stored_len = storedCount(e.stream.count, e.form.method) * e.form.stored_width;
-        if (src + stored_len > stored.len) return corrupt;
-        decode(stored[src..][0..stored_len], e.stream, e.form, out[dst..][0..len]);
-        src += stored_len;
+        const array_len = storedCount(e.stream.count, e.form.method) * e.form.stored_width;
+        if (src + array_len > buf.len) return corrupt;
+        var in: []const u8 = buf[src..][0..array_len];
+        if (e.form.shuffled) {
+            // Each byte plane is read across the whole array, ahead of what
+            // the restore writes, so the planes are moved out first.
+            if (planes.len < array_len) {
+                allocator.free(planes);
+                planes = &.{};
+                planes = try allocator.alloc(u8, array_len);
+            }
+            @memcpy(planes[0..array_len], in);
+            in = planes[0..array_len];
+        }
+        decode(in, e.stream, e.form, buf[dst..][0..len]);
+        src += array_len;
         dst += len;
     }
-    if (stored.len - src != out.len - dst) return corrupt;
-    @memcpy(out[dst..], stored[src..]);
+    // The bytes past the last array are already in place.
+    if (src != dst) return corrupt;
 }
 
 fn storedCount(count: u32, method: Method) usize {
@@ -201,7 +236,7 @@ fn fit(values: []const u64, method: Method, s: Stream) ?Form {
                 if (lower) base = v;
             }
             const spread = spreadOf(values, base, 0);
-            return .{ .method = .frame, .stored_width = narrowWidth(spread.max), .base = base, .factor = spread.factor };
+            return .{ .method = .frame, .stored_width = @min(narrowWidth(spread.max), s.width), .base = base, .factor = spread.factor };
         },
         .delta => {
             if (values.len < 2) return null;
@@ -212,7 +247,7 @@ fn fit(values: []const u64, method: Method, s: Stream) ?Form {
                 prev = v;
             }
             const spread = spreadOf(values, @bitCast(base), 1);
-            return .{ .method = .delta, .stored_width = narrowWidth(spread.max), .base = @bitCast(base), .factor = spread.factor, .first = values[0] };
+            return .{ .method = .delta, .stored_width = @min(narrowWidth(spread.max), s.width), .base = @bitCast(base), .factor = spread.factor, .first = values[0] };
         },
     }
 }
@@ -324,9 +359,10 @@ fn readEntry(in: *const [entry_size]u8) !Entry {
         else => return corrupt,
     }
     switch (stored_width) {
-        0, 1, 2, 4, 8 => {},
-        else => if (method != .plain) return corrupt,
+        0, 1, 2, 3, 4, 8 => {},
+        else => return corrupt,
     }
+    if (stored_width > width) return corrupt;
     if (method == .plain and stored_width != width) return corrupt;
     if (method == .delta and count == 0) return corrupt;
     return .{
@@ -453,11 +489,21 @@ fn expectRoundTrip(payload: []const u8, streams: []const Stream) !bool {
         try std.testing.expectEqual(@as(usize, 0), stored.items.len);
         return false;
     }
-    const out = try allocator.alloc(u8, payload.len);
+    const out = try restoreCopy(stored.items, payload.len);
     defer allocator.free(out);
-    try restore(stored.items, out);
     try std.testing.expectEqualSlices(u8, payload, out);
     return true;
+}
+
+/// `stored` restored into a fresh buffer of `len` bytes, as a reader does.
+fn restoreCopy(stored: []const u8, len: usize) ![]u8 {
+    const allocator = std.testing.allocator;
+    if (stored.len > len) return format.Error.CorruptColumnBlockHeader;
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+    @memcpy(out[len - stored.len ..], stored);
+    try restore(allocator, out, len - stored.len);
+    return out;
 }
 
 test "int_streams restores every shape and width exactly; keeps arrays a rewrite can't shrink" {
@@ -530,12 +576,10 @@ test "int_streams restore rejects truncated and malformed stored forms" {
     var stored: std.ArrayList(u8) = .empty;
     defer stored.deinit(allocator);
     try std.testing.expect(try transform(allocator, &compressor, &payload, &.{.{ .offset = 0, .count = count, .width = 8 }}, &stored));
-    var out: [count * 8]u8 = undefined;
-
     const corrupt = format.Error.CorruptColumnBlockHeader;
-    try std.testing.expectError(corrupt, restore(stored.items[0 .. stored.items.len - 1], &out));
-    try std.testing.expectError(corrupt, restore(stored.items[0..2], &out));
-    try std.testing.expectError(corrupt, restore(stored.items, out[0 .. out.len - 1]));
+    try std.testing.expectError(corrupt, restoreCopy(stored.items[0 .. stored.items.len - 1], payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(stored.items[0..2], payload.len));
+    try std.testing.expectError(corrupt, restoreCopy(stored.items, payload.len - 1));
     stored.items[4 + 8] = 5;
-    try std.testing.expectError(corrupt, restore(stored.items, &out));
+    try std.testing.expectError(corrupt, restoreCopy(stored.items, payload.len));
 }
