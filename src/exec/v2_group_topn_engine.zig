@@ -539,8 +539,8 @@ pub const Params = struct {
     count_sketch: bool = true,
     having_bound: bool = true,
     /// Group hashed keys by their bytes, the digest only placing them (see
-    /// `SiloCore.GroupRowsLayout.exact_key`).
-    exact_group_keys: bool = false,
+    /// `SiloCore.GroupRowsLayout.exact_key`); else the digest is the key.
+    exact_group_keys: bool = true,
     /// The hashed key digest's width (`SiloCore.RunConfig.key_digest_mask`).
     key_digest_bits: u8 = 128,
 };
@@ -616,7 +616,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
-        .exact_group_keys = if (getenv("THINDB_EXACT_GROUP_KEYS")) |v| v[0] != 0 and v[0] != '0' else false,
+        .exact_group_keys = if (getenv("THINDB_DIGEST_GROUP_KEYS")) |v| v[0] == 0 or v[0] == '0' else true,
         .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 128), 1), 128)),
     };
 }

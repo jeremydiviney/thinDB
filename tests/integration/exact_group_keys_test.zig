@@ -33,12 +33,12 @@ fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
 
 fn setMode(exact: bool) void {
     setEnv("THINDB_V2_KEY_DIGEST_BITS", std.fmt.comptimePrint("{d}", .{DIGEST_BITS}));
-    setEnv("THINDB_EXACT_GROUP_KEYS", if (exact) "1" else "0");
+    setEnv("THINDB_DIGEST_GROUP_KEYS", if (exact) "0" else "1");
 }
 
 fn clearMode() void {
     setEnv("THINDB_V2_KEY_DIGEST_BITS", "");
-    setEnv("THINDB_EXACT_GROUP_KEYS", "");
+    setEnv("THINDB_DIGEST_GROUP_KEYS", "");
 }
 
 /// The first `i < j` whose `digestOf` agree in their low DIGEST_BITS.

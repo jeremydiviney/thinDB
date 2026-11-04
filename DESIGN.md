@@ -1291,7 +1291,7 @@ and radix's cache-resident gate, keep the product.
 
 Some keys are never compared byte for byte: a 128-bit digest stands in for
 them. These are a string or wider-than-128-bit GROUP BY key in the V2 grouped
-engine, a global COUNT(DISTINCT) over text, a table function's PARTITION BY
+engine under digest group keys (below), a global COUNT(DISTINCT) over text, a table function's PARTITION BY
 key, and the predicate digests that key the condition cache and the miss memo
 (§6.4). Two keys merge only if their digests collide, about n² / 2¹²⁹ for n
 keys. The digests are XXH3 under a per-process key (`exec.setDigestSeed`):
@@ -1303,9 +1303,10 @@ nested-shape pool (§3): it is set before any database opens and every
 database shares it. An embedder that leaves it unset keeps seed 0. The
 `XX_HASH3_*` SQL functions keep StarRocks' fixed seeds.
 
-The V2 grouped engine never needs a hashed key's bytes before emit, which
-reads each group's values back from its first row (its rowref) and recomputes
-any derived key there. So a string key column nothing else reads reaches it as
+Under digest group keys the V2 grouped engine never needs a hashed key's bytes
+before emit, which reads each group's values back from its first row (its
+rowref) and recomputes any derived key there. So a string key column nothing
+else reads reaches it as
 per-row digests taken off the column's block (`Batch.hashed`): a dictionary
 entry is digested once per row group, not once per row. A key derived as a
 CASE whose every result is a string column or a string literal (Q39's
@@ -1316,18 +1317,23 @@ emits an empty placeholder column in place of the strings. A result column
 that only such keys read, and never in a condition, then arrives as digests
 too, so neither the column nor the key's strings are ever copied.
 
-**Exact group keys.** `SET THINDB_EXACT_GROUP_KEYS = 1` (off by default)
-makes the V2 grouped engine decide its hashed keys' groups by their bytes:
-two keys share a group only if their bytes are equal, whatever their digests.
-The digest still places a key (its partition, bucket and hash slot); its
-bytes decide among the keys found there.
+**Exact group keys.** The V2 grouped engine decides its hashed keys' groups
+by their bytes: two keys share a group only if their bytes are equal,
+whatever their digests. The digest still places a key (its partition, bucket
+and hash slot); its bytes decide among the keys found there. `SET
+THINDB_DIGEST_GROUP_KEYS = 1` makes the digest the key instead (digest group
+keys, above), which measures what the bytes cost.
 
 - **Staging.** Each staged row carries its key's bytes as the last string
   column (`GroupRowsLayout.exact_key`): a lone string key's bytes, or a
   composite key's encoding (a validity byte per nullable part, a length and
   the bytes per string part, the native bytes per fixed-width part). A
   staged row that folds another row in, the weighted collapse's, compares
-  their bytes first.
+  their bytes first. A grid that defers its folds until every row is staged
+  (`deferBucketFolds`) has each scan worker copy a key's bytes once into an
+  arena of its own (`KeyArena`) and stage a 16-byte `KeyRef` to them instead
+  (`GroupRowsLayout.key_refs`): the stage and part scatters move it like any
+  fixed lane, and a part's `KeyBank` borrows the bytes.
 - **Buckets.** A bucket keeps each group's key bytes (`KeyBank`) and
   compares them on every digest match (`getOrPutMatching`); keys that share
   a digest take groups of their own.
@@ -1351,9 +1357,9 @@ bytes decide among the keys found there.
 
 `THINDB_V2_KEY_DIGEST_BITS` narrows the staged digest so that keys collide
 on purpose: tests check exact keys under real collisions with it. On
-ClickBench's hashed GROUP BY queries exact keys cost about 16% locally (sum
-418 → 486 ms, 11-03), mostly on keys of a few hundred thousand groups and
-on composite keys over long strings.
+ClickBench on a c6a.4xlarge, exact keys cost about 5% of the hot sum (1.72 →
+1.80 s, 11-04), most of it Q40's CASE key, whose string bytes the dictionary
+collapse and the CASE copy before the staging copies them once more.
 
 A keyed GROUP BY whose keys aren't a sorted prefix of its input picks its plan
 (hash, partitioned hash, or sort then stream) by pricing each against the
