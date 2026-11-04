@@ -71,6 +71,25 @@ pub const PartPayloads = std.EnumArray(format.StringBlockPart, PartPayload);
 /// A row-group block's decompressed parts, empty where left out.
 pub const BlockParts = std.EnumArray(format.StringBlockPart, []const u8);
 
+/// What a read of a row-group block rebuilds: the whole `.dict` payload, or
+/// one without the per-row codes (`format.DICT_NO_CODES`), for readers that
+/// count values by the entry stats, or without the values' bytes
+/// (`format.DICT_NO_BYTES`), for readers of lengths. Each form's parts lie
+/// together on disk, so a read of one is one range.
+pub const Form = enum {
+    full,
+    no_codes,
+    no_bytes,
+
+    pub fn reads(form: Form, part: format.StringBlockPart) bool {
+        return switch (form) {
+            .full => true,
+            .no_codes => part != .codes,
+            .no_bytes => part == .codes or part == .index,
+        };
+    }
+};
+
 pub fn pageCount(shared_count: u32) u32 {
     return @intCast((@as(u64, shared_count) + page_values - 1) / page_values);
 }
@@ -627,9 +646,12 @@ fn appendU32(out: *std.ArrayList(u8), v: u32) void {
 pub const Page = struct {
     count: u32,
     offsets: []const u8,
+    /// Empty when the page was read for its values' lengths alone.
     bytes: []const u8,
 
-    pub fn of(payload: []const u8, expected_count: u32) !Page {
+    /// `payload` holds the page's count and offsets, then its bytes when
+    /// `with_bytes`.
+    pub fn of(payload: []const u8, expected_count: u32, with_bytes: bool) !Page {
         if (payload.len < 8) return format.Error.CorruptColumnBlockHeader;
         const count = format.readU32(payload[0..4]);
         if (count != expected_count) return format.Error.CorruptColumnBlockHeader;
@@ -646,14 +668,21 @@ pub const Page = struct {
             if (o < prev) return format.Error.CorruptColumnBlockHeader;
             prev = o;
         }
-        if (prev != page.bytes.len) return format.Error.CorruptColumnBlockHeader;
+        if (page.bytes.len != if (with_bytes) prev else 0) return format.Error.CorruptColumnBlockHeader;
         return page;
     }
 
+    /// Value `i`, of a page read with its bytes.
     pub fn value(self: Page, i: u32) []const u8 {
         const a = format.readU32(self.offsets[@as(usize, i) * 4 ..][0..4]);
         const b = format.readU32(self.offsets[(@as(usize, i) + 1) * 4 ..][0..4]);
         return self.bytes[a..b];
+    }
+
+    pub fn valueLen(self: Page, i: u32) u32 {
+        const a = format.readU32(self.offsets[@as(usize, i) * 4 ..][0..4]);
+        const b = format.readU32(self.offsets[(@as(usize, i) + 1) * 4 ..][0..4]);
+        return b - a;
     }
 };
 
@@ -663,9 +692,10 @@ pub fn pageValueCount(shared_count: u32, p: u32) u32 {
 }
 
 /// Rebuilds a row-group block's decompressed parts (the index's validity
-/// bitmap first when `has_nulls`) into a `.dict` payload with
-/// `format.DICT_SEGMENT_IDS`, allocated 16-aligned from `allocator`.
-/// `pages.page(p)` yields shared page `p` of the column's table.
+/// bitmap first when `has_nulls`), the ones `form` reads, into a `.dict`
+/// payload with `format.DICT_SEGMENT_IDS`, allocated 16-aligned from
+/// `allocator`. `pages.page(p)` yields shared page `p` of the column's
+/// table, with its bytes unless `form` is `.no_bytes`.
 pub fn rebuildDict(
     allocator: Allocator,
     parts: BlockParts,
@@ -673,6 +703,7 @@ pub fn rebuildDict(
     has_nulls: bool,
     table: format.StringTable,
     pages: anytype,
+    form: Form,
 ) ![]align(16) u8 {
     const corrupt = format.Error.CorruptColumnBlockHeader;
     const index = parts.get(.index);
@@ -697,14 +728,17 @@ pub fn rebuildDict(
     const shared_bits = values[at..][0..shared_bits_len];
     const ranks = values[at + shared_bits_len ..][0..ranks_len];
     const local_offsets = values[at + shared_bits_len + ranks_len ..][0..local_offsets_len];
+    const local_byte_count = format.readU32(local_offsets[local_count * 4 ..][0..4]);
     const local_bytes = parts.get(.bytes);
-    if (format.readU32(local_offsets[local_count * 4 ..][0..4]) != local_bytes.len) return corrupt;
-    const local_byte_count = local_bytes.len;
+    const with_bytes = form.reads(.bytes);
+    if (local_bytes.len != if (with_bytes) local_byte_count else 0) return corrupt;
     const codes = parts.get(.codes);
     const stats = parts.get(.stats);
-    const stats_len: usize = if (flags & format.DICT_ENTRY_STATS != 0) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
-    if (codes.len != @as(usize, row_count) * code_width or stats.len != stats_len) return corrupt;
-    const tail_len = codes.len + stats_len;
+    const with_stats = flags & format.DICT_ENTRY_STATS != 0 and form.reads(.stats);
+    const stats_len: usize = if (with_stats) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
+    const codes_len: usize = if (form.reads(.codes)) @as(usize, row_count) * code_width else 0;
+    if (codes.len != codes_len or stats.len != stats_len) return corrupt;
+    const tail_len = codes_len + stats_len;
 
     const Entries = struct {
         shared_bits: []const u8,
@@ -712,6 +746,7 @@ pub fn rebuildDict(
         rank_width: u8,
         local_offsets: []const u8,
         local_bytes: []const u8,
+        local_byte_count: u32,
         table: format.StringTable,
 
         fn isShared(e: @This(), i: usize) bool {
@@ -724,11 +759,14 @@ pub fn rebuildDict(
             if (v >= e.table.shared_count) return format.Error.CorruptColumnBlockHeader;
             return v;
         }
-        fn local(e: @This(), l: usize) ![]const u8 {
+        fn localStart(e: @This(), l: usize) !u32 {
             const a = format.readU32(e.local_offsets[l * 4 ..][0..4]);
             const b = format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]);
-            if (a > b or b > e.local_bytes.len) return format.Error.CorruptColumnBlockHeader;
-            return e.local_bytes[a..b];
+            if (a > b or b > e.local_byte_count) return format.Error.CorruptColumnBlockHeader;
+            return a;
+        }
+        fn localLen(e: @This(), l: usize) u32 {
+            return format.readU32(e.local_offsets[(l + 1) * 4 ..][0..4]) - format.readU32(e.local_offsets[l * 4 ..][0..4]);
         }
     };
     const entries: Entries = .{
@@ -737,6 +775,7 @@ pub fn rebuildDict(
         .rank_width = rank_width,
         .local_offsets = local_offsets,
         .local_bytes = local_bytes,
+        .local_byte_count = local_byte_count,
         .table = table,
     };
 
@@ -749,50 +788,60 @@ pub fn rebuildDict(
         var r: usize = 0;
         for (0..k) |e| if (entries.isShared(e)) {
             const rank = try entries.rank(r);
-            dict_bytes += (try pages.page(rank / page_values)).value(rank % page_values).len;
+            dict_bytes += (try pages.page(rank / page_values)).valueLen(rank % page_values);
             r += 1;
         };
     }
     if (dict_bytes > std.math.maxInt(u32)) return corrupt;
+    const stored_bytes = if (with_bytes) dict_bytes else 0;
 
-    const out_len = bitmap_len + 8 + (@as(usize, k) + 1) * 4 + dict_bytes + tail_len + @as(usize, k) * 4;
+    var out_flags = flags | format.DICT_SEGMENT_IDS;
+    if (!with_stats) out_flags &= ~format.DICT_ENTRY_STATS;
+    if (!form.reads(.codes)) out_flags |= format.DICT_NO_CODES;
+    if (!with_bytes) out_flags |= format.DICT_NO_BYTES;
+
+    const out_len = bitmap_len + 8 + (@as(usize, k) + 1) * 4 + stored_bytes + tail_len + @as(usize, k) * 4;
     const out = try allocator.alignedAlloc(u8, .@"16", out_len);
     errdefer allocator.free(out);
     @memcpy(out[0..bitmap_len], index[0..bitmap_len]);
     var o: usize = bitmap_len;
     format.writeU32(out[o..][0..4], k);
     out[o + 4] = code_width;
-    out[o + 5] = flags | format.DICT_SEGMENT_IDS;
+    out[o + 5] = out_flags;
     out[o + 6] = 0;
     out[o + 7] = 0;
     o += 8;
     const offsets_at = o;
     const bytes_at = offsets_at + (@as(usize, k) + 1) * 4;
-    const tail_at = bytes_at + dict_bytes;
+    const tail_at = bytes_at + stored_bytes;
     const ids_at = tail_at + tail_len;
     format.writeU32(out[offsets_at..][0..4], 0);
     var acc: usize = 0;
     var r: usize = 0;
     var l: usize = 0;
     for (0..k) |e| {
-        const bytes, const id = if (entries.isShared(e)) shared: {
+        const len, const id = if (entries.isShared(e)) shared: {
             const rank = try entries.rank(r);
             r += 1;
-            break :shared .{ (try pages.page(rank / page_values)).value(rank % page_values), rank };
+            const page = try pages.page(rank / page_values);
+            const len = page.valueLen(rank % page_values);
+            if (with_bytes) @memcpy(out[bytes_at + acc ..][0..len], page.value(rank % page_values));
+            break :shared .{ len, rank };
         } else local: {
+            const start = try entries.localStart(l);
+            const len = entries.localLen(l);
+            if (with_bytes) @memcpy(out[bytes_at + acc ..][0..len], local_bytes[start..][0..len]);
             const id: u32 = local_first_id + @as(u32, @intCast(l));
-            const bytes = try entries.local(l);
             l += 1;
-            break :local .{ bytes, id };
+            break :local .{ len, id };
         };
-        @memcpy(out[bytes_at + acc ..][0..bytes.len], bytes);
-        acc += bytes.len;
+        acc += len;
         format.writeU32(out[offsets_at + (e + 1) * 4 ..][0..4], @intCast(acc));
         format.writeU32(out[ids_at + e * 4 ..][0..4], id);
     }
     if (acc != dict_bytes) return corrupt;
-    @memcpy(out[tail_at..][0..codes.len], codes);
-    @memcpy(out[tail_at + codes.len ..][0..stats_len], stats);
+    @memcpy(out[tail_at..][0..codes_len], codes);
+    @memcpy(out[tail_at + codes_len ..][0..stats_len], stats);
     return out;
 }
 

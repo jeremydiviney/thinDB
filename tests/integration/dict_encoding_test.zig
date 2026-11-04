@@ -224,6 +224,11 @@ test "dict predicate pushdown returns correct rows (=, <>, range, LIKE)" {
     // note: NULL (i%4==0), '' (1), 'yes' (2), 'no' (3). NULL/'' excluded by <>''.
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note = 'yes'", quarter);
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note <> ''", quarter * 2); // yes + no
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note = ''", quarter);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note > ''", quarter * 2);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note >= ''", quarter * 3);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note <= ''", quarter);
+    try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note < ''", 0);
     try expectCount(allocator, db, "SELECT COUNT(*) FROM t WHERE note LIKE 'y%'", quarter); // yes
 
     // Deleted rows leave the counts a row group's dictionary stores: rows

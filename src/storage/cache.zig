@@ -66,14 +66,20 @@ pub const Key = struct {
 /// it matched (`exec/condition_cache.zig`) or only how many it matched; the
 /// `exec.stringKeyDigest` of each entry of a column block's dictionary
 /// (§6.5), which holds only for the process's digest key and so is never
-/// written anywhere; or one page of a segment string table's shared values
-/// (§4.4), keyed by page index in `row_group_idx`.
+/// written anywhere; one page of a segment string table's shared values
+/// (§4.4), keyed by page index in `row_group_idx`, or only its offsets; or a
+/// segment-dictionary column block rebuilt without its codes or without its
+/// values' bytes (`segment_strings.Form`), which a whole `.column` entry
+/// serves in its place.
 pub const Content = enum(u8) {
     column,
     matched_rows,
     matched_count,
     dict_digests,
     shared_strings,
+    shared_offsets,
+    dict_no_codes,
+    dict_no_bytes,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).

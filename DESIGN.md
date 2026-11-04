@@ -935,7 +935,13 @@ A zstd-1 trial on the array's first 8,192 values picks the form. The array stays
 - Cap: past 2^26 (67,108,864) distinct values in one segment's column, the column's later row groups fall back to the per-row-group encodings above.
 - A `lz4_fsst` table chose FSST for its large string blocks, so its string columns keep the per-row-group encodings.
 
-The reader rebuilds a segment-dictionary block into an ordinary dictionary block at cache fill, appending each value's segment id (`DICT_SEGMENT_IDS`). Most distinct values of a high-cardinality column live in one row group (ClickBench: 85% of URL's), so the shared table stays small and a row group reads mostly its own block; the duplicates the shared table removes are the values row groups repeat.
+The reader rebuilds a segment-dictionary block into an ordinary dictionary block at cache fill, appending each value's segment id (`DICT_SEGMENT_IDS`). A scan lane that needs only some parts asks for a **form**, read with one positioned read of the parts' contiguous range, and caches the result apart from the whole block:
+- **no bytes** (codes + index; shared pages' offsets only): value lengths, and comparisons with the empty string, which sorts first, so lengths alone place it.
+- **no codes** (index + bytes + stats): per-value counts (the scan's counted entries, a filter counted per value) and a whole row group's distinct values alone. It reads whole when the block stores no stats, since counts then come from the codes.
+
+The rebuilt block carries the full offsets and segment ids, with `DICT_NO_BYTES` or `DICT_NO_CODES` set and the missing region left empty. A cached whole block serves any form in its place.
+
+Most distinct values of a high-cardinality column live in one row group (ClickBench: 85% of URL's), so the shared table stays small and a row group reads mostly its own block; the duplicates the shared table removes are the values row groups repeat.
 
 ### 4.5 Tombstone files
 

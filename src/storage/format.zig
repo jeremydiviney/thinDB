@@ -167,6 +167,12 @@ pub const DICT_ENTRY_STATS: u8 = 1;
 /// follows the entry stats. Set only on a block rebuilt from a segment string
 /// table: equal ids are equal values within the segment.
 pub const DICT_SEGMENT_IDS: u8 = 2;
+/// `.dict` header flags of a block rebuilt from some of a segment-dictionary
+/// block's parts (`segment_strings.Form`), only ever in the block cache: the
+/// codes are left out, or the values' bytes are (`dict_offsets` still give
+/// their lengths).
+pub const DICT_NO_CODES: u8 = 4;
+pub const DICT_NO_BYTES: u8 = 8;
 
 /// On-disk encoding byte of a row-group block over the segment's string table.
 pub const segment_dict_encoding: u8 = 5;
