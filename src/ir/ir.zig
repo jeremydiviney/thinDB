@@ -285,7 +285,7 @@ pub const CreateTable = struct {
     /// append and duplicates on the key are kept).
     order_key: []const []const u8,
     unique: bool = true,
-    /// From `PROPERTIES ("compression" = "...")`; null = table default (lz4).
+    /// From `PROPERTIES ("compression" = "...")`; null = table default (zstd).
     compression: ?types.TableCompression = null,
     /// `CREATE TABLE t LIKE src`: copy src's whole definition (columns,
     /// key, defaults, compression). `columns` and `order_key` are empty.

@@ -905,7 +905,7 @@ Encoding is chosen per row group at flush time based on the column's data charac
 | **Fixed-width** | `CHAR(N)` always | N bytes per row |
 | **Offsets + bytes** | `VARCHAR(N)`/`STRING` when dictionary is not chosen | `u32` offsets + flat byte buffer (Arrow-style) |
 
-After encoding, each column block is compressed per the table's `compression` option (LZ4HC by default, zstd, or none) when that shrinks it. Both the encoding and the compressed size are recorded in the block header.
+After encoding, each column block is compressed per the table's `compression` option (zstd level 6 by default, LZ4HC, or none) when that shrinks it. The default is zstd because a cold scan is bound by the bytes it reads. zstd decodes level-6 frames at least as fast as level-3 ones, and hot scans read the decompressed cache either way, so the level only trades write CPU for size. On ClickBench (100M rows, c6a.4xlarge), zstd-6 against LZ4HC-3 takes the table from 9.95 to 7.72 GB and the cold run from 49.1 to 37.2 s, with hot runs unchanged and the load at 71.9 s against 69.4 s (zstd-3: 8.13 GB, 40.2 s cold, 56.4 s load). Both the encoding and the compressed size are recorded in the block header.
 
 **Segment string tables.** Within one segment, each distinct value of a string column gets a **segment id**, so a reader can group or count distinct values of that column exactly without hashing them. The writer keeps the column's distinct values for the whole segment and defers the column's row-group blocks to the end of the file; everything else streams to the file as it encodes (flush and compaction both write this way, and a writer that fails or is abandoned deletes its partial file):
 

@@ -804,8 +804,8 @@ pub const TableSchemaError = error{
 pub const TableCompression = enum(u8) {
     /// Encodings only; payload bytes stored raw.
     none = 0,
-    /// zstd-3 on every block; the cache holds decompressed bytes. Fastest hot
-    /// reads, largest resident set, best ratio.
+    /// zstd at `compression.block_level` on every block; the cache holds
+    /// decompressed bytes. Best ratio; cold scans are bound by bytes read.
     zstd = 1,
     /// LZ4HC on every block (decode ~4 GB/s); every block is decompressed
     /// once at cache fill.
@@ -817,7 +817,7 @@ pub const TableCompression = enum(u8) {
     lz4_fsst = 3,
 };
 
-pub const default_table_compression: TableCompression = .lz4;
+pub const default_table_compression: TableCompression = .zstd;
 
 pub const TableSchema = struct {
     columns: []const Column,

@@ -1031,7 +1031,7 @@ fn appendBlock(
     switch (table_compression) {
         .none => {},
         .zstd => {
-            compressed = try compressor.compress(allocator, payload);
+            compressed = try compressor.compress(allocator, payload, compression_mod.block_level);
             kind = if (compressed.?.len < payload.len) .zstd else .none;
         },
         .lz4, .lz4_fsst => {

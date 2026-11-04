@@ -172,8 +172,7 @@ pub const Config = struct {
     compact_tombstone_threshold: f32 = 0.30,
 
     /// Worker threads for the per-column block encode+compress inside a
-    /// compaction merge (block compression — LZ4HC for large string blocks —
-    /// dominates merge cost). `1` (default) = serial, matching the embedded
+    /// compaction merge (block compression dominates merge cost). `1` (default) = serial, matching the embedded
     /// no-surprise-threads contract. `0` = auto: ~25% of the physical cores.
     /// `thindb-server` passes auto unless `--compact-threads` says otherwise.
     compact_threads: usize = 1,
