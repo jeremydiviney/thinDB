@@ -1351,15 +1351,32 @@ test "segment string tables: blocks read without their codes or their values' by
         try std.testing.expect(!values.firstRowEntries(&[_]u32{ 0, 4 }, entries[0..2]));
     }
 
-    // Row group 0's first read without bytes cached its shared page's
-    // offsets alone.
+    // On a fresh cache: a read without bytes caches its shared page's offsets
+    // alone; a read without codes then caches the whole page, which frees
+    // them; and the whole block, cached, frees both partial blocks and
+    // serves either form in their place.
+    var fresh_controller = memory.MemoryPool.init(1 << 20);
+    var fresh = cache.Cache.init(allocator, &fresh_controller, 0);
+    fresh_controller.shareCache(&fresh, fresh_controller.budget);
+    defer fresh.deinit();
+    const ftc: cache.TableCache = .{ .cache = &fresh, .table_uid = 0 };
+    const page_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .shared_strings };
     const offsets_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .shared_offsets };
-    c.release(c.acquireDerived(offsets_key).?);
-    // A whole block cached serves either form in its parts' place.
-    var cached = try seg.borrowColumnBlock(allocator, 0, 1, tc);
-    cached.release(allocator, tc);
-    var served = try seg.borrowStringBlock(allocator, 0, 1, tc, .no_bytes);
-    defer served.release(allocator, tc);
+    var no_bytes = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_bytes);
+    no_bytes.release(allocator, ftc);
+    fresh.release(fresh.acquireDerived(offsets_key).?);
+    try std.testing.expect(fresh.acquireDerived(page_key) == null);
+    var no_codes = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_codes);
+    no_codes.release(allocator, ftc);
+    fresh.release(fresh.acquireDerived(page_key).?);
+    try std.testing.expect(fresh.acquireDerived(offsets_key) == null);
+
+    var cached = try seg.borrowColumnBlock(allocator, 0, 1, ftc);
+    cached.release(allocator, ftc);
+    try std.testing.expect(seg.cachedStringBlock(0, 1, ftc, .no_bytes) == null);
+    try std.testing.expect(seg.cachedStringBlock(0, 1, ftc, .no_codes) == null);
+    var served = try seg.borrowStringBlock(allocator, 0, 1, ftc, .no_bytes);
+    defer served.release(allocator, ftc);
     try std.testing.expectEqual(segment_strings.Form.full, served.form);
 }
 
