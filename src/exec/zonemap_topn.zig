@@ -239,6 +239,7 @@ pub const ZonemapTopN = struct {
         late_built = true;
         errdefer late_q.deinit();
         const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
+        late.dop = @max(dop, 1);
 
         const self = try allocator.create(ZonemapTopN);
         errdefer allocator.destroy(self);

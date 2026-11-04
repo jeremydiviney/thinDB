@@ -106,7 +106,7 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, column_idx);
+            const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             defer cc.release(entry);
             return decodeColumnPayload(allocator, col_type, entry.bytes, rg.row_count, flags, entry.encoding);
         }
@@ -117,6 +117,24 @@ pub const ReadSegment = struct {
         const payload = try self.rebuildSegmentDict(allocator, allocator, block, 0, row_group_idx, column_idx, null, .full);
         defer allocator.free(payload);
         return decodeColumnPayload(allocator, col_type, payload, rg.row_count, flags, .dict);
+    }
+
+    /// The cached block for `key`, pinned; on a miss read in by this reader
+    /// (`fillCacheEntry`), or by the one already reading it, waited for.
+    fn acquireBlock(
+        self: ReadSegment,
+        allocator: Allocator,
+        tc: storage_cache.TableCache,
+        key: storage_cache.Key,
+        column_idx: usize,
+    ) !*storage_cache.Cache.Entry {
+        const fill = switch (try tc.cache.claimAfterFill(self.io, key)) {
+            .hit => |entry| return entry,
+            .fill => |fill| fill,
+        };
+        defer tc.cache.endFill(self.io, fill);
+        if (tc.misses) |log| log.note(column_idx, .block);
+        return self.fillCacheEntry(allocator, tc.cache, key, column_idx);
     }
 
     /// Cache-miss fill: pread the block, decompress it and insert it pinned,
@@ -171,14 +189,19 @@ pub const ReadSegment = struct {
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            if (tc.cache.acquire(key)) |entry| return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
+            if (tc.cache.acquireAfterFill(self.io, key)) |entry| return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
             key.content = partialContent(form);
-            const entry = tc.cache.acquireDerived(key) orelse filled: {
-                const read = try self.readStringParts(allocator, row_group_idx, column_idx, parts, form);
-                defer allocator.free(read.bytes);
-                const raw = try self.rebuildSegmentDict(tc.cache.blockAllocator(), allocator, read.bytes, read.start, row_group_idx, column_idx, tc, form);
-                errdefer tc.cache.blockAllocator().free(raw);
-                break :filled try tc.cache.insertPinned(key, raw, .dict);
+            const entry = switch (try tc.cache.claimAfterFill(self.io, key)) {
+                .hit => |entry| entry,
+                .fill => |fill| filled: {
+                    defer tc.cache.endFill(self.io, fill);
+                    if (tc.misses) |log| log.note(column_idx, missRead(form));
+                    const read = try self.readStringParts(allocator, row_group_idx, column_idx, parts, form);
+                    defer allocator.free(read.bytes);
+                    const raw = try self.rebuildSegmentDict(tc.cache.blockAllocator(), allocator, read.bytes, read.start, row_group_idx, column_idx, tc, form);
+                    errdefer tc.cache.blockAllocator().free(raw);
+                    break :filled try tc.cache.insertPinned(key, raw, .dict);
+                },
             };
             return .{ .bytes = entry.bytes, .encoding = .dict, .entry = entry, .form = form };
         }
@@ -204,17 +227,16 @@ pub const ReadSegment = struct {
         const parts = self.stringBlockParts(row_group_idx, column_idx) orelse return null;
         if (parts.lengths.get(.stats) == 0) return null;
         const rows = self.info.row_groups[row_group_idx].row_count;
-        var key: storage_cache.Key = undefined;
         if (c) |tc| {
-            key = .{
+            var key: storage_cache.Key = .{
                 .table_uid = tc.table_uid,
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            const block = tc.cache.acquire(key) orelse no_codes: {
+            const block = tc.cache.acquireAfterFill(self.io, key) orelse no_codes: {
                 key.content = .dict_no_codes;
-                break :no_codes tc.cache.acquireDerived(key);
+                break :no_codes tc.cache.acquireAfterFill(self.io, key);
             };
             if (block) |entry| {
                 if (entry.encoding == .dict) {
@@ -224,15 +246,19 @@ pub const ReadSegment = struct {
                 tc.cache.release(entry);
             }
             key.content = .dict_counts;
-            if (tc.cache.acquireDerived(key)) |entry| return .{ .entries = .of(entry.bytes), .entry = entry };
-        }
-        const out_allocator = if (c) |tc| tc.cache.blockAllocator() else allocator;
-        const raw = (try self.readEntryCounts(out_allocator, allocator, row_group_idx, column_idx, parts)) orelse return null;
-        if (c) |tc| {
+            const fill = switch (try tc.cache.claimAfterFill(self.io, key)) {
+                .hit => |entry| return .{ .entries = .of(entry.bytes), .entry = entry },
+                .fill => |fill| fill,
+            };
+            defer tc.cache.endFill(self.io, fill);
+            if (tc.misses) |log| log.note(column_idx, .entry_counts);
+            const out_allocator = tc.cache.blockAllocator();
+            const raw = (try self.readEntryCounts(out_allocator, allocator, row_group_idx, column_idx, parts)) orelse return null;
             errdefer out_allocator.free(raw);
             const entry = try tc.cache.insertPinned(key, raw, .raw);
             return .{ .entries = .of(entry.bytes), .entry = entry };
         }
+        const raw = (try self.readEntryCounts(allocator, allocator, row_group_idx, column_idx, parts)) orelse return null;
         return .{ .entries = .of(raw), .owned = raw };
     }
 
@@ -302,6 +328,97 @@ pub const ReadSegment = struct {
         return .{ .bytes = entry.bytes, .encoding = .dict, .entry = entry, .form = form };
     }
 
+    fn missRead(form: segment_strings.Form) storage_cache.MissLog.Read {
+        return switch (form) {
+            .full => .block,
+            .no_codes => .no_codes,
+            .no_bytes => .no_bytes,
+        };
+    }
+
+    /// Gaps between two hinted ranges this short are hinted with them: one
+    /// read of both costs the disk about what either does alone.
+    const HINT_GAP = 8 << 10;
+
+    /// Hints (`willNeed`) the reads `misses` name in row groups
+    /// `row_groups` (ascending), of each block, or block part, the cache
+    /// holds nothing for, as few ranges as they make: a column's blocks of
+    /// consecutive row groups lie end to end in a column-major segment.
+    pub fn hintMisses(self: ReadSegment, row_groups: []const u32, misses: []const storage_cache.MissLog.Miss, c: storage_cache.TableCache) void {
+        for (misses) |m| {
+            var run: ?FileRange = null;
+            for (row_groups) |rg_idx| {
+                var buf: [2]FileRange = undefined;
+                for (self.missRanges(rg_idx, m, c, &buf)) |next| {
+                    if (run) |*r| if (next.start >= r.end and next.start - r.end <= HINT_GAP) {
+                        r.end = next.end;
+                        continue;
+                    };
+                    if (run) |r| self.willNeed(r.start, r.end - r.start);
+                    run = next;
+                }
+            }
+            if (run) |r| self.willNeed(r.start, r.end - r.start);
+        }
+    }
+
+    const FileRange = struct { start: u64, end: u64 };
+
+    /// The file ranges miss `m` reads in row group `rg_idx`, in `buf`;
+    /// none when the cache holds or fills them.
+    fn missRanges(self: ReadSegment, rg_idx: u32, m: storage_cache.MissLog.Miss, c: storage_cache.TableCache, buf: *[2]FileRange) []const FileRange {
+        const rg = self.info.row_groups[rg_idx];
+        const col: usize = m.column_idx;
+        var key: storage_cache.Key = .{
+            .table_uid = c.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = rg_idx,
+            .column_idx = m.column_idx,
+        };
+        if (c.cache.holdsOrFills(key)) return &.{};
+        const block_offset = rg.col_offsets[col];
+        if (m.read == .block) {
+            buf[0] = .{ .start = block_offset, .end = block_offset + rg.col_lengths[col] };
+            return buf[0..1];
+        }
+        const parts = self.stringBlockParts(rg_idx, col) orelse return &.{};
+        key.content = switch (m.read) {
+            .block => unreachable,
+            .no_codes => .dict_no_codes,
+            .no_bytes => .dict_no_bytes,
+            .entry_counts => .dict_counts,
+        };
+        if (c.cache.holdsOrFills(key)) return &.{};
+        switch (m.read) {
+            .block => unreachable,
+            .no_codes, .no_bytes => {
+                const range = partsRange(parts, if (m.read == .no_codes) .no_codes else .no_bytes) orelse return &.{};
+                buf[0] = .{ .start = block_offset + range.start, .end = block_offset + range.end };
+                return buf[0..1];
+            },
+            .entry_counts => {
+                for ([_]format.StringBlockPart{ .index, .stats }, buf) |part, *r| {
+                    const start = block_offset + parts.offset(part);
+                    r.* = .{ .start = start, .end = start + parts.lengths.get(part) };
+                }
+                return buf;
+            },
+        }
+    }
+
+    /// The byte range, from the block's start, that the parts `form` reads
+    /// lie in.
+    fn partsRange(parts: format.StringBlockParts, form: segment_strings.Form) ?struct { start: u32, end: u32 } {
+        var start: ?u32 = null;
+        var end: u32 = 0;
+        for (std.enums.values(format.StringBlockPart)) |part| {
+            if (!form.reads(part) or parts.lengths.get(part) == 0) continue;
+            if (start == null) start = parts.offset(part);
+            end = parts.offset(part) + parts.lengths.get(part);
+        }
+        return .{ .start = start orelse return null, .end = end };
+    }
+
     fn partialContent(form: segment_strings.Form) storage_cache.Content {
         return switch (form) {
             .full => .column,
@@ -351,7 +468,8 @@ pub const ReadSegment = struct {
     }
 
     /// The shared-string pages one rebuild reads, each read (and through the
-    /// cache, pinned) at first use and held until `release`.
+    /// cache, pinned) at first use, or together by `loadWanted`, and held
+    /// until `release`.
     const SharedPages = struct {
         seg: ReadSegment,
         allocator: Allocator,
@@ -359,7 +477,14 @@ pub const ReadSegment = struct {
         c: ?storage_cache.TableCache,
         /// Whether the pages' bytes are read, or only their offsets.
         with_bytes: bool,
-        held: []?Held = &.{},
+        slots: []Slot = &.{},
+        /// How many slots `want` marked.
+        wanted: usize = 0,
+
+        const Slot = struct {
+            held: ?Held = null,
+            wanted: bool = false,
+        };
 
         const Held = struct {
             page: segment_strings.Page,
@@ -368,54 +493,142 @@ pub const ReadSegment = struct {
         };
 
         pub fn page(self: *SharedPages, p: u32) !segment_strings.Page {
-            if (p >= self.table.pages.len) return format.Error.CorruptColumnBlockHeader;
-            if (self.held.len == 0) {
-                self.held = try self.allocator.alloc(?Held, self.table.pages.len);
-                @memset(self.held, null);
-            }
-            if (self.held[p]) |h| return h.page;
-            const h = try self.load(p, segment_strings.pageValueCount(self.table.shared_count, p));
-            self.held[p] = h;
+            const slot = try self.slotOf(p);
+            if (slot.held) |h| return h.page;
+            const h = try self.load(p);
+            slot.held = h;
             return h.page;
+        }
+
+        /// Marks page `p` as one the caller reads, for `loadWanted`; true
+        /// once every page is marked.
+        pub fn want(self: *SharedPages, p: u32) !bool {
+            const slot = try self.slotOf(p);
+            if (!slot.wanted) {
+                slot.wanted = true;
+                self.wanted += 1;
+            }
+            return self.wanted == self.slots.len;
+        }
+
+        /// Takes every page `want` marked. The ones nobody holds or reads
+        /// are hinted to the OS first, so the disk reads them side by side
+        /// rather than one pread at a time. Then this reader fills the
+        /// pages no other reader is filling, in order, and waits for the
+        /// rest last: the readers of one segment want the same pages at
+        /// once, and so each fill a different one instead of queueing on
+        /// the first.
+        pub fn loadWanted(self: *SharedPages) !void {
+            for (self.slots, 0..) |s, p| {
+                if (!s.wanted or s.held != null) continue;
+                if (self.c) |tc| {
+                    if (tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_strings))) continue;
+                    if (!self.with_bytes and tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_offsets))) continue;
+                }
+                const range = self.table.pages[p];
+                self.seg.willNeed(range.offset, readLength(range, self.with_bytes));
+            }
+            const tc = self.c orelse return;
+            var waits = false;
+            for (self.slots, 0..) |*s, p| {
+                if (!s.wanted or s.held != null) continue;
+                s.held = try self.tryLoad(tc, p);
+                if (s.held == null) waits = true;
+            }
+            if (!waits) return;
+            for (self.slots, 0..) |*s, p| {
+                if (s.wanted and s.held == null) s.held = try self.load(@intCast(p));
+            }
+        }
+
+        fn slotOf(self: *SharedPages, p: u32) !*Slot {
+            if (p >= self.table.pages.len) return format.Error.CorruptColumnBlockHeader;
+            if (self.slots.len == 0) {
+                self.slots = try self.allocator.alloc(Slot, self.table.pages.len);
+                @memset(self.slots, .{});
+            }
+            return &self.slots[p];
         }
 
         /// Page `p`, through the cache when set: the whole page when cached,
         /// else, reading only its offsets unless `with_bytes`, cached apart
-        /// from the whole page.
-        fn load(self: *SharedPages, p: u32, expected: u32) !Held {
-            const range = self.table.pages[p];
+        /// from the whole page. A page another reader is reading in is
+        /// waited for.
+        fn load(self: *SharedPages, p: u32) !Held {
             if (self.c) |tc| {
-                var key = storage_cache.Key{
-                    .table_uid = tc.table_uid,
-                    .segment_id = self.seg.info.segment_id,
-                    .row_group_idx = p,
-                    .column_idx = self.table.column_idx,
-                    .content = .shared_strings,
-                };
-                const entry = tc.cache.acquire(key) orelse cached: {
-                    if (!self.with_bytes) {
-                        key.content = .shared_offsets;
-                        if (tc.cache.acquireDerived(key)) |e| break :cached e;
-                    }
-                    const raw = try self.readPage(tc.cache.blockAllocator(), range, self.with_bytes);
-                    errdefer tc.cache.blockAllocator().free(raw);
-                    break :cached try tc.cache.insertPinned(key, raw, .raw);
-                };
-                errdefer tc.cache.release(entry);
-                const with_bytes = entry.key.content == .shared_strings;
-                return .{ .page = try segment_strings.Page.of(entry.bytes, expected, with_bytes), .entry = entry, .owned = null };
+                const whole = self.pageKey(tc, p, .shared_strings);
+                const entry = if (self.with_bytes)
+                    try self.fillPage(tc, whole)
+                else
+                    tc.cache.acquireAfterFill(self.seg.io, whole) orelse try self.fillPage(tc, self.pageKey(tc, p, .shared_offsets));
+                return self.heldOf(tc, entry, p);
             }
-            const raw = try self.readPage(self.allocator, range, self.with_bytes);
+            const raw = try self.readPage(self.allocator, self.table.pages[p], self.with_bytes);
             errdefer self.allocator.free(raw);
-            return .{ .page = try segment_strings.Page.of(raw, expected, self.with_bytes), .entry = null, .owned = raw };
+            return .{ .page = try segment_strings.Page.of(raw, self.expectedCount(p), self.with_bytes), .entry = null, .owned = raw };
+        }
+
+        /// `load` through the cache, but null instead of waiting while
+        /// another reader fills the page.
+        fn tryLoad(self: *SharedPages, tc: storage_cache.TableCache, p: usize) !?Held {
+            const whole = self.pageKey(tc, p, .shared_strings);
+            const key = if (self.with_bytes) whole else offsets: {
+                if (tc.cache.acquire(whole)) |entry| return try self.heldOf(tc, entry, p);
+                break :offsets self.pageKey(tc, p, .shared_offsets);
+            };
+            const fill = switch (try tc.cache.claim(key)) {
+                .hit => |entry| return try self.heldOf(tc, entry, p),
+                .busy => return null,
+                .fill => |fill| fill,
+            };
+            defer tc.cache.endFill(self.seg.io, fill);
+            return try self.heldOf(tc, try self.insertPage(tc, key), p);
+        }
+
+        fn fillPage(self: *SharedPages, tc: storage_cache.TableCache, key: storage_cache.Key) !*storage_cache.Cache.Entry {
+            const fill = switch (try tc.cache.claimAfterFill(self.seg.io, key)) {
+                .hit => |entry| return entry,
+                .fill => |fill| fill,
+            };
+            defer tc.cache.endFill(self.seg.io, fill);
+            return self.insertPage(tc, key);
+        }
+
+        fn insertPage(self: *SharedPages, tc: storage_cache.TableCache, key: storage_cache.Key) !*storage_cache.Cache.Entry {
+            const raw = try self.readPage(tc.cache.blockAllocator(), self.table.pages[key.row_group_idx], key.content == .shared_strings);
+            errdefer tc.cache.blockAllocator().free(raw);
+            return tc.cache.insertPinned(key, raw, .raw);
+        }
+
+        fn heldOf(self: *SharedPages, tc: storage_cache.TableCache, entry: *storage_cache.Cache.Entry, p: usize) !Held {
+            errdefer tc.cache.release(entry);
+            const with_bytes = entry.key.content == .shared_strings;
+            return .{ .page = try segment_strings.Page.of(entry.bytes, self.expectedCount(p), with_bytes), .entry = entry, .owned = null };
+        }
+
+        fn pageKey(self: *const SharedPages, tc: storage_cache.TableCache, p: usize, content: storage_cache.Content) storage_cache.Key {
+            return .{
+                .table_uid = tc.table_uid,
+                .segment_id = self.seg.info.segment_id,
+                .row_group_idx = @intCast(p),
+                .column_idx = self.table.column_idx,
+                .content = content,
+            };
+        }
+
+        fn expectedCount(self: *const SharedPages, p: usize) u32 {
+            return segment_strings.pageValueCount(self.table.shared_count, @intCast(p));
+        }
+
+        fn readLength(range: format.SharedPage, with_bytes: bool) usize {
+            return @as(usize, range.index_length) + if (with_bytes) range.bytes_length else 0;
         }
 
         /// Reads a page's offsets block, and its bytes block when
         /// `with_bytes`, into one buffer, as `segment_strings.Page.of` takes
         /// it.
         fn readPage(self: *SharedPages, out_allocator: Allocator, range: format.SharedPage, with_bytes: bool) ![]align(16) u8 {
-            const read_len = @as(usize, range.index_length) + if (with_bytes) range.bytes_length else 0;
-            const block = try self.allocator.alloc(u8, read_len);
+            const block = try self.allocator.alloc(u8, readLength(range, with_bytes));
             defer self.allocator.free(block);
             if (try self.seg.file.readPositionalAll(self.seg.io, block, range.offset) != block.len) {
                 return format.Error.UnexpectedEof;
@@ -434,11 +647,11 @@ pub const ReadSegment = struct {
         }
 
         fn release(self: *SharedPages) void {
-            for (self.held) |held| if (held) |h| {
+            for (self.slots) |s| if (s.held) |h| {
                 if (h.entry) |e| self.c.?.cache.release(e);
                 if (h.owned) |o| self.allocator.free(o);
             };
-            self.allocator.free(self.held);
+            self.allocator.free(self.slots);
         }
     };
 
@@ -548,14 +761,13 @@ pub const ReadSegment = struct {
         c: ?storage_cache.TableCache,
     ) !BorrowedBlock {
         if (c) |tc| {
-            const cc = tc.cache;
             const key = storage_cache.Key{
                 .table_uid = tc.table_uid,
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
             };
-            const entry = (cc.acquire(key)) orelse try self.fillCacheEntry(allocator, cc, key, column_idx);
+            const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
         const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
@@ -587,20 +799,24 @@ pub const ReadSegment = struct {
             .row_group_idx = @intCast(row_group_idx),
             .column_idx = @intCast(column_idx),
         };
-        const entry = c.cache.acquire(key) orelse miss: {
-            var header: [format.column_block_header_size]u8 = undefined;
-            if (try self.file.readPositionalAll(self.io, &header, rg.col_offsets[column_idx]) != header.len) {
-                return format.Error.UnexpectedEof;
-            }
-            if (blockEncoding(&header, 0) == .raw) {
-                const flags = format.ColumnBlockFlags.fromByte(header[1]);
-                const framing = if (flags.has_nulls) column.bitmapBytes(rg.row_count) else 0;
-                const offsets = 4 + (@as(u64, rg.row_count) + 1) * 4;
-                const payload = format.readU32(header[4..8]);
-                if (payload < framing + offsets) return format.Error.CorruptColumnBlockHeader;
-                return payload - framing - offsets;
-            }
-            break :miss try self.fillCacheEntry(allocator, c.cache, key, column_idx);
+        const entry = switch (try c.cache.claimAfterFill(self.io, key)) {
+            .hit => |entry| entry,
+            .fill => |fill| miss: {
+                defer c.cache.endFill(self.io, fill);
+                var header: [format.column_block_header_size]u8 = undefined;
+                if (try self.file.readPositionalAll(self.io, &header, rg.col_offsets[column_idx]) != header.len) {
+                    return format.Error.UnexpectedEof;
+                }
+                if (blockEncoding(&header, 0) == .raw) {
+                    const flags = format.ColumnBlockFlags.fromByte(header[1]);
+                    const framing = if (flags.has_nulls) column.bitmapBytes(rg.row_count) else 0;
+                    const offsets = 4 + (@as(u64, rg.row_count) + 1) * 4;
+                    const payload = format.readU32(header[4..8]);
+                    if (payload < framing + offsets) return format.Error.CorruptColumnBlockHeader;
+                    return payload - framing - offsets;
+                }
+                break :miss try self.fillCacheEntry(allocator, c.cache, key, column_idx);
+            },
         };
         defer c.cache.release(entry);
         const values = if (nullable) entry.bytes[column.bitmapBytes(rg.row_count)..] else entry.bytes;
@@ -713,6 +929,16 @@ pub const ReadSegment = struct {
         return bytes;
     }
 
+    /// Tells the OS the `len` bytes at `offset` will be read soon, so it
+    /// reads them in while the caller works and a later pread of them waits
+    /// on what is still in flight, not on a whole disk read. Only for bytes
+    /// the caller will read: a hint is a real disk read. Linux only; a hint
+    /// that fails changes nothing.
+    pub fn willNeed(self: ReadSegment, offset: u64, len: usize) void {
+        if (builtin.os.tag != .linux or len == 0) return;
+        _ = std.os.linux.fadvise(self.file.handle, @intCast(offset), @intCast(len), std.os.linux.POSIX_FADV.WILLNEED);
+    }
+
     /// Read the raw on-disk bytes (header + payload, or a segment-dictionary
     /// block's parts) of one column's block in a row group via a single
     /// positioned read.
@@ -743,15 +969,9 @@ pub const ReadSegment = struct {
         parts: format.StringBlockParts,
         form: segment_strings.Form,
     ) !struct { bytes: []u8, start: u32 } {
-        var start: ?u32 = null;
-        var end: u32 = 0;
-        for (std.enums.values(format.StringBlockPart)) |part| {
-            if (!form.reads(part) or parts.lengths.get(part) == 0) continue;
-            if (start == null) start = parts.offset(part);
-            end = parts.offset(part) + parts.lengths.get(part);
-        }
-        const first = start orelse return format.Error.CorruptColumnBlockHeader;
-        const buf = try allocator.alloc(u8, end - first);
+        const range = partsRange(parts, form) orelse return format.Error.CorruptColumnBlockHeader;
+        const first = range.start;
+        const buf = try allocator.alloc(u8, range.end - first);
         errdefer allocator.free(buf);
         const block_offset = self.info.row_groups[row_group_idx].col_offsets[column_idx];
         if (try self.file.readPositionalAll(self.io, buf, block_offset + first) != buf.len) {

@@ -695,7 +695,9 @@ pub fn pageValueCount(shared_count: u32, p: u32) u32 {
 /// bitmap first when `has_nulls`), the ones `form` reads, into a `.dict`
 /// payload with `format.DICT_SEGMENT_IDS`, allocated 16-aligned from
 /// `allocator`. `pages.page(p)` yields shared page `p` of the column's
-/// table, with its bytes unless `form` is `.no_bytes`.
+/// table, with its bytes unless `form` is `.no_bytes`; first,
+/// `pages.want(p)` marks each page the rebuild takes (true once all are
+/// marked) and `pages.loadWanted()` loads the marked pages together.
 pub fn rebuildDict(
     allocator: Allocator,
     parts: BlockParts,
@@ -720,6 +722,15 @@ pub fn rebuildDict(
     const codes_len: usize = if (form.reads(.codes)) @as(usize, row_count) * entries.code_width else 0;
     if (codes.len != codes_len or stats.len != stats_len) return corrupt;
     const tail_len = codes_len + stats_len;
+
+    {
+        var r: usize = 0;
+        for (0..k) |e| if (entries.isShared(e)) {
+            if (try pages.want((try entries.rank(r)) / page_values)) break;
+            r += 1;
+        };
+        try pages.loadWanted();
+    }
 
     var dict_bytes: usize = entries.local_byte_count;
     {
