@@ -1079,7 +1079,10 @@ const Load = struct {
                 try self.unlocked(storage.MergedSegmentWriter.appendStringTable, .{ &write.writer, &build });
                 appended = true;
             }
-            if (write.append_column == columns) break;
+            // A table may finish while another appends with the lock released,
+            // and its worker leaves it to this pass, so only a pass that
+            // appended nothing ends the loop.
+            if (write.append_column == columns) continue;
             if (write.append_rg == write.rg_count) {
                 write.append_column += 1;
                 write.append_rg = 0;
