@@ -442,6 +442,22 @@ pub fn touchesColumn(expr: PredicateExpr, name: []const u8) bool {
     };
 }
 
+/// Whether the predicate is made of per-row kernels that read column `name`
+/// alone, so it passes or fails each of the column's values as a whole.
+pub fn readsOnlyColumn(expr: PredicateExpr, name: []const u8) bool {
+    return switch (expr) {
+        .leaf, .text_as_number => |l| types.columnNameEql(l.col, name),
+        .is_null, .is_not_null => |c| types.columnNameEql(c, name),
+        .like => |l| types.columnNameEql(l.col, name),
+        .in_set, .text_as_number_set => |s| types.columnNameEql(s.col, name),
+        .@"and", .@"or" => |arms| for (arms) |a| {
+            if (!readsOnlyColumn(a, name)) break false;
+        } else true,
+        .not => |n| readsOnlyColumn(n.*, name),
+        else => false,
+    };
+}
+
 /// Every column the predicate reads, appended to `out` once each. A
 /// subquery marker reads its compared columns; its inner query is its own.
 pub fn collectColumnNames(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged([]const u8), expr: PredicateExpr) std.mem.Allocator.Error!void {

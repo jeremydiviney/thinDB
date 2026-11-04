@@ -3712,6 +3712,154 @@ test "V2 COUNT top-K: heavy keys rank exactly over dictionary, raw, tombstoned a
     }
 }
 
+test "V2 COUNT top-K by segment string ids counts shared, local and absent values exactly" {
+    // Three segments of 64 1024-row groups, past the low-cardinality
+    // engine's groups in fillers held twice each. The hot urls repeat in
+    // every row group of every segment. "edge" repeats in segments A and C but
+    // sits in one row group of B, under B's report threshold, so its B rows
+    // count only once the row groups whose string bounds admit it are read;
+    // "late" is in no row group of A, which the search there must prove.
+    // Each places in the top five only with its counts from every segment.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rg_rows = 1024;
+    const rg_count = 64;
+    const Unit = struct { s: []const u8, count: usize, rg: ?usize = null };
+    const hot = [_][]const u8{ "hot0", "hot1", "hot2", "hot3", "hot4", "hot5" };
+    var segments: [3][]const Unit = undefined;
+    var units_a: [hot.len + 2]Unit = undefined;
+    var units_b: [hot.len + 2]Unit = undefined;
+    var units_c: [hot.len + 2]Unit = undefined;
+    for (hot, 0..) |s, g| {
+        units_a[g] = .{ .s = s, .count = 600 - 40 * g };
+        units_b[g] = .{ .s = s, .count = 500 - 30 * g };
+        units_c[g] = .{ .s = s, .count = 400 - 20 * g };
+    }
+    units_a[hot.len] = .{ .s = "edge", .count = 700 };
+    units_a[hot.len + 1] = .{ .s = "zed", .count = 16 };
+    units_b[hot.len] = .{ .s = "edge", .count = 60, .rg = 3 };
+    units_b[hot.len + 1] = .{ .s = "late", .count = 700 };
+    units_c[hot.len] = .{ .s = "edge", .count = 600 };
+    units_c[hot.len + 1] = .{ .s = "late", .count = 650 };
+    segments = .{ &units_a, &units_b, &units_c };
+
+    var ends: [3]usize = undefined;
+    var all: std.ArrayList(HkRow) = .empty;
+    var id: i64 = 0;
+    for (segments, &ends, 0..) |units, *end, seg| {
+        var by_rg: [rg_count]std.ArrayList([]const u8) = @splat(.empty);
+        for (units) |u| {
+            for (0..u.count) |i| try by_rg[u.rg orelse i % rg_count].append(arena, u.s);
+        }
+        for (&by_rg, 0..) |*rg, r| {
+            var f: usize = 0;
+            while (rg.items.len < rg_rows) : (f += 1) {
+                const filler = try std.fmt.allocPrint(arena, "fill{d}-{d}-{d}", .{ seg, r, f });
+                for (0..@min(2, rg_rows - rg.items.len)) |_| try rg.append(arena, filler);
+            }
+            for (rg.items) |s| {
+                try all.append(arena, .{ .id = id, .s = s, .v = 0 });
+                id += 1;
+            }
+        }
+        end.* = all.items.len;
+    }
+    const want = try hkGroups(allocator, all.items, "");
+    defer allocator.free(want);
+    const no_hot0 = try hkGroups(allocator, all.items, "hot0");
+    defer allocator.free(no_hot0);
+    try std.testing.expectEqualStrings("edge", want[2].s);
+    try std.testing.expectEqualStrings("late", want[3].s);
+
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("ids", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string }, .{ .name = "v", .type = .int } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = rg_rows });
+        var start: usize = 0;
+        for (ends) |end| {
+            try t.insert(all.items[start..end]);
+            try t.flush();
+            start = end;
+        }
+
+        const snapshot = try thindb.exec.Scan.captureSnapshotAlloc(t, allocator, null);
+        defer {
+            snapshot.release(t);
+            allocator.free(snapshot.segments);
+        }
+        var rows: std.ArrayListUnmanaged(thindb.exec.silo_group_core.TopRow) = .empty;
+        defer rows.deinit(allocator);
+        try std.testing.expect(try thindb.exec.segment_id_topk.run(allocator, .{ .table = t, .snapshot = snapshot, .column = "s", .need = 5, .workers = dop }, &rows));
+        try std.testing.expectEqual(@as(usize, 5), rows.items.len);
+        for (rows.items, want[0..5]) |row, w| {
+            try std.testing.expectEqual(thindb.exec.stringKeyDigest(w.s), row.key);
+            try std.testing.expectEqual(@as(u64, @intCast(w.count)), row.count);
+        }
+
+        // Every filler is local to its row group and none stands out, so
+        // each segment would report all of them: the run declines first.
+        const fillers = try db.table("fillers", .{
+            .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "s", .type = .string }, .{ .name = "v", .type = .int } },
+            .order_key = &.{"id"},
+            .unique = false,
+        }, .{ .order_key = &.{"id"}, .row_group_size = rg_rows });
+        var filler_rows: std.ArrayList(HkRow) = .empty;
+        defer filler_rows.deinit(allocator);
+        var filler_start: usize = 0;
+        for (ends) |end| {
+            filler_rows.clearRetainingCapacity();
+            for (all.items[filler_start..end]) |row| {
+                if (std.mem.startsWith(u8, row.s, "fill")) try filler_rows.append(allocator, row);
+            }
+            try fillers.insert(filler_rows.items);
+            try fillers.flush();
+            filler_start = end;
+        }
+        const filler_snapshot = try thindb.exec.Scan.captureSnapshotAlloc(fillers, allocator, null);
+        defer {
+            filler_snapshot.release(fillers);
+            allocator.free(filler_snapshot.segments);
+        }
+        var none: std.ArrayListUnmanaged(thindb.exec.silo_group_core.TopRow) = .empty;
+        defer none.deinit(allocator);
+        try std.testing.expect(!try thindb.exec.segment_id_topk.run(allocator, .{ .table = fillers, .snapshot = filler_snapshot, .column = "s", .need = 5, .workers = dop }, &none));
+        try std.testing.expectEqual(@as(usize, 0), none.items.len);
+
+        // A filter on the key alone keeps or drops each value whole.
+        const Case = struct { sql: []const u8, want: []const HkGroup, at: usize = 0 };
+        const cases = [_]Case{
+            .{ .sql = "SELECT s, COUNT(*) AS c FROM ids GROUP BY s ORDER BY c DESC LIMIT 5", .want = want[0..5] },
+            .{ .sql = "SELECT s, COUNT(*) AS c FROM ids GROUP BY s ORDER BY c DESC LIMIT 2 OFFSET 2", .want = want[2..4] },
+            .{ .sql = "SELECT s, COUNT(*) AS c FROM ids GROUP BY s HAVING COUNT(*) > 1340 ORDER BY c DESC LIMIT 5", .want = want[0..4] },
+            .{ .sql = "SELECT 1, s, COUNT(*) AS c FROM ids GROUP BY 1, s ORDER BY c DESC LIMIT 5", .want = want[0..5], .at = 1 },
+            .{ .sql = "SELECT s, COUNT(*) AS c FROM ids WHERE s <> 'hot0' GROUP BY s ORDER BY c DESC LIMIT 5", .want = no_hot0[0..5] },
+        };
+        for (cases) |case| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, case.sql });
+            try expectPlanRunsGroupTopN(allocator, db, case.sql);
+            var q = try runSql(allocator, db, case.sql);
+            defer q.deinit();
+            var rank: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    try std.testing.expectEqualStrings(case.want[rank].s, batch.values[case.at].data.string.rowBytes(r));
+                    try std.testing.expectEqual(@as(?f64, @floatFromInt(case.want[rank].count)), try cellNumber(batch.values[case.at + 1], r));
+                    rank += 1;
+                }
+            }
+            try std.testing.expectEqual(case.want.len, rank);
+        }
+    }
+}
+
 test "group keys packed past 96 bits keep groups that differ only in their high bits" {
     const allocator = std.testing.allocator;
     const Row = struct { id: i64, a: i64, b: i64, c: i32, d: i32 };

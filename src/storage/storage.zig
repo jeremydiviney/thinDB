@@ -1380,6 +1380,82 @@ test "segment string tables: blocks read without their codes or their values' by
     try std.testing.expectEqual(segment_strings.Form.full, served.form);
 }
 
+test "segment string tables: entry counts from the index and stats parts match the whole block's" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The blocks of the test above: three shared values in every row group,
+    // one local value in each.
+    const shared = [_][]const u8{ "pear orchard row", "fig orchard row", "kiwi orchard row" };
+    const local = [_][]const u8{ "", "date palm grove", "apple tree lane" };
+    var vals: [48][]const u8 = undefined;
+    for (&vals, 0..) |*v, i| v.* = if (i % 4 == 3) local[i / 16] else shared[i % 4];
+    var ids: [vals.len]i32 = undefined;
+    for (&ids, 0..) |*v, i| v.* = @intCast(i);
+    var s = try buildStringCol(allocator, &vals);
+    defer s.deinit(allocator);
+    const schema = TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .int }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const columns = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(null) };
+    var info = try writeSegment(allocator, io, tmp.dir, "counts.dat", schema, 1, 0, 16, &columns, false, 2);
+    defer info.deinit(allocator);
+    var seg = try readSegment(allocator, io, tmp.dir, "counts.dat", schema);
+    defer seg.deinit();
+
+    var controller = memory.MemoryPool.init(1 << 20);
+    var c = cache.Cache.init(allocator, &controller, 0);
+    controller.shareCache(&c, controller.budget);
+    defer c.deinit();
+    const tc: cache.TableCache = .{ .cache = &c, .table_uid = 0 };
+
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        var whole = try seg.borrowColumnBlock(allocator, rg_idx, 1, null);
+        defer whole.release(allocator, null);
+        const want = segment_reader.dictBlockOf(whole.bytes, rg.row_count).entryCounts();
+        // Read, then served by the cached counts.
+        for ([_]?cache.TableCache{ null, tc, tc }) |ctc| {
+            var got = (try seg.borrowStringEntries(allocator, rg_idx, 1, ctc)).?;
+            defer got.release(allocator, ctc);
+            try std.testing.expectEqual(want.ndv, got.entries.ndv);
+            for (0..want.ndv) |e| {
+                try std.testing.expectEqual(want.id(e), got.entries.id(e));
+                try std.testing.expectEqual(want.count(e), got.entries.count(e));
+                try std.testing.expectEqual(want.firstRow(e), got.entries.firstRow(e));
+            }
+        }
+    }
+    // Row group 1 holds each of its four values in four rows.
+    var rg1_entries = (try seg.borrowStringEntries(allocator, 1, 1, tc)).?;
+    defer rg1_entries.release(allocator, tc);
+    var counts: [4]u32 = undefined;
+    for (&counts, 0..) |*n, e| n.* = rg1_entries.entries.count(e);
+    std.mem.sort(u32, &counts, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 4, 4, 4 }, &counts);
+
+    // A cached whole block frees the cached counts and serves them itself.
+    const counts_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .dict_counts };
+    var cached = try seg.borrowColumnBlock(allocator, 0, 1, tc);
+    cached.release(allocator, tc);
+    try std.testing.expect(c.acquireDerived(counts_key) == null);
+    var served = (try seg.borrowStringEntries(allocator, 0, 1, tc)).?;
+    defer served.release(allocator, tc);
+    try std.testing.expect(served.entry != null and served.owned == null);
+
+    var strings = seg.sharedStrings(allocator, 1, tc).?;
+    defer strings.release();
+    try std.testing.expectEqual(@as(u32, 3), strings.count());
+    for ([_][]const u8{ "fig orchard row", "kiwi orchard row", "pear orchard row" }, 0..) |v, rank| {
+        try std.testing.expectEqualStrings(v, try strings.value(@intCast(rank)));
+        try std.testing.expectEqual(@as(?u32, @intCast(rank)), try strings.rankOf(v));
+    }
+    for ([_][]const u8{ "", "date palm grove", "zebra" }) |v| try std.testing.expectEqual(@as(?u32, null), try strings.rankOf(v));
+}
+
 test "segment string tables: past the cap a column's later row groups keep their own encodings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

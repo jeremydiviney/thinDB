@@ -67,10 +67,11 @@ pub const Key = struct {
 /// `exec.stringKeyDigest` of each entry of a column block's dictionary
 /// (§6.5), which holds only for the process's digest key and so is never
 /// written anywhere; one page of a segment string table's shared values
-/// (§4.4), keyed by page index in `row_group_idx`, or only its offsets; or a
+/// (§4.4), keyed by page index in `row_group_idx`, or only its offsets; a
 /// segment-dictionary column block rebuilt without its codes or without its
 /// values' bytes (`segment_strings.Form`), which a whole `.column` entry
-/// serves in its place.
+/// serves in its place; or such a block's values by segment id alone
+/// (`segment_strings.EntryCounts`), which either of those serves too.
 pub const Content = enum(u8) {
     column,
     matched_rows,
@@ -80,6 +81,7 @@ pub const Content = enum(u8) {
     shared_offsets,
     dict_no_codes,
     dict_no_bytes,
+    dict_counts,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).
@@ -91,7 +93,8 @@ pub const Content = enum(u8) {
     /// content serves in their place.
     pub fn partials(self: Content) []const Content {
         return switch (self) {
-            .column => &.{ .dict_no_codes, .dict_no_bytes },
+            .column => &.{ .dict_no_codes, .dict_no_bytes, .dict_counts },
+            .dict_no_codes => &.{.dict_counts},
             .shared_strings => &.{.shared_offsets},
             else => &.{},
         };

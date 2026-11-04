@@ -188,6 +188,91 @@ pub const ReadSegment = struct {
         return .{ .bytes = raw, .encoding = .dict, .owned = raw, .form = form };
     }
 
+    /// Row group `row_group_idx`'s values of non-nullable string column
+    /// `column_idx` by segment id, with their row counts and first rows,
+    /// when the column's string table took the row group and its block
+    /// stores entry stats; else null. Reads only the block's index and stats parts, cached apart
+    /// from the whole block; a cached whole block, or one cached without its
+    /// codes, serves the read instead.
+    pub fn borrowStringEntries(
+        self: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        c: ?storage_cache.TableCache,
+    ) !?BorrowedEntries {
+        const parts = self.stringBlockParts(row_group_idx, column_idx) orelse return null;
+        if (parts.lengths.get(.stats) == 0) return null;
+        const rows = self.info.row_groups[row_group_idx].row_count;
+        var key: storage_cache.Key = undefined;
+        if (c) |tc| {
+            key = .{
+                .table_uid = tc.table_uid,
+                .segment_id = self.info.segment_id,
+                .row_group_idx = @intCast(row_group_idx),
+                .column_idx = @intCast(column_idx),
+            };
+            const block = tc.cache.acquire(key) orelse no_codes: {
+                key.content = .dict_no_codes;
+                break :no_codes tc.cache.acquireDerived(key);
+            };
+            if (block) |entry| {
+                if (entry.encoding == .dict) {
+                    const db = dictBlockOf(entry.bytes, rows);
+                    if (db.hasSegmentIds() and db.hasEntryStats()) return .{ .entries = db.entryCounts(), .entry = entry };
+                }
+                tc.cache.release(entry);
+            }
+            key.content = .dict_counts;
+            if (tc.cache.acquireDerived(key)) |entry| return .{ .entries = .of(entry.bytes), .entry = entry };
+        }
+        const out_allocator = if (c) |tc| tc.cache.blockAllocator() else allocator;
+        const raw = (try self.readEntryCounts(out_allocator, allocator, row_group_idx, column_idx, parts)) orelse return null;
+        if (c) |tc| {
+            errdefer out_allocator.free(raw);
+            const entry = try tc.cache.insertPinned(key, raw, .raw);
+            return .{ .entries = .of(entry.bytes), .entry = entry };
+        }
+        return .{ .entries = .of(raw), .owned = raw };
+    }
+
+    /// Reads a block's index and stats parts and rebuilds them into an
+    /// `EntryCounts` payload from `out_allocator`.
+    fn readEntryCounts(
+        self: ReadSegment,
+        out_allocator: Allocator,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        parts: format.StringBlockParts,
+    ) !?[]align(16) u8 {
+        const table = self.info.stringTable(column_idx) orelse return format.Error.CorruptColumnBlockHeader;
+        const block_offset = self.info.row_groups[row_group_idx].col_offsets[column_idx];
+        var payloads: [2][]u8 = .{ &.{}, &.{} };
+        defer for (payloads) |p| allocator.free(p);
+        var has_nulls = false;
+        for ([_]format.StringBlockPart{ .index, .stats }, &payloads) |part, *payload| {
+            const frame = try allocator.alloc(u8, parts.lengths.get(part));
+            defer allocator.free(frame);
+            if (try self.file.readPositionalAll(self.io, frame, block_offset + parts.offset(part)) != frame.len) {
+                return format.Error.UnexpectedEof;
+            }
+            try checkFrame(frame);
+            if (!isSegmentDictBlock(frame)) return format.Error.CorruptColumnBlockHeader;
+            if (part == .index) has_nulls = format.ColumnBlockFlags.fromByte(frame[1]).has_nulls;
+            payload.* = try allocator.alloc(u8, format.readU32(frame[4..8]));
+            try decompressBlockInto(allocator, frame, payload.*);
+        }
+        return segment_strings.rebuildEntryCounts(out_allocator, payloads[0], payloads[1], self.info.row_groups[row_group_idx].row_count, has_nulls, table);
+    }
+
+    /// The shared values of column `column_idx`'s string table, read page
+    /// by page through the cache when `c` is set; release with `release`.
+    pub fn sharedStrings(self: ReadSegment, allocator: Allocator, column_idx: usize, c: ?storage_cache.TableCache) ?SharedStrings {
+        const table = self.info.stringTable(column_idx) orelse return null;
+        return .{ .pages = .{ .seg = self, .allocator = allocator, .table = table, .c = c, .with_bytes = true } };
+    }
+
     /// Row group `row_group_idx`'s block parts of column `column_idx`, when
     /// the column's string table took the row group.
     fn stringBlockParts(self: ReadSegment, row_group_idx: usize, column_idx: usize) ?format.StringBlockParts {
@@ -394,6 +479,57 @@ pub const ReadSegment = struct {
             }
             if (self.expanded) |*col| col.deinit(allocator);
             self.* = undefined;
+        }
+    };
+
+    /// One row group's values by segment id (`borrowStringEntries`), pinned
+    /// in the cache or owned.
+    pub const BorrowedEntries = struct {
+        entries: segment_strings.EntryCounts,
+        entry: ?*storage_cache.Cache.Entry = null,
+        owned: ?[]align(16) u8 = null,
+
+        pub fn release(self: *BorrowedEntries, allocator: Allocator, c: ?storage_cache.TableCache) void {
+            if (self.entry) |e| {
+                if (c) |tc| tc.cache.release(e);
+            }
+            if (self.owned) |b| allocator.free(b);
+            self.* = undefined;
+        }
+    };
+
+    /// A string table's shared values by rank (`sharedStrings`). A value
+    /// stays valid until `release`.
+    pub const SharedStrings = struct {
+        pages: SharedPages,
+
+        pub fn count(self: *const SharedStrings) u32 {
+            return self.pages.table.shared_count;
+        }
+
+        pub fn value(self: *SharedStrings, rank: u32) ![]const u8 {
+            if (rank >= self.pages.table.shared_count) return format.Error.CorruptColumnBlockHeader;
+            return (try self.pages.page(rank / segment_strings.page_values)).value(rank % segment_strings.page_values);
+        }
+
+        /// The rank of `bytes`, which the table holds ascending; null when
+        /// it holds no such value.
+        pub fn rankOf(self: *SharedStrings, bytes: []const u8) !?u32 {
+            var lo: u32 = 0;
+            var hi: u32 = self.pages.table.shared_count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                switch (std.mem.order(u8, try self.value(mid), bytes)) {
+                    .lt => lo = mid + 1,
+                    .gt => hi = mid,
+                    .eq => return mid,
+                }
+            }
+            return null;
+        }
+
+        pub fn release(self: *SharedStrings) void {
+            self.pages.release();
         }
     };
 
@@ -1719,6 +1855,12 @@ pub const DictBlock = struct {
     /// `hasSegmentIds`.
     pub fn segmentId(self: DictBlock, code: u32) u32 {
         return format.readU32(self.segment_ids[@as(usize, code) * 4 ..][0..4]);
+    }
+
+    /// The block's ids and stats as `EntryCounts`, for a block with
+    /// `hasSegmentIds` and `hasEntryStats`.
+    pub fn entryCounts(self: DictBlock) segment_strings.EntryCounts {
+        return .{ .ndv = self.ndv, .segment_ids = self.segment_ids, .entry_counts = self.entry_counts, .entry_rows = self.entry_rows, .stat_width = self.stat_width };
     }
 
     /// The stored row count of each value into `counts` and its first row
