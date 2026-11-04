@@ -1735,6 +1735,34 @@ pub const DictBlock = struct {
         }
     }
 
+    /// Into `entries`, the value each of `rows` (ascending) is the first row
+    /// of, from the stored first rows alone, for a block with
+    /// `hasEntryStats`; false when a row is no value's first row.
+    pub fn firstRowEntries(self: DictBlock, rows: []const u32, entries: []u32) bool {
+        const order = struct {
+            fn f(target: u32, item: u32) std.math.Order {
+                return std.math.order(target, item);
+            }
+        }.f;
+        var matched: usize = 0;
+        switch (self.stat_width) {
+            inline 2, 4 => |w| {
+                const T = @Int(.unsigned, @as(u16, w) * 8);
+                for (0..self.ndv) |c| {
+                    if (matched == rows.len) break;
+                    const first: u32 = std.mem.readInt(T, self.entry_rows[c * w ..][0..w], .little);
+                    var j = std.sort.lowerBound(u32, rows, first, order);
+                    while (j < rows.len and rows[j] == first) : (j += 1) {
+                        entries[j] = @intCast(c);
+                        matched += 1;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        return matched == rows.len;
+    }
+
     /// The rows holding the values `pass` flags, from the stored counts, for
     /// a block with `hasEntryStats`.
     pub fn rowsPassing(self: DictBlock, pass: []const bool) usize {

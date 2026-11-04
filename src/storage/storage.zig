@@ -1343,6 +1343,12 @@ test "segment string tables: blocks read without their codes or their values' by
             try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], full.dictValue(full.rowCode(r)));
             try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], values.dictValue(codes.rowCode(r)));
         }
+        // Rows 0-3 each hold a value first; row 4 repeats row 0's.
+        const first_rows = [_]u32{ 0, 1, 2, 3 };
+        var entries: [first_rows.len]u32 = undefined;
+        try std.testing.expect(values.firstRowEntries(&first_rows, &entries));
+        for (first_rows, entries) |r, e| try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], values.dictValue(e));
+        try std.testing.expect(!values.firstRowEntries(&[_]u32{ 0, 4 }, entries[0..2]));
     }
 
     // Row group 0's first read without bytes cached its shared page's

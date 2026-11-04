@@ -693,6 +693,31 @@ pub fn appendDictRowsOf(allocator: Allocator, codes_raw: []const u8, values_raw:
     try appendRowsValidity(allocator, nulls, rows, out);
 }
 
+/// `appendDictRows` for `rows` (ascending) that are each some value's first
+/// row, as a counting scan locates them: the block's stored per-value stats
+/// name their values, so a block read without its codes serves them. False,
+/// appending nothing, when the block stores no stats or a row is no value's
+/// first row.
+pub fn appendDictFirstRows(allocator: Allocator, raw: []const u8, row_count: u32, flags: storage.format.ColumnBlockFlags, rows: []const u32, out: *ColumnStore) !bool {
+    const bm_len: usize = if (flags.has_nulls) storage.column.bitmapBytes(row_count) else 0;
+    const db = storage.segment_reader.dictBlockOf(raw[bm_len..], row_count);
+    if (!db.hasEntryStats()) return false;
+    const entries = try allocator.alloc(u32, rows.len);
+    defer allocator.free(entries);
+    if (!db.firstRowEntries(rows, entries)) return false;
+    var total_bytes: usize = 0;
+    for (entries) |e| total_bytes += db.dictValue(e).len;
+    switch (out.data) {
+        .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
+            try ss.ensureUnusedValueCapacity(allocator, rows.len, total_bytes);
+            for (entries) |e| ss.appendValueAssumeCapacity(db.dictValue(e));
+        },
+        else => unreachable, // the writer only dict-encodes string-family columns
+    }
+    try appendRowsValidity(allocator, if (flags.has_nulls) raw[0..bm_len] else null, rows, out);
+    return true;
+}
+
 /// `appendDictRows` over the rows `[start, start + n)`, read in sequence
 /// with no row list.
 pub fn appendDictRange(allocator: Allocator, raw: []const u8, row_count: u32, flags: storage.format.ColumnBlockFlags, start: usize, n: usize, out: *ColumnStore) !void {
