@@ -1327,6 +1327,24 @@ test "segment string tables: blocks read without their codes or their values' by
         }
     }
 
+    // The two partial forms share code space and offsets: a row's code from
+    // one names its value in the other, as the late scan reads them.
+    for (seg.info.row_groups, 0..) |rg, rg_idx| {
+        var whole = try seg.borrowColumnBlock(allocator, rg_idx, 1, null);
+        defer whole.release(allocator, null);
+        const full = segment_reader.dictBlockOf(whole.bytes, rg.row_count);
+        var values_block = seg.cachedStringBlock(rg_idx, 1, tc, .no_codes).?;
+        defer values_block.release(allocator, tc);
+        var codes_block = seg.cachedStringBlock(rg_idx, 1, tc, .no_bytes).?;
+        defer codes_block.release(allocator, tc);
+        const values = segment_reader.dictBlockOf(values_block.bytes, rg.row_count);
+        const codes = segment_reader.dictBlockOf(codes_block.bytes, rg.row_count);
+        for (0..rg.row_count) |r| {
+            try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], full.dictValue(full.rowCode(r)));
+            try std.testing.expectEqualStrings(vals[rg_idx * 16 + r], values.dictValue(codes.rowCode(r)));
+        }
+    }
+
     // Row group 0's first read without bytes cached its shared page's
     // offsets alone.
     const offsets_key = cache.Key{ .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = 1, .content = .shared_offsets };

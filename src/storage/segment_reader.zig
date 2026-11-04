@@ -172,7 +172,7 @@ pub const ReadSegment = struct {
                 .column_idx = @intCast(column_idx),
             };
             if (tc.cache.acquire(key)) |entry| return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
-            key.content = if (form == .no_codes) .dict_no_codes else .dict_no_bytes;
+            key.content = partialContent(form);
             const entry = tc.cache.acquireDerived(key) orelse filled: {
                 const read = try self.readStringParts(allocator, row_group_idx, column_idx, parts, form);
                 defer allocator.free(read.bytes);
@@ -194,6 +194,35 @@ pub const ReadSegment = struct {
         const table = self.info.stringTable(column_idx) orelse return null;
         const parts = table.blocks[row_group_idx];
         return if (parts.isSplit()) parts else null;
+    }
+
+    /// The block `borrowStringBlock` cached for row group `row_group_idx` of
+    /// column `column_idx` in form `form` (not `.full`), when the cache
+    /// holds it; else null, reading nothing.
+    pub fn cachedStringBlock(
+        self: ReadSegment,
+        row_group_idx: usize,
+        column_idx: usize,
+        c: ?storage_cache.TableCache,
+        form: segment_strings.Form,
+    ) ?BorrowedBlock {
+        const tc = c orelse return null;
+        const entry = tc.cache.acquireDerived(.{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+            .content = partialContent(form),
+        }) orelse return null;
+        return .{ .bytes = entry.bytes, .encoding = .dict, .entry = entry, .form = form };
+    }
+
+    fn partialContent(form: segment_strings.Form) storage_cache.Content {
+        return switch (form) {
+            .full => .column,
+            .no_codes => .dict_no_codes,
+            .no_bytes => .dict_no_bytes,
+        };
     }
 
     /// Rebuilds the parts `form` reads of a segment-dictionary block
