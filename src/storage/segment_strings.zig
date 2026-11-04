@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const format = @import("format.zig");
 const compression = @import("compression.zig");
+const int_streams = @import("int_streams.zig");
 const column = @import("column.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
@@ -378,8 +379,9 @@ pub const ColumnStrings = struct {
         return bytes;
     }
 
-    /// Appends shared-string page `p`'s payload to `out`.
-    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, out: *std.ArrayList(u8)) !void {
+    /// Appends shared-string page `p`'s payload to `out` and returns its
+    /// offsets array.
+    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, out: *std.ArrayList(u8)) !int_streams.Stream {
         const lo = @as(usize, p) * page_values;
         const hi = @min(self.shared.len, lo + page_values);
         var bytes: usize = 0;
@@ -393,10 +395,18 @@ pub const ColumnStrings = struct {
             appendU32(out, acc);
         }
         for (self.shared[lo..hi]) |v| out.appendSliceAssumeCapacity(self.value(v));
+        return .{ .offset = @intCast(out.items.len - bytes - (hi - lo + 1) * 4), .count = @intCast(hi - lo + 1), .width = 4 };
     }
 
-    /// Appends block `b`'s payload to `out`, after `assignIds`.
-    pub fn blockPayload(self: ColumnStrings, allocator: Allocator, b: Block, out: *std.ArrayList(u8)) !void {
+    /// Appends block `b`'s payload to `out`, after `assignIds`, and its
+    /// integer arrays to `streams`.
+    pub fn blockPayload(
+        self: ColumnStrings,
+        allocator: Allocator,
+        b: Block,
+        out: *std.ArrayList(u8),
+        streams: *std.ArrayList(int_streams.Stream),
+    ) !void {
         const k = b.values.len;
         var local_count: usize = 0;
         var local_bytes: usize = 0;
@@ -420,12 +430,15 @@ pub const ColumnStrings = struct {
 
         const bits_at = out.items.len;
         out.appendNTimesAssumeCapacity(0, shared_bits);
+        try streams.ensureUnusedCapacity(allocator, 5);
+        streams.appendAssumeCapacity(.{ .offset = @intCast(out.items.len), .count = @intCast(k - local_count), .width = rank_width });
         for (b.values, 0..) |v, e| if (self.owners.items[v] == shared_owner) {
             out.items[bits_at + e / 8] |= @as(u8, 1) << @intCast(e % 8);
             var b4: [4]u8 = undefined;
             std.mem.writeInt(u32, &b4, self.ids[v], .little);
             out.appendSliceAssumeCapacity(b4[0..rank_width]);
         };
+        streams.appendAssumeCapacity(.{ .offset = @intCast(out.items.len), .count = @intCast(local_count + 1), .width = 4 });
         appendU32(out, 0);
         var acc: u32 = 0;
         for (b.values) |v| if (self.owners.items[v] != shared_owner) {
@@ -433,9 +446,17 @@ pub const ColumnStrings = struct {
             appendU32(out, acc);
         };
         for (b.values) |v| if (self.owners.items[v] != shared_owner) out.appendSliceAssumeCapacity(self.value(v));
+        const tail_at = out.items.len;
         const tail = out.unusedCapacitySlice()[0 .. b.codes_len + b.stats_len];
         try compression.lz4DecompressInto(b.held, tail);
         out.items.len += tail.len;
+        streams.appendAssumeCapacity(.{ .offset = @intCast(tail_at), .count = b.row_count, .width = b.code_width });
+        if (b.stats_len > 0) {
+            const stat_width: u8 = @intCast(b.stats_len / (2 * k));
+            const stats_at = tail_at + b.codes_len;
+            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at), .count = @intCast(k), .width = stat_width });
+            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at + k * stat_width), .count = @intCast(k), .width = stat_width });
+        }
     }
 };
 
