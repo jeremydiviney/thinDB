@@ -42,6 +42,8 @@ const Predicate = predicate.Predicate;
 
 const rowloc = @import("rowloc.zig");
 const Scan = @import("scan.zig").Scan;
+const parallel = @import("../util/parallel.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
 
 pub const LateScan = struct {
     allocator: Allocator,
@@ -68,6 +70,10 @@ pub const LateScan = struct {
     views: []ColumnView,
 
     done: bool = false,
+
+    /// Threads the fetch may read the survivors' blocks on (`prefill`).
+    /// One for an operator that runs inside a worker already.
+    dop: usize = 1,
 
     /// Scratch for one (segment, row-group) run of survivor offsets; reused
     /// across runs so a multi-million-row emit does not grow a list per run.
@@ -217,6 +223,7 @@ pub const LateScan = struct {
     /// the pinned snapshot's columns by row index.
     fn materialize(self: *LateScan, locs: []const i64) !void {
         if (!std.sort.isSorted(i64, locs, {}, std.sort.asc(i64))) return self.materializeUnordered(locs);
+        if (self.dop > 1) try self.prefill(locs);
         var i: usize = 0;
         var cur_entry: ?*storage.cache.SegmentHandles.Entry = null;
         var cur_seg_idx: usize = std.math.maxInt(usize);
@@ -250,6 +257,79 @@ pub const LateScan = struct {
                 },
             }
         }
+    }
+
+    /// Reads the blocks `appendSegmentRows` borrows whole for the survivors
+    /// in `locs` (sorted) into the cache, one job per row group and output
+    /// column, on up to `dop` threads: a cold fetch of a wide row otherwise
+    /// reads and decompresses every column's block one after another on
+    /// one thread. The gather then finds them cached. A column a scan cached
+    /// without its codes is left to the gather, which may take less of it.
+    fn prefill(self: *LateScan, locs: []const i64) !void {
+        const Group = struct { seg_idx: usize, rg_idx: usize, entry: *storage.cache.SegmentHandles.Entry };
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        defer {
+            for (groups.items, 0..) |g, i| {
+                if (i == 0 or groups.items[i - 1].entry != g.entry) self.table.releaseSegment(g.entry);
+            }
+            groups.deinit(self.allocator);
+        }
+        for (locs) |packed_loc| switch (rowloc.unpack(packed_loc)) {
+            .memtable => {},
+            .segment => |s| {
+                const last = if (groups.items.len > 0) groups.items[groups.items.len - 1] else null;
+                if (last) |g| if (g.seg_idx == s.seg_idx and g.rg_idx == s.rg_idx) continue;
+                const entry = if (last != null and last.?.seg_idx == s.seg_idx)
+                    last.?.entry
+                else
+                    try self.table.acquireSegment(self.inner_scan.segs[s.seg_idx].segment_id);
+                groups.append(self.allocator, .{ .seg_idx = s.seg_idx, .rg_idx = s.rg_idx, .entry = entry }) catch |err| {
+                    if (last == null or last.?.entry != entry) self.table.releaseSegment(entry);
+                    return err;
+                };
+            },
+        };
+        const jobs = groups.items.len * self.out_phys.len;
+        if (jobs < 2) return;
+        var grant = core_scheduler.reserveWorkers(@min(self.dop, jobs));
+        defer grant.release();
+        if (grant.count < 2) return;
+
+        const Prefill = struct {
+            late: *LateScan,
+            groups: []const Group,
+            allocator: Allocator,
+            failed: std.atomic.Value(bool) = .init(false),
+            err: ?anyerror = null,
+
+            fn job(ctx: *@This(), _: usize, j: usize) void {
+                if (ctx.failed.load(.monotonic)) return;
+                const g = ctx.groups[j / ctx.late.out_phys.len];
+                const phys = ctx.late.out_phys[j % ctx.late.out_phys.len];
+                ctx.fill(&g.entry.seg, g.rg_idx, phys) catch |err| {
+                    if (ctx.failed.swap(true, .acq_rel)) return;
+                    ctx.err = err;
+                };
+            }
+
+            fn fill(ctx: *@This(), seg: *storage.ReadSegment, rg_idx: usize, phys: usize) !void {
+                const c = ctx.late.table.cacheRef();
+                if (seg.cachedStringBlock(rg_idx, phys, c, .no_codes)) |cached| {
+                    var values = cached;
+                    values.release(ctx.allocator, c);
+                    return;
+                }
+                var bb = try seg.borrowColumnBlock(ctx.allocator, rg_idx, phys, c);
+                bb.release(ctx.allocator, c);
+            }
+        };
+        var ctx: Prefill = .{
+            .late = self,
+            .groups = groups.items,
+            .allocator = try exec.memory.workerAllocator(exec.memory.accountantOf(self.allocator), std.heap.c_allocator),
+        };
+        parallel.forJobs(grant.count, jobs, &ctx, Prefill.job);
+        if (ctx.err) |err| return err;
     }
 
     /// Out-of-order locations (TopN emit order, group-hash order) degenerate

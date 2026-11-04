@@ -30,6 +30,13 @@
 //! — that guarantees the pin drops on every return path, including a `try`
 //! error mid-decode, so a failed query can't leak a pin and wedge a block.
 //!
+//! ## Fills
+//! A miss through `claim` registers a fill of the key, and the readers that
+//! miss the same key before it ends wait for it (`waitFill`) instead of
+//! reading and decompressing the same bytes again. A fill only ever waits on
+//! fills of the shared pages its block's dictionary takes, and a page's fill
+//! waits on nothing, so waits never cycle.
+//!
 //! ## Coherence
 //! Segments are immutable once written and, within one table generation,
 //! segment IDs come from a monotonic never-reused counter — so a cached block
@@ -44,6 +51,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 const format = @import("format.zig");
 const huge_page = @import("../util/huge_page.zig");
 const memory = @import("../memory.zig");
@@ -99,6 +107,12 @@ pub const Content = enum(u8) {
             else => &.{},
         };
     }
+
+    /// Whether lookups of the content count in the hits and misses: whole
+    /// column blocks and shared pages, not what is derived from them.
+    fn counted(self: Content) bool {
+        return self == .column or self == .shared_strings;
+    }
 };
 
 /// A table's handle into the shared block cache: the cache plus the table's
@@ -108,6 +122,70 @@ pub const Content = enum(u8) {
 pub const TableCache = struct {
     cache: *Cache,
     table_uid: u64,
+    /// Where a reader notes the blocks it reads in on a miss, for a scan's
+    /// read-ahead; null: nowhere.
+    misses: ?*MissLog = null,
+};
+
+/// The blocks a reader missed in the cache and read in, by column and the
+/// part of the block read, row group by row group, and the misses every row
+/// group since the last `restart` shared: a scan reads the same columns'
+/// blocks row group after row group, so those name the reads of the row
+/// groups after. A column a filter reads only for the row groups it keeps
+/// rows of drops out at the first row group that doesn't read it. One
+/// reader's; bounded, dropping what it has no room for, which costs only
+/// those hints.
+pub const MissLog = struct {
+    misses: [CAPACITY]Miss = undefined,
+    len: usize = 0,
+    /// The row group before's misses.
+    last: [CAPACITY]Miss = undefined,
+    last_len: usize = 0,
+    shared: [CAPACITY]Miss = undefined,
+    shared_len: usize = 0,
+    /// The next `settle` starts `shared` over from `last`.
+    restarted: bool = true,
+
+    pub const CAPACITY = 32;
+
+    pub const Miss = struct { column_idx: u32, read: Read };
+
+    pub const Read = enum { block, no_codes, no_bytes, entry_counts };
+
+    pub fn note(self: *MissLog, column_idx: usize, read: Read) void {
+        const miss: Miss = .{ .column_idx = @intCast(column_idx), .read = read };
+        if (contains(self.misses[0..self.len], miss) or self.len == CAPACITY) return;
+        self.misses[self.len] = miss;
+        self.len += 1;
+    }
+
+    /// End a row group: keep in `shared` only what it missed too. The
+    /// misses shared, when any are; when none are, the next row group's
+    /// start over from this one's.
+    pub fn settle(self: *MissLog) ?[]const Miss {
+        const from = if (self.restarted) self.last[0..self.last_len] else self.shared[0..self.shared_len];
+        var kept: usize = 0;
+        for (from) |m| if (contains(self.misses[0..self.len], m)) {
+            self.shared[kept] = m;
+            kept += 1;
+        };
+        self.shared_len = kept;
+        self.restarted = kept == 0;
+        @memcpy(self.last[0..self.len], self.misses[0..self.len]);
+        self.last_len = self.len;
+        self.len = 0;
+        return if (kept == 0) null else self.shared[0..kept];
+    }
+
+    /// Start `shared` over at the next `settle`, from the row group before.
+    pub fn restart(self: *MissLog) void {
+        self.restarted = true;
+    }
+
+    fn contains(misses: []const Miss, miss: Miss) bool {
+        for (misses) |m| if (std.meta.eql(m, miss)) return true;
+        return false;
+    }
 };
 
 var next_table_uid = std.atomic.Value(u64).init(1);
@@ -265,6 +343,8 @@ pub const Cache = struct {
     scratch_bytes: std.atomic.Value(usize) = .init(0),
 
     map: std.AutoHashMapUnmanaged(Key, *Entry) = .empty,
+    /// The fills in flight, by key (`claim`).
+    fills: std.AutoHashMapUnmanaged(Key, *Fill) = .empty,
     /// Doubly-linked LRU list. Head = most recently used; tail = LRU (next evict).
     head: ?*Entry = null,
     tail: ?*Entry = null,
@@ -336,6 +416,32 @@ pub const Cache = struct {
         }
     };
 
+    /// A missing entry one reader is reading in. Readers of the same key
+    /// wait for it instead of reading and decompressing the same bytes
+    /// side by side, which a cold scan's workers otherwise do with each
+    /// shared page of a segment they all start on at once.
+    pub const Fill = struct {
+        key: Key,
+        done: Io.Event = .unset,
+        /// The filler's, and each waiter's; the last to drop it frees it.
+        refs: u32 = 1,
+    };
+
+    pub const Claim = union(enum) {
+        hit: *Entry,
+        /// The caller reads the entry in, inserts it (`insertPinned`) and
+        /// then calls `endFill`, inserted or not.
+        fill: *Fill,
+        /// Another reader is filling the key.
+        busy,
+    };
+
+    /// A `Claim` that is the caller's to use: the entry, or its fill.
+    pub const Owned = union(enum) {
+        hit: *Entry,
+        fill: *Fill,
+    };
+
     /// A cache under `controller`'s budget, with a predicate memo of at most
     /// `memo_bytes` (0: none). It grows within the budget once the
     /// controller shares it (`MemoryPool.shareCache`), which also keeps its
@@ -369,6 +475,8 @@ pub const Cache = struct {
             cur = nxt;
         }
         self.map.deinit(self.allocator);
+        std.debug.assert(self.fills.count() == 0);
+        self.fills.deinit(self.allocator);
         self.predicate_memo.deinit();
         for (self.scratch) |s| {
             if (s) |buf| self.allocator.free(buf);
@@ -461,6 +569,119 @@ pub const Cache = struct {
         entry.pins += 1;
         self.touch(entry);
         return entry;
+    }
+
+    /// The entry for `key` pinned, as `acquire` (or `acquireDerived`) takes
+    /// it; else `.busy` while another reader fills it; else a new fill of
+    /// it, which the caller makes. Never blocks. Thread-safe.
+    pub fn claim(self: *Cache, key: Key) !Claim {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.hitLocked(key)) |entry| return .{ .hit = entry };
+        if (self.fills.contains(key)) return .busy;
+        return .{ .fill = try self.newFillLocked(key) };
+    }
+
+    /// `claim`, waiting out a fill in flight instead of returning `.busy`.
+    pub fn claimAfterFill(self: *Cache, io: Io, key: Key) !Owned {
+        while (true) {
+            const fill = fill: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.hitLocked(key)) |entry| return .{ .hit = entry };
+                const fill = self.fills.get(key) orelse return .{ .fill = try self.newFillLocked(key) };
+                fill.refs += 1;
+                break :fill fill;
+            };
+            self.waitFill(io, fill);
+        }
+    }
+
+    /// `acquire` (or `acquireDerived`), but after waiting out a fill of
+    /// `key` in flight, so a reader that needs the entry only when cached
+    /// still finds one another reader is reading in.
+    pub fn acquireAfterFill(self: *Cache, io: Io, key: Key) ?*Entry {
+        while (true) {
+            const fill = fill: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.hitLocked(key)) |entry| return entry;
+                const fill = self.fills.get(key) orelse {
+                    self.missLocked(key);
+                    return null;
+                };
+                fill.refs += 1;
+                break :fill fill;
+            };
+            self.waitFill(io, fill);
+        }
+    }
+
+    /// Whether the entry for `key` is cached or being filled.
+    pub fn holdsOrFills(self: *Cache, key: Key) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.map.contains(key) or self.fills.contains(key);
+    }
+
+    /// Ends the caller's fill from `claim`: readers waiting on it look
+    /// again, finding the entry when the caller inserted it, else filling
+    /// it themselves.
+    pub fn endFill(self: *Cache, io: Io, fill: *Fill) void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const removed = self.fills.remove(fill.key);
+            std.debug.assert(removed);
+        }
+        fill.done.set(io);
+        self.dropFill(fill);
+    }
+
+    /// Waits for `fill`, which the caller took a reference to, to end, and
+    /// drops the reference.
+    fn waitFill(self: *Cache, io: Io, fill: *Fill) void {
+        fill.done.waitUncancelable(io);
+        self.dropFill(fill);
+    }
+
+    fn dropFill(self: *Cache, fill: *Fill) void {
+        const last = last: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            fill.refs -= 1;
+            break :last fill.refs == 0;
+        };
+        if (last) self.allocator.destroy(fill);
+    }
+
+    /// Caller holds `mutex`.
+    fn newFillLocked(self: *Cache, key: Key) !*Fill {
+        self.missLocked(key);
+        const fill = try self.allocator.create(Fill);
+        errdefer self.allocator.destroy(fill);
+        fill.* = .{ .key = key };
+        try self.fills.put(self.allocator, key, fill);
+        return fill;
+    }
+
+    /// Caller holds `mutex`.
+    fn hitLocked(self: *Cache, key: Key) ?*Entry {
+        const entry = self.map.get(key) orelse return null;
+        entry.pins += 1;
+        self.touch(entry);
+        if (key.content.counted()) {
+            self.hits += 1;
+            _ = g_hits.fetchAdd(1, .monotonic);
+        }
+        return entry;
+    }
+
+    /// Caller holds `mutex`.
+    fn missLocked(self: *Cache, key: Key) void {
+        if (!key.content.counted()) return;
+        self.misses += 1;
+        _ = g_misses.fetchAdd(1, .monotonic);
     }
 
     /// Insert `bytes` for `key` (ownership transfers to the cache) and return a
@@ -817,6 +1038,81 @@ test "cache acquire/insert round-trip + hit/miss counters" {
     try std.testing.expectEqualStrings("hello", e2.bytes);
     try std.testing.expectEqual(@as(u64, 1), c.hits);
     c.release(e2);
+}
+
+test "one reader fills a missing key; the others find it busy, then the entry, or the fill once it ends without one" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
+    defer c.deinit();
+
+    const k = Key{ .segment_id = 3, .row_group_idx = 1, .column_idx = 2 };
+    const fill = (try c.claim(k)).fill;
+    try std.testing.expect(c.holdsOrFills(k));
+    try std.testing.expect(try c.claim(k) == .busy);
+    c.endFill(io, fill);
+    try std.testing.expect(!c.holdsOrFills(k));
+    try std.testing.expect(c.acquireAfterFill(io, k) == null);
+
+    const refill = (try c.claimAfterFill(io, k)).fill;
+    c.release(try c.insertPinned(k, try adup(allocator, "page"), .raw));
+    c.endFill(io, refill);
+    const hit = (try c.claim(k)).hit;
+    defer c.release(hit);
+    try std.testing.expectEqualStrings("page", hit.bytes);
+    try std.testing.expectEqual(@as(u64, 3), c.misses);
+}
+
+test "a miss log names the misses every row group since its restart shared" {
+    var log: MissLog = .{};
+    try std.testing.expectEqual(null, log.settle());
+    log.note(1, .block);
+    log.note(2, .no_codes);
+    try std.testing.expectEqual(null, log.settle());
+    log.note(2, .no_codes);
+    log.note(1, .block);
+    log.note(1, .block);
+    try std.testing.expectEqualSlices(MissLog.Miss, &.{
+        .{ .column_idx = 1, .read = .block },
+        .{ .column_idx = 2, .read = .no_codes },
+    }, log.settle().?);
+    log.note(1, .block);
+    try std.testing.expectEqualSlices(MissLog.Miss, &.{.{ .column_idx = 1, .read = .block }}, log.settle().?);
+    log.note(1, .block);
+    log.note(2, .no_codes);
+    try std.testing.expectEqualSlices(MissLog.Miss, &.{.{ .column_idx = 1, .read = .block }}, log.settle().?);
+    log.restart();
+    log.note(2, .no_codes);
+    try std.testing.expectEqualSlices(MissLog.Miss, &.{.{ .column_idx = 2, .read = .no_codes }}, log.settle().?);
+    try std.testing.expectEqual(null, log.settle());
+    try std.testing.expectEqual(null, log.settle());
+}
+
+test "a reader that misses a key being filled waits for the fill and takes its entry" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var controller = memory.MemoryPool.init(1024);
+    var c: Cache = undefined;
+    shareWhole(&c, &controller);
+    defer c.deinit();
+
+    const k = Key{ .segment_id = 9, .row_group_idx = 0, .column_idx = 0 };
+    const fill = (try c.claim(k)).fill;
+    const Waiter = struct {
+        fn run(cache: *Cache, key: Key, out: *?[]const u8) void {
+            const entry = cache.acquireAfterFill(std.testing.io, key) orelse return;
+            defer cache.release(entry);
+            out.* = entry.bytes;
+        }
+    };
+    var seen: ?[]const u8 = null;
+    const waiter = try std.Thread.spawn(.{}, Waiter.run, .{ &c, k, &seen });
+    c.release(try c.insertPinned(k, try adup(allocator, "block"), .raw));
+    c.endFill(io, fill);
+    waiter.join();
+    try std.testing.expectEqualStrings("block", seen.?);
 }
 
 test "condition records keep to their share, oldest out first, past no column block or pinned record" {
@@ -1267,15 +1563,28 @@ pub const SegmentHandles = struct {
     tombstone_generation: std.atomic.Value(u64) = .init(0),
     /// The newest `TombstoneEpoch`, created by the first pin or publish.
     epoch: ?*TombstoneEpoch = null,
+    /// The opens in flight, by segment id (`acquire`).
+    opening: std.AutoHashMapUnmanaged(u64, *Opening) = .empty,
     lock: std.atomic.Mutex = .unlocked,
+
+    /// A segment one reader is opening: readers of the same segment wait
+    /// for it, readers of others open theirs alongside.
+    const Opening = struct {
+        done: std.Io.Event = .unset,
+        /// The opener's, and each waiter's; the last to drop it frees it.
+        refs: u32 = 1,
+    };
 
     fn lockSpin(self: *SegmentHandles) void {
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
     }
 
-    /// Get-or-open the segment, pinned. A first touch parses the footer while
-    /// holding the lock — one-time per segment per table lifetime; peers spin
-    /// only on that cold start.
+    /// Get-or-open the segment, pinned. A first touch reads and parses the
+    /// footer outside the lock, once per segment per table lifetime: readers
+    /// of the same segment wait for that open, and readers of other
+    /// segments open theirs at the same time rather than queueing on it.
+    /// `retire` and `clear` run with the table held exclusively, so never
+    /// during an open.
     pub fn acquire(
         self: *SegmentHandles,
         allocator: Allocator,
@@ -1285,21 +1594,59 @@ pub const SegmentHandles = struct {
         schema: types_mod.TableSchema,
         segment_id: u64,
     ) !*Entry {
-        self.lockSpin();
-        defer self.lock.unlock();
-        const gop = try self.map.getOrPut(allocator, segment_id);
-        if (gop.found_existing) {
-            const e = gop.value_ptr.*;
-            e.pins += 1;
-            return e;
+        const opening = while (true) {
+            const waiting = waiting: {
+                self.lockSpin();
+                defer self.lock.unlock();
+                if (self.map.get(segment_id)) |e| {
+                    e.pins += 1;
+                    return e;
+                }
+                if (self.opening.get(segment_id)) |o| {
+                    o.refs += 1;
+                    break :waiting o;
+                }
+                const o = try allocator.create(Opening);
+                errdefer allocator.destroy(o);
+                o.* = .{};
+                try self.opening.put(allocator, segment_id, o);
+                break o;
+            };
+            waiting.done.waitUncancelable(io);
+            self.dropOpening(allocator, waiting);
+        };
+        defer {
+            self.lockSpin();
+            _ = self.opening.remove(segment_id);
+            self.lock.unlock();
+            opening.done.set(io);
+            self.dropOpening(allocator, opening);
         }
-        errdefer _ = self.map.remove(segment_id);
         const entry = try allocator.create(Entry);
         errdefer allocator.destroy(entry);
-        entry.* = .{ .segment_id = segment_id, .seg = undefined, .pins = 1 };
-        entry.seg = try segment_reader.readSegment(allocator, io, dir, file_name, schema);
-        gop.value_ptr.* = entry;
+        entry.* = .{ .segment_id = segment_id, .seg = try segment_reader.readSegment(allocator, io, dir, file_name, schema), .pins = 1 };
+        errdefer entry.seg.deinit();
+        self.lockSpin();
+        defer self.lock.unlock();
+        try self.map.put(allocator, segment_id, entry);
         return entry;
+    }
+
+    /// Whether the segment's handle is open.
+    pub fn holds(self: *SegmentHandles, segment_id: u64) bool {
+        self.lockSpin();
+        defer self.lock.unlock();
+        return self.map.contains(segment_id);
+    }
+
+    fn dropOpening(self: *SegmentHandles, allocator: Allocator, opening: *Opening) void {
+        const last = last: {
+            self.lockSpin();
+            defer self.lock.unlock();
+            opening.refs -= 1;
+            break :last opening.refs == 0;
+        };
+        if (last) allocator.destroy(opening);
     }
 
     pub fn release(self: *SegmentHandles, allocator: Allocator, entry: *Entry) void {
@@ -1698,6 +2045,8 @@ pub const SegmentHandles = struct {
         self.discardUnwrittenLocked(allocator);
         self.unwritten.deinit(allocator);
         self.map.deinit(allocator);
+        std.debug.assert(self.opening.count() == 0);
+        self.opening.deinit(allocator);
     }
 
     /// The string bytes row group `rg_idx`'s block of string column

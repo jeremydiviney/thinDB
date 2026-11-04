@@ -194,6 +194,49 @@ test "tombstones in one row group keep the rest of the segment on the encoded pa
     }
 }
 
+test "readers opening segments at once share one handle per segment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = 128 });
+    defer db.close();
+    try helpers.exec(allocator, db, "CREATE TABLE t (id BIGINT PRIMARY KEY, x BIGINT NOT NULL)");
+    const table = try db.openTable("t", .{});
+    const Row = struct { id: i64, x: i64 };
+    var rows: [256]Row = undefined;
+    for (0..2) |s| {
+        for (&rows, 0..) |*row, i| row.* = .{ .id = @intCast(s * rows.len + i), .x = @intCast(i) };
+        try table.insert(&rows);
+        try table.flush();
+    }
+    const segments = table.manifest.segments.items;
+    try std.testing.expectEqual(2, segments.len);
+    table.seg_handles.clear(table.allocator);
+
+    const Reader = struct {
+        fn run(t: *thindb.Table, id: u64, out: **thindb.storage.cache.SegmentHandles.Entry, failed: *std.atomic.Value(bool)) void {
+            out.* = t.acquireSegment(id) catch {
+                failed.store(true, .monotonic);
+                return;
+            };
+        }
+    };
+    var entries: [8]*thindb.storage.cache.SegmentHandles.Entry = undefined;
+    var threads: [8]std.Thread = undefined;
+    var failed: std.atomic.Value(bool) = .init(false);
+    for (&threads, &entries, 0..) |*thread, *entry, i| {
+        thread.* = try std.Thread.spawn(.{}, Reader.run, .{ table, segments[i % 2].segment_id, entry, &failed });
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!failed.load(.monotonic));
+    defer for (entries) |entry| table.releaseSegment(entry);
+    for (entries, 0..) |entry, i| {
+        try std.testing.expectEqual(entries[i % 2], entry);
+        try std.testing.expectEqual(segments[i % 2].segment_id, entry.segment_id);
+    }
+    try std.testing.expect(entries[0] != entries[1]);
+}
+
 test "a reader's shared tombstone list outlives the invalidation of a later DELETE" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
