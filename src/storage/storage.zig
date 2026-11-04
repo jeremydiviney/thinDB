@@ -1202,6 +1202,9 @@ fn expectSegmentStrings(allocator: Allocator, seg: *ReadSegment) !usize {
         else
             null;
         if (db != null and db.?.hasSegmentIds()) with_ids += 1;
+        const parts = seg.info.stringTable(1).?.blocks[rg_idx];
+        try std.testing.expectEqual(db != null and db.?.hasSegmentIds(), parts.isSplit());
+        if (parts.isSplit()) try std.testing.expectEqual(@as(u64, rg.col_lengths[1]), parts.total());
         for (0..rg.row_count) |r| {
             const valid = column.isValidBit(&sst_nulls, row);
             try std.testing.expectEqual(valid, col.view().isValid(r));
@@ -1247,6 +1250,13 @@ test "segment string tables: one id per distinct value across row groups; blocks
     try std.testing.expectEqual(@as(u32, 3), table.shared_count);
     try std.testing.expectEqual(@as(u32, 6), table.value_count);
     try std.testing.expectEqual(@as(usize, 3), try expectSegmentStrings(allocator, &seg));
+    // Only row group 1 has local bytes (row group 2's one local value is
+    // empty), so the others leave their bytes part out; a nullable column's
+    // blocks carry no entry stats.
+    for (table.blocks, [_]bool{ false, true, false }) |parts, has_bytes| {
+        try std.testing.expectEqual(has_bytes, parts.lengths.get(.bytes) != 0);
+        try std.testing.expectEqual(@as(u32, 0), parts.lengths.get(.stats));
+    }
 }
 
 test "segment string tables: past the cap a column's later row groups keep their own encodings" {

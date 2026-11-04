@@ -5,20 +5,23 @@
 //! end. The reader rebuilds each row-group block into an ordinary `.dict`
 //! payload that also carries every value's segment id.
 //!
-//! Row-group block payload, past the validity bitmap (on-disk encoding byte
-//! `format.segment_dict_encoding`):
+//! A row-group block is up to four parts (`format.StringBlockPart`), each a
+//! column block of its own (on-disk encoding byte
+//! `format.segment_dict_encoding`), so a query reads only the parts it needs:
 //!
-//!   [ndv: u32]
-//!   [code_width: u8][flags: u8][rank_width: u8][pad]
-//!   [local_count: u32][local_first_id: u32]
-//!   [shared: ceil(ndv/8)]                bit e set when value e is shared
-//!   [ranks: (ndv-local_count) × rank_width]  shared values' table ranks
-//!   [local_offsets: (local_count+1) × u32]
-//!   [local_bytes]                        the block's own values, in order
-//!   [codes: row_count × code_width]      as `.dict`
-//!   [entry stats]                        as `.dict`, per `flags`
+//!   codes:  [codes: row_count × code_width]      as `.dict`
+//!   index:  [validity bitmap, when the block has nulls]
+//!           [ndv: u32]
+//!           [code_width: u8][flags: u8][rank_width: u8][pad]
+//!           [local_count: u32][local_first_id: u32]
+//!           [shared: ceil(ndv/8)]                bit e set when value e is shared
+//!           [ranks: (ndv-local_count) × rank_width]  shared values' table ranks
+//!           [local_offsets: (local_count+1) × u32]
+//!   bytes:  [local_bytes]                        the block's own values, in order
+//!   stats:  [entry stats]                        as `.dict`, per `flags`
 //!
-//! Shared-string page payload: [count: u32][(count+1) × u32 offsets][bytes].
+//! A shared-string page is two blocks: [count: u32][(count+1) × u32
+//! offsets], then its [bytes].
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,6 +53,23 @@ pub fn eligible(t: types.Type) bool {
 pub fn rankWidth(shared_count: u32) u8 {
     return if (shared_count <= narrow_rank_limit) 3 else 4;
 }
+
+/// One part's payload and its integer arrays, for `int_streams`.
+pub const PartPayload = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    streams: std.ArrayList(int_streams.Stream) = .empty,
+
+    pub fn deinit(self: *PartPayload, allocator: Allocator) void {
+        self.bytes.deinit(allocator);
+        self.streams.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const PartPayloads = std.EnumArray(format.StringBlockPart, PartPayload);
+
+/// A row-group block's decompressed parts, empty where left out.
+pub const BlockParts = std.EnumArray(format.StringBlockPart, []const u8);
 
 pub fn pageCount(shared_count: u32) u32 {
     return @intCast((@as(u64, shared_count) + page_values - 1) / page_values);
@@ -379,34 +399,30 @@ pub const ColumnStrings = struct {
         return bytes;
     }
 
-    /// Appends shared-string page `p`'s payload to `out` and returns its
-    /// offsets array.
-    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, out: *std.ArrayList(u8)) !int_streams.Stream {
+    /// Appends shared-string page `p`'s count and offsets to `index`,
+    /// returning the offsets array, and its values to `bytes`.
+    pub fn pagePayload(self: ColumnStrings, allocator: Allocator, p: u32, index: *std.ArrayList(u8), bytes: *std.ArrayList(u8)) !int_streams.Stream {
         const lo = @as(usize, p) * page_values;
         const hi = @min(self.shared.len, lo + page_values);
-        var bytes: usize = 0;
-        for (self.shared[lo..hi]) |v| bytes += self.value(v).len;
-        try out.ensureUnusedCapacity(allocator, 4 + (hi - lo + 1) * 4 + bytes);
-        appendU32(out, @intCast(hi - lo));
-        appendU32(out, 0);
+        var byte_count: usize = 0;
+        for (self.shared[lo..hi]) |v| byte_count += self.value(v).len;
+        try index.ensureUnusedCapacity(allocator, 4 + (hi - lo + 1) * 4);
+        try bytes.ensureUnusedCapacity(allocator, byte_count);
+        appendU32(index, @intCast(hi - lo));
+        const offsets_at = index.items.len;
+        appendU32(index, 0);
         var acc: u32 = 0;
         for (self.shared[lo..hi]) |v| {
             acc += @intCast(self.value(v).len);
-            appendU32(out, acc);
+            appendU32(index, acc);
         }
-        for (self.shared[lo..hi]) |v| out.appendSliceAssumeCapacity(self.value(v));
-        return .{ .offset = @intCast(out.items.len - bytes - (hi - lo + 1) * 4), .count = @intCast(hi - lo + 1), .width = 4 };
+        for (self.shared[lo..hi]) |v| bytes.appendSliceAssumeCapacity(self.value(v));
+        return .{ .offset = @intCast(offsets_at), .count = @intCast(hi - lo + 1), .width = 4 };
     }
 
-    /// Appends block `b`'s payload to `out`, after `assignIds`, and its
-    /// integer arrays to `streams`.
-    pub fn blockPayload(
-        self: ColumnStrings,
-        allocator: Allocator,
-        b: Block,
-        out: *std.ArrayList(u8),
-        streams: *std.ArrayList(int_streams.Stream),
-    ) !void {
+    /// Appends block `b`'s parts, after `assignIds`, each with its integer
+    /// arrays, to `parts`.
+    pub fn blockPayload(self: ColumnStrings, allocator: Allocator, b: Block, parts: *PartPayloads) !void {
         const k = b.values.len;
         var local_count: usize = 0;
         var local_bytes: usize = 0;
@@ -418,8 +434,10 @@ pub const ColumnStrings = struct {
         };
         const rank_width = rankWidth(self.sharedCount());
         const shared_bits = (k + 7) / 8;
+        const out = &parts.getPtr(.index).bytes;
+        const streams = &parts.getPtr(.index).streams;
         try out.ensureUnusedCapacity(allocator, b.bitmap.len + block_header_bytes + shared_bits +
-            (k - local_count) * rank_width + (local_count + 1) * 4 + local_bytes + b.codes_len + b.stats_len);
+            (k - local_count) * rank_width + (local_count + 1) * 4);
 
         out.appendSliceAssumeCapacity(b.bitmap);
         appendU32(out, @intCast(k));
@@ -430,7 +448,7 @@ pub const ColumnStrings = struct {
 
         const bits_at = out.items.len;
         out.appendNTimesAssumeCapacity(0, shared_bits);
-        try streams.ensureUnusedCapacity(allocator, 5);
+        try streams.ensureUnusedCapacity(allocator, 2);
         streams.appendAssumeCapacity(.{ .offset = @intCast(out.items.len), .count = @intCast(k - local_count), .width = rank_width });
         for (b.values, 0..) |v, e| if (self.owners.items[v] == shared_owner) {
             out.items[bits_at + e / 8] |= @as(u8, 1) << @intCast(e % 8);
@@ -445,18 +463,24 @@ pub const ColumnStrings = struct {
             acc += @intCast(self.value(v).len);
             appendU32(out, acc);
         };
-        for (b.values) |v| if (self.owners.items[v] != shared_owner) out.appendSliceAssumeCapacity(self.value(v));
-        const tail_at = out.items.len;
-        const tail = out.unusedCapacitySlice()[0 .. b.codes_len + b.stats_len];
-        try compression.lz4DecompressInto(b.held, tail);
-        out.items.len += tail.len;
-        streams.appendAssumeCapacity(.{ .offset = @intCast(tail_at), .count = b.row_count, .width = b.code_width });
+        const local = &parts.getPtr(.bytes).bytes;
+        try local.ensureUnusedCapacity(allocator, local_bytes);
+        for (b.values) |v| if (self.owners.items[v] != shared_owner) local.appendSliceAssumeCapacity(self.value(v));
+
+        // `held` is the codes and the entry stats, compressed together.
+        const codes = parts.getPtr(.codes);
+        try codes.bytes.resize(allocator, b.codes_len + b.stats_len);
+        try compression.lz4DecompressInto(b.held, codes.bytes.items);
+        try codes.streams.append(allocator, .{ .offset = 0, .count = b.row_count, .width = b.code_width });
         if (b.stats_len > 0) {
+            const stats = parts.getPtr(.stats);
+            try stats.bytes.appendSlice(allocator, codes.bytes.items[b.codes_len..]);
             const stat_width: u8 = @intCast(b.stats_len / (2 * k));
-            const stats_at = tail_at + b.codes_len;
-            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at), .count = @intCast(k), .width = stat_width });
-            streams.appendAssumeCapacity(.{ .offset = @intCast(stats_at + k * stat_width), .count = @intCast(k), .width = stat_width });
+            try stats.streams.ensureUnusedCapacity(allocator, 2);
+            stats.streams.appendAssumeCapacity(.{ .offset = 0, .count = @intCast(k), .width = stat_width });
+            stats.streams.appendAssumeCapacity(.{ .offset = @intCast(k * stat_width), .count = @intCast(k), .width = stat_width });
         }
+        codes.bytes.shrinkRetainingCapacity(b.codes_len);
     }
 };
 
@@ -638,22 +662,23 @@ pub fn pageValueCount(shared_count: u32, p: u32) u32 {
     return @min(page_values, shared_count - p * page_values);
 }
 
-/// Rebuilds a row-group block's decompressed payload (validity bitmap first
-/// when `has_nulls`) into a `.dict` payload with `format.DICT_SEGMENT_IDS`,
-/// allocated 16-aligned from `allocator`. `pages.page(p)` yields shared page
-/// `p` of the column's table.
+/// Rebuilds a row-group block's decompressed parts (the index's validity
+/// bitmap first when `has_nulls`) into a `.dict` payload with
+/// `format.DICT_SEGMENT_IDS`, allocated 16-aligned from `allocator`.
+/// `pages.page(p)` yields shared page `p` of the column's table.
 pub fn rebuildDict(
     allocator: Allocator,
-    payload: []const u8,
+    parts: BlockParts,
     row_count: u32,
     has_nulls: bool,
     table: format.StringTable,
     pages: anytype,
 ) ![]align(16) u8 {
     const corrupt = format.Error.CorruptColumnBlockHeader;
+    const index = parts.get(.index);
     const bitmap_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
-    if (payload.len < bitmap_len + block_header_bytes) return corrupt;
-    const values = payload[bitmap_len..];
+    if (index.len < bitmap_len + block_header_bytes) return corrupt;
+    const values = index[bitmap_len..];
     const k = format.readU32(values[0..4]);
     const code_width = values[4];
     const flags = values[5];
@@ -667,22 +692,19 @@ pub fn rebuildDict(
     const shared_bits_len = (@as(usize, k) + 7) / 8;
     const ranks_len = @as(usize, k - local_count) * rank_width;
     const local_offsets_len = (@as(usize, local_count) + 1) * 4;
-    var at: usize = block_header_bytes;
-    if (values.len < at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
+    const at: usize = block_header_bytes;
+    if (values.len != at + shared_bits_len + ranks_len + local_offsets_len) return corrupt;
     const shared_bits = values[at..][0..shared_bits_len];
-    at += shared_bits_len;
-    const ranks = values[at..][0..ranks_len];
-    at += ranks_len;
-    const local_offsets = values[at..][0..local_offsets_len];
-    at += local_offsets_len;
-    const local_byte_count = format.readU32(local_offsets[local_count * 4 ..][0..4]);
-    if (values.len < at + local_byte_count) return corrupt;
-    const local_bytes = values[at..][0..local_byte_count];
-    at += local_byte_count;
+    const ranks = values[at + shared_bits_len ..][0..ranks_len];
+    const local_offsets = values[at + shared_bits_len + ranks_len ..][0..local_offsets_len];
+    const local_bytes = parts.get(.bytes);
+    if (format.readU32(local_offsets[local_count * 4 ..][0..4]) != local_bytes.len) return corrupt;
+    const local_byte_count = local_bytes.len;
+    const codes = parts.get(.codes);
+    const stats = parts.get(.stats);
     const stats_len: usize = if (flags & format.DICT_ENTRY_STATS != 0) 2 * @as(usize, k) * format.dictEntryStatWidth(row_count) else 0;
-    const tail_len = @as(usize, row_count) * code_width + stats_len;
-    if (values.len != at + tail_len) return corrupt;
-    const tail = values[at..];
+    if (codes.len != @as(usize, row_count) * code_width or stats.len != stats_len) return corrupt;
+    const tail_len = codes.len + stats_len;
 
     const Entries = struct {
         shared_bits: []const u8,
@@ -736,7 +758,7 @@ pub fn rebuildDict(
     const out_len = bitmap_len + 8 + (@as(usize, k) + 1) * 4 + dict_bytes + tail_len + @as(usize, k) * 4;
     const out = try allocator.alignedAlloc(u8, .@"16", out_len);
     errdefer allocator.free(out);
-    @memcpy(out[0..bitmap_len], payload[0..bitmap_len]);
+    @memcpy(out[0..bitmap_len], index[0..bitmap_len]);
     var o: usize = bitmap_len;
     format.writeU32(out[o..][0..4], k);
     out[o + 4] = code_width;
@@ -769,7 +791,8 @@ pub fn rebuildDict(
         format.writeU32(out[ids_at + e * 4 ..][0..4], id);
     }
     if (acc != dict_bytes) return corrupt;
-    @memcpy(out[tail_at..][0..tail_len], tail);
+    @memcpy(out[tail_at..][0..codes.len], codes);
+    @memcpy(out[tail_at + codes.len ..][0..stats_len], stats);
     return out;
 }
 
