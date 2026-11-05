@@ -40,6 +40,8 @@ const int_streams = @import("int_streams.zig");
 const fsst = @import("fsst.zig");
 const segment_strings = @import("segment_strings.zig");
 const storage_cache = @import("cache.zig");
+const core_scheduler = @import("../util/core_scheduler.zig");
+const parallel = @import("../util/parallel.zig");
 const simd_mod = @import("../util/simd.zig");
 const prof = @import("../util/prof.zig");
 const ColumnView = column.ColumnView;
@@ -54,6 +56,10 @@ pub const ReadSegment = struct {
     file: Io.File,
     io: Io,
     info: SegmentInfo,
+    /// Per shared page of the string tables, in `info.string_tables` order:
+    /// the awake-clock millisecond a reader last hinted its bytes
+    /// (`claimPageHint`), 0 for never. Shared by every copy of the segment.
+    page_hints: []std.atomic.Value(u32) = &.{},
 
     pub fn deinit(self: *ReadSegment) void {
         for (self.info.row_groups) |rg| {
@@ -63,8 +69,31 @@ pub const ReadSegment = struct {
         }
         self.allocator.free(self.info.row_groups);
         format.freeStringTables(self.allocator, self.info.string_tables);
+        self.allocator.free(self.page_hints);
         self.file.close(self.io);
         self.* = undefined;
+    }
+
+    /// How long one reader's hint of a shared page stands in for the
+    /// others': the page is read in by then, or at least on its way.
+    const PAGE_HINT_MS = 1000;
+
+    /// Whether the caller is to hint page `p` of column `column_idx`'s
+    /// string table, at `now_ms`: false when another reader did within
+    /// `PAGE_HINT_MS`. The readers of one segment want its pages at once,
+    /// and a hint blocks while the disk queue is full, so each that hinted
+    /// every page waited out the whole read before decompressing one.
+    fn claimPageHint(self: ReadSegment, column_idx: u32, p: usize, now_ms: u32) bool {
+        var base: usize = 0;
+        for (self.info.string_tables) |t| {
+            if (t.column_idx == column_idx) break;
+            base += t.pages.len;
+        } else return true;
+        if (base + p >= self.page_hints.len) return true;
+        const stamp = &self.page_hints[base + p];
+        const last = stamp.load(.monotonic);
+        if (last != 0 and now_ms -% last < PAGE_HINT_MS) return false;
+        return stamp.cmpxchgStrong(last, now_ms, .monotonic, .monotonic) == null;
     }
 
     /// Decode a single column out of a single row group. Caller frees via `OwnedColumn.deinit`.
@@ -514,31 +543,81 @@ pub const ReadSegment = struct {
         /// Takes every page `want` marked. The ones nobody holds or reads
         /// are hinted to the OS first, so the disk reads them side by side
         /// rather than one pread at a time. Then this reader fills the
-        /// pages no other reader is filling, in order, and waits for the
-        /// rest last: the readers of one segment want the same pages at
-        /// once, and so each fill a different one instead of queueing on
-        /// the first.
+        /// pages no other reader is filling, in order, with what idle
+        /// threads the machine has, and waits for the rest last: a page
+        /// takes milliseconds to decompress, and the readers of one segment
+        /// want the same pages at once, so few readers would otherwise
+        /// decompress them all one after another.
         pub fn loadWanted(self: *SharedPages) !void {
+            const now_ms: u32 = @as(u32, @truncate(@as(u64, @intCast(@divTrunc(@max(Io.Clock.awake.now(self.seg.io).nanoseconds, 0), std.time.ns_per_ms))))) | 1;
+            const tc = self.c orelse {
+                for (self.slots, 0..) |s, p| {
+                    if (s.wanted and s.held == null) self.hint(p, now_ms);
+                }
+                return;
+            };
+            var reads: std.ArrayListUnmanaged(u32) = .empty;
+            defer reads.deinit(self.allocator);
             for (self.slots, 0..) |s, p| {
                 if (!s.wanted or s.held != null) continue;
-                if (self.c) |tc| {
-                    if (tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_strings))) continue;
-                    if (!self.with_bytes and tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_offsets))) continue;
-                }
-                const range = self.table.pages[p];
-                self.seg.willNeed(range.offset, readLength(range, self.with_bytes));
+                if (tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_strings))) continue;
+                if (!self.with_bytes and tc.cache.holdsOrFills(self.pageKey(tc, p, .shared_offsets))) continue;
+                try reads.append(self.allocator, @intCast(p));
             }
-            const tc = self.c orelse return;
-            var waits = false;
-            for (self.slots, 0..) |*s, p| {
-                if (!s.wanted or s.held != null) continue;
-                s.held = try self.tryLoad(tc, p);
-                if (s.held == null) waits = true;
+            if (reads.items.len > 0) {
+                // One job hints, the rest fill a page each: a lone page
+                // gains nothing from a helper.
+                var grant = core_scheduler.reserveWorkers(if (reads.items.len > 1) reads.items.len + 1 else 1);
+                defer grant.release();
+                var fetch: Fetch = .{ .pages = self, .tc = tc, .reads = reads.items, .now_ms = now_ms };
+                fetch.run(grant.count);
             }
-            if (!waits) return;
             for (self.slots, 0..) |*s, p| {
                 if (s.wanted and s.held == null) s.held = try self.load(@intCast(p));
             }
+        }
+
+        /// One `loadWanted`'s reads as jobs its threads claim in order:
+        /// hinting them all, then filling one page each.
+        const Fetch = struct {
+            pages: *SharedPages,
+            tc: storage_cache.TableCache,
+            reads: []const u32,
+            now_ms: u32,
+            next: std.atomic.Value(usize) = .init(0),
+
+            fn run(self: *Fetch, threads: usize) void {
+                var helpers: [parallel.MAX_THREADS]?parallel.Helper = @splat(null);
+                const n = @min(@max(threads, 1), helpers.len);
+                for (helpers[1..n]) |*h| h.* = parallel.spawn(work, .{self}) catch null;
+                self.work();
+                for (helpers[1..n]) |h| if (h) |helper| helper.join();
+            }
+
+            fn work(self: *Fetch) void {
+                while (true) {
+                    const j = self.next.fetchAdd(1, .monotonic);
+                    if (j > self.reads.len) return;
+                    if (j == 0) {
+                        for (self.reads) |p| self.pages.hint(p, self.now_ms);
+                        continue;
+                    }
+                    const p = self.reads[j - 1];
+                    // A fill that fails leaves the page to `loadWanted`'s
+                    // waiting pass, which reads it again and returns the
+                    // error.
+                    self.pages.slots[p].held = self.pages.tryLoad(self.tc, p) catch null;
+                }
+            }
+        };
+
+        /// Hints page `p` unless another reader just hinted its bytes. A
+        /// reader of the offsets alone hints them regardless: the reader of
+        /// the whole page it would stand in for hints the bytes too.
+        fn hint(self: *SharedPages, p: usize, now_ms: u32) void {
+            if (self.with_bytes and !self.seg.claimPageHint(self.table.column_idx, p, now_ms)) return;
+            const range = self.table.pages[p];
+            self.seg.willNeed(range.offset, readLength(range, self.with_bytes));
         }
 
         fn slotOf(self: *SharedPages, p: u32) !*Slot {
@@ -563,7 +642,7 @@ pub const ReadSegment = struct {
                     tc.cache.acquireAfterFill(self.seg.io, whole) orelse try self.fillPage(tc, self.pageKey(tc, p, .shared_offsets));
                 return self.heldOf(tc, entry, p);
             }
-            const raw = try self.readPage(self.allocator, self.table.pages[p], self.with_bytes);
+            const raw = try self.readPage(self.allocator, self.allocator, self.table.pages[p], self.with_bytes);
             errdefer self.allocator.free(raw);
             return .{ .page = try segment_strings.Page.of(raw, self.expectedCount(p), self.with_bytes), .entry = null, .owned = raw };
         }
@@ -595,7 +674,9 @@ pub const ReadSegment = struct {
         }
 
         fn insertPage(self: *SharedPages, tc: storage_cache.TableCache, key: storage_cache.Key) !*storage_cache.Cache.Entry {
-            const raw = try self.readPage(tc.cache.blockAllocator(), self.table.pages[key.row_group_idx], key.content == .shared_strings);
+            // Helper threads fill pages too (`Fetch`): the scratch comes from
+            // the segment's own allocator, which any thread may use.
+            const raw = try self.readPage(tc.cache.blockAllocator(), self.seg.allocator, self.table.pages[key.row_group_idx], key.content == .shared_strings);
             errdefer tc.cache.blockAllocator().free(raw);
             return tc.cache.insertPinned(key, raw, .raw);
         }
@@ -627,9 +708,9 @@ pub const ReadSegment = struct {
         /// Reads a page's offsets block, and its bytes block when
         /// `with_bytes`, into one buffer, as `segment_strings.Page.of` takes
         /// it.
-        fn readPage(self: *SharedPages, out_allocator: Allocator, range: format.SharedPage, with_bytes: bool) ![]align(16) u8 {
-            const block = try self.allocator.alloc(u8, readLength(range, with_bytes));
-            defer self.allocator.free(block);
+        fn readPage(self: *SharedPages, out_allocator: Allocator, scratch: Allocator, range: format.SharedPage, with_bytes: bool) ![]align(16) u8 {
+            const block = try scratch.alloc(u8, readLength(range, with_bytes));
+            defer scratch.free(block);
             if (try self.seg.file.readPositionalAll(self.seg.io, block, range.offset) != block.len) {
                 return format.Error.UnexpectedEof;
             }
@@ -641,8 +722,8 @@ pub const ReadSegment = struct {
             const bytes_len: usize = if (with_bytes) format.readU32(bytes[4..8]) else 0;
             const out = try out_allocator.alignedAlloc(u8, .@"16", @as(usize, index_len) + bytes_len);
             errdefer out_allocator.free(out);
-            try decompressBlockInto(self.allocator, index, out[0..index_len]);
-            if (with_bytes) try decompressBlockInto(self.allocator, bytes, out[index_len..]);
+            try decompressBlockInto(scratch, index, out[0..index_len]);
+            if (with_bytes) try decompressBlockInto(scratch, bytes, out[index_len..]);
             return out;
         }
 
@@ -1109,6 +1190,11 @@ pub fn readSegment(
         inited_rg += 1;
     }
     const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols, row_groups);
+    errdefer format.freeStringTables(allocator, string_tables);
+    var page_count: usize = 0;
+    for (string_tables) |t| page_count += t.pages.len;
+    const page_hints = try allocator.alloc(std.atomic.Value(u32), page_count);
+    @memset(page_hints, .init(0));
 
     return ReadSegment{
         .allocator = allocator,
@@ -1122,6 +1208,7 @@ pub fn readSegment(
             .row_groups = row_groups,
             .string_tables = string_tables,
         },
+        .page_hints = page_hints,
     };
 }
 
