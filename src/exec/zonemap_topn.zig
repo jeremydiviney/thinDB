@@ -685,6 +685,8 @@ const ProbeScratch = struct {
     mask: std.ArrayListUnmanaged(bool) = .empty,
     pred_mask: std.ArrayListUnmanaged(bool) = .empty,
     entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    /// The row group's rows left after the WHERE, by position.
+    kept_rows: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(allocator: Allocator, columns: usize, keys: usize) !ProbeScratch {
         const blocks = try allocator.alloc(storage.ReadSegment.BorrowedBlock, columns);
@@ -725,6 +727,7 @@ const ProbeScratch = struct {
         self.mask.deinit(allocator);
         self.pred_mask.deinit(allocator);
         self.entry_hits.deinit(allocator);
+        self.kept_rows.deinit(allocator);
     }
 };
 
@@ -759,7 +762,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     const prefiltered = z.keep > 0 and ch.full();
     if (prefiltered) {
         try leadKeyPrefilter(z, allocator, ch, scratch, scratch.cols[lead], mask);
-        if (std.mem.indexOfScalar(bool, mask, true) == null) return;
+        if (simd.countTrue(mask) == 0) return;
     } else {
         @memset(mask, true);
     }
@@ -791,7 +794,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
             if (!prefiltered) keepCondition(z, seg, ref.rg_idx, pred_mask);
         }
     }
-    for (mask, pred_mask) |*m, p| m.* = m.* and p;
+    simd.combineMaskInto(.@"and", mask, pred_mask);
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
 
     for (z.key_probe_idx, scratch.key_views) |j, *kv| kv.* = switch (scratch.cols[j]) {
@@ -799,8 +802,9 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
         .dict => |d| d.entries,
     };
     const key: KeyRef = .{ .views = scratch.key_views, .rows = scratch.key_rows };
-    for (mask, 0..) |keep, row| {
-        if (!keep) continue;
+    try scratch.kept_rows.resize(allocator, rg_count);
+    const kept_rows = scratch.kept_rows.items[0..simd.maskIndices(mask, scratch.kept_rows.items)];
+    for (kept_rows) |row| {
         for (z.key_probe_idx, scratch.key_rows) |j, *kr| kr.* = switch (scratch.cols[j]) {
             .view => row,
             .dict => |d| d.db.rowCode(row),
@@ -870,9 +874,9 @@ fn leadKeyPrefilter(z: *const ZonemapTopN, allocator: Allocator, ch: *const Cand
             inline .tinyint, .smallint, .int, .bigint, .largeint, .date, .datetime, .decimal64, .decimal128 => |values, tag| {
                 const w = @field(worst_view.data, @tagName(tag))[worst];
                 if (desc) {
-                    for (values[0..mask.len], mask) |x, *m| m.* = x >= w;
+                    simd.compareInto(@TypeOf(w), .gte, values[0..mask.len], w, mask);
                 } else {
-                    for (values[0..mask.len], mask) |x, *m| m.* = x <= w;
+                    simd.compareInto(@TypeOf(w), .lte, values[0..mask.len], w, mask);
                 }
             },
             else => for (mask, 0..) |*m, row| {
