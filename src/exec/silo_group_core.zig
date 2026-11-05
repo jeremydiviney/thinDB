@@ -2499,6 +2499,28 @@ test "merged top picks the rows one top set would from every worker's candidates
     }
 }
 
+test "key bank keeps every key's bytes in place across chunks, past a chunk's size and after a clear" {
+    const allocator = std.testing.allocator;
+    var bank = KeyBank.init(allocator);
+    defer bank.deinit(allocator);
+    var long: [3 * KeyBank.MAX_CHUNK_BYTES]u8 = undefined;
+    for (&long, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const lens = [_]usize{ 0, 1, 700, 400, KeyBank.FIRST_CHUNK_BYTES, 3, long.len, 9000, 5 };
+    for (0..2) |_| {
+        try bank.keys.ensureTotalCapacity(allocator, 2 * lens.len);
+        for (lens) |len| {
+            try bank.add(long[0..len]);
+            try bank.add(null);
+        }
+        for (lens, 0..) |len, i| {
+            try std.testing.expectEqualSlices(u8, long[0..len], bank.keys.items[2 * i].?);
+            try std.testing.expectEqual(@as(?[]const u8, null), bank.keys.items[2 * i + 1]);
+        }
+        bank.clear();
+        try std.testing.expectEqual(@as(usize, 0), bank.keys.items.len);
+    }
+}
+
 fn testSlotOf(bound: *const SlotBound, key: u64) usize {
     return slotOfHash(routeHashRowBits(key, 0), bound.shift);
 }
@@ -6521,12 +6543,21 @@ fn fixedKeyPart(view: ColumnView, typ: thindb.types.Type) ?FixedKeyPart {
 const KeyBank = struct {
     keys: std.ArrayListUnmanaged(?[]const u8) = .empty,
     arena: std.heap.ArenaAllocator,
+    /// The arena chunk keys are copied into next. An arena starts at one
+    /// key's size and grows half again per step, each step a charge to the
+    /// query's accountant that every worker's buckets contend for; a bucket
+    /// of a few groups now takes one chunk.
+    rest: []u8 = &.{},
+    next_chunk: usize = FIRST_CHUNK_BYTES,
     /// The gid `keys[0]` holds: a deferred part's table holds only the
     /// groups that part adds.
     base: u32 = 0,
     /// Whether `add` keeps the rows' own bytes rather than a copy, for rows
     /// that outlive every lookup (a deferred part's).
     borrows: bool = false,
+
+    const FIRST_CHUNK_BYTES: usize = 1024;
+    const MAX_CHUNK_BYTES: usize = 64 * 1024;
 
     fn init(allocator: Allocator) KeyBank {
         return .{ .arena = .init(allocator) };
@@ -6540,12 +6571,25 @@ const KeyBank = struct {
     fn clear(self: *KeyBank) void {
         self.keys.clearRetainingCapacity();
         _ = self.arena.reset(.free_all);
+        self.rest = &.{};
+        self.next_chunk = FIRST_CHUNK_BYTES;
     }
 
     /// Adds the next group's key, with room for it already ensured.
     fn add(self: *KeyBank, bytes: ?[]const u8) !void {
-        const held = if (bytes) |b| (if (self.borrows) b else try self.arena.allocator().dupe(u8, b)) else null;
+        const held = if (bytes) |b| (if (self.borrows) b else try self.hold(b)) else null;
         self.keys.appendAssumeCapacity(held);
+    }
+
+    fn hold(self: *KeyBank, bytes: []const u8) ![]const u8 {
+        if (self.rest.len < bytes.len) {
+            self.rest = try self.arena.allocator().alloc(u8, @max(bytes.len, self.next_chunk));
+            self.next_chunk = @min(self.next_chunk * 2, MAX_CHUNK_BYTES);
+        }
+        const held = self.rest[0..bytes.len];
+        @memcpy(held, bytes);
+        self.rest = self.rest[bytes.len..];
+        return held;
     }
 };
 
