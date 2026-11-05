@@ -929,14 +929,24 @@ pub const ReadSegment = struct {
         return bytes;
     }
 
+    /// The most of a range one WILLNEED hint asks for. Linux reads at most
+    /// the larger of a device's readahead window and its largest request
+    /// per hint (128 and 256 KiB on EBS) and drops the rest, so a longer
+    /// range is hinted in pieces; 128 KiB pieces also beat 256 KiB ones on a
+    /// c6a gp2 volume (40 MiB cold: 19 against 31 ms).
+    const HINT_PIECE = 128 << 10;
+
     /// Tells the OS the `len` bytes at `offset` will be read soon, so it
     /// reads them in while the caller works and a later pread of them waits
     /// on what is still in flight, not on a whole disk read. Only for bytes
     /// the caller will read: a hint is a real disk read. Linux only; a hint
     /// that fails changes nothing.
     pub fn willNeed(self: ReadSegment, offset: u64, len: usize) void {
-        if (builtin.os.tag != .linux or len == 0) return;
-        _ = std.os.linux.fadvise(self.file.handle, @intCast(offset), @intCast(len), std.os.linux.POSIX_FADV.WILLNEED);
+        if (builtin.os.tag != .linux) return;
+        var at: usize = 0;
+        while (at < len) : (at += HINT_PIECE) {
+            _ = std.os.linux.fadvise(self.file.handle, @intCast(offset + at), @intCast(@min(HINT_PIECE, len - at)), std.os.linux.POSIX_FADV.WILLNEED);
+        }
     }
 
     /// Read the raw on-disk bytes (header + payload, or a segment-dictionary
