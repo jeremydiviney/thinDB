@@ -2044,8 +2044,8 @@ fn validateShape(table: *api.Table, request: Request, schema: ?[]const Column) ?
     // Decide packed vs hashed: integer keys totalling ≤128 bits bit-pack
     // losslessly into the staged key (exact, reversible at emit). A string key
     // or an integer combo wider than 128 bits can't pack, so the key becomes a
-    // 128-bit hash and the real values are late-materialized from each row's
-    // __rowloc at emit.
+    // 64-bit digest, its bytes deciding among keys that share one, and the
+    // real values are late-materialized from each row's __rowloc at emit.
     var hashed = false;
     var total_bits: u32 = 0;
     for (request.group_cols) |name| {

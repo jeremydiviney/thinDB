@@ -492,7 +492,7 @@ pub const Shape = struct {
     emit_rank: ?SiloCore.EmitRank = null,
     // The group key is a hash of the key columns (string / >128-bit keys); each
     // staged row carries its __rowloc so the real key values are recovered at
-    // emit via late materialization. Forces the u128 key lane + rowref region.
+    // emit via late materialization. Forces the u64 digest lane + rowref region.
     hashed: bool = false,
     // Rows the ORDER BY ... LIMIT above the core can't keep, dropped in
     // each worker's scan (see `Scan.setKeyBound`).
@@ -539,7 +539,7 @@ pub const Params = struct {
     count_sketch: bool = true,
     having_bound: bool = true,
     /// The hashed key digest's width (`SiloCore.RunConfig.key_digest_mask`).
-    key_digest_bits: u8 = 128,
+    key_digest_bits: u8 = 64,
 };
 
 pub const RunRequest = struct {
@@ -613,7 +613,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
-        .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 128), 1), 128)),
+        .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 64), 1), 64)),
     };
 }
 
@@ -995,7 +995,7 @@ fn runHarness(
         n_str_columns += 1;
     }
     const group_rows_layout = SiloCore.GroupRowsLayout{
-        .key_width = if (shape.hashed) .u128 else harnessKeyWidth(shape.key_width),
+        .key_width = if (shape.hashed) .u64 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..n_columns],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
@@ -1112,7 +1112,7 @@ fn runHarness(
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
         .byte_length_columns = length_cols_buf[0..n_length_cols],
-        .key_digest_mask = @as(u128, std.math.maxInt(u128)) >> @intCast(128 - @as(u16, params.key_digest_bits)),
+        .key_digest_mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - params.key_digest_bits),
     };
     // The sketch's counters are u32, and a retried filter pass discards
     // its rows, so per-group-allocated states rule it out.
@@ -1489,7 +1489,7 @@ test "exact group keys still answer a COUNT top-K from segment string ids" {
     const count_star = [_]SiloCore.GroupAggregateSpec{.{ .op = .count_star, .state_index = 0 }};
     const str_columns = [_]SiloCore.GroupStrColumnSpec{.{ .source_name = "s" }};
     var cfg: SiloCore.RunConfig = .{ .dop = 1, .bucket_count = 1, .snapshot = undefined, .group_rows_layout = .{
-        .key_width = .u128,
+        .key_width = .u64,
         .key_columns = &key_columns,
         .aggregates = &count_star,
         .str_columns = &str_columns,
