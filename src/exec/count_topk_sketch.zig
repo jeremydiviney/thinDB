@@ -45,6 +45,12 @@ const BELOW_ROW_COUNT_KEPT_FRACTION_DENOM: u64 = 16;
 /// count below the row count.
 const BELOW_ROW_COUNT_THRESHOLD_STEPS: u64 = 4096;
 
+/// `tooFewToSettle`'s bar: counters the settle merge reads per tallied row.
+/// One thread adds a counter several times faster than the workers
+/// together group a row, which puts the break-even near ten; this keeps
+/// a wide margin.
+const SETTLE_COUNTERS_PER_ROW: u64 = 64;
+
 /// What the top-K ranks groups by.
 pub const RankedBy = enum {
     /// COUNT(*): a group's counter bounds it from above.
@@ -72,6 +78,8 @@ pub const CountSketch = struct {
     /// zeroes its own slice on first use, so idle workers cost nothing.
     counts: []u32,
     touched: []bool,
+    /// Rows each worker tallied, which its tally's caller adds.
+    tallied: []u64,
     /// Bit c set: the filter pass keeps the rows of counter c.
     keep: []u64 = &.{},
     threshold: u64 = 0,
@@ -92,13 +100,17 @@ pub const CountSketch = struct {
         const counts = try allocator.alloc(u32, workers << bits);
         errdefer allocator.free(counts);
         const touched = try allocator.alloc(bool, workers);
+        errdefer allocator.free(touched);
         @memset(touched, false);
-        return .{ .bits = bits, .counts = counts, .touched = touched };
+        const tallied = try allocator.alloc(u64, workers);
+        @memset(tallied, 0);
+        return .{ .bits = bits, .counts = counts, .touched = touched, .tallied = tallied };
     }
 
     pub fn deinit(self: *CountSketch, allocator: Allocator) void {
         allocator.free(self.counts);
         allocator.free(self.touched);
+        allocator.free(self.tallied);
         if (self.keep.len > 0) allocator.free(self.keep);
         if (self.row_slots) |*rs| rs.deinit();
         self.* = undefined;
@@ -141,6 +153,19 @@ pub const CountSketch = struct {
             self.touched[w] = true;
         }
         return slice;
+    }
+
+    /// Whether the tally saw too few rows for `settle` to pay: its merge
+    /// reads every counter of each worker that tallied, which costs more
+    /// than grouping the rows the tally held.
+    pub fn tooFewToSettle(self: *const CountSketch) bool {
+        var rows: u64 = 0;
+        var workers: u64 = 0;
+        for (self.touched, self.tallied) |t, n| {
+            rows += n;
+            workers += @intFromBool(t);
+        }
+        return rows * SETTLE_COUNTERS_PER_ROW < workers << self.bits;
     }
 
     /// Sum the workers' counters and pick the threshold for the `need` best
@@ -1356,6 +1381,20 @@ test "count sketch declines near-unique keys" {
     var g: u128 = 0;
     while (g < 100_000) : (g += 1) counts[sketch.counter(g)] += 1;
     try std.testing.expect(!try sketch.settle(allocator, 10, .row_count));
+}
+
+test "count sketch settles only once the rows outweigh the counters its merge reads" {
+    const allocator = std.testing.allocator;
+    var sketch = try CountSketch.init(allocator, 6, 3);
+    defer sketch.deinit(allocator);
+    _ = sketch.workerCounts(0);
+    try std.testing.expect(sketch.tooFewToSettle());
+    sketch.tallied[0] = 1;
+    try std.testing.expect(!sketch.tooFewToSettle());
+    _ = sketch.workerCounts(2);
+    try std.testing.expect(sketch.tooFewToSettle());
+    sketch.tallied[2] = 1;
+    try std.testing.expect(!sketch.tooFewToSettle());
 }
 
 test "count sketch declines unique keys spread thinner than the counters" {

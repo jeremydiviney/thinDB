@@ -2472,6 +2472,31 @@ test "group completion waits for a delayed partial before collecting top rows an
     }
 }
 
+test "merged top picks the rows one top set would from every worker's candidates" {
+    const allocator = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(7121);
+    inline for (.{ 1, 10, 300 }) |k| {
+        var tops: [3]TopSet = undefined;
+        for (&tops) |*t| t.* = try TopSet.init(allocator, k);
+        defer for (&tops) |*t| t.deinit(allocator);
+        var single = try TopSet.init(allocator, k);
+        defer single.deinit(allocator);
+        for (0..500) |key| {
+            const row: TopRow = .{ .key = key, .count = random.random().uintLessThan(u64, 40), .rowref = @intCast(key) };
+            tops[key % tops.len].consider(row);
+            single.consider(row);
+        }
+        try single.sortBestFirst(allocator);
+        var merged = try MergedTop.init(allocator, &tops, k);
+        defer merged.deinit(allocator);
+        try std.testing.expectEqual(single.len, merged.len);
+        for (0..merged.len) |i| {
+            try std.testing.expectEqual(single.rowAt(i).key, merged.rowAt(i).key);
+            try std.testing.expectEqual(single.rowAt(i).rowref, merged.rowAt(i).rowref);
+        }
+    }
+}
+
 fn testSlotOf(bound: *const SlotBound, key: u64) usize {
     return slotOfHash(routeHashRowBits(key, 0), bound.shift);
 }
@@ -5035,6 +5060,9 @@ const TopSet = struct {
         key: u128,
         count: u64,
         slot: u32,
+        /// The worker whose set holds the row, for MergedTop; it fills the
+        /// padding after `slot`, so a rank stays 32 bytes.
+        worker: u32 = 0,
 
         fn of(row: TopRow, slot: usize) Rank {
             return .{ .key = row.key, .count = row.count, .slot = @intCast(slot) };
@@ -5111,6 +5139,43 @@ const TopSet = struct {
 
     fn rowAt(self: *const TopSet, i: usize) TopRow {
         return self.items[self.ranks[i].slot];
+    }
+};
+
+/// The best `k` rows across the workers' top sets, best first. Each group
+/// lives in one worker's set, so ranking the sets' ranks together and reading
+/// rows in place picks the same rows a merged TopSet would, without copying
+/// every candidate row into it.
+const MergedTop = struct {
+    tops: []const TopSet,
+    ranks: []TopSet.Rank,
+    len: usize,
+
+    fn init(allocator: Allocator, tops: []const TopSet, k: usize) !MergedTop {
+        var total: usize = 0;
+        for (tops) |t| total += t.len;
+        const ranks = try allocator.alloc(TopSet.Rank, total);
+        errdefer allocator.free(ranks);
+        var n: usize = 0;
+        for (tops, 0..) |t, worker| {
+            for (t.ranks[0..t.len]) |r| {
+                ranks[n] = r;
+                ranks[n].worker = @intCast(worker);
+                n += 1;
+            }
+        }
+        const len = @min(k, total);
+        try thindb.exec.memory.sortPrefix(TopSet.Rank, ranks, len, {}, allocator, TopSet.Rank.before);
+        return .{ .tops = tops, .ranks = ranks, .len = len };
+    }
+
+    fn deinit(self: *MergedTop, allocator: Allocator) void {
+        allocator.free(self.ranks);
+    }
+
+    fn rowAt(self: *const MergedTop, i: usize) TopRow {
+        const r = self.ranks[i];
+        return self.tops[r.worker].items[r.slot];
     }
 };
 
@@ -9831,6 +9896,7 @@ fn sketchRuns(job: SiloGridJob, pass: CountSketchPass, row_count: usize, key_run
     switch (pass) {
         .tally => |sketch| {
             const counts = sketch.workerCounts(job.worker_index);
+            sketch.tallied[job.worker_index] += row_count;
             while (try spans.next()) |key| counts[sketch.counter(key)] += @intCast(spans.rows);
         },
         .dup_tally => |dups| while (try spans.next()) |key| try dups.tallyRows(job.worker_index, key, spans.rows),
@@ -10124,7 +10190,15 @@ fn tallyRows(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, weigh
 
 fn tallyIdentities(job: SiloGridJob, pass: CountSketchPass, ids: []const u128, weights: ?[]const u32, slots: ?[]u32) !void {
     switch (pass) {
-        .tally => |sketch| sketch.tally(sketch.workerCounts(job.worker_index), ids, weights, slots),
+        .tally => |sketch| {
+            var rows: u64 = ids.len;
+            if (weights) |w| {
+                rows = 0;
+                for (w) |n| rows += n;
+            }
+            sketch.tallied[job.worker_index] += rows;
+            sketch.tally(sketch.workerCounts(job.worker_index), ids, weights, slots);
+        },
         .dup_tally => |dups| try dups.tally(job.worker_index, ids, weights, slots),
         .filter, .heavy_tally, .heavy_filter, .dup_filter => return error.UnsupportedOperatorForType,
     }
@@ -11955,21 +12029,14 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     for (chunks) |chunk_count| total_chunks += chunk_count;
 
     const final_t0 = platform.nowTicks();
-    var top = try TopSet.init(allocator, top_k_eff);
-    defer top.deinit(allocator);
     var group_count: u64 = 0;
     var grouped_rows: u64 = 0;
     for (buckets) |*bucket| {
         group_count += bucket.states.len;
         grouped_rows += bucket.row_count;
     }
-    for (worker_tops) |worker_top| {
-        for (worker_top.items[0..worker_top.len], 0..) |candidate, candidate_index| {
-            if (candidate_index % 1024 == 0) try thindb.exec.memory.checkCancelled(allocator);
-            top.consider(candidate);
-        }
-    }
-    try top.sortBestFirst(allocator);
+    var top = try MergedTop.init(allocator, worker_tops, top_k_eff);
+    defer top.deinit(allocator);
     const final_merge_ticks = platform.nowTicks() - final_t0;
     const total_ticks = platform.nowTicks() - total_t0;
     const function_ticks = platform.nowTicks() - function_t0;
