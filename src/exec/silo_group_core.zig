@@ -884,19 +884,18 @@ pub const GroupRowsLayout = struct {
     // key values can be late-materialized at emit) and for GROUP_CONCAT
     // (per-item emission order). Dormant (region absent) otherwise.
     has_rowref: bool = false,
-    // The staged key is a 128-bit hash of the key columns rather than a
-    // lossless bit-pack (string / >128-bit keys). Implies has_rowref; the
-    // reverse does not hold (concat carries rowrefs under packed keys).
+    // The staged key is a 128-bit digest of the key columns rather than a
+    // lossless bit-pack (string / >128-bit keys). The key's bytes ride as
+    // the LAST str column (a lone string key's own bytes, else `ExactKey`'s
+    // encoded parts), each group keeps the bytes it was created with, and a
+    // row joins a group only when its digest and its bytes both match. The
+    // digest only places the key; two keys sharing one never merge. Implies
+    // has_rowref; the reverse does not hold (concat carries rowrefs under
+    // packed keys).
     hashed_key: bool = false,
     // The program has GROUP_CONCAT aggregates: buckets maintain concat_states.
     has_concat: bool = false,
-    // Exact group keys: the hashed key's bytes ride as the LAST str column
-    // (a lone string key's own bytes, else `ExactKey`'s encoded parts), each
-    // group keeps the bytes it was created with, and a row joins a group
-    // only when its digest and its bytes both match. The digest only places
-    // the key; two keys sharing one never merge.
-    exact_key: bool = false,
-    // An exact key whose bytes a scan worker copies once into its
+    // A hashed key whose bytes a scan worker copies once into its
     // `KeyArena`, each row carrying a `KeyRef` lane instead of a str column:
     // a deferred grid holds every staged row until it folds, so the bytes
     // stay put while the rows move.
@@ -917,7 +916,7 @@ pub const GroupRowsLayout = struct {
 };
 
 fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
-    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.exact_key != b.exact_key or a.key_refs != b.key_refs or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
+    if (a.key_width != b.key_width or a.has_rowref != b.has_rowref or a.hashed_key != b.hashed_key or a.has_concat != b.has_concat or a.key_refs != b.key_refs or a.has_udf != b.has_udf or a.has_weight != b.has_weight or a.has_str_payload != b.has_str_payload or a.distinct_slot_count != b.distinct_slot_count or a.key_columns.len != b.key_columns.len or a.columns.len != b.columns.len or a.str_columns.len != b.str_columns.len or a.aggregates.len != b.aggregates.len) return false;
     var key_i: usize = 0;
     while (key_i < a.key_columns.len) : (key_i += 1) {
         if (!thindb.types.columnNameEql(a.key_columns[key_i].name, b.key_columns[key_i].name) or
@@ -1677,7 +1676,7 @@ test "count update pipeline folds exact results below and above the live state t
     }
 }
 
-test "hashed key digests that differ only past bit 96 fold into separate groups" {
+test "packed keys that differ only past bit 96 fold into separate groups" {
     const allocator = std.testing.allocator;
     var bucket = try PipeBucket.init(allocator, 16);
     defer bucket.deinit(allocator);
@@ -1685,7 +1684,7 @@ test "hashed key digests that differ only past bit 96 fold into separate groups"
     defer scratch.deinit(allocator);
     var rows: GroupRows = .{};
     defer rows.deinit(allocator);
-    const layout = GroupRowsLayout{ .key_width = .u128, .hashed_key = true, .has_rowref = true, .columns = &.{}, .aggregates = &.{.{ .op = .count_star, .state_index = 0 }} };
+    const layout = GroupRowsLayout{ .key_width = .u128, .has_rowref = true, .columns = &.{}, .aggregates = &.{.{ .op = .count_star, .state_index = 0 }} };
     const low: u128 = 0x0123_4567_89ab_cdef_0011_2233;
     try rows.resize(allocator, layout, 6);
     for (0..6) |i| {
@@ -2830,7 +2829,6 @@ test "a deferred bucket fold keeps exact keys that share a digest apart, split i
                 .has_str_payload = true,
                 .has_rowref = true,
                 .hashed_key = true,
-                .exact_key = true,
             }),
             .defer_fold = true,
         };
@@ -2922,20 +2920,20 @@ test "a grid defers its folds only for many groups per bucket and staging within
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = false, .shape = .plain },
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .str_payload },
         .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1_000_000, .budget = true, .shape = .distinct },
-        .{ .want = true, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024, .budget = true, .shape = .exact_key },
-        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024 + 1, .budget = true, .shape = .exact_key },
-        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1024, .budget = true, .shape = .exact_key_and_str },
+        .{ .want = true, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024, .budget = true, .shape = .hashed_key },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 512 * 1024 + 1, .budget = true, .shape = .hashed_key },
+        .{ .want = false, .staged = true, .workers = 4, .groups = DEFER_FOLD_MIN_GROUPS, .rows = 1024, .budget = true, .shape = .hashed_key_and_str },
     };
     const str_columns = [_]GroupStrColumnSpec{ .{ .source_name = "s" }, .{ .source_name = "k" } };
     inline for (cases) |c| {
-        const exact = c.shape == .exact_key or c.shape == .exact_key_and_str;
+        const exact = c.shape == .hashed_key or c.shape == .hashed_key_and_str;
         const layout = GroupRowsLayout{
             .key_width = .u64,
             .columns = &.{},
             .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
-            .str_columns = if (c.shape == .exact_key) str_columns[1..] else if (exact or c.shape == .str_payload) &str_columns else &.{},
+            .str_columns = if (c.shape == .hashed_key) str_columns[1..] else if (exact or c.shape == .str_payload) &str_columns else &.{},
             .has_str_payload = exact or c.shape == .str_payload,
-            .exact_key = exact,
+            .hashed_key = exact,
             .distinct_slot_count = if (c.shape == .distinct) 1 else 0,
         };
         try std.testing.expectEqual(c.want, deferBucketFolds(layout, c.workers, c.staged, c.groups, c.rows, 8, if (c.budget) &resources else null));
@@ -5314,7 +5312,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
     if (layout.has_str_payload) {
         if (layout.str_columns.len > MAX_GROUP_STR_COLUMNS) return error.UnsupportedOperatorForType;
         const ascending_column = if (row_weights) |rw| rw.ascending_column else null;
-        const n_inputs = layout.str_columns.len - @intFromBool(layout.exact_key);
+        const n_inputs = layout.str_columns.len - @intFromBool(layout.hashed_key);
         for (layout.str_columns[0..n_inputs], 0..) |sc, i| {
             const ci = batch.columnIndex(sc.source_name) orelse return error.ColumnNotFound;
             str_inputs_buf[i] = try StrInput.of(batch, ci, layout.aggregates, i);
@@ -5323,7 +5321,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         str_inputs = str_inputs_buf[0..n_inputs];
         if (layout.has_weight) try parts.ensureStrPending(shared.allocator, raw_chunk_rows, str_inputs.len);
     }
-    const exact: ?ExactKey = if (layout.exact_key) try ExactKey.of(layout, batch) else null;
+    const exact: ?ExactKey = if (layout.hashed_key) try ExactKey.of(layout, batch) else null;
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
     // string lane (if any) rides along via appendStrPayload inside each kernel.
@@ -6233,7 +6231,7 @@ inline fn appendStrPayload(active: *RawRows, allocator: Allocator, inputs: []con
 }
 
 /// A batch's group key, read for the bytes exact group keys compare (see
-/// `GroupRowsLayout.exact_key`): a lone string key's own bytes, else its
+/// `GroupRowsLayout.hashed_key`): a lone string key's own bytes, else its
 /// parts in order, a nullable part behind a validity byte (a NULL part adds
 /// nothing more), a string part behind its u32 length and any other part in
 /// its type's own width.
@@ -6915,7 +6913,7 @@ fn groupChunkRowsDirect(
     if (rows.layout.columns.len > MAX_GROUP_PAYLOAD_COLUMNS) return error.UnsupportedOperatorForType;
     try validateGroupAggregateProgram(rows.layout.aggregates, rows.layout.columns.len);
     const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
-    if (rows.layout.exact_key) {
+    if (rows.layout.hashed_key) {
         const bank = key_bank orelse return error.UnsupportedOperatorForType;
         if (rows.layout.key_width != .u128) return error.UnsupportedOperatorForType;
         try bank.keys.ensureTotalCapacity(allocator, states.len - bank.base + n);
@@ -7423,7 +7421,7 @@ fn groupChunkRowsDirectKeysProgram(
     if (has_distinct) try foldGroupDistinctChunk(distinct_sets, allocator, states, gids, aggregates, rows);
 }
 
-// Exact group keys' fold (see `GroupRowsLayout.exact_key`): a row joins a
+// Exact group keys' fold (see `GroupRowsLayout.hashed_key`): a row joins a
 // group only when its key bytes (the rows' last str column) match the
 // group's in `key_bank`; a run of one digest ends where the bytes change.
 // Counts and the kernel aggregates fold as groupChunkRowsDirectKeys folds
@@ -7591,7 +7589,6 @@ test "exact group keys keep keys that share a digest in groups of their own" {
             .has_str_payload = true,
             .has_rowref = true,
             .hashed_key = true,
-            .exact_key = true,
             .has_weight = weighted,
         };
         var bucket = try PipeBucket.init(allocator, 16);
@@ -7651,7 +7648,7 @@ test "an exact key's staged bytes hold another row's key only when every part ma
     const same = [_][2]usize{ .{ 0, 1 }, .{ 4, 4 }, .{ 5, 5 } };
     const apart = [_][2]usize{ .{ 0, 2 }, .{ 0, 3 }, .{ 2, 0 }, .{ 4, 5 }, .{ 5, 4 }, .{ 0, 5 } };
     inline for (.{ &[_]GroupKeyColumnSpec{ s_part, g_part }, &[_]GroupKeyColumnSpec{s_part} }) |parts| {
-        const key = try ExactKey.of(.{ .key_columns = parts, .hashed_key = true, .exact_key = true }, batch);
+        const key = try ExactKey.of(.{ .key_columns = parts, .hashed_key = true }, batch);
         var store: StrStore = .{};
         defer store.deinit(allocator);
         try store.ensure(allocator, 1, batch.row_count, 0);
@@ -8722,10 +8719,10 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
     defer filter_reads.deinit(allocator);
     if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
     var source = (try dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items)) orelse return null;
-    // Only an exact key's staging reads a key's bytes through its codes; a
+    // Only a hashed key's staging reads a key's bytes through its codes; a
     // heavy pass reads its lone key's bytes off the batch (`heavyKeyColumn`).
     const heavy = if (cfg.count_sketch) |pass| pass == .heavy_tally or pass == .heavy_filter else false;
-    if (!layout.exact_key or heavy) source.keys_only = 0;
+    if (!layout.hashed_key or heavy) source.keys_only = 0;
     return source;
 }
 
@@ -10244,7 +10241,7 @@ fn heavyTallyRows(job: SiloGridJob, heavy: *HeavyKeys, batch: thindb.Batch, weig
         const gop = try unit_keys.getOrPut(scratch_allocator, thindb.exec.stringKeyDigest(keys.rowBytes(r)));
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .count = 0, .row = @intCast(r) };
-        } else if (heavy.exact_keys and !std.mem.eql(u8, keys.rowBytes(gop.value_ptr.row), keys.rowBytes(r))) heavy.noteSharedDigest(w);
+        } else if (!std.mem.eql(u8, keys.rowBytes(gop.value_ptr.row), keys.rowBytes(r))) heavy.noteSharedDigest(w);
         gop.value_ptr.count += 1;
     }
     var it = unit_keys.iterator();
@@ -10628,7 +10625,7 @@ fn foldDeferredBucket(
     const table = &local.defer_table.?;
     const transient = top.items.len != 0 and layout.distinct_slot_count == 0;
     const states = if (transient) &local.defer_states else &bucket.states;
-    const keys: ?*KeyBank = if (layout.exact_key) keys: {
+    const keys: ?*KeyBank = if (layout.hashed_key) keys: {
         if (local.defer_keys == null) local.defer_keys = .{ .arena = .init(allocator), .borrows = true };
         break :keys &local.defer_keys.?;
     } else null;
@@ -10879,7 +10876,7 @@ fn runSiloGridWorker(comptime downstream_first: bool, job: SiloGridJob) !void {
 /// the set's misses.
 fn deferBucketFolds(layout: GroupRowsLayout, n_workers: usize, staged: bool, expected_groups_per_bucket: usize, input_rows: u64, key_row_bytes: u64, resources: ?*thindb.exec.memory.MemoryAccountant) bool {
     if (!staged or n_workers < 2 or expected_groups_per_bucket < DEFER_FOLD_MIN_GROUPS) return false;
-    const key_only = layout.exact_key and layout.str_columns.len == 1;
+    const key_only = layout.hashed_key and layout.str_columns.len == 1;
     if ((layout.has_str_payload and !key_only) or hasStringResults(layout) or layout.has_concat or layout.has_udf or layout.distinct_slot_count != 0) return false;
     const accountant = resources orelse return false;
     const row_bytes = GroupRows.slabBytes(layout, 1) + if (layout.has_str_payload) @sizeOf(KeyRef) + key_row_bytes else 0;
@@ -10894,7 +10891,7 @@ const GUESSED_KEY_STRING_WIDTH: u64 = 32;
 /// `layout` with its exact key staged as a KeyRef (see
 /// `GroupRowsLayout.key_refs`); deferBucketFolds admits no other string.
 fn keyRefLayout(layout: GroupRowsLayout) GroupRowsLayout {
-    std.debug.assert(layout.exact_key and layout.str_columns.len == 1);
+    std.debug.assert(layout.hashed_key and layout.str_columns.len == 1);
     var staged = layout;
     staged.str_columns = &.{};
     staged.has_str_payload = false;
@@ -10951,10 +10948,11 @@ pub const RunConfig = struct {
     // memory is back; an untracked one must outlive the query. The engine sets
     // this only for the fresh-workspace path (never the arena).
     defer_heavy_teardown: bool = false,
-    // String group-key columns the worker scans emit as key digests
-    // (`Batch.hashed`) instead of materialized strings — hashed-key shapes
-    // where the key bytes only return at emit via rowref late-mat. A scan
-    // decline (or a sidecar-less batch) falls back to digesting bytes.
+    // String group-key columns nothing else reads: a dictionary-coded block
+    // brings their digests beside its dictionary (`Scan.setBlockDictDigests`),
+    // and a count tally, which needs no bytes, takes the digests alone
+    // (`Batch.hashed`). A scan decline (or a sidecar-less batch) falls back
+    // to digesting bytes.
     hash_key_columns: []const []const u8 = &.{},
     /// Keeps only these bits of each hashed key's digest where a row takes
     /// its staged key, so keys collide as often as a digest this narrow
@@ -11485,10 +11483,10 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         for (stage_builders) |*builder| builder.* = .{};
     }
 
-    const defer_fold = deferBucketFolds(group_rows_layout, n_workers, use_dedicated_raw_stage, expectedGroupsPerBucket(defer_groups, bucket_count), stats_scan.stats().upper_rows, if (group_rows_layout.exact_key) exactKeyRowBytes(table, snap, group_rows_layout.key_columns) else 0, resources);
+    const defer_fold = deferBucketFolds(group_rows_layout, n_workers, use_dedicated_raw_stage, expectedGroupsPerBucket(defer_groups, bucket_count), stats_scan.stats().upper_rows, if (group_rows_layout.hashed_key) exactKeyRowBytes(table, snap, group_rows_layout.key_columns) else 0, resources);
     // A deferred fold reads keys only once every row is staged, so a worker's
     // KeyArena can hold each exact key's bytes from the scan to the last fold.
-    const staged_layout = if (defer_fold and group_rows_layout.exact_key) keyRefLayout(group_rows_layout) else group_rows_layout;
+    const staged_layout = if (defer_fold and group_rows_layout.hashed_key) keyRefLayout(group_rows_layout) else group_rows_layout;
     var shared = PipeShared{
         .resources = resources,
         .allocator = allocator,
@@ -11590,11 +11588,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             }
         }
         _ = try cfg.offered_prunes.apply(scans[i]);
-        // A pass that groups exact keys compares their bytes, which a column
+        // A pass that groups hashed keys compares their bytes, which a column
         // the scan only digests never fills. A tally counts by digest, which
         // can only count a key's rows with another's, never lose them.
         const tallies = if (cfg.count_sketch) |pass| pass.tallies() else false;
-        if (!cfg.group_rows_layout.exact_key or tallies) {
+        if (tallies) {
             for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         }
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
@@ -11753,7 +11751,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 const at = sc.blockDictColumnIndex(scan_schema[j].name).?;
                 try sc.setBlockDictColumn(at);
                 if (counted) sc.setBlockDictCounted(at);
-                if (layout.exact_key and nameListed(cfg.hash_key_columns, scan_schema[j].name)) sc.setBlockDictDigests(at);
+                if (layout.hashed_key and nameListed(cfg.hash_key_columns, scan_schema[j].name)) sc.setBlockDictDigests(at);
             }
         }
         kept = true;

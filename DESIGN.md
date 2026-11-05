@@ -1290,9 +1290,8 @@ bound, such as an aggregate's own stats, the low-cardinality handler's gate
 and radix's cache-resident gate, keep the product.
 
 Some keys are never compared byte for byte: a 128-bit digest stands in for
-them. These are a string or wider-than-128-bit GROUP BY key in the V2 grouped
-engine under digest group keys (below), a global COUNT(DISTINCT) over text, a table function's PARTITION BY
-key, and the predicate digests that key the condition cache and the miss memo
+them. These are a global COUNT(DISTINCT) over text, a table function's
+PARTITION BY key, and the predicate digests that key the condition cache and the miss memo
 (§6.4). Two keys merge only if their digests collide, about n² / 2¹²⁹ for n
 keys. The digests are XXH3 under a per-process key (`exec.setDigestSeed`):
 the server draws it at startup, so no stored value or query text can be built
@@ -1303,29 +1302,14 @@ nested-shape pool (§3): it is set before any database opens and every
 database shares it. An embedder that leaves it unset keeps seed 0. The
 `XX_HASH3_*` SQL functions keep StarRocks' fixed seeds.
 
-Under digest group keys the V2 grouped engine never needs a hashed key's bytes
-before emit, which reads each group's values back from its first row (its
-rowref) and recomputes any derived key there. So a string key column nothing
-else reads reaches it as
-per-row digests taken off the column's block (`Batch.hashed`): a dictionary
-entry is digested once per row group, not once per row. A key derived as a
-CASE whose every result is a string column or a string literal (Q39's
-`CASE WHEN … THEN Referer ELSE '' END`) is grouped by digest as well
-(`Derived.digest_only`): the Compute picks each row's result digest, from the
-column's digests when it arrives as digests and from its bytes otherwise, and
-emits an empty placeholder column in place of the strings. A result column
-that only such keys read, and never in a condition, then arrives as digests
-too, so neither the column nor the key's strings are ever copied.
-
-**Exact group keys.** The V2 grouped engine decides its hashed keys' groups
-by their bytes: two keys share a group only if their bytes are equal,
-whatever their digests. The digest still places a key (its partition, bucket
-and hash slot); its bytes decide among the keys found there. `SET
-THINDB_DIGEST_GROUP_KEYS = 1` makes the digest the key instead (digest group
-keys, above), which measures what the bytes cost.
+**Exact group keys.** The V2 grouped engine hashes a string or
+wider-than-128-bit key (`GroupRowsLayout.hashed_key`) and decides its groups
+by its bytes: two keys share a group only if their bytes are equal, whatever
+their digests. The digest only places a key (its partition, bucket and hash
+slot); its bytes decide among the keys found there.
 
 - **Staging.** Each staged row carries its key's bytes as the last string
-  column (`GroupRowsLayout.exact_key`): a lone string key's bytes, or a
+  column: a lone string key's bytes, or a
   composite key's encoding (a validity byte per nullable part, a length and
   the bytes per string part, the native bytes per fixed-width part). A
   staged row that folds another row in, the weighted collapse's, compares
@@ -1340,9 +1324,7 @@ keys, above), which measures what the bytes cost.
 - **Scans.** A dictionary-coded key column arrives with both its digests and
   its dictionary (`Scan.setBlockDictDigests`). A dictionary collapse whose
   used codes leave gaps hands the staging the codes rather than a copy of
-  their values, and the staging copies each key from the dictionary. Keys
-  derived as a CASE (above) keep their bytes, as no comparison could read a
-  digest-only column.
+  their values, and the staging copies each key from the dictionary.
 - **Count top-K.** The heavy-keys sketch keeps each reported key's bytes. A
   second key reported under one digest marks the digest shared: the filter
   pass then keeps every row under a candidate digest, and the answer stands
