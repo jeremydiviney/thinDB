@@ -1508,7 +1508,7 @@ fn compareF64(a: f64, b: f64) i8 {
 }
 
 fn emitResultStage(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: []const SiloCore.TopRow) !void {
-    if (op.plan.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null) return emitResultStageHashed(op, snapshot, rows);
+    if (op.plan.hashed) return emitResultStageHashed(op, snapshot, rows);
     if (rows.len == 0) return;
     var grant = core_scheduler.reserveWorkers(emitWorkerCount(op, rows.len));
     defer grant.release();

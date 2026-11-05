@@ -2,9 +2,8 @@
 //! 128-bit digest are known (a search takes ~2^64 digests), so
 //! THINDB_V2_KEY_DIGEST_BITS narrows the digest each row stages to 32 bits,
 //! where a birthday search finds a pair in ~2^16 digests of the very function
-//! and seed the engine takes (tests run under digest seed 0). Without exact
-//! keys the pair merges into one group, which proves the narrowed digest
-//! reached the group table; with them, each key keeps a group of its own.
+//! and seed the engine takes (tests run under digest seed 0). Each key of the
+//! pair keeps a group of its own.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -31,14 +30,12 @@ fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
     }
 }
 
-fn setMode(exact: bool) void {
+fn narrowDigests() void {
     setEnv("THINDB_V2_KEY_DIGEST_BITS", std.fmt.comptimePrint("{d}", .{DIGEST_BITS}));
-    setEnv("THINDB_DIGEST_GROUP_KEYS", if (exact) "0" else "1");
 }
 
-fn clearMode() void {
+fn widenDigests() void {
     setEnv("THINDB_V2_KEY_DIGEST_BITS", "");
-    setEnv("THINDB_DIGEST_GROUP_KEYS", "");
 }
 
 /// The first `i < j` whose `digestOf` agree in their low DIGEST_BITS.
@@ -154,68 +151,47 @@ fn freeResult(allocator: std.mem.Allocator, result: *std.StringHashMapUnmanaged(
     result.deinit(allocator);
 }
 
-/// Checks one GROUP BY of a table holding `copies` copies of `groups`' rows:
-/// `collide` are the indexes in `groups` of the pair whose keys share a
-/// narrowed digest, and `with_g` whether the query groups by `g` as well as
-/// `s` (a lone `s` groups the composite pair's "c" rows as one key).
-fn expectGroups(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, groups: []const Group, copies: i64, collide: [2]usize, with_g: bool) !void {
-    // Exact keys: every group apart, each with its own count.
-    {
-        setMode(true);
-        defer clearMode();
-        var result = try runGroups(allocator, db, sql);
-        defer freeResult(allocator, &result);
-        var expected: std.StringHashMapUnmanaged(i64) = .empty;
-        defer freeResult(allocator, &expected);
-        for (groups) |grp| {
-            const key = try resultKey(allocator, if (with_g) grp.g else 0, grp.s);
-            const entry = expected.getOrPut(allocator, key) catch |err| {
-                allocator.free(key);
-                return err;
-            };
-            if (entry.found_existing) {
-                allocator.free(key);
-                entry.value_ptr.* += copies * grp.count;
-            } else entry.value_ptr.* = copies * grp.count;
-        }
-        try std.testing.expectEqual(expected.count(), result.count());
-        var it = expected.iterator();
-        while (it.next()) |want| try std.testing.expectEqual(want.value_ptr.*, result.get(want.key_ptr.*) orelse return error.TestExpectedEqual);
+/// Checks one GROUP BY of a table holding `copies` copies of `groups`' rows
+/// under narrowed digests: every group apart, each with its own count.
+/// `with_g` is whether the query groups by `g` as well as `s` (a lone `s`
+/// groups the composite pair's "c" rows as one key).
+fn expectGroups(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, groups: []const Group, copies: i64, with_g: bool) !void {
+    narrowDigests();
+    defer widenDigests();
+    var result = try runGroups(allocator, db, sql);
+    defer freeResult(allocator, &result);
+    var expected: std.StringHashMapUnmanaged(i64) = .empty;
+    defer freeResult(allocator, &expected);
+    for (groups) |grp| {
+        const key = try resultKey(allocator, if (with_g) grp.g else 0, grp.s);
+        const entry = expected.getOrPut(allocator, key) catch |err| {
+            allocator.free(key);
+            return err;
+        };
+        if (entry.found_existing) {
+            allocator.free(key);
+            entry.value_ptr.* += copies * grp.count;
+        } else entry.value_ptr.* = copies * grp.count;
     }
-    // Digest keys: the colliding pair shares one group, under either key,
-    // with both keys' rows.
-    {
-        setMode(false);
-        defer clearMode();
-        var result = try runGroups(allocator, db, sql);
-        defer freeResult(allocator, &result);
-        var counts: [2]?i64 = undefined;
-        for (&counts, collide) |*count, at| {
-            const key = try resultKey(allocator, if (with_g) groups[at].g else 0, groups[at].s);
-            defer allocator.free(key);
-            count.* = result.get(key);
-        }
-        try std.testing.expect((counts[0] == null) != (counts[1] == null));
-        try std.testing.expectEqual(copies * (groups[collide[0]].count + groups[collide[1]].count), (counts[0] orelse counts[1]).?);
-    }
+    try std.testing.expectEqual(expected.count(), result.count());
+    var it = expected.iterator();
+    while (it.next()) |want| try std.testing.expectEqual(want.value_ptr.*, result.get(want.key_ptr.*) orelse return error.TestExpectedEqual);
 }
 
 /// A HAVING each key of the string pair meets but their pooled rows don't:
-/// exact keys return both, each with its own count, and digest keys neither.
+/// both return, each with its own count.
 fn expectHavingPair(allocator: std.mem.Allocator, db: *thindb.Database, groups: []const Group, copies: i64) !void {
     const sql = try std.fmt.allocPrint(allocator, "SELECT s, COUNT(*) FROM t GROUP BY s HAVING COUNT(*) BETWEEN {d} AND {d}", .{ 2 * copies, 3 * copies });
     defer allocator.free(sql);
-    inline for (.{ true, false }) |exact| {
-        setMode(exact);
-        defer clearMode();
-        var result = try runGroups(allocator, db, sql);
-        defer freeResult(allocator, &result);
-        try std.testing.expectEqual(@as(usize, if (exact) 2 else 0), result.count());
-        if (exact) for (groups[0..2]) |grp| {
-            const key = try resultKey(allocator, 0, grp.s);
-            defer allocator.free(key);
-            try std.testing.expectEqual(copies * grp.count, result.get(key) orelse return error.TestExpectedEqual);
-        };
+    narrowDigests();
+    defer widenDigests();
+    var result = try runGroups(allocator, db, sql);
+    defer freeResult(allocator, &result);
+    try std.testing.expectEqual(@as(usize, 2), result.count());
+    for (groups[0..2]) |grp| {
+        const key = try resultKey(allocator, 0, grp.s);
+        defer allocator.free(key);
+        try std.testing.expectEqual(copies * grp.count, result.get(key) orelse return error.TestExpectedEqual);
     }
 }
 
@@ -246,9 +222,9 @@ test "exact group keys keep keys whose digests collide in groups of their own" {
             try (try db.openTable("t", .{})).flush();
             next_id = try insertCopy(allocator, db, groups, next_id);
         }
-        try expectGroups(allocator, db, "SELECT s, COUNT(*) FROM t GROUP BY s", groups, copies, .{ 0, 1 }, false);
-        try expectGroups(allocator, db, "SELECT g, s, COUNT(*) FROM t GROUP BY g, s", groups, copies, .{ 2, 3 }, true);
-        try expectGroups(allocator, db, "SELECT s, COUNT(*) FROM t WHERE s <> '" ++ GAP_KEY ++ "' GROUP BY s", gapped.items, copies, .{ 0, 1 }, false);
+        try expectGroups(allocator, db, "SELECT s, COUNT(*) FROM t GROUP BY s", groups, copies, false);
+        try expectGroups(allocator, db, "SELECT g, s, COUNT(*) FROM t GROUP BY g, s", groups, copies, true);
+        try expectGroups(allocator, db, "SELECT s, COUNT(*) FROM t WHERE s <> '" ++ GAP_KEY ++ "' GROUP BY s", gapped.items, copies, false);
         try expectHavingPair(allocator, db, groups, copies);
     }
 }
@@ -304,8 +280,8 @@ test "exact group keys keep colliding values apart in the count top-K by segment
         try t.flush();
     }
 
-    setMode(true);
-    defer clearMode();
+    narrowDigests();
+    defer widenDigests();
     var plan = try runSql(allocator, db, "EXPLAIN " ++ sql);
     defer plan.deinit();
     var grouped = false;

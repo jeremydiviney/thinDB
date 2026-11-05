@@ -60,49 +60,7 @@ const makeQuery = exec.makeQuery;
 pub const Derived = struct {
     name: []const u8,
     expr: Expr,
-    /// The consumer reads the column only as a group key's identity, never
-    /// its bytes. A CASE choosing among string columns and literals
-    /// (`selectsStrings`) then carries each row's key digest
-    /// (`Batch.hashed`) over an empty placeholder, rather than copying the
-    /// bytes it chose for the consumer to hash.
-    digest_only: bool = false,
 };
-
-/// Whether `e` is a CASE whose every result, an ELSE included, is a
-/// non-nullable string column of `schema` or a string literal: a row's
-/// value is then one result's bytes as they stand, so its key digest is
-/// that result's.
-pub fn selectsStrings(e: Expr, schema: []const Column) bool {
-    const cs = switch (e) {
-        .case => |cs| cs,
-        else => return false,
-    };
-    const else_branch = cs.else_branch orelse return false;
-    for (cs.branches) |b| {
-        if (!isStringResult(b.then, schema)) return false;
-    }
-    return isStringResult(else_branch.*, schema);
-}
-
-fn isStringResult(e: Expr, schema: []const Column) bool {
-    return switch (e) {
-        .col_ref => |name| if (columnIndex(schema, name)) |i| schema[i].type.isString() and !schema[i].nullable else false,
-        .lit => |v| v == .text,
-        else => false,
-    };
-}
-
-/// Whether a CASE's conditions or operands read column `name`.
-pub fn caseConditionsRead(allocator: Allocator, cs: Expr.Case, name: []const u8) !bool {
-    var refs: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer refs.deinit(allocator);
-    for (cs.operands) |o| try collectColumnRefs(allocator, &refs, o.expr);
-    for (cs.branches) |b| try expr_mod.collectCaseConditionRefs(allocator, &refs, cs, b.cond);
-    for (refs.items) |r| {
-        if (types.columnNameEql(r, name)) return true;
-    }
-    return false;
-}
 
 fn appendUniqueName(allocator: Allocator, out: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
     if (name.len == 0) return;
@@ -386,10 +344,6 @@ const CasePlan = struct {
     /// any then_src is a nullable column). Used by Compute to decide
     /// whether the output column needs a validity bitmap.
     may_produce_null: bool,
-    /// The column is `Derived.digest_only` and `selectsStrings`: each batch
-    /// leaves `output` empty and fills `digests` instead.
-    digest_only: bool = false,
-    digests: std.ArrayListUnmanaged(u128) = .empty,
 };
 
 const CaseOperand = struct {
@@ -580,9 +534,6 @@ pub const Compute = struct {
     /// The output batch's key-digest sidecar, like `out_lengths`: a hashed
     /// column no derived entry reads keeps its digests past this operator.
     out_hashed: []?[]const u128,
-    /// The zeroed offsets a digest-only CASE's placeholder view shares.
-    /// Views die with their batch, so it grows only between batches.
-    placeholder_offsets: []u32 = &.{},
 
     pub fn create(
         allocator: Allocator,
@@ -627,7 +578,7 @@ pub const Compute = struct {
         const aa = arena.allocator();
         const derived_ir = try aa.alloc(Derived, derived.len);
         for (derived, derived_ir) |d, *owned| {
-            owned.* = .{ .name = try aa.dupe(u8, d.name), .expr = try expr_mod.deepClone(aa, d.expr), .digest_only = d.digest_only };
+            owned.* = .{ .name = try aa.dupe(u8, d.name), .expr = try expr_mod.deepClone(aa, d.expr) };
         }
 
         const resolved = try aa.alloc(ResolvedDerived, derived.len);
@@ -770,7 +721,6 @@ pub const Compute = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.out_lengths);
         self.allocator.free(self.out_hashed);
-        self.allocator.free(self.placeholder_offsets);
         self.arena.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -1156,11 +1106,6 @@ pub const Compute = struct {
                     }
                 },
                 .case => |plan| {
-                    if (plan.digest_only) {
-                        try self.evalCaseDigests(plan, in, n);
-                        direct.* = true;
-                        continue;
-                    }
                     try self.evalCase(plan, in.values, n);
                     if (std.meta.activeTag(plan.output.data) == std.meta.activeTag(out_col.data) and
                         plan.output.rowCount() == n)
@@ -1180,7 +1125,7 @@ pub const Compute = struct {
                 .rename => |rn| in.values[rn.src_idx],
                 .lit_only => |slot| slot.buf.view(),
                 .call => |plan| plan.outputView(),
-                .case => |plan| if (plan.digest_only) self.placeholderView(plan.output.view(), n) else plan.output.view(),
+                .case => |plan| plan.output.view(),
                 // Only the four kinds above ever set `direct`.
                 .null_only, .fused_scalar => unreachable,
             };
@@ -1191,39 +1136,8 @@ pub const Compute = struct {
             .values = self.views,
             .row_count = n,
             .byte_lengths = self.passedThrough(u32, in.byte_lengths, self.out_lengths),
-            .hashed = self.outputDigests(in.hashed),
+            .hashed = self.passedThrough(u128, in.hashed, self.out_hashed),
         };
-    }
-
-    /// `empty`, a digest-only CASE's emptied string output, as the batch's
-    /// `n` empty strings.
-    fn placeholderView(self: *const Compute, empty: ColumnView, n: usize) ColumnView {
-        var view = empty;
-        switch (view.data) {
-            inline .varchar, .string, .char, .json => |*sv| sv.offsets = self.placeholder_offsets[0 .. n + 1],
-            // `selectsStrings` admits string results only.
-            else => unreachable,
-        }
-        return view;
-    }
-
-    /// The output batch's key-digest sidecar: the input's passed through,
-    /// and each digest-only CASE's digests.
-    fn outputDigests(self: *Compute, in: ?[]const ?[]const u128) ?[]const ?[]const u128 {
-        var out = self.passedThrough(u128, in, self.out_hashed);
-        for (self.derived, self.derived_output_indices) |r, out_idx| {
-            const plan = switch (r.kind) {
-                .case => |plan| plan,
-                else => continue,
-            };
-            if (!plan.digest_only) continue;
-            if (out == null) {
-                @memset(self.out_hashed, null);
-                out = self.out_hashed;
-            }
-            self.out_hashed[out_idx] = plan.digests.items;
-        }
-        return out;
     }
 
     /// The input's per-column sidecar `in`, copied into `out` with the
@@ -1476,60 +1390,6 @@ pub const Compute = struct {
             inline else => |*list, tag| try assembleCaseFixed(self.allocator, list, tag, plan.output, srcs, winners),
         }
         try ensureNarrow(plan.output);
-    }
-
-    /// A digest-only CASE (`CasePlan.digest_only`): each row's key digest,
-    /// its result's (the input's digest sidecar for a column that has one),
-    /// into `plan.digests`, and room for its placeholder's offsets.
-    fn evalCaseDigests(self: *Compute, plan: *CasePlan, in: Batch, n: usize) anyerror!void {
-        plan.output.clear();
-        if (plan.branches.len > MAX_CASE_BRANCHES) return Error.ComputeTooManyArgs;
-        if (self.placeholder_offsets.len < n + 1) {
-            const offsets = try self.allocator.alloc(u32, n + 1);
-            @memset(offsets, 0);
-            self.allocator.free(self.placeholder_offsets);
-            self.placeholder_offsets = offsets;
-        }
-
-        const winners = try self.allocator.alloc(CaseWinner, n);
-        defer self.allocator.free(winners);
-        var reached: std.ArrayList(ColumnStore) = .empty;
-        defer {
-            for (reached.items) |*s| s.deinit(self.allocator);
-            reached.deinit(self.allocator);
-        }
-        try self.caseWinners(plan, in.values, winners, &reached);
-
-        try plan.digests.resize(self.allocator, n);
-        const out = plan.digests.items;
-        for (0..plan.branches.len + 1) |slot| {
-            const src = if (slot < plan.branches.len) plan.branches[slot].then_src else plan.else_src orelse return Error.ComputeUnsupportedExpr;
-            switch (src) {
-                .lit => |l| {
-                    const digest = exec.stringKeyDigest(l.value.text);
-                    for (out, winners) |*o, w| {
-                        if (w == slot) o.* = digest;
-                    }
-                },
-                .col => |c| {
-                    const sidecar = if (in.hashed) |hs| (if (c < hs.len) hs[c] else null) else null;
-                    if (sidecar) |digests| {
-                        for (out, winners, digests[0..n]) |*o, w, d| {
-                            if (w == slot) o.* = d;
-                        }
-                        continue;
-                    }
-                    const sv = switch (in.values[c].data) {
-                        .varchar, .string, .char, .json => |sv| sv,
-                        else => return Error.TypeMismatch,
-                    };
-                    for (out, winners, 0..) |*o, w, r| {
-                        if (w == slot) o.* = exec.stringKeyDigest(sv.rowBytes(r));
-                    }
-                },
-                else => return Error.ComputeUnsupportedExpr,
-            }
-        }
     }
 
     /// Per row, the THEN or ELSE source it takes into `winners`: the first
@@ -2316,7 +2176,6 @@ fn resolveDerived(
         },
         .case => {
             const plan = try buildCasePlan(runtime_allocator, aa, d.expr.case, up_schema, udf_registry);
-            plan.digest_only = d.digest_only and selectsStrings(d.expr, up_schema);
             return .{
                 .name = name,
                 .output_type = plan.output_type,
@@ -2663,7 +2522,6 @@ fn freeCasePlan(allocator: Allocator, plan: *CasePlan) void {
         plan.output.deinit(allocator);
         allocator.destroy(plan.output);
     }
-    plan.digests.deinit(allocator);
 }
 
 /// Recursively resolve an Expr into a CallPlan. The Expr must be a

@@ -538,9 +538,6 @@ pub const Params = struct {
     sync_teardown: bool = false,
     count_sketch: bool = true,
     having_bound: bool = true,
-    /// Group hashed keys by their bytes, the digest only placing them (see
-    /// `SiloCore.GroupRowsLayout.exact_key`); else the digest is the key.
-    exact_group_keys: bool = true,
     /// The hashed key digest's width (`SiloCore.RunConfig.key_digest_mask`).
     key_digest_bits: u8 = 128,
 };
@@ -616,7 +613,6 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .sync_teardown = getenv("THINDB_V2_SYNC_TEARDOWN") != null,
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
-        .exact_group_keys = if (getenv("THINDB_DIGEST_GROUP_KEYS")) |v| v[0] == 0 or v[0] == '0' else true,
         .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 128), 1), 128)),
     };
 }
@@ -891,10 +887,6 @@ fn runHarness(
             .udf_arg_input_indices = agg.udf_arg_input_indices,
         };
     }
-    // shape.hashed comes from the shape gate (string / >128-bit keys). The env
-    // toggle additionally forces an integer-key query down the same path for
-    // cross-checking against the exact integer-packed result.
-    const force_hash = shape.hashed or getenv("THINDB_V2_FORCE_HASH_KEY") != null;
     // Weighted collapse: decomposable programs (COUNT(*) / SUM / AVG / MIN /
     // MAX, string MIN / MAX included) ship (key, weight, pre-folded inputs)
     // staged rows — the scan emitter folds rows of a key already staged in
@@ -997,40 +989,36 @@ fn runHarness(
     for (shape.aggregate_program) |agg| {
         if (agg.is_concat) has_concat = true;
     }
-    const exact_keys = force_hash and params.exact_group_keys;
-    if (exact_keys) {
+    if (shape.hashed) {
         if (n_str_columns == group_str_columns_buf.len) return error.UnsupportedOperatorForType;
         group_str_columns_buf[n_str_columns] = .{ .source_name = group_key_columns_buf[0].name };
         n_str_columns += 1;
     }
     const group_rows_layout = SiloCore.GroupRowsLayout{
-        .key_width = if (force_hash) .u128 else harnessKeyWidth(shape.key_width),
+        .key_width = if (shape.hashed) .u128 else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..n_columns],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
         .str_columns = group_str_columns_buf[0..n_str_columns],
-        .has_str_payload = shape.string_aggregate_inputs.len > 0 or exact_keys,
-        .exact_key = exact_keys,
+        .has_str_payload = shape.string_aggregate_inputs.len > 0 or shape.hashed,
         .distinct_slot_count = distinct_slot_count,
         // GROUP_CONCAT carries per-row rowrefs (emission order) even under
-        // packed keys; only force_hash makes the key itself a hash.
-        .has_rowref = force_hash or has_concat,
-        .hashed_key = force_hash,
+        // packed keys; only shape.hashed makes the key itself a hash.
+        .has_rowref = shape.hashed or has_concat,
+        .hashed_key = shape.hashed,
         .has_concat = has_concat,
         .has_weight = weight_mode,
         .has_udf = has_udf,
     };
 
-    // Scan-side key digests: a string group key consumed only as hashed
-    // identity (its bytes come back via rowref late-mat) never materializes —
-    // the scan emits per-row `stringKeyDigest` values straight off the cached
-    // block, and the derived expressions' Compute passes them through.
+    // Scan-side key digests: a string group key nothing else reads takes its
+    // digests off the cached block (`SiloCore.RunConfig.hash_key_columns`).
     // Excluded when the column is also an aggregate input or read by a
     // derived expression or the residual filter (those need real bytes in
     // the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
-    if (force_hash) {
+    if (shape.hashed) {
         outer: for (shape.group_key_inputs) |input| {
             switch (input.source_type) {
                 .varchar, .string, .char, .json, .nested, .bitmap => {},
@@ -1049,32 +1037,6 @@ fn runHarness(
             if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, input.name)) continue :outer;
             hash_key_cols_buf[n_hash_keys] = input.name;
             n_hash_keys += 1;
-        }
-    }
-
-    // A string key a CASE derives by choosing among string columns and
-    // literals carries its rows' digests rather than their bytes (see
-    // `exec.Derived.digest_only`), and a column only such keys read, only
-    // as a result, arrives as digests too: neither ever materializes.
-    // Exact keys compare those bytes, so they keep them.
-    const marked_derived = if (force_hash and !exact_keys) try markDigestKeys(allocator, table, shape, derived, residual_filter) else null;
-    defer if (marked_derived) |m| allocator.free(m);
-    if (marked_derived) |marked| {
-        for (marked) |d| {
-            if (!d.digest_only) continue;
-            const cs = d.expr.case;
-            for (0..cs.branches.len + 1) |b| {
-                const result = if (b < cs.branches.len) cs.branches[b].then else cs.else_branch.?.*;
-                const name = switch (result) {
-                    .col_ref => |name| name,
-                    else => continue,
-                };
-                if (n_hash_keys == hash_key_cols_buf.len) break;
-                if (try digestResultHashes(allocator, shape, marked, residual_filter, hash_key_cols_buf[0..n_hash_keys], name)) {
-                    hash_key_cols_buf[n_hash_keys] = name;
-                    n_hash_keys += 1;
-                }
-            }
         }
     }
 
@@ -1124,7 +1086,7 @@ fn runHarness(
         .raw_batch_chunks = params.raw_batch_chunks,
         .group_rows_layout = group_rows_layout,
         .scan_columns = scan_columns,
-        .derived = marked_derived orelse derived,
+        .derived = derived,
         .udf_registry = udf_registry,
         .resources = resources,
         .filter_expr = filter_expr,
@@ -1208,7 +1170,6 @@ fn runCountSketch(
         defer heavy.deinit(allocator);
         heavy.floor = floor;
         heavy.input_rows = snapshotRows(cfg.snapshot);
-        heavy.exact_keys = cfg.group_rows_layout.exact_key;
         if ((cfg.filter_expr != null or cfg.computed_where != null) and rowBitsFit(allocator, cfg.snapshot, 1)) {
             heavy.row_slots = try count_topk_sketch.RowSlots.init(try exec.memory.workerAllocatorOf(allocator), cfg.snapshot.segments);
         }
@@ -1262,9 +1223,9 @@ fn countsRowsOnly(cfg: SiloCore.RunConfig) bool {
     if (cfg.filter_expr) |expr| {
         if (!exec.predicate.readsOnlyColumn(expr, layout.key_columns[0].name)) return false;
     }
-    // Exact keys carry the key's own bytes as the last string column, which
+    // Hashed keys carry the key's own bytes as the last string column, which
     // the segment ids, compared by bytes across segments, don't need.
-    if (layout.str_columns.len > @intFromBool(layout.exact_key) or layout.distinct_slot_count != 0) return false;
+    if (layout.str_columns.len > @intFromBool(layout.hashed_key) or layout.distinct_slot_count != 0) return false;
     for (layout.aggregates) |agg| {
         if (agg.op != .count_star or agg.is_distinct or agg.is_udf or agg.is_concat) return false;
     }
@@ -1416,70 +1377,6 @@ fn rankedCount(row: SiloCore.TopRow, rank: ?CountRank) u64 {
     return r.value(r.ctx, row);
 }
 
-/// `derived` with `digest_only` set on each string key of a hashed layout
-/// that a CASE derives by choosing among string columns and literals
-/// (`compute_op.selectsStrings`) and that nothing reads past its key: no
-/// aggregate, derived column or residual filter. Null when none is; else
-/// owned by the caller.
-fn markDigestKeys(
-    allocator: Allocator,
-    table: *api.Table,
-    shape: Shape,
-    derived: []const exec.Derived,
-    residual_filter: ?exec.PredicateExpr,
-) !?[]exec.Derived {
-    var marked: ?[]exec.Derived = null;
-    errdefer if (marked) |m| allocator.free(m);
-    outer: for (derived, 0..) |d, di| {
-        for (shape.group_key_inputs) |input| {
-            if (types.columnNameEql(input.name, d.name)) break;
-        } else continue;
-        if (types.findColumn(table.schema.columns, d.name) != null) continue;
-        if (!exec.compute_op.selectsStrings(d.expr, table.schema.columns)) continue;
-        for (shape.aggregate_inputs) |ai| {
-            if (types.columnNameEql(ai.source_name, d.name)) continue :outer;
-        }
-        for (shape.string_aggregate_inputs) |si| {
-            if (types.columnNameEql(si.source_name, d.name)) continue :outer;
-        }
-        for (derived) |other| {
-            if (try derivedReadsColumn(allocator, other, d.name)) continue :outer;
-        }
-        if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, d.name)) continue;
-        if (marked == null) marked = try allocator.dupe(exec.Derived, derived);
-        marked.?[di].digest_only = true;
-    }
-    return marked;
-}
-
-/// Whether the scan can send column `name`, a digest-only key's result
-/// (`markDigestKeys`), as key digests: only such keys read it, never in a
-/// condition, and no aggregate or residual filter does.
-fn digestResultHashes(
-    allocator: Allocator,
-    shape: Shape,
-    derived: []const exec.Derived,
-    residual_filter: ?exec.PredicateExpr,
-    hashed: []const []const u8,
-    name: []const u8,
-) !bool {
-    for (hashed) |h| {
-        if (types.columnNameEql(h, name)) return false;
-    }
-    for (shape.aggregate_inputs) |ai| {
-        if (types.columnNameEql(ai.source_name, name)) return false;
-    }
-    for (shape.string_aggregate_inputs) |si| {
-        if (types.columnNameEql(si.source_name, name)) return false;
-    }
-    if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, name)) return false;
-    for (derived) |d| {
-        if (!try derivedReadsColumn(allocator, d, name)) continue;
-        if (!d.digest_only or try exec.compute_op.caseConditionsRead(allocator, d.expr.case, name)) return false;
-    }
-    return true;
-}
-
 fn derivedReadsColumn(allocator: Allocator, d: exec.Derived, name: []const u8) !bool {
     var refs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer refs.deinit(allocator);
@@ -1597,14 +1494,14 @@ test "exact group keys still answer a COUNT top-K from segment string ids" {
         .aggregates = &count_star,
         .str_columns = &str_columns,
         .has_str_payload = true,
-        .exact_key = true,
         .has_rowref = true,
         .hashed_key = true,
     } };
     try std.testing.expect(countsRowsOnly(cfg));
     // The same column as a string aggregate's input is a payload the
     // per-value counts can't fold.
-    cfg.group_rows_layout.exact_key = false;
+    const with_payload = [_]SiloCore.GroupStrColumnSpec{ .{ .source_name = "s" }, .{ .source_name = "s" } };
+    cfg.group_rows_layout.str_columns = &with_payload;
     try std.testing.expect(!countsRowsOnly(cfg));
 }
 

@@ -4562,11 +4562,9 @@ fn ckText(col: anytype, row: usize) ![]const u8 {
     };
 }
 
-test "V2 group-topN: a CASE key choosing among string columns groups by its results' digests" {
-    // Such a key (ClickBench Q39's Src) never materializes while grouping:
-    // its rows carry their results' digests, a result column nothing else
-    // reads arrives as digests, and emit recomputes the key from rowrefs.
-    // The memtable's rows digest their bytes.
+test "V2 group-topN: a CASE key choosing among string columns groups by its results" {
+    // ClickBench Q39's Src, over dictionary-coded segment rows and the
+    // memtable's.
     const allocator = std.testing.allocator;
     const refs = [_][]const u8{ "", "http://a.example/", "http://b.example/x", "r3", "r4", "r5", "r6" };
     const urls = [_][]const u8{ "u0", "u1/a/longer/path", "u2", "u3", "u4" };
