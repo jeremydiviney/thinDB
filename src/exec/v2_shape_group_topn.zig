@@ -952,9 +952,11 @@ fn unorderedLimitCap(ctx: *const ExecutionContext) usize {
 
 // Rows the key pick reads looking for its groups, and the leading rows it
 // judges the picked keys' share on; past a 1/PICK_SHARE_DENOMINATOR share the
-// filtered aggregation saves little over the plain one.
+// filtered aggregation saves little over the plain one. The pick runs serially
+// before the parallel aggregation, so every sampled row is wall time; at the
+// bar, this many rows already hold about a thousand matches.
 const PICK_MAX_ROWS: usize = 1 << 20;
-const PICK_SAMPLE_ROWS: usize = 1 << 16;
+const PICK_SAMPLE_ROWS: usize = 1 << 13;
 const PICK_SHARE_DENOMINATOR: usize = 8;
 
 // Without ORDER BY or HAVING, any LIMIT+OFFSET groups answer the query, and a
