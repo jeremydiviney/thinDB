@@ -1133,3 +1133,23 @@ test "zonemap fallback: a name that doesn't resolve returns null with nothing le
         try std.testing.expect(z == null);
     }
 }
+
+test "zonemap pooled leading-key bound over many row groups, every integer-valued lead type" {
+    inline for (.{ .int, .date, .datetime, .decimal128 }) |lead| {
+        inline for (.{ false, true }) |desc| {
+            inline for (.{ 0, 5 }) |off| {
+                try runScenario(.{
+                    .lead_type = lead,
+                    .second_type = .string,
+                    .lead_desc = desc,
+                    .filter = 1,
+                    .n = 3,
+                    .offset = off,
+                    .flush_groups = &.{ 16, 16, 16, 16, 16, 16, 16, 16 },
+                    .memtable_rows = 2,
+                    .seed = 0xA0A0,
+                });
+            }
+        }
+    }
+}
