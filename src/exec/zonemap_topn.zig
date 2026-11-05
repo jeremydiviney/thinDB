@@ -136,6 +136,8 @@ pub const ZonemapTopN = struct {
     /// local K-th best is worse-or-equal to the global K-th best, so when ITS
     /// stop condition fires on the sorted claim order, the global condition
     /// holds for every later row group too — one shared flag stops everyone.
+    /// The workers also pool their kept rows' leading keys (`LeadPool`), a
+    /// global bound that usually fires the stop long before a private heap.
     dop: usize,
 
     /// Main candidate heap: receives the memtable rows and the merged
@@ -352,8 +354,9 @@ pub const ZonemapTopN = struct {
 
     /// Visit the sorted row-group list: workers claim entries off a shared
     /// atomic cursor, fold survivors into PRIVATE heaps, and any worker whose
-    /// local stop condition fires sets the shared stop flag (its threshold is
-    /// conservative w.r.t. the global one, so the proof carries). Per-worker
+    /// local or pooled (`LeadPool`) stop condition fires sets the shared stop
+    /// flag (either threshold is conservative w.r.t. the global one, so the
+    /// proof carries). Per-worker
     /// survivors then merge into the main heap. dop == 1 runs the same claim
     /// loop inline on the main heap — the serial reference behavior.
     fn visitRowGroups(self: *ZonemapTopN, refs: []const RgRef) !void {
@@ -381,6 +384,12 @@ pub const ZonemapTopN = struct {
             return zWorkerRun(&w);
         }
 
+        var pool: ?LeadPool = if (self.keep > 0 and self.keep <= LeadPool.MAX_KEEP)
+            try LeadPool.init(allocator, self.keep, self.key_desc[0])
+        else
+            null;
+        defer if (pool) |*p| p.deinit(allocator);
+
         const workers = try allocator.alloc(ZWorker, n_workers);
         defer allocator.free(workers);
         const heaps = try allocator.alloc(CandidateHeap, n_workers);
@@ -400,6 +409,7 @@ pub const ZonemapTopN = struct {
                 .refs = refs,
                 .next_ref = &next_ref,
                 .stop = &stop,
+                .pool = if (pool) |*p| p else null,
             };
         }
 
@@ -435,7 +445,7 @@ pub const ZonemapTopN = struct {
         for (src.key_cols, views) |kc, *v| v.* = kc.view();
         for (src.heap.items) |row| {
             @memset(rows, row);
-            try self.main.pushCandidate(.{ .views = views, .rows = rows }, src.loc_store.items[row]);
+            _ = try self.main.pushCandidate(.{ .views = views, .rows = rows }, src.loc_store.items[row]);
         }
     }
 
@@ -552,7 +562,7 @@ pub const ZonemapTopN = struct {
         for (mask, 0..) |keep, row| {
             if (!keep) continue;
             @memset(rows, row);
-            try self.main.pushCandidate(.{ .views = views, .rows = rows }, rowloc.packMemtable(row));
+            _ = try self.main.pushCandidate(.{ .views = views, .rows = rows }, rowloc.packMemtable(row));
         }
     }
 
@@ -577,6 +587,100 @@ pub const ZonemapTopN = struct {
     }
 };
 
+/// The leading-key values (`keyValueI128`) of rows the visit workers kept,
+/// pooled across workers in a bounded heap of the best `keep`. A worker's own
+/// heap sees only the row groups it claimed, so when few row groups hold
+/// qualifying rows no worker's K-th best gets good enough to stop the visit
+/// (Q27 at 16 workers visited ~100 of 1528 row groups where about 50 have a
+/// corner that can beat its answer). Each kept row is pooled once, so the
+/// pool's K-th best is reached by K distinct rows and no row sorting strictly
+/// after it on the leading key is in the global top-K.
+const LeadPool = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    /// Worst value at the root under the leading key's direction.
+    heap: std.ArrayListUnmanaged(i128),
+    keep: usize,
+    desc: bool,
+
+    /// The pool and each worker's batch hold up to `keep` values, so only a
+    /// `keep` this small pools.
+    const MAX_KEEP: usize = 1 << 14;
+
+    fn init(allocator: Allocator, keep: usize, desc: bool) !LeadPool {
+        return .{ .heap = try .initCapacity(allocator, keep), .keep = keep, .desc = desc };
+    }
+
+    fn deinit(self: *LeadPool, allocator: Allocator) void {
+        self.heap.deinit(allocator);
+    }
+
+    fn before(self: *const LeadPool, a: i128, b: i128) bool {
+        return if (self.desc) a > b else a < b;
+    }
+
+    /// The pooled K-th best, once `keep` values are pooled.
+    fn bound(self: *LeadPool) ?i128 {
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.lock.unlock();
+        return if (self.heap.items.len == self.keep) self.heap.items[0] else null;
+    }
+
+    /// Note a kept row's value in a worker's batch, trimmed to its best
+    /// `keep` whenever it doubles past that.
+    fn collect(self: *const LeadPool, allocator: Allocator, batch: *std.ArrayListUnmanaged(i128), value: i128) !void {
+        try batch.append(allocator, value);
+        if (batch.items.len >= 2 * self.keep) try self.trim(allocator, batch);
+    }
+
+    /// Pool a worker's batch and empty it.
+    fn add(self: *LeadPool, allocator: Allocator, batch: *std.ArrayListUnmanaged(i128)) !void {
+        defer batch.clearRetainingCapacity();
+        try self.trim(allocator, batch);
+        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.lock.unlock();
+        for (batch.items) |value| {
+            if (self.heap.items.len < self.keep) {
+                self.heap.appendAssumeCapacity(value);
+                self.siftUp(self.heap.items.len - 1);
+            } else if (self.before(value, self.heap.items[0])) {
+                self.heap.items[0] = value;
+                self.siftDown();
+            }
+        }
+    }
+
+    fn trim(self: *const LeadPool, allocator: Allocator, batch: *std.ArrayListUnmanaged(i128)) !void {
+        if (batch.items.len <= self.keep) return;
+        try exec.memory.sortRange(i128, batch.items, self.keep, self.keep, self, allocator, before);
+        batch.shrinkRetainingCapacity(self.keep);
+    }
+
+    fn siftUp(self: *LeadPool, start: usize) void {
+        const items = self.heap.items;
+        var idx = start;
+        while (idx > 0) {
+            const parent = (idx - 1) / 2;
+            if (!self.before(items[parent], items[idx])) break;
+            std.mem.swap(i128, &items[idx], &items[parent]);
+            idx = parent;
+        }
+    }
+
+    fn siftDown(self: *LeadPool) void {
+        const items = self.heap.items;
+        var idx: usize = 0;
+        while (true) {
+            var worst = idx;
+            for ([2]usize{ 2 * idx + 1, 2 * idx + 2 }) |child| {
+                if (child < items.len and self.before(items[worst], items[child])) worst = child;
+            }
+            if (worst == idx) break;
+            std.mem.swap(i128, &items[idx], &items[worst]);
+            idx = worst;
+        }
+    }
+};
+
 /// One worker of the parallel row-group visit: claims sorted refs off the
 /// shared cursor, folds survivors into a private heap, and raises the shared
 /// stop flag when its own (conservative) stop condition fires.
@@ -588,6 +692,7 @@ const ZWorker = struct {
     refs: []const RgRef,
     next_ref: *std.atomic.Value(usize),
     stop: *std.atomic.Value(bool),
+    pool: ?*LeadPool = null,
     err: ?anyerror = null,
 };
 
@@ -632,12 +737,15 @@ fn zWorkerRun(w: *ZWorker) !void {
         // Local stop: this worker's K-th best is worse-or-equal to the global
         // K-th best, so corner-worse-than-local implies corner-worse-than-
         // global — and the claim order is the sorted corner order, so every
-        // later row group is worse still. Stop everyone.
-        if (z.keep > 0 and w.ch.full() and w.ch.cornerWorseThanWorst(ref)) {
+        // later row group is worse still. Stop everyone. The pooled K-th best
+        // leading key bounds the global K-th best the same way.
+        const pooled: ?i128 = if (w.pool) |p| p.bound() else null;
+        const past_pool = if (pooled) |b| w.pool.?.before(b, z.cornerOf(ref)[0]) else false;
+        if (past_pool or (z.keep > 0 and w.ch.full() and w.ch.cornerWorseThanWorst(ref))) {
             w.stop.store(true, .release);
             break;
         }
-        try processSegmentRowGroup(z, allocator, w.ch, &scratch, &cache, ref);
+        try processSegmentRowGroup(z, allocator, w.ch, &scratch, &cache, ref, w.pool, pooled);
     }
 }
 
@@ -685,6 +793,9 @@ const ProbeScratch = struct {
     mask: std.ArrayListUnmanaged(bool) = .empty,
     pred_mask: std.ArrayListUnmanaged(bool) = .empty,
     entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    /// Leading-key values of the rows this row group added to the worker's
+    /// heap, for the `LeadPool`.
+    kept_leads: std.ArrayListUnmanaged(i128) = .empty,
     /// The row group's rows left after the WHERE, by position.
     kept_rows: std.ArrayListUnmanaged(u32) = .empty,
 
@@ -727,6 +838,7 @@ const ProbeScratch = struct {
         self.mask.deinit(allocator);
         self.pred_mask.deinit(allocator);
         self.entry_hits.deinit(allocator);
+        self.kept_leads.deinit(allocator);
         self.kept_rows.deinit(allocator);
     }
 };
@@ -744,7 +856,7 @@ const DictColumn = struct {
     entries: ColumnView,
 };
 
-fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, scratch: *ProbeScratch, cache: *SegCache, ref: RgRef) !void {
+fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *CandidateHeap, scratch: *ProbeScratch, cache: *SegCache, ref: RgRef, pool: ?*LeadPool, pooled: ?i128) !void {
     const seg = try cache.segment(z, allocator, ref.seg_idx);
 
     const rg_count = ref.row_count;
@@ -803,14 +915,21 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     };
     const key: KeyRef = .{ .views = scratch.key_views, .rows = scratch.key_rows };
     try scratch.kept_rows.resize(allocator, rg_count);
-    const kept_rows = scratch.kept_rows.items[0..simd.maskIndices(mask, scratch.kept_rows.items)];
+    var kept_rows = scratch.kept_rows.items[0..simd.maskIndices(mask, scratch.kept_rows.items)];
+    // Cut after the WHERE, not before it with the full heap's prefilter: a
+    // row group is visited only when its corner doesn't sort after the bound,
+    // so a cut over all its rows almost never empties it, and it would read
+    // the leading key of every row where the WHERE leaves a few.
+    if (pooled) |b| kept_rows = rowsNotPast(z, scratch.cols[lead], b, kept_rows);
     for (kept_rows) |row| {
         for (z.key_probe_idx, scratch.key_rows) |j, *kr| kr.* = switch (scratch.cols[j]) {
             .view => row,
             .dict => |d| d.db.rowCode(row),
         };
-        try ch.pushCandidate(key, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
+        const kept = try ch.pushCandidate(key, rowloc.packSegment(ref.seg_idx, ref.rg_idx, row));
+        if (pool) |p| if (kept) |value| try p.collect(allocator, &scratch.kept_leads, value);
     }
+    if (pool) |p| try p.add(allocator, &scratch.kept_leads);
 }
 
 /// Borrow probe column `j`'s block for this row group. A dictionary-coded
@@ -883,6 +1002,28 @@ fn leadKeyPrefilter(z: *const ZonemapTopN, allocator: Allocator, ch: *const Cand
                 m.* = transform.compareViewRowsNullsFirst(v, row, worst_view, worst) != after;
             },
         },
+    }
+}
+
+/// The rows of `rows` whose leading ORDER BY key doesn't sort strictly after
+/// `bound`, compacted in place. Only the integer-valued key types cut, whose
+/// values are their own `keyValueI128`; the heap judges the rest.
+fn rowsNotPast(z: *const ZonemapTopN, lead: ProbeColumn, bound: i128, rows: []u32) []u32 {
+    const view = switch (lead) {
+        .view => |v| v,
+        .dict => return rows,
+    };
+    switch (view.data) {
+        inline .tinyint, .smallint, .int, .bigint, .largeint, .date, .datetime, .decimal64, .decimal128 => |values| {
+            var n: usize = 0;
+            for (rows) |row| {
+                rows[n] = row;
+                const value: i128 = values[row];
+                n += @intFromBool(if (z.key_desc[0]) value >= bound else value <= bound);
+            }
+            return rows[0..n];
+        },
+        else => return rows,
     }
 }
 
@@ -1075,24 +1216,27 @@ const CandidateHeap = struct {
     /// Push one survivor (its ORDER BY key values + packed loc) into the bounded
     /// max-heap. Below `keep`: append + sift up. At capacity: if the candidate
     /// is NOT worse than the worst-kept (root), append it, replace the root with
-    /// it, sift down (the old root becomes a dead row); else drop.
-    fn pushCandidate(self: *CandidateHeap, key: KeyRef, loc: i64) !void {
-        if (self.z.keep == 0) return;
+    /// it, sift down (the old root becomes a dead row); else drop. Returns the
+    /// kept row's leading key as `keyValueI128`, null when it was dropped.
+    fn pushCandidate(self: *CandidateHeap, key: KeyRef, loc: i64) !?i128 {
+        if (self.z.keep == 0) return null;
 
         if (self.heap.items.len < self.z.keep) {
             const slot = try self.appendCandidateRow(key, loc);
             try self.heap.append(self.allocator, slot);
             self.siftUp(self.heap.items.len - 1);
-            return;
+            return keyValueI128(self.key_cols[0], slot);
         }
 
         const worst_row = self.heap.items[0];
-        if (self.candidateWorseThanRow(key, loc, worst_row)) return;
+        if (self.candidateWorseThanRow(key, loc, worst_row)) return null;
 
         const slot = try self.appendCandidateRow(key, loc);
+        const lead = keyValueI128(self.key_cols[0], slot);
         self.heap.items[0] = slot;
         self.siftDown(0);
         self.compactIfNeeded();
+        return lead;
     }
 
     /// Append the candidate's per-key values + loc as a fresh row; return its
@@ -1275,4 +1419,29 @@ test "predicateExcludesBlank accepts only provable non-blank conjuncts" {
     const conj = [_]PredicateExpr{ predicate.leafExpr("k", .gt, .{ .bigint = 5 }), blank };
     try t.expect(ZonemapTopN.predicateExcludesBlank(.{ .@"and" = &conj }, "s"));
     try t.expect(!ZonemapTopN.predicateExcludesBlank(.{ .@"or" = &conj }, "s"));
+}
+
+test "lead pool bounds at the K-th best value pooled, across batches and a mid-batch trim" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |desc| {
+        var pool = try LeadPool.init(allocator, 3, desc);
+        defer pool.deinit(allocator);
+        var batch: std.ArrayListUnmanaged(i128) = .empty;
+        defer batch.deinit(allocator);
+
+        try std.testing.expectEqual(@as(?i128, null), pool.bound());
+        for ([_]i128{ 50, 7 }) |v| try pool.collect(allocator, &batch, v);
+        try pool.add(allocator, &batch);
+        try std.testing.expectEqual(@as(?i128, null), pool.bound());
+        try std.testing.expectEqual(@as(usize, 0), batch.items.len);
+
+        // The batch trims to its best three at six values, before the last two arrive.
+        for ([_]i128{ 9, -4, 30, 12, 1, 99, -20, 5 }) |v| try pool.collect(allocator, &batch, v);
+        try pool.add(allocator, &batch);
+        try std.testing.expectEqual(@as(?i128, if (desc) 30 else 1), pool.bound());
+
+        try pool.collect(allocator, &batch, if (desc) 40 else -10);
+        try pool.add(allocator, &batch);
+        try std.testing.expectEqual(@as(?i128, if (desc) 40 else -4), pool.bound());
+    }
 }
