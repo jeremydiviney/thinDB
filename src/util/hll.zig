@@ -52,11 +52,25 @@ pub fn Sketch(comptime p: comptime_int) type {
         }
 
         pub fn estimate(self: *const Self) u64 {
-            var sum: f64 = 0;
+            // Each register's 2^-r is built from its bits (biased exponent
+            // 1023 - r over a zero mantissa) in vector lanes rather than
+            // divided out one by one: the per-query column stats estimate
+            // every column of the table, serially ahead of the workers.
+            const lanes = 16;
+            const Lanes = @Vector(lanes, u8);
+            var sums: @Vector(lanes, f64) = @splat(0);
             var zeros: usize = 0;
-            for (self.registers) |r| {
-                sum += 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(r)));
-                if (r == 0) zeros += 1;
+            var i: usize = 0;
+            while (i + lanes <= registers_len) : (i += lanes) {
+                const r: Lanes = self.registers[i..][0..lanes].*;
+                const exponent = @as(@Vector(lanes, u64), @splat(1023)) - @as(@Vector(lanes, u64), r);
+                sums += @as(@Vector(lanes, f64), @bitCast(exponent << @splat(52)));
+                zeros += @popCount(@as(u16, @bitCast(r == @as(Lanes, @splat(0)))));
+            }
+            var sum = @reduce(.Add, sums);
+            while (i < registers_len) : (i += 1) {
+                sum += 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(self.registers[i])));
+                if (self.registers[i] == 0) zeros += 1;
             }
             const mf: f64 = @floatFromInt(registers_len);
             const alpha = 0.7213 / (1.0 + 1.079 / mf);
@@ -114,6 +128,28 @@ test "hll: merge equals union (no error growth across sketches)" {
     while (j < 4500) : (j += 1) b.add(std.hash.Wyhash.hash(0, std.mem.asBytes(&j)));
     a.merge(&b);
     try std.testing.expect(approxEq(a.estimate(), 4500, 0.10));
+}
+
+test "hll: the estimate sums each register's 2^-r as the per-register formula does" {
+    var prng = std.Random.DefaultPrng.init(0x4E11);
+    const random = prng.random();
+    inline for (.{ 10, 12, 3 }) |p| {
+        const S = Sketch(p);
+        for ([_]u64{ 1, 40, 900, 20_000, 3_000_000 }) |n| {
+            var h: S = .{};
+            for (0..n) |_| h.add(random.int(u64));
+            var sum: f64 = 0;
+            var zeros: usize = 0;
+            for (h.registers) |r| {
+                sum += 1.0 / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(r)));
+                if (r == 0) zeros += 1;
+            }
+            const mf: f64 = @floatFromInt(h.registers.len);
+            var e = 0.7213 / (1.0 + 1.079 / mf) * mf * mf / sum;
+            if (e <= 2.5 * mf and zeros > 0) e = mf * @log(mf / @as(f64, @floatFromInt(zeros)));
+            try std.testing.expectEqual(@as(u64, @intFromFloat(@round(e))), h.estimate());
+        }
+    }
 }
 
 test "hll: empty sketch estimates zero" {
