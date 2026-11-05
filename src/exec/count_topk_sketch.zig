@@ -155,6 +155,12 @@ pub const CountSketch = struct {
         return slice;
     }
 
+    /// The fewest rows a tally by `workers` workers over `bits`-bit counters
+    /// must see for `settle` to pay (see tooFewToSettle).
+    pub fn settleMinRows(workers: u64, bits: u6) u64 {
+        return (workers << bits) / SETTLE_COUNTERS_PER_ROW;
+    }
+
     /// Whether the tally saw too few rows for `settle` to pay: its merge
     /// reads every counter of each worker that tallied, which costs more
     /// than grouping the rows the tally held.
@@ -165,7 +171,7 @@ pub const CountSketch = struct {
             rows += n;
             workers += @intFromBool(t);
         }
-        return rows * SETTLE_COUNTERS_PER_ROW < workers << self.bits;
+        return rows < settleMinRows(workers, self.bits);
     }
 
     /// Sum the workers' counters and pick the threshold for the `need` best
