@@ -3046,6 +3046,23 @@ pub const Scan = struct {
         seg.hintMisses(window[0..n], missed, self.table.cacheRef());
     }
 
+    /// Once row group `rg_idx`'s filter kept rows, hints every output
+    /// column block of it the cache lacks, so their reads overlap instead of
+    /// landing one at a time as each column is first read. A string read for
+    /// its lengths alone hints no bytes: the whole block would read them for
+    /// nothing, and the cache keeps that partial read apart from the block,
+    /// so a hot run's block hint would never find it held.
+    fn hintRowGroupColumns(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize) void {
+        var misses: [storage.cache.MissLog.CAPACITY]storage.cache.MissLog.Miss = undefined;
+        const n = @min(self.out_phys.len, misses.len);
+        for (self.out_phys[0..n], misses[0..n], 0..) |phys, *m, j| {
+            const measured = self.len_cols_by_j.len > j and self.len_cols_by_j[j];
+            m.* = .{ .column_idx = @intCast(phys), .read = if (measured and self.readsLengthsOnly(phys)) .no_bytes else .block };
+        }
+        const rgs = [1]u32{@intCast(rg_idx)};
+        seg.hintMisses(&rgs, misses[0..n], self.table.cacheRef());
+    }
+
     pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
         for (self.prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
@@ -4337,6 +4354,7 @@ pub const Scan = struct {
             return @as(usize, 0);
         }
 
+        self.hintRowGroupColumns(seg, rg_idx);
         const _tm = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
         const emitted = try self.materializeSurvivors(seg, rg_idx, rg_count, mask[0..rg_count]);
         if (exec.prof.enabled) {
