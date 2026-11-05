@@ -5696,6 +5696,49 @@ test "scan: an arm's matched rows are kept per row group, and a later scan shari
     try std.testing.expectEqualSlices(i64, &.{ 9, 30, 40 }, keys.items);
 }
 
+/// Whether a scan of `t` filtered by `expr` finds, from condition-cache
+/// records alone, fewer than `limit` rows passing it.
+fn conditionsPassFewerThan(allocator: std.mem.Allocator, t: *api.Table, expr: PredicateExpr, limit: u64) !bool {
+    var base = try scan(allocator, t);
+    defer base.deinit();
+    const scan_op = exec.queryAs(exec.Scan, base).?;
+    try std.testing.expect(try scan_op.tryFuseFilter(expr));
+    return scan_op.conditionsPassFewerThan(limit);
+}
+
+test "scan: condition-cache records bound the rows a filter passes from above" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const opened = try openMemoTable(allocator, tmp.dir, false);
+    defer opened.db.close();
+    const t = opened.t;
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+    const hit: PredicateExpr = .{ .like = .{ .col = "s", .pattern = "%hit%" } };
+
+    try std.testing.expect(!try conditionsPassFewerThan(allocator, t, hit, 100));
+    _ = try conditionScan(allocator, t, hit, &keys);
+    try std.testing.expect(try conditionsPassFewerThan(allocator, t, hit, 4));
+    try std.testing.expect(!try conditionsPassFewerThan(allocator, t, hit, 3));
+
+    // An AND is bounded by its kept arm; a numeric comparison keeps none.
+    const odd: PredicateExpr = .{ .leaf = .{ .col = "n", .op = .eq, .val = .{ .int = 10 } } };
+    const odd_and_hit = [_]PredicateExpr{ odd, hit };
+    try std.testing.expect(try conditionsPassFewerThan(allocator, t, .{ .@"and" = &odd_and_hit }, 4));
+    try std.testing.expect(!try conditionsPassFewerThan(allocator, t, odd, 100));
+
+    // Records count stored rows: a delete since leaves the bound as it was.
+    try std.testing.expectEqual(@as(usize, 1), try t.delete(.{ .col = "k", .op = .eq, .val = .{ .bigint = 29 } }));
+    try std.testing.expect(!try conditionsPassFewerThan(allocator, t, hit, 3));
+
+    // Unflushed rows have no records and count in full.
+    var more: [1]MemoRow = .{.{ .k = 40, .s = "x", .n = 0 }};
+    try t.insert(&more);
+    try std.testing.expect(!try conditionsPassFewerThan(allocator, t, hit, 4));
+    try std.testing.expect(try conditionsPassFewerThan(allocator, t, hit, 5));
+}
+
 test "scan: with the condition cache off no scan keeps or reuses an arm's rows, nor uses the predicate memo" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -11420,14 +11420,17 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const has_filter = cfg.filter_expr != null or cfg.residual_filter != null or cfg.computed_where != null;
     const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, wideKeys(group_rows_layout), has_filter));
     // A tally declines (counting nothing, so the sketch never settles) where
-    // the single pass is already cheap or the stats say it can't settle. It
-    // groups nothing itself, and a filter pass groups at most the rows it
+    // the single pass is already cheap, the stats say it can't settle, or
+    // the condition cache shows the filter leaves too few rows for it to
+    // settle: the tally would be a wasted pass ahead of grouping them all.
+    // It groups nothing itself, and a filter pass groups at most the rows it
     // keeps.
     if (cfg.count_sketch) |pass| {
         const large = !small_input and estimated_groups >= COUNT_SKETCH_MIN_GROUPS;
         const near_unique = large and nearUniqueKeyColumn(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns);
         const tally_declines = switch (pass) {
-            .tally, .heavy_tally => !large or near_unique,
+            .tally, .heavy_tally => !large or near_unique or
+                stats_scan.conditionsPassFewerThan(CountSketch.settleMinRows(n_workers, count_topk_sketch.DEFAULT_BITS)),
             .dup_tally => small_input,
             .filter, .heavy_filter, .dup_filter => false,
         };
