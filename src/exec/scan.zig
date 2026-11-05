@@ -6536,6 +6536,50 @@ pub const Scan = struct {
         return null;
     }
 
+    /// Whether the condition cache shows the fused filter passing fewer than
+    /// `limit` rows: the memtable's rows plus, per row group the hints leave,
+    /// the whole filter's recorded match count, else its fewest-matching
+    /// arm's. Counts are taken before tombstones, so they bound the rows from
+    /// above. False when such a row group has no record and isn't memoized
+    /// as unmatched.
+    pub fn conditionsPassFewerThan(self: *Scan, limit: u64) bool {
+        if (self.fused_filter == null) return false;
+        if (self.filter_memo == null) self.filter_memo = self.buildFilterMemo();
+        const memo = &self.filter_memo.?;
+        if (memo.cond_whole == null and memo.n_cond == 0) return false;
+        var rows: u64 = self.memtable_row_count;
+        if (rows >= limit) return false;
+        for (self.segs) |entry| {
+            const handle = self.table.acquireSegment(entry.segment_id) catch return false;
+            defer self.table.releaseSegment(handle);
+            for (handle.seg.info.row_groups, 0..) |rg, rg_idx| {
+                if (!self.rowGroupCanMatch(rg)) continue;
+                if (self.recordedMatches(memo, &handle.seg, rg_idx)) |matched| {
+                    rows += matched;
+                    if (rows >= limit) return false;
+                } else if (!self.memoSaysUnmatched(memo, &handle.seg, rg_idx)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn recordedMatches(self: *const Scan, memo: *const FilterMemo, seg: *const storage.ReadSegment, rg_idx: usize) ?usize {
+        const cache = self.table.cache;
+        if (memo.cond_whole) |whole| for ([_]storage.cache.Content{ .matched_rows, .matched_count }) |content| {
+            const e = cache.acquireDerived(self.conditionKey(seg, rg_idx, content, whole)) orelse continue;
+            defer cache.release(e);
+            return condition_cache.matchedRows(e.bytes);
+        };
+        var fewest: ?usize = null;
+        for (memo.cond[0..memo.n_cond]) |arm| {
+            const e = cache.acquireDerived(self.conditionKey(seg, rg_idx, .matched_rows, arm.digest)) orelse continue;
+            defer cache.release(e);
+            const matched = condition_cache.matchedRows(e.bytes);
+            fewest = if (fewest) |f| @min(f, matched) else matched;
+        }
+        return fewest;
+    }
+
     /// Keep `verdicts`, the filter's AND child `child` (0 for a filter that
     /// is no AND) evaluated over every stored row of row group `rg_idx`, in
     /// the condition cache, when the cache keeps that arm. Best effort: a
