@@ -1128,11 +1128,15 @@ fn prepareFinalRows(op: *GroupTopNPipeline, rows: []SiloCore.TopRow) !FinalRows 
 
 const MAX_HEAP_KEEP = 65536;
 
-// The best `keep` rows in order, with the page [start, start + limit) of them
-// returned. Orders compact entries, not rows: a TopRow is over 200 bytes, and
-// moving rows through a heap or sort took most of a large-LIMIT query (LIMIT
-// 10 OFFSET 5000000 over 17.6M groups: 67 s). The rows move once at the end.
+// The page [start, start + limit) of the best `keep` rows, in order; only the
+// page is sorted, so a deep OFFSET costs partition passes, not a sort of every
+// row before it. Orders compact entries, not rows: a TopRow is over 200 bytes,
+// and moving rows through a heap or sort took most of a large-LIMIT query
+// (LIMIT 10 OFFSET 5000000 over 17.6M groups: 67 s). The rows move once at
+// the end.
 fn rankedFinalRows(allocator: Allocator, keys: []const OrderKey, rows: []SiloCore.TopRow, keep: usize, start: usize, limit: usize) !FinalRows {
+    const end = limitEnd(start, keep, limit);
+    if (end == start) return .{ .allocator = allocator };
     const entries = try allocator.alloc(RankEntry, rows.len);
     defer allocator.free(entries);
     var exact = keys.len == 1;
@@ -1143,9 +1147,7 @@ fn rankedFinalRows(allocator: Allocator, keys: []const OrderKey, rows: []SiloCor
         entry.* = .{ .key = row.key, .prefix = prefix.value, .class = prefix.class, .row = @intCast(i) };
     }
     const order: RankOrder = .{ .rows = rows, .keys = keys, .prefix_decides = exact };
-    try exec.memory.sortPrefix(RankEntry, entries, keep, &order, allocator, RankOrder.before);
-    const end = limitEnd(start, keep, limit);
-    if (end == start) return .{ .allocator = allocator };
+    try exec.memory.sortRange(RankEntry, entries, start, end, &order, allocator, RankOrder.before);
     if ((end - start) * 2 < rows.len) {
         const page = try allocator.alloc(SiloCore.TopRow, end - start);
         for (page, entries[start..end]) |*dst, entry| dst.* = rows[entry.row];
