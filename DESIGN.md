@@ -1303,10 +1303,15 @@ database shares it. An embedder that leaves it unset keeps seed 0. The
 `XX_HASH3_*` SQL functions keep StarRocks' fixed seeds.
 
 **Exact group keys.** The V2 grouped engine hashes a string or
-wider-than-128-bit key (`GroupRowsLayout.hashed_key`) and decides its groups
-by its bytes: two keys share a group only if their bytes are equal, whatever
-their digests. The digest only places a key (its partition, bucket and hash
-slot); its bytes decide among the keys found there.
+wider-than-128-bit key (`GroupRowsLayout.hashed_key`) to a 64-bit digest and
+decides its groups by its bytes: two keys share a group only if their bytes
+are equal, whatever their digests. The digest only places a key (its
+partition, bucket and hash slot); its bytes decide among the keys found
+there. Sixty-four bits keep the staged key lane at 8 bytes and the hash slot
+at 16, half a 128-bit digest's; two of n keys share a digest about n² / 2⁶⁵
+of the time (once per ~3,700 queries of 100M groups), and a shared digest
+costs one more byte compare. A global COUNT(DISTINCT), which keeps no bytes,
+stays on 128 bits (above).
 
 - **Staging.** Each staged row carries its key's bytes as the last string
   column: a lone string key's bytes, or a
@@ -1337,8 +1342,8 @@ slot); its bytes decide among the keys found there.
   bounds every key in it from above, however many keys share its digest.
   HAVING itself reads the exact groups.
 
-`THINDB_V2_KEY_DIGEST_BITS` narrows the staged digest so that keys collide
-on purpose: tests check exact keys under real collisions with it. On
+`THINDB_V2_KEY_DIGEST_BITS` (1–64) narrows the staged digest so that keys
+collide on purpose: tests check exact keys under real collisions with it. On
 ClickBench on a c6a.4xlarge, exact keys cost about 5% of the hot sum (1.72 →
 1.80 s, 11-04), most of it Q40's CASE key, whose string bytes the dictionary
 collapse and the CASE copy before the staging copies them once more.

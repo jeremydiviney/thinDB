@@ -3800,7 +3800,7 @@ test "V2 COUNT top-K by segment string ids counts shared, local and absent value
         try std.testing.expect(try thindb.exec.segment_id_topk.run(allocator, .{ .table = t, .snapshot = snapshot, .column = "s", .need = 5, .workers = dop }, &rows));
         try std.testing.expectEqual(@as(usize, 5), rows.items.len);
         for (rows.items, want[0..5]) |row, w| {
-            try std.testing.expectEqual(thindb.exec.stringKeyDigest(w.s), row.key);
+            try std.testing.expectEqual(thindb.exec.stringKeyDigest(w.s) & std.math.maxInt(u64), row.key);
             try std.testing.expectEqual(@as(u64, @intCast(w.count)), row.count);
         }
 

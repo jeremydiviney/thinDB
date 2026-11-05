@@ -60,7 +60,7 @@ pub const Request = struct {
     /// The fewest rows a group needs to place at all.
     floor: u64 = 0,
     workers: usize,
-    key_digest_mask: u128 = std.math.maxInt(u128),
+    key_digest_mask: u64 = std.math.maxInt(u64),
 };
 
 /// Appends the top `need` values of the request's column by row count to

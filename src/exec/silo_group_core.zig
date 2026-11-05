@@ -54,8 +54,8 @@ const group_table = thindb.exec.group_table;
 const GroupTable = group_table.IntKeyMemsetTable(96);
 const WideGroupTable = group_table.IntKeyMemsetTable(128);
 
-/// A bucket's group table, at the slot width its keys need. A key wider than
-/// 96 bits, packed or a hashed key's digest, compares on all 128.
+/// A bucket's group table, at the slot width its keys need. A packed key
+/// wider than 96 bits compares on all 128.
 const BucketTable = union(enum) {
     narrow: GroupTable,
     wide: WideGroupTable,
@@ -882,7 +882,7 @@ pub const GroupRowsLayout = struct {
     // key values can be late-materialized at emit) and for GROUP_CONCAT
     // (per-item emission order). Dormant (region absent) otherwise.
     has_rowref: bool = false,
-    // The staged key is a 128-bit digest of the key columns rather than a
+    // The staged key is a 64-bit digest of the key columns rather than a
     // lossless bit-pack (string / >128-bit keys). The key's bytes ride as
     // the LAST str column (a lone string key's own bytes, else `ExactKey`'s
     // encoded parts), each group keeps the bytes it was created with, and a
@@ -2330,7 +2330,7 @@ const PipeShared = struct {
     /// Per-slot HAVING bounds the drains prune by once the scans settle them.
     slot_bound: ?*SlotBound = null,
     // See RunConfig.key_digest_mask.
-    key_digest_mask: u128 = std.math.maxInt(u128),
+    key_digest_mask: u64 = std.math.maxInt(u64),
 
     /// Every row sits in a group queue: scans are done, no raw chunk awaits
     /// a stage pass, and no stage builder holds a tail.
@@ -2820,7 +2820,7 @@ test "a deferred bucket fold keeps exact keys that share a digest apart, split i
             .input_rows_per_bucket = c.rows,
             .scan_threads = 1,
             .group_rows_layout = keyRefLayout(.{
-                .key_width = .u128,
+                .key_width = .u64,
                 .columns = &.{},
                 .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
                 .str_columns = &.{.{ .source_name = "k" }},
@@ -2855,7 +2855,7 @@ test "a deferred bucket fold keeps exact keys that share a digest apart, split i
         try source.resize(allocator, shared.group_rows_layout, c.rows);
         for (0..c.rows) |i| {
             const g = groupOf(i);
-            source.setKey(i, 5 | (@as(u128, g / 2) << 96));
+            source.setKey(i, 5 | (@as(u128, g / 2) << 32));
             source.rowrefAll()[i] = @intCast(i);
             var buf: [16]u8 = undefined;
             source.keyRefAll()[i] = if (g == 0) KeyRef.null_key else ref: {
@@ -2891,13 +2891,13 @@ test "a deferred bucket fold keeps exact keys that share a digest apart, split i
             const g = groupOf(@intCast(row.rowref));
             try std.testing.expect(!seen[g]);
             seen[g] = true;
-            try std.testing.expectEqual(5 | (@as(u128, g / 2) << 96), row.key);
+            try std.testing.expectEqual(5 | (@as(u128, g / 2) << 32), row.key);
             try std.testing.expectEqual(expected[g], row.count);
         }
         if (c.top_k != 0) {
             const last = top.rowAt(top.len - 1);
             for (expected, seen, 0..) |count, kept, g| {
-                const key = 5 | (@as(u128, g / 2) << 96);
+                const key = 5 | (@as(u128, g / 2) << 32);
                 if (count > last.count or (count == last.count and key < last.key)) try std.testing.expect(kept);
             }
         }
@@ -5191,8 +5191,8 @@ fn genericKeyFromViews(layout: GroupRowsLayout, key_views: []const thindb.storag
 // recomputed from bytes otherwise — so per-column digests compose identically
 // across mixed batch sources and with native int key columns. The actual key
 // values are recovered at emit via the row's carried __rowloc (late
-// materialization), so collisions — astronomically unlikely at 128 bits — are
-// the only correctness caveat.
+// materialization). The staged key keeps the digest's low 64 bits; exact
+// group keys (`GroupRowsLayout.hashed_key`) tell apart keys that share them.
 //
 // The per-column parts are packed into one buffer and digested in a single
 // pass (`stringKeyDigest` over the concatenation): streaming Wyhash fed the
@@ -6902,10 +6902,10 @@ fn groupChunkRowsDirect(
     const rowrefs: []const i64 = if (rows.layout.has_rowref) rows.rowrefAll()[0..n] else &.{};
     if (rows.layout.hashed_key) {
         const bank = key_bank orelse return error.UnsupportedOperatorForType;
-        if (rows.layout.key_width != .u128) return error.UnsupportedOperatorForType;
+        if (rows.layout.key_width != .u64) return error.UnsupportedOperatorForType;
         try bank.keys.ensureTotalCapacity(allocator, states.len - bank.base + n);
         switch (table.*) {
-            inline else => |*t| try groupChunkRowsExact(t, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, bank, &scratch.gids, allocator, rows.keyU128All()[0..n], rows, rowrefs),
+            inline else => |*t| try groupChunkRowsExact(t, states, str_states, concat_states, udf_states, udf_arena, str_arena, str_bank, distinct_sets, bank, &scratch.gids, allocator, rows.keyU64All()[0..n], rows, rowrefs),
         }
         return;
     }
@@ -7427,7 +7427,7 @@ fn groupChunkRowsExact(
     key_bank: *KeyBank,
     gids_buf: *std.ArrayListUnmanaged(u32),
     allocator: Allocator,
-    keys: []const u128,
+    keys: []const u64,
     rows: GroupRows,
     rowrefs: []const i64,
 ) !void {
@@ -7561,7 +7561,7 @@ inline fn sameKeyBytes(a: ?[]const u8, b: ?[]const u8) bool {
 
 test "exact group keys keep keys that share a digest in groups of their own" {
     const allocator = std.testing.allocator;
-    const Row = struct { digest: u128, key: ?[]const u8, weight: u32 = 1 };
+    const Row = struct { digest: u64, key: ?[]const u8, weight: u32 = 1 };
     // "a", "b", "" and NULL all share digest 7; "c" has its own.
     const chunks = [_][]const Row{
         &.{ .{ .digest = 7, .key = "a" }, .{ .digest = 7, .key = "b" }, .{ .digest = 7, .key = "b", .weight = 3 }, .{ .digest = 7, .key = "a" }, .{ .digest = 9, .key = "c" } },
@@ -7569,7 +7569,7 @@ test "exact group keys keep keys that share a digest in groups of their own" {
     };
     inline for (.{ false, true }) |weighted| {
         const layout: GroupRowsLayout = .{
-            .key_width = .u128,
+            .key_width = .u64,
             .columns = &.{},
             .aggregates = &.{.{ .op = .count_star, .state_index = 0 }},
             .str_columns = &.{.{ .source_name = "k" }},
@@ -10880,7 +10880,7 @@ pub const RunConfig = struct {
     /// Keeps only these bits of each hashed key's digest where a row takes
     /// its staged key, so keys collide as often as a digest this narrow
     /// collides: a test of exact group keys under real collisions.
-    key_digest_mask: u128 = std.math.maxInt(u128),
+    key_digest_mask: u64 = std.math.maxInt(u64),
     // Columns the derived expressions read only through `octet_length`,
     // which the worker scans emit as byte lengths (`Batch.byte_lengths`).
     byte_length_columns: []const []const u8 = &.{},
@@ -11013,12 +11013,12 @@ fn nearUniqueKeyColumn(total_rows: u64, stats: thindb.exec.PipelineStats, schema
     return false;
 }
 
-fn expectedTotalGroups(total_rows: u64, stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec, generic_key_width: GroupKeyWidth, generic_has_filter: bool) u64 {
+fn expectedTotalGroups(total_rows: u64, stats: thindb.exec.PipelineStats, schema: []const thindb.types.Column, key_columns: []const GroupKeyColumnSpec, wide_keys: bool, generic_has_filter: bool) u64 {
     const conservative_total = @max(@as(u64, 16), total_rows / 4);
     const generic_key_count = key_columns.len;
     const estimated_total = estimateGroupCountFromStats(stats, schema, key_columns) orelse conservative_total;
     const has_filter = generic_has_filter;
-    const generic_wide_no_filter = generic_key_count != 0 and !has_filter and (generic_key_width == .u96 or generic_key_width == .u128);
+    const generic_wide_no_filter = generic_key_count != 0 and !has_filter and wide_keys;
     const no_filter_near_unique = !has_filter and estimated_total * 4 >= total_rows * 3;
     // These are allocation hints, not exact cardinalities: column sketches
     // estimate marginal NDVs and compound keys may be correlated. Buckets
@@ -11034,6 +11034,12 @@ fn expectedTotalGroups(total_rows: u64, stats: thindb.exec.PipelineStats, schema
         @min(@min(estimated_total, conservative_total), filtered_init_cap)
     else
         @min(estimated_total, conservative_total);
+}
+
+/// Keys wider than 64 bits: packed on a u96 or u128 lane, or hashed (a string
+/// or wider-than-128-bit key, whatever its digest's width).
+fn wideKeys(layout: GroupRowsLayout) bool {
+    return layout.hashed_key or layout.key_width == .u96 or layout.key_width == .u128;
 }
 
 /// The most groups the aggregation can see when every key column carries an
@@ -11206,7 +11212,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     const serial_fold = n_workers == 1 and cfg.raw_group_mode == .staged_final;
     const set_bound = offeredSetGroupBound(cfg.offered_prunes.sets, group_rows_layout.key_columns);
     const has_filter = cfg.filter_expr != null or cfg.residual_filter != null or cfg.computed_where != null;
-    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, group_rows_layout.key_width, has_filter));
+    const estimated_groups = @min(set_bound, expectedTotalGroups(total, stats_scan.stats(), stats_scan.outputSchema(), group_rows_layout.key_columns, wideKeys(group_rows_layout), has_filter));
     // A tally declines (counting nothing, so the sketch never settles) where
     // the single pass is already cheap or the stats say it can't settle. It
     // groups nothing itself, and a filter pass groups at most the rows it
