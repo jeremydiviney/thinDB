@@ -325,3 +325,123 @@ test "exact group keys keep colliding values apart in the count top-K by segment
         try std.testing.expectEqual(@as(i64, @intCast(segment_count * rg_count * n)), result.get(result_key) orelse return error.TestExpectedEqual);
     }
 }
+
+const Q40Row = struct { id: i64, se: i32, ref: []const u8, url: []const u8 };
+
+fn cellText(view: thindb.storage.ColumnView, r: usize) ![]const u8 {
+    return switch (view.data) {
+        .string, .varchar => |sv| sv.rowBytes(r),
+        else => error.TestUnexpectedType,
+    };
+}
+
+test "exact group keys keep Q40-shaped groups apart under a 4-bit digest, a url staged from its codes or its bytes" {
+    // Integer keys beside string keys a CASE or a rename derives: a url
+    // read only as a key reaches the staging as its row groups' dictionary
+    // codes, and one a CASE also reads as its bytes. Four digest bits put
+    // the groups on 16 digests, so most share one with another group.
+    const allocator = std.testing.allocator;
+    const refs = [_][]const u8{ "", "http://a.example/", "http://b.example/x", "r3" };
+    const urls = [_][]const u8{ "u0", "u1/a/longer/path", "u2", "u3", "u4", "u5" };
+    var rows: [6000]Q40Row = undefined;
+    for (&rows, 0..) |*r, i| r.* = .{
+        .id = @intCast(i),
+        .se = @intCast(i / 5 % 3),
+        .ref = refs[i * 7 / 3 % refs.len],
+        .url = urls[i * 5 / 7 % urls.len],
+    };
+    const cases = [_]struct { sql: []const u8, src: *const fn (Q40Row) []const u8, keep: *const fn (Q40Row) bool }{
+        .{
+            .sql = "SELECT se, CASE WHEN se = 0 THEN ref ELSE '' END AS src, url AS dst, COUNT(*) AS c FROM q GROUP BY se, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: Q40Row) []const u8 {
+                    return if (r.se == 0) r.ref else "";
+                }
+            }.f,
+            .keep = struct {
+                fn f(_: Q40Row) bool {
+                    return true;
+                }
+            }.f,
+        },
+        .{
+            .sql = "SELECT se, CASE WHEN se = 1 THEN ref ELSE url END AS src, url AS dst, COUNT(*) AS c FROM q GROUP BY se, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: Q40Row) []const u8 {
+                    return if (r.se == 1) r.ref else r.url;
+                }
+            }.f,
+            .keep = struct {
+                fn f(_: Q40Row) bool {
+                    return true;
+                }
+            }.f,
+        },
+        .{
+            .sql = "SELECT se, ref AS src, url AS dst, COUNT(*) AS c FROM q WHERE id % 7 <> 3 GROUP BY se, src, dst ORDER BY c DESC LIMIT 100000",
+            .src = struct {
+                fn f(r: Q40Row) []const u8 {
+                    return r.ref;
+                }
+            }.f,
+            .keep = struct {
+                fn f(r: Q40Row) bool {
+                    return @mod(r.id, 7) != 3;
+                }
+            }.f,
+        },
+    };
+
+    setEnv("THINDB_V2_KEY_DIGEST_BITS", "4");
+    defer setEnv("THINDB_V2_KEY_DIGEST_BITS", "");
+    inline for (.{ @as(usize, 1), @as(usize, 4) }) |dop| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .max_dop = dop, .auto_flush_secs = 0 });
+        defer db.close();
+        const t = try db.table("q", .{
+            .columns = &.{
+                .{ .name = "id", .type = .bigint },
+                .{ .name = "se", .type = .int },
+                .{ .name = "ref", .type = .string },
+                .{ .name = "url", .type = .string },
+            },
+            .order_key = &.{"id"},
+            .unique = true,
+        }, .{ .order_key = &.{"id"}, .unique = true, .row_group_size = 1024 });
+        try t.insert(rows[0..5000]);
+        try t.flush();
+        try t.insert(rows[5000..]);
+
+        for (cases) |case| {
+            errdefer std.debug.print("dop {d}: {s}\n", .{ dop, case.sql });
+            var expected: std.StringHashMapUnmanaged(i64) = .empty;
+            defer freeResult(allocator, &expected);
+            for (rows) |r| {
+                if (!case.keep(r)) continue;
+                const key = try std.fmt.allocPrint(allocator, "{d}/{s}/{s}", .{ r.se, case.src(r), r.url });
+                const entry = expected.getOrPut(allocator, key) catch |err| {
+                    allocator.free(key);
+                    return err;
+                };
+                if (entry.found_existing) {
+                    allocator.free(key);
+                    entry.value_ptr.* += 1;
+                } else entry.value_ptr.* = 1;
+            }
+
+            var q = try runSql(allocator, db, case.sql);
+            defer q.deinit();
+            var seen: usize = 0;
+            while (try q.next()) |batch| {
+                for (0..batch.row_count) |r| {
+                    const key = try std.fmt.allocPrint(allocator, "{d}/{s}/{s}", .{ batch.values[0].data.int[r], try cellText(batch.values[1], r), try cellText(batch.values[2], r) });
+                    defer allocator.free(key);
+                    try std.testing.expectEqual(expected.get(key) orelse return error.TestUnexpectedResult, batch.values[3].data.bigint[r]);
+                    seen += 1;
+                }
+            }
+            try std.testing.expectEqual(expected.count(), seen);
+        }
+    }
+}
