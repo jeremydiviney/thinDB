@@ -1811,6 +1811,10 @@ pub const BlockDictColumn = struct {
     /// for zero), and `codes` is empty. The entry's row location, if the
     /// batch carries them, is one of those rows'.
     counts: ?[]const u32 = null,
+    /// The dictionary's bytes stay put until the scan is freed
+    /// (`Scan.setBlockDictPinned`), so a consumer may keep slices of them
+    /// past the batch.
+    pinned: bool = false,
 
     pub fn valueCount(self: BlockDictColumn) usize {
         return if (self.digests) |d| d.len else self.dict.rowCount();

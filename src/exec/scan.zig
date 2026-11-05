@@ -849,6 +849,9 @@ pub const Scan = struct {
     n_dicts: usize = 0,
     dict_bufs: []DictBuf = &.{},
     dict_slots: []?exec.BlockDictColumn = &.{},
+    /// The dictionary blocks a pinned column (`setBlockDictPinned`) moved
+    /// past, held until the scan is freed.
+    pinned_blocks: std.ArrayListUnmanaged(storage.ReadSegment.BorrowedBlock) = .empty,
     filtered_dicts: ?[]const ?exec.BlockDictColumn = null,
     /// LIKE over a dictionary block: one match flag per entry, and the
     /// entries' offsets when the block's can't be viewed in place.
@@ -884,6 +887,9 @@ pub const Scan = struct {
         counted: bool = false,
         /// The consumer takes the values' digests beside the values.
         digested: bool = false,
+        /// The consumer keeps slices of the dictionaries' values until the
+        /// scan is freed.
+        pinned: bool = false,
         entry_counts: std.ArrayListUnmanaged(u32) = .empty,
         entry_rows: std.ArrayListUnmanaged(u32) = .empty,
         entry_pass: std.ArrayListUnmanaged(bool) = .empty,
@@ -1680,6 +1686,23 @@ pub const Scan = struct {
         self.dict_bufs[j].digested = true;
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as kept
+    /// past its batches: each dictionary block it reads stays held until the
+    /// scan is freed (`BlockDictColumn.pinned`), so slices of its values
+    /// outlive the row group.
+    pub fn setBlockDictPinned(self: *Scan, j: usize) void {
+        self.dict_bufs[j].pinned = true;
+    }
+
+    /// Moves a pinned column's dictionary block out of `buf` into
+    /// `pinned_blocks` before `buf` takes another block.
+    fn keepPinnedBlock(self: *Scan, buf: *DictBuf) !void {
+        if (!buf.pinned or buf.held == null) return;
+        const block = buf.block orelse return;
+        try self.pinned_blocks.append(self.allocator, block);
+        buf.block = null;
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1726,6 +1749,7 @@ pub const Scan = struct {
             .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes },
             .digests = if (buf.digested) buf.heldDigests() else null,
             .every_value = every_value,
+            .pinned = buf.pinned,
         };
     }
 
@@ -1746,6 +1770,10 @@ pub const Scan = struct {
                 block.release(self.allocator, self.cacheRef());
                 return null;
             }
+            self.keepPinnedBlock(buf) catch |e| {
+                block.release(self.allocator, self.cacheRef());
+                return e;
+            };
             buf.releaseBlock(self.allocator, self.cacheRef());
             buf.block = block;
             const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
@@ -1831,7 +1859,7 @@ pub const Scan = struct {
         slots[0] = if (hashed)
             .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .counts = counts }
         else
-            .{ .codes = &.{}, .dict = dict, .digests = if (buf.digested) buf.heldDigests() else null, .counts = counts };
+            .{ .codes = &.{}, .dict = dict, .digests = if (buf.digested) buf.heldDigests() else null, .counts = counts, .pinned = buf.pinned };
         self.filtered_coded = null;
         self.filtered_hashed = null;
         self.filtered_lengths = null;
@@ -2067,6 +2095,10 @@ pub const Scan = struct {
             return false;
         };
         const buf = &self.dict_bufs[j];
+        self.keepPinnedBlock(buf) catch |e| {
+            block.release(self.allocator, self.cacheRef());
+            return e;
+        };
         buf.releaseBlock(self.allocator, self.cacheRef());
         buf.block = block;
         buf.raw = .{ .seg_idx = self.cur_seg_idx, .rg_idx = rg_idx, .view = view };
@@ -2213,6 +2245,8 @@ pub const Scan = struct {
         if (self.runs_slots.len > 0) self.allocator.free(self.runs_slots);
         for (self.dict_bufs) |*b| b.deinit(self.allocator, self.cacheRef());
         if (self.dict_bufs.len > 0) self.allocator.free(self.dict_bufs);
+        for (self.pinned_blocks.items) |*b| b.release(self.allocator, self.cacheRef());
+        self.pinned_blocks.deinit(self.allocator);
         if (self.dict_cols_by_j.len > 0) self.allocator.free(self.dict_cols_by_j);
         if (self.dict_slots.len > 0) self.allocator.free(self.dict_slots);
         self.dict_entry_hits.deinit(self.allocator);

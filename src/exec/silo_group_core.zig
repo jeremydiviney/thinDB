@@ -895,10 +895,12 @@ pub const GroupRowsLayout = struct {
     hashed_key: bool = false,
     // The program has GROUP_CONCAT aggregates: buckets maintain concat_states.
     has_concat: bool = false,
-    // A hashed key whose bytes a scan worker copies once into its
-    // `KeyArena`, each row carrying a `KeyRef` lane instead of a str column:
-    // a deferred grid holds every staged row until it folds, so the bytes
-    // stay put while the rows move.
+    // A hashed key staged as a `KeyRef` lane instead of a str column: a
+    // lone string key's bytes, else its `KeyRecord`. A string a pinned
+    // dictionary holds (`BlockDictColumn.pinned`) is referenced in place;
+    // any other is copied once into the scan worker's `KeyArena`. A
+    // deferred grid holds every staged row until it folds, so the bytes stay
+    // put while the rows move.
     key_refs: bool = false,
     // COUNT-only programs (no payload/str columns, no distinct): each staged
     // row carries a u32 weight, and the scan emitter collapses a run of
@@ -6244,8 +6246,14 @@ const ExactKey = struct {
     views: [MAX_GENERIC_GROUP_KEYS]ColumnView = undefined,
     strs: [MAX_GENERIC_GROUP_KEYS]?StringView = undefined,
     codes: [MAX_GENERIC_GROUP_KEYS]?[]const u32 = undefined,
+    /// A coded part's dictionary outlives the staged rows, so a KeyRef
+    /// (`stageRef`) takes its bytes in place.
+    pinned: [MAX_GENERIC_GROUP_KEYS]bool = @splat(false),
+    /// The string parts, at the front of a `KeyRecord`.
+    str_parts: usize = 0,
     /// Some part's codes land its rows' bytes far apart in its dictionary
-    /// (`prefetch`); ascending ones stream.
+    /// (`prefetch`); ascending ones stream, and a pinned one's bytes are
+    /// referenced rather than read.
     scattered: bool = false,
     /// A fixed-width part's values end to end, `widths[i]` bytes each.
     fixed: [MAX_GENERIC_GROUP_KEYS][]const u8 = undefined,
@@ -6265,8 +6273,12 @@ const ExactKey = struct {
             if (batch.block_dicts) |dicts| if (dicts[ci]) |d| if (d.holdsValues() and d.codes.len >= batch.row_count) {
                 key.strs[i] = d.dict;
                 key.codes[i] = d.codes;
-                if (!d.ascending) key.scattered = true;
+                key.pinned[i] = d.pinned;
+                if (!d.ascending and !d.pinned) key.scattered = true;
             };
+            // `KeyRecord.refsOf` counts the string parts by type.
+            if ((key.strs[i] != null) == isFixedKeyType(part.typ)) return error.TypeMismatch;
+            if (key.strs[i] != null) key.str_parts += 1;
             if (key.strs[i] == null) {
                 const fixed = fixedKeyPart(batch.values[ci], part.typ) orelse return error.TypeMismatch;
                 key.fixed[i] = fixed.bytes;
@@ -6285,6 +6297,7 @@ const ExactKey = struct {
     inline fn prefetch(self: *const ExactKey, r: usize) void {
         for (self.parts, 0..) |_, i| {
             const codes = self.codes[i] orelse continue;
+            if (self.pinned[i]) continue;
             const sv = self.strs[i].?;
             @prefetch(sv.bytes.ptr + sv.offsets[codes[r]], .{});
         }
@@ -6325,23 +6338,58 @@ const ExactKey = struct {
         store.refs[dst * cols + cols - 1] = .{ .off = @intCast(at), .len = @intCast(len) };
     }
 
-    /// Makes row `r`'s key staged row `dst`'s KeyRef, its bytes copied into
-    /// `arena`.
+    /// Makes row `r`'s key staged row `dst`'s KeyRef: a lone key's bytes,
+    /// else its `KeyRecord` in `arena`.
     fn stageRef(self: *const ExactKey, arena: *KeyArena, allocator: Allocator, refs: []KeyRef, dst: usize, r: usize) !void {
         if (self.lone()) {
-            if (self.parts[0].nullable and !self.views[0].isValid(r)) {
-                refs[dst] = KeyRef.null_key;
-                return;
-            }
-            const bytes = self.strBytes(0, r);
-            const held = try arena.take(allocator, bytes.len);
-            @memcpy(held, bytes);
-            refs[dst] = .of(held);
+            refs[dst] = try self.partRef(arena, allocator, 0, r);
             return;
         }
-        const held = try arena.take(allocator, self.encodedLen(r));
-        self.encode(held, r);
-        refs[dst] = .of(held);
+        const record = try arena.take(allocator, self.recordLen(r));
+        var s: usize = 0;
+        var at: usize = self.str_parts * @sizeOf(KeyRef);
+        for (self.parts, 0..) |part, i| {
+            if (self.strs[i] != null) {
+                const ref = try self.partRef(arena, allocator, i, r);
+                @memcpy(record[s * @sizeOf(KeyRef) ..][0..@sizeOf(KeyRef)], std.mem.asBytes(&ref));
+                s += 1;
+                continue;
+            }
+            if (part.nullable) {
+                const valid = self.views[i].isValid(r);
+                record[at] = @intFromBool(valid);
+                at += 1;
+                if (!valid) continue;
+            }
+            const bytes = self.fixedBytes(i, r);
+            @memcpy(record[at..][0..bytes.len], bytes);
+            at += bytes.len;
+        }
+        refs[dst] = .of(record);
+    }
+
+    /// Row `r`'s string part `i` as a KeyRef: in place in a pinned
+    /// dictionary, else copied into `arena`.
+    fn partRef(self: *const ExactKey, arena: *KeyArena, allocator: Allocator, i: usize, r: usize) !KeyRef {
+        if (self.parts[i].nullable and !self.views[i].isValid(r)) return KeyRef.null_key;
+        const bytes = self.strBytes(i, r);
+        if (self.pinned[i]) return .of(bytes);
+        const held = try arena.take(allocator, bytes.len);
+        @memcpy(held, bytes);
+        return .of(held);
+    }
+
+    fn recordLen(self: *const ExactKey, r: usize) usize {
+        var len = self.str_parts * @sizeOf(KeyRef);
+        for (self.parts, 0..) |part, i| {
+            if (self.strs[i] != null) continue;
+            if (part.nullable) {
+                len += 1;
+                if (!self.views[i].isValid(r)) continue;
+            }
+            len += self.widths[i];
+        }
+        return len;
     }
 
     /// Row `r`'s parts' encoding, `encodedLen(r)` bytes, into `out`.
@@ -6375,8 +6423,34 @@ const ExactKey = struct {
 
     /// Whether staged row `held` of `rows` holds row `r`'s key.
     fn heldIn(self: *const ExactKey, rows: *const RawRows, held: usize, r: usize) bool {
-        if (rows.layout.key_refs) return self.holds(rows.keyRefAll()[held].bytes(), r);
+        if (rows.layout.key_refs) return self.holdsRef(rows.keyRefAll()[held], r);
         return self.heldBy(&rows.str, rows.layout.str_columns.len, held, r);
+    }
+
+    /// Whether a KeyRef `stageRef` staged holds row `r`'s key.
+    fn holdsRef(self: *const ExactKey, ref: KeyRef, r: usize) bool {
+        if (self.lone()) return self.holds(ref.bytes(), r);
+        const record = ref.bytes() orelse return false;
+        var s: usize = 0;
+        var at: usize = self.str_parts * @sizeOf(KeyRef);
+        for (self.parts, 0..) |part, i| {
+            const valid = !part.nullable or self.views[i].isValid(r);
+            if (self.strs[i] != null) {
+                const held = KeyRecord.ref(record, s);
+                s += 1;
+                if (!sameKeyBytes(held.bytes(), if (valid) self.strBytes(i, r) else null)) return false;
+                continue;
+            }
+            if (part.nullable) {
+                if (record[at] != @intFromBool(valid)) return false;
+                at += 1;
+                if (!valid) continue;
+            }
+            const bytes = self.fixedBytes(i, r);
+            if (!std.mem.eql(u8, record[at..][0..bytes.len], bytes)) return false;
+            at += bytes.len;
+        }
+        return true;
     }
 
     /// Whether staged row `held` of `store` holds row `r`'s key.
@@ -6418,6 +6492,15 @@ const ExactKey = struct {
 };
 
 const FixedKeyPart = struct { bytes: []const u8, width: usize };
+
+/// The key part types `fixedKeyPart` reads; an exact key holds any other
+/// part as a string.
+fn isFixedKeyType(typ: thindb.types.Type) bool {
+    return switch (typ) {
+        .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => true,
+        else => false,
+    };
+}
 
 /// A fixed-width key column's values as bytes, for the views
 /// `readGenericKeyBits` reads under `typ`.
@@ -6481,8 +6564,8 @@ const KeyBank = struct {
     }
 };
 
-/// A staged exact key's bytes in a scan worker's `KeyArena` (see
-/// `GroupRowsLayout.key_refs`), or a NULL key.
+/// A staged exact key's bytes (see `GroupRowsLayout.key_refs`), in a scan
+/// worker's `KeyArena` or a pinned dictionary, or a NULL key.
 const KeyRef = extern struct {
     // 16 bytes on every target: a stage lane moves it as a u128.
     ptr: [*]const u8 align(16),
@@ -6497,6 +6580,38 @@ const KeyRef = extern struct {
 
     inline fn bytes(self: KeyRef) ?[]const u8 {
         return if (self.valid != 0) self.ptr[0..self.len] else null;
+    }
+};
+
+/// A staged exact key under `GroupRowsLayout.key_refs` other than a lone
+/// string: each string part's KeyRef (unaligned) at the front, in part
+/// order, then the other parts as `ExactKey.encode` lays them out. Equal
+/// strings may sit in different places, so records compare by their
+/// strings' bytes.
+const KeyRecord = struct {
+    /// The string KeyRefs at the front of `layout`'s staged records, or
+    /// null when its staged keys compare byte for byte.
+    fn refsOf(layout: GroupRowsLayout) ?usize {
+        if (!layout.key_refs) return null;
+        const parts = layout.key_columns;
+        if (parts.len == 1 and !isFixedKeyType(parts[0].typ)) return null;
+        var n: usize = 0;
+        for (parts) |part| n += @intFromBool(!isFixedKeyType(part.typ));
+        return n;
+    }
+
+    inline fn ref(record: []const u8, s: usize) KeyRef {
+        return std.mem.bytesToValue(KeyRef, record[s * @sizeOf(KeyRef) ..][0..@sizeOf(KeyRef)]);
+    }
+
+    fn eql(refs: usize, a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        const at = refs * @sizeOf(KeyRef);
+        if (!std.mem.eql(u8, a[at..], b[at..])) return false;
+        for (0..refs) |s| {
+            if (!sameKeyBytes(ref(a, s).bytes(), ref(b, s).bytes())) return false;
+        }
+        return true;
     }
 };
 
@@ -6528,16 +6643,17 @@ const KeyArena = struct {
 };
 
 /// A group whose key bytes in `bank` (from gid `base`) are `bytes` (or
-/// NULL when not `valid`), for getOrPutMatching.
+/// NULL when not `valid`), for getOrPutMatching. Records
+/// (`KeyRecord.refsOf`) compare by their strings.
 const GroupKeyMatch = struct {
     bank: []const ?[]const u8,
     base: u32,
     bytes: []const u8,
     valid: bool,
+    record_refs: ?usize,
 
     pub inline fn matches(self: GroupKeyMatch, gid: u32) bool {
-        const held = self.bank[gid - self.base] orelse return !self.valid;
-        return self.valid and std.mem.eql(u8, held, self.bytes);
+        return sameExactKey(self.record_refs, self.bank[gid - self.base], if (self.valid) self.bytes else null);
     }
 };
 
@@ -7485,6 +7601,7 @@ fn groupChunkRowsExact(
     const mark_new = kernels and has_extreme;
     try gids_buf.resize(allocator, n);
     const gids = gids_buf.items[0..n];
+    const record_refs = KeyRecord.refsOf(rows.layout);
 
     const prefetch = prefetchesSlots(table);
     var r: usize = 0;
@@ -7497,14 +7614,14 @@ fn groupChunkRowsExact(
         const valid = held != null;
         const bytes = held orelse "";
         var run_end = r + 1;
-        while (run_end < n and keys[run_end] == key and sameKeyBytes(exactKeyBytes(rows, run_end), held)) run_end += 1;
+        while (run_end < n and keys[run_end] == key and sameExactKey(record_refs, exactKeyBytes(rows, run_end), held)) run_end += 1;
         const run_len: u64 = if (weights.len != 0) blk: {
             var sum: u64 = 0;
             for (weights[r..run_end]) |w| sum += w;
             break :blk sum;
         } else @intCast(run_end - r);
 
-        const probe = table.getOrPutMatching(@TypeOf(table.*).hashKey(key), key, GroupKeyMatch{ .bank = key_bank.keys.items, .base = key_bank.base, .bytes = bytes, .valid = valid });
+        const probe = table.getOrPutMatching(@TypeOf(table.*).hashKey(key), key, GroupKeyMatch{ .bank = key_bank.keys.items, .base = key_bank.base, .bytes = bytes, .valid = valid, .record_refs = record_refs });
         var gid: u32 = probe.gid;
         var tagged: u32 = probe.gid;
         // The per-row program's first row initializes a new group's record.
@@ -7578,6 +7695,15 @@ inline fn sameKeyBytes(a: ?[]const u8, b: ?[]const u8) bool {
     const x = a orelse return b == null;
     const y = b orelse return false;
     return std.mem.eql(u8, x, y);
+}
+
+/// Whether two staged exact keys match: `KeyRecord`s when `record_refs`
+/// counts their strings, else bytes.
+inline fn sameExactKey(record_refs: ?usize, a: ?[]const u8, b: ?[]const u8) bool {
+    const refs = record_refs orelse return sameKeyBytes(a, b);
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return KeyRecord.eql(refs, x, y);
 }
 
 test "exact group keys keep keys that share a digest in groups of their own" {
@@ -7673,6 +7799,57 @@ test "an exact key's staged bytes hold another row's key only when every part ma
         } else {
             try std.testing.expectEqualStrings("ab", store.get(1, 0, 0));
             try std.testing.expect(store.isNull(1, 4, 0));
+        }
+    }
+}
+
+test "an exact key's KeyRefs take a pinned dictionary's bytes in place and match across dictionaries" {
+    const allocator = std.testing.allocator;
+    const schema = [_]thindb.types.Column{
+        .{ .name = "s", .type = .{ .varchar = 16 } },
+        .{ .name = "g", .type = .bigint, .nullable = true },
+    };
+    // Two row groups' dictionaries hold "ab" and "c" in different places;
+    // either's rows are ("ab", 1), ("c", 1) and ("ab", NULL).
+    const dict_a: storage_mod.StringView = .{ .offsets = &.{ 0, 2, 3 }, .bytes = "abc" };
+    const dict_b: storage_mod.StringView = .{ .offsets = &.{ 0, 1, 3 }, .bytes = "cab" };
+    const g_valid = [_]u8{0b011};
+    const views = [_]ColumnView{
+        .{ .data = .{ .varchar = .{ .offsets = &.{ 0, 0, 0, 0 }, .bytes = "" } } },
+        .{ .data = .{ .bigint = &.{ 1, 1, 1 } }, .nulls = &g_valid },
+    };
+    const s_part: GroupKeyColumnSpec = .{ .name = "s", .typ = .{ .varchar = 16 }, .offset_bits = 0, .width_bits = 128 };
+    const g_part: GroupKeyColumnSpec = .{ .name = "g", .typ = .bigint, .offset_bits = 0, .width_bits = 64, .nullable = true };
+    inline for (.{ true, false }) |pinned| {
+        const dicts_a = [_]?thindb.exec.BlockDictColumn{ .{ .codes = &.{ 0, 1, 0 }, .dict = dict_a, .pinned = pinned }, null };
+        const dicts_b = [_]?thindb.exec.BlockDictColumn{ .{ .codes = &.{ 1, 0, 1 }, .dict = dict_b, .pinned = pinned }, null };
+        const batch_a: thindb.Batch = .{ .schema = &schema, .values = &views, .row_count = 3, .block_dicts = &dicts_a };
+        const batch_b: thindb.Batch = .{ .schema = &schema, .values = &views, .row_count = 3, .block_dicts = &dicts_b };
+        inline for (.{ &[_]GroupKeyColumnSpec{ s_part, g_part }, &[_]GroupKeyColumnSpec{s_part} }) |parts| {
+            const layout: GroupRowsLayout = .{ .key_columns = parts, .hashed_key = true, .key_refs = true };
+            const key_a = try ExactKey.of(layout, batch_a);
+            const key_b = try ExactKey.of(layout, batch_b);
+            var arena: KeyArena = .{};
+            defer arena.deinit(allocator);
+            var refs: [6]KeyRef = undefined;
+            for (0..3) |r| {
+                try key_a.stageRef(&arena, allocator, &refs, r, r);
+                try key_b.stageRef(&arena, allocator, &refs, 3 + r, r);
+            }
+            const record_refs = KeyRecord.refsOf(layout);
+            const ab = if (record_refs == null) refs[0] else KeyRecord.ref(refs[0].bytes().?, 0);
+            try std.testing.expectEqualStrings("ab", ab.bytes().?);
+            try std.testing.expectEqual(pinned, ab.ptr == dict_a.bytes.ptr);
+            for (0..3) |r| {
+                try std.testing.expect(sameExactKey(record_refs, refs[r].bytes(), refs[3 + r].bytes()));
+                try std.testing.expect(key_a.holdsRef(refs[3 + r], r));
+                try std.testing.expect(key_b.holdsRef(refs[r], r));
+            }
+            try std.testing.expect(!sameExactKey(record_refs, refs[0].bytes(), refs[4].bytes()));
+            try std.testing.expect(!key_a.holdsRef(refs[4], 0));
+            // Only the g part tells ("ab", 1) from ("ab", NULL).
+            try std.testing.expectEqual(parts.len == 1, sameExactKey(record_refs, refs[0].bytes(), refs[5].bytes()));
+            try std.testing.expectEqual(parts.len == 1, key_b.holdsRef(refs[0], 2));
         }
     }
 }
@@ -8421,7 +8598,7 @@ const GridDictEval = struct {
             // A hashed key's value column stays the scan's placeholder, as
             // a coded one's does.
             if (coded) {
-                self.dicts[j] = .{ .codes = codes.items, .dict = d.dict };
+                self.dicts[j] = .{ .codes = codes.items, .dict = d.dict, .pinned = d.pinned };
                 any_dicts = true;
             } else if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
@@ -8476,7 +8653,7 @@ const GridDictEval = struct {
                 any_hashed = true;
             }
             if (coded) {
-                self.dicts[j] = .{ .codes = codes, .dict = d.dict };
+                self.dicts[j] = .{ .codes = codes, .dict = d.dict, .pinned = d.pinned };
                 any_dicts = true;
             } else if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
@@ -8618,15 +8795,16 @@ const GridDictEval = struct {
         // A hashed key's value column is the scan's empty placeholder; else
         // a contiguous run of used codes is a slice of the dictionary itself,
         // and a gapped one copies just the used values. An exact key's
-        // staging copies its bytes from the dictionary (`ExactKey.of`), so
-        // a gapped run passes its codes instead, unless a derived column,
-        // whose evaluation drops the dictionary, reads the values.
+        // staging reads its bytes through the dictionary (`ExactKey.of`), so
+        // a gapped run passes its codes instead, as does any run of a pinned
+        // dictionary, whose bytes a KeyRef keeps in place, unless a derived
+        // column, whose evaluation drops the dictionary, reads the values.
         const dict = column.dict;
         var values: storage_mod.StringView = undefined;
         var through = false;
         if (!column.holdsValues()) {
             values = .{ .offsets = raw_values.offsets[0 .. used + 1], .bytes = raw_values.bytes };
-        } else if (used == hi - lo) {
+        } else if (used == hi - lo and !(column.pinned and column.digests != null and self.compute == null)) {
             values = .{ .offsets = dict.offsets[lo .. hi + 1], .bytes = dict.bytes };
         } else if (column.digests != null and self.compute == null) {
             self.used_codes.clearRetainingCapacity();
@@ -8670,7 +8848,7 @@ const GridDictEval = struct {
         } else null;
         const dicts: ?[]const ?thindb.exec.BlockDictColumn = if (through) blk: {
             @memset(self.dicts, null);
-            self.dicts[column_index] = .{ .codes = self.used_codes.items, .dict = dict, .ascending = true };
+            self.dicts[column_index] = .{ .codes = self.used_codes.items, .dict = dict, .ascending = true, .pinned = column.pinned };
             break :blk self.dicts;
         } else null;
         return .{ .schema = raw.schema, .values = self.views, .row_count = used, .hashed = hashed, .block_dicts = dicts };
@@ -11761,11 +11939,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         // the scan's per-entry counts, where the scan can count them.
         const counted = source.len == 1 and source.n_pre == 0 and n_partials == 0;
         for (scans[0..n_workers]) |sc| {
-            for (source.columns[0..source.strings]) |j| {
+            for (source.columns[0..source.strings], 0..) |j, m| {
                 const at = sc.blockDictColumnIndex(scan_schema[j].name).?;
                 try sc.setBlockDictColumn(at);
                 if (counted) sc.setBlockDictCounted(at);
                 if (layout.hashed_key and nameListed(cfg.hash_key_columns, scan_schema[j].name)) sc.setBlockDictDigests(at);
+                // A staged KeyRef keeps a coded key's bytes in place.
+                if (staged_layout.key_refs and source.keyOnly(m)) sc.setBlockDictPinned(at);
             }
         }
         kept = true;
