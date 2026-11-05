@@ -172,6 +172,8 @@ test "a part table a heavy part grew shrinks back before a small part's fold" {
 /// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
 const RGS_PER_GRID_WORKER: usize = 2;
 const PREFETCH_DIST_BUCKET: usize = 32;
+/// Rows ahead the staging fetches an exact key's coded bytes (`ExactKey.prefetch`).
+const KEY_PREFETCH_ROWS: usize = 8;
 // A table smaller than this stays in the core's cache, so a look-ahead
 // prefetch would cost a second key hash per row and hide no miss.
 const PREFETCH_MIN_TABLE_BYTES: usize = 256 * 1024;
@@ -5410,6 +5412,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 accepted += 1;
             }
         } else while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
+            if (exact) |*ek| if (r + KEY_PREFETCH_ROWS < batch.row_count) ek.prefetch(r + KEY_PREFETCH_ROWS);
             const key = if (hashed_ids) |ids| ids[r] & shared.key_digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             // Weighted collapse (decomposable programs): a key already staged
@@ -6269,6 +6272,16 @@ const ExactKey = struct {
 
     inline fn lone(self: *const ExactKey) bool {
         return self.parts.len == 1 and self.strs[0] != null;
+    }
+
+    /// Starts fetching row `r`'s coded parts' bytes: their codes land them
+    /// far apart in their dictionaries.
+    inline fn prefetch(self: *const ExactKey, r: usize) void {
+        for (self.parts, 0..) |_, i| {
+            const codes = self.codes[i] orelse continue;
+            const sv = self.strs[i].?;
+            @prefetch(sv.bytes.ptr + sv.offsets[codes[r]], .{});
+        }
     }
 
     inline fn strBytes(self: *const ExactKey, i: usize, r: usize) []const u8 {
@@ -8189,12 +8202,12 @@ const GridDictEval = struct {
     row_ids: std.ArrayListUnmanaged(u32) = .empty,
     tuple_values: std.ArrayListUnmanaged(u64) = .empty,
     tuple_rows: std.ArrayListUnmanaged(u32) = .empty,
-    tuple_codes: std.ArrayListUnmanaged(u32) = .empty,
     tuple_slots: std.ArrayListUnmanaged(u32) = .empty,
     /// Per source column, its values in the collapsed (or materialized)
-    /// batch, and a hashed key's digests.
+    /// batch, a hashed key's digests, and a string column's codes there.
     stores: [MAX_DICT_EVAL_COLUMNS]?ColumnStore = @splat(null),
     source_digests: [MAX_DICT_EVAL_COLUMNS]std.ArrayListUnmanaged(u128) = @splat(.empty),
+    source_codes: [MAX_DICT_EVAL_COLUMNS]std.ArrayListUnmanaged(u32) = @splat(.empty),
     /// After a collapse that kept most rows, the batches left to evaluate
     /// row by row, and the wait after the next such collapse (doubling).
     skip_batches: u32 = 0,
@@ -8222,10 +8235,10 @@ const GridDictEval = struct {
         self.row_ids.deinit(allocator);
         self.tuple_values.deinit(allocator);
         self.tuple_rows.deinit(allocator);
-        self.tuple_codes.deinit(allocator);
         self.tuple_slots.deinit(allocator);
         for (&self.stores) |*st| if (st.*) |*s| s.deinit(allocator);
         for (&self.source_digests) |*d| d.deinit(allocator);
+        for (&self.source_codes) |*c| c.deinit(allocator);
     }
 
     fn next(self: *GridDictEval, scan: *Scan, allocator: Allocator) !?thindb.Batch {
@@ -8374,7 +8387,9 @@ const GridDictEval = struct {
         for (self.partials) |*p| try p.accumulate(allocator, raw.values[p.column], ids, n);
         try self.spanViews(allocator, raw, n);
         @memset(self.hashed, null);
+        @memset(self.dicts, null);
         var any_hashed = false;
+        var any_dicts = false;
         for (self.source.slice(), 0..) |j, m| {
             if (m >= self.source.strings) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
@@ -8383,19 +8398,29 @@ const GridDictEval = struct {
                 continue;
             }
             const d = dicts[j].?;
-            try self.tuple_codes.resize(allocator, n);
-            for (self.tuple_codes.items, first_rows) |*c, r| c.* = d.codes[r];
-            if (d.digests) |ds| {
+            const codes = &self.source_codes[m];
+            try codes.resize(allocator, n);
+            for (codes.items, first_rows) |*c, r| c.* = d.codes[r];
+            const coded = self.source.keyOnly(m) and d.holdsValues();
+            if (d.digests != null or coded) {
                 const out = &self.source_digests[m];
                 try out.resize(allocator, n);
-                for (out.items, self.tuple_codes.items) |*o, c| o.* = ds[c];
+                if (d.digests) |ds| {
+                    for (out.items, codes.items) |*o, c| o.* = ds[c];
+                } else {
+                    for (out.items, codes.items) |*o, c| o.* = thindb.exec.stringKeyDigest(d.dict.rowBytes(c));
+                }
                 self.hashed[j] = out.items;
                 any_hashed = true;
             }
-            // A hashed key's value column stays the scan's placeholder.
-            if (d.holdsValues()) {
+            // A hashed key's value column stays the scan's placeholder, as
+            // a coded one's does.
+            if (coded) {
+                self.dicts[j] = .{ .codes = codes.items, .dict = d.dict };
+                any_dicts = true;
+            } else if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
-                try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), self.tuple_codes.items, store);
+                try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), codes.items, store);
                 self.views[j] = store.view();
             }
         }
@@ -8411,16 +8436,19 @@ const GridDictEval = struct {
             self.views[p.column] = view;
             self.partial_views[p.layout_column] = view;
         }
-        return .{ .schema = raw.schema, .values = self.views, .row_count = n, .hashed = if (any_hashed) self.hashed else null };
+        return .{ .schema = raw.schema, .values = self.views, .row_count = n, .hashed = if (any_hashed) self.hashed else null, .block_dicts = if (any_dicts) self.dicts else null };
     }
 
     /// `raw` with its dictionary-coded source columns as per-row values (a
-    /// hashed key's as per-row digests), for evaluation row by row.
+    /// hashed key's as per-row digests, a coded key's as its codes and
+    /// digests), for evaluation row by row.
     fn materialize(self: *GridDictEval, allocator: Allocator, raw: thindb.Batch, dicts: []const ?thindb.exec.BlockDictColumn) !thindb.Batch {
         try self.ensureViews(allocator, raw.values.len);
         @memcpy(self.views, raw.values);
         @memset(self.hashed, null);
+        @memset(self.dicts, null);
         var any_hashed = false;
+        var any_dicts = false;
         if (raw.hashed) |hs| {
             @memcpy(self.hashed[0..hs.len], hs);
             any_hashed = true;
@@ -8428,14 +8456,24 @@ const GridDictEval = struct {
         for (self.source.columns[0..self.source.strings], 0..) |j, m| {
             const d = dicts[j] orelse continue;
             const codes = d.codes[0..raw.row_count];
-            if (d.digests) |ds| {
+            const coded = self.source.keyOnly(m) and d.holdsValues();
+            if (d.digests != null or coded) {
                 const out = &self.source_digests[m];
                 try out.resize(allocator, codes.len);
-                for (out.items, codes) |*o, c| o.* = ds[c];
+                if (d.digests) |ds| {
+                    for (out.items, codes) |*o, c| o.* = ds[c];
+                } else {
+                    for (out.items, codes, 0..) |*o, c, r| {
+                        o.* = if (r > 0 and c == codes[r - 1]) out.items[r - 1] else thindb.exec.stringKeyDigest(d.dict.rowBytes(c));
+                    }
+                }
                 self.hashed[j] = out.items;
                 any_hashed = true;
             }
-            if (d.holdsValues()) {
+            if (coded) {
+                self.dicts[j] = .{ .codes = codes, .dict = d.dict };
+                any_dicts = true;
+            } else if (d.holdsValues()) {
                 const store = try self.sourceStore(allocator, m, raw.values[j]);
                 try appendByIndices(allocator, try dictionaryView(raw.values[j], d.dict), codes, store);
                 self.views[j] = store.view();
@@ -8444,7 +8482,7 @@ const GridDictEval = struct {
         var out = raw;
         out.values = self.views;
         out.hashed = if (any_hashed) self.hashed else null;
-        out.block_dicts = null;
+        out.block_dicts = if (any_dicts) self.dicts else null;
         return out;
     }
 
@@ -8683,7 +8721,12 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
     var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
     defer filter_reads.deinit(allocator);
     if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
-    return dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items);
+    var source = (try dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items)) orelse return null;
+    // Only an exact key's staging reads a key's bytes through its codes; a
+    // heavy pass reads its lone key's bytes off the batch (`heavyKeyColumn`).
+    const heavy = if (cfg.count_sketch) |pass| pass == .heavy_tally or pass == .heavy_filter else false;
+    if (!layout.exact_key or heavy) source.keys_only = 0;
+    return source;
 }
 
 /// Marks for row-group dictionary emit (`Batch.block_dicts`) each string
@@ -8732,6 +8775,11 @@ pub const DictSource = struct {
     columns: [MAX_DICT_EVAL_COLUMNS]usize = undefined,
     len: usize = 0,
     strings: usize = 0,
+    /// Per string position, set when the column is read only as a group
+    /// key, itself or through renames: the staging reads its bytes through
+    /// its codes (`ExactKey.of`), so it reaches the staging as codes rather
+    /// than values copied out of its dictionary.
+    keys_only: u8 = 0,
     /// Positions in `derived` of the columns that read only integer scan
     /// columns. They evaluate per row ahead of the collapse, so the
     /// combination holds their values (an hour) rather than the integers
@@ -8745,6 +8793,10 @@ pub const DictSource = struct {
 
     pub fn preDerived(self: *const DictSource) []const usize {
         return self.pre[0..self.n_pre];
+    }
+
+    pub fn keyOnly(self: *const DictSource, m: usize) bool {
+        return m < self.strings and (self.keys_only >> @intCast(m)) & 1 != 0;
     }
 };
 
@@ -8780,6 +8832,13 @@ pub fn dictEvalSource(
     defer later_refs.deinit(allocator);
     var refs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer refs.deinit(allocator);
+    // The reads of derived columns other than renames to a key, and the
+    // names under which a column is a key.
+    var value_refs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer value_refs.deinit(allocator);
+    var key_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer key_names.deinit(allocator);
+    try key_names.appendSlice(allocator, keys);
     for (derived, 0..) |d, di| {
         refs.clearRetainingCapacity();
         try thindb.exec.compute_op.collectColumnRefs(allocator, &refs, d.expr);
@@ -8788,8 +8847,23 @@ pub fn dictEvalSource(
             source.n_pre += 1;
             try pre_refs.appendSlice(allocator, refs.items);
         } else try later_refs.appendSlice(allocator, refs.items);
+        switch (d.expr) {
+            .col_ref => |src| if (nameListed(keys, d.name)) {
+                try key_names.append(allocator, src);
+                continue;
+            },
+            else => {},
+        }
+        try value_refs.appendSlice(allocator, refs.items);
     }
     try later_refs.appendSlice(allocator, filter_reads);
+    try value_refs.appendSlice(allocator, filter_reads);
+    // A rename read as anything but a key, by a later derived column or
+    // an aggregate, reads its source's values.
+    for (derived) |d| switch (d.expr) {
+        .col_ref => |src| if (nameListed(value_refs.items, d.name) or nameListed(foldable, d.name)) try value_refs.append(allocator, src),
+        else => {},
+    };
     var numbers: [MAX_DICT_EVAL_COLUMNS]usize = undefined;
     var n_numbers: usize = 0;
     var derived_reads_string = false;
@@ -8802,6 +8876,9 @@ pub fn dictEvalSource(
         switch (col.type) {
             .varchar, .string => {
                 if (source.strings == MAX_DICT_EVAL_COLUMNS) return null;
+                if (nameListed(key_names.items, col.name) and !nameListed(value_refs.items, col.name) and !folds) {
+                    source.keys_only |= @as(u8, 1) << @intCast(source.strings);
+                }
                 source.columns[source.strings] = j;
                 source.strings += 1;
                 derived_reads_string = derived_reads_string or read;

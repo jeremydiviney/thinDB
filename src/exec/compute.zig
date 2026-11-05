@@ -580,6 +580,8 @@ pub const Compute = struct {
     /// The output batch's key-digest sidecar, like `out_lengths`: a hashed
     /// column no derived entry reads keeps its digests past this operator.
     out_hashed: []?[]const u128,
+    /// The output batch's block dictionaries, like `out_lengths`.
+    out_dicts: []?exec.BlockDictColumn,
     /// The zeroed offsets a digest-only CASE's placeholder view shares.
     /// Views die with their batch, so it grows only between batches.
     placeholder_offsets: []u32 = &.{},
@@ -696,6 +698,8 @@ pub const Compute = struct {
         errdefer allocator.free(out_lengths);
         const out_hashed = try allocator.alloc(?[]const u128, output_schema.len);
         errdefer allocator.free(out_hashed);
+        const out_dicts = try allocator.alloc(?exec.BlockDictColumn, output_schema.len);
+        errdefer allocator.free(out_dicts);
 
         const self = try allocator.create(Compute);
         errdefer allocator.destroy(self);
@@ -715,6 +719,7 @@ pub const Compute = struct {
             .layered_on_upstream = layered_on_upstream,
             .out_lengths = out_lengths,
             .out_hashed = out_hashed,
+            .out_dicts = out_dicts,
         };
         return makeQuery(allocator, self);
     }
@@ -770,6 +775,7 @@ pub const Compute = struct {
         self.allocator.free(self.views);
         self.allocator.free(self.out_lengths);
         self.allocator.free(self.out_hashed);
+        self.allocator.free(self.out_dicts);
         self.allocator.free(self.placeholder_offsets);
         self.arena.deinit();
         const allocator = self.allocator;
@@ -1192,6 +1198,7 @@ pub const Compute = struct {
             .row_count = n,
             .byte_lengths = self.passedThrough(u32, in.byte_lengths, self.out_lengths),
             .hashed = self.outputDigests(in.hashed),
+            .block_dicts = self.outputDicts(in.block_dicts),
         };
     }
 
@@ -1213,6 +1220,14 @@ pub const Compute = struct {
         var out = self.passedThrough(u128, in, self.out_hashed);
         for (self.derived, self.derived_output_indices) |r, out_idx| {
             const plan = switch (r.kind) {
+                // A rename's digests are its source's, over the same bytes;
+                // its view may be a placeholder (`outputDicts`).
+                .rename => |rn| {
+                    if (in) |digests| if (rn.src_idx < digests.len) {
+                        self.out_hashed[out_idx] = digests[rn.src_idx];
+                    };
+                    continue;
+                },
                 .case => |plan| plan,
                 else => continue,
             };
@@ -1224,6 +1239,24 @@ pub const Compute = struct {
             self.out_hashed[out_idx] = plan.digests.items;
         }
         return out;
+    }
+
+    /// The input's block dictionaries, for the columns passed through and
+    /// under each rename too: a column coded against one may arrive with
+    /// a placeholder view, for a consumer that reads its codes
+    /// (`GridDictEval`), and the codes index the same rows here.
+    fn outputDicts(self: *Compute, in: ?[]const ?exec.BlockDictColumn) ?[]const ?exec.BlockDictColumn {
+        const dicts = in orelse return null;
+        @memset(self.out_dicts, null);
+        const w = @min(dicts.len, self.out_dicts.len);
+        @memcpy(self.out_dicts[0..w], dicts[0..w]);
+        for (self.derived, self.derived_output_indices) |r, out_idx| {
+            self.out_dicts[out_idx] = switch (r.kind) {
+                .rename => |rn| if (rn.src_idx < dicts.len) dicts[rn.src_idx] else null,
+                else => null,
+            };
+        }
+        return self.out_dicts;
     }
 
     /// The input's per-column sidecar `in`, copied into `out` with the
