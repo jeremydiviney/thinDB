@@ -12136,10 +12136,13 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             // The merged top-N rows borrow each survivor's bucket str bytes (and
             // already carry finalized UDAF slots from collectOwnedTop); re-dup
             // the str bytes into the result allocator so they survive teardown.
+            // Sized exactly: grown rows are copied, as is an oversized list
+            // when the caller takes it as an owned slice.
+            try out.ensureTotalCapacityPrecise(allocator, out.items.len + top.len);
             for (0..top.len) |rank_index| {
                 var row = top.rowAt(rank_index);
                 if (has_str_out) try ownTopRowStr(&row, allocator);
-                try out.append(allocator, row);
+                out.appendAssumeCapacity(row);
             }
         }
     }
