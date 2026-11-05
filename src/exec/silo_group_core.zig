@@ -5322,6 +5322,10 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
         if (layout.has_weight) try parts.ensureStrPending(shared.allocator, raw_chunk_rows, str_inputs.len);
     }
     const exact: ?ExactKey = if (layout.hashed_key) try ExactKey.of(layout, batch) else null;
+    const prefetch_keys = if (exact) |ek| ek.scattered else false;
+    // A local: the row loops' stores may alias `shared`, so the compiler
+    // would reload it every row.
+    const digest_mask = shared.key_digest_mask;
 
     // Key-shape fast variants (no hashed key). Payload is type-generic; the
     // string lane (if any) rides along via appendStrPayload inside each kernel.
@@ -5398,7 +5402,7 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
             // so the weighted-collapse branch lives only in the other copy.
             std.debug.assert(!layout.has_weight);
             while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-                const key = if (hashed_ids) |ids| ids[r] & shared.key_digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+                const key = if (hashed_ids) |ids| ids[r] & digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
                 const idx = active.len();
                 active.setKey(idx, key);
                 if (layout.has_rowref) active.rowrefAll()[idx] = rowref_col[r];
@@ -5410,8 +5414,8 @@ fn appendBatchRawChunksGeneric(parts: *WorkerParts, shared: *PipeShared, batch: 
                 accepted += 1;
             }
         } else while (r < batch.row_count and active.len() < raw_chunk_rows) : (r += 1) {
-            if (exact) |*ek| if (r + KEY_PREFETCH_ROWS < batch.row_count) ek.prefetch(r + KEY_PREFETCH_ROWS);
-            const key = if (hashed_ids) |ids| ids[r] & shared.key_digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
+            if (prefetch_keys and r + KEY_PREFETCH_ROWS < batch.row_count) exact.?.prefetch(r + KEY_PREFETCH_ROWS);
+            const key = if (hashed_ids) |ids| ids[r] & digest_mask else try genericKeyFromViews(layout, key_views_buf[0..layout.key_columns.len], r);
             const idx = active.len();
             // Weighted collapse (decomposable programs): a key already staged
             // in the chunk — the previous row's, or one the fold index finds —
@@ -6240,6 +6244,9 @@ const ExactKey = struct {
     views: [MAX_GENERIC_GROUP_KEYS]ColumnView = undefined,
     strs: [MAX_GENERIC_GROUP_KEYS]?StringView = undefined,
     codes: [MAX_GENERIC_GROUP_KEYS]?[]const u32 = undefined,
+    /// Some part's codes land its rows' bytes far apart in its dictionary
+    /// (`prefetch`); ascending ones stream.
+    scattered: bool = false,
     /// A fixed-width part's values end to end, `widths[i]` bytes each.
     fixed: [MAX_GENERIC_GROUP_KEYS][]const u8 = undefined,
     widths: [MAX_GENERIC_GROUP_KEYS]usize = undefined,
@@ -6258,6 +6265,7 @@ const ExactKey = struct {
             if (batch.block_dicts) |dicts| if (dicts[ci]) |d| if (d.holdsValues() and d.codes.len >= batch.row_count) {
                 key.strs[i] = d.dict;
                 key.codes[i] = d.codes;
+                if (!d.ascending) key.scattered = true;
             };
             if (key.strs[i] == null) {
                 const fixed = fixedKeyPart(batch.values[ci], part.typ) orelse return error.TypeMismatch;
@@ -8662,7 +8670,7 @@ const GridDictEval = struct {
         } else null;
         const dicts: ?[]const ?thindb.exec.BlockDictColumn = if (through) blk: {
             @memset(self.dicts, null);
-            self.dicts[column_index] = .{ .codes = self.used_codes.items, .dict = dict };
+            self.dicts[column_index] = .{ .codes = self.used_codes.items, .dict = dict, .ascending = true };
             break :blk self.dicts;
         } else null;
         return .{ .schema = raw.schema, .values = self.views, .row_count = used, .hashed = hashed, .block_dicts = dicts };
