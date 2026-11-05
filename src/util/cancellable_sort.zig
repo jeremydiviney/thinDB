@@ -35,17 +35,20 @@ pub fn pdq(
     comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
 ) error{QueryCancelled}!void {
     if (flag == null) return std.sort.pdq(T, items, context, lessThanFn);
-    return pdqPrefix(T, items, items.len, context, flag, lessThanFn);
+    return pdqRange(T, items, 0, items.len, context, flag, lessThanFn);
 }
 
-/// Puts the `prefix` least items, in order, at the front of `items`; the rest
-/// end up in unspecified order. Ranges that start at or past `prefix` are
-/// never partitioned further, so the cost is about a partition pass over the
-/// rest plus a sort of the prefix.
-pub fn pdqPrefix(
+/// Puts `items[from..to]` where a full sort would, in order; the items before
+/// `from` are the `from` least and those from `to` on the rest, each in
+/// unspecified order. Ranges that end at or before `from`, or start at or past
+/// `to`, are never partitioned further, so the cost is about a partition pass
+/// per level down to the window plus a sort of the window. With `from == to`
+/// it only splits the `from` least from the rest.
+pub fn pdqRange(
     comptime T: type,
     items: []T,
-    prefix: usize,
+    from: usize,
+    to: usize,
     context: anytype,
     flag: ?*const std.atomic.Value(bool),
     comptime lessThanFn: fn (context: @TypeOf(context), lhs: T, rhs: T) bool,
@@ -65,7 +68,7 @@ pub fn pdqPrefix(
             return mem.swap(T, &ctx.items[a], &ctx.items[b]);
         }
     };
-    try pdqContext(0, items.len, prefix, Context{ .items = items, .sub_ctx = context, .check = &check });
+    try pdqContext(0, items.len, from, to, Context{ .items = items, .sub_ctx = context, .check = &check });
     try check.poll();
 }
 
@@ -84,7 +87,7 @@ const Range = struct {
     partitioned: bool,
 };
 
-pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{QueryCancelled}!void {
+pub fn pdqContext(a: usize, b: usize, from: usize, to: usize, context: anytype) error{QueryCancelled}!void {
     const max_insertion = 24;
     const max_limit = if (b > a) math.log2_int(usize, b - a) else 0;
 
@@ -102,7 +105,7 @@ pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{Query
     while (true) {
         while (true) {
             try context.check.step();
-            if (range.a >= need) break;
+            if (range.a >= to or range.b <= from) break;
             const len = range.b - range.a;
 
             if (len <= max_insertion) {
@@ -521,7 +524,7 @@ test "cancellation sort matches standard ordering across patterns" {
     }
 }
 
-test "prefix sort orders the least items and keeps every item" {
+test "range sort orders the window, splits the rest around it and keeps every item" {
     const alloc = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(4421);
     for ([_]usize{ 0, 1, 25, 1024, 4097 }) |n| {
@@ -529,7 +532,9 @@ test "prefix sort orders the least items and keeps every item" {
         defer alloc.free(values);
         const expected = try alloc.alloc(u32, n);
         defer alloc.free(expected);
-        for ([_]usize{ 0, @min(1, n), n / 3, n -| 1, n }) |prefix| for (0..4) |pattern| {
+        const bounds = [_]usize{ 0, @min(1, n), n / 3, n / 2, n -| 1, n };
+        for (bounds) |from| for (bounds) |to| for (0..4) |pattern| {
+            if (to < from) continue;
             for (values, 0..) |*v, i| v.* = switch (pattern) {
                 0 => random.random().int(u32),
                 1 => @intCast(n - i),
@@ -538,8 +543,10 @@ test "prefix sort orders the least items and keeps every item" {
             };
             @memcpy(expected, values);
             std.sort.pdq(u32, expected, {}, std.sort.asc(u32));
-            try pdqPrefix(u32, values, prefix, {}, null, std.sort.asc(u32));
-            try std.testing.expectEqualSlices(u32, expected[0..prefix], values[0..prefix]);
+            try pdqRange(u32, values, from, to, {}, null, std.sort.asc(u32));
+            try std.testing.expectEqualSlices(u32, expected[from..to], values[from..to]);
+            if (from > 0) for (values[0..from]) |v| try std.testing.expect(v <= expected[from - 1]);
+            if (to < n) for (values[to..]) |v| try std.testing.expect(v >= expected[to]);
             std.sort.pdq(u32, values, {}, std.sort.asc(u32));
             try std.testing.expectEqualSlices(u32, expected, values);
         };

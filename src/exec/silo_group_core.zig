@@ -2486,14 +2486,16 @@ test "merged top picks the rows one top set would from every worker's candidates
             tops[key % tops.len].consider(row);
             single.consider(row);
         }
-        try single.sortBestFirst(allocator);
         var merged = try MergedTop.init(allocator, &tops, k);
         defer merged.deinit(allocator);
         try std.testing.expectEqual(single.len, merged.len);
+        var picked: [500]bool = @splat(false);
         for (0..merged.len) |i| {
-            try std.testing.expectEqual(single.rowAt(i).key, merged.rowAt(i).key);
-            try std.testing.expectEqual(single.rowAt(i).rowref, merged.rowAt(i).rowref);
+            const row = merged.rowAt(i);
+            try std.testing.expectEqual(@as(i64, @intCast(row.key)), row.rowref);
+            picked[@intCast(row.key)] = true;
         }
+        for (0..single.len) |i| try std.testing.expect(picked[@intCast(single.rowAt(i).key)]);
     }
 }
 
@@ -5142,10 +5144,11 @@ const TopSet = struct {
     }
 };
 
-/// The best `k` rows across the workers' top sets, best first. Each group
-/// lives in one worker's set, so ranking the sets' ranks together and reading
-/// rows in place picks the same rows a merged TopSet would, without copying
-/// every candidate row into it.
+/// The best `k` rows across the workers' top sets, in no particular order:
+/// the group top-N ranks them by its ORDER BY anyway, so only selecting them
+/// here spares a second sort. Each group lives in one worker's set, so
+/// selecting among the sets' ranks and reading rows in place picks the same
+/// rows a merged TopSet would, without copying every candidate row into it.
 const MergedTop = struct {
     tops: []const TopSet,
     ranks: []TopSet.Rank,
@@ -5165,7 +5168,7 @@ const MergedTop = struct {
             }
         }
         const len = @min(k, total);
-        try thindb.exec.memory.sortPrefix(TopSet.Rank, ranks, len, {}, allocator, TopSet.Rank.before);
+        try thindb.exec.memory.sortRange(TopSet.Rank, ranks, len, len, {}, allocator, TopSet.Rank.before);
         return .{ .tops = tops, .ranks = ranks, .len = len };
     }
 
