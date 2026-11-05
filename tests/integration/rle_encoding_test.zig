@@ -155,6 +155,17 @@ test "RLE-encoded columns round-trip exactly through flush" {
         @as(i64, 100),
         try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE runs = 7000000003"),
     );
+
+    // A filtered COUNT(*) over one RLE column counts its runs.
+    try std.testing.expectEqual(@as(i64, 10), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE flag <> 0"));
+    try std.testing.expectEqual(@as(i64, 2490), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE flag = 0"));
+    try std.testing.expectEqual(@as(i64, 1400), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE runs > 7000000010"));
+    try std.testing.expectEqual(@as(i64, 1100), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE runs <= 7000000010"));
+
+    // Deleted rows still leave the runs: rows 0..299 hold the flag at row 249.
+    try exec(allocator, db, "DELETE FROM t WHERE id <= 300");
+    try std.testing.expectEqual(@as(i64, 9), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE flag <> 0"));
+    try std.testing.expectEqual(@as(i64, 1100 - 300), try sumVia(allocator, db, "SELECT COUNT(*) FROM t WHERE runs <= 7000000010"));
 }
 
 test "RLE-encoded columns round-trip across multiple segments" {

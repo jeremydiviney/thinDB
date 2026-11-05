@@ -1855,15 +1855,17 @@ pub const Scan = struct {
     }
 
     /// Whether a scan that only counts its rows can count a row group by its
-    /// filter's column's dictionary entries: the filter reads one column.
+    /// filter's column's dictionary entries or runs: the filter reads one
+    /// column.
     fn countsFilterEntries(self: *const Scan) bool {
         return self.out_phys.len == 0 and !self.emit_loc and self.filter_phys.len == 1 and self.derived_filter == null;
     }
 
     /// The rows of row group `rg_idx` that `expr` passes, testing it once per
     /// value of its column's dictionary block and summing the counts the
-    /// block stores; null when the block stores none, or tombstones, a key
-    /// bound or a sieve narrow the row group's rows.
+    /// block stores, or once per run of an RLE block a plain comparison
+    /// reads; null for any other block, or when tombstones, a key bound or a
+    /// sieve narrow the row group's rows.
     fn countFilterEntries(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_first: u32, rg_count: u32, expr: PredicateExpr) !?usize {
         if (self.key_bound != null or self.sievedRows(rg_idx, rg_count) != null) return null;
         if (self.rowGroupHasTombstones(rg_first, rg_count)) return null;
@@ -1871,6 +1873,20 @@ pub const Scan = struct {
         if (self.table.schema.columns[phys].nullable) return null;
         var block = try seg.borrowStringBlock(self.allocator, rg_idx, phys, self.cacheRef(), .no_codes);
         defer block.release(self.allocator, self.cacheRef());
+        if (block.encoding == .rle) {
+            const leaf = switch (expr) {
+                .leaf => |l| l,
+                else => return null,
+            };
+            const col_type = self.table.schema.columns[phys].type;
+            if (!storage.format.bytesFollowComparison(col_type) or !predicate.typeHasRange(col_type)) return null;
+            const want = predicate.valueToRangeI128(leaf.val) orelse return null;
+            const rb = storage.segment_reader.rleViewOf(block.bytes, rg_count, .{ .has_nulls = false }).block;
+            const matched = rleCountMatching(rb, rg_count, leaf.op, want) orelse return null;
+            if (matched == 0) self.rg_unmatched = .whole;
+            self.noteConditionCount(seg, rg_idx, rg_count, matched);
+            return matched;
+        }
         if (block.encoding != .dict) return null;
         const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
         if (!db.hasEntryStats()) return null;
@@ -2441,17 +2457,18 @@ pub const Scan = struct {
             self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, self.schema_stats);
             return;
         }
-        const all_phys = try self.allocator.alloc(usize, schema.len);
-        defer self.allocator.free(all_phys);
-        for (all_phys, 0..) |*p, i| p.* = i;
-        const col_stats = try computeColumnStats(
-            self.allocator,
-            schema,
-            self.segs,
-            all_phys,
-            self.memtable_row_count,
-        );
+        // The ordering looks up only the filter's own columns. Merging every
+        // column's sketches cost a 105-column table ~0.1 ms per scan, paid
+        // once per worker scan a statement opens, one after another.
+        var refs: std.ArrayListUnmanaged(usize) = .empty;
+        defer refs.deinit(self.allocator);
+        try collectPredicateColumns(self.allocator, expr, schema, &refs);
+        const ref_stats = try computeColumnStats(self.allocator, schema, self.segs, refs.items, self.memtable_row_count);
+        defer self.allocator.free(ref_stats);
+        const col_stats = try self.allocator.alloc(exec.ColStat, schema.len);
         defer self.allocator.free(col_stats);
+        @memset(col_stats, .{});
+        for (refs.items, ref_stats) |ci, s| col_stats[ci] = s;
         self.fused_filter = try filter_mod.orderPredicate(self.allocator, &self.filter_rewritten, expr, schema, col_stats);
     }
 
@@ -5264,6 +5281,28 @@ pub const Scan = struct {
         }
         if (pos < rg_count) @memset(out[pos..rg_count], false);
         return true;
+    }
+
+    /// How many rows `rleCompareInto` would mark, without the mask.
+    fn rleCountMatching(rb: storage.segment_reader.RleBlock, rg_count: u32, op: PredicateOp, want: i128) ?usize {
+        var pos: usize = 0;
+        var matched: usize = 0;
+        switch (op) {
+            inline else => |o| switch (rb.value_width) {
+                inline 1, 2, 4, 8 => |W| {
+                    const T = @Int(.signed, W * 8);
+                    var run: usize = 0;
+                    while (run < rb.n_runs and pos < rg_count) : (run += 1) {
+                        const v: i128 = std.mem.readInt(T, rb.values[run * W ..][0..W], .little);
+                        const len = @min(@as(usize, rb.runLength(run)), rg_count - pos);
+                        if (fcmpFor(o, v, want)) matched += len;
+                        pos += len;
+                    }
+                },
+                else => return null,
+            },
+        }
+        return matched;
     }
 
     /// `out[i]` = whether row i's value is one of `wants` (ascending): one
