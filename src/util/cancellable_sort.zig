@@ -1,4 +1,4 @@
-// Adapted from Zig 0.16 std/sort/pdq.zig to propagate cancellation without
+// Adapted from Zig 0.17 std/sort/pdq.zig to propagate cancellation without
 // changing comparator ordering. Upstream license follows.
 // The MIT License (Expat)
 //
@@ -75,36 +75,49 @@ const Hint = enum {
     unknown,
 };
 
+const Range = struct {
+    a: usize,
+    b: usize,
+    limit: usize,
+    leftmost: bool,
+    balanced: bool,
+    partitioned: bool,
+};
+
 pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{QueryCancelled}!void {
     const max_insertion = 24;
+    const max_limit = if (b > a) math.log2_int(usize, b - a) else 0;
 
-    const max_limit = std.math.floorPowerOfTwo(usize, b - a) + 1;
-
-    const Range = struct { a: usize, b: usize, limit: usize };
-    const stack_size = math.log2(math.maxInt(usize) + 1);
-    var stack: [stack_size]Range = undefined;
-    var range = Range{ .a = a, .b = b, .limit = max_limit };
+    var stack: [@bitSizeOf(usize)]Range = undefined;
+    var range = Range{
+        .a = a,
+        .b = b,
+        .limit = max_limit,
+        .leftmost = true,
+        .balanced = true,
+        .partitioned = true,
+    };
     var top: usize = 0;
 
     while (true) {
-        try context.check.step();
-        var was_balanced = true;
-        var was_partitioned = true;
-
         while (true) {
             try context.check.step();
             if (range.a >= need) break;
             const len = range.b - range.a;
 
             if (len <= max_insertion) {
-                break sort.insertionContext(range.a, range.b, context);
+                if (range.leftmost) {
+                    break sort.insertionContext(range.a, range.b, context);
+                } else {
+                    break unguardedInsertionContext(range.a, range.b, context);
+                }
             }
 
             if (range.limit == 0) {
                 break try heapContext(range.a, range.b, context);
             }
 
-            if (!was_balanced) {
+            if (!range.balanced) {
                 breakPatterns(range.a, range.b, context);
                 range.limit -= 1;
             }
@@ -118,7 +131,7 @@ pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{Query
                 hint = .increasing;
             }
 
-            if (was_balanced and was_partitioned and hint == .increasing) {
+            if (range.balanced and range.partitioned and hint == .increasing) {
                 if (try partialInsertionSort(range.a, range.b, context)) break;
             }
 
@@ -128,26 +141,55 @@ pub fn pdqContext(a: usize, b: usize, need: usize, context: anytype) error{Query
             }
 
             var mid = pivot;
-            was_partitioned = try partition(range.a, range.b, &mid, context);
+            const was_partitioned = try partition(range.a, range.b, &mid, context);
 
             const left_len = mid - range.a;
-            const right_len = range.b - mid;
+            const right_len = range.b - (mid + 1);
             const balanced_threshold = len / 8;
-            if (left_len < right_len) {
-                was_balanced = left_len >= balanced_threshold;
-                stack[top] = .{ .a = range.a, .b = mid, .limit = range.limit };
-                top += 1;
-                range.a = mid + 1;
-            } else {
-                was_balanced = right_len >= balanced_threshold;
-                stack[top] = .{ .a = mid + 1, .b = range.b, .limit = range.limit };
-                top += 1;
-                range.b = mid;
-            }
+
+            const left_is_smaller = left_len < right_len;
+
+            const smaller_len = if (left_is_smaller) left_len else right_len;
+            const was_balanced = smaller_len >= balanced_threshold;
+
+            const smaller_start_offset = if (left_is_smaller) range.a else mid + 1;
+            const larger_start_offset = if (left_is_smaller) mid + 1 else range.a;
+            const smaller_end_exclusive_offset = if (left_is_smaller) mid else range.b;
+            const larger_end_exclusive_offset = if (left_is_smaller) range.b else mid;
+
+            const smaller_is_leftmost = if (left_is_smaller) range.leftmost else false;
+            const larger_is_leftmost = if (left_is_smaller) false else range.leftmost;
+
+            stack[top] = .{
+                .a = larger_start_offset,
+                .b = larger_end_exclusive_offset,
+                .limit = range.limit,
+                .leftmost = larger_is_leftmost,
+                .balanced = was_balanced,
+                .partitioned = was_partitioned,
+            };
+            top += 1;
+
+            range.a = smaller_start_offset;
+            range.b = smaller_end_exclusive_offset;
+            range.leftmost = smaller_is_leftmost;
+            range.balanced = true;
+            range.partitioned = was_partitioned;
         }
 
         top = math.sub(usize, top, 1) catch break;
         range = stack[top];
+    }
+}
+
+/// Insertion sort that assumes `items[a-1]` exists and is <= all elements in `[a, b)`.
+fn unguardedInsertionContext(a: usize, b: usize, context: anytype) void {
+    var i = a + 1;
+    while (i < b) : (i += 1) {
+        var j = i;
+        while (context.lessThan(j, j - 1)) : (j -= 1) {
+            context.swap(j, j - 1);
+        }
     }
 }
 
@@ -176,21 +218,79 @@ fn partition(a: usize, b: usize, pivot: *usize, context: anytype) error{QueryCan
     i += 1;
     j -= 1;
 
-    while (true) {
-        try context.check.step();
-        while (i <= j and context.lessThan(i, a)) {
-            try context.check.step();
-            i += 1;
+    const block_size = 64;
+    var offsets_l: [block_size]u8 align(std.atomic.cache_line) = undefined;
+    var offsets_r: [block_size]u8 align(std.atomic.cache_line) = undefined;
+
+    var offsets_l_base = i;
+    var offsets_r_base = j;
+    var num_l: usize = 0;
+    var num_r: usize = 0;
+    var start_l: usize = 0;
+    var start_r: usize = 0;
+
+    while (i <= j) {
+        const num_unknown = j + 1 - i;
+        const left_split = if (num_l == 0)
+            @min(block_size, if (num_r == 0) num_unknown / 2 else num_unknown)
+        else
+            0;
+        const right_split = if (num_r == 0)
+            @min(block_size, num_unknown - left_split)
+        else
+            0;
+        // `@min` against the comptime block size narrows both splits to u7.
+        try context.check.stepBy(@as(usize, left_split) + right_split);
+
+        for (0..left_split) |k| {
+            offsets_l[num_l] = @intCast(k);
+            num_l += @intFromBool(!context.lessThan(i + k, a));
         }
-        while (i <= j and !context.lessThan(j, a)) {
-            try context.check.step();
+        i += left_split;
+
+        for (0..right_split) |k| {
+            offsets_r[num_r] = @intCast(k);
+            num_r += @intFromBool(context.lessThan(j - k, a));
+        }
+        j -= right_split;
+
+        const num = @min(num_l, num_r);
+        for (0..num) |m| {
+            context.swap(
+                offsets_l_base + offsets_l[start_l + m],
+                offsets_r_base - offsets_r[start_r + m],
+            );
+        }
+        num_l -= num;
+        num_r -= num;
+        start_l += num;
+        start_r += num;
+
+        if (num_l == 0) {
+            start_l = 0;
+            offsets_l_base = i;
+        }
+        if (num_r == 0) {
+            start_r = 0;
+            offsets_r_base = j;
+        }
+    }
+
+    if (num_l > 0) {
+        while (num_l > 0) {
+            num_l -= 1;
+            context.swap(offsets_l_base + offsets_l[start_l + num_l], j);
             j -= 1;
         }
-        if (i > j) break;
-
-        context.swap(i, j);
-        i += 1;
-        j -= 1;
+        i = j + 1;
+    }
+    if (num_r > 0) {
+        while (num_r > 0) {
+            num_r -= 1;
+            context.swap(offsets_r_base - offsets_r[start_r + num_r], i);
+            i += 1;
+        }
+        j = i - 1;
     }
 
     context.swap(j, a);
@@ -289,7 +389,6 @@ fn breakPatterns(a: usize, b: usize, context: anytype) void {
 
 fn chosePivot(a: usize, b: usize, pivot: *usize, context: anytype) Hint {
     const shortest_ninther = 50;
-
     const max_swaps = 4 * 3;
 
     const len = b - a;
@@ -346,16 +445,27 @@ fn reverseRange(a: usize, b: usize, context: anytype) error{QueryCancelled}!void
 
 const Check = struct {
     flag: ?*const std.atomic.Value(bool),
-    remaining: usize = 1024,
-    fn poll(self: *Check) error{QueryCancelled}!void {
+    remaining: usize = poll_interval,
+
+    /// Comparisons between polls of the flag.
+    const poll_interval = 1024;
+
+    fn poll(self: *const Check) error{QueryCancelled}!void {
         if (self.flag) |flag| if (flag.load(.acquire)) return error.QueryCancelled;
     }
+
     fn step(self: *Check) error{QueryCancelled}!void {
-        self.remaining -= 1;
-        if (self.remaining == 0) {
-            self.remaining = 1024;
-            try self.poll();
+        return self.stepBy(1);
+    }
+
+    /// Counts `n` comparisons toward the next poll.
+    fn stepBy(self: *Check, n: usize) error{QueryCancelled}!void {
+        if (n < self.remaining) {
+            self.remaining -= n;
+            return;
         }
+        self.remaining = poll_interval;
+        try self.poll();
     }
 };
 

@@ -863,7 +863,36 @@ pub const TableSchema = struct {
 /// every lookup site needs to bridge that, or `WatchID` vs `watchid`
 /// silently 404s.
 pub fn columnNameEql(a: []const u8, b: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(a, b);
+    if (a.len != b.len) return false;
+    if (a.len < 8) return std.ascii.eqlIgnoreCase(a, b);
+    // Generated names of one width share long prefixes (`sum(x + 1)`,
+    // `sum(x + 2)`), so the last word settles most mismatches at once.
+    const tail = a.len - 8;
+    if (lowerWord(a[tail..][0..8]) != lowerWord(b[tail..][0..8])) return false;
+    var i: usize = 0;
+    while (i < tail) : (i += 8) {
+        if (lowerWord(a[i..][0..8]) != lowerWord(b[i..][0..8])) return false;
+    }
+    return true;
+}
+
+/// `std.ascii.toLower` of eight bytes at once.
+fn lowerWord(bytes: *const [8]u8) u64 {
+    const ones: u64 = 0x0101010101010101;
+    const word = std.mem.readInt(u64, bytes, .little);
+    const low7 = word & (ones * 0x7f);
+    const from_a = low7 + ones * (0x80 - 'A');
+    const past_z = low7 + ones * (0x80 - 'Z' - 1);
+    const upper = from_a & ~past_z & ~word & (ones * 0x80);
+    return word | (upper >> 2);
+}
+
+/// `columnNameEql(unqualifiedName(column), name)`. The bare column is a
+/// suffix of `column`, so a column whose tail isn't `name` never splits.
+pub fn bareColumnNameEql(column: []const u8, name: []const u8) bool {
+    if (column.len < name.len) return false;
+    if (!columnNameEql(column[column.len - name.len ..], name)) return false;
+    return unqualifiedName(column).len == name.len;
 }
 
 fn columnNameIn(names: []const []const u8, name: []const u8) bool {
@@ -984,10 +1013,10 @@ pub fn findColumn(columns: []const Column, name: []const u8) ?usize {
     }
     // A name that only looks qualified (`t.a + 1`, a column named by its
     // text) is still the bare column of an alias-qualified one.
+    // The first loop already took a column `name` spells whole.
     var match: ?usize = null;
     for (columns, 0..) |c, i| {
-        const split = splitQualifiedName(c.name) orelse continue;
-        if (columnNameEql(split.bare, name)) {
+        if (bareColumnNameEql(c.name, name)) {
             if (match != null) return null; // ambiguous
             match = i;
         }
@@ -1182,6 +1211,44 @@ test "splitResultName splits only a qualified identifier" {
     }
     inline for (.{ "id", "0.5", "a.b c", "t.price * t.qty", "e.a IS NULL", "s.mul(x, 1.5)", "s.0.5" }) |name| {
         try std.testing.expect(splitResultName(name) == null);
+    }
+}
+
+test "columnNameEql ignores ASCII case at every length" {
+    const cases = .{
+        .{ "", "", true },
+        .{ "id", "ID", true },
+        .{ "WatchID", "watchid", true },
+        .{ "watchid", "watchie", false },
+        .{ "ResolutionW", "resolutionw", true },
+        .{ "sum(ResolutionWidth + 1)", "SUM(resolutionwidth + 1)", true },
+        .{ "sum(ResolutionWidth + 1)", "sum(ResolutionWidth + 2)", false },
+        .{ "sum(ResolutionWidth + 1)", "sum(ResolutionXidth + 1)", false },
+        .{ "count(DISTINCT x)", "COUNT(distinct X)", true },
+        .{ "abcdefghijklmnopq", "abcdefghijklmnop", false },
+        .{ "abcdefghi_jklmnop", "ABCDEFGHI-JKLMNOP", false },
+        .{ "a@b[c`d{e~", "A@B[C`D{E~", true },
+        .{ "a@b[c`d{e~", "a`b{c@d[e^", false },
+        .{ "\xc1bcdefghij", "\xe1BCDEFGHIJ", false },
+        .{ "\xc1bcdefghij", "\xc1BCDEFGHIJ", true },
+    };
+    inline for (cases) |c| try std.testing.expectEqual(c[2], columnNameEql(c[0], c[1]));
+}
+
+test "bareColumnNameEql matches the bare column of a qualified name" {
+    const cases = .{
+        .{ "WatchID", "watchid", true },
+        .{ "t.WatchID", "watchid", true },
+        .{ "d.t.a + 1", "t.a + 1", true },
+        .{ "s.0.5", "0.5", true },
+        .{ "xt.id", "t.id", false },
+        .{ "t.id", "d", false },
+        .{ "id", "t.id", false },
+        .{ "add(x, 1.5)", "5", false },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(c[2], bareColumnNameEql(c[0], c[1]));
+        try std.testing.expectEqual(columnNameEql(unqualifiedName(c[0]), c[1]), bareColumnNameEql(c[0], c[1]));
     }
 }
 

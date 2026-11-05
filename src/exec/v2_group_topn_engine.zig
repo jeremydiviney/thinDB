@@ -1199,7 +1199,7 @@ fn runCountSketch(
     try SiloCore.runSiloGrid(allocator, table, cpus, tally);
     if (sketch.near_unique) return rank == null and try runDupSketch(allocator, table, cpus, grid, need, rows);
     const held = if (sketch.row_slots) |*rs| rs else null;
-    if (!try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return try groupHeldRows(allocator, table, cpus, grid, held);
+    if (sketch.tooFewToSettle() or !try sketch.settle(allocator, need, if (rank == null) .row_count else .at_most_row_count)) return try groupHeldRows(allocator, table, cpus, grid, held);
 
     var filter = cfg;
     filter.count_sketch = .{ .filter = &sketch };

@@ -8895,7 +8895,7 @@ fn projectionNameClaimed(items: []const ProjItem, name: []const u8) bool {
     for (items) |item| {
         if (item.kind == .star) continue;
         if (types.columnNameEql(item.name, name)) return true;
-        if (item.kind == .col and Parser.projectOutputName(item) == null and types.columnNameEql(types.unqualifiedName(item.kind.col), name)) return true;
+        if (item.kind == .col and Parser.projectOutputName(item) == null and types.bareColumnNameEql(item.kind.col, name)) return true;
     }
     return false;
 }
@@ -9612,7 +9612,7 @@ fn usingColumnOf(column: []const u8, using: []const []const u8) ?[]const u8 {
 /// bare name matches on the bare column, as `types.findColumn` does.
 fn exposesColumn(columns: []const []const u8, name: []const u8) bool {
     for (columns) |c| {
-        if (types.columnNameEql(types.unqualifiedName(c), name)) return true;
+        if (types.bareColumnNameEql(c, name)) return true;
     }
     return false;
 }
@@ -9621,11 +9621,11 @@ fn exposesColumn(columns: []const []const u8, name: []const u8) bool {
 /// or a plain SELECT column reads it, which only a grouped column can be.
 fn groupMayKeepColumn(proj: []const ProjItem, group_exprs: []const ir.Expr, name: []const u8) bool {
     for (group_exprs) |ge| switch (ge) {
-        .col_ref => |c| if (types.columnNameEql(types.unqualifiedName(c), name)) return true,
+        .col_ref => |c| if (types.bareColumnNameEql(c, name)) return true,
         else => {},
     };
     for (proj) |p| switch (p.kind) {
-        .col => |c| if (types.columnNameEql(types.unqualifiedName(c), name)) return true,
+        .col => |c| if (types.bareColumnNameEql(c, name)) return true,
         else => {},
     };
     return false;
