@@ -367,6 +367,14 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
         "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY c DESC LIMIT 4",
         "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 2 GROUP BY tag ORDER BY c DESC, tag LIMIT 20",
         "SELECT tag, COUNT(DISTINCT url) AS d FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY d DESC, tag LIMIT 5",
+        // CASE keys picking `url` or a constant: 'u5' is also a url, which a
+        // condition over the other keys keeps in groups apart.
+        "SELECT tag, CASE WHEN tag = 'tag1' THEN url ELSE 'u5' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT tag, CASE WHEN tag = 'tag0' THEN url WHEN tag = 'tag1' THEN '' ELSE url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT id, CASE WHEN id < 500 THEN url ELSE '' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY id, u ORDER BY c DESC, id LIMIT 10",
+        "SELECT CASE WHEN id % 2 = 0 THEN url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
+        // Here a row of either branch may hold 'u5', so the key reads bytes.
+        "SELECT CASE WHEN id % 2 = 0 THEN url ELSE 'u5' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
     };
     // Memtable rows, then tombstones, rule the ids out.
     const Step = struct { changes: []const []const u8 = &.{}, flush: bool = false };
@@ -397,5 +405,45 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
             errdefer std.debug.print("query: {s}\n", .{by_ids});
             try std.testing.expectEqualStrings(want, got);
         }
+    }
+}
+
+test "table string ids: claiming a segment's ids never waits on another reader's fill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR NOT NULL, PRIMARY KEY (id))");
+    const t = try db.openTable("t", .{});
+    try insertTags(allocator, db, 0, 100, 0, 5);
+    try t.flush();
+
+    var name_buf: [32]u8 = undefined;
+    const name = try thindb.Table.segmentFileName(&name_buf, t.manifest.segments.items[0].segment_id);
+    var seg = try thindb.storage.readSegment(allocator, t.io, t.segments_dir, name, t.schema);
+    defer seg.deinit();
+    const tc = t.cacheRef();
+    try std.testing.expect(try seg.claimTableIds(0, tc) == .none);
+
+    const key: thindb.storage.cache.Key = .{ .table_uid = tc.table_uid, .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = tag_column, .content = .table_ids };
+    const fill = switch (try tc.cache.claim(key)) {
+        .fill => |f| f,
+        else => return error.TestUnexpectedClaim,
+    };
+    try std.testing.expect(try seg.claimTableIds(tag_column, tc) == .busy);
+    tc.cache.endFill(t.io, fill);
+
+    const want = (try seg.tableIds(allocator, tag_column)).?;
+    defer allocator.free(want);
+    // The first claim reads the ids in; the second finds them cached.
+    for (0..2) |_| {
+        const held = switch (try seg.claimTableIds(tag_column, tc)) {
+            .held => |h| h,
+            else => return error.TestUnexpectedClaim,
+        };
+        defer held.release();
+        try std.testing.expectEqual(want.len, held.ids.len);
+        for (want, held.ids) |w, h| try std.testing.expectEqual(w, std.mem.littleToNative(u32, h));
     }
 }

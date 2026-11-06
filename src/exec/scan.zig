@@ -1890,13 +1890,38 @@ pub const Scan = struct {
     /// The table ids of segment `seg`'s column `phys`, by segment id, held
     /// in `buf` while the scan reads the segment, for `db`, a block of it.
     fn holdSegmentIds(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock) ![]align(1) const u32 {
-        if (buf.segment_ids == null or buf.segment_ids.?.seg_idx != self.cur_seg_idx) {
+        if (!self.holdsSegmentIds(buf)) try self.claimIdKeySegmentIds(seg);
+        if (!self.holdsSegmentIds(buf)) {
             buf.releaseSegmentIds();
             const ids = (try seg.cachedTableIds(phys, self.cacheRef())) orelse return error.UnsupportedQueryShape;
             buf.segment_ids = .{ .seg_idx = self.cur_seg_idx, .ids = ids };
         }
         if (db.ndv != 0 and !db.hasSegmentIds()) return error.UnsupportedQueryShape;
         return buf.segment_ids.?.ids.ids;
+    }
+
+    fn holdsSegmentIds(self: *const Scan, buf: *const DictBuf) bool {
+        return if (buf.segment_ids) |s| s.seg_idx == self.cur_seg_idx else false;
+    }
+
+    /// Holds segment `seg`'s table ids for each id-keyed column holding none
+    /// for it yet, but none another worker is reading in. A segment's ids
+    /// block is read whole, so the workers starting a segment together read
+    /// its id-keyed columns' blocks side by side, each waiting on another's
+    /// only after reading its own, not all of them on one column's and then
+    /// on the next's.
+    fn claimIdKeySegmentIds(self: *Scan, seg: *storage.ReadSegment) !void {
+        if (self.n_id_keys < 2) return;
+        for (self.dict_bufs, 0..) |*buf, j| {
+            if (!self.idKeyed(j) or self.holdsSegmentIds(buf)) continue;
+            switch (try seg.claimTableIds(self.out_phys[j], self.cacheRef())) {
+                .none, .busy => {},
+                .held => |ids| {
+                    buf.releaseSegmentIds();
+                    buf.segment_ids = .{ .seg_idx = self.cur_seg_idx, .ids = ids };
+                },
+            }
+        }
     }
 
     /// Id-keyed position `j`'s batch over its codes (every row of the row
