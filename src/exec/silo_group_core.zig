@@ -536,6 +536,9 @@ pub const GroupKeyColumnSpec = struct {
     // a NULL row's payload is skipped (its decoded bytes are an encoding
     // artifact that may differ across batch sources).
     nullable: bool = false,
+    // A string the scan carries as table ids (DESIGN.md §4.6), or a CASE
+    // picking one, packed as an `.int` part holding the id (`IdKeyLanes`).
+    ids: bool = false,
 };
 
 pub const GroupAggregateOp = enum {
@@ -923,7 +926,8 @@ fn sameRowsLayout(a: GroupRowsLayout, b: GroupRowsLayout) bool {
             !std.meta.eql(a.key_columns[key_i].typ, b.key_columns[key_i].typ) or
             a.key_columns[key_i].offset_bits != b.key_columns[key_i].offset_bits or
             a.key_columns[key_i].width_bits != b.key_columns[key_i].width_bits or
-            a.key_columns[key_i].nullable != b.key_columns[key_i].nullable)
+            a.key_columns[key_i].nullable != b.key_columns[key_i].nullable or
+            a.key_columns[key_i].ids != b.key_columns[key_i].ids)
         {
             return false;
         }
@@ -8844,7 +8848,7 @@ fn dictEvalColumn(allocator: Allocator, cfg: RunConfig, scan_schema: []const thi
     var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
     defer filter_reads.deinit(allocator);
     if (cfg.residual_filter) |expr| try thindb.exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
-    var source = (try dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items)) orelse return null;
+    var source = (try dictEvalSource(allocator, scan_schema, cfg.derived, cfg.udf_registry, foldable_buf[0..n_foldable], keys_buf[0..layout.key_columns.len], filter_reads.items, cfg.id_value_columns)) orelse return null;
     // Only a hashed key's staging reads a key's bytes through its codes; a
     // heavy pass reads its lone key's bytes off the batch (`heavyKeyColumn`).
     const heavy = if (cfg.count_sketch) |pass| pass == .heavy_tally or pass == .heavy_filter else false;
@@ -8935,7 +8939,9 @@ pub const DictSource = struct {
 /// columns a residual filter reads (`filter_reads`, scan or derived) stay
 /// whole, as a later derived column's reads do. More than one column takes
 /// a derived column reading a string: the combinations cost a hash per row,
-/// which a string expression evaluated per row dwarfs.
+/// which a string expression evaluated per row dwarfs. A column the scan
+/// carries as table ids (`id_valued`) holds four bytes a row, so an
+/// expression over it is no such string expression.
 pub fn dictEvalSource(
     allocator: Allocator,
     scan_schema: []const thindb.types.Column,
@@ -8944,6 +8950,7 @@ pub fn dictEvalSource(
     foldable: []const []const u8,
     keys: []const []const u8,
     filter_reads: []const []const u8,
+    id_valued: []const []const u8,
 ) !?DictSource {
     for (derived) |d| {
         if (thindb.exec.compute_op.mayVary(d.expr, udf_registry)) return null;
@@ -9004,7 +9011,7 @@ pub fn dictEvalSource(
                 }
                 source.columns[source.strings] = j;
                 source.strings += 1;
-                derived_reads_string = derived_reads_string or read;
+                derived_reads_string = derived_reads_string or (read and !nameListed(id_valued, col.name));
             },
             .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => {
                 // Folded, or read only by pre-evaluated columns.
@@ -9763,10 +9770,86 @@ const BatchKeys = struct {
     }
 };
 
+/// A batch's table-id key parts (`GroupKeyColumnSpec.ids`) as `.int`
+/// columns. A value arrives as its id's four bytes; any other is a CASE's
+/// text constant, which takes the id past every table id: such a CASE keeps
+/// a group's rows on one branch (`idCaseColumn`), so one id stands for all
+/// its constants.
+const IdKeyLanes = struct {
+    lanes: [MAX_GENERIC_GROUP_KEYS]std.ArrayListUnmanaged(i32) = @splat(.empty),
+    values: std.ArrayListUnmanaged(ColumnView) = .empty,
+    schema: std.ArrayListUnmanaged(thindb.types.Column) = .empty,
+    block_dicts: std.ArrayListUnmanaged(?thindb.exec.BlockDictColumn) = .empty,
+
+    const CONSTANT_ID: i32 = storage_mod.table_strings.id_cap + 1;
+
+    fn deinit(self: *IdKeyLanes, allocator: Allocator) void {
+        for (&self.lanes) |*lane| lane.deinit(allocator);
+        self.values.deinit(allocator);
+        self.schema.deinit(allocator);
+        self.block_dicts.deinit(allocator);
+    }
+
+    /// `batch` with `layout`'s id parts as `.int` columns, borrowing this
+    /// scratch until the next call.
+    fn of(self: *IdKeyLanes, allocator: Allocator, layout: GroupRowsLayout, batch: thindb.Batch) !thindb.Batch {
+        try self.values.resize(allocator, batch.values.len);
+        @memcpy(self.values.items, batch.values);
+        try self.schema.resize(allocator, batch.schema.len);
+        @memcpy(self.schema.items, batch.schema);
+        var out = batch;
+        if (batch.block_dicts) |dicts| {
+            try self.block_dicts.resize(allocator, dicts.len);
+            @memcpy(self.block_dicts.items, dicts);
+            out.block_dicts = self.block_dicts.items;
+        }
+        const n = batch.row_count;
+        for (layout.key_columns, 0..) |part, i| {
+            if (!part.ids) continue;
+            const ci = batch.columnIndex(part.name) orelse return error.ColumnNotFound;
+            const lane = &self.lanes[i];
+            try lane.resize(allocator, n);
+            const block = if (batch.block_dicts) |dicts| dicts[ci] else null;
+            if (block != null and block.?.holdsValues() and block.?.codes.len >= n) {
+                const d = block.?;
+                for (lane.items, d.codes[0..n]) |*id, c| id.* = idOf(d.dict.rowBytes(c));
+                self.block_dicts.items[ci] = null;
+            } else {
+                const sv = switch (batch.values[ci].data) {
+                    .string, .varchar => |sv| sv,
+                    else => return error.TypeMismatch,
+                };
+                for (lane.items, 0..) |*id, r| id.* = idOf(sv.rowBytes(r));
+            }
+            self.values.items[ci] = .{ .data = .{ .int = lane.items }, .nulls = batch.values[ci].nulls };
+            self.schema.items[ci].type = .int;
+        }
+        out.values = self.values.items;
+        out.schema = self.schema.items;
+        return out;
+    }
+
+    inline fn idOf(bytes: []const u8) i32 {
+        return if (bytes.len == @sizeOf(u32)) std.mem.bytesToValue(i32, bytes[0..@sizeOf(u32)]) else CONSTANT_ID;
+    }
+
+    inline fn idBits(bytes: []const u8) u32 {
+        return @bitCast(idOf(bytes));
+    }
+};
+
+fn hasIdKeys(layout: GroupRowsLayout) bool {
+    for (layout.key_columns) |part| {
+        if (part.ids) return true;
+    }
+    return false;
+}
+
 /// One grid worker's buffers for a batch's group identities (and their key
 /// lanes), and for a count-sketch pass: the kept spans of run-encoded keys,
 /// and the rows (and identities) a filter pass keeps.
 const SketchScratch = struct {
+    id_keys: IdKeyLanes = .{},
     ids: std.ArrayListUnmanaged(u128) = .empty,
     lanes: std.ArrayListUnmanaged(u128) = .empty,
     kept_ids: std.ArrayListUnmanaged(u128) = .empty,
@@ -9805,6 +9888,7 @@ const SketchScratch = struct {
         self.bin_counts.deinit(allocator);
         for (&self.partial_ints) |*v| v.deinit(allocator);
         for (&self.partial_floats) |*v| v.deinit(allocator);
+        self.id_keys.deinit(allocator);
         self.deinitColumns(allocator);
     }
 
@@ -10172,6 +10256,17 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
     @memset(out, 0);
     for (layout.key_columns, keys.views[0..keys.len]) |part, view| {
         const shift: u7 = @intCast(part.offset_bits);
+        if (part.ids) {
+            const sv = switch (view.data) {
+                .string, .varchar => |sv| sv,
+                else => return error.TypeMismatch,
+            };
+            const valid_bit = if (part.nullable) @as(u128, 1) << @intCast(part.width_bits - 1) else 0;
+            for (out, 0..) |*id, r| {
+                if (view.isValid(r)) id.* |= (@as(u128, IdKeyLanes.idBits(sv.rowBytes(r))) | valid_bit) << shift;
+            }
+            continue;
+        }
         if (part.nullable) {
             const valid_bit = @as(u128, 1) << @intCast(part.width_bits - 1);
             for (out, 0..) |*id, r| {
@@ -10198,9 +10293,11 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
 /// key, so the parts of a hashed key fold together in a multiply each
 /// instead of a digest; the grid digests just the rows the filter pass keeps.
 /// A lone key folds when it's keyed by table id (`sketchIdKeys`): its id
-/// folds for less than its digest costs to gather.
+/// folds for less than its digest costs to gather. A packed key folds when
+/// it packs table ids (`GroupKeyColumnSpec.ids`): they fold as they arrive,
+/// and the grid converts just the kept rows' ids.
 fn foldsSketchKeys(layout: GroupRowsLayout, id_key_columns: []const []const u8) bool {
-    if (!layout.hashed_key) return false;
+    if (!layout.hashed_key and !hasIdKeys(layout)) return false;
     for (layout.key_columns) |part| {
         if (part.nullable) return false;
     }
@@ -10224,7 +10321,12 @@ fn foldSketchKeys(job: SiloGridJob, keys: *const BatchKeys, lo: usize, out: []u1
     const lanes = job.sketch_scratch.lanes.items;
     for (job.shared.group_rows_layout.key_columns, 0..) |part, i| {
         const lane_out = lanes[i * IDENTITY_LANE_ROWS ..][0..out.len];
-        const lane = if (job.shared.sketch_id_keys[i]) idLane(keys.views[i], lo, lane_out) else keyLane(keys.views[i], keys.digests[i], part.typ, lo, lane_out);
+        const lane = if (job.shared.sketch_id_keys[i])
+            idLane(keys.views[i], lo, lane_out)
+        else if (part.ids)
+            idValueLane(keys.views[i], lo, lane_out)
+        else
+            keyLane(keys.views[i], keys.digests[i], part.typ, lo, lane_out);
         if (i == 0) {
             for (out, lane) |*key, bits| key.* = foldSketchPart(0, bits);
         } else {
@@ -10258,6 +10360,20 @@ fn idLane(view: ColumnView, lo: usize, lane: []u128) []const u128 {
     const base = sv.offsets[lo];
     std.debug.assert(sv.offsets[lo + lane.len] - base == lane.len * 4);
     for (lane, 0..) |*p, j| p.* = std.mem.readInt(u32, sv.bytes[base + j * 4 ..][0..4], .native);
+    return lane;
+}
+
+/// Rows `[lo, lo + lane.len)` of a CASE picking an id-keyed column, each an
+/// id's four bytes or a constant, as `IdKeyLanes` reads them.
+fn idValueLane(view: ColumnView, lo: usize, lane: []u128) []const u128 {
+    const sv = switch (view.data) {
+        .string, .varchar => |sv| sv,
+        else => {
+            @memset(lane, 0);
+            return lane;
+        },
+    };
+    for (lane, 0..) |*p, j| p.* = IdKeyLanes.idBits(sv.rowBytes(lo + j));
     return lane;
 }
 
@@ -10608,6 +10724,7 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
     const encoded = job.drive.ptr == @as(*anyopaque, job.scan) and layout.has_weight and !layout.has_rowref and
         !layout.hashed_key and !layout.has_str_payload and layout.columns.len == 0 and
         layout.key_columns.len > 0 and layout.key_columns.len <= MAX_GENERIC_GROUP_KEYS and !job.shared.generic_filter_required;
+    const id_keys = hasIdKeys(layout);
     while (true) {
         const t0 = if (job.profile) platform.nowTicks() else 0;
         if (encoded) {
@@ -10645,8 +10762,11 @@ fn runGridScanBurst(job: SiloGridJob, scan_exhausted: *bool, marked_scan_done: *
             },
             .heavy_filter => |heavy| (try heavyKeptRows(job, job.scan.allocator, heavy, passed.batch, passed.weights)) orelse continue,
         } else passed;
+        // A count sketch reads table ids as they arrive (`batchIdentities`,
+        // `foldSketchKeys`), so only the rows it keeps take theirs as ints.
+        const grouped = if (id_keys) try job.sketch_scratch.id_keys.of(job.scan.allocator, layout, kept.batch) else kept.batch;
         const hashed_ids = if (layout.hashed_key) kept.ids orelse try batchIdentities(job, job.scan.allocator, kept.batch) else null;
-        try appendBatchRawChunks(job.local, job.shared, kept.batch, kept.weights, hashed_ids, job.raw_chunk_rows, job.profile, job.filter_fused);
+        try appendBatchRawChunks(job.local, job.shared, grouped, kept.weights, hashed_ids, job.raw_chunk_rows, job.profile, job.filter_fused);
     }
 
     if (job.raw_group_mode != .off and job.shared.raw_scan_queues.len > 0) {
@@ -11796,8 +11916,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         }
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
-        // A folded tally keys id columns by their ids alone (`sketchIdKeys`).
-        const id_digests = !(tallies and foldsSketchKeys(cfg.group_rows_layout, cfg.id_key_columns));
+        // A folded tally keys id columns by their ids alone (`sketchIdKeys`),
+        // as a packed key does (`GroupKeyColumnSpec.ids`).
+        const id_digests = cfg.group_rows_layout.hashed_key and !(tallies and foldsSketchKeys(cfg.group_rows_layout, cfg.id_key_columns));
         for (cfg.id_key_columns) |name| {
             if (!try scans[i].setIdKeyColumn(name, id_digests)) return error.UnsupportedQueryShape;
         }
@@ -12278,7 +12399,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         );
     } else if (PROFILING and !cfg.quiet) {
         std.debug.print(
-            "[clientip-prof] query={s} DOP={d} scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms mode=silo-grid workers={d} worker_wall={d:.1}ms final_merge={d:.3}ms group_lease_buckets={d} group_lease_rows={d}\n",
+            "[clientip-prof] query={s} DOP={d} scanned={d}/{d} filtered={d} grouped_rows={d} groups={d} total={d:.1}ms mode=silo-grid keys={s} workers={d} worker_wall={d:.1}ms final_merge={d:.3}ms group_lease_buckets={d} group_lease_rows={d}\n",
             .{
                 "generic",
                 n_workers,
@@ -12288,6 +12409,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
                 grouped_rows,
                 group_count,
                 platform.ticksToMs(total_ticks, freq),
+                if (group_rows_layout.hashed_key) "hashed" else if (hasIdKeys(group_rows_layout)) "packed-ids" else "packed",
                 n_workers,
                 platform.ticksToMs(worker_wall_ticks, freq),
                 platform.ticksToMs(final_merge_ticks, freq),
