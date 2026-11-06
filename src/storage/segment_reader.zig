@@ -2033,7 +2033,12 @@ fn readForCode(codes: []const u8, width: u8, row: usize) u64 {
 
 fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u32) ![]T {
     const data = try allocator.alloc(T, row_count);
-    errdefer allocator.free(data);
+    fillFor(T, fb, data);
+    return data;
+}
+
+/// Write `fb`'s values over `data`, a value per row.
+fn fillFor(comptime T: type, fb: ForBlock, data: []T) void {
     const base: T = @intCast(fb.base);
     switch (fb.width) {
         1 => expandWidth(T, u8, base, fb.codes, data),
@@ -2042,7 +2047,6 @@ fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u3
         8 => expandWidth(T, u64, base, fb.codes, data),
         else => unreachable,
     }
-    return data;
 }
 
 /// Reconstruct native values from the narrow unsigned deltas: `out[i] = base +
@@ -2164,11 +2168,67 @@ pub fn decodeRleColumn(
 }
 
 fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u32) ![]T {
+    const data = try allocator.alloc(T, row_count);
+    fillRuns(T, rb, data);
+    return data;
+}
+
+/// Expand an RLE or FOR block of an integer-family column into `buf`, grown
+/// to fit and reused across calls, and view the values there; the view's
+/// nulls alias `raw`. Null for any other encoding or type.
+pub fn expandBlockInto(
+    allocator: Allocator,
+    buf: *std.ArrayListUnmanaged(u64),
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+    encoding: format.Encoding,
+) !?ColumnView {
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    const packed_values: PackedValues = switch (encoding) {
+        .rle => .{ .rle = rleBlockOf(values) },
+        .for_ => .{ .for_ = forBlockOf(values, row_count) },
+        else => return null,
+    };
+    return switch (col_type) {
+        .int => .{ .data = .{ .int = try expandInto(i32, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .date => .{ .data = .{ .date = try expandInto(i32, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .bigint => .{ .data = .{ .bigint = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .datetime => .{ .data = .{ .datetime = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .decimal64 => .{ .data = .{ .decimal64 = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .smallint => .{ .data = .{ .smallint = try expandInto(i16, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .tinyint => .{ .data = .{ .tinyint = try expandInto(i8, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .boolean => .{ .data = .{ .boolean = try expandInto(u8, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        else => null,
+    };
+}
+
+const PackedValues = union(enum) { rle: RleBlock, for_: ForBlock };
+
+fn expandInto(comptime T: type, allocator: Allocator, buf: *std.ArrayListUnmanaged(u64), packed_values: PackedValues, row_count: u32) ![]T {
+    const len = @as(usize, row_count) * @sizeOf(T);
+    try buf.resize(allocator, (len + @sizeOf(u64) - 1) / @sizeOf(u64));
+    const data: []T = std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(buf.items)[0..len]);
+    switch (packed_values) {
+        .rle => |rb| fillRuns(T, rb, data),
+        .for_ => |fb| fillFor(T, fb, data),
+    }
+    return data;
+}
+
+/// Write `rb`'s runs over `data`, a value per row.
+fn fillRuns(comptime T: type, rb: RleBlock, data: []T) void {
     // A run this short is written as one full-width store whose overhang the
     // next run overwrites: runs of a few rows otherwise pay a fill loop each.
     const short = 32 / @sizeOf(T);
-    const data = try allocator.alloc(T, row_count);
-    errdefer allocator.free(data);
+    const row_count = data.len;
     var pos: usize = 0;
     var run: usize = 0;
     while (run < rb.n_runs) : (run += 1) {
@@ -2184,14 +2244,14 @@ fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u3
         pos += len;
         if (pos == row_count) break;
     }
-    return data;
 }
 
 /// Build a BORROWED `ColumnView` over the raw decompressed block bytes —
 /// zero allocation, the view aliases `raw` directly. Used by the scan-side
 /// in-place filter fast path: the view is created over PINNED cache bytes,
 /// used for predicate evaluation + survivor compaction, and dropped within a
-/// single `next()` call. It must never be handed to a downstream operator.
+/// single `next()` call. It must never be handed to a downstream operator
+/// unless its caller keeps the block pinned for as long as the view lives.
 ///
 /// Returns `null` when a typed view can't be formed safely:
 ///   - a `.for_` block: its bytes are narrow deltas, not native-width values,

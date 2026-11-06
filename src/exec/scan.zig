@@ -859,6 +859,9 @@ pub const Scan = struct {
     dict_cols_by_j: []bool = &.{},
     n_dicts: usize = 0,
     dict_bufs: []DictBuf = &.{},
+    /// Per projected column, the fixed-width block `emitRowGroup` holds for
+    /// the batch it last emitted (`holdFixedColumn`).
+    fixed_holds: []FixedHold = &.{},
     /// How many positions emit by table id (`setIdKeyColumn`).
     n_id_keys: usize = 0,
     /// Offsets `4 * i`, which an id-keyed column's values share: each is
@@ -873,6 +876,22 @@ pub const Scan = struct {
     dict_entry_offsets: std.ArrayListUnmanaged(u32) = .empty,
 
     const Phase = enum { segments, memtable, done };
+
+    const FixedHold = struct {
+        /// Pinned until the batch is released.
+        block: ?storage.ReadSegment.BorrowedBlock = null,
+        /// An RLE or FOR block's values, expanded; reused row group to row
+        /// group.
+        expanded: std.ArrayListUnmanaged(u64) = .empty,
+        /// The held block's values, in the cache or in `expanded`.
+        view: ?ColumnView = null,
+
+        fn releaseBlock(self: *FixedHold, allocator: Allocator, cache: storage.cache.TableCache) void {
+            self.view = null;
+            if (self.block) |*b| b.release(allocator, cache);
+            self.block = null;
+        }
+    };
 
     const DictBuf = struct {
         codes: std.ArrayListUnmanaged(u32) = .empty,
@@ -2455,6 +2474,53 @@ pub const Scan = struct {
         }
     }
 
+    /// Holds column `j`'s fixed-width block of row group `rg_idx` for the
+    /// batch `emitRowGroup` emits, in place of an owned copy: a raw block
+    /// viewed where the cache keeps it, an RLE or FOR block expanded into the
+    /// column's reused buffer. False, holding nothing, for any other block.
+    /// Each row group otherwise allocates and fills a fresh copy of every
+    /// such column.
+    fn holdFixedColumn(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32) !bool {
+        const col = self.table.schema.columns[phys];
+        if (heldPlaceholder(col.type) == null) return false;
+        if (self.fixed_holds.len == 0) {
+            self.fixed_holds = try self.allocator.alloc(FixedHold, self.out_phys.len);
+            @memset(self.fixed_holds, .{});
+        }
+        const hold = &self.fixed_holds[j];
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+        var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.cacheRef());
+        errdefer block.release(self.allocator, self.cacheRef());
+        const view = switch (block.encoding) {
+            .raw => storage.segment_reader.viewRawColumn(col.type, block.bytes, rg_count, flags, .raw),
+            else => try storage.segment_reader.expandBlockInto(self.allocator, &hold.expanded, col.type, block.bytes, rg_count, flags, block.encoding),
+        } orelse {
+            block.release(self.allocator, self.cacheRef());
+            return false;
+        };
+        hold.block = block;
+        hold.view = view;
+        return true;
+    }
+
+    /// The decoded slot of a column `holdFixedColumn` holds, which has no
+    /// rows of its own; null for a type it never holds.
+    fn heldPlaceholder(col_type: types.Type) ?storage.OwnedColumn {
+        return switch (col_type) {
+            inline .int, .bigint, .boolean, .float, .double, .date, .datetime, .tinyint, .smallint, .largeint, .decimal64, .decimal128, .uuid, .decimal256 => |_, tag| .{
+                .data = @unionInit(@FieldType(storage.OwnedColumn, "data"), @tagName(tag), &.{}),
+            },
+            else => null,
+        };
+    }
+
+    /// Column `i` of the row group `emitRowGroup` emitted: its held
+    /// block's view, else its decoded copy's.
+    fn emittedView(self: *const Scan, i: usize) ColumnView {
+        if (i < self.fixed_holds.len) if (self.fixed_holds[i].view) |v| return v;
+        return self.decoded[i].view();
+    }
+
     /// Pins column `j`'s block in row group `rg_idx` in `dict_bufs[j]` when
     /// it holds raw strings, viewed in place until the column's next block
     /// replaces it: a dictionary column's raw blocks skip the decode copy,
@@ -2576,6 +2642,8 @@ pub const Scan = struct {
         defer if (owned_accountant) |a| a.releaseOwner(owner_allocator);
         self.releaseBatch();
         self.closeCurSegment();
+        for (self.fixed_holds) |*h| h.expanded.deinit(self.allocator);
+        if (self.fixed_holds.len > 0) self.allocator.free(self.fixed_holds);
         self.allocator.free(self.zero_offsets);
         if (self.mask_buf.len > 0) self.allocator.free(self.mask_buf);
         if (self.mask_buf2.len > 0) self.allocator.free(self.mask_buf2);
@@ -4014,7 +4082,7 @@ pub const Scan = struct {
     /// and advance the cursor. Only the plain projection path uses this.
     fn emitSub(self: *Scan) Batch {
         const n = @min(self.sub_batch_rows, self.sub_count - self.sub_off);
-        for (self.decoded[0..self.views.len], 0..) |c, i| self.views[i] = subView(c.view(), self.sub_off, n);
+        for (0..self.views.len) |i| self.views[i] = subView(self.emittedView(i), self.sub_off, n);
         self.rg_slice = .{ .seg = self.cur_seg_idx, .rg = self.cur_rg_idx - 1, .rows = @intCast(self.sub_count), .offset = @intCast(self.sub_off), .len = @intCast(n) };
         self.sub_off += n;
         return Batch{ .schema = self.out_schema, .values = self.views, .row_count = @intCast(n) };
@@ -4260,6 +4328,8 @@ pub const Scan = struct {
             } else if (measuring and self.len_cols_by_j[j]) {
                 _ = try self.fillByteLengths(seg, self.cur_rg_idx, phys, j, rg_count, null);
                 self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
+            } else if (rg_clean and try self.holdFixedColumn(seg, self.cur_rg_idx, phys, j, rg_count)) {
+                self.decoded[j] = heldPlaceholder(self.table.schema.columns[phys].type).?;
             } else {
                 self.decoded[j] = try seg.decodeColumnMaybeCached(
                     self.allocator,
@@ -4292,7 +4362,7 @@ pub const Scan = struct {
         const masked = try self.applyTombsIfAny(rg_first, rg_count);
         if (masked) |out| return out;
 
-        for (self.decoded, 0..) |c, i| self.views[i] = c.view();
+        for (0..self.decoded.len) |i| self.views[i] = self.emittedView(i);
         if (any_raw) {
             for (self.dict_bufs[0..self.out_phys.len], 0..) |b, j| {
                 const raw = b.raw orelse continue;
@@ -7201,6 +7271,7 @@ pub const Scan = struct {
             for (self.decoded) |*c| self.deinitDecoded(c);
             self.decoded_valid = false;
         }
+        for (self.fixed_holds) |*h| h.releaseBlock(self.allocator, self.cacheRef());
         self.sub_off = 0;
         self.sub_count = 0;
         self.pending_rows = &.{};
