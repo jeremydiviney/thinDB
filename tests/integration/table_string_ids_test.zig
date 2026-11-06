@@ -367,6 +367,14 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
         "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY c DESC LIMIT 4",
         "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 2 GROUP BY tag ORDER BY c DESC, tag LIMIT 20",
         "SELECT tag, COUNT(DISTINCT url) AS d FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY d DESC, tag LIMIT 5",
+        // CASE keys picking `url` or a constant: 'u5' is also a url, which a
+        // condition over the other keys keeps in groups apart.
+        "SELECT tag, CASE WHEN tag = 'tag1' THEN url ELSE 'u5' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT tag, CASE WHEN tag = 'tag0' THEN url WHEN tag = 'tag1' THEN '' ELSE url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT id, CASE WHEN id < 500 THEN url ELSE '' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY id, u ORDER BY c DESC, id LIMIT 10",
+        "SELECT CASE WHEN id % 2 = 0 THEN url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
+        // Here a row of either branch may hold 'u5', so the key reads bytes.
+        "SELECT CASE WHEN id % 2 = 0 THEN url ELSE 'u5' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
     };
     // Memtable rows, then tombstones, rule the ids out.
     const Step = struct { changes: []const []const u8 = &.{}, flush: bool = false };

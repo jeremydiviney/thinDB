@@ -1022,6 +1022,7 @@ fn runHarness(
     // the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
     var id_key_cols_buf: [8][]const u8 = undefined;
+    var id_value_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
     if (shape.hashed) {
         outer: for (shape.group_key_inputs) |input| {
@@ -1117,6 +1118,7 @@ fn runHarness(
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
         .id_key_columns = try idKeyColumns(table, snapshot, shape, params, hash_key_cols_buf[0..n_hash_keys], &id_key_cols_buf),
+        .id_value_columns = try idValueColumns(allocator, table, snapshot, shape, params, derived, residual_filter, &id_value_cols_buf),
         .byte_length_columns = length_cols_buf[0..n_length_cols],
         .key_digest_mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - params.key_digest_bits),
     };
@@ -1152,6 +1154,141 @@ fn idKeyColumns(table: *api.Table, snapshot: exec.Scan.Snapshot, shape: Shape, p
         n += 1;
     }
     return buf[0..n];
+}
+
+/// The columns the run reads by table id (DESIGN.md §4.6) for the CASE
+/// group keys that pick them (`idCaseColumn`), listed in `buf`: columns
+/// `idKeyColumns` would take, which nothing else reads. Such a key compares
+/// a picked value by its id's four bytes and a constant by its own bytes;
+/// the result recomputes it from the values read back by rowref.
+fn idValueColumns(
+    allocator: Allocator,
+    table: *api.Table,
+    snapshot: exec.Scan.Snapshot,
+    shape: Shape,
+    params: Params,
+    derived: []const exec.Derived,
+    residual_filter: ?exec.PredicateExpr,
+    buf: *[8][]const u8,
+) ![]const []const u8 {
+    if (!params.table_id_keys or !shape.hashed or shape.key_bound != null) return &.{};
+    var n: usize = 0;
+    outer: for (derived) |d| {
+        const name = (try idCaseColumn(allocator, shape, derived, residual_filter, d)) orelse continue;
+        for (buf[0..n]) |listed| {
+            if (types.columnNameEql(listed, name)) continue :outer;
+        }
+        if (n == buf.len) break;
+        const col_idx = types.findColumn(table.schema.columns, name) orelse continue;
+        const col = table.schema.columns[col_idx];
+        if (col.nullable) continue;
+        switch (col.type) {
+            .varchar, .string => {},
+            else => continue,
+        }
+        for (derived) |other| {
+            if (try idCaseColumn(allocator, shape, derived, residual_filter, other)) |picked| {
+                if (types.columnNameEql(picked, name)) continue;
+            }
+            if (derivedReadsColumn(allocator, other, name) catch true) continue :outer;
+        }
+        for (shape.group_key_inputs) |input| {
+            if (types.columnNameEql(input.name, name)) continue :outer;
+        }
+        for (shape.aggregate_inputs) |ai| {
+            if (types.columnNameEql(ai.source_name, name)) continue :outer;
+        }
+        for (shape.string_aggregate_inputs) |si| {
+            if (types.columnNameEql(si.source_name, name)) continue :outer;
+        }
+        if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, name)) continue;
+        if (try exec.table_id_distinct.readable(table, snapshot, col_idx) == null) continue;
+        buf[n] = name;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// The column group key `d` picks, when it's a CASE read only as a key
+/// whose every value (the ELSE's too, NULL when absent) is that one column
+/// or a constant, and whose conditions don't read the column. A text
+/// constant equals a picked value of the same bytes, which its id can't
+/// show, so it needs every row of a group to take one branch: conditions
+/// that read only plain group keys, each grouping rows of one stored value
+/// alone. No picked value is NULL (`idValueColumns`), so a NULL is no tie.
+fn idCaseColumn(allocator: Allocator, shape: Shape, derived: []const exec.Derived, residual_filter: ?exec.PredicateExpr, d: exec.Derived) !?[]const u8 {
+    const cs = switch (d.expr) {
+        .case => |c| c,
+        else => return null,
+    };
+    for (shape.group_key_inputs) |input| {
+        if (types.columnNameEql(input.name, d.name)) break;
+    } else return null;
+    for (shape.aggregate_inputs) |ai| {
+        if (types.columnNameEql(ai.source_name, d.name)) return null;
+    }
+    for (shape.string_aggregate_inputs) |si| {
+        if (types.columnNameEql(si.source_name, d.name)) return null;
+    }
+    if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, d.name)) return null;
+    for (derived) |other| {
+        if (try derivedReadsColumn(allocator, other, d.name)) return null;
+    }
+    var column: ?[]const u8 = null;
+    var text_constants = false;
+    for (cs.branches) |b| {
+        if (!casePick(b.then, &column, &text_constants)) return null;
+    }
+    if (cs.else_branch) |e| if (!casePick(e.*, &column, &text_constants)) return null;
+    const name = column orelse return null;
+    if (types.columnNameEql(d.name, name)) return null;
+    var reads: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer reads.deinit(allocator);
+    for (cs.branches) |b| try exec.expr_mod.collectCaseConditionRefs(allocator, &reads, cs, b.cond);
+    for (cs.operands) |o| try exec.compute_op.collectColumnRefs(allocator, &reads, o.expr);
+    for (reads.items) |r| {
+        if (types.columnNameEql(r, name)) return null;
+        if (text_constants and !groupsByStoredValue(shape, derived, r)) return null;
+    }
+    return name;
+}
+
+/// Folds CASE value `e` into the column the CASE picks and whether it has a
+/// text constant; false when it's anything else, or a second column.
+fn casePick(e: exec.Expr, column: *?[]const u8, text_constants: *bool) bool {
+    switch (e) {
+        .col_ref => |name| {
+            if (column.*) |c| return types.columnNameEql(c, name);
+            column.* = name;
+            return true;
+        },
+        .lit => |v| switch (v) {
+            .text => {
+                text_constants.* = true;
+                return true;
+            },
+            else => return false,
+        },
+        .null_lit => return true,
+        else => return false,
+    }
+}
+
+/// Whether `name` is a plain group key whose rows in one group hold one
+/// stored value: no derived column, and no float, whose equal keys (0 and
+/// -0) may hold values a condition tells apart.
+fn groupsByStoredValue(shape: Shape, derived: []const exec.Derived, name: []const u8) bool {
+    for (derived) |d| {
+        if (types.columnNameEql(d.name, name)) return false;
+    }
+    for (shape.group_key_inputs) |input| {
+        if (!types.columnNameEql(input.name, name)) continue;
+        return switch (input.source_type) {
+            .float, .double => false,
+            else => true,
+        };
+    }
+    return false;
 }
 
 fn snapshotRows(snapshot: exec.Scan.Snapshot) u64 {

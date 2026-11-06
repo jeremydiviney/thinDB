@@ -11139,6 +11139,10 @@ pub const RunConfig = struct {
     // checked that the snapshot's segments store the ids
     // (`table_id_distinct.readable`).
     id_key_columns: []const []const u8 = &.{},
+    // Columns every worker scan of every pass emits as their table ids
+    // alone, for the CASE group keys that pick them: such a key compares a
+    // picked value by its id's four bytes. Checked as `id_key_columns` are.
+    id_value_columns: []const []const u8 = &.{},
     /// Keeps only these bits of each hashed key's digest where a row takes
     /// its staged key, so keys collide as often as a digest this narrow
     /// collides: a test of exact group keys under real collisions.
@@ -11796,6 +11800,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         const id_digests = !(tallies and foldsSketchKeys(cfg.group_rows_layout, cfg.id_key_columns));
         for (cfg.id_key_columns) |name| {
             if (!try scans[i].setIdKeyColumn(name, id_digests)) return error.UnsupportedQueryShape;
+        }
+        for (cfg.id_value_columns) |name| {
+            if (!try scans[i].setIdKeyColumn(name, false)) return error.UnsupportedQueryShape;
         }
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
         if (cfg.count_sketch) |pass| switch (pass) {
