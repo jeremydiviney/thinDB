@@ -375,6 +375,12 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
         "SELECT CASE WHEN id % 2 = 0 THEN url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
         // Here a row of either branch may hold 'u5', so the key reads bytes.
         "SELECT CASE WHEN id % 2 = 0 THEN url ELSE 'u5' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY u ORDER BY c DESC, u LIMIT 10",
+        // Keys packing their ids: 'u100' is a url as wide as an id; a NULL
+        // branch; 128 bits exactly; and past 128 bits, hashed instead.
+        "SELECT tag, CASE WHEN tag = 'tag1' THEN url ELSE 'u100' END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT tag, CASE WHEN id % 2 = 0 THEN url END AS u, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY tag, u ORDER BY c DESC, tag, u LIMIT 12",
+        "SELECT id % 5 AS m, tag, url, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY m, tag, url ORDER BY c DESC, m, tag, url LIMIT 12",
+        "SELECT id, id + 1 AS n, url, COUNT(*) AS c FROM {s} WHERE id % 7 <> 3 GROUP BY id, n, url ORDER BY c DESC, id LIMIT 10",
     };
     // Memtable rows, then tombstones, rule the ids out.
     const Step = struct { changes: []const []const u8 = &.{}, flush: bool = false };
