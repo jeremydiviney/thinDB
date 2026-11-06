@@ -543,6 +543,8 @@ pub const Params = struct {
     /// Group string keys by table id where the segments store them
     /// (`SiloCore.RunConfig.id_key_columns`).
     table_id_keys: bool = true,
+    /// Pack keys of integers and table ids as integer keys (`packedIdKeys`).
+    packed_id_keys: bool = true,
 };
 
 pub const RunRequest = struct {
@@ -618,6 +620,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
         .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 64), 1), 64)),
         .table_id_keys = envUsize("THINDB_V2_NO_TABLE_ID_KEYS", 0) == 0,
+        .packed_id_keys = envUsize("THINDB_V2_NO_PACKED_ID_KEYS", 0) == 0,
     };
 }
 
@@ -767,6 +770,7 @@ fn dictionaryCollapses(
     derived: []const exec.Derived,
     udf_registry: ?*const @import("../udf.zig").UdfRegistry,
     residual_filter: ?exec.PredicateExpr,
+    id_valued: []const []const u8,
 ) !bool {
     var foldable: std.ArrayListUnmanaged([]const u8) = .empty;
     defer foldable.deinit(allocator);
@@ -792,7 +796,7 @@ fn dictionaryCollapses(
     var filter_reads: std.ArrayListUnmanaged([]const u8) = .empty;
     defer filter_reads.deinit(allocator);
     if (residual_filter) |expr| try exec.predicate.collectColumnNames(allocator, &filter_reads, expr);
-    const source = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items, keys.items, filter_reads.items)) orelse return false;
+    const source = (try SiloCore.dictEvalSource(allocator, columns.items, derived, udf_registry, foldable.items, keys.items, filter_reads.items, id_valued)) orelse return false;
     if (derived.len == 0) return true;
     for (source.columns[0..source.strings]) |j| {
         if (try exec.compute_op.readsOnlyByteLength(allocator, derived, columns.items[j].name)) return false;
@@ -818,9 +822,44 @@ fn runHarness(
     rows: *std.ArrayListUnmanaged(SiloCore.TopRow),
     workspace: *SiloCore.SiloGridWorkspace,
 ) !void {
+    // Scan-side key digests: a string group key nothing else reads takes its
+    // digests off the cached block (`SiloCore.RunConfig.hash_key_columns`).
+    // Excluded when the column is also an aggregate input or read by a
+    // derived expression or the residual filter (those need real bytes in
+    // the batch).
+    var hash_key_cols_buf: [8][]const u8 = undefined;
+    var n_hash_keys: usize = 0;
+    if (shape.hashed) {
+        outer: for (shape.group_key_inputs) |input| {
+            switch (input.source_type) {
+                .varchar, .string, .char, .json, .nested, .bitmap => {},
+                else => continue,
+            }
+            for (shape.aggregate_inputs) |ai| {
+                if (types.columnNameEql(ai.source_name, input.name)) continue :outer;
+            }
+            for (shape.string_aggregate_inputs) |si| {
+                if (types.columnNameEql(si.source_name, input.name)) continue :outer;
+            }
+            for (derived) |d| {
+                if (types.columnNameEql(d.name, input.name)) continue :outer;
+                if (derivedReadsColumn(allocator, d, input.name) catch true) continue :outer;
+            }
+            if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, input.name)) continue :outer;
+            hash_key_cols_buf[n_hash_keys] = input.name;
+            n_hash_keys += 1;
+        }
+    }
+    var id_key_cols_buf: [8][]const u8 = undefined;
+    const id_key_columns = try idKeyColumns(table, snapshot, shape, params, hash_key_cols_buf[0..n_hash_keys], &id_key_cols_buf);
+    var id_value_cols_buf: [8][]const u8 = undefined;
+    const id_value_columns = try idValueColumns(allocator, table, snapshot, shape, params, derived, residual_filter, &id_value_cols_buf);
+
     var group_key_columns_buf: [8]SiloCore.GroupKeyColumnSpec = undefined;
     if (shape.group_key_inputs.len > group_key_columns_buf.len) return error.UnsupportedOperatorForType;
-    for (shape.group_key_inputs, 0..) |input, i| {
+    const packed_id_bits = if (shape.hashed and params.packed_id_keys) try packedIdKeys(allocator, shape, derived, residual_filter, id_key_columns, id_value_columns, &group_key_columns_buf) else null;
+    const hashed = shape.hashed and packed_id_bits == null;
+    if (packed_id_bits == null) for (shape.group_key_inputs, 0..) |input, i| {
         group_key_columns_buf[i] = .{
             .name = input.name,
             .typ = input.source_type,
@@ -828,7 +867,7 @@ fn runHarness(
             .width_bits = input.width_bits,
             .nullable = input.nullable,
         };
-    }
+    };
     var group_columns_buf: [16]SiloCore.GroupColumnSpec = undefined;
     if (shape.aggregate_inputs.len > group_columns_buf.len) return error.UnsupportedOperatorForType;
     var n_valid_lanes: u16 = 0;
@@ -954,7 +993,7 @@ fn runHarness(
         // as does a program whose rows collapse per dictionary value.
         if (shape.aggregate_inputs.len != 0 and shape.string_aggregate_inputs.len == 0 and
             !keyColumnsRunStructured(table, snapshot.segments, group_key_columns_buf[0..shape.group_key_inputs.len]) and
-            !(params.distinct_eval and try dictionaryCollapses(allocator, table, shape, scan_columns, derived, udf_registry, residual_filter))) break :blk false;
+            !(params.distinct_eval and try dictionaryCollapses(allocator, table, shape, scan_columns, derived, udf_registry, residual_filter, id_value_columns))) break :blk false;
         break :blk true;
     };
     // Weighted staged columns carry RUN PARTIALS, not row values: widen to
@@ -993,58 +1032,28 @@ fn runHarness(
     for (shape.aggregate_program) |agg| {
         if (agg.is_concat) has_concat = true;
     }
-    if (shape.hashed) {
+    if (hashed) {
         if (n_str_columns == group_str_columns_buf.len) return error.UnsupportedOperatorForType;
         group_str_columns_buf[n_str_columns] = .{ .source_name = group_key_columns_buf[0].name };
         n_str_columns += 1;
     }
     const group_rows_layout = SiloCore.GroupRowsLayout{
-        .key_width = if (shape.hashed) .u64 else harnessKeyWidth(shape.key_width),
+        .key_width = if (hashed) .u64 else if (packed_id_bits) |bits| harnessKeyWidth(KeyWidth.fromBits(bits)) else harnessKeyWidth(shape.key_width),
         .key_columns = group_key_columns_buf[0..shape.group_key_inputs.len],
         .columns = group_columns_buf[0..n_columns],
         .aggregates = group_aggregates_buf[0..shape.aggregate_program.len],
         .str_columns = group_str_columns_buf[0..n_str_columns],
-        .has_str_payload = shape.string_aggregate_inputs.len > 0 or shape.hashed,
+        .has_str_payload = shape.string_aggregate_inputs.len > 0 or hashed,
         .distinct_slot_count = distinct_slot_count,
         // GROUP_CONCAT carries per-row rowrefs (emission order) even under
-        // packed keys; only shape.hashed makes the key itself a hash.
+        // packed keys, as do packed table ids, whose values the result reads
+        // back as a hashed key's; only `hashed` makes the key itself a hash.
         .has_rowref = shape.hashed or has_concat,
-        .hashed_key = shape.hashed,
+        .hashed_key = hashed,
         .has_concat = has_concat,
         .has_weight = weight_mode,
         .has_udf = has_udf,
     };
-
-    // Scan-side key digests: a string group key nothing else reads takes its
-    // digests off the cached block (`SiloCore.RunConfig.hash_key_columns`).
-    // Excluded when the column is also an aggregate input or read by a
-    // derived expression or the residual filter (those need real bytes in
-    // the batch).
-    var hash_key_cols_buf: [8][]const u8 = undefined;
-    var id_key_cols_buf: [8][]const u8 = undefined;
-    var id_value_cols_buf: [8][]const u8 = undefined;
-    var n_hash_keys: usize = 0;
-    if (shape.hashed) {
-        outer: for (shape.group_key_inputs) |input| {
-            switch (input.source_type) {
-                .varchar, .string, .char, .json, .nested, .bitmap => {},
-                else => continue,
-            }
-            for (shape.aggregate_inputs) |ai| {
-                if (types.columnNameEql(ai.source_name, input.name)) continue :outer;
-            }
-            for (shape.string_aggregate_inputs) |si| {
-                if (types.columnNameEql(si.source_name, input.name)) continue :outer;
-            }
-            for (derived) |d| {
-                if (types.columnNameEql(d.name, input.name)) continue :outer;
-                if (derivedReadsColumn(allocator, d, input.name) catch true) continue :outer;
-            }
-            if (residual_filter) |expr| if (exec.predicate.touchesColumn(expr, input.name)) continue :outer;
-            hash_key_cols_buf[n_hash_keys] = input.name;
-            n_hash_keys += 1;
-        }
-    }
 
     // Scan-side byte lengths: a column the derived expressions read only
     // through `octet_length` (and no key, aggregate or residual filter
@@ -1116,9 +1125,10 @@ fn runHarness(
         // The arena path frees the whole arena synchronously right after the
         // run — a detached free racing it would be use-after-free.
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
-        .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
-        .id_key_columns = try idKeyColumns(table, snapshot, shape, params, hash_key_cols_buf[0..n_hash_keys], &id_key_cols_buf),
-        .id_value_columns = try idValueColumns(allocator, table, snapshot, shape, params, derived, residual_filter, &id_value_cols_buf),
+        // Packed table ids arrive as ids alone, never as digests.
+        .hash_key_columns = if (hashed) hash_key_cols_buf[0..n_hash_keys] else &.{},
+        .id_key_columns = id_key_columns,
+        .id_value_columns = id_value_columns,
         .byte_length_columns = length_cols_buf[0..n_length_cols],
         .key_digest_mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - params.key_digest_bits),
     };
@@ -1129,7 +1139,7 @@ fn runHarness(
         snapshotRows(snapshot) <= std.math.maxInt(u32) and
         !group_rows_layout.has_concat and !group_rows_layout.has_udf)
     {
-        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, n_hash_keys == 1, rows)) return;
+        if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, hashed and n_hash_keys == 1, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
 }
@@ -1207,6 +1217,66 @@ fn idValueColumns(
         n += 1;
     }
     return buf[0..n];
+}
+
+/// The group keys of a hashed `shape` packed into `out`, and their width in
+/// bits, when every key is an integer or a string the run reads as table ids
+/// (`id_keys`, or a CASE picking one of `id_values`) and they fit 128 bits.
+/// Equal ids are equal values, so the packed values are the key, as an
+/// integer key's are, with no digest to place it and no bytes to confirm it.
+/// Each id packs as an `.int` part (`SiloCore.GroupKeyColumnSpec.ids`). Null
+/// when any key is anything else.
+fn packedIdKeys(
+    allocator: Allocator,
+    shape: Shape,
+    derived: []const exec.Derived,
+    residual_filter: ?exec.PredicateExpr,
+    id_keys: []const []const u8,
+    id_values: []const []const u8,
+    out: *[8]SiloCore.GroupKeyColumnSpec,
+) !?u16 {
+    if (id_keys.len + id_values.len == 0) return null;
+    // A lone string key a count sketch may rank stays hashed: its digest is
+    // the identity the heavy keys tally and the segment top-K key on.
+    if (shape.group_key_inputs.len < 2 and shape.count_sketch) return null;
+    var bits: u16 = 0;
+    for (shape.group_key_inputs, 0..) |input, i| {
+        const typ: types.Type, const ids = switch (input.source_type) {
+            .boolean, .tinyint, .smallint, .int, .date, .bigint, .datetime, .decimal64 => .{ input.source_type, false },
+            .varchar, .string => ids: {
+                if (!nameListed(id_keys, input.name) and !try picksIdValue(allocator, shape, derived, residual_filter, id_values, input.name)) return null;
+                break :ids .{ .int, true };
+            },
+            else => return null,
+        };
+        const width: u16 = @as(u16, switch (typ) {
+            .boolean, .tinyint => 8,
+            .smallint => 16,
+            .int, .date => 32,
+            else => 64,
+        }) + @intFromBool(input.nullable);
+        if (bits + width > 128) return null;
+        out[i] = .{ .name = input.name, .typ = typ, .offset_bits = @intCast(bits), .width_bits = @intCast(width), .nullable = input.nullable, .ids = ids };
+        bits += width;
+    }
+    return bits;
+}
+
+/// Whether group key `name` is a CASE that picks a column of `id_values`.
+fn picksIdValue(allocator: Allocator, shape: Shape, derived: []const exec.Derived, residual_filter: ?exec.PredicateExpr, id_values: []const []const u8, name: []const u8) !bool {
+    for (derived) |d| {
+        if (!types.columnNameEql(d.name, name)) continue;
+        const picked = (try idCaseColumn(allocator, shape, derived, residual_filter, d)) orelse return false;
+        return nameListed(id_values, picked);
+    }
+    return false;
+}
+
+fn nameListed(names: []const []const u8, name: []const u8) bool {
+    for (names) |listed| {
+        if (types.columnNameEql(listed, name)) return true;
+    }
+    return false;
 }
 
 /// The column group key `d` picks, when it's a CASE read only as a key
