@@ -328,6 +328,69 @@ pub const ReadSegment = struct {
         return .{ .pages = .{ .seg = self, .allocator = allocator, .table = table, .c = c, .with_bytes = true } };
     }
 
+    /// The table id (DESIGN.md §4.6) of each segment id of column
+    /// `column_idx`'s string table, owned by the caller; null when the
+    /// segment carries none for the column.
+    pub fn tableIds(self: ReadSegment, allocator: Allocator, column_idx: usize) !?[]u32 {
+        const table = self.info.stringTable(column_idx) orelse return null;
+        if (table.table_ids.length == 0) return null;
+        const payload = try self.readTableIds(allocator, allocator, table);
+        defer allocator.free(payload);
+        const ids = try allocator.alloc(u32, table.value_count);
+        for (ids, 0..) |*id, i| id.* = format.readU32(payload[i * 4 ..][0..4]);
+        return ids;
+    }
+
+    /// `tableIds` through the cache, held until `TableIds.release`; null
+    /// when the segment carries none for the column.
+    pub fn cachedTableIds(self: ReadSegment, column_idx: usize, c: storage_cache.TableCache) !?TableIds {
+        const table = self.info.stringTable(column_idx) orelse return null;
+        if (table.table_ids.length == 0) return null;
+        const key = storage_cache.Key{
+            .table_uid = c.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = 0,
+            .column_idx = @intCast(column_idx),
+            .content = .table_ids,
+        };
+        const entry = switch (try c.cache.claimAfterFill(self.io, key)) {
+            .hit => |entry| entry,
+            .fill => |fill| miss: {
+                defer c.cache.endFill(self.io, fill);
+                const payload = try self.readTableIds(c.cache.blockAllocator(), self.allocator, table);
+                errdefer c.cache.blockAllocator().free(payload);
+                break :miss try c.cache.insertPinned(key, payload, .raw);
+            },
+        };
+        return .{ .ids = std.mem.bytesAsSlice(u32, entry.bytes), .entry = entry, .cache = c.cache };
+    }
+
+    /// A segment string table's table ids, pinned in the cache.
+    pub const TableIds = struct {
+        /// Little-endian, as stored.
+        ids: []align(1) const u32,
+        entry: *storage_cache.Cache.Entry,
+        cache: *storage_cache.Cache,
+
+        pub fn release(self: TableIds) void {
+            self.cache.release(self.entry);
+        }
+    };
+
+    /// The decompressed payload of `table`'s table-ids block, from
+    /// `out_allocator`; `scratch` holds the stored frame.
+    fn readTableIds(self: ReadSegment, out_allocator: Allocator, scratch: Allocator, table: format.StringTable) ![]align(16) u8 {
+        const block = table.table_ids;
+        const frame = try scratch.alloc(u8, block.length);
+        defer scratch.free(frame);
+        if (try self.file.readPositionalAll(self.io, frame, block.offset) != frame.len) return format.Error.UnexpectedEof;
+        try checkFrame(frame);
+        const payload = try out_allocator.alignedAlloc(u8, .@"16", @as(usize, table.value_count) * 4);
+        errdefer out_allocator.free(payload);
+        try decompressBlockInto(scratch, frame, payload);
+        return payload;
+    }
+
     /// Row group `row_group_idx`'s block parts of column `column_idx`, when
     /// the column's string table took the row group.
     fn stringBlockParts(self: ReadSegment, row_group_idx: usize, column_idx: usize) ?format.StringBlockParts {
@@ -1240,7 +1303,7 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
             return format.Error.CorruptFooter;
         }
         const parts_len = std.enums.values(format.StringBlockPart).len * 4;
-        if (bytes.len < off + @as(usize, page_count) * 16 + row_groups.len * parts_len) return format.Error.CorruptFooter;
+        if (bytes.len < off + @as(usize, page_count) * 16 + row_groups.len * parts_len + 12) return format.Error.CorruptFooter;
         const pages = try allocator.alloc(format.SharedPage, page_count);
         errdefer allocator.free(pages);
         for (pages) |*p| {
@@ -1261,7 +1324,9 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
             if (!b.isSplit() and b.total() != 0) return format.Error.CorruptFooter;
             if (b.isSplit() and b.total() != rg.col_lengths[column_idx]) return format.Error.CorruptFooter;
         }
-        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages, .blocks = blocks };
+        const table_ids: format.TableIdsBlock = .{ .offset = format.readU64(bytes[off..][0..8]), .length = format.readU32(bytes[off + 8 ..][0..4]) };
+        off += 12;
+        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages, .blocks = blocks, .table_ids = table_ids };
         inited += 1;
     }
     if (off != bytes.len) return format.Error.CorruptFooter;

@@ -2,7 +2,7 @@
 //! write-tmp-then-rename so readers either see the old or new state, never a
 //! partial state.
 //!
-//! Format (v11, binary, little-endian; v10 remains readable):
+//! Format (v12, binary, little-endian; v10 and v11 remain readable):
 //!
 //!   [Header — 56 bytes]
 //!     magic "tDBM"            (4)
@@ -33,12 +33,20 @@
 //!                              across segments for cardinality-based GROUP BY
 //!                              routing; all-zero ⟺ no sketch)
 //!
+//!   [String ids — v12]
+//!     column_count u32        (4)
+//!     For each string column taking table ids (DESIGN.md §4.6):
+//!       column_idx u32        (4)
+//!       id_count u32          (4) — ids its list held at publication
+//!       flags u32             (4) — bit 0 = closed
+//!
 //!   [Trailer]
 //!     magic "tDBM"            (4)
 //!
 //! The v10 header has no WAL checkpoint. v11 adds a 16-byte WAL generation
 //! followed by the covered physical offset (u64), so manifest publication
 //! makes recovery independent of whether subsequent WAL cleanup succeeds.
+//! v12 adds the string-id section.
 
 const std = @import("std");
 const Io = std.Io;
@@ -49,8 +57,8 @@ const hll = @import("../util/hll.zig");
 const types = @import("../types.zig");
 
 pub const manifest_magic: [4]u8 = .{ 't', 'D', 'B', 'M' };
-// v11 retains v10's fixed entries and adds the WAL checkpoint to its header.
-pub const manifest_version: u16 = 11;
+// v12 retains v11's header and fixed entries and adds the string-id section.
+pub const manifest_version: u16 = 12;
 pub const manifest_filename = "manifest";
 pub const manifest_tmp_filename = "manifest.tmp";
 pub const header_size: usize = 56;
@@ -68,6 +76,16 @@ pub const trailer_size: usize = 4;
 
 /// Per-entry flag bits.
 const flag_leading_key_stats: u32 = 1 << 0;
+const string_ids_entry_size: usize = 12;
+const flag_string_ids_closed: u32 = 1 << 0;
+
+/// One string column's table-id list as a manifest publishes it: the ids
+/// its segments may reference, or closed, when they reference none.
+pub const StringIdState = struct {
+    column_idx: u32,
+    id_count: u32,
+    closed: bool,
+};
 
 pub const Error = error{
     ManifestTooSmall,
@@ -163,7 +181,8 @@ pub const Manifest = struct {
     }
 };
 
-pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
+/// `string_ids` is the table's `table_strings.TableStrings.persist` result.
+pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, string_ids: []const StringIdState, sync: bool) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(m.allocator);
 
@@ -229,6 +248,13 @@ pub fn writeManifest(io: Io, dir: Io.Dir, m: Manifest, sync: bool) !void {
         // entries at table open.
     }
 
+    try appendU32(m.allocator, &buf, @intCast(string_ids.len));
+    for (string_ids) |s| {
+        try appendU32(m.allocator, &buf, s.column_idx);
+        try appendU32(m.allocator, &buf, s.id_count);
+        try appendU32(m.allocator, &buf, if (s.closed) flag_string_ids_closed else 0);
+    }
+
     try buf.appendSlice(m.allocator, &manifest_magic);
 
     try @import("storage.zig").writeFileAtomic(io, dir, manifest_tmp_filename, manifest_filename, buf.items, sync);
@@ -240,8 +266,25 @@ pub fn readManifest(
     dir: Io.Dir,
     schema_fingerprint: u64,
 ) !Manifest {
+    const read = try readManifestWithStringIds(allocator, io, dir, schema_fingerprint);
+    allocator.free(read.string_ids);
+    return read.manifest;
+}
+
+pub const ManifestRead = struct {
+    manifest: Manifest,
+    /// Owned by the caller; empty before v12.
+    string_ids: []StringIdState,
+};
+
+pub fn readManifestWithStringIds(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    schema_fingerprint: u64,
+) !ManifestRead {
     const bytes = dir.readFileAlloc(io, manifest_filename, allocator, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return Manifest.empty(allocator, schema_fingerprint, 0),
+        error.FileNotFound => return .{ .manifest = Manifest.empty(allocator, schema_fingerprint, 0), .string_ids = &.{} },
         else => return err,
     };
     defer allocator.free(bytes);
@@ -250,7 +293,7 @@ pub fn readManifest(
     if (!std.mem.eql(u8, bytes[0..4], &manifest_magic)) return Error.ManifestBadMagic;
 
     const version = format.readU16(bytes[4..6]);
-    if (version != 10 and version != manifest_version) return Error.ManifestUnsupportedVersion;
+    if (version < 10 or version > manifest_version) return Error.ManifestUnsupportedVersion;
     const actual_header_size: usize = if (version == 10) legacy_header_size else header_size;
     if (bytes.len < actual_header_size + trailer_size) return Error.ManifestTooSmall;
 
@@ -268,7 +311,14 @@ pub fn readManifest(
     // Entries are fixed-size again in v10 (blooms moved to sidecar files),
     // so the total is exact.
     const entry_size: usize = entry_prefix_size + @as(usize, column_count) * (stats_slot_size + sketch_slot_size);
-    const want_size: usize = actual_header_size + @as(usize, count) * entry_size + trailer_size;
+    const entries_end: usize = actual_header_size + @as(usize, count) * entry_size;
+    var string_id_count: usize = 0;
+    if (version >= 12) {
+        if (bytes.len < entries_end + 4 + trailer_size) return Error.ManifestCorrupt;
+        string_id_count = format.readU32(bytes[entries_end..][0..4]);
+    }
+    const string_ids_size: usize = if (version >= 12) 4 + string_id_count * string_ids_entry_size else 0;
+    const want_size: usize = entries_end + string_ids_size + trailer_size;
     if (bytes.len != want_size) return Error.ManifestCorrupt;
 
     if (!std.mem.eql(u8, bytes[bytes.len - 4 .. bytes.len], &manifest_magic)) {
@@ -340,13 +390,26 @@ pub fn readManifest(
         segments.appendAssumeCapacity(entry);
     }
 
-    return Manifest{
-        .allocator = allocator,
-        .schema_fingerprint = schema_fingerprint,
-        .column_count = column_count,
-        .auto_inc_next = auto_inc_next,
-        .wal_checkpoint = checkpoint,
-        .segments = segments,
+    const string_ids = try allocator.alloc(StringIdState, string_id_count);
+    for (string_ids, 0..) |*s, k| {
+        const at = entries_end + 4 + k * string_ids_entry_size;
+        s.* = .{
+            .column_idx = format.readU32(bytes[at..][0..4]),
+            .id_count = format.readU32(bytes[at + 4 ..][0..4]),
+            .closed = format.readU32(bytes[at + 8 ..][0..4]) & flag_string_ids_closed != 0,
+        };
+    }
+
+    return .{
+        .manifest = .{
+            .allocator = allocator,
+            .schema_fingerprint = schema_fingerprint,
+            .column_count = column_count,
+            .auto_inc_next = auto_inc_next,
+            .wal_checkpoint = checkpoint,
+            .segments = segments,
+        },
+        .string_ids = string_ids,
     };
 }
 
@@ -471,7 +534,7 @@ test "manifest round-trips with entries" {
         .leading_key_stats = null,
     });
 
-    try writeManifest(io, tmp.dir, written, false);
+    try writeManifest(io, tmp.dir, written, &.{}, false);
 
     var read = try readManifest(allocator, io, tmp.dir, 0xABCDEF);
     defer read.deinit();
@@ -508,6 +571,27 @@ test "manifest read of missing file returns empty" {
     try std.testing.expectEqual(@as(u64, 1), m.nextSegmentId());
 }
 
+test "manifest round-trips string id states" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var written = Manifest.empty(a, 77, 3);
+    defer written.deinit();
+    try written.appendSegment(.{ .segment_id = 1, .row_count = 5 });
+    const states = [_]StringIdState{
+        .{ .column_idx = 0, .id_count = 1234, .closed = false },
+        .{ .column_idx = 2, .id_count = 0, .closed = true },
+    };
+    try writeManifest(io, tmp.dir, written, &states, false);
+    const read = try readManifestWithStringIds(a, io, tmp.dir, 77);
+    var m = read.manifest;
+    defer m.deinit();
+    defer a.free(read.string_ids);
+    try std.testing.expectEqualSlices(StringIdState, &states, read.string_ids);
+    try std.testing.expectEqual(@as(usize, 1), m.segments.items.len);
+}
+
 test "manifest v10 remains readable without a WAL checkpoint" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -518,13 +602,15 @@ test "manifest v10 remains readable without a WAL checkpoint" {
     original.auto_inc_next = 97;
     original.wal_checkpoint = .{ .generation = @splat(42), .offset = 4096 };
     try original.appendSegment(.{ .segment_id = 8, .row_count = 23 });
-    try writeManifest(io, tmp.dir, original, false);
+    try writeManifest(io, tmp.dir, original, &.{}, false);
     const current = try tmp.dir.readFileAlloc(io, manifest_filename, a, .unlimited);
     defer a.free(current);
-    const legacy = try a.alloc(u8, current.len - (header_size - legacy_header_size));
+    // v10 has neither the checkpoint nor the (empty) string-id section.
+    const legacy = try a.alloc(u8, current.len - (header_size - legacy_header_size) - 4);
     defer a.free(legacy);
     @memcpy(legacy[0..legacy_header_size], current[0..legacy_header_size]);
-    @memcpy(legacy[legacy_header_size..], current[header_size..]);
+    @memcpy(legacy[legacy_header_size .. legacy.len - trailer_size], current[header_size .. current.len - trailer_size - 4]);
+    @memcpy(legacy[legacy.len - trailer_size ..], &manifest_magic);
     std.mem.writeInt(u16, legacy[4..6], 10, .little);
     try tmp.dir.writeFile(io, .{ .sub_path = manifest_filename, .data = legacy });
     var read = try readManifest(a, io, tmp.dir, 1234);
@@ -545,7 +631,7 @@ test "manifest fingerprint mismatch errors" {
 
     var written = Manifest.empty(allocator, 0xAAAA, 0);
     defer written.deinit();
-    try writeManifest(io, tmp.dir, written, false);
+    try writeManifest(io, tmp.dir, written, &.{}, false);
 
     try std.testing.expectError(Error.SchemaFingerprintMismatch, readManifest(allocator, io, tmp.dir, 0xBBBB));
 }
@@ -561,14 +647,14 @@ test "manifest atomic rename replaces existing manifest" {
     var v1 = Manifest.empty(allocator, 1, 0);
     defer v1.deinit();
     try v1.appendSegment(.{ .segment_id = 1, .row_count = 10 });
-    try writeManifest(io, tmp.dir, v1, false);
+    try writeManifest(io, tmp.dir, v1, &.{}, false);
 
     // Second write replaces it
     var v2 = Manifest.empty(allocator, 1, 0);
     defer v2.deinit();
     try v2.appendSegment(.{ .segment_id = 1, .row_count = 10 });
     try v2.appendSegment(.{ .segment_id = 2, .row_count = 20 });
-    try writeManifest(io, tmp.dir, v2, false);
+    try writeManifest(io, tmp.dir, v2, &.{}, false);
 
     var read = try readManifest(allocator, io, tmp.dir, 1);
     defer read.deinit();

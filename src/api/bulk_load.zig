@@ -547,6 +547,7 @@ const Write = struct {
         // hands them over before `finish`.
         var writer = try storage.MergedSegmentWriter.begin(allocator, t.io, t.segments_dir, file_name, t.schema, id, t.schema_fingerprint, rg_rows, &.{}, 1);
         errdefer writer.deinit();
+        writer.useTableIds(t.tableIdsTarget());
         try writer.beginRowGroups(rows);
 
         var table_count: usize = 0;

@@ -585,6 +585,7 @@ fn streamMerge(
     sketches_owned_here = false; // writer.deinit / finish now owns out_sketches
     var writer_finished = false;
     errdefer if (!writer_finished) writer.deinit();
+    writer.useTableIds(t.tableIdsTarget());
 
     // Output row-group accumulator: one ColumnStore per column, reused across
     // row-groups (cleared, capacity retained). Flushed to `writer` each time it

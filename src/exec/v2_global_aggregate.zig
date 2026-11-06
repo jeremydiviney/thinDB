@@ -39,6 +39,7 @@ const expr = @import("expr.zig");
 const Scan = @import("scan.zig").Scan;
 const RowGroupTiles = @import("rg_tiles.zig").RowGroupTiles;
 const partitioned_distinct = @import("partitioned_distinct.zig");
+const table_id_distinct = @import("table_id_distinct.zig");
 const SiloCore = exec.silo_group_core;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -1480,6 +1481,10 @@ const GlobalAggregate = struct {
     }
 
     fn execute(self: *GlobalAggregate) !void {
+        if (try self.countByTableIds()) {
+            self.row_count = 1;
+            return;
+        }
         var lane = if (self.dop > 1)
             try self.reduceParallel()
         else
@@ -1487,6 +1492,36 @@ const GlobalAggregate = struct {
         defer lane.deinit(self.allocator);
         try self.emitRow(lane);
         self.row_count = 1;
+    }
+
+    /// Answers COUNT(DISTINCT)s of string columns alone, unfiltered, by the
+    /// table ids the segments store (table_id_distinct.zig). False, writing
+    /// nothing, when any of them can't be.
+    fn countByTableIds(self: *GlobalAggregate) !bool {
+        if (self.where_filter != null or self.derived.len != 0) return false;
+        for (self.plans) |p| {
+            if (p.op != .count_distinct or p.is_udf or p.dkind != .string) return false;
+        }
+        const table = self.table;
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+        const snap = try Scan.captureSnapshotAlloc(table, self.allocator, exec.memory.accountantOf(self.allocator));
+        defer snap.release(table);
+        defer self.allocator.free(snap.segments);
+
+        const counts = try self.allocator.alloc(u64, self.plans.len);
+        defer self.allocator.free(counts);
+        for (self.plans, counts) |p, *n| {
+            const column_idx = types.findColumn(table.schema.columns, p.input_name orelse return false) orelse return false;
+            n.* = (try table_id_distinct.count(self.allocator, .{
+                .table = table,
+                .snapshot = snap,
+                .column_idx = column_idx,
+                .workers = self.dop,
+            })) orelse return false;
+        }
+        for (self.output_cols, counts) |*col, n| try col.data.bigint.append(self.allocator, @intCast(n));
+        return true;
     }
 
     fn openScan(self: *GlobalAggregate, allocator: Allocator, snap: ?Scan.Snapshot) !ScanSource {
