@@ -1153,3 +1153,159 @@ test "zonemap pooled leading-key bound over many row groups, every integer-value
         }
     }
 }
+
+// --- Deferred keys: the heap compares the keys before the first string key past
+// the lead; the candidates' remaining keys are fetched and the final sort uses
+// all of them. ---
+
+const DeferRow = struct { a: i32, t: i64, s: ?[]const u8, c: i32, s2: []const u8, w: i64, pay: []const u8 };
+
+fn deferredTable(db: *api.Database, row_group_size: usize) !*api.Table {
+    const schema = types.TableSchema{
+        .columns = &.{
+            .{ .name = "a", .type = .int },
+            .{ .name = "t", .type = .datetime },
+            .{ .name = "s", .type = .string, .nullable = true },
+            .{ .name = "c", .type = .int },
+            .{ .name = "s2", .type = .string },
+            .{ .name = "w", .type = .bigint },
+            .{ .name = "pay", .type = .string },
+        },
+        .order_key = &.{"a"},
+        .unique = false,
+    };
+    return db.table("t", schema, .{ .order_key = &.{"a"}, .row_group_size = row_group_size });
+}
+
+/// Runs every case against the lateScan reference at DOP 1 and 4. The probe
+/// set is the ORDER BY columns plus `filter_col`.
+fn expectDeferredCasesMatch(t: *api.Table, cases: anytype) !void {
+    const allocator = std.testing.allocator;
+    inline for (cases) |c| {
+        var probe_buf: [8][]const u8 = undefined;
+        for (c.specs, 0..) |sp, i| probe_buf[i] = sp.col;
+        var n_probe = c.specs.len;
+        if (c.filter_col) |fc| {
+            probe_buf[n_probe] = fc;
+            n_probe += 1;
+        }
+        const probe = probe_buf[0..n_probe];
+
+        var ref_q = try exec.lateScan(allocator, t, null, probe, c.pred, c.specs, c.out, c.n, c.offset);
+        defer ref_q.deinit();
+        var ref = try capture(allocator, &ref_q);
+        defer ref.deinit();
+
+        inline for (.{ 1, 4 }) |dop| {
+            var z_q = (try exec.zonemapTopN(allocator, t, null, probe, c.pred, c.specs, c.out, c.n, c.offset, dop)).?;
+            defer z_q.deinit();
+            var got = try capture(allocator, &z_q);
+            defer got.deinit();
+            try expectSameRows(ref, got);
+            try std.testing.expectEqual(c.n, got.rows.items.len);
+        }
+    }
+}
+
+test "zonemap deferred keys past the first string key match lateScan (hidden, nullable, later numeric keys)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 32,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try deferredTable(db, 32);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const vocab = [_]?[]const u8{ null, "", "", "kiwi", "fig", "lime", "pear" };
+    var gen = Gen.init(0xDEFE);
+    var w: i64 = 0;
+    for (0..5) |batch| {
+        var rows: [200]DeferRow = undefined;
+        for (&rows) |*r| {
+            const rnd = gen.r();
+            r.* = .{
+                .a = rnd.intRangeAtMost(i32, 0, 6),
+                .t = @as(i64, rnd.intRangeAtMost(i32, 0, 3)) * 1_000_000,
+                .s = vocab[rnd.uintLessThan(usize, vocab.len)],
+                .c = rnd.intRangeAtMost(i32, 0, 4),
+                .s2 = vocab[3 + rnd.uintLessThan(usize, 4)].?,
+                .w = w,
+                .pay = try std.fmt.allocPrint(arena.allocator(), "p{d}", .{w}),
+            };
+            w += 1;
+        }
+        try t.insert(&rows);
+        // The last batch stays in the memtable.
+        if (batch < 4) try t.flush();
+    }
+
+    const no_filter: ?[]const u8 = null;
+    const all_keys = &[_]SortSpec{ .{ .col = "a" }, .{ .col = "t" }, .{ .col = "s" }, .{ .col = "c" }, .{ .col = "s2" }, .{ .col = "w" } };
+    const mixed_dirs = &[_]SortSpec{ .{ .col = "a", .desc = true }, .{ .col = "t" }, .{ .col = "s", .desc = true }, .{ .col = "c", .desc = true }, .{ .col = "s2" }, .{ .col = "w", .desc = true } };
+    const cases = .{
+        // Every sort key hidden from the output.
+        .{ .specs = all_keys, .pred = PredicateExpr{ .always = true }, .filter_col = no_filter, .out = &[_][]const u8{"pay"}, .n = 10, .offset = 0 },
+        // A deferred key compared only with '' in the WHERE.
+        .{ .specs = mixed_dirs, .pred = leafExpr("s", .neq, .{ .text = "" }), .filter_col = @as(?[]const u8, "s"), .out = &[_][]const u8{ "w", "s2" }, .n = 8, .offset = 5 },
+        // A filter on a column outside the sort.
+        .{ .specs = &[_]SortSpec{ .{ .col = "a" }, .{ .col = "s" }, .{ .col = "w" } }, .pred = leafExpr("c", .gt, .{ .int = 1 }), .filter_col = @as(?[]const u8, "c"), .out = &[_][]const u8{ "a", "pay" }, .n = 12, .offset = 3 },
+        // A datetime lead with a numeric second key; a LIMIT past the first ties.
+        .{ .specs = &[_]SortSpec{ .{ .col = "t", .desc = true }, .{ .col = "a" }, .{ .col = "s2" }, .{ .col = "c" }, .{ .col = "w" } }, .pred = leafExpr("s2", .neq, .{ .text = "" }), .filter_col = @as(?[]const u8, "s2"), .out = &[_][]const u8{ "pay", "s" }, .n = 300, .offset = 0 },
+    };
+    try expectDeferredCasesMatch(t, cases);
+}
+
+test "zonemap deferred keys: more ties than the cap fall back to comparing every key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try api.Database.open(allocator, io, tmp.dir, .{
+        .row_group_size = 256,
+        .auto_flush_rows = std.math.maxInt(u64),
+        .auto_flush_bytes = std.math.maxInt(u64),
+    });
+    defer db.close();
+    const t = try deferredTable(db, 256);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const vocab = [_][]const u8{ "kiwi", "fig", "lime", "pear", "plum" };
+    var gen = Gen.init(0x71E5);
+    var w: i64 = 0;
+    // 3000 rows share the best (a, t); the tie list overflows its 1024 cap.
+    for (0..4) |batch| {
+        var rows: [800]DeferRow = undefined;
+        for (&rows) |*r| {
+            const rnd = gen.r();
+            const tied = rnd.uintLessThan(u32, 16) != 0;
+            r.* = .{
+                .a = if (tied) 0 else rnd.intRangeAtMost(i32, 1, 9),
+                .t = 0,
+                .s = vocab[rnd.uintLessThan(usize, vocab.len)],
+                .c = rnd.intRangeAtMost(i32, 0, 4),
+                .s2 = vocab[rnd.uintLessThan(usize, vocab.len)],
+                .w = w,
+                .pay = try std.fmt.allocPrint(arena.allocator(), "p{d}", .{w}),
+            };
+            w += 1;
+        }
+        try t.insert(&rows);
+        if (batch < 3) try t.flush();
+    }
+
+    const no_filter: ?[]const u8 = null;
+    const cases = .{
+        .{ .specs = &[_]SortSpec{ .{ .col = "a" }, .{ .col = "t" }, .{ .col = "s" }, .{ .col = "w" } }, .pred = PredicateExpr{ .always = true }, .filter_col = no_filter, .out = &[_][]const u8{ "w", "s" }, .n = 5, .offset = 0 },
+        .{ .specs = &[_]SortSpec{ .{ .col = "a" }, .{ .col = "s", .desc = true }, .{ .col = "c" }, .{ .col = "w", .desc = true } }, .pred = leafExpr("s2", .neq, .{ .text = "fig" }), .filter_col = @as(?[]const u8, "s2"), .out = &[_][]const u8{"pay"}, .n = 7, .offset = 2 },
+    };
+    try expectDeferredCasesMatch(t, cases);
+}
