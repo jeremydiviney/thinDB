@@ -356,22 +356,51 @@ pub const ReadSegment = struct {
     pub fn cachedTableIds(self: ReadSegment, column_idx: usize, c: storage_cache.TableCache) !?TableIds {
         const table = self.info.stringTable(column_idx) orelse return null;
         if (table.table_ids.length == 0) return null;
-        const key = storage_cache.Key{
+        const key = tableIdsKey(self, column_idx, c);
+        return switch (try c.cache.claimAfterFill(self.io, key)) {
+            .hit => |entry| heldTableIds(entry, c),
+            .fill => |fill| try self.fillTableIds(table, key, fill, c),
+        };
+    }
+
+    /// `cachedTableIds`, but `.busy`, reading nothing, while another reader
+    /// fills them.
+    pub fn claimTableIds(self: ReadSegment, column_idx: usize, c: storage_cache.TableCache) !TableIdsClaim {
+        const table = self.info.stringTable(column_idx) orelse return .none;
+        if (table.table_ids.length == 0) return .none;
+        const key = tableIdsKey(self, column_idx, c);
+        return switch (try c.cache.claim(key)) {
+            .hit => |entry| .{ .held = heldTableIds(entry, c) },
+            .busy => .busy,
+            .fill => |fill| .{ .held = try self.fillTableIds(table, key, fill, c) },
+        };
+    }
+
+    pub const TableIdsClaim = union(enum) {
+        /// The segment carries none for the column.
+        none,
+        busy,
+        held: TableIds,
+    };
+
+    fn tableIdsKey(self: ReadSegment, column_idx: usize, c: storage_cache.TableCache) storage_cache.Key {
+        return .{
             .table_uid = c.table_uid,
             .segment_id = self.info.segment_id,
             .row_group_idx = 0,
             .column_idx = @intCast(column_idx),
             .content = .table_ids,
         };
-        const entry = switch (try c.cache.claimAfterFill(self.io, key)) {
-            .hit => |entry| entry,
-            .fill => |fill| miss: {
-                defer c.cache.endFill(self.io, fill);
-                const payload = try self.readTableIds(c.cache.blockAllocator(), self.allocator, table);
-                errdefer c.cache.blockAllocator().free(payload);
-                break :miss try c.cache.insertPinned(key, payload, .raw);
-            },
-        };
+    }
+
+    fn fillTableIds(self: ReadSegment, table: format.StringTable, key: storage_cache.Key, fill: *storage_cache.Cache.Fill, c: storage_cache.TableCache) !TableIds {
+        defer c.cache.endFill(self.io, fill);
+        const payload = try self.readTableIds(c.cache.blockAllocator(), self.allocator, table);
+        errdefer c.cache.blockAllocator().free(payload);
+        return heldTableIds(try c.cache.insertPinned(key, payload, .raw), c);
+    }
+
+    fn heldTableIds(entry: *storage_cache.Cache.Entry, c: storage_cache.TableCache) TableIds {
         return .{ .ids = std.mem.bytesAsSlice(u32, entry.bytes), .entry = entry, .cache = c.cache };
     }
 

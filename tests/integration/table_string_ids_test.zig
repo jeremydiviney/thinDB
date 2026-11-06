@@ -407,3 +407,43 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
         }
     }
 }
+
+test "table string ids: claiming a segment's ids never waits on another reader's fill" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR NOT NULL, PRIMARY KEY (id))");
+    const t = try db.openTable("t", .{});
+    try insertTags(allocator, db, 0, 100, 0, 5);
+    try t.flush();
+
+    var name_buf: [32]u8 = undefined;
+    const name = try thindb.Table.segmentFileName(&name_buf, t.manifest.segments.items[0].segment_id);
+    var seg = try thindb.storage.readSegment(allocator, t.io, t.segments_dir, name, t.schema);
+    defer seg.deinit();
+    const tc = t.cacheRef();
+    try std.testing.expect(try seg.claimTableIds(0, tc) == .none);
+
+    const key: thindb.storage.cache.Key = .{ .table_uid = tc.table_uid, .segment_id = seg.info.segment_id, .row_group_idx = 0, .column_idx = tag_column, .content = .table_ids };
+    const fill = switch (try tc.cache.claim(key)) {
+        .fill => |f| f,
+        else => return error.TestUnexpectedClaim,
+    };
+    try std.testing.expect(try seg.claimTableIds(tag_column, tc) == .busy);
+    tc.cache.endFill(t.io, fill);
+
+    const want = (try seg.tableIds(allocator, tag_column)).?;
+    defer allocator.free(want);
+    // The first claim reads the ids in; the second finds them cached.
+    for (0..2) |_| {
+        const held = switch (try seg.claimTableIds(tag_column, tc)) {
+            .held => |h| h,
+            else => return error.TestUnexpectedClaim,
+        };
+        defer held.release();
+        try std.testing.expectEqual(want.len, held.ids.len);
+        for (want, held.ids) |w, h| try std.testing.expectEqual(w, std.mem.littleToNative(u32, h));
+    }
+}
