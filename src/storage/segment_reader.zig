@@ -417,18 +417,72 @@ pub const ReadSegment = struct {
     };
 
     /// The decompressed payload of `table`'s table-ids block, from
-    /// `out_allocator`; `scratch` holds the stored frame.
+    /// `out_allocator`; `scratch` holds the stored run. Its column blocks
+    /// decode side by side, with what idle threads the machine has.
     fn readTableIds(self: ReadSegment, out_allocator: Allocator, scratch: Allocator, table: format.StringTable) ![]align(16) u8 {
         const block = table.table_ids;
-        const frame = try scratch.alloc(u8, block.length);
-        defer scratch.free(frame);
-        if (try self.file.readPositionalAll(self.io, frame, block.offset) != frame.len) return format.Error.UnexpectedEof;
-        try checkFrame(frame);
+        const run = try scratch.alloc(u8, block.length);
+        defer scratch.free(run);
+        if (try self.file.readPositionalAll(self.io, run, block.offset) != run.len) return format.Error.UnexpectedEof;
         const payload = try out_allocator.alignedAlloc(u8, .@"16", @as(usize, table.value_count) * 4);
         errdefer out_allocator.free(payload);
-        try decompressBlockInto(scratch, frame, payload);
+        var chunks: std.ArrayList(IdsDecode.Chunk) = .empty;
+        defer chunks.deinit(scratch);
+        var at: usize = 0;
+        var out_at: usize = 0;
+        while (at < run.len) {
+            if (run.len - at < format.column_block_header_size) return format.Error.CorruptColumnBlockHeader;
+            const frame_len = format.column_block_header_size + @as(usize, format.readU32(run[at + 8 ..][0..4]));
+            if (frame_len > run.len - at) return format.Error.CorruptColumnBlockHeader;
+            const frame = run[at..][0..frame_len];
+            try checkFrame(frame);
+            const raw_len: usize = format.readU32(frame[4..8]);
+            if (raw_len > payload.len - out_at) return format.Error.CorruptColumnBlockHeader;
+            try chunks.append(scratch, .{ .frame = frame, .out = payload[out_at..][0..raw_len] });
+            at += frame_len;
+            out_at += raw_len;
+        }
+        if (out_at != payload.len) return format.Error.CorruptColumnBlockHeader;
+        var grant = core_scheduler.reserveWorkers(chunks.items.len);
+        defer grant.release();
+        var decode: IdsDecode = .{ .allocator = self.allocator, .chunks = chunks.items };
+        decode.run(grant.count);
+        for (chunks.items) |c| {
+            if (!c.done) try decompressBlockInto(scratch, c.frame, c.out);
+        }
         return payload;
     }
+
+    /// One table-ids block's column blocks as jobs its threads claim in
+    /// order.
+    const IdsDecode = struct {
+        /// The segment's own allocator, which any thread may use.
+        allocator: Allocator,
+        chunks: []Chunk,
+        next: std.atomic.Value(usize) = .init(0),
+
+        const Chunk = struct { frame: []const u8, out: []u8, done: bool = false };
+
+        fn run(self: *IdsDecode, threads: usize) void {
+            var helpers: [parallel.MAX_THREADS]?parallel.Helper = @splat(null);
+            const n = @min(@max(threads, 1), helpers.len);
+            for (helpers[1..n]) |*h| h.* = parallel.spawn(work, .{self}) catch null;
+            self.work();
+            for (helpers[1..n]) |h| if (h) |helper| helper.join();
+        }
+
+        fn work(self: *IdsDecode) void {
+            while (true) {
+                const j = self.next.fetchAdd(1, .monotonic);
+                if (j >= self.chunks.len) return;
+                const c = &self.chunks[j];
+                // A block that fails is decoded again by `readTableIds`,
+                // which returns the error.
+                decompressBlockInto(self.allocator, c.frame, c.out) catch continue;
+                c.done = true;
+            }
+        }
+    };
 
     /// Row group `row_group_idx`'s block parts of column `column_idx`, when
     /// the column's string table took the row group.

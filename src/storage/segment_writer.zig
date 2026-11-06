@@ -576,10 +576,17 @@ fn encodeTableIds(
     table_compression: types.TableCompression,
     out: *std.ArrayList(u8),
 ) !void {
-    const payload = try allocator.alloc(u8, ids.len * 4);
+    const chunk_ids: usize = @min(ids.len, format.table_ids_chunk);
+    const payload = try allocator.alloc(u8, chunk_ids * 4);
     defer allocator.free(payload);
-    for (ids, 0..) |id, i| format.writeU32(payload[i * 4 ..][0..4], id);
-    try appendBlock(allocator, compressor, out, payload, &.{.{ .offset = 0, .count = @intCast(ids.len), .width = 4 }}, @backingInt(format.Encoding.raw), false, table_compression);
+    var lo: usize = 0;
+    while (true) {
+        const chunk = ids[lo..@min(lo + format.table_ids_chunk, ids.len)];
+        for (chunk, 0..) |id, i| format.writeU32(payload[i * 4 ..][0..4], id);
+        try appendBlock(allocator, compressor, out, payload[0 .. chunk.len * 4], &.{.{ .offset = 0, .count = @intCast(chunk.len), .width = 4 }}, @backingInt(format.Encoding.raw), false, table_compression);
+        lo += chunk.len;
+        if (lo >= ids.len) break;
+    }
 }
 
 /// One column's string table, laid out apart from its segment file in
