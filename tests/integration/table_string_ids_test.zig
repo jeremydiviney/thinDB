@@ -19,6 +19,14 @@ const config: thindb.Config = .{
     .auto_flush_bytes = 64 * 1024 * 1024,
 };
 
+/// `config` with row groups small enough that a selective filter leaves a
+/// batch only a few rows.
+const small_row_groups: thindb.Config = blk: {
+    var c = config;
+    c.row_group_size = 100;
+    break :blk c;
+};
+
 const tag_column = 1;
 
 /// The table id each value has, gathered over a table's segments.
@@ -216,10 +224,10 @@ test "table string ids: COUNT(DISTINCT) by ids matches the scan, and declines me
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    const db = try thindb.Database.open(allocator, io, tmp.dir, small_row_groups);
     defer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR, PRIMARY KEY (id))");
-    const t = try db.openTable("t", .{ .row_group_size = 100 });
+    const t = try db.openTable("t", .{});
 
     // Every fifth tag NULL, then a row group of NULLs alone, which stands
     // apart from the string table.
@@ -257,10 +265,10 @@ test "table string ids: a filtered COUNT(DISTINCT) counts by ids, beside memtabl
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    const db = try thindb.Database.open(allocator, io, tmp.dir, small_row_groups);
     defer db.close();
     try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR NOT NULL, PRIMARY KEY (id))");
-    const t = try db.openTable("t", .{ .row_group_size = 100 });
+    const t = try db.openTable("t", .{});
     try insertTags(allocator, db, 0, 400, 0, 10);
     try t.flush();
     try insertTags(allocator, db, 400, 400, 6, 10);
@@ -282,4 +290,112 @@ test "table string ids: a filtered COUNT(DISTINCT) counts by ids, beside memtabl
     try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", "11");
     try exec(allocator, db, "DELETE FROM t WHERE id = 1000");
     try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", "10");
+}
+
+/// Every row of `sql`'s result, each cell's text followed by `|`.
+fn resultText(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8) ![]u8 {
+    var q = try helpers.runSql(allocator, db, sql);
+    defer q.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    while (try q.next()) |batch| {
+        for (0..batch.row_count) |row| {
+            for (batch.values, batch.schema) |col, c| {
+                if (!col.isValid(row)) {
+                    try out.appendSlice(allocator, "NULL");
+                } else switch (col.data) {
+                    .string, .varchar => |sv| try out.appendSlice(allocator, sv.rowBytes(row)),
+                    inline .tinyint, .smallint, .int, .bigint, .largeint => |s| try out.print(allocator, "{d}", .{s[row]}),
+                    inline .decimal64, .decimal128 => |s| {
+                        var buf: [thindb.exec.decimal.DECIMAL_TEXT_MAX]u8 = undefined;
+                        try out.appendSlice(allocator, thindb.exec.decimal.formatDecimal(&buf, s[row], c.type.decimalSpec().?.s));
+                    },
+                    else => return error.TestUnexpectedType,
+                }
+                try out.append(allocator, '|');
+            }
+            try out.append(allocator, '\n');
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Inserts rows `lo..hi` of a fixed shuffle of 1040 into table `name`:
+/// row `i` holds `id` i, a `url` of 307, and a `tag` of 304: `tag0` to
+/// `tag3` on 50, 40, 30 and 20 rows, the others on 3 each.
+fn insertShuffled(allocator: std.mem.Allocator, db: *thindb.Database, name: []const u8, lo: usize, hi: usize) !void {
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    try sql.print(allocator, "INSERT INTO {s} (id, tag, url) VALUES ", .{name});
+    for (lo..hi) |i| {
+        // 389 is prime to 1040, so the slots visit every tag's run.
+        const slot = i * 389 % 1040;
+        const tag: usize = if (slot < 50) 0 else if (slot < 90) 1 else if (slot < 120) 2 else if (slot < 140) 3 else 4 + (slot - 140) % 300;
+        if (i != lo) try sql.appendSlice(allocator, ", ");
+        try sql.print(allocator, "({d}, 'tag{d}', 'u{d}')", .{ i, tag, i % 307 });
+    }
+    try exec(allocator, db, sql.items);
+}
+
+test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, small_row_groups);
+    defer db.close();
+    // `s` stays in the memtable, which groups its keys by their bytes.
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR NOT NULL, url VARCHAR NOT NULL, PRIMARY KEY (id))");
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT NOT NULL, tag VARCHAR NOT NULL, url VARCHAR NOT NULL, PRIMARY KEY (id))");
+    const t = try db.openTable("t", .{});
+    try insertShuffled(allocator, db, "t", 0, 520);
+    try t.flush();
+    try insertShuffled(allocator, db, "t", 520, 1040);
+    try t.flush();
+    try insertShuffled(allocator, db, "s", 0, 1040);
+
+    // A string extreme or a filter on an expression keeps each query off the
+    // low-cardinality path, which groups these few values by its own codes.
+    const queries = [_][]const u8{
+        "SELECT tag, MIN(url) AS m, COUNT(*) AS c FROM {s} GROUP BY tag ORDER BY c DESC, tag LIMIT 10",
+        "SELECT tag, url, MAX(url) AS m FROM {s} GROUP BY tag, url ORDER BY m DESC, tag LIMIT 5",
+        "SELECT tag, MAX(url) AS m FROM {s} WHERE id < 700 GROUP BY tag ORDER BY m DESC, tag LIMIT 5",
+        "SELECT tag, MIN(url) AS m, COUNT(*) AS c FROM {s} WHERE tag <> 'tag0' GROUP BY tag ORDER BY c DESC, tag LIMIT 5",
+        "SELECT tag, MIN(url) AS m FROM {s} WHERE tag LIKE 'tag1%' GROUP BY tag ORDER BY m, tag LIMIT 5",
+        "SELECT tag, url, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag, url ORDER BY c DESC, tag, url LIMIT 12",
+        "SELECT tag, url, MIN(id) AS m FROM {s} WHERE id % 3 = 0 GROUP BY tag, url ORDER BY m LIMIT 6",
+        "SELECT tag, COUNT(*) AS c FROM {s} WHERE id % 10 = 0 GROUP BY tag ORDER BY c DESC, tag LIMIT 8",
+        "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY c DESC LIMIT 4",
+        "SELECT tag, COUNT(*) AS c FROM {s} WHERE LENGTH(url) > 2 GROUP BY tag ORDER BY c DESC, tag LIMIT 20",
+        "SELECT tag, COUNT(DISTINCT url) AS d FROM {s} WHERE LENGTH(url) > 1 GROUP BY tag ORDER BY d DESC, tag LIMIT 5",
+    };
+    // Memtable rows, then tombstones, rule the ids out.
+    const Step = struct { changes: []const []const u8 = &.{}, flush: bool = false };
+    const steps = [_]Step{
+        .{},
+        .{ .changes = &.{ "INSERT INTO {s} (id, tag, url) VALUES (2000, 'tag3', 'u9'), (2001, 'tag30', 'u0')", "DELETE FROM {s} WHERE id = 2001" } },
+        .{ .flush = true },
+        .{ .changes = &.{"DELETE FROM {s} WHERE id < 40"} },
+    };
+    for (steps) |step| {
+        for (step.changes) |change| {
+            inline for (.{ "t", "s" }) |name| {
+                const sql = try std.mem.replaceOwned(u8, allocator, change, "{s}", name);
+                defer allocator.free(sql);
+                try exec(allocator, db, sql);
+            }
+        }
+        if (step.flush) try t.flush();
+        for (queries) |query| {
+            const by_ids = try std.mem.replaceOwned(u8, allocator, query, "{s}", "t");
+            defer allocator.free(by_ids);
+            const by_bytes = try std.mem.replaceOwned(u8, allocator, query, "{s}", "s");
+            defer allocator.free(by_bytes);
+            const got = try resultText(allocator, db, by_ids);
+            defer allocator.free(got);
+            const want = try resultText(allocator, db, by_bytes);
+            defer allocator.free(want);
+            errdefer std.debug.print("query: {s}\n", .{by_ids});
+            try std.testing.expectEqualStrings(want, got);
+        }
+    }
 }

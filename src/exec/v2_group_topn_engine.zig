@@ -540,6 +540,9 @@ pub const Params = struct {
     having_bound: bool = true,
     /// The hashed key digest's width (`SiloCore.RunConfig.key_digest_mask`).
     key_digest_bits: u8 = 64,
+    /// Group string keys by table id where the segments store them
+    /// (`SiloCore.RunConfig.id_key_columns`).
+    table_id_keys: bool = true,
 };
 
 pub const RunRequest = struct {
@@ -614,6 +617,7 @@ pub fn paramsFromEnv(default_dop: usize) Params {
         .count_sketch = getenv("THINDB_V2_NO_COUNT_SKETCH") == null,
         .having_bound = getenv("THINDB_V2_NO_HAVING_BOUND") == null,
         .key_digest_bits = @intCast(@min(@max(envUsize("THINDB_V2_KEY_DIGEST_BITS", 64), 1), 64)),
+        .table_id_keys = envUsize("THINDB_V2_NO_TABLE_ID_KEYS", 0) == 0,
     };
 }
 
@@ -1017,6 +1021,7 @@ fn runHarness(
     // derived expression or the residual filter (those need real bytes in
     // the batch).
     var hash_key_cols_buf: [8][]const u8 = undefined;
+    var id_key_cols_buf: [8][]const u8 = undefined;
     var n_hash_keys: usize = 0;
     if (shape.hashed) {
         outer: for (shape.group_key_inputs) |input| {
@@ -1111,6 +1116,7 @@ fn runHarness(
         // run — a detached free racing it would be use-after-free.
         .defer_heavy_teardown = !params.arena_workspace and !params.sync_teardown,
         .hash_key_columns = hash_key_cols_buf[0..n_hash_keys],
+        .id_key_columns = try idKeyColumns(table, snapshot, shape, params, hash_key_cols_buf[0..n_hash_keys], &id_key_cols_buf),
         .byte_length_columns = length_cols_buf[0..n_length_cols],
         .key_digest_mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - params.key_digest_bits),
     };
@@ -1124,6 +1130,28 @@ fn runHarness(
         if (try runCountSketch(allocator, table, cpus, cfg, need, shape.count_rank, shape.count_floor, n_hash_keys == 1, rows)) return;
     }
     try SiloCore.runSiloGrid(allocator, table, cpus, cfg);
+}
+
+/// The hashed keys of `hash_keys` the run groups by table id (DESIGN.md
+/// §4.6), listed in `buf`: non-nullable VARCHAR or STRING columns whose
+/// table ids every segment of `snapshot` stores, with no memtable row or
+/// tombstone in it. A key bound compares values, so it rules them out.
+fn idKeyColumns(table: *api.Table, snapshot: exec.Scan.Snapshot, shape: Shape, params: Params, hash_keys: []const []const u8, buf: *[8][]const u8) ![]const []const u8 {
+    if (!params.table_id_keys or shape.key_bound != null) return &.{};
+    var n: usize = 0;
+    for (hash_keys) |name| {
+        const col_idx = types.findColumn(table.schema.columns, name) orelse continue;
+        const col = table.schema.columns[col_idx];
+        if (col.nullable) continue;
+        switch (col.type) {
+            .varchar, .string => {},
+            else => continue,
+        }
+        if (try exec.table_id_distinct.readable(table, snapshot, col_idx) == null) continue;
+        buf[n] = name;
+        n += 1;
+    }
+    return buf[0..n];
 }
 
 fn snapshotRows(snapshot: exec.Scan.Snapshot) u64 {
