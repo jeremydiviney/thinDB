@@ -94,6 +94,9 @@ pub const Table = struct {
     dirs_open: bool = true,
 
     manifest: storage.Manifest,
+    /// The table's string-id lists (DESIGN.md §4.6). Segment writers take
+    /// ids from them, and every manifest publish persists them first.
+    strings: storage.TableStrings,
     /// Active memtable. Heap-allocated + refcounted so concurrent scans
     /// can pin a snapshot of it: flush/delete swap this pointer to a fresh
     /// memtable and retire the old, but the old stays alive while readers
@@ -220,8 +223,12 @@ pub const Table = struct {
             else => return err,
         }
 
-        var manifest = try storage.readManifest(allocator, io, table_dir, fp);
+        const read = try storage.readManifestWithStringIds(allocator, io, table_dir, fp);
+        var manifest = read.manifest;
         errdefer manifest.deinit();
+        defer allocator.free(read.string_ids);
+        var strings = try storage.TableStrings.init(allocator, schema, read.string_ids);
+        errdefer strings.deinit();
         try checkSegmentFiles(io, segments_dir, manifest, name);
         // Fresh manifests (no file on disk) carry column_count=0; set
         // from the schema so future writes emit the right per-entry size.
@@ -300,6 +307,7 @@ pub const Table = struct {
             .table_dir = table_dir,
             .segments_dir = segments_dir,
             .manifest = manifest,
+            .strings = strings,
             .memtable = memtable,
             .wal = null,
             .next_segment_id = .init(manifest.nextSegmentId()),
@@ -353,6 +361,7 @@ pub const Table = struct {
         // memtable stays alive until the last reader releases it.
         self.memtable.release();
         self.manifest.deinit();
+        self.strings.deinit();
         if (self.dirs_open) {
             self.segments_dir.close(io);
             self.table_dir.close(io);
@@ -927,7 +936,7 @@ pub const Table = struct {
 
         const sync = self.syncEnabled();
 
-        var info = try storage.writeSegment(
+        var info = try storage.writeSegmentWithStrings(
             self.allocator,
             self.io,
             self.segments_dir,
@@ -939,6 +948,7 @@ pub const Table = struct {
             snapshot.views,
             sync,
             self.compact_threads,
+            .{ .table_ids = self.tableIdsTarget() },
         );
         defer info.deinit(self.allocator);
 
@@ -1129,10 +1139,22 @@ pub const Table = struct {
 
     pub fn persistManifest(self: *Table, manifest: storage.Manifest, sync: bool) !void {
         try self.ensureUsable();
-        storage.writeManifest(self.io, self.table_dir, manifest, sync) catch |err| {
+        self.writeManifestFiles(manifest, sync) catch |err| {
             self.recordIoFailure(err);
             return err;
         };
+    }
+
+    /// The string-id lists, then the manifest that counts their ids.
+    fn writeManifestFiles(self: *Table, manifest: storage.Manifest, sync: bool) !void {
+        const states = try self.strings.persist(self.allocator, self.io, self.table_dir, sync);
+        defer self.allocator.free(states);
+        try storage.writeManifest(self.io, self.table_dir, manifest, states, sync);
+    }
+
+    /// Where this table's segment writers take string ids from.
+    pub fn tableIdsTarget(self: *Table) storage.table_strings.Target {
+        return .{ .strings = &self.strings, .io = self.io, .table_dir = self.table_dir, .threads = self.compact_threads };
     }
 
     /// Add `offsets` to segment `id`'s tombstones and write the files now,

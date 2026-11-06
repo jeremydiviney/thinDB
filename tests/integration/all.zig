@@ -117,4 +117,5 @@ test {
     _ = @import("float_key_equality_test.zig");
     _ = @import("condition_cache_test.zig");
     _ = @import("parquet_load_test.zig");
+    _ = @import("table_string_ids_test.zig");
 }

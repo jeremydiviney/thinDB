@@ -369,9 +369,14 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
         shadow_dir.close(t.io);
     };
 
-    // 3. Rewrite every segment under the new schema.
+    // 3. Rewrite every segment under the new schema. Its string ids start
+    //    over in the shadow: the column indices may have moved.
     var new_manifest = storage.Manifest.empty(t.allocator, new_fp, @intCast(new_schema.columns.len));
     defer new_manifest.deinit();
+    var new_strings = try storage.TableStrings.init(t.allocator, new_schema, &.{});
+    var owns_new_strings = true;
+    defer if (owns_new_strings) new_strings.deinit();
+    const new_ids: storage.table_strings.Target = .{ .strings = &new_strings, .io = t.io, .table_dir = shadow_dir, .threads = t.compact_threads };
 
     const sync = t.syncEnabled();
     const new_lk_idx: ?usize = if (new_schema.order_key.len > 0)
@@ -379,7 +384,7 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     else
         null;
     for (t.manifest.segments.items) |entry| {
-        const info = (try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, sync)) orelse continue;
+        const info = (try rewriteSegment(t, &plan, shadow_segs, entry, new_schema, new_fp, new_ids, sync)) orelse continue;
         defer info.deinit(t.allocator);
         if (!plan.rekeyed) try carrySidecars(t, shadow_segs, entry.segment_id, sync);
         try new_manifest.appendSegment(
@@ -391,7 +396,9 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     //    recovery reads a manifest as a complete shadow.
     try storage.schema_file.writeSchema(t.io, shadow_dir, new_schema, t.allocator, sync);
     if (sync) try storage.syncDirectory(t.io, shadow_segs);
-    try storage.writeManifest(t.io, shadow_dir, new_manifest, sync);
+    const string_ids = try new_strings.persist(t.allocator, t.io, shadow_dir, sync);
+    defer t.allocator.free(string_ids);
+    try storage.writeManifest(t.io, shadow_dir, new_manifest, string_ids, sync);
 
     // 5. Swap on disk: close current + shadow handles, set the original tree
     //    aside, rename the shadow into place, delete the original. The WAL
@@ -435,6 +442,9 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
 
     // 6. Re-open Table state under the new schema.
     try reInitTableState(s, t, new_fp, had_wal);
+    t.strings.deinit();
+    t.strings = new_strings;
+    owns_new_strings = false;
     // Committed: an original the delete leaves behind is only garbage, which
     // the next open of the schema or alter of the table removes.
     storage.retryTransientWindowsRefusal(t.io, Io.Dir.deleteTree, .{ s.schema_dir, t.io, aside_name }) catch {};
@@ -452,6 +462,7 @@ fn rewriteSegment(
     entry: storage.ManifestEntry,
     new_schema: TableSchema,
     new_fp: u64,
+    table_ids: storage.table_strings.Target,
     sync: bool,
 ) !?storage.format.SegmentInfo {
     var name_buf: [32]u8 = undefined;
@@ -502,7 +513,7 @@ fn rewriteSegment(
     defer t.allocator.free(new_views);
     for (written, 0..) |c, i| new_views[i] = c.view();
 
-    return try storage.writeSegment(
+    return try storage.writeSegmentWithStrings(
         t.allocator,
         t.io,
         shadow_segs,
@@ -514,6 +525,7 @@ fn rewriteSegment(
         new_views,
         sync,
         t.compact_threads,
+        .{ .table_ids = table_ids },
     );
 }
 

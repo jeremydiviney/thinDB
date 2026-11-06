@@ -78,8 +78,9 @@ pub const Key = struct {
 /// (§4.4), keyed by page index in `row_group_idx`, or only its offsets; a
 /// segment-dictionary column block rebuilt without its codes or without its
 /// values' bytes (`segment_strings.Form`), which a whole `.column` entry
-/// serves in its place; or such a block's values by segment id alone
-/// (`segment_strings.EntryCounts`), which either of those serves too.
+/// serves in its place; such a block's values by segment id alone
+/// (`segment_strings.EntryCounts`), which either of those serves too; or a
+/// segment string table's table ids (§4.6), keyed by row group 0.
 pub const Content = enum(u8) {
     column,
     matched_rows,
@@ -90,6 +91,7 @@ pub const Content = enum(u8) {
     dict_no_codes,
     dict_no_bytes,
     dict_counts,
+    table_ids,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).

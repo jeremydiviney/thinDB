@@ -20,6 +20,7 @@ pub const compression = @import("compression.zig");
 pub const snappy = @import("snappy.zig");
 pub const fsst = @import("fsst.zig");
 pub const segment_strings = @import("segment_strings.zig");
+pub const table_strings = @import("table_strings.zig");
 pub const cache = @import("cache.zig");
 
 pub const ColumnView = column.ColumnView;
@@ -35,9 +36,12 @@ pub const Manifest = manifest.Manifest;
 pub const ManifestEntry = manifest.ManifestEntry;
 pub const writeManifest = manifest.writeManifest;
 pub const readManifest = manifest.readManifest;
+pub const readManifestWithStringIds = manifest.readManifestWithStringIds;
 
 pub const writeSegment = segment_writer.writeSegment;
+pub const writeSegmentWithStrings = segment_writer.writeSegmentWithStrings;
 pub const MergedSegmentWriter = segment_writer.MergedSegmentWriter;
+pub const TableStrings = table_strings.TableStrings;
 pub const readSegment = segment_reader.readSegment;
 
 /// Write `data` to `dir/sub_path`. When `sync_after_write` is true, also
@@ -328,7 +332,7 @@ test "lz4 string blocks: large raw block is cached decompressed and borrowed in 
         .{ .data = .{ .bigint = ids } },
         .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } } },
     };
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "seg.dat", schema, 3, 0x124, 4096, &columns, false, 1, 0);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "seg.dat", schema, 3, 0x124, 4096, &columns, false, 1, .{ .value_cap = 0 });
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
@@ -503,7 +507,7 @@ test "fsst encoding: high-NDV string block round-trips, dict-sized stays dict" {
         .{ .data = .{ .string = .{ .offsets = offsets, .bytes = bytes.items } }, .nulls = nulls },
     };
 
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "seg.dat", schema, 9, 0xF557, 1024, &columns, false, 1, 0);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "seg.dat", schema, 9, 0xF557, 1024, &columns, false, 1, .{ .value_cap = 0 });
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "seg.dat", schema);
@@ -909,7 +913,7 @@ test "dict encoding: low-card string → dict, high-card → raw, both round-tri
 
     const columns = [_]ColumnView{ color.view(null), uniq.view(null) };
 
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false, 1, 0);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "dict.dat", schema, 11, 0, n, &columns, false, 1, .{ .value_cap = 0 });
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "dict.dat", schema);
@@ -1028,7 +1032,7 @@ test "dict encoding: blob-like (avg len > 256) declines dict; stays raw with fss
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false, 1, 0);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "blob.dat", schema, 13, 0, n, &columns, false, 1, .{ .value_cap = 0 });
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "blob.dat", schema);
@@ -1063,7 +1067,7 @@ test "dict encoding: NDV beyond the cap abandons mid-build → raw fallback, rou
     defer col.deinit(allocator);
     const columns = [_]ColumnView{col.view(null)};
 
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false, 1, 0);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "abandon.dat", schema, 14, 0, n, &columns, false, 1, .{ .value_cap = 0 });
     defer info.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), info.row_groups.len);
 
@@ -1469,7 +1473,7 @@ test "segment string tables: past the cap a column's later row groups keep their
     const columns = [_]ColumnView{ .{ .data = .{ .int = &ids } }, s.view(&sst_nulls) };
 
     // Row group 0 holds three values; row group 1's date and apple pass four.
-    var info = try segment_writer.writeSegmentWithStringCap(allocator, io, tmp.dir, "cap.dat", sst_schema, 1, 0, 4, &columns, false, 1, 4);
+    var info = try segment_writer.writeSegmentWithStrings(allocator, io, tmp.dir, "cap.dat", sst_schema, 1, 0, 4, &columns, false, 1, .{ .value_cap = 4 });
     defer info.deinit(allocator);
 
     var seg = try readSegment(allocator, io, tmp.dir, "cap.dat", sst_schema);
@@ -1834,5 +1838,6 @@ test {
     _ = tombstone;
     _ = compression;
     _ = segment_strings;
+    _ = table_strings;
     _ = cache;
 }

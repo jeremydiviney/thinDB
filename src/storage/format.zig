@@ -18,7 +18,8 @@
 //!         12-byte block header + payload
 //!
 //!   [Segment string tables — per string column (segment_strings.zig)]
-//!     shared-string pages, then the column's row-group blocks
+//!     shared-string pages, then the column's row-group blocks, then its
+//!     table-ids block when it has one
 //!
 //!   [Footer]
 //!     row_group_count u32     (4)
@@ -32,6 +33,7 @@
 //!     For each string table:
 //!       column_idx, shared_count, value_count, page_count  (u32 each)
 //!       per page: offset u64, length u32
+//!       table ids: offset u64, length u32 (v16)
 //!     footer_size u32         (4 — total footer bytes incl. itself + trailing magic)
 //!     magic "tDBS"            (4)
 
@@ -72,7 +74,11 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// entry stats) and a shared-string page two (offsets, bytes), so a reader
 /// reads only the parts a query needs; the footer's string-table directory
 /// gives each part's length.
-pub const segment_version: u16 = 15;
+///
+/// v15→v16: table string ids. A string table may carry one more block, the
+/// table id of each segment id (`TableIdsBlock`), and the directory gives
+/// its offset and length after the table's block lengths.
+pub const segment_version: u16 = 16;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -397,6 +403,15 @@ pub const StringTable = struct {
     pages: []const SharedPage,
     /// Each row group's block parts, by row-group index.
     blocks: []const StringBlockParts,
+    table_ids: TableIdsBlock = .{},
+};
+
+/// A string table's table ids (DESIGN.md §4.6): one column block of
+/// `value_count` u32s, the table id of each segment id in turn. Length 0
+/// when the segment stores none for the column.
+pub const TableIdsBlock = struct {
+    offset: u64 = 0,
+    length: u32 = 0,
 };
 
 pub const SegmentInfo = struct {

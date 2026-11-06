@@ -18,6 +18,7 @@ const compression_mod = @import("compression.zig");
 const fsst = @import("fsst.zig");
 const int_streams = @import("int_streams.zig");
 const segment_strings = @import("segment_strings.zig");
+const table_strings = @import("table_strings.zig");
 const hll = @import("../util/hll.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
@@ -147,13 +148,19 @@ pub fn writeSegment(
     /// `MergedSegmentWriter`). 1 = serial; output is byte-identical either way.
     encode_threads: usize,
 ) !SegmentInfo {
-    return writeSegmentWithStringCap(allocator, io, dir, file_name, schema, segment_id, schema_fingerprint, row_group_size, columns, sync_on_close, encode_threads, segment_strings.segment_value_cap);
+    return writeSegmentWithStrings(allocator, io, dir, file_name, schema, segment_id, schema_fingerprint, row_group_size, columns, sync_on_close, encode_threads, .{});
 }
 
-/// `writeSegment` with the segment string tables capped at
-/// `string_value_cap` distinct values per column (0: none, every string row
-/// group takes the per-row-group encodings).
-pub fn writeSegmentWithStringCap(
+/// How a segment's string columns take segment string tables.
+pub const StringOptions = struct {
+    /// Distinct values a column's table may hold (0: none, every string row
+    /// group takes the per-row-group encodings).
+    value_cap: u32 = segment_strings.segment_value_cap,
+    /// The table's string ids, for each table to carry (DESIGN.md §4.6).
+    table_ids: ?table_strings.Target = null,
+};
+
+pub fn writeSegmentWithStrings(
     allocator: Allocator,
     io: Io,
     dir: Io.Dir,
@@ -165,7 +172,7 @@ pub fn writeSegmentWithStringCap(
     columns: []const ColumnView,
     sync_on_close: bool,
     encode_threads: usize,
-    string_value_cap: u32,
+    string_options: StringOptions,
 ) !SegmentInfo {
     if (columns.len != schema.columns.len) return format.Error.SchemaMismatch;
     if (row_group_size == 0) return format.Error.InvalidRowGroupSize;
@@ -192,7 +199,7 @@ pub fn writeSegmentWithStringCap(
         for (row_groups.items) |rg| freeRowGroupMeta(allocator, rg);
         row_groups.deinit(allocator);
     }
-    var strings = try segment_strings.SegmentStrings.init(allocator, schema, string_value_cap);
+    var strings = try segment_strings.SegmentStrings.init(allocator, schema, string_options.value_cap);
     defer strings.deinit();
 
     var row_offset: usize = 0;
@@ -218,7 +225,7 @@ pub fn writeSegmentWithStringCap(
         for (tables.items) |t| freeStringTable(allocator, t);
         tables.deinit(allocator);
     }
-    try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads, &tables);
+    try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads, string_options.table_ids, &tables);
     const string_tables = try tables.toOwnedSlice(allocator);
     errdefer format.freeStringTables(allocator, string_tables);
     try writeFooter(allocator, &out, row_groups.items, string_tables);
@@ -400,6 +407,7 @@ fn writeStringTables(
     row_groups: []RowGroupMeta,
     table_compression: types.TableCompression,
     threads: usize,
+    table_ids: ?table_strings.Target,
     tables: *std.ArrayList(format.StringTable),
 ) !void {
     var compressor = try compression_mod.Compressor.init();
@@ -460,6 +468,15 @@ fn writeStringTables(
             first += chunk.len;
         }
 
+        var ids_block: format.TableIdsBlock = .{};
+        if (table_ids) |target| if (try resolveTableIds(allocator, target, cs, ci)) |ids| {
+            defer allocator.free(ids);
+            page_block.clearRetainingCapacity();
+            try encodeTableIds(allocator, &compressor, ids, table_compression, &page_block);
+            ids_block = .{ .offset = out.offset(), .length = @intCast(page_block.items.len) };
+            try out.append(allocator, page_block.items);
+        };
+
         try tables.ensureUnusedCapacity(allocator, 1);
         tables.appendAssumeCapacity(.{
             .column_idx = @intCast(ci),
@@ -468,6 +485,7 @@ fn writeStringTables(
             .value_bytes = cs.valueBytes(),
             .pages = pages,
             .blocks = blocks,
+            .table_ids = ids_block,
         });
     }
 }
@@ -518,13 +536,62 @@ fn encodeStringBlock(
     return parts;
 }
 
+/// A string table's values in segment-id order, for
+/// `TableStrings.resolve`.
+const SegmentValues = struct {
+    strings: *const segment_strings.ColumnStrings,
+    /// The value of each segment id.
+    by_id: []const u32,
+
+    pub fn len(self: SegmentValues) usize {
+        return self.by_id.len;
+    }
+
+    pub fn get(self: SegmentValues, i: usize) []const u8 {
+        return self.strings.value(self.by_id[i]);
+    }
+};
+
+/// The table id of each of `cs`'s segment ids, after `assignIds`; null
+/// when column `ci` takes none. Caller owns the result.
+fn resolveTableIds(allocator: Allocator, target: table_strings.Target, cs: *const segment_strings.ColumnStrings, ci: usize) !?[]u32 {
+    const by_id = try allocator.alloc(u32, cs.valueCount());
+    defer allocator.free(by_id);
+    for (cs.ids, 0..) |id, v| by_id[id] = @intCast(v);
+    const ids = try allocator.alloc(u32, by_id.len);
+    errdefer allocator.free(ids);
+    const values: SegmentValues = .{ .strings = cs, .by_id = by_id };
+    if (!try target.strings.resolve(target.io, target.table_dir, target.threads, ci, values, ids)) {
+        allocator.free(ids);
+        return null;
+    }
+    return ids;
+}
+
+/// Encodes `ids` as a table-ids block (`format.TableIdsBlock`) onto `out`.
+fn encodeTableIds(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    ids: []const u32,
+    table_compression: types.TableCompression,
+    out: *std.ArrayList(u8),
+) !void {
+    const payload = try allocator.alloc(u8, ids.len * 4);
+    defer allocator.free(payload);
+    for (ids, 0..) |id, i| format.writeU32(payload[i * 4 ..][0..4], id);
+    try appendBlock(allocator, compressor, out, payload, &.{.{ .offset = 0, .count = @intCast(ids.len), .width = 4 }}, @backingInt(format.Encoding.raw), false, table_compression);
+}
+
 /// One column's string table, laid out apart from its segment file in
 /// pieces that encode in parallel: its shared-string pages, then its
-/// row-group blocks. `MergedSegmentWriter.appendStringTable` places it.
+/// row-group blocks, then its table ids if it carries them.
+/// `MergedSegmentWriter.appendStringTable` places it.
 pub const StringTableBuild = struct {
     strings: segment_strings.ColumnStrings,
     column_idx: u32,
     page_count: usize,
+    /// The table id of each segment id; null when the table carries none.
+    table_ids: ?[]u32,
     /// Each piece's encoded bytes, pages first.
     pieces: []std.ArrayList(u8),
     /// Each piece's part lengths; a page's are its index and bytes.
@@ -534,8 +601,13 @@ pub const StringTableBuild = struct {
         for (self.pieces) |*p| p.deinit(allocator);
         allocator.free(self.pieces);
         allocator.free(self.parts);
+        if (self.table_ids) |ids| allocator.free(ids);
         self.strings.deinit();
         self.* = undefined;
+    }
+
+    fn blockCount(self: *const StringTableBuild) usize {
+        return self.strings.blocks.items.len;
     }
 };
 
@@ -600,6 +672,8 @@ fn appendFooter(
             try appendU32(allocator, buf, p.bytes_length);
         }
         for (t.blocks) |b| for (b.lengths.values) |len| try appendU32(allocator, buf, len);
+        try appendU64(allocator, buf, t.table_ids.offset);
+        try appendU32(allocator, buf, t.table_ids.length);
     }
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);
     try appendU32(allocator, buf, footer_size);
@@ -650,6 +724,7 @@ pub const MergedSegmentWriter = struct {
     strings: segment_strings.SegmentStrings,
     /// String tables `appendStringTable` placed.
     string_tables: std.ArrayList(format.StringTable),
+    table_ids: ?table_strings.Target = null,
 
     pub fn begin(
         allocator: Allocator,
@@ -733,6 +808,12 @@ pub const MergedSegmentWriter = struct {
             return e;
         };
         self.row_count += @intCast(rows);
+    }
+
+    /// Has the writer's string tables carry the table's string ids
+    /// (DESIGN.md §4.6).
+    pub fn useTableIds(self: *MergedSegmentWriter, target: table_strings.Target) void {
+        self.table_ids = target;
     }
 
     /// Encodes column `ci` of a row group into `out`, apart from the writer's
@@ -820,19 +901,25 @@ pub const MergedSegmentWriter = struct {
             return null;
         }
         try cs.assignIds();
+        const table_ids = if (self.table_ids) |target| try resolveTableIds(self.allocator, target, &cs, ci) else null;
+        errdefer if (table_ids) |ids| self.allocator.free(ids);
         const page_count = segment_strings.pageCount(cs.sharedCount());
-        const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len);
+        const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len + @intFromBool(table_ids != null));
         errdefer self.allocator.free(pieces);
         @memset(pieces, .empty);
         const parts = try self.allocator.alloc(format.StringBlockParts, pieces.len);
         @memset(parts, .{});
-        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .pieces = pieces, .parts = parts };
+        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .table_ids = table_ids, .pieces = pieces, .parts = parts };
     }
 
     /// Encodes piece `i` of `build` into its own buffer, apart from the
     /// writer's other work and the build's other pieces.
     pub fn encodeStringTablePiece(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, build: *StringTableBuild, i: usize) !void {
         const cs = &build.strings;
+        if (i == build.page_count + build.blockCount()) {
+            try encodeTableIds(self.allocator, compressor, build.table_ids.?, self.schema.compression, &build.pieces[i]);
+            return;
+        }
         if (i >= build.page_count) {
             build.parts[i] = try encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
             return;
@@ -863,12 +950,19 @@ pub const MergedSegmentWriter = struct {
             page.* = .{ .offset = self.out.offset(), .index_length = parts.lengths.get(.index), .bytes_length = parts.lengths.get(.bytes) };
             try self.out.append(self.allocator, piece.items);
         }
-        for (cs.blocks.items, build.pieces[build.page_count..], build.parts[build.page_count..]) |b, piece, parts| {
+        const blocks_end = build.page_count + build.blockCount();
+        for (cs.blocks.items, build.pieces[build.page_count..blocks_end], build.parts[build.page_count..blocks_end]) |b, piece, parts| {
             const rg = self.row_groups.items[b.rg_idx];
             @constCast(rg.col_offsets)[build.column_idx] = self.out.offset();
             @constCast(rg.col_lengths)[build.column_idx] = @intCast(piece.items.len);
             blocks[b.rg_idx] = parts;
             try self.out.append(self.allocator, piece.items);
+        }
+        var ids_block: format.TableIdsBlock = .{};
+        if (build.table_ids != null) {
+            const piece = build.pieces[blocks_end].items;
+            ids_block = .{ .offset = self.out.offset(), .length = @intCast(piece.len) };
+            try self.out.append(self.allocator, piece);
         }
         self.string_tables.appendAssumeCapacity(.{
             .column_idx = build.column_idx,
@@ -877,6 +971,7 @@ pub const MergedSegmentWriter = struct {
             .value_bytes = cs.valueBytes(),
             .pages = pages,
             .blocks = blocks,
+            .table_ids = ids_block,
         });
     }
 
@@ -886,7 +981,7 @@ pub const MergedSegmentWriter = struct {
     /// `finish` the writer is spent; do not call `deinit`. After a failed one,
     /// call `deinit`.
     pub fn finish(self: *MergedSegmentWriter, sync_on_close: bool) !SegmentInfo {
-        try writeStringTables(self.allocator, &self.out, &self.strings, self.row_groups.items, self.schema.compression, self.encode_threads, &self.string_tables);
+        try writeStringTables(self.allocator, &self.out, &self.strings, self.row_groups.items, self.schema.compression, self.encode_threads, self.table_ids, &self.string_tables);
         const string_tables = try self.string_tables.toOwnedSlice(self.allocator);
         errdefer format.freeStringTables(self.allocator, string_tables);
         try writeFooter(self.allocator, &self.out, self.row_groups.items, string_tables);

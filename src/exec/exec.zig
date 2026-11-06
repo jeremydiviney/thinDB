@@ -35,6 +35,7 @@ pub const table_fn = @import("table_fn.zig");
 pub const region_exec = @import("region_exec.zig");
 pub const v2_group_topn_engine = @import("v2_group_topn_engine.zig");
 pub const segment_id_topk = @import("segment_id_topk.zig");
+pub const table_id_distinct = @import("table_id_distinct.zig");
 
 /// Diagnostic override for the GROUP BY path selection (see net/local.zig).
 /// `.auto` is normal cardinality/budget-based routing; `.hash`, `.sort`, and
@@ -1966,6 +1967,7 @@ test {
     _ = v2_group_topn_engine;
     _ = @import("count_topk_sketch.zig");
     _ = segment_id_topk;
+    _ = table_id_distinct;
     _ = @import("global_dict.zig");
     _ = @import("radix_aggregate.zig");
     _ = @import("partitioned_distinct.zig");
