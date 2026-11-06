@@ -126,7 +126,7 @@ fn collectPredicateColumns(
 
 /// Whether `expr` reads column `phys` only through comparisons with the
 /// empty string.
-fn comparesOnlyWithEmpty(expr: PredicateExpr, schema: []const Column, phys: usize) bool {
+pub fn comparesOnlyWithEmpty(expr: PredicateExpr, schema: []const Column, phys: usize) bool {
     const t = @import("../types.zig");
     return switch (expr) {
         .leaf => |p| t.findColumn(schema, p.col) != phys or switch (p.val) {

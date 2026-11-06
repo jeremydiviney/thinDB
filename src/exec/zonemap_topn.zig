@@ -40,6 +40,14 @@
 //! sort match `TopN` exactly, so the output is byte-identical to the lateScan
 //! reference path. When ANY precondition isn't met, the builder returns null
 //! and the caller falls back to lateScan.
+//!
+//! DEFERRED KEYS: a variable-width ORDER BY key after the lead, and every key
+//! after it, is left out of the heap, so its bytes are never read for rows
+//! the keys before it already rule out (`ORDER BY EventTime, SearchPhrase`).
+//! The heap compares the leading keys alone and also keeps every row tied
+//! with its worst on them; only those candidates' keys are fetched, with the
+//! output columns, and sorted on every key (`cutDeferred`). Past `tieCap`
+//! tied rows the plan compares every key instead (`collectTopK`).
 
 const std = @import("std");
 const parallel = @import("../util/parallel.zig");
@@ -70,7 +78,8 @@ const SortSpec = @import("sort.zig").SortSpec;
 const rowloc = @import("rowloc.zig");
 const condition_cache = @import("condition_cache.zig");
 const simd = @import("../util/simd.zig");
-const Scan = @import("scan.zig").Scan;
+const scan_mod = @import("scan.zig");
+const Scan = scan_mod.Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -106,19 +115,33 @@ pub const ZonemapTopN = struct {
     key_desc: []bool,
     /// Probe-batch index of each ORDER BY key column. Owned.
     key_probe_idx: []usize,
+    /// How many leading ORDER BY keys the candidate heap compares: every
+    /// key, or those before the first deferred one (see the module doc).
+    heap_keys: usize,
+    /// Per ORDER BY key, its column among `late`'s fetched columns: the
+    /// output columns, then the keys no output column holds. Empty when no
+    /// key is deferred. Owned.
+    key_out: []usize,
+    /// Per probe column: the WHERE reads it. Owned.
+    filter_reads: []bool,
     /// Probe-batch index of the one column the WHERE clause reads: a
     /// dictionary-coded block of it is filtered once per dictionary entry
     /// instead of being expanded to its rows' strings.
     dict_filter_probe: ?usize,
+    /// Whether the WHERE compares `dict_filter_probe`, no key the heap
+    /// compares, only with the empty string, which its values' lengths
+    /// settle: its blocks are read without the values' bytes
+    /// (`loadProbeColumn`).
+    lengths_filter: bool,
     /// Per probe column: a dictionary-coded block may stay coded. Owned.
     dict_ok: []bool,
     /// The digest the condition cache keeps `pred`'s per-row-group records
     /// under; null when it keeps none.
     condition: ?u128,
     /// Prunable prefix length: the longest leading run of ORDER BY keys with
-    /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`).
-    /// Only these keys drive row-group pruning; the rest still order rows in the
-    /// heap comparator.
+    /// non-nullable stat-bearing footer stats (≥1; see `leadingKeyTypeSupported`),
+    /// no longer than `heap_keys`. Only these keys drive row-group pruning; the
+    /// rest still order rows in the heap comparator.
     prefix_len: usize,
     /// Flat best-corner store, `prefix_len` i128s per row group. Scratch for one
     /// `collectTopK`; allocated in `enumerateRowGroups`, freed at its end.
@@ -145,7 +168,12 @@ pub const ZonemapTopN = struct {
     main: CandidateHeap,
 
     done: bool = false,
+    /// The output columns: the first of `late`'s fetched columns.
     out_schema: []const Column,
+
+    /// The fewest rows tied with the heap's worst that a deferred sort keeps
+    /// before it compares every key instead; `keep` raises it.
+    const MIN_TIE_CAP: usize = 1024;
 
     /// Build a zonemap top-N plan, or null when the shape/leading-key isn't
     /// supported (caller falls back to `exec.lateScan`). Same parameter shape
@@ -186,14 +214,9 @@ pub const ZonemapTopN = struct {
             key_desc[i] = sp.desc;
         }
 
-        // Prunable prefix: the leading key is already validated as prunable;
-        // extend while each subsequent key is also non-nullable with usable
-        // footer stats. The first nullable key caps the prefix.
-        var prefix_len: usize = 1;
-        while (prefix_len < order_specs.len) : (prefix_len += 1) {
-            const c = table.schema.columns[key_phys[prefix_len]];
-            if (c.nullable or !leadingKeyTypeSupported(c.type)) break;
-        }
+        const keep = std.math.add(usize, n, offset) catch std.math.maxInt(usize);
+        const heap_keys = if (keep == 0) key_phys.len else deferredFrom(table.schema.columns, key_phys);
+        const prefix_len = @min(prunablePrefix(table.schema.columns, key_phys), heap_keys);
 
         const probe_phys = try allocator.alloc(usize, probe_names.len);
         defer if (!built) allocator.free(probe_phys);
@@ -227,6 +250,14 @@ pub const ZonemapTopN = struct {
         const dict_filter_probe = try dictFilterProbe(allocator, validated, probe_schema);
         const dict_ok = try dictCodedProbes(allocator, validated, probe_schema, key_probe_idx, dict_filter_probe);
         errdefer allocator.free(dict_ok);
+        const filter_reads = try filterReads(allocator, validated, probe_schema);
+        errdefer allocator.free(filter_reads);
+
+        var fetch_names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer fetch_names.deinit(allocator);
+        try fetch_names.appendSlice(allocator, output_names);
+        const key_out: []usize = if (heap_keys == key_phys.len) &.{} else try fetchedKeys(allocator, table, order_specs, key_phys, &fetch_names);
+        errdefer allocator.free(key_out);
 
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
@@ -237,7 +268,7 @@ pub const ZonemapTopN = struct {
 
         inner = try inner.filter(validated);
         inner = try inner.topN(order_specs, n, offset);
-        var late_q = try LateScan.create(allocator, inner, scan_ptr, table, output_names);
+        var late_q = try LateScan.create(allocator, inner, scan_ptr, table, fetch_names.items);
         late_built = true;
         errdefer late_q.deinit();
         const late: *LateScan = @ptrCast(@alignCast(late_q.ptr));
@@ -245,8 +276,6 @@ pub const ZonemapTopN = struct {
 
         const self = try allocator.create(ZonemapTopN);
         errdefer allocator.destroy(self);
-
-        const keep = std.math.add(usize, n, offset) catch std.math.maxInt(usize);
 
         self.* = .{
             .allocator = allocator,
@@ -260,7 +289,11 @@ pub const ZonemapTopN = struct {
             .key_phys = key_phys,
             .key_desc = key_desc,
             .key_probe_idx = key_probe_idx,
+            .heap_keys = heap_keys,
+            .key_out = key_out,
+            .filter_reads = filter_reads,
             .dict_filter_probe = dict_filter_probe,
+            .lengths_filter = lengthsOnly(validated, probe_schema, key_probe_idx[0..heap_keys], dict_filter_probe),
             .dict_ok = dict_ok,
             .condition = scan_ptr.conditionDigest(validated),
             .prefix_len = prefix_len,
@@ -269,7 +302,7 @@ pub const ZonemapTopN = struct {
             .keep = keep,
             .dop = @max(dop, 1),
             .main = undefined,
-            .out_schema = late.outputSchema(),
+            .out_schema = late.outputSchema()[0..output_names.len],
         };
         self.main = try CandidateHeap.init(self, allocator);
         built = true;
@@ -284,6 +317,8 @@ pub const ZonemapTopN = struct {
         self.allocator.free(self.key_phys);
         self.allocator.free(self.key_desc);
         self.allocator.free(self.key_probe_idx);
+        self.allocator.free(self.key_out);
+        self.allocator.free(self.filter_reads);
         self.allocator.free(self.dict_ok);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -327,18 +362,68 @@ pub const ZonemapTopN = struct {
         if (locs.len == 0) return null;
 
         try self.late.materializeInto(locs);
+        if (self.heap_keys < self.key_phys.len and try self.cutDeferred(locs) == 0) return null;
         const out = self.late.outputColumns();
-        for (out.columns, 0..) |c, i| self.late.views[i] = c.view();
+        const visible = out.columns[0..self.out_schema.len];
+        for (visible, 0..) |c, i| self.late.views[i] = c.view();
         return Batch{
-            .schema = out.schema,
-            .values = self.late.views[0..out.columns.len],
-            .row_count = out.columns[0].rowCount(),
+            .schema = self.out_schema,
+            .values = self.late.views[0..visible.len],
+            .row_count = visible[0].rowCount(),
         };
     }
 
-    /// Run the zonemap heap and return the final sorted survivor `__rowloc`s
-    /// (after dropping OFFSET, keeping n), caller-owned.
+    /// Run the zonemap heap and return the survivors' `__rowloc`s,
+    /// caller-owned: in emit order after dropping OFFSET and keeping n, or,
+    /// with deferred keys, every candidate in storage order.
     fn collectTopK(self: *ZonemapTopN) ![]i64 {
+        if (self.heap_keys < self.key_phys.len) {
+            if (self.collectCandidates()) |locs| return locs else |err| if (err != error.TooManyTies) return err;
+            try self.compareEveryKey();
+        }
+        return self.collectCandidates();
+    }
+
+    /// Stop deferring keys: the next visit's heap compares every key.
+    fn compareEveryKey(self: *ZonemapTopN) !void {
+        self.heap_keys = self.key_phys.len;
+        self.prefix_len = prunablePrefix(self.table.schema.columns, self.key_phys);
+        self.lengths_filter = lengthsOnly(self.pred, self.probe_schema, self.key_probe_idx, self.dict_filter_probe);
+        const fresh = try CandidateHeap.init(self, self.allocator);
+        self.main.deinit();
+        self.main = fresh;
+    }
+
+    /// How many rows tied with the heap's worst a deferred sort keeps.
+    fn tieCap(self: *const ZonemapTopN) usize {
+        return @max(self.keep, MIN_TIE_CAP);
+    }
+
+    /// Sort the fetched candidates on every ORDER BY key, then their
+    /// locations, and cut the output columns to rows `offset..offset + n`
+    /// of that order. Returns the rows kept.
+    fn cutDeferred(self: *ZonemapTopN, locs: []const i64) !usize {
+        const cols = self.late.outputColumns().columns;
+        const perm = try self.allocator.alloc(u32, locs.len);
+        defer self.allocator.free(perm);
+        for (perm, 0..) |*p, i| p.* = @intCast(i);
+        const order: FetchedOrder = .{ .cols = cols, .key_out = self.key_out, .desc = self.key_desc, .locs = locs };
+        std.sort.pdq(u32, perm, order, FetchedOrder.lessThan);
+
+        const start = @min(self.offset, perm.len);
+        const end = @min(std.math.add(usize, self.offset, self.n) catch perm.len, perm.len);
+        const kept = perm[start..@max(start, end)];
+        for (cols[0..self.out_schema.len], self.out_schema) |*c, col| {
+            var cut = try ColumnStore.init(self.allocator, col.type, col.nullable);
+            errdefer cut.deinit(self.allocator);
+            try transform.appendByIndices(self.allocator, c.view(), kept, &cut);
+            c.deinit(self.allocator);
+            c.* = cut;
+        }
+        return kept.len;
+    }
+
+    fn collectCandidates(self: *ZonemapTopN) ![]i64 {
         const refs = try self.enumerateRowGroups();
         defer self.allocator.free(refs);
         defer {
@@ -443,9 +528,11 @@ pub const ZonemapTopN = struct {
         const rows = try self.allocator.alloc(usize, src.key_cols.len);
         defer self.allocator.free(rows);
         for (src.key_cols, views) |kc, *v| v.* = kc.view();
-        for (src.heap.items) |row| {
-            @memset(rows, row);
-            _ = try self.main.pushCandidate(.{ .views = views, .rows = rows }, src.loc_store.items[row]);
+        for ([2][]const u32{ src.heap.items, src.ties.items }) |kept| {
+            for (kept) |row| {
+                @memset(rows, row);
+                _ = try self.main.pushCandidate(.{ .views = views, .rows = rows }, src.loc_store.items[row]);
+            }
         }
     }
 
@@ -554,11 +641,12 @@ pub const ZonemapTopN = struct {
         defer self.allocator.free(mask);
         try evalPredicate(self, self.allocator, vbuf, n, mask, null);
 
-        const views = try self.allocator.alloc(ColumnView, self.key_probe_idx.len);
+        const compared = self.key_probe_idx[0..self.heap_keys];
+        const views = try self.allocator.alloc(ColumnView, compared.len);
         defer self.allocator.free(views);
-        const rows = try self.allocator.alloc(usize, self.key_probe_idx.len);
+        const rows = try self.allocator.alloc(usize, compared.len);
         defer self.allocator.free(rows);
-        for (self.key_probe_idx, views) |j, *v| v.* = vbuf[j];
+        for (compared, views) |j, *v| v.* = vbuf[j];
         for (mask, 0..) |keep, row| {
             if (!keep) continue;
             @memset(rows, row);
@@ -567,8 +655,10 @@ pub const ZonemapTopN = struct {
     }
 
     /// Sort the live heap rows by the comparator, drop the first `offset`, keep
-    /// `n`, and return their locs in emit order (caller-owned).
+    /// `n`, and return their locs in emit order (caller-owned). With deferred
+    /// keys, every candidate's loc instead (`collectTopK`).
     fn finalize(self: *ZonemapTopN) ![]i64 {
+        if (self.heap_keys < self.key_phys.len) return self.main.candidateLocs(self.allocator);
         const total = self.main.heap.items.len;
         if (total == 0) return self.allocator.alloc(i64, 0);
 
@@ -706,13 +796,15 @@ fn zWorkerMain(w: *ZWorker) void {
     defer lease.release();
     zWorkerRun(w) catch |e| {
         w.err = e;
+        // The visit fails whatever the other workers find.
+        w.stop.store(true, .release);
     };
 }
 
 fn zWorkerRun(w: *ZWorker) !void {
     const z = w.z;
     const allocator = w.allocator;
-    var scratch = try ProbeScratch.init(allocator, z.probe_phys.len, z.key_phys.len);
+    var scratch = try ProbeScratch.init(allocator, z.probe_phys.len, z.heap_keys);
     defer scratch.deinit(allocator);
 
     // Per-worker segment + tombstone caches: the corner-sorted claim order
@@ -793,6 +885,9 @@ const ProbeScratch = struct {
     mask: std.ArrayListUnmanaged(bool) = .empty,
     pred_mask: std.ArrayListUnmanaged(bool) = .empty,
     entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    /// One byte per non-empty dictionary entry, standing for its value
+    /// (`emptinessEntries`).
+    entry_marks: std.ArrayListUnmanaged(u8) = .empty,
     /// Leading-key values of the rows this row group added to the worker's
     /// heap, for the `LeadPool`.
     kept_leads: std.ArrayListUnmanaged(i128) = .empty,
@@ -838,6 +933,7 @@ const ProbeScratch = struct {
         self.mask.deinit(allocator);
         self.pred_mask.deinit(allocator);
         self.entry_hits.deinit(allocator);
+        self.entry_marks.deinit(allocator);
         self.kept_leads.deinit(allocator);
         self.kept_rows.deinit(allocator);
     }
@@ -879,13 +975,16 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
         @memset(mask, true);
     }
     // A condition-cache record of the row group stands in for the WHERE, and
-    // the columns only the WHERE reads stay unloaded.
+    // the columns only the WHERE reads stay unloaded, as do deferred keys.
     const block_cache = z.table.cache;
     const record = if (z.condition) |d| block_cache.acquireDerived(z.inner_scan.conditionKey(seg, ref.rg_idx, .matched_rows, d)) else null;
     defer if (record) |e| block_cache.release(e);
     if (record) |e| if (condition_cache.matchedRows(e.bytes) == 0) return;
+    const compared = z.key_probe_idx[0..z.heap_keys];
     for (0..z.probe_phys.len) |j| {
-        if (j == lead or (record != null and std.mem.indexOfScalar(usize, z.key_probe_idx, j) == null)) continue;
+        if (j == lead) continue;
+        const heap_key = std.mem.indexOfScalar(usize, compared, j) != null;
+        if (!heap_key and (record != null or !z.filter_reads[j])) continue;
         try loadProbeColumn(z, allocator, scratch, seg, ref, j);
     }
 
@@ -909,7 +1008,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     simd.combineMaskInto(.@"and", mask, pred_mask);
     try applyTombstones(z, allocator, cache, ref, seg.*, rg_count, mask);
 
-    for (z.key_probe_idx, scratch.key_views) |j, *kv| kv.* = switch (scratch.cols[j]) {
+    for (compared, scratch.key_views) |j, *kv| kv.* = switch (scratch.cols[j]) {
         .view => |v| v,
         .dict => |d| d.entries,
     };
@@ -922,7 +1021,7 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
     // the leading key of every row where the WHERE leaves a few.
     if (pooled) |b| kept_rows = rowsNotPast(z, scratch.cols[lead], b, kept_rows);
     for (kept_rows) |row| {
-        for (z.key_probe_idx, scratch.key_rows) |j, *kr| kr.* = switch (scratch.cols[j]) {
+        for (compared, scratch.key_rows) |j, *kr| kr.* = switch (scratch.cols[j]) {
             .view => row,
             .dict => |d| d.db.rowCode(row),
         };
@@ -938,7 +1037,11 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
 fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, seg: *storage.ReadSegment, ref: RgRef, j: usize) !void {
     const rg_count = ref.row_count;
     const phys = z.probe_phys[j];
-    scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
+    const lengths = z.lengths_filter and z.dict_filter_probe == j;
+    scratch.blocks[j] = if (lengths)
+        try seg.borrowStringBlock(allocator, ref.rg_idx, phys, z.table.cacheRef(), .no_bytes)
+    else
+        try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
     scratch.borrowed[j] = true;
     const block = &scratch.blocks[j];
     const col = z.table.schema.columns[phys];
@@ -952,6 +1055,15 @@ fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeS
             values = block.bytes[bm_len..];
         }
         const db = storage.segment_reader.dictBlockOf(values, rg_count);
+        if (lengths) {
+            scratch.cols[j] = .{ .dict = .{
+                .db = db,
+                .nulls = nulls,
+                .entries = try stringColumnView(col.type, try emptinessEntries(allocator, scratch, db, j), null),
+            } };
+            scratch.views[j] = try stringColumnView(col.type, .{ .offsets = &.{0}, .bytes = "" }, null);
+            return;
+        }
         const offsets = db.offsetsInPlace() orelse offsets: {
             const decoded = &scratch.entry_offsets[j];
             try decoded.resize(allocator, @as(usize, db.ndv) + 1);
@@ -973,6 +1085,23 @@ fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeS
     };
     scratch.cols[j] = .{ .view = view };
     scratch.views[j] = view;
+}
+
+/// A dictionary's entries as a `lengths_filter` WHERE reads them: each
+/// non-empty value as one byte, which compares with the empty string as the
+/// value does. Only the entries' lengths are read, so a block without its
+/// values' bytes serves.
+fn emptinessEntries(allocator: Allocator, scratch: *ProbeScratch, db: storage.segment_reader.DictBlock, j: usize) !storage.StringView {
+    const offsets = &scratch.entry_offsets[j];
+    try offsets.resize(allocator, @as(usize, db.ndv) + 1);
+    offsets.items[0] = 0;
+    for (0..db.ndv) |c| offsets.items[c + 1] = offsets.items[c] + @intFromBool(db.valueLen(@intCast(c)) != 0);
+    const marks = &scratch.entry_marks;
+    if (marks.items.len < db.ndv) {
+        try marks.resize(allocator, db.ndv);
+        @memset(marks.items, 'x');
+    }
+    return .{ .offsets = offsets.items, .bytes = marks.items[0..offsets.items[db.ndv]] };
 }
 
 /// Set `mask` to the rows whose leading ORDER BY key doesn't sort strictly
@@ -1056,6 +1185,87 @@ fn evalPredicate(z: *const ZonemapTopN, allocator: Allocator, views: []const Col
     const batch = Batch{ .schema = z.probe_schema, .values = views, .row_count = n };
     try predicate.evaluateExprGuided(allocator, z.pred, z.probe_schema, batch, mask, active);
 }
+
+/// The prunable prefix: the leading key, then each following key while it is
+/// non-nullable with usable footer stats.
+fn prunablePrefix(columns: []const Column, key_phys: []const usize) usize {
+    var len: usize = 1;
+    while (len < key_phys.len) : (len += 1) {
+        const c = columns[key_phys[len]];
+        if (c.nullable or !leadingKeyTypeSupported(c.type)) break;
+    }
+    return len;
+}
+
+/// `ZonemapTopN.heap_keys`: the keys before the first variable-width key
+/// past the lead, or every key.
+fn deferredFrom(columns: []const Column, key_phys: []const usize) usize {
+    for (key_phys[1..], 1..) |phys, i| {
+        const t = columns[phys].type;
+        if (t.isString() or t == .nested or t == .bitmap) return i;
+    }
+    return key_phys.len;
+}
+
+/// Whether the WHERE compares `dict_filter_probe`, none of the `compared`
+/// key probes, only with the empty string (`ZonemapTopN.lengths_filter`).
+fn lengthsOnly(pred: PredicateExpr, probe_schema: []const Column, compared: []const usize, dict_filter_probe: ?usize) bool {
+    const j = dict_filter_probe orelse return false;
+    return std.mem.indexOfScalar(usize, compared, j) == null and scan_mod.comparesOnlyWithEmpty(pred, probe_schema, j);
+}
+
+fn filterReads(allocator: Allocator, pred: PredicateExpr, probe_schema: []const Column) ![]bool {
+    const names = try predicateColumns(allocator, pred);
+    defer allocator.free(names);
+    const reads = try allocator.alloc(bool, probe_schema.len);
+    for (probe_schema, reads) |col, *r| {
+        r.* = false;
+        for (names) |nm| {
+            if (types.columnNameEql(nm, col.name)) r.* = true;
+        }
+    }
+    return reads;
+}
+
+/// `ZonemapTopN.key_out`, appending to `fetch_names` each key no fetched
+/// column holds yet.
+fn fetchedKeys(
+    allocator: Allocator,
+    table: *Table,
+    order_specs: []const SortSpec,
+    key_phys: []const usize,
+    fetch_names: *std.ArrayListUnmanaged([]const u8),
+) ![]usize {
+    const key_out = try allocator.alloc(usize, key_phys.len);
+    errdefer allocator.free(key_out);
+    for (key_phys, order_specs, key_out) |phys, sp, *o| {
+        o.* = for (fetch_names.items, 0..) |nm, c| {
+            if (types.findColumn(table.schema.columns, nm) == phys) break c;
+        } else c: {
+            try fetch_names.append(allocator, sp.col);
+            break :c fetch_names.items.len - 1;
+        };
+    }
+    return key_out;
+}
+
+/// `ZonemapTopN.cutDeferred`'s order of the fetched candidates: every ORDER
+/// BY key, then the location, as `CandidateHeap.permLess` orders the heap.
+const FetchedOrder = struct {
+    cols: []const ColumnStore,
+    key_out: []const usize,
+    desc: []const bool,
+    locs: []const i64,
+
+    fn lessThan(self: FetchedOrder, a: u32, b: u32) bool {
+        for (self.key_out, self.desc) |c, desc| {
+            const ord = transform.compareInColumnNullsFirst(self.cols[c], a, b);
+            if (ord == .lt) return !desc;
+            if (ord == .gt) return desc;
+        }
+        return self.locs[a] < self.locs[b];
+    }
+};
 
 /// The probe index of the one column the predicate reads, through per-row
 /// kernels only.
@@ -1171,13 +1381,16 @@ const CandidateHeap = struct {
     key_cols: []ColumnStore,
     loc_store: std.ArrayListUnmanaged(i64) = .empty,
     heap: std.ArrayListUnmanaged(u32) = .empty,
+    /// With deferred keys, the rows outside the heap tied with its worst on
+    /// the compared keys.
+    ties: std.ArrayListUnmanaged(u32) = .empty,
 
     fn init(z: *const ZonemapTopN, allocator: Allocator) !CandidateHeap {
-        const key_cols = try allocator.alloc(ColumnStore, z.key_phys.len);
+        const key_cols = try allocator.alloc(ColumnStore, z.heap_keys);
         errdefer allocator.free(key_cols);
         var inited: usize = 0;
         errdefer for (key_cols[0..inited]) |*c| c.deinit(allocator);
-        for (z.key_phys, 0..) |phys, i| {
+        for (z.key_phys[0..z.heap_keys], 0..) |phys, i| {
             const c = z.table.schema.columns[phys];
             key_cols[i] = try ColumnStore.init(allocator, c.type, c.nullable);
             inited += 1;
@@ -1190,6 +1403,7 @@ const CandidateHeap = struct {
         self.allocator.free(self.key_cols);
         self.loc_store.deinit(self.allocator);
         self.heap.deinit(self.allocator);
+        self.ties.deinit(self.allocator);
     }
 
     fn full(self: *const CandidateHeap) bool {
@@ -1229,6 +1443,7 @@ const CandidateHeap = struct {
         }
 
         const worst_row = self.heap.items[0];
+        if (self.z.heap_keys < self.z.key_phys.len) return self.pushKeepingTies(key, loc, worst_row);
         if (self.candidateWorseThanRow(key, loc, worst_row)) return null;
 
         const slot = try self.appendCandidateRow(key, loc);
@@ -1237,6 +1452,61 @@ const CandidateHeap = struct {
         self.siftDown(0);
         self.compactIfNeeded();
         return lead;
+    }
+
+    /// `pushCandidate` into a full heap whose deferred keys may still reorder
+    /// rows tied on the compared keys: a candidate tied with the worst joins
+    /// `ties`, and a better one keeps the old worst there too while it ties
+    /// the new worst. Every row that can still make the cut stays at hand.
+    fn pushKeepingTies(self: *CandidateHeap, key: KeyRef, loc: i64, worst_row: u32) !?i128 {
+        const ord = self.candidateOrder(key, worst_row);
+        if (ord == .gt) return null;
+        const slot = try self.appendCandidateRow(key, loc);
+        const lead = keyValueI128(self.key_cols[0], slot);
+        if (ord == .eq) {
+            try self.addTie(slot);
+            return lead;
+        }
+        self.heap.items[0] = slot;
+        self.siftDown(0);
+        if (self.rowsTie(self.heap.items[0], worst_row)) {
+            try self.addTie(worst_row);
+        } else {
+            self.ties.clearRetainingCapacity();
+        }
+        self.compactIfNeeded();
+        return lead;
+    }
+
+    fn addTie(self: *CandidateHeap, row: u32) !void {
+        if (self.ties.items.len >= self.z.tieCap()) return error.TooManyTies;
+        try self.ties.append(self.allocator, row);
+    }
+
+    /// Where candidate `key` sorts against stored row `other` on the compared
+    /// keys alone, under their directions.
+    fn candidateOrder(self: *const CandidateHeap, key: KeyRef, other: u32) std.math.Order {
+        for (self.key_cols, key.views, key.rows, 0..) |kc, v, row, i| {
+            const ord = transform.compareViewRowsNullsFirst(v, row, kc.view(), other);
+            if (ord != .eq) return if (self.z.key_desc[i]) ord.invert() else ord;
+        }
+        return .eq;
+    }
+
+    fn rowsTie(self: *const CandidateHeap, a: u32, b: u32) bool {
+        for (self.key_cols) |kc| {
+            if (transform.compareInColumnNullsFirst(kc, a, b) != .eq) return false;
+        }
+        return true;
+    }
+
+    /// The heap's and the ties' locations in storage order (caller-owned).
+    fn candidateLocs(self: *const CandidateHeap, allocator: Allocator) ![]i64 {
+        const locs = try allocator.alloc(i64, self.heap.items.len + self.ties.items.len);
+        for (locs[0..self.heap.items.len], self.heap.items) |*l, row| l.* = self.loc_store.items[row];
+        for (locs[self.heap.items.len..], self.ties.items) |*l, row| l.* = self.loc_store.items[row];
+        std.sort.pdq(i64, locs, {}, std.sort.asc(i64));
+        return locs;
     }
 
     /// Append the candidate's per-key values + loc as a fresh row; return its
@@ -1315,18 +1585,20 @@ const CandidateHeap = struct {
         }
     }
 
-    /// Rebuild the candidate store down to just the live heap rows once dead
-    /// rows dominate (store grown past 2×keep), so memory stays O(keep). Heap
-    /// indices are remapped to the compacted positions.
+    /// Rebuild the candidate store down to just the live heap and tie rows once
+    /// dead rows dominate (store grown past twice the live rows' bound), so
+    /// memory stays O(keep). Heap and tie indices are remapped to the
+    /// compacted positions.
     fn compactIfNeeded(self: *CandidateHeap) void {
         if (self.z.keep == std.math.maxInt(usize)) return;
-        const cap = std.math.mul(usize, self.z.keep, 2) catch return;
+        const live = std.math.add(usize, self.z.keep, self.ties.items.len) catch return;
+        const cap = std.math.mul(usize, live, 2) catch return;
         if (self.loc_store.items.len <= cap) return;
         self.compact() catch {}; // best-effort; correctness unaffected if it no-ops
     }
 
     fn compact(self: *CandidateHeap) !void {
-        const live = self.heap.items.len;
+        const live = self.heap.items.len + self.ties.items.len;
         var fresh = try self.allocator.alloc(ColumnStore, self.key_cols.len);
         var finited: usize = 0;
         errdefer {
@@ -1342,16 +1614,20 @@ const CandidateHeap = struct {
         errdefer fresh_locs.deinit(self.allocator);
         try fresh_locs.ensureTotalCapacity(self.allocator, live);
 
-        // Append each live heap row (in heap order) into the fresh store; the
-        // heap's row index becomes its new position.
-        for (self.heap.items, 0..) |row, new_idx| {
-            for (self.key_cols, 0..) |src, i| {
-                const one = [_]u32{row};
-                try transform.appendByIndices(self.allocator, src.view(), &one, &fresh[i]);
+        // Append each live row (the heap's in heap order, then the ties) into
+        // the fresh store, and only once all are in renumber them to their
+        // new positions: a failed append leaves the old store whole.
+        for ([2][]const u32{ self.heap.items, self.ties.items }) |rows| {
+            for (rows) |row| {
+                for (self.key_cols, 0..) |src, i| {
+                    const one = [_]u32{row};
+                    try transform.appendByIndices(self.allocator, src.view(), &one, &fresh[i]);
+                }
+                fresh_locs.appendAssumeCapacity(self.loc_store.items[row]);
             }
-            fresh_locs.appendAssumeCapacity(self.loc_store.items[row]);
-            self.heap.items[new_idx] = @intCast(new_idx);
         }
+        for (self.heap.items, 0..) |*row, new_idx| row.* = @intCast(new_idx);
+        for (self.ties.items, self.heap.items.len..) |*row, new_idx| row.* = @intCast(new_idx);
 
         for (self.key_cols) |*c| c.deinit(self.allocator);
         self.allocator.free(self.key_cols);

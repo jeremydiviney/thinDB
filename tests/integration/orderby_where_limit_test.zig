@@ -27,7 +27,7 @@ const TAIL_ROWS: i64 = 64;
 ///   v         = i % 7, NULL when i % 11 == 0
 ///   updatedAt = 2026-01-01 00:00 + i minutes, NULL when i % 13 == 0
 ///   d         = 2026-<1 + (i/28) % 12>-<1 + i % 28>, NULL when i % 17 == 0
-///   s         = 'k' ++ (i % 5), NULL when i % 19 == 0
+///   s         = 'k' ++ (i % 5) ('' for 4), NULL when i % 19 == 0
 ///   amt       = i * 1.25
 ///   big       = i * 1000
 fn createTable(allocator: std.mem.Allocator, db: *thindb.Database) !void {
@@ -52,7 +52,7 @@ fn insertRows(allocator: std.mem.Allocator, db: *thindb.Database, first: i64, co
         var d_buf: [16]u8 = undefined;
         const d = if (@mod(i, 17) == 0) "NULL" else try std.fmt.bufPrint(&d_buf, "'2026-{s}-{s}'", .{ twoDigits(1 + @mod(@divTrunc(i, 28), 12)), twoDigits(1 + @mod(i, 28)) });
         var s_buf: [8]u8 = undefined;
-        const s = if (@mod(i, 19) == 0) "NULL" else try std.fmt.bufPrint(&s_buf, "'k{d}'", .{@mod(i, 5)});
+        const s = if (@mod(i, 19) == 0) "NULL" else if (@mod(i, 5) == 4) "''" else try std.fmt.bufPrint(&s_buf, "'k{d}'", .{@mod(i, 5)});
         const cents = i * 125;
         const row = try std.fmt.bufPrint(line[8..], "({d}, {d}, {s}, {s}, {s}, {s}, {d}.{s}, {d})", .{ i, @mod(i, 3), v, ts, d, s, @divTrunc(cents, 100), twoDigits(@mod(cents, 100)), i * 1000 });
         try buf.appendSlice(allocator, row);
@@ -146,6 +146,10 @@ const wheres = [_][]const u8{
     "WHERE s NOT LIKE '%2'",
     "WHERE NOT (s = 'k2')",
     "WHERE s IS NULL OR s = 'k1'",
+    // compared only with '', which the values' lengths settle
+    "WHERE s <> ''",
+    "WHERE s = ''",
+    "WHERE NOT (s > '')",
     // nullable int
     "WHERE v = 3",
     "WHERE v IN (1, 2)",
@@ -260,6 +264,29 @@ test "WHERE × ORDER BY × LIMIT matrix over flushed segments" {
     var db = try setup(allocator, io, tmp.dir, .segments, 1);
     defer db.close();
     try checkMatrix(allocator, db, .segments);
+}
+
+test "WHERE × ORDER BY × LIMIT matrix over flushed segments without the condition cache" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No record stands in for a WHERE, so each top-N probe reads its filter
+    // columns, `s` by its lengths alone where only '' compares with it.
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .row_group_size = 64, .condition_cache = false });
+    defer db.close();
+    try createTable(allocator, db);
+    try insertRows(allocator, db, 0, ROWS);
+    const t = try db.openTable("t", .{});
+    try t.flush();
+    try checkMatrix(allocator, db, .segments);
+    // The probe holds `s` without its bytes, yet the rows it picks show theirs.
+    var q = try runSql(allocator, db, "SELECT s FROM t WHERE s <> '' ORDER BY id DESC LIMIT 3");
+    defer q.deinit();
+    const picked = try helpers.columnText(allocator, &q);
+    defer helpers.freeStrings(allocator, picked);
+    try std.testing.expectEqual(@as(usize, 3), picked.len);
+    for (picked, [_][]const u8{ "k1", "k0", "k3" }) |got, want| try std.testing.expectEqualStrings(want, got.?);
 }
 
 test "WHERE × ORDER BY × LIMIT matrix over segments + memtable tail + tombstones" {
