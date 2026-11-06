@@ -162,12 +162,6 @@ fn unitBetween(chunks: []const MaterializedResult.Chunk, a: StripeCut, b: Stripe
     return .{ .chunk_lo = a.chunk, .chunk_hi = b.chunk + 1, .row_lo = a.row, .row_hi = b.row };
 }
 
-/// Selective-query right-sizing: one worker thread per this many surviving
-/// (post-zone-map) row groups, so a point lookup that touches 13 of 958 row
-/// groups doesn't pay 12 thread spawns. 2 keeps per-thread wall at roughly two
-/// block decodes — small enough that the clamp never gates a real workload.
-const RGS_PER_THREAD: usize = 2;
-
 /// Execution strategy, chosen lazily on the first `next()` (fusion happens
 /// after `create`). `materialize` is the fused-filter path: each worker drains
 /// its whole slice and deep-copies survivors, then we concat. `round` is the
@@ -2654,16 +2648,18 @@ pub const ParallelScan = struct {
 
     /// Threads worth asking the fan-out budget for: the configured DOP
     /// clamped by the work that survives zone-map pruning
-    /// (`Scan.survivingWorkUnits`). Runs at spawn time — the first `next()`
-    /// — which is after the Query is composed, so the workers' prune hints are
-    /// installed. No hints → full DOP.
+    /// (`Scan.survivingWorkUnits`): a thread per surviving row group, so a
+    /// point lookup that touches 3 of 958 row groups spawns 3 threads. Runs
+    /// at spawn time — the first `next()` — which is after the Query is
+    /// composed, so the workers' prune hints are installed. No hints → full
+    /// DOP.
     fn effectiveThreads(self: *ParallelScan) usize {
         if (self.n_threads <= 1) return self.n_threads;
         // A buffer stripe with nothing fused into it is a view slice — no
         // work to spread, only a pool to spawn and join.
         if (self.table == null and !self.compute_fused and !self.agg_fused and self.probe_sink == null) return 1;
         const by_work = if (self.workers[0].survivingWorkUnits()) |surviving|
-            @min(self.n_threads, (surviving + RGS_PER_THREAD - 1) / RGS_PER_THREAD)
+            @min(self.n_threads, surviving)
         else
             self.n_threads;
         return @max(@as(usize, 1), by_work);

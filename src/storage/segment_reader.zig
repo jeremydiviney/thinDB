@@ -417,18 +417,72 @@ pub const ReadSegment = struct {
     };
 
     /// The decompressed payload of `table`'s table-ids block, from
-    /// `out_allocator`; `scratch` holds the stored frame.
+    /// `out_allocator`; `scratch` holds the stored run. Its column blocks
+    /// decode side by side, with what idle threads the machine has.
     fn readTableIds(self: ReadSegment, out_allocator: Allocator, scratch: Allocator, table: format.StringTable) ![]align(16) u8 {
         const block = table.table_ids;
-        const frame = try scratch.alloc(u8, block.length);
-        defer scratch.free(frame);
-        if (try self.file.readPositionalAll(self.io, frame, block.offset) != frame.len) return format.Error.UnexpectedEof;
-        try checkFrame(frame);
+        const run = try scratch.alloc(u8, block.length);
+        defer scratch.free(run);
+        if (try self.file.readPositionalAll(self.io, run, block.offset) != run.len) return format.Error.UnexpectedEof;
         const payload = try out_allocator.alignedAlloc(u8, .@"16", @as(usize, table.value_count) * 4);
         errdefer out_allocator.free(payload);
-        try decompressBlockInto(scratch, frame, payload);
+        var chunks: std.ArrayList(IdsDecode.Chunk) = .empty;
+        defer chunks.deinit(scratch);
+        var at: usize = 0;
+        var out_at: usize = 0;
+        while (at < run.len) {
+            if (run.len - at < format.column_block_header_size) return format.Error.CorruptColumnBlockHeader;
+            const frame_len = format.column_block_header_size + @as(usize, format.readU32(run[at + 8 ..][0..4]));
+            if (frame_len > run.len - at) return format.Error.CorruptColumnBlockHeader;
+            const frame = run[at..][0..frame_len];
+            try checkFrame(frame);
+            const raw_len: usize = format.readU32(frame[4..8]);
+            if (raw_len > payload.len - out_at) return format.Error.CorruptColumnBlockHeader;
+            try chunks.append(scratch, .{ .frame = frame, .out = payload[out_at..][0..raw_len] });
+            at += frame_len;
+            out_at += raw_len;
+        }
+        if (out_at != payload.len) return format.Error.CorruptColumnBlockHeader;
+        var grant = core_scheduler.reserveWorkers(chunks.items.len);
+        defer grant.release();
+        var decode: IdsDecode = .{ .allocator = self.allocator, .chunks = chunks.items };
+        decode.run(grant.count);
+        for (chunks.items) |c| {
+            if (!c.done) try decompressBlockInto(scratch, c.frame, c.out);
+        }
         return payload;
     }
+
+    /// One table-ids block's column blocks as jobs its threads claim in
+    /// order.
+    const IdsDecode = struct {
+        /// The segment's own allocator, which any thread may use.
+        allocator: Allocator,
+        chunks: []Chunk,
+        next: std.atomic.Value(usize) = .init(0),
+
+        const Chunk = struct { frame: []const u8, out: []u8, done: bool = false };
+
+        fn run(self: *IdsDecode, threads: usize) void {
+            var helpers: [parallel.MAX_THREADS]?parallel.Helper = @splat(null);
+            const n = @min(@max(threads, 1), helpers.len);
+            for (helpers[1..n]) |*h| h.* = parallel.spawn(work, .{self}) catch null;
+            self.work();
+            for (helpers[1..n]) |h| if (h) |helper| helper.join();
+        }
+
+        fn work(self: *IdsDecode) void {
+            while (true) {
+                const j = self.next.fetchAdd(1, .monotonic);
+                if (j >= self.chunks.len) return;
+                const c = &self.chunks[j];
+                // A block that fails is decoded again by `readTableIds`,
+                // which returns the error.
+                decompressBlockInto(self.allocator, c.frame, c.out) catch continue;
+                c.done = true;
+            }
+        }
+    };
 
     /// Row group `row_group_idx`'s block parts of column `column_idx`, when
     /// the column's string table took the row group.
@@ -1979,7 +2033,12 @@ fn readForCode(codes: []const u8, width: u8, row: usize) u64 {
 
 fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u32) ![]T {
     const data = try allocator.alloc(T, row_count);
-    errdefer allocator.free(data);
+    fillFor(T, fb, data);
+    return data;
+}
+
+/// Write `fb`'s values over `data`, a value per row.
+fn fillFor(comptime T: type, fb: ForBlock, data: []T) void {
     const base: T = @intCast(fb.base);
     switch (fb.width) {
         1 => expandWidth(T, u8, base, fb.codes, data),
@@ -1988,7 +2047,6 @@ fn expandFor(comptime T: type, allocator: Allocator, fb: ForBlock, row_count: u3
         8 => expandWidth(T, u64, base, fb.codes, data),
         else => unreachable,
     }
-    return data;
 }
 
 /// Reconstruct native values from the narrow unsigned deltas: `out[i] = base +
@@ -2110,11 +2168,67 @@ pub fn decodeRleColumn(
 }
 
 fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u32) ![]T {
+    const data = try allocator.alloc(T, row_count);
+    fillRuns(T, rb, data);
+    return data;
+}
+
+/// Expand an RLE or FOR block of an integer-family column into `buf`, grown
+/// to fit and reused across calls, and view the values there; the view's
+/// nulls alias `raw`. Null for any other encoding or type.
+pub fn expandBlockInto(
+    allocator: Allocator,
+    buf: *std.ArrayListUnmanaged(u64),
+    col_type: Type,
+    raw: []const u8,
+    row_count: u32,
+    flags: format.ColumnBlockFlags,
+    encoding: format.Encoding,
+) !?ColumnView {
+    var nulls: ?[]const u8 = null;
+    var values = raw;
+    if (flags.has_nulls) {
+        const bm_len = column.bitmapBytes(row_count);
+        nulls = raw[0..bm_len];
+        values = raw[bm_len..];
+    }
+    const packed_values: PackedValues = switch (encoding) {
+        .rle => .{ .rle = rleBlockOf(values) },
+        .for_ => .{ .for_ = forBlockOf(values, row_count) },
+        else => return null,
+    };
+    return switch (col_type) {
+        .int => .{ .data = .{ .int = try expandInto(i32, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .date => .{ .data = .{ .date = try expandInto(i32, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .bigint => .{ .data = .{ .bigint = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .datetime => .{ .data = .{ .datetime = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .decimal64 => .{ .data = .{ .decimal64 = try expandInto(i64, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .smallint => .{ .data = .{ .smallint = try expandInto(i16, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .tinyint => .{ .data = .{ .tinyint = try expandInto(i8, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        .boolean => .{ .data = .{ .boolean = try expandInto(u8, allocator, buf, packed_values, row_count) }, .nulls = nulls },
+        else => null,
+    };
+}
+
+const PackedValues = union(enum) { rle: RleBlock, for_: ForBlock };
+
+fn expandInto(comptime T: type, allocator: Allocator, buf: *std.ArrayListUnmanaged(u64), packed_values: PackedValues, row_count: u32) ![]T {
+    const len = @as(usize, row_count) * @sizeOf(T);
+    try buf.resize(allocator, (len + @sizeOf(u64) - 1) / @sizeOf(u64));
+    const data: []T = std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(buf.items)[0..len]);
+    switch (packed_values) {
+        .rle => |rb| fillRuns(T, rb, data),
+        .for_ => |fb| fillFor(T, fb, data),
+    }
+    return data;
+}
+
+/// Write `rb`'s runs over `data`, a value per row.
+fn fillRuns(comptime T: type, rb: RleBlock, data: []T) void {
     // A run this short is written as one full-width store whose overhang the
     // next run overwrites: runs of a few rows otherwise pay a fill loop each.
     const short = 32 / @sizeOf(T);
-    const data = try allocator.alloc(T, row_count);
-    errdefer allocator.free(data);
+    const row_count = data.len;
     var pos: usize = 0;
     var run: usize = 0;
     while (run < rb.n_runs) : (run += 1) {
@@ -2130,14 +2244,14 @@ fn expandRle(comptime T: type, allocator: Allocator, rb: RleBlock, row_count: u3
         pos += len;
         if (pos == row_count) break;
     }
-    return data;
 }
 
 /// Build a BORROWED `ColumnView` over the raw decompressed block bytes —
 /// zero allocation, the view aliases `raw` directly. Used by the scan-side
 /// in-place filter fast path: the view is created over PINNED cache bytes,
 /// used for predicate evaluation + survivor compaction, and dropped within a
-/// single `next()` call. It must never be handed to a downstream operator.
+/// single `next()` call. It must never be handed to a downstream operator
+/// unless its caller keeps the block pinned for as long as the view lives.
 ///
 /// Returns `null` when a typed view can't be formed safely:
 ///   - a `.for_` block: its bytes are narrow deltas, not native-width values,

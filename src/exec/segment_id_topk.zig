@@ -24,6 +24,13 @@
 //! A WHERE reading the column alone keeps or drops each value's rows whole,
 //! so it is tested on the reported values: one it fails holds no filtered
 //! row, and the thresholds, set over every value, still bound the rest.
+//!
+//! With no WHERE, when every segment carries the column's table ids
+//! (DESIGN.md §4.6), a value is its table id in every segment: reports name
+//! values by id, read from the segments' ids blocks instead of the values'
+//! bytes, and one pass over each segment's ids finds every candidate's
+//! segment id there, so its exact count needs no search by bytes. Only the
+//! values that place have their bytes read.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -90,15 +97,21 @@ pub fn run(allocator: Allocator, request: Request, rows: *std.ArrayListUnmanaged
         for (state.segments[0..opened]) |*s| s.deinit(worker_allocator, table);
         worker_allocator.free(state.segments);
     }
-    var jobs: usize = 0;
+    var by_id = request.filter == null and idsOpen(table, column_idx);
     var table_bytes: u64 = 0;
     for (snapshot.segments, state.segments) |entry, *s| {
         s.* = .{ .handle = try table.acquireSegment(entry.segment_id) };
         opened += 1;
         if (!try qualifies(table, s, snapshot, column_idx)) return false;
+        by_id = by_id and s.has_ids;
+        table_bytes += @as(u64, s.shared_count) * 8 + s.handle.seg.info.row_groups.len * 12;
+    }
+    // The ids blocks load first, side by side with the row groups' counts.
+    state.id_jobs = if (by_id) state.segments.len else 0;
+    var jobs = state.id_jobs;
+    for (state.segments) |*s| {
         s.first_job = jobs;
         jobs += s.handle.seg.info.row_groups.len;
-        table_bytes += @as(u64, s.shared_count) * 8 + s.handle.seg.info.row_groups.len * 4;
     }
     if (exec.memory.accountantOf(allocator)) |accountant| {
         if (table_bytes > accountant.pool.statementLimit() / 8) return false;
@@ -119,15 +132,25 @@ pub fn run(allocator: Allocator, request: Request, rows: *std.ArrayListUnmanaged
     const candidates = (try pickCandidates(merge_arena.allocator(), &state, &reports, request, slack)) orelse return false;
     if (candidates.len == 0) return true;
 
-    try searchShared(&state, merge_arena.allocator(), candidates, request.workers);
-    if (try state.outcome()) return false;
-    try resolveLocals(&state, merge_arena.allocator(), candidates, request);
-    if (try state.outcome()) return false;
+    const placing = if (by_id) placing: {
+        try resolveById(&state, merge_arena.allocator(), candidates, request.workers);
+        if (try state.outcome()) return false;
+        const top = placingByCount(candidates, request.need);
+        readValues(&state, &reports, top, request.workers);
+        if (try state.outcome()) return false;
+        break :placing top;
+    } else placing: {
+        try searchShared(&state, merge_arena.allocator(), candidates, request.workers);
+        if (try state.outcome()) return false;
+        try resolveLocals(&state, merge_arena.allocator(), candidates, request);
+        if (try state.outcome()) return false;
+        break :placing candidates;
+    };
 
-    std.sort.pdq(Candidate, candidates, {}, Candidate.before);
-    const keep = @min(request.need, candidates.len);
+    std.sort.pdq(Candidate, placing, {}, Candidate.before);
+    const keep = @min(request.need, placing.len);
     try rows.ensureUnusedCapacity(allocator, keep);
-    for (candidates[0..keep]) |c| {
+    for (placing[0..keep]) |c| {
         rows.appendAssumeCapacity(.{
             .key = exec.stringKeyDigest(c.bytes) & request.key_digest_mask,
             .count = c.count,
@@ -143,9 +166,16 @@ fn snapshotRows(snapshot: exec.Scan.Snapshot) u64 {
     return n;
 }
 
+/// Whether the column takes table ids: ids of a closed column don't name
+/// values across segments.
+fn idsOpen(table: *api.Table, column_idx: usize) bool {
+    const ids = table.strings.readerState(column_idx) orelse return false;
+    return !ids.closed;
+}
+
 /// Whether segment `s` keeps the column in a string table with entry stats
 /// for every row group, its counts fit u32 and the snapshot holds no
-/// tombstones in it; sets its shared count.
+/// tombstones in it; sets its shared count and whether it carries ids.
 fn qualifies(table: *api.Table, s: *Segment, snapshot: exec.Scan.Snapshot, column_idx: usize) !bool {
     const info = s.handle.seg.info;
     if (info.row_count > std.math.maxInt(u32)) return false;
@@ -158,18 +188,26 @@ fn qualifies(table: *api.Table, s: *Segment, snapshot: exec.Scan.Snapshot, colum
         if (tombs.rows.len > 0) return false;
     }
     s.shared_count = string_table.shared_count;
+    s.value_count = string_table.value_count;
+    s.has_ids = string_table.table_ids.length != 0;
     return true;
 }
 
 const Segment = struct {
     handle: *storage.cache.SegmentHandles.Entry,
     shared_count: u32 = 0,
+    value_count: u32 = 0,
     /// Per shared value, by rank: its rows in the segment, and one row
     /// group holding it, plus one (0 until one is seen).
     counts: []u32 = &.{},
     holders: []u32 = &.{},
     /// Per row group, its largest local value's rows.
     local_max: []u32 = &.{},
+    /// Per row group, the segment ids its local values span, [lo, hi).
+    local_ids: [][2]u32 = &.{},
+    has_ids: bool = false,
+    /// Each segment id's table id, when read by id.
+    ids: ?storage.ReadSegment.TableIds = null,
     /// Per bucket b, the segment's local values of [2^b, 2^(b+1)) rows: a
     /// bound on its local reports before any is read.
     local_hist: [32]u64 = @splat(0),
@@ -191,12 +229,16 @@ const Segment = struct {
         @memset(self.holders, 0);
         self.local_max = try allocator.alloc(u32, self.handle.seg.info.row_groups.len);
         @memset(self.local_max, 0);
+        self.local_ids = try allocator.alloc([2]u32, self.handle.seg.info.row_groups.len);
+        @memset(self.local_ids, .{ 0, 0 });
     }
 
     fn deinit(self: *Segment, allocator: Allocator, table: *api.Table) void {
+        if (self.ids) |ids| ids.release();
         allocator.free(self.counts);
         allocator.free(self.holders);
         allocator.free(self.local_max);
+        allocator.free(self.local_ids);
         self.reported.deinit(allocator);
         self.pending.deinit(allocator);
         table.releaseSegment(self.handle);
@@ -206,11 +248,15 @@ const Segment = struct {
 const Loc = union(enum) {
     /// A row group of segment `seg` holds its shared value `rank`.
     shared: struct { seg: u32, rank: u32 },
-    row: i64,
+    /// Row `at` holds its segment's value `id`.
+    row: struct { at: i64, id: u32 },
 };
 
 const Candidate = struct {
+    /// Empty when read by id, until the value may place (`readValues`).
     bytes: []const u8,
+    /// Its table id, when read by id.
+    id: u32,
     count: u64,
     /// Σ t_s - 1 over the segments that reported it.
     reported_slack: u64,
@@ -224,6 +270,10 @@ const Candidate = struct {
         if (a.count != b.count) return a.count > b.count;
         return std.mem.lessThan(u8, a.bytes, b.bytes);
     }
+
+    fn moreRows(_: void, a: Candidate, b: Candidate) bool {
+        return a.count > b.count;
+    }
 };
 
 const Run = struct {
@@ -231,6 +281,9 @@ const Run = struct {
     table: *api.Table,
     column_idx: usize,
     segments: []Segment,
+    /// Count jobs that load a segment's table ids before the row groups'
+    /// (one per segment when read by id, else none).
+    id_jobs: usize = 0,
     failure: std.atomic.Value(bool) = .init(false),
     declined: std.atomic.Value(bool) = .init(false),
     err: anyerror = error.Unexpected,
@@ -253,6 +306,10 @@ const Run = struct {
         return self.table.cacheRef();
     }
 
+    fn byId(self: *const Run) bool {
+        return self.id_jobs != 0;
+    }
+
     /// The segment and row group of count job `j`.
     fn locate(self: *const Run, j: usize) struct { usize, usize } {
         var lo: usize = 0;
@@ -267,7 +324,7 @@ const Run = struct {
     /// A packed row location (rowloc.zig) holding the value `loc` names.
     fn rowOf(self: *const Run, loc: Loc) !i64 {
         switch (loc) {
-            .row => |r| return r,
+            .row => |r| return r.at,
             .shared => |sh| {
                 const s = &self.segments[sh.seg];
                 const holder = s.holders[sh.rank];
@@ -288,12 +345,27 @@ const Run = struct {
 
 fn countJob(state: *Run, _: usize, j: usize) void {
     if (state.stopped()) return;
+    if (j < state.id_jobs) {
+        loadIds(state, &state.segments[j]) catch |err| state.fail(err);
+        return;
+    }
     const si, const rg = state.locate(j);
     countRowGroup(state, &state.segments[si], rg) catch |err| state.fail(err);
 }
 
+/// Takes segment `s`'s table ids through the cache, held until the run
+/// ends.
+fn loadIds(state: *Run, s: *Segment) !void {
+    const ids = (try s.handle.seg.cachedTableIds(state.column_idx, state.cacheRef())) orelse {
+        state.declined.store(true, .release);
+        return;
+    };
+    s.ids = ids;
+    if (ids.ids.len != s.value_count) return storage.format.Error.CorruptColumnBlockHeader;
+}
+
 /// Adds row group `rg`'s shared values' rows to `s.counts` and notes its
-/// largest local value's.
+/// largest local value's and the ids its local values span.
 fn countRowGroup(state: *Run, s: *Segment, rg: usize) !void {
     var borrowed = (try s.handle.seg.borrowStringEntries(state.allocator, rg, state.column_idx, state.cacheRef())) orelse {
         state.declined.store(true, .release);
@@ -302,6 +374,8 @@ fn countRowGroup(state: *Run, s: *Segment, rg: usize) !void {
     defer borrowed.release(state.allocator, state.cacheRef());
     const e = borrowed.entries;
     var local_max: u32 = 0;
+    var local_lo: u32 = std.math.maxInt(u32);
+    var local_hi: u32 = 0;
     var hist: [32]u32 = @splat(0);
     switch (e.stat_width) {
         inline 2, 4 => |w| {
@@ -311,6 +385,8 @@ fn countRowGroup(state: *Run, s: *Segment, rg: usize) !void {
                 const id = e.id(c);
                 if (id >= s.shared_count) {
                     local_max = @max(local_max, n);
+                    local_lo = @min(local_lo, id);
+                    local_hi = @max(local_hi, id + 1);
                     hist[std.math.log2_int(u32, n)] += 1;
                     continue;
                 }
@@ -321,6 +397,7 @@ fn countRowGroup(state: *Run, s: *Segment, rg: usize) !void {
         else => return storage.format.Error.CorruptColumnBlockHeader,
     }
     s.local_max[rg] = local_max;
+    if (local_hi > 0) s.local_ids[rg] = .{ local_lo, local_hi };
     for (hist, &s.local_hist) |h, *total| {
         if (h != 0) _ = @atomicRmw(u64, total, .Add, h, .monotonic);
     }
@@ -346,7 +423,9 @@ fn setThresholds(segments: []Segment, request: Request, total_rows: u64) u64 {
     return slack;
 }
 
-const Report = struct { seg: u32, bytes: []const u8, count: u64, loc: Loc };
+/// A segment's count of a value, named by its bytes, or by its table id
+/// when read by id.
+const Report = struct { seg: u32, bytes: []const u8 = "", id: u32 = 0, count: u64, loc: Loc };
 
 const ReportJob = union(enum) {
     /// Segment `seg`'s reported ranks `reported[lo..hi]`, all on one page.
@@ -377,8 +456,9 @@ const Reports = struct {
 const ReportRun = struct { state: *Run, reports: *Reports };
 
 /// Every segment's reports into `reports`: its shared values of t_s rows or
-/// more, read page by page, and its local values of t_s rows or more, read
-/// from their row groups' blocks.
+/// more, read page by page (by id, from its ids), and its local values of
+/// t_s rows or more, read from their row groups' blocks (by id, their entry
+/// counts).
 fn collectReports(state: *Run, reports: *Reports, workers: usize) !void {
     var reported: usize = 0;
     for (state.segments, 0..) |*s, si| {
@@ -393,8 +473,16 @@ fn collectReports(state: *Run, reports: *Reports, workers: usize) !void {
             state.declined.store(true, .release);
             return;
         }
+        if (s.ids) |ids| {
+            for (s.reported.items) |rank| try reports.lists[0].append(reports.arenas[0].allocator(), .{
+                .seg = @intCast(si),
+                .id = ids.ids[rank],
+                .count = s.counts[rank],
+                .loc = .{ .shared = .{ .seg = @intCast(si), .rank = rank } },
+            });
+        }
         var lo: usize = 0;
-        while (lo < s.reported.items.len) {
+        while (s.ids == null and lo < s.reported.items.len) {
             const page = s.reported.items[lo] / page_values;
             var hi = lo + 1;
             while (hi < s.reported.items.len and s.reported.items[hi] / page_values == page) hi += 1;
@@ -416,7 +504,10 @@ fn reportJob(ctx: *ReportRun, w: usize, j: usize) void {
     const arena = ctx.reports.arenas[w].allocator();
     switch (ctx.reports.jobs.items[j]) {
         .page => |p| reportShared(ctx.state, arena, out, p.seg, p.lo, p.hi) catch |err| ctx.state.fail(err),
-        .locals => |l| reportLocals(ctx.state, arena, out, l.seg, l.rg) catch |err| ctx.state.fail(err),
+        .locals => |l| if (ctx.state.byId())
+            reportLocalIds(ctx.state, arena, out, l.seg, l.rg) catch |err| ctx.state.fail(err)
+        else
+            reportLocals(ctx.state, arena, out, l.seg, l.rg) catch |err| ctx.state.fail(err),
     }
 }
 
@@ -450,7 +541,30 @@ fn reportLocals(state: *Run, arena: Allocator, out: *std.ArrayList(Report), seg:
             .seg = seg,
             .bytes = try arena.dupe(u8, db.dictValue(@intCast(c))),
             .count = n,
-            .loc = .{ .row = exec.rowloc.packSegment(seg, rg, entries.firstRow(c)) },
+            .loc = .{ .row = .{ .at = exec.rowloc.packSegment(seg, rg, entries.firstRow(c)), .id = id } },
+        });
+    }
+}
+
+/// `reportLocals` by table id, from the row group's entry counts.
+fn reportLocalIds(state: *Run, arena: Allocator, out: *std.ArrayList(Report), seg: u32, rg: u32) !void {
+    const s = &state.segments[seg];
+    const ids = s.ids.?.ids;
+    var borrowed = (try s.handle.seg.borrowStringEntries(state.allocator, rg, state.column_idx, state.cacheRef())) orelse
+        return storage.format.Error.CorruptColumnBlockHeader;
+    defer borrowed.release(state.allocator, state.cacheRef());
+    const e = borrowed.entries;
+    for (0..e.ndv) |c| {
+        const id = e.id(c);
+        if (id < s.shared_count) continue;
+        const n = e.count(c);
+        if (n < s.threshold) continue;
+        if (id >= ids.len) return storage.format.Error.CorruptColumnBlockHeader;
+        try out.append(arena, .{
+            .seg = seg,
+            .id = ids[id],
+            .count = n,
+            .loc = .{ .row = .{ .at = exec.rowloc.packSegment(seg, rg, e.firstRow(c)), .id = id } },
         });
     }
 }
@@ -464,15 +578,24 @@ fn dictOf(s: *const Segment, rg: usize, block: storage.ReadSegment.BorrowedBlock
     return db;
 }
 
-/// The reported values that may place, merged by bytes; null when an
-/// unreported value might place too.
+/// The reported values that may place, merged by bytes, or by table id when
+/// read by id; null when an unreported value might place too.
 fn pickCandidates(arena: Allocator, state: *Run, reports: *const Reports, request: Request, slack: u64) !?[]Candidate {
-    var merged: std.StringHashMapUnmanaged(Candidate) = .empty;
+    return if (state.byId())
+        pickMerged(true, arena, state, reports, request, slack)
+    else
+        pickMerged(false, arena, state, reports, request, slack);
+}
+
+fn pickMerged(comptime by_id: bool, arena: Allocator, state: *Run, reports: *const Reports, request: Request, slack: u64) !?[]Candidate {
+    const Merged = if (by_id) std.AutoHashMapUnmanaged(u32, Candidate) else std.StringHashMapUnmanaged(Candidate);
+    var merged: Merged = .empty;
     const m = state.segments.len;
     for (reports.lists) |list| for (list.items) |r| {
-        const gop = try merged.getOrPut(arena, r.bytes);
+        const gop = try merged.getOrPut(arena, if (by_id) r.id else r.bytes);
         if (!gop.found_existing) gop.value_ptr.* = .{
             .bytes = r.bytes,
+            .id = r.id,
             .count = 0,
             .reported_slack = 0,
             .known = try std.DynamicBitSetUnmanaged.initEmpty(arena, m),
@@ -483,7 +606,7 @@ fn pickCandidates(arena: Allocator, state: *Run, reports: *const Reports, reques
         c.reported_slack += state.segments[r.seg].threshold - 1;
         c.known.set(r.seg);
     };
-    if (request.filter) |filter| try dropFailing(arena, state, &merged, filter);
+    if (!by_id) if (request.filter) |filter| try dropFailing(arena, state, &merged, filter);
 
     const counts = try arena.alloc(u64, merged.count());
     var i: usize = 0;
@@ -636,5 +759,206 @@ fn resolveRowGroup(ctx: *LocalRun, seg: u32, rg: u32) !void {
         if (lo == db.ndv or !std.mem.eql(u8, db.dictValue(lo), bytes)) continue;
         if (db.segmentId(lo) < s.shared_count) return storage.format.Error.CorruptColumnBlockHeader;
         _ = ctx.hits[ci].fetchAdd(db.entryCounts().count(lo), .monotonic);
+    }
+}
+
+/// Ids one job of `resolveById`'s pass over a segment's ids takes.
+const ID_CHUNK: usize = 1 << 18;
+
+const IdChunk = struct { seg: u32, lo: usize, hi: usize };
+
+const IdSearch = struct {
+    state: *Run,
+    chunks: []const IdChunk,
+    /// The candidates' table ids plus one, open-addressed (0: empty).
+    slots: []const u32,
+    /// The candidate at each slot.
+    slot_candidates: []const u32,
+    /// Per candidate and segment: its segment id there plus one, 0 when the
+    /// segment holds no such value.
+    found: []u32,
+};
+
+/// A candidate local in a segment that didn't report it: segment `seg`'s
+/// row group `rg` holds it as its own value `id`, `count` rows of it.
+const LocalHit = struct {
+    seg: u32,
+    rg: u32,
+    id: u32,
+    candidate: u32,
+    count: u32 = 0,
+
+    fn before(_: void, a: LocalHit, b: LocalHit) bool {
+        if (a.seg != b.seg) return a.seg < b.seg;
+        if (a.rg != b.rg) return a.rg < b.rg;
+        return a.id < b.id;
+    }
+};
+
+const LocalIdRun = struct {
+    state: *Run,
+    hits: []LocalHit,
+    /// Where each row group's hits start in `hits`, then `hits.len`.
+    groups: []const usize,
+};
+
+/// Makes every candidate's count exact by adding its count in each segment
+/// that didn't report it. One pass over such a segment's ids finds each
+/// candidate's segment id there, if any: a shared value's count is summed
+/// already, and a local value's is its row group's entry count. A segment
+/// whose ids lack the candidate holds none of its rows.
+fn resolveById(state: *Run, arena: Allocator, candidates: []Candidate, workers: usize) !void {
+    const m = state.segments.len;
+    var chunks: std.ArrayList(IdChunk) = .empty;
+    for (state.segments, 0..) |*s, si| {
+        const open = for (candidates) |c| {
+            if (!c.known.isSet(si)) break true;
+        } else false;
+        if (!open) continue;
+        var lo: usize = 0;
+        while (lo < s.value_count) : (lo += ID_CHUNK) {
+            try chunks.append(arena, .{ .seg = @intCast(si), .lo = lo, .hi = @min(lo + ID_CHUNK, s.value_count) });
+        }
+    }
+    if (chunks.items.len == 0) return;
+
+    const n_slots = try std.math.ceilPowerOfTwo(usize, @max(candidates.len * 4, 64));
+    const slots = try arena.alloc(u32, n_slots);
+    @memset(slots, 0);
+    const slot_candidates = try arena.alloc(u32, n_slots);
+    for (candidates, 0..) |c, ci| {
+        var slot = idSlot(c.id, n_slots);
+        while (slots[slot] != 0) slot = (slot + 1) & (n_slots - 1);
+        slots[slot] = c.id + 1;
+        slot_candidates[slot] = @intCast(ci);
+    }
+    const found = try arena.alloc(u32, candidates.len * m);
+    @memset(found, 0);
+    var search: IdSearch = .{ .state = state, .chunks = chunks.items, .slots = slots, .slot_candidates = slot_candidates, .found = found };
+    parallel.forJobs(workers, chunks.items.len, &search, searchIdChunk);
+    if (state.stopped()) return;
+
+    var hits: std.ArrayList(LocalHit) = .empty;
+    for (candidates, 0..) |*c, ci| for (state.segments, 0..) |*s, si| {
+        if (c.known.isSet(si)) continue;
+        c.known.set(si);
+        const at = found[ci * m + si];
+        if (at == 0) continue;
+        const id = at - 1;
+        if (id < s.shared_count) {
+            c.count += s.counts[id];
+            continue;
+        }
+        const holder = for (s.local_ids, 0..) |span, rg| {
+            if (id >= span[0] and id < span[1]) break rg;
+        } else return storage.format.Error.CorruptColumnBlockHeader;
+        try hits.append(arena, .{ .seg = @intCast(si), .rg = @intCast(holder), .id = id, .candidate = @intCast(ci) });
+    };
+    if (hits.items.len == 0) return;
+
+    std.sort.pdq(LocalHit, hits.items, {}, LocalHit.before);
+    var groups: std.ArrayList(usize) = .empty;
+    for (hits.items, 0..) |h, i| {
+        if (i == 0 or h.seg != hits.items[i - 1].seg or h.rg != hits.items[i - 1].rg) try groups.append(arena, i);
+    }
+    try groups.append(arena, hits.items.len);
+    var locals: LocalIdRun = .{ .state = state, .hits = hits.items, .groups = groups.items };
+    parallel.forJobs(workers, groups.items.len - 1, &locals, localIdJob);
+    if (state.stopped()) return;
+    for (hits.items) |h| candidates[h.candidate].count += h.count;
+}
+
+fn idSlot(id: u32, n_slots: usize) usize {
+    return @intCast(((@as(u64, id) *% 0x9E3779B97F4A7C15) >> 32) & (n_slots - 1));
+}
+
+fn searchIdChunk(ctx: *IdSearch, _: usize, j: usize) void {
+    if (ctx.state.stopped()) return;
+    const chunk = ctx.chunks[j];
+    const ids = ctx.state.segments[chunk.seg].ids.?.ids;
+    const m = ctx.state.segments.len;
+    const mask = ctx.slots.len - 1;
+    for (chunk.lo..chunk.hi) |i| {
+        const want = ids[i] +% 1;
+        var slot = idSlot(ids[i], ctx.slots.len);
+        while (ctx.slots[slot] != 0) : (slot = (slot + 1) & mask) {
+            if (ctx.slots[slot] != want) continue;
+            ctx.found[@as(usize, ctx.slot_candidates[slot]) * m + chunk.seg] = @intCast(i + 1);
+            break;
+        }
+    }
+}
+
+fn localIdJob(ctx: *LocalIdRun, _: usize, g: usize) void {
+    if (ctx.state.stopped()) return;
+    countLocalHits(ctx.state, ctx.hits[ctx.groups[g]..ctx.groups[g + 1]]) catch |err| ctx.state.fail(err);
+}
+
+/// Sets the count of each of `hits`, one row group's, ascending by id.
+fn countLocalHits(state: *Run, hits: []LocalHit) !void {
+    const s = &state.segments[hits[0].seg];
+    var borrowed = (try s.handle.seg.borrowStringEntries(state.allocator, hits[0].rg, state.column_idx, state.cacheRef())) orelse
+        return storage.format.Error.CorruptColumnBlockHeader;
+    defer borrowed.release(state.allocator, state.cacheRef());
+    const e = borrowed.entries;
+    var counted: usize = 0;
+    for (0..e.ndv) |c| {
+        const id = e.id(c);
+        if (id < hits[0].id or id > hits[hits.len - 1].id) continue;
+        var lo: usize = 0;
+        var hi = hits.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (hits[mid].id < id) lo = mid + 1 else hi = mid;
+        }
+        if (lo == hits.len or hits[lo].id != id) continue;
+        hits[lo].count = e.count(c);
+        counted += 1;
+    }
+    if (counted != hits.len) return storage.format.Error.CorruptColumnBlockHeader;
+}
+
+/// The candidates that place, their counts exact, moved to the front: the
+/// `need` with the most rows and any tied with the last of them, which the
+/// values' bytes order.
+fn placingByCount(candidates: []Candidate, need: usize) []Candidate {
+    std.sort.pdq(Candidate, candidates, {}, Candidate.moreRows);
+    const keep = @min(need, candidates.len);
+    if (keep == 0) return candidates[0..0];
+    const cut = candidates[keep - 1].count;
+    var end = keep;
+    while (end < candidates.len and candidates[end].count == cut) end += 1;
+    return candidates[0..end];
+}
+
+const ValueRun = struct { state: *Run, reports: *Reports, candidates: []Candidate };
+
+/// Reads each of `candidates`' bytes, one job each, into the reports'
+/// arenas.
+fn readValues(state: *Run, reports: *Reports, candidates: []Candidate, workers: usize) void {
+    var ctx: ValueRun = .{ .state = state, .reports = reports, .candidates = candidates };
+    parallel.forJobs(workers, candidates.len, &ctx, valueJob);
+}
+
+fn valueJob(ctx: *ValueRun, w: usize, j: usize) void {
+    if (ctx.state.stopped()) return;
+    readValue(ctx.state, ctx.reports.arenas[w].allocator(), &ctx.candidates[j]) catch |err| ctx.state.fail(err);
+}
+
+fn readValue(state: *Run, arena: Allocator, c: *Candidate) !void {
+    switch (c.loc) {
+        .shared => |sh| {
+            var shared = state.segments[sh.seg].handle.seg.sharedStrings(state.allocator, state.column_idx, state.cacheRef()) orelse
+                return storage.format.Error.CorruptColumnBlockHeader;
+            defer shared.release();
+            c.bytes = try arena.dupe(u8, try shared.value(sh.rank));
+        },
+        .row => |r| {
+            const at = exec.rowloc.unpack(r.at).segment;
+            var values = state.segments[at.seg_idx].handle.seg.entryValues(state.allocator, at.rg_idx, state.column_idx, state.cacheRef()) orelse
+                return storage.format.Error.CorruptColumnBlockHeader;
+            defer values.release();
+            c.bytes = try arena.dupe(u8, try values.value(r.id));
+        },
     }
 }

@@ -220,6 +220,43 @@ fn distinctByIds(allocator: std.mem.Allocator, t: *thindb.Table) !?u64 {
     return thindb.exec.table_id_distinct.count(allocator, .{ .table = t, .snapshot = snap, .column_idx = tag_column, .workers = 4 });
 }
 
+test "table string ids: a segment's ids past one block decode from every block" {
+    // More distinct values than one block of a table-ids run holds, a few of
+    // them in every row group, so the ids decode from several blocks side by
+    // side.
+    const allocator = std.testing.allocator;
+    const rows = 2 * thindb.storage.format.table_ids_chunk + 123;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    const t = try db.table("t", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "tag", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"} });
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Row = struct { id: i64, tag: []const u8 };
+    const all = try arena.alloc(Row, rows);
+    var distinct: u32 = 5;
+    for (all, 0..) |*r, i| {
+        const tag = if (i % 7 == 0) try std.fmt.allocPrint(arena, "common{d}", .{i % 5}) else try std.fmt.allocPrint(arena, "tag{d}", .{i});
+        r.* = .{ .id = @intCast(i), .tag = tag };
+        if (i % 7 != 0) distinct += 1;
+    }
+    try t.insert(all);
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+
+    var ids = try gatherIds(allocator, t, tag_column);
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ids.without);
+    try expectDense(&ids, distinct);
+    try std.testing.expectEqual(@as(?u64, distinct), try distinctByIds(allocator, t));
+}
+
 test "table string ids: COUNT(DISTINCT) by ids matches the scan, and declines memtable rows and tombstones" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -412,6 +449,63 @@ test "table string ids: GROUP BY string keys by ids matches grouping by bytes" {
             try std.testing.expectEqualStrings(want, got);
         }
     }
+}
+
+test "table string ids: a parallel result reads its keys' values apart" {
+    // The Q37 shape: `s`, keyed by id and otherwise compared only with '',
+    // is held without its bytes, so the result reads its rows' values apart,
+    // their row groups side by side. Every row group holds five values
+    // repeated in all (shared, 160 to 480 rows), one of its own (3 to 82
+    // rows), and one-row fillers enough to pass the lowcard engine's groups.
+    const allocator = std.testing.allocator;
+    const rg_rows = 1024;
+    const rg_count = 40;
+    const segment_count = 2;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, .{ .max_dop = 4, .auto_flush_secs = 0 });
+    defer db.close();
+    const Row = struct { id: i64, g: i32, s: []const u8 };
+    const t = try db.table("t", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "g", .type = .int }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"}, .row_group_size = rg_rows });
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var id: i64 = 0;
+    for (0..segment_count) |seg| {
+        var rows: std.ArrayList(Row) = .empty;
+        for (0..rg_count) |rg| {
+            const own = try std.fmt.allocPrint(arena, "own{d}-{d}", .{ seg, rg });
+            for (0..5) |h| {
+                const hot = try std.fmt.allocPrint(arena, "hot{d}", .{h});
+                for (0..h + 2) |_| {
+                    try rows.append(arena, .{ .id = id, .g = 0, .s = hot });
+                    id += 1;
+                }
+            }
+            for (0..3 + seg * rg_count + rg) |_| {
+                try rows.append(arena, .{ .id = id, .g = 0, .s = own });
+                id += 1;
+            }
+            var f: usize = 0;
+            while (rows.items.len < (rg + 1) * rg_rows) : (f += 1) {
+                try rows.append(arena, .{ .id = id, .g = @intFromBool(f % 7 == 0), .s = try std.fmt.allocPrint(arena, "f{d}-{d}-{d}", .{ seg, rg, f }) });
+                id += 1;
+            }
+        }
+        try t.insert(rows.items);
+        try t.flush();
+    }
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(allocator);
+    for (0..5) |i| try want.print(allocator, "hot{d}|{d}|\n", .{ 4 - i, (6 - i) * segment_count * rg_count });
+    for (0..10) |i| try want.print(allocator, "own1-{d}|{d}|\n", .{ rg_count - 1 - i, 3 + 2 * rg_count - 1 - i });
+    const got = try resultText(allocator, db, "SELECT s, COUNT(*) AS c FROM t WHERE g = 0 AND s <> '' GROUP BY s ORDER BY c DESC LIMIT 15");
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(want.items, got);
 }
 
 test "table string ids: claiming a segment's ids never waits on another reader's fill" {

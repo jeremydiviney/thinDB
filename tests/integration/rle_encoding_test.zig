@@ -338,3 +338,95 @@ test "RLE columns of short runs round-trip and group exactly" {
     }
     try std.testing.expectEqual(SHORT_GROUPS, at);
 }
+
+// One column's encoding changes from row group to row group: `v` holds long
+// runs (RLE) in row group 0, a narrow range (FOR) in row group 1 and
+// full-width values (raw) in row group 2, and `n` is its nullable twin with
+// NULL runs. The scan views each block in place, or expands it into one buffer
+// per column it reuses, so every row group, sub-batch and tombstoned row group
+// must still read back its own values.
+const MIXED_RG_ROWS: usize = 4096;
+
+fn mixedV(i: usize) i64 {
+    return switch (i / MIXED_RG_ROWS) {
+        0 => @intCast(9_000_000_000 + i / 512),
+        1 => @intCast(5_000 + (i * 37) % 200),
+        else => @bitCast(@as(u64, i) *% 0x9E3779B97F4A7C15),
+    };
+}
+fn mixedN(i: usize) ?i64 {
+    return if ((i / 64) % 5 == 0) null else mixedV(i);
+}
+
+const MIXED_DELETED = [2]usize{ 4100, 4200 };
+
+fn verifyMixed(allocator: std.mem.Allocator, db: anytype, deleted: bool) !void {
+    const gone = MIXED_DELETED[1] - MIXED_DELETED[0];
+    {
+        var q = try runSql(allocator, db, "SELECT id, v, n FROM m");
+        defer q.deinit();
+        var seen: usize = 0;
+        while (try q.next()) |batch| {
+            for (0..batch.row_count) |r| {
+                const i: usize = @intCast(batch.values[0].data.bigint[r]);
+                if (deleted) try std.testing.expect(i < MIXED_DELETED[0] or i >= MIXED_DELETED[1]);
+                try std.testing.expectEqual(mixedV(i), batch.values[1].data.bigint[r]);
+                const n: ?i64 = if (batch.values[2].isValid(r)) batch.values[2].data.bigint[r] else null;
+                try std.testing.expectEqual(mixedN(i), n);
+                seen += 1;
+            }
+        }
+        try std.testing.expectEqual(3 * MIXED_RG_ROWS - if (deleted) gone else 0, seen);
+    }
+
+    var min: i64 = std.math.maxInt(i64);
+    var max: i64 = std.math.minInt(i64);
+    var non_null: i64 = 0;
+    for (0..3 * MIXED_RG_ROWS) |i| {
+        if (deleted and i >= MIXED_DELETED[0] and i < MIXED_DELETED[1]) continue;
+        min = @min(min, mixedV(i));
+        max = @max(max, mixedV(i));
+        if (mixedN(i) != null) non_null += 1;
+    }
+    var q = try runSql(allocator, db, "SELECT MIN(v), MAX(v), COUNT(n) FROM m");
+    defer q.deinit();
+    const batch = (try q.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(min, batch.values[0].data.bigint[0]);
+    try std.testing.expectEqual(max, batch.values[1].data.bigint[0]);
+    try std.testing.expectEqual(non_null, batch.values[2].data.bigint[0]);
+    while (try q.next()) |_| {}
+}
+
+test "a column switching encodings across row groups reads back exactly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db = try thindb.Database.open(allocator, std.testing.io, tmp.dir, .{ .row_group_size = MIXED_RG_ROWS, .auto_flush_secs = 0 });
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE m (id BIGINT PRIMARY KEY, v BIGINT NOT NULL, n BIGINT)");
+    const t = try db.openTable("m", .{});
+    const Row = struct { id: i64, v: i64, n: ?i64 };
+    const rows = try allocator.alloc(Row, 3 * MIXED_RG_ROWS);
+    defer allocator.free(rows);
+    for (rows, 0..) |*row, i| row.* = .{ .id = @intCast(i), .v = mixedV(i), .n = mixedN(i) };
+    try t.insert(rows);
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segmentCount());
+
+    const saved = thindb.exec.scan_sub_batch;
+    defer thindb.exec.scan_sub_batch = saved;
+    for ([_]usize{ 0, 1024 }) |sub_batch| {
+        thindb.exec.scan_sub_batch = sub_batch;
+        try verifyMixed(allocator, db, false);
+    }
+
+    // Tombstones send row group 1 down the owned-decode path between two
+    // row groups whose blocks are held.
+    var buf: [96]u8 = undefined;
+    try exec(allocator, db, try std.fmt.bufPrint(&buf, "DELETE FROM m WHERE id >= {d} AND id < {d}", .{ MIXED_DELETED[0], MIXED_DELETED[1] }));
+    for ([_]usize{ 0, 1024 }) |sub_batch| {
+        thindb.exec.scan_sub_batch = sub_batch;
+        try verifyMixed(allocator, db, true);
+    }
+}
