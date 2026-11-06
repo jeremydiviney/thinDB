@@ -328,6 +328,16 @@ pub const ReadSegment = struct {
         return .{ .pages = .{ .seg = self, .allocator = allocator, .table = table, .c = c, .with_bytes = true } };
     }
 
+    /// Row group `row_group_idx`'s values of column `column_idx` by segment
+    /// id, each read apart (`EntryValues`), the pages through the cache when
+    /// `c` is set; null when the column's string table didn't take the row
+    /// group. Release with `EntryValues.release`.
+    pub fn entryValues(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize, c: ?storage_cache.TableCache) ?EntryValues {
+        _ = self.stringBlockParts(row_group_idx, column_idx) orelse return null;
+        const shared = self.sharedStrings(allocator, column_idx, c) orelse return null;
+        return .{ .seg = self, .allocator = allocator, .row_group_idx = row_group_idx, .column_idx = column_idx, .shared = shared };
+    }
+
     /// The table id (DESIGN.md §4.6) of each segment id of column
     /// `column_idx`'s string table, owned by the caller; null when the
     /// segment carries none for the column.
@@ -887,6 +897,124 @@ pub const ReadSegment = struct {
 
         pub fn release(self: *SharedStrings) void {
             self.pages.release();
+        }
+    };
+
+    /// A row group's values by segment id, read apart from its block, whose
+    /// shared values span pages a few values don't need: a shared value from
+    /// its page alone, an own value from the row group's index and bytes
+    /// parts alone. A value stays valid until `release`.
+    pub const EntryValues = struct {
+        seg: ReadSegment,
+        allocator: Allocator,
+        row_group_idx: usize,
+        column_idx: usize,
+        shared: SharedStrings,
+        /// The decompressed index and bytes parts, read at the first own
+        /// value: cached when the pages are, else owned.
+        locals: ?struct { entry: ?*storage_cache.Cache.Entry, owned: ?[]align(16) u8, values: segment_strings.LocalValues } = null,
+
+        /// A `.local_strings` entry's layout: its index part's length (u32),
+        /// the block's flags byte, padding to 8, then the index and bytes
+        /// parts, decompressed.
+        const LOCALS_HEADER = 8;
+
+        pub fn value(self: *EntryValues, segment_id: u32) ![]const u8 {
+            if (segment_id < self.shared.count()) return self.shared.value(segment_id);
+            return (try self.heldLocals()).value(segment_id);
+        }
+
+        /// Marks the page of `segment_id`, when it's a shared value's, for
+        /// `loadWanted`.
+        pub fn want(self: *EntryValues, segment_id: u32) !void {
+            if (segment_id < self.shared.count()) _ = try self.shared.pages.want(segment_id / segment_strings.page_values);
+        }
+
+        /// Reads the pages `want` marked side by side (`SharedPages.loadWanted`).
+        pub fn loadWanted(self: *EntryValues) !void {
+            try self.shared.pages.loadWanted();
+        }
+
+        fn heldLocals(self: *EntryValues) !segment_strings.LocalValues {
+            if (self.locals) |l| return l.values;
+            const tc = self.shared.pages.c orelse {
+                const owned = try self.readLocals(self.allocator);
+                errdefer self.allocator.free(owned);
+                const values = try self.localsOf(owned);
+                self.locals = .{ .entry = null, .owned = owned, .values = values };
+                return values;
+            };
+            const key: storage_cache.Key = .{
+                .table_uid = tc.table_uid,
+                .segment_id = self.seg.info.segment_id,
+                .row_group_idx = @intCast(self.row_group_idx),
+                .column_idx = @intCast(self.column_idx),
+                .content = .local_strings,
+            };
+            const entry = switch (try tc.cache.claimAfterFill(self.seg.io, key)) {
+                .hit => |entry| entry,
+                .fill => |fill| fill: {
+                    defer tc.cache.endFill(self.seg.io, fill);
+                    const bytes = try self.readLocals(tc.cache.blockAllocator());
+                    errdefer tc.cache.blockAllocator().free(bytes);
+                    break :fill try tc.cache.insertPinned(key, bytes, .raw);
+                },
+            };
+            errdefer tc.cache.release(entry);
+            const values = try self.localsOf(entry.bytes);
+            self.locals = .{ .entry = entry, .owned = null, .values = values };
+            return values;
+        }
+
+        /// The row group's index and bytes parts, decompressed, in the
+        /// `.local_strings` layout.
+        fn readLocals(self: *EntryValues, out_allocator: Allocator) ![]align(16) u8 {
+            const seg = self.seg;
+            const parts = seg.stringBlockParts(self.row_group_idx, self.column_idx) orelse return format.Error.CorruptColumnBlockHeader;
+            const start = parts.offset(.index);
+            const read = try self.allocator.alloc(u8, parts.offset(.bytes) + parts.lengths.get(.bytes) - start);
+            defer self.allocator.free(read);
+            const block_offset = seg.info.row_groups[self.row_group_idx].col_offsets[self.column_idx];
+            if (try seg.file.readPositionalAll(seg.io, read, block_offset + start) != read.len) return format.Error.UnexpectedEof;
+            const frames: [2][]const u8 = .{ read[0..parts.lengths.get(.index)], read[parts.offset(.bytes) - start ..] };
+            if (frames[0].len == 0) return format.Error.CorruptColumnBlockHeader;
+            var payload_len: usize = LOCALS_HEADER;
+            for (frames) |frame| if (frame.len > 0) {
+                try checkFrame(frame);
+                if (!isSegmentDictBlock(frame)) return format.Error.CorruptColumnBlockHeader;
+                payload_len += format.readU32(frame[4..8]);
+            };
+            const payload = try out_allocator.alignedAlloc(u8, .@"16", payload_len);
+            errdefer out_allocator.free(payload);
+            @memset(payload[0..LOCALS_HEADER], 0);
+            format.writeU32(payload[0..4], format.readU32(frames[0][4..8]));
+            payload[4] = frames[0][1];
+            var at: usize = LOCALS_HEADER;
+            for (frames) |frame| if (frame.len > 0) {
+                const out = payload[at..][0..format.readU32(frame[4..8])];
+                try decompressBlockInto(self.allocator, frame, out);
+                at += out.len;
+            };
+            return payload;
+        }
+
+        fn localsOf(self: *const EntryValues, bytes: []const u8) !segment_strings.LocalValues {
+            const table = self.seg.info.stringTable(self.column_idx) orelse return format.Error.CorruptColumnBlockHeader;
+            if (bytes.len < LOCALS_HEADER) return format.Error.CorruptColumnBlockHeader;
+            const index_len = format.readU32(bytes[0..4]);
+            if (bytes.len - LOCALS_HEADER < index_len) return format.Error.CorruptColumnBlockHeader;
+            const index = bytes[LOCALS_HEADER..][0..index_len];
+            const has_nulls = format.ColumnBlockFlags.fromByte(bytes[4]).has_nulls;
+            return segment_strings.LocalValues.init(index, bytes[LOCALS_HEADER + index_len ..], self.seg.info.row_groups[self.row_group_idx].row_count, has_nulls, table);
+        }
+
+        pub fn release(self: *EntryValues) void {
+            self.shared.release();
+            if (self.locals) |l| {
+                if (l.entry) |e| self.shared.pages.c.?.cache.release(e);
+                if (l.owned) |o| self.allocator.free(o);
+            }
+            self.locals = null;
         }
     };
 

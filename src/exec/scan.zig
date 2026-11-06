@@ -1776,6 +1776,14 @@ pub const Scan = struct {
         return self.n_id_keys > 0 and self.dict_bufs[j].id_keyed;
     }
 
+    /// The form id-keyed column `phys`'s blocks are held in: keyed by
+    /// codes and the index alone, they need their values' bytes only for
+    /// another reader of the column. The result reads its keys' values
+    /// back apart (`LateScan.appendValuesApart`).
+    fn idKeyForm(self: *const Scan, phys: usize) storage.segment_strings.Form {
+        return if (self.readsLengthsOnly(phys)) .no_bytes else .full;
+    }
+
     /// Whether id-keyed position `j`'s batch values are its rows' table ids.
     /// A hashed one arrives as digests alone, its values the scan's
     /// placeholder, as a hashed byte column's are, unless it's ids-only.
@@ -1848,7 +1856,7 @@ pub const Scan = struct {
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
         const every_value = rows == null;
         const codes_wanted = buf.id_keyed or !(every_value and buf.entries_only);
-        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, if (codes_wanted) .full else .no_codes)) orelse return null;
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, if (buf.id_keyed) self.idKeyForm(phys) else if (codes_wanted) .full else .no_codes)) orelse return null;
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
@@ -1926,7 +1934,7 @@ pub const Scan = struct {
     /// digests a byte column's rows.
     fn fillIdKeys(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !void {
         const buf = &self.dict_bufs[j];
-        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, .full)) orelse return error.UnsupportedQueryShape;
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, self.idKeyForm(phys))) orelse return error.UnsupportedQueryShape;
         const n = if (rows) |r| r.len else rg_count;
         var digests: ?[]u128 = null;
         if (self.idDigests(j)) {
@@ -3887,15 +3895,15 @@ pub const Scan = struct {
     }
 
     /// Whether the scan reads column `phys` for its values' lengths alone:
-    /// projected, if at all, only as lengths, and filtered only by
-    /// comparisons with the empty string, which lengths place too. Its
-    /// blocks are then read without the values' bytes; any other column's
-    /// lengths and empty-string leaves share the whole block the scan reads
-    /// anyway.
+    /// projected, if at all, only as lengths or keyed by table id, and
+    /// filtered only by comparisons with the empty string, which lengths
+    /// place too. Its blocks are then read without the values' bytes; any
+    /// other column's lengths and empty-string leaves share the whole block
+    /// the scan reads anyway.
     fn readsLengthsOnly(self: *const Scan, phys: usize) bool {
         if (self.derived_filter != null) return false;
         for (self.out_phys, 0..) |p, j| {
-            if (p == phys and !(self.len_cols_by_j.len > j and self.len_cols_by_j[j])) return false;
+            if (p == phys and !(self.len_cols_by_j.len > j and self.len_cols_by_j[j]) and !self.idKeyed(j)) return false;
         }
         const filter = self.fused_filter orelse return true;
         return comparesOnlyWithEmpty(filter, self.table.schema.columns, phys);

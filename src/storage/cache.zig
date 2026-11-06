@@ -125,6 +125,9 @@ pub const Content = enum(u8) {
     dict_counts,
     table_ids,
     id_keys,
+    /// A string block's row-group-own values alone, its index and bytes
+    /// parts (`ReadSegment.EntryValues`).
+    local_strings,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).
@@ -136,8 +139,8 @@ pub const Content = enum(u8) {
     /// content serves in their place.
     pub fn partials(self: Content) []const Content {
         return switch (self) {
-            .column => &.{ .dict_no_codes, .dict_no_bytes, .dict_counts },
-            .dict_no_codes => &.{.dict_counts},
+            .column => &.{ .dict_no_codes, .dict_no_bytes, .dict_counts, .local_strings },
+            .dict_no_codes => &.{ .dict_counts, .local_strings },
             .shared_strings => &.{.shared_offsets},
             else => &.{},
         };
