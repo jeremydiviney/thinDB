@@ -70,7 +70,8 @@ const SortSpec = @import("sort.zig").SortSpec;
 const rowloc = @import("rowloc.zig");
 const condition_cache = @import("condition_cache.zig");
 const simd = @import("../util/simd.zig");
-const Scan = @import("scan.zig").Scan;
+const scan_mod = @import("scan.zig");
+const Scan = scan_mod.Scan;
 const LateScan = @import("latescan.zig").LateScan;
 const platform = @import("../util/platform.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -110,6 +111,10 @@ pub const ZonemapTopN = struct {
     /// dictionary-coded block of it is filtered once per dictionary entry
     /// instead of being expanded to its rows' strings.
     dict_filter_probe: ?usize,
+    /// Whether the WHERE compares `dict_filter_probe`, no ORDER BY key, only
+    /// with the empty string, which its values' lengths settle: its blocks
+    /// are read without the values' bytes (`loadProbeColumn`).
+    lengths_filter: bool,
     /// Per probe column: a dictionary-coded block may stay coded. Owned.
     dict_ok: []bool,
     /// The digest the condition cache keeps `pred`'s per-row-group records
@@ -227,6 +232,10 @@ pub const ZonemapTopN = struct {
         const dict_filter_probe = try dictFilterProbe(allocator, validated, probe_schema);
         const dict_ok = try dictCodedProbes(allocator, validated, probe_schema, key_probe_idx, dict_filter_probe);
         errdefer allocator.free(dict_ok);
+        const lengths_filter = if (dict_filter_probe) |j|
+            std.mem.indexOfScalar(usize, key_probe_idx, j) == null and scan_mod.comparesOnlyWithEmpty(validated, probe_schema, j)
+        else
+            false;
 
         // Build the inner late-mat plan: pins the memtable + ddl_lock and gives
         // us the wide-column materializer. We never call `inner.next()`.
@@ -261,6 +270,7 @@ pub const ZonemapTopN = struct {
             .key_desc = key_desc,
             .key_probe_idx = key_probe_idx,
             .dict_filter_probe = dict_filter_probe,
+            .lengths_filter = lengths_filter,
             .dict_ok = dict_ok,
             .condition = scan_ptr.conditionDigest(validated),
             .prefix_len = prefix_len,
@@ -793,6 +803,9 @@ const ProbeScratch = struct {
     mask: std.ArrayListUnmanaged(bool) = .empty,
     pred_mask: std.ArrayListUnmanaged(bool) = .empty,
     entry_hits: std.ArrayListUnmanaged(bool) = .empty,
+    /// One byte per non-empty dictionary entry, standing for its value
+    /// (`emptinessEntries`).
+    entry_marks: std.ArrayListUnmanaged(u8) = .empty,
     /// Leading-key values of the rows this row group added to the worker's
     /// heap, for the `LeadPool`.
     kept_leads: std.ArrayListUnmanaged(i128) = .empty,
@@ -838,6 +851,7 @@ const ProbeScratch = struct {
         self.mask.deinit(allocator);
         self.pred_mask.deinit(allocator);
         self.entry_hits.deinit(allocator);
+        self.entry_marks.deinit(allocator);
         self.kept_leads.deinit(allocator);
         self.kept_rows.deinit(allocator);
     }
@@ -938,7 +952,11 @@ fn processSegmentRowGroup(z: *const ZonemapTopN, allocator: Allocator, ch: *Cand
 fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeScratch, seg: *storage.ReadSegment, ref: RgRef, j: usize) !void {
     const rg_count = ref.row_count;
     const phys = z.probe_phys[j];
-    scratch.blocks[j] = try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
+    const lengths = z.lengths_filter and z.dict_filter_probe == j;
+    scratch.blocks[j] = if (lengths)
+        try seg.borrowStringBlock(allocator, ref.rg_idx, phys, z.table.cacheRef(), .no_bytes)
+    else
+        try seg.borrowColumnBlock(allocator, ref.rg_idx, phys, z.table.cacheRef());
     scratch.borrowed[j] = true;
     const block = &scratch.blocks[j];
     const col = z.table.schema.columns[phys];
@@ -952,6 +970,15 @@ fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeS
             values = block.bytes[bm_len..];
         }
         const db = storage.segment_reader.dictBlockOf(values, rg_count);
+        if (lengths) {
+            scratch.cols[j] = .{ .dict = .{
+                .db = db,
+                .nulls = nulls,
+                .entries = try stringColumnView(col.type, try emptinessEntries(allocator, scratch, db, j), null),
+            } };
+            scratch.views[j] = try stringColumnView(col.type, .{ .offsets = &.{0}, .bytes = "" }, null);
+            return;
+        }
         const offsets = db.offsetsInPlace() orelse offsets: {
             const decoded = &scratch.entry_offsets[j];
             try decoded.resize(allocator, @as(usize, db.ndv) + 1);
@@ -973,6 +1000,23 @@ fn loadProbeColumn(z: *const ZonemapTopN, allocator: Allocator, scratch: *ProbeS
     };
     scratch.cols[j] = .{ .view = view };
     scratch.views[j] = view;
+}
+
+/// A dictionary's entries as a `lengths_filter` WHERE reads them: each
+/// non-empty value as one byte, which compares with the empty string as the
+/// value does. Only the entries' lengths are read, so a block without its
+/// values' bytes serves.
+fn emptinessEntries(allocator: Allocator, scratch: *ProbeScratch, db: storage.segment_reader.DictBlock, j: usize) !storage.StringView {
+    const offsets = &scratch.entry_offsets[j];
+    try offsets.resize(allocator, @as(usize, db.ndv) + 1);
+    offsets.items[0] = 0;
+    for (0..db.ndv) |c| offsets.items[c + 1] = offsets.items[c] + @intFromBool(db.valueLen(@intCast(c)) != 0);
+    const marks = &scratch.entry_marks;
+    if (marks.items.len < db.ndv) {
+        try marks.resize(allocator, db.ndv);
+        @memset(marks.items, 'x');
+    }
+    return .{ .offsets = offsets.items, .bytes = marks.items[0..offsets.items[db.ndv]] };
 }
 
 /// Set `mask` to the rows whose leading ORDER BY key doesn't sort strictly
