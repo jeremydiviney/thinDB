@@ -163,10 +163,9 @@ fn unitBetween(chunks: []const MaterializedResult.Chunk, a: StripeCut, b: Stripe
 }
 
 /// Selective-query right-sizing: one worker thread per this many surviving
-/// (post-zone-map) row groups, so a point lookup that touches 13 of 958 row
-/// groups doesn't pay 12 thread spawns. 2 keeps per-thread wall at roughly two
-/// block decodes — small enough that the clamp never gates a real workload.
-const RGS_PER_THREAD: usize = 2;
+/// (post-zone-map) row groups, up to the fan-out budget, so a point lookup
+/// that touches 3 of 958 row groups spawns 3 threads, not the full DOP.
+const RGS_PER_THREAD: usize = 1;
 
 /// Execution strategy, chosen lazily on the first `next()` (fusion happens
 /// after `create`). `materialize` is the fused-filter path: each worker drains

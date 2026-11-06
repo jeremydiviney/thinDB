@@ -170,7 +170,7 @@ test "a part table a heavy part grew shrinks back before a small part's fold" {
 /// Selective-query right-sizing: one grid worker per this many surviving
 /// (post-zone-map) row groups, so a filter that touches a handful of row
 /// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
-const RGS_PER_GRID_WORKER: usize = 2;
+const RGS_PER_GRID_WORKER: usize = 1;
 const PREFETCH_DIST_BUCKET: usize = 32;
 /// Rows ahead the staging fetches an exact key's coded bytes (`ExactKey.prefetch`).
 const KEY_PREFETCH_ROWS: usize = 8;
