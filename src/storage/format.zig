@@ -78,7 +78,11 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v15→v16: table string ids. A string table may carry one more block, the
 /// table id of each segment id (`TableIdsBlock`), and the directory gives
 /// its offset and length after the table's block lengths.
-pub const segment_version: u16 = 16;
+///
+/// v16→v17: chunked table ids. A table-ids block is a run of column blocks
+/// of up to `table_ids_chunk` ids each, so a reader decodes them side by
+/// side.
+pub const segment_version: u16 = 17;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -406,9 +410,14 @@ pub const StringTable = struct {
     table_ids: TableIdsBlock = .{},
 };
 
-/// A string table's table ids (DESIGN.md §4.6): one column block of
-/// `value_count` u32s, the table id of each segment id in turn. Length 0
-/// when the segment stores none for the column.
+/// Ids per column block of a table-ids block: a segment's ids span many
+/// blocks, which its reader decodes on as many threads.
+pub const table_ids_chunk: usize = 1 << 16;
+
+/// A string table's table ids (DESIGN.md §4.6): `value_count` u32s, the
+/// table id of each segment id in turn, as a run of column blocks of up to
+/// `table_ids_chunk` ids each laid end to end; offset and length span the
+/// run. Length 0 when the segment stores none for the column.
 pub const TableIdsBlock = struct {
     offset: u64 = 0,
     length: u32 = 0,

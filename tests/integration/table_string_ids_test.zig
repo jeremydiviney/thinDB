@@ -220,6 +220,43 @@ fn distinctByIds(allocator: std.mem.Allocator, t: *thindb.Table) !?u64 {
     return thindb.exec.table_id_distinct.count(allocator, .{ .table = t, .snapshot = snap, .column_idx = tag_column, .workers = 4 });
 }
 
+test "table string ids: a segment's ids past one block decode from every block" {
+    // More distinct values than one block of a table-ids run holds, a few of
+    // them in every row group, so the ids decode from several blocks side by
+    // side.
+    const allocator = std.testing.allocator;
+    const rows = 2 * thindb.storage.format.table_ids_chunk + 123;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    const t = try db.table("t", .{
+        .columns = &.{ .{ .name = "id", .type = .bigint }, .{ .name = "tag", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    }, .{ .order_key = &.{"id"} });
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Row = struct { id: i64, tag: []const u8 };
+    const all = try arena.alloc(Row, rows);
+    var distinct: u32 = 5;
+    for (all, 0..) |*r, i| {
+        const tag = if (i % 7 == 0) try std.fmt.allocPrint(arena, "common{d}", .{i % 5}) else try std.fmt.allocPrint(arena, "tag{d}", .{i});
+        r.* = .{ .id = @intCast(i), .tag = tag };
+        if (i % 7 != 0) distinct += 1;
+    }
+    try t.insert(all);
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.manifest.segments.items.len);
+
+    var ids = try gatherIds(allocator, t, tag_column);
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ids.without);
+    try expectDense(&ids, distinct);
+    try std.testing.expectEqual(@as(?u64, distinct), try distinctByIds(allocator, t));
+}
+
 test "table string ids: COUNT(DISTINCT) by ids matches the scan, and declines memtable rows and tombstones" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
