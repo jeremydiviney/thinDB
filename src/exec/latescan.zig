@@ -319,6 +319,7 @@ pub const LateScan = struct {
                     values.release(ctx.allocator, c);
                     return;
                 }
+                if (ctx.late.readsValuesApart(seg, rg_idx, phys)) return;
                 var bb = try seg.borrowColumnBlock(ctx.allocator, rg_idx, phys, c);
                 bb.release(ctx.allocator, c);
             }
@@ -398,6 +399,7 @@ pub const LateScan = struct {
                 try engine.transform.appendDictRowsOf(self.allocator, codes.bytes, values.bytes, rc, flags, offsets, out);
                 continue;
             }
+            if (try self.appendValuesApart(seg, rg_idx, phys, rc, offsets, out)) continue;
 
             var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
             defer bb.release(self.allocator, self.table.cacheRef());
@@ -419,6 +421,58 @@ pub const LateScan = struct {
                 },
             }
         }
+    }
+
+    /// Whether row group `rg_idx` of non-nullable string column `phys` reads
+    /// its rows' values apart (`appendValuesApart`): a scan cached its block
+    /// without its values' bytes, as one keying the column by table id does,
+    /// and no reader holds the whole block. The whole block's shared values
+    /// span pages a few rows don't need.
+    fn readsValuesApart(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize) bool {
+        if (self.table.schema.columns[phys].nullable) return false;
+        const c = self.table.cacheRef();
+        var codes = seg.cachedStringBlock(rg_idx, phys, c, .no_bytes) orelse return false;
+        codes.release(self.allocator, c);
+        return !self.holdsWholeBlock(seg, rg_idx, phys);
+    }
+
+    fn holdsWholeBlock(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize) bool {
+        const c = self.table.cacheRef();
+        return c.cache.holdsOrFills(.{
+            .table_uid = c.table_uid,
+            .segment_id = seg.info.segment_id,
+            .row_group_idx = @intCast(rg_idx),
+            .column_idx = @intCast(phys),
+        });
+    }
+
+    /// When `readsValuesApart`, the values of `rows` (ascending) of row
+    /// group `rg_idx` of column `phys`, each read apart
+    /// (`ReadSegment.EntryValues`): its code from the cached block without
+    /// bytes, then its page alone or the row group's own bytes alone. False,
+    /// appending nothing, otherwise.
+    fn appendValuesApart(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rc: u32, rows: []const u32, out: *ColumnStore) !bool {
+        if (self.table.schema.columns[phys].nullable) return false;
+        const c = self.table.cacheRef();
+        var codes = seg.cachedStringBlock(rg_idx, phys, c, .no_bytes) orelse return false;
+        defer codes.release(self.allocator, c);
+        if (self.holdsWholeBlock(seg, rg_idx, phys)) return false;
+        const db = storage.segment_reader.dictBlockOf(codes.bytes, rc);
+        if (!db.hasSegmentIds()) return false;
+        var values = seg.entryValues(self.allocator, rg_idx, phys, c) orelse return false;
+        defer values.release();
+        for (rows) |row| try values.want(db.segmentId(db.rowCode(row)));
+        try values.loadWanted();
+        var total_bytes: usize = 0;
+        for (rows) |row| total_bytes += (try values.value(db.segmentId(db.rowCode(row)))).len;
+        switch (out.data) {
+            .varchar, .string, .char, .json, .nested, .bitmap => |*ss| {
+                try ss.ensureUnusedValueCapacity(self.allocator, rows.len, total_bytes);
+                for (rows) |row| ss.appendValueAssumeCapacity(try values.value(db.segmentId(db.rowCode(row))));
+            },
+            else => return false,
+        }
+        return true;
     }
 
     fn appendMemtableRow(self: *LateScan, row: usize) !void {

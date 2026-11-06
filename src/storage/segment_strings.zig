@@ -882,6 +882,27 @@ const BlockIndex = struct {
     }
 };
 
+/// A row-group block's own values by segment id, from its index and bytes
+/// parts alone: what a reader of a few values takes instead of the whole
+/// block, whose shared values it would read from every page they span.
+pub const LocalValues = struct {
+    entries: BlockIndex,
+    bytes: []const u8,
+
+    pub fn init(index: []const u8, local_bytes: []const u8, row_count: u32, has_nulls: bool, table: format.StringTable) !LocalValues {
+        const entries = try BlockIndex.parse(index, row_count, has_nulls, table);
+        if (local_bytes.len != entries.local_byte_count) return format.Error.CorruptColumnBlockHeader;
+        return .{ .entries = entries, .bytes = local_bytes };
+    }
+
+    pub fn value(self: LocalValues, segment_id: u32) ![]const u8 {
+        const e = self.entries;
+        if (segment_id < e.local_first_id or segment_id - e.local_first_id >= e.local_count) return format.Error.CorruptColumnBlockHeader;
+        const l = segment_id - e.local_first_id;
+        return self.bytes[try e.localStart(l)..][0..e.localLen(l)];
+    }
+};
+
 /// A row-group block's values by segment id alone, with the row count and
 /// first row its stats store for each: what a reader counting values by id
 /// takes from the block's index and stats parts, reading neither its codes
