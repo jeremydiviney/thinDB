@@ -884,6 +884,13 @@ pub const Scan = struct {
         counted: bool = false,
         /// The consumer takes the values' digests beside the values.
         digested: bool = false,
+        /// The consumer takes the values' table ids beside the values.
+        id_mapped: bool = false,
+        /// The held block's values' table ids, by code.
+        table_ids: std.ArrayListUnmanaged(u32) = .empty,
+        /// The table ids of the segment the scan reads, pinned until it
+        /// moves to another.
+        segment_ids: ?struct { seg_idx: usize, ids: storage.ReadSegment.TableIds } = null,
         entry_counts: std.ArrayListUnmanaged(u32) = .empty,
         entry_rows: std.ArrayListUnmanaged(u32) = .empty,
         entry_pass: std.ArrayListUnmanaged(bool) = .empty,
@@ -908,8 +915,15 @@ pub const Scan = struct {
             return if (self.digests_cached) |e| e.digests() else self.digests.items;
         }
 
+        fn releaseSegmentIds(self: *DictBuf) void {
+            if (self.segment_ids) |s| s.ids.release();
+            self.segment_ids = null;
+        }
+
         fn deinit(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
             self.releaseBlock(allocator, cache);
+            self.releaseSegmentIds();
+            self.table_ids.deinit(allocator);
             self.codes.deinit(allocator);
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
@@ -1680,6 +1694,15 @@ pub const Scan = struct {
         self.dict_bufs[j].digested = true;
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as read by
+    /// table id (DESIGN.md §4.6): its dictionary comes with its values'
+    /// table ids (`BlockDictColumn.table_ids`). The caller has checked that
+    /// every row group of the scan stores them (`table_id_distinct.qualifies`);
+    /// one that doesn't fails the scan.
+    pub fn setBlockDictTableIds(self: *Scan, j: usize) void {
+        self.dict_bufs[j].id_mapped = true;
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1725,8 +1748,27 @@ pub const Scan = struct {
             .codes = buf.codes.items,
             .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes },
             .digests = if (buf.digested) buf.heldDigests() else null,
+            .table_ids = if (buf.id_mapped) buf.table_ids.items else null,
             .every_value = every_value,
         };
+    }
+
+    /// Fills `buf.table_ids` with the table id of each value of `db`, a block
+    /// of segment `seg`'s column `phys`.
+    fn mapTableIds(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock) !void {
+        if (buf.segment_ids == null or buf.segment_ids.?.seg_idx != self.cur_seg_idx) {
+            buf.releaseSegmentIds();
+            const ids = (try seg.cachedTableIds(phys, self.cacheRef())) orelse return error.UnsupportedQueryShape;
+            buf.segment_ids = .{ .seg_idx = self.cur_seg_idx, .ids = ids };
+        }
+        if (db.ndv != 0 and !db.hasSegmentIds()) return error.UnsupportedQueryShape;
+        const ids = buf.segment_ids.?.ids.ids;
+        try buf.table_ids.resize(self.allocator, db.ndv);
+        for (buf.table_ids.items, 0..) |*id, c| {
+            const s = db.segmentId(@intCast(c));
+            if (s >= ids.len) return storage.format.Error.CorruptColumnBlockHeader;
+            id.* = std.mem.littleToNative(u32, ids[s]);
+        }
     }
 
     /// Column `j`'s dictionary block in row group `rg_idx`, with at least
@@ -1761,6 +1803,7 @@ pub const Scan = struct {
                 };
                 if (!buf.digests_whole) try buf.digests.resize(self.allocator, db.ndv);
             }
+            if (buf.id_mapped) try self.mapTableIds(seg, phys, buf, db);
             // Counted entries test the filter on a hashed key's values too.
             if ((!hashed or buf.counted) and db.offsetsInPlace() == null) {
                 try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);

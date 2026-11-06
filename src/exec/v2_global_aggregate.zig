@@ -96,6 +96,7 @@ fn openScanSource(
     where_filter: ?PredicateExpr,
     derived: []const compute.Derived,
     hash_cols: []const []const u8,
+    id_cols: []const bool,
     aggs: []const AggSpec,
     snap: ?Scan.Snapshot,
     registry: ?*const udf_mod.UdfRegistry,
@@ -108,14 +109,21 @@ fn openScanSource(
     }
     // A decline (nullable column) or a sidecar-less batch falls back to
     // digesting the materialized bytes in the fold — same digest either way.
-    for (hash_cols) |hc| _ = scan.setHashKeyColumn(hc);
+    for (hash_cols, id_cols) |hc, by_id| {
+        if (!by_id) _ = scan.setHashKeyColumn(hc);
+    }
     if (derived.len == 0) {
-        for (hash_cols) |hc| if (scan.blockDictColumnIndex(hc)) |j| {
+        for (hash_cols, id_cols) |hc, by_id| {
+            const j = scan.blockDictColumnIndex(hc) orelse {
+                if (by_id) return error.UnsupportedQueryShape;
+                continue;
+            };
             try scan.setBlockDictColumn(j);
+            if (by_id) scan.setBlockDictTableIds(j);
             // COUNT(DISTINCT) is all that reads a hashed column; with no
             // filter to compact rows by, it needs no codes.
             if (where_filter == null) scan.setBlockDictEntriesOnly(j);
-        };
+        }
         return .{ .scan = scan, .drive = exec.makeQuery(allocator, scan), .encoded = where_filter == null and hash_cols.len == 0 };
     }
     // A column the aggregates read only through `octet_length` arrives as
@@ -197,6 +205,11 @@ const AggPlan = struct {
     input_scale: u8 = 0,
     // Distinct-key derivation; meaningful only for .count_distinct.
     dkind: DistinctKind = .int,
+    // A string COUNT(DISTINCT) the scan feeds by table id (DESIGN.md §4.6):
+    // every lane marks its rows' ids in one shared bitmap, `id_map`, instead
+    // of a digest set.
+    by_table_id: bool = false,
+    id_map: []u64 = &.{},
     output_type: Type,
     name: []const u8,
     // User-defined aggregate. Each lane folds its row share into a private
@@ -326,7 +339,7 @@ const Lane = struct {
     fn finalizeDistinct(self: *Lane, plans: []const AggPlan) void {
         for (plans, 0..) |p, i| {
             if (p.op != .count_distinct) continue;
-            self.distinct_counts[i] = self.dsets[i].count() + @intFromBool(self.has_blank[i]);
+            self.distinct_counts[i] = if (p.by_table_id) idCount(p.id_map) else self.dsets[i].count() + @intFromBool(self.has_blank[i]);
         }
     }
 
@@ -361,8 +374,8 @@ const Lane = struct {
                 continue;
             }
             if (p.op == .count_distinct) {
-                // Every lane fed the same shared set, so there is nothing to
-                // union; only the out-of-band blank flag folds here.
+                // Every lane fed the same shared set or bitmap, so there is
+                // nothing to union; only the out-of-band blank flag folds here.
                 if (other.has_blank[i]) self.has_blank[i] = true;
                 continue;
             }
@@ -602,12 +615,42 @@ fn foldExtremeFloatGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns:
 // field's shared set, on the serial path into the lane's own set through a
 // `DistinctFeed`, which overlaps the set probes' cache misses.
 fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, dict: ?exec.BlockDictColumn, n: usize) !void {
+    if (p.by_table_id) {
+        const d = dict orelse return error.UnsupportedQueryShape;
+        lane.ns[i] += n;
+        return markTableIds(p.id_map, d, d.table_ids orelse return error.UnsupportedQueryShape, n);
+    }
     if (i < lane.producers.len) if (lane.producers[i]) |producer| switch (producer) {
         inline else => |prod| return foldDistinctInto(prod, lane, p, i, view, digests, dict, n),
     };
     var feed: DistinctFeed = .{ .set = &lane.dsets[i], .allocator = lane.allocator };
     try foldDistinctInto(&feed, lane, p, i, view, digests, dict, n);
     try feed.drain();
+}
+
+// Marks the table id of each of the batch's rows (every entry's, when the
+// batch holds them all).
+fn markTableIds(map: []u64, dict: exec.BlockDictColumn, ids: []const u32, n: usize) !void {
+    if (dict.every_value) {
+        for (ids) |id| try setIdBit(map, id);
+        return;
+    }
+    for (dict.codes[0..n]) |c| try setIdBit(map, ids[c]);
+}
+
+// Most rows repeat a value some row already marked, so a plain load finds
+// the bit set and the atomic OR runs only for a new one.
+inline fn setIdBit(map: []u64, id: u32) !void {
+    const w = id >> 6;
+    if (w >= map.len) return storage.format.Error.CorruptColumnBlockHeader;
+    const bit = @as(u64, 1) << @truncate(id);
+    if (@atomicLoad(u64, &map[w], .monotonic) & bit == 0) _ = @atomicRmw(u64, &map[w], .Or, bit, .monotonic);
+}
+
+fn idCount(map: []const u64) u64 {
+    var total: u64 = 0;
+    for (map) |w| total += @popCount(w);
+    return total;
 }
 
 // A dictionary block's rows hold only its entries, so each entry the rows
@@ -1247,7 +1290,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         defer if (probe) |*p| p.deinit();
         var probe_schema: ?[]const Column = null;
         if (request.derived.len > 0) {
-            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, &.{}, null, request.udf_registry);
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, &.{}, &.{}, null, request.udf_registry);
             probe_schema = probe.?.schema();
         }
         for (request.aggs, plans) |agg, *p| {
@@ -1388,6 +1431,9 @@ const GlobalAggregate = struct {
     needed: []const []const u8,
     // String COUNT(DISTINCT) inputs the worker scans emit as key digests.
     hash_cols: []const []const u8,
+    // Which of `hash_cols` the scans read by table id instead, decided once
+    // the snapshot is taken (`markTableIdPlans`).
+    id_cols: []bool = &.{},
     output_schema: []Column,
     output_cols: []ColumnStore,
     views: []ColumnView,
@@ -1418,6 +1464,9 @@ const GlobalAggregate = struct {
         }
 
         const views = try allocator.alloc(ColumnView, output_schema.len);
+        errdefer allocator.free(views);
+        const id_cols = try allocator.alloc(bool, hash_cols.len);
+        @memset(id_cols, false);
         return .{
             .allocator = allocator,
             .udf_registry = request.udf_registry,
@@ -1429,6 +1478,7 @@ const GlobalAggregate = struct {
             .plans = plans,
             .needed = needed,
             .hash_cols = hash_cols,
+            .id_cols = id_cols,
             .output_schema = output_schema,
             .output_cols = output_cols,
             .views = views,
@@ -1440,9 +1490,11 @@ const GlobalAggregate = struct {
         self.allocator.free(self.output_cols);
         self.allocator.free(self.views);
         self.allocator.free(self.output_schema);
+        for (self.plans) |p| self.allocator.free(p.id_map);
         self.allocator.free(self.plans);
         self.allocator.free(@constCast(self.needed));
         if (self.hash_cols.len > 0) self.allocator.free(@constCast(self.hash_cols));
+        self.allocator.free(self.id_cols);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1525,13 +1577,41 @@ const GlobalAggregate = struct {
     }
 
     fn openScan(self: *GlobalAggregate, allocator: Allocator, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, self.aggs, snap, self.udf_registry);
+        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, self.id_cols, self.aggs, snap, self.udf_registry);
+    }
+
+    /// Marks each string COUNT(DISTINCT) whose column the scans of `snap`
+    /// can read by table id (`table_id_distinct.readable`) to count by them,
+    /// and its column in `id_cols`.
+    fn markTableIdPlans(self: *GlobalAggregate, snap: Scan.Snapshot) !void {
+        if (self.derived.len != 0) return;
+        const table = self.table;
+        for (self.hash_cols, self.id_cols) |hc, *by_id| {
+            const column_idx = types.findColumn(table.schema.columns, hc) orelse continue;
+            if (table.schema.columns[column_idx].nullable) continue;
+            const id_count = (try table_id_distinct.readable(table, snap, column_idx)) orelse continue;
+            by_id.* = true;
+            for (self.plans) |*p| {
+                if (p.op != .count_distinct or p.is_udf or p.dkind != .string) continue;
+                if (!types.columnNameEql(p.input_name orelse continue, hc)) continue;
+                p.id_map = try self.allocator.alloc(u64, (@as(usize, id_count) + 63) / 64);
+                @memset(p.id_map, 0);
+                p.by_table_id = true;
+            }
+        }
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {
+        const table = self.table;
+        table.ddl_lock.lockSharedUncancelable(table.io);
+        defer table.ddl_lock.unlockShared(table.io);
+        const snap = try Scan.captureSnapshotAlloc(table, self.allocator, exec.memory.accountantOf(self.allocator));
+        defer snap.release(table);
+        defer self.allocator.free(snap.segments);
+        try self.markTableIdPlans(snap);
         var lane = try Lane.init(self.allocator, self.plans);
         errdefer lane.deinit(self.allocator);
-        var source = try self.openScan(self.allocator, null);
+        var source = try self.openScan(self.allocator, snap);
         defer source.deinit();
         try driveScan(&lane, self.plans, self.allocator, &source);
         lane.finalizeDistinct(self.plans);
@@ -1559,6 +1639,7 @@ const GlobalAggregate = struct {
             total_rgs += entry.row_group_count;
         }
         seg_start[snap.segment_count] = total_rgs;
+        try self.markTableIdPlans(snap);
 
         // Pin lanes round-robin across the CPU layout (physical cores first,
         // then hyperthread siblings). Capping at the logical count means
@@ -1593,7 +1674,7 @@ const GlobalAggregate = struct {
         @memset(shared, null);
         errdefer self.destroyShared(shared, 1, false);
         for (self.plans, shared) |p, *slot| {
-            if (p.op != .count_distinct) continue;
+            if (p.op != .count_distinct or p.by_table_id) continue;
             slot.* = if (distinctTier(p.dkind) == .u64)
                 .{ .narrow = try NarrowDistinct.create(self.allocator) }
             else
@@ -1690,6 +1771,9 @@ const GlobalAggregate = struct {
         var merged = try Lane.init(self.allocator, self.plans);
         errdefer merged.deinit(self.allocator);
         for (workers) |*w| try merged.mergeFrom(w.lane, self.plans);
+        for (self.plans, 0..) |p, i| {
+            if (p.by_table_id) merged.distinct_counts[i] = idCount(p.id_map);
+        }
         // COUNT(DISTINCT): publish each lane's partial chunks, drain what is
         // still queued across the workers' cores, then count the shared sets.
         // The out-of-band `''` (folded as a boolean, never inserted into a set)

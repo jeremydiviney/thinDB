@@ -252,3 +252,34 @@ test "table string ids: COUNT(DISTINCT) by ids matches the scan, and declines me
     try std.testing.expectEqual(@as(?u64, null), try distinctByIds(allocator, t));
     try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t", "14");
 }
+
+test "table string ids: a filtered COUNT(DISTINCT) counts by ids, beside memtable rows and tombstones" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE t (id BIGINT NOT NULL, tag VARCHAR NOT NULL, PRIMARY KEY (id))");
+    const t = try db.openTable("t", .{ .row_group_size = 100 });
+    try insertTags(allocator, db, 0, 400, 0, 10);
+    try t.flush();
+    try insertTags(allocator, db, 400, 400, 6, 10);
+    try t.flush();
+
+    const cases = .{
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE id < 5", .expected = "5" },
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 395 AND id < 405", .expected = "6" },
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", .expected = "10" },
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE tag <> 'tag3'", .expected = "15" },
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE id % 2 = 0", .expected = "8" },
+        .{ .sql = "SELECT COUNT(DISTINCT tag) FROM t WHERE id > 5000", .expected = "0" },
+    };
+    inline for (cases) |c| try helpers.expectText(allocator, db, c.sql, c.expected);
+
+    try exec(allocator, db, "INSERT INTO t (id, tag) VALUES (1000, 'tag99')");
+    try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", "11");
+    try t.flush();
+    try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", "11");
+    try exec(allocator, db, "DELETE FROM t WHERE id = 1000");
+    try helpers.expectText(allocator, db, "SELECT COUNT(DISTINCT tag) FROM t WHERE id >= 400", "10");
+}
