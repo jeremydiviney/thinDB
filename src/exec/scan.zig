@@ -456,6 +456,12 @@ pub const MAT_KINDS = 9;
 /// rows touched) beats the branchless masked compaction, which streams the
 /// whole block; above it the sequential pass wins.
 const SPARSE_GATHER_DIVISOR = 4;
+/// Rows of a batch below which an id-keyed column identifies their entries
+/// one row at a time (`identifyRows`), or at least without looking for its
+/// block's cached table ids and digests (`seekIdKeys`): the lookup takes the
+/// block cache's lock, which the workers contend on, and the block's
+/// per-entry arrays cost more than a sparse batch's few entries.
+const ID_KEYS_SEEK_ROWS = 64;
 const MAT_KIND_NAMES = [MAT_KINDS][]const u8{ "other", "coded", "hashed", "for", "dict", "rle", "fsst", "rawview", "rawowned" };
 pub fn matKindName(k: usize) []const u8 {
     return MAT_KIND_NAMES[k];
@@ -651,6 +657,11 @@ pub const Scan = struct {
     /// taken at the first filtered `next()`; null until then and again
     /// whenever the filter changes.
     filter_memo: ?FilterMemo = null,
+    /// Whether the block cache keeps dictionary digests for this scan
+    /// (`dictDigestsKey`), read once: its switches are environment
+    /// variables, and `getenv` takes the C runtime's environment lock, which
+    /// workers asking per row group contend on.
+    keeps_dict_digests: bool,
     /// Set by the filter paths for the row group `filterRowGroup` just
     /// evaluated: which digest of `filter_memo` matched none of its stored
     /// rows, before tombstones or the key bound took any out.
@@ -848,6 +859,12 @@ pub const Scan = struct {
     dict_cols_by_j: []bool = &.{},
     n_dicts: usize = 0,
     dict_bufs: []DictBuf = &.{},
+    /// How many positions emit by table id (`setIdKeyColumn`).
+    n_id_keys: usize = 0,
+    /// Offsets `4 * i`, which an id-keyed column's values share: each is
+    /// its table id's four bytes. Views die with their batch, so it grows
+    /// only as a row group starts filling.
+    id_offsets: []u32 = &.{},
     dict_slots: []?exec.BlockDictColumn = &.{},
     filtered_dicts: ?[]const ?exec.BlockDictColumn = null,
     /// LIKE over a dictionary block: one match flag per entry, and the
@@ -884,6 +901,30 @@ pub const Scan = struct {
         counted: bool = false,
         /// The consumer takes the values' digests beside the values.
         digested: bool = false,
+        /// The consumer takes the values' table ids beside the values.
+        id_mapped: bool = false,
+        /// The consumer reads the column only as a group key's identity
+        /// (`setIdKeyColumn`): each value arrives as its table id's four
+        /// bytes, and `table_ids` and `digests` fill per entry as the
+        /// batches name them, flagged in `digests_known`.
+        id_keyed: bool = false,
+        /// An id-keyed column whose consumer keys on the ids themselves:
+        /// its rows carry no digests, and its ids arrive though it's hashed.
+        ids_only: bool = false,
+        /// The held block's values' table ids, by code.
+        table_ids: std.ArrayListUnmanaged(u32) = .empty,
+        /// An id-keyed column's cached table ids and digests of every entry
+        /// of the held block (`idKeysKey`), pinned until it's released;
+        /// `table_ids` and `digests` go unused while they're held.
+        id_keys_cached: ?*storage.cache.Cache.Entry = null,
+        /// Whether the held block's batches have looked for its cached
+        /// table ids and digests (`seekIdKeys`).
+        id_keys_sought: bool = false,
+        /// An id-keyed column's last batch, as each row's table id.
+        row_ids: std.ArrayListUnmanaged(u32) = .empty,
+        /// The table ids of the segment the scan reads, pinned until it
+        /// moves to another.
+        segment_ids: ?struct { seg_idx: usize, ids: storage.ReadSegment.TableIds } = null,
         entry_counts: std.ArrayListUnmanaged(u32) = .empty,
         entry_rows: std.ArrayListUnmanaged(u32) = .empty,
         entry_pass: std.ArrayListUnmanaged(bool) = .empty,
@@ -902,14 +943,30 @@ pub const Scan = struct {
             self.block = null;
             if (self.digests_cached) |e| cache.cache.release(e);
             self.digests_cached = null;
+            if (self.id_keys_cached) |e| cache.cache.release(e);
+            self.id_keys_cached = null;
+        }
+
+        /// An id-keyed column's held table ids and digests, by code.
+        fn heldIdKeys(self: *const DictBuf) storage.cache.IdKeys {
+            if (self.id_keys_cached) |e| return e.idKeys();
+            return .{ .digests = self.digests.items, .ids = self.table_ids.items };
         }
 
         fn heldDigests(self: *const DictBuf) []const u128 {
             return if (self.digests_cached) |e| e.digests() else self.digests.items;
         }
 
+        fn releaseSegmentIds(self: *DictBuf) void {
+            if (self.segment_ids) |s| s.ids.release();
+            self.segment_ids = null;
+        }
+
         fn deinit(self: *DictBuf, allocator: Allocator, cache: storage.cache.TableCache) void {
             self.releaseBlock(allocator, cache);
+            self.releaseSegmentIds();
+            self.table_ids.deinit(allocator);
+            self.row_ids.deinit(allocator);
             self.codes.deinit(allocator);
             self.offsets.deinit(allocator);
             self.digests.deinit(allocator);
@@ -1360,6 +1417,7 @@ pub const Scan = struct {
             .cached_stats = cached_stats,
             .schema_stats = schema_stats,
             .snapshot_id = snapshot_id,
+            .keeps_dict_digests = table.cache.conditions and !conditionsSwitchedOff() and !dictDigestsSwitchedOff(),
         };
 
         // Cache-aware scan sub-batch: size the per-emit row count from the
@@ -1680,6 +1738,84 @@ pub const Scan = struct {
         self.dict_bufs[j].digested = true;
     }
 
+    /// Mark position `j`, already set for block-dictionary emit, as read by
+    /// table id (DESIGN.md §4.6): its dictionary comes with its values'
+    /// table ids (`BlockDictColumn.table_ids`). The caller has checked that
+    /// every row group of the scan stores them (`table_id_distinct.qualifies`);
+    /// one that doesn't fails the scan.
+    pub fn setBlockDictTableIds(self: *Scan, j: usize) void {
+        self.dict_bufs[j].id_mapped = true;
+    }
+
+    /// Mark the projected column `name` as read only as a group key's
+    /// identity, by table id (DESIGN.md §4.6): every batch carries each
+    /// row's value as its table id's four bytes, digested as those bytes
+    /// (`Batch.hashed`), or, set for block-dictionary emit too, a block
+    /// dictionary (`Batch.block_dicts`) of its values' ids the same way.
+    /// Two rows hold one value exactly when they hold one id, so a consumer
+    /// that only tells values apart reads no value's bytes. The caller has
+    /// checked that every row group of the scan stores the ids and no
+    /// tombstone or memtable row reaches it (`table_id_distinct.readable`);
+    /// one that does fails the scan. Without `digested` the rows carry no
+    /// digests: a consumer that keys on the ids themselves reads four bytes
+    /// a row, not sixteen. False, marking nothing, when the column can't take
+    /// block-dictionary emit.
+    pub fn setIdKeyColumn(self: *Scan, name: []const u8, digested: bool) !bool {
+        const j = self.blockDictColumnIndex(name) orelse return false;
+        try self.ensureDictArrays();
+        try self.ensureHashArrays();
+        if (!self.dict_bufs[j].id_keyed) {
+            self.dict_bufs[j].id_keyed = true;
+            self.n_id_keys += 1;
+        }
+        self.dict_bufs[j].ids_only = !digested;
+        return true;
+    }
+
+    fn idKeyed(self: *const Scan, j: usize) bool {
+        return self.n_id_keys > 0 and self.dict_bufs[j].id_keyed;
+    }
+
+    /// Whether id-keyed position `j`'s batch values are its rows' table ids.
+    /// A hashed one arrives as digests alone, its values the scan's
+    /// placeholder, as a hashed byte column's are, unless it's ids-only.
+    fn idRows(self: *const Scan, j: usize) bool {
+        return self.idKeyed(j) and (self.dict_bufs[j].ids_only or !self.hashKeyed(j));
+    }
+
+    /// Whether id-keyed position `j`'s rows carry digests (`Batch.hashed`).
+    fn idDigests(self: *const Scan, j: usize) bool {
+        return self.idKeyed(j) and !self.dict_bufs[j].ids_only;
+    }
+
+    fn hashKeyed(self: *const Scan, j: usize) bool {
+        return self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
+    }
+
+    /// Whether id-keyed position `j` arrives row by row (`fillIdKeys`)
+    /// rather than as a block dictionary.
+    fn idDigestRows(self: *const Scan, j: usize) bool {
+        return self.idKeyed(j) and !self.dict_cols_by_j[j];
+    }
+
+    /// Room in `id_offsets` for `n` values.
+    fn ensureIdOffsets(self: *Scan, n: usize) !void {
+        if (self.id_offsets.len > n) return;
+        const offsets = try self.allocator.alloc(u32, n + 1);
+        for (offsets, 0..) |*o, i| o.* = @intCast(i * @sizeOf(u32));
+        self.allocator.free(self.id_offsets);
+        self.id_offsets = offsets;
+    }
+
+    /// Id-keyed position `j`'s last `n` rows (`DictBuf.row_ids`) as values.
+    fn idRowsView(self: *const Scan, j: usize, n: usize) ColumnView {
+        const sv: storage.StringView = .{ .offsets = self.id_offsets[0 .. n + 1], .bytes = std.mem.sliceAsBytes(self.dict_bufs[j].row_ids.items[0..n]) };
+        return .{ .data = switch (self.out_schema[j].type) {
+            .varchar => .{ .varchar = sv },
+            else => .{ .string = sv },
+        } };
+    }
+
     fn ensureDictArrays(self: *Scan) !void {
         if (self.dict_cols_by_j.len == self.out_phys.len) return;
         const flags = try self.allocator.alloc(bool, self.out_phys.len);
@@ -1711,11 +1847,12 @@ pub const Scan = struct {
         const buf = &self.dict_bufs[j];
         const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
         const every_value = rows == null;
-        const codes_wanted = !(every_value and buf.entries_only);
+        const codes_wanted = buf.id_keyed or !(every_value and buf.entries_only);
         const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, if (codes_wanted) .full else .no_codes)) orelse return null;
         const n = if (rows) |r| r.len else if (codes_wanted) rg_count else 0;
         try buf.codes.resize(self.allocator, n);
         if (rows) |r| db.codesAt(r, buf.codes.items) else db.codesInto(buf.codes.items);
+        if (buf.id_keyed) return try self.idBlockDict(seg, phys, j, db, rg_count, every_value, !self.idRows(j));
         if (hashed) {
             try self.digestBlockDict(buf, db, every_value);
             return .{ .codes = buf.codes.items, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .every_value = every_value };
@@ -1725,8 +1862,212 @@ pub const Scan = struct {
             .codes = buf.codes.items,
             .dict = .{ .offsets = db.offsetsInPlace() orelse buf.offsets.items, .bytes = db.dict_bytes },
             .digests = if (buf.digested) buf.heldDigests() else null,
+            .table_ids = if (buf.id_mapped) buf.table_ids.items else null,
             .every_value = every_value,
         };
+    }
+
+    /// Fills `buf.table_ids` with the table id of each value of `db`, a block
+    /// of segment `seg`'s column `phys`.
+    fn mapTableIds(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock) !void {
+        const ids = try self.holdSegmentIds(seg, phys, buf, db);
+        try buf.table_ids.resize(self.allocator, db.ndv);
+        for (buf.table_ids.items, 0..) |*id, c| {
+            const s = db.segmentId(@intCast(c));
+            if (s >= ids.len) return storage.format.Error.CorruptColumnBlockHeader;
+            id.* = std.mem.littleToNative(u32, ids[s]);
+        }
+    }
+
+    /// The table ids of segment `seg`'s column `phys`, by segment id, held
+    /// in `buf` while the scan reads the segment, for `db`, a block of it.
+    fn holdSegmentIds(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock) ![]align(1) const u32 {
+        if (buf.segment_ids == null or buf.segment_ids.?.seg_idx != self.cur_seg_idx) {
+            buf.releaseSegmentIds();
+            const ids = (try seg.cachedTableIds(phys, self.cacheRef())) orelse return error.UnsupportedQueryShape;
+            buf.segment_ids = .{ .seg_idx = self.cur_seg_idx, .ids = ids };
+        }
+        if (db.ndv != 0 and !db.hasSegmentIds()) return error.UnsupportedQueryShape;
+        return buf.segment_ids.?.ids.ids;
+    }
+
+    /// Id-keyed position `j`'s batch over its codes (every row of the row
+    /// group when `every_value`) of `db`, its held block of segment `seg`'s
+    /// column `phys` in a row group of `rg_count` rows: each row's table id,
+    /// and the block as the dictionary of its values' ids, digested; for a
+    /// `hashed` column, the digests alone.
+    fn idBlockDict(self: *Scan, seg: *storage.ReadSegment, phys: usize, j: usize, db: storage.segment_reader.DictBlock, rg_count: u32, every_value: bool, hashed: bool) !exec.BlockDictColumn {
+        const buf = &self.dict_bufs[j];
+        try self.identifyEntries(seg, phys, buf, db, every_value);
+        const held = buf.heldIdKeys();
+        const codes = buf.codes.items;
+        if (hashed) return .{ .codes = codes, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = held.digests, .every_value = every_value };
+        try buf.row_ids.resize(self.allocator, codes.len);
+        for (buf.row_ids.items, codes) |*id, c| id.* = held.ids[c];
+        try self.ensureIdOffsets(@max(rg_count, db.ndv));
+        return .{
+            .codes = codes,
+            .dict = self.idDictView(held.ids),
+            .digests = held.digests,
+            .table_ids = held.ids,
+            .every_value = every_value,
+        };
+    }
+
+    /// A held block's values' table ids `ids` as its dictionary.
+    fn idDictView(self: *const Scan, ids: []const u32) storage.StringView {
+        return .{ .offsets = self.id_offsets[0 .. ids.len + 1], .bytes = std.mem.sliceAsBytes(ids) };
+    }
+
+    /// Id-keyed position `j`'s rows of row group `rg_idx` (`rg_count` rows)
+    /// of segment `seg`'s column `phys`, or only `rows` (ascending) of them:
+    /// each one's digest into `hash_bufs[j]` (`idDigests`) and its table id
+    /// into `row_ids` (`idRows`), through its code, as `fillKeyHashes`
+    /// digests a byte column's rows.
+    fn fillIdKeys(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, j: usize, rg_count: u32, rows: ?[]const u32) !void {
+        const buf = &self.dict_bufs[j];
+        const db = (try self.holdDictBlock(seg, rg_idx, phys, j, rg_count, .full)) orelse return error.UnsupportedQueryShape;
+        const n = if (rows) |r| r.len else rg_count;
+        var digests: ?[]u128 = null;
+        if (self.idDigests(j)) {
+            try self.hash_bufs[j].resize(self.allocator, n);
+            digests = self.hash_bufs[j].items;
+        }
+        var ids: ?[]u32 = null;
+        if (self.idRows(j)) {
+            try buf.row_ids.resize(self.allocator, n);
+            try self.ensureIdOffsets(n);
+            ids = buf.row_ids.items;
+        }
+        if (rows) |r| if (!buf.digests_whole) {
+            if (r.len < ID_KEYS_SEEK_ROWS) return self.identifyRows(seg, phys, buf, db, r, digests, ids);
+            try buf.codes.resize(self.allocator, n);
+            db.codesAt(r, buf.codes.items);
+        };
+        try self.identifyEntries(seg, phys, buf, db, rows == null);
+        const held = buf.heldIdKeys();
+        switch (db.code_width) {
+            inline 1, 2, 4 => |w| idKeysOfRows(w, db, rows, held, digests, ids),
+            else => idKeysOfRows(null, db, rows, held, digests, ids),
+        }
+    }
+
+    /// Each of `rows` of id-keyed `buf`'s held block `db`, of segment `seg`'s
+    /// column `phys`: its table id into `ids` and that id's digest into
+    /// `digests`, straight from its entry. A sparse batch's few rows cost
+    /// less this way than the block's per-entry arrays (`identifyEntries`),
+    /// as `hashSurvivorsFromBlock` hashes a byte column's few survivors.
+    fn identifyRows(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock, rows: []const u32, digests: ?[]u128, ids: ?[]u32) !void {
+        const segment_ids = try self.holdSegmentIds(seg, phys, buf, db);
+        for (rows, 0..) |row, k| {
+            const id = try entryTableId(db, segment_ids, db.rowCode(row));
+            if (ids) |out| out[k] = id;
+            if (digests) |out| out[k] = exec.stringKeyDigest(std.mem.asBytes(&id));
+        }
+    }
+
+    inline fn idKeysOfRows(comptime width: ?u8, db: storage.segment_reader.DictBlock, rows: ?[]const u32, held: storage.cache.IdKeys, digests: ?[]u128, ids: ?[]u32) void {
+        if (digests) |ds| {
+            if (ids) |out| {
+                for (ds, out, 0..) |*d, *id, k| {
+                    const c = rowCodeOf(width, db, rows, k);
+                    d.* = held.digests[c];
+                    id.* = held.ids[c];
+                }
+            } else for (ds, 0..) |*d, k| {
+                d.* = held.digests[rowCodeOf(width, db, rows, k)];
+            }
+        } else if (ids) |out| {
+            for (out, 0..) |*id, k| id.* = held.ids[rowCodeOf(width, db, rows, k)];
+        }
+    }
+
+    inline fn rowCodeOf(comptime width: ?u8, db: storage.segment_reader.DictBlock, rows: ?[]const u32, k: usize) u32 {
+        const row = if (rows) |r| r[k] else k;
+        return if (width) |w| db.rowCodeAs(w, row) else db.rowCode(row);
+    }
+
+    /// The block-cache key of the table ids and digests of column `phys`'s
+    /// dictionary `db` in row group `rg_idx`, under the switches that
+    /// govern its dictionary digests' (`dictDigestsKey`).
+    fn idKeysKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, phys: usize, db: storage.segment_reader.DictBlock) ?storage.cache.Key {
+        var key = self.dictDigestsKey(seg, rg_idx, phys, db) orelse return null;
+        key.content = .id_keys;
+        return key;
+    }
+
+    /// Cache the table id and digest of every entry of the block id-keyed
+    /// `buf` holds, taking those it already filled, and hold them in its
+    /// place. False, with `buf` unchanged, when they aren't cached or the
+    /// cache can't take them.
+    fn cacheIdKeys(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock) !bool {
+        const key = buf.digests_key orelse return false;
+        const cache = self.table.cache;
+        const bytes = cache.blockAllocator().alignedAlloc(u8, .@"16", storage.cache.IdKeys.bytesFor(db.ndv)) catch return false;
+        errdefer cache.blockAllocator().free(bytes);
+        const out = storage.cache.IdKeys.slotsOf(bytes);
+        const known: ?[]const bool = if (buf.digests_known_count > 0) buf.digests_known.items else null;
+        const segment_ids = buf.segment_ids.?.ids.ids;
+        for (out.ids, out.digests, 0..) |*id, *d, c| {
+            if (known) |k| if (k[c]) {
+                id.* = buf.table_ids.items[c];
+                d.* = buf.digests.items[c];
+                continue;
+            };
+            id.* = try entryTableId(db, segment_ids, @intCast(c));
+            d.* = exec.stringKeyDigest(std.mem.asBytes(id));
+        }
+        buf.id_keys_cached = cache.insertPinned(key, bytes, .raw) catch {
+            cache.blockAllocator().free(bytes);
+            return false;
+        };
+        buf.digests_whole = true;
+        return true;
+    }
+
+    /// Fill the table id and its digest of each entry of id-keyed `buf`'s
+    /// held block `db`, of segment `seg`'s column `phys`, that `buf.codes`
+    /// names (every entry when `every_value`), each once per held block.
+    fn identifyEntries(self: *Scan, seg: *storage.ReadSegment, phys: usize, buf: *DictBuf, db: storage.segment_reader.DictBlock, every_value: bool) !void {
+        if (buf.digests_whole or self.seekIdKeys(buf, every_value)) return;
+        const ids = try self.holdSegmentIds(seg, phys, buf, db);
+        try buf.table_ids.resize(self.allocator, db.ndv);
+        try buf.digests.resize(self.allocator, db.ndv);
+        if (every_value) {
+            if (try self.cacheIdKeys(buf, db)) return;
+            for (0..db.ndv) |c| try identifyEntry(buf, db, ids, @intCast(c));
+            buf.digests_whole = true;
+            return;
+        }
+        for (try self.unknownEntries(buf, db)) |c| try identifyEntry(buf, db, ids, c);
+        // As `cacheHeldDigestsWhenMost` does for a dictionary's digests.
+        if (buf.digests_known_count * 2 >= db.ndv) _ = try self.cacheIdKeys(buf, db);
+    }
+
+    /// Hold the cached table ids and digests of every entry of id-keyed
+    /// `buf`'s held block, looking once per block, and only for every value
+    /// or a batch of at least `ID_KEYS_SEEK_ROWS` rows. True when held.
+    fn seekIdKeys(self: *Scan, buf: *DictBuf, every_value: bool) bool {
+        if (buf.id_keys_sought or !(every_value or buf.codes.items.len >= ID_KEYS_SEEK_ROWS)) return false;
+        buf.id_keys_sought = true;
+        const key = buf.digests_key orelse return false;
+        buf.id_keys_cached = self.table.cache.acquireDerived(key) orelse return false;
+        buf.digests_whole = true;
+        return true;
+    }
+
+    // The entry's bytes are its id's in `table_ids`, so they and its
+    // digest match the rows' (`row_ids`).
+    inline fn identifyEntry(buf: *DictBuf, db: storage.segment_reader.DictBlock, ids: []align(1) const u32, c: u32) !void {
+        const id = &buf.table_ids.items[c];
+        id.* = try entryTableId(db, ids, c);
+        buf.digests.items[c] = exec.stringKeyDigest(std.mem.asBytes(id));
+    }
+
+    inline fn entryTableId(db: storage.segment_reader.DictBlock, ids: []align(1) const u32, c: u32) !u32 {
+        const s = db.segmentId(c);
+        if (s >= ids.len) return storage.format.Error.CorruptColumnBlockHeader;
+        return std.mem.littleToNative(u32, ids[s]);
     }
 
     /// Column `j`'s dictionary block in row group `rg_idx`, with at least
@@ -1750,7 +2091,13 @@ pub const Scan = struct {
             buf.block = block;
             const db = storage.segment_reader.dictBlockOf(block.bytes, rg_count);
             const hashed = self.hash_cols_by_j.len > j and self.hash_cols_by_j[j];
-            if (hashed or buf.digested) {
+            if (buf.id_keyed) {
+                buf.digests_whole = false;
+                buf.id_keys_sought = false;
+                buf.digests_known.clearRetainingCapacity();
+                buf.digests_known_count = 0;
+                buf.digests_key = self.idKeysKey(seg, rg_idx, phys, db);
+            } else if (hashed or buf.digested) {
                 buf.digests_whole = false;
                 buf.digests_known.clearRetainingCapacity();
                 buf.digests_known_count = 0;
@@ -1761,8 +2108,9 @@ pub const Scan = struct {
                 };
                 if (!buf.digests_whole) try buf.digests.resize(self.allocator, db.ndv);
             }
+            if (buf.id_mapped and !buf.id_keyed) try self.mapTableIds(seg, phys, buf, db);
             // Counted entries test the filter on a hashed key's values too.
-            if ((!hashed or buf.counted) and db.offsetsInPlace() == null) {
+            if ((buf.counted or (!hashed and !buf.id_keyed)) and db.offsetsInPlace() == null) {
                 try buf.offsets.resize(self.allocator, @as(usize, db.ndv) + 1);
                 for (buf.offsets.items, 0..) |*o, c| o.* = storage.format.readU32(db.offsets_region[c * 4 ..][0..4]);
             }
@@ -1818,7 +2166,14 @@ pub const Scan = struct {
         }
 
         const hashed = self.hash_cols_by_j.len > 0 and self.hash_cols_by_j[0];
-        if (hashed or buf.digested) try self.digestCountedEntries(buf, db, counts);
+        if (buf.id_keyed) {
+            try self.identifyEntries(seg, phys, buf, db, true);
+            if (self.idRows(0)) {
+                try buf.row_ids.resize(self.allocator, ndv);
+                @memcpy(buf.row_ids.items, buf.heldIdKeys().ids);
+                try self.ensureIdOffsets(ndv);
+            }
+        } else if (hashed or buf.digested) try self.digestCountedEntries(buf, db, counts);
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
         try self.markPlaceholder(0, ndv);
@@ -1828,7 +2183,11 @@ pub const Scan = struct {
             for (locs, buf.entry_rows.items) |*loc, row| loc.* = base | @as(i64, row);
         }
         const slots = try self.ensureDictSlots();
-        slots[0] = if (hashed)
+        slots[0] = if (buf.id_keyed and self.idRows(0))
+            .{ .codes = &.{}, .dict = self.idDictView(buf.heldIdKeys().ids), .digests = buf.heldIdKeys().digests, .table_ids = buf.heldIdKeys().ids, .counts = counts }
+        else if (buf.id_keyed)
+            .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldIdKeys().digests, .counts = counts }
+        else if (hashed)
             .{ .codes = &.{}, .dict = .{ .offsets = &.{0}, .bytes = &.{} }, .digests = buf.heldDigests(), .counts = counts }
         else
             .{ .codes = &.{}, .dict = dict, .digests = if (buf.digested) buf.heldDigests() else null, .counts = counts };
@@ -1935,18 +2294,27 @@ pub const Scan = struct {
     fn digestBlockDict(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock, every_value: bool) !void {
         if (buf.digests_whole) return;
         const digests = buf.digests.items;
-        const codes = buf.codes.items;
         if (every_value) {
             if (self.cacheHeldDigests(buf, db)) return;
             for (digests, 0..) |*d, c| d.* = exec.stringKeyDigest(db.dictValue(@intCast(c)));
             buf.digests_whole = true;
             return;
         }
+        digestEntries(db, try self.unknownEntries(buf, db), digests);
+        self.cacheHeldDigestsWhenMost(buf, db);
+    }
+
+    /// The entries of `buf`'s held block `db` that `buf.codes` names and
+    /// no earlier batch of the block did, flagged known as they're listed.
+    /// Codes outnumbering the entries mark theirs first and list them in
+    /// dictionary order.
+    fn unknownEntries(self: *Scan, buf: *DictBuf, db: storage.segment_reader.DictBlock) ![]const u32 {
         if (buf.digests_known.items.len != db.ndv) {
             try buf.digests_known.resize(self.allocator, db.ndv);
             @memset(buf.digests_known.items, false);
         }
         const known = buf.digests_known.items;
+        const codes = buf.codes.items;
         buf.digests_todo.clearRetainingCapacity();
         try buf.digests_todo.ensureTotalCapacity(self.allocator, @min(codes.len, db.ndv));
         if (codes.len < db.ndv) {
@@ -1964,9 +2332,8 @@ pub const Scan = struct {
                 buf.digests_todo.appendAssumeCapacity(@intCast(c));
             };
         }
-        digestEntries(db, buf.digests_todo.items, digests);
         buf.digests_known_count += buf.digests_todo.items.len;
-        self.cacheHeldDigestsWhenMost(buf, db);
+        return buf.digests_todo.items;
     }
 
     /// The block-cache key of the digests of column `phys`'s dictionary
@@ -1974,7 +2341,7 @@ pub const Scan = struct {
     /// an empty dictionary, the condition cache off, or
     /// `SET THINDB_NO_DICT_DIGESTS = 1`.
     fn dictDigestsKey(self: *const Scan, seg: *const storage.ReadSegment, rg_idx: usize, phys: usize, db: storage.segment_reader.DictBlock) ?storage.cache.Key {
-        if (db.ndv == 0 or !self.table.cache.conditions or conditionsSwitchedOff() or dictDigestsSwitchedOff()) return null;
+        if (db.ndv == 0 or !self.keeps_dict_digests) return null;
         return .{ .table_uid = self.table.cache_uid, .segment_id = seg.info.segment_id, .row_group_idx = @intCast(rg_idx), .column_idx = @intCast(phys), .content = .dict_digests };
     }
 
@@ -2232,6 +2599,7 @@ pub const Scan = struct {
             self.allocator.free(self.placeholders);
         }
         self.allocator.free(self.placeholder_offsets);
+        self.allocator.free(self.id_offsets);
         self.allocator.free(self.decoded);
         self.allocator.free(self.views);
         if (self.segs.len > 0) self.allocator.free(@constCast(self.segs));
@@ -2310,6 +2678,10 @@ pub const Scan = struct {
         for (self.filtered.?, self.placeholders, 0..) |c, placeholder, i| {
             self.views[i] = c.view();
             if (!placeholder) continue;
+            if (self.idRows(i)) {
+                self.views[i] = self.idRowsView(i, n);
+                continue;
+            }
             switch (self.views[i].data) {
                 inline .varchar, .string, .char, .json, .nested, .bitmap => |*sv| sv.offsets = self.placeholder_offsets[0 .. n + 1],
                 else => unreachable,
@@ -3780,6 +4152,7 @@ pub const Scan = struct {
         if (self.phase == .memtable) {
             self.phase = .done;
             if (!self.scan_memtable or self.memtable_row_count == 0) return null;
+            if (self.n_id_keys > 0) return error.UnsupportedQueryShape;
 
             for (self.out_phys, 0..) |phys, j| {
                 self.views[j] = self.memtable_snap.columns[phys].view();
@@ -3823,14 +4196,23 @@ pub const Scan = struct {
         // column is exactly how the real key bytes come back at emit.
         const hashing = self.n_hashed > 0 and rg_clean;
         const measuring = self.n_lengths > 0 and rg_clean;
+        if (self.n_id_keys > 0 and !rg_clean) return error.UnsupportedQueryShape;
         const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0 and rg_clean) try self.ensureDictSlots() else null;
         var any_dict = false;
         var any_raw = false;
         for (self.out_phys, 0..) |phys, j| {
+            if (self.idDigestRows(j)) {
+                try self.fillIdKeys(seg, self.cur_rg_idx, phys, j, rg_count, null);
+                self.decoded[j] = try self.emptyStringColumn(self.table.schema.columns[phys].type, rg_count);
+                decoded_cols += 1;
+                continue;
+            }
             if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
                 if (try self.fillBlockDict(seg, self.cur_rg_idx, phys, j, rg_count, null)) |d| {
                     dict_slots.?[j] = d;
                     any_dict = true;
+                } else if (self.idKeyed(j)) {
+                    return error.UnsupportedQueryShape;
                 } else if (!(hashing and self.hash_cols_by_j[j]) and try self.holdRawStrings(seg, self.cur_rg_idx, phys, j, rg_count)) {
                     any_raw = true;
                 } else break :dict;
@@ -3884,6 +4266,11 @@ pub const Scan = struct {
                 if (raw.seg_idx == self.cur_seg_idx and raw.rg_idx == self.cur_rg_idx - 1) self.views[j] = raw.view;
             }
         }
+        if (self.n_id_keys > 0) {
+            for (0..self.out_phys.len) |j| if (self.idRows(j)) {
+                self.views[j] = self.idRowsView(j, rg_count);
+            };
+        }
         var sidecar: ?[]const ?exec.CodedColumn = null;
         if (coding) {
             const slots = try self.ensureCodedSlots();
@@ -3895,11 +4282,17 @@ pub const Scan = struct {
             sidecar = slots;
         }
         var hash_sidecar: ?[]const ?[]const u128 = null;
-        if (hashing) {
+        if (hashing or self.n_id_keys > 0) {
             const slots = try self.ensureHashedSlots();
             var any_hashed = false;
             for (0..self.out_phys.len) |j| {
-                if (!self.hash_cols_by_j[j]) continue;
+                if (self.idDigestRows(j)) {
+                    if (!self.idDigests(j)) continue;
+                    slots[j] = self.hash_bufs[j].items[0..rg_count];
+                    any_hashed = true;
+                    continue;
+                }
+                if (!hashing or !self.hash_cols_by_j[j]) continue;
                 if (any_dict and dict_slots.?[j] != null) continue;
                 slots[j] = self.hash_bufs[j].items[0..rg_count];
                 any_hashed = true;
@@ -3921,7 +4314,7 @@ pub const Scan = struct {
         // `emit_runs` also keeps the full row group: the run sidecar is
         // per-RG (a run-aware consumer does near-zero per-row work, so the
         // L2-residency slicing buys nothing there).
-        if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !any_raw and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
+        if (self.sub_batch_rows > 0 and !coding and !hashing and !measuring and !any_dict and !any_raw and self.n_id_keys == 0 and !self.emit_loc and !self.emit_runs and rg_count > self.sub_batch_rows) {
             self.sub_off = 0;
             self.sub_count = rg_count;
             return self.emitSub();
@@ -5623,7 +6016,7 @@ pub const Scan = struct {
     /// costs a pass over the block's whole dictionary.
     fn materializeNextSlice(self: *Scan, seg: *storage.ReadSegment, mask: []const bool) !usize {
         const rows = self.pending_rows;
-        const per_dictionary = self.n_dicts > 0 or self.n_hashed > 0 or self.n_coded > 0;
+        const per_dictionary = self.n_dicts > 0 or self.n_hashed > 0 or self.n_coded > 0 or self.n_id_keys > 0;
         const sub = if (per_dictionary) 0 else self.sub_batch_rows;
         var n = rows.len;
         var hi: usize = self.pending_rg_count;
@@ -5656,7 +6049,7 @@ pub const Scan = struct {
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
         const hashing = self.n_hashed > 0;
-        const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
+        const hash_slots: ?[]?[]const u128 = if (hashing or self.n_id_keys > 0) try self.ensureHashedSlots() else null;
         const measuring = self.n_lengths > 0;
         const length_slots: ?[]?[]const u32 = if (measuring) try self.ensureLengthSlots() else null;
         const dict_slots: ?[]?exec.BlockDictColumn = if (self.n_dicts > 0) try self.ensureDictSlots() else null;
@@ -5673,8 +6066,20 @@ pub const Scan = struct {
                 self.scan_mat_kind_cols[mat_kind] += 1;
             };
 
+            if (self.idDigestRows(j)) {
+                try self.fillIdKeys(seg, rg_idx, phys, j, rg_count, rows);
+                try self.markPlaceholder(j, matched);
+                if (self.idDigests(j)) {
+                    hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
+                    any_hashed = true;
+                }
+                continue;
+            }
             if (dict_slots != null and self.dict_cols_by_j[j]) dict: {
-                dict_slots.?[j] = (try self.fillBlockDict(seg, rg_idx, phys, j, rg_count, rows)) orelse break :dict;
+                dict_slots.?[j] = (try self.fillBlockDict(seg, rg_idx, phys, j, rg_count, rows)) orelse {
+                    if (self.idKeyed(j)) return error.UnsupportedQueryShape;
+                    break :dict;
+                };
                 mat_kind = 4;
                 any_dict = true;
                 try self.markPlaceholder(j, matched);
@@ -6192,6 +6597,7 @@ pub const Scan = struct {
     /// sidecar replaces them with (block dictionary, codes, digests, lengths).
     fn outViewHoldsValues(self: *const Scan, j: usize) bool {
         if (self.dict_cols_by_j.len > j and self.dict_cols_by_j[j]) return false;
+        if (self.n_id_keys > 0 and self.dict_bufs[j].id_keyed) return false;
         if (self.coded_dicts_by_j.len > j and self.coded_dicts_by_j[j] != null) return false;
         if (self.hash_cols_by_j.len > j and self.hash_cols_by_j[j]) return false;
         return !(self.len_cols_by_j.len > j and self.len_cols_by_j[j]);
@@ -6243,16 +6649,34 @@ pub const Scan = struct {
         const coding = self.n_coded > 0;
         const slots: ?[]?exec.CodedColumn = if (coding) try self.ensureCodedSlots() else null;
         const hashing = self.n_hashed > 0;
-        const hash_slots: ?[]?[]const u128 = if (hashing) try self.ensureHashedSlots() else null;
+        const hash_slots: ?[]?[]const u128 = if (hashing or self.n_id_keys > 0) try self.ensureHashedSlots() else null;
         const measuring = self.n_lengths > 0;
         const length_slots: ?[]?[]const u32 = if (measuring) try self.ensureLengthSlots() else null;
 
         const filtered_cols = try self.ensureFilteredBuffers();
         for (filtered_cols) |*c| c.clear();
+        var id_slots: ?[]?exec.BlockDictColumn = null;
         // Only the first `out_count` columns are emitted; any trailing entries
         // in `eval_views` are filter-only and stay inside the scan. (Under
         // emit_loc `filtered_cols` also carries a trailing `__rowloc` buffer.)
         for (eval_views[0..out_count], filtered_cols[0..out_count], 0..) |src, *dst, j| {
+            // The filter read the values; the survivors leave by table id.
+            if (self.idKeyed(j)) {
+                const rg = switch (loc) {
+                    .segment => |rg| rg,
+                    .memtable => return error.UnsupportedQueryShape,
+                };
+                const rows = try self.survivorRows(mask[0..n]);
+                if (self.idDigestRows(j)) {
+                    try self.fillIdKeys(self.cur_segment.?, rg, self.out_phys[j], j, @intCast(n), rows);
+                    if (self.idDigests(j)) hash_slots.?[j] = self.hash_bufs[j].items[0..matched];
+                } else {
+                    if (id_slots == null) id_slots = try self.ensureDictSlots();
+                    id_slots.?[j] = (try self.fillBlockDict(self.cur_segment.?, rg, self.out_phys[j], j, @intCast(n), rows)) orelse return error.UnsupportedQueryShape;
+                }
+                try self.markPlaceholder(j, matched);
+                continue;
+            }
             // Coded group key: intern just the survivors' strings into the code
             // buffer (the views are already decoded here); placeholder in the
             // value column. The aggregate reads the sidecar codes.
@@ -6321,7 +6745,7 @@ pub const Scan = struct {
         self.filtered_coded = slots;
         self.filtered_hashed = hash_slots;
         self.filtered_lengths = length_slots;
-        self.filtered_dicts = null;
+        self.filtered_dicts = id_slots;
         return matched;
     }
 

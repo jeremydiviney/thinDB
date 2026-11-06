@@ -1799,6 +1799,9 @@ pub const BlockDictColumn = struct {
     codes: []const u32,
     dict: storage.StringView,
     digests: ?[]const u128 = null,
+    /// Each value's table id (DESIGN.md §4.6), by code, when the consumer
+    /// asked for them (`Scan.setBlockDictTableIds`).
+    table_ids: ?[]const u32 = null,
     /// The codes ascend, so their values stream in dictionary order.
     ascending: bool = false,
     /// Every dictionary value occurs in the batch's rows: the batch is its

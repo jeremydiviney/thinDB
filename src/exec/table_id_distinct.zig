@@ -85,6 +85,22 @@ pub fn count(allocator: Allocator, request: Request) !?u64 {
     return total;
 }
 
+/// The column's id count when a scan of the snapshot can read every value
+/// of it by table id: the snapshot holds no memtable rows or tombstones,
+/// the column takes ids, and each segment's string table holds all its
+/// values with their ids. Null otherwise.
+pub fn readable(table: *api.Table, snapshot: exec.Scan.Snapshot, column_idx: usize) !?u32 {
+    if (snapshot.memtable_row_count != 0) return null;
+    const state = table.strings.readerState(column_idx) orelse return null;
+    if (state.closed) return null;
+    for (snapshot.segments) |entry| {
+        const handle = try table.acquireSegment(entry.segment_id);
+        defer table.releaseSegment(handle);
+        if (!try qualifies(table, handle, snapshot, column_idx)) return null;
+    }
+    return state.id_count;
+}
+
 /// Whether the segment's string table holds every non-NULL value of the
 /// column: a row group whose block stands apart (past the table's cap)
 /// holds values it doesn't, unless the row group's values are all NULL.

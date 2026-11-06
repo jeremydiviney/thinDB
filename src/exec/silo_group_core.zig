@@ -2286,6 +2286,11 @@ const PipeShared = struct {
     generic_filter_required: bool = false,
     residual_filter: ?thindb.exec.PredicateExpr = null,
     count_sketch: ?CountSketchPass = null,
+    /// Whether the count sketch folds the layout's key parts
+    /// (`foldsSketchKeys`), and per key column whether it folds by its rows'
+    /// table ids (`sketchIdKeys`).
+    folds_sketch_keys: bool = false,
+    sketch_id_keys: [MAX_GENERIC_GROUP_KEYS]bool = @splat(false),
     stage_outstanding_chunks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     stage_outstanding_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stage_builder_rows: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -8371,8 +8376,9 @@ const GridDictEval = struct {
         self.collapsed = true;
         const out = try self.evalLater(batch);
         // A derived column may take the collapsed column's name and slot;
-        // hashed values are the scan's placeholders.
-        self.ascending = column.holdsValues() and sameStringView(out.values[column_index], batch.values[column_index]);
+        // hashed values are the scan's placeholders. Table ids don't follow
+        // their values' order.
+        self.ascending = column.holdsValues() and column.table_ids == null and sameStringView(out.values[column_index], batch.values[column_index]);
         return out;
     }
 
@@ -10191,10 +10197,25 @@ fn batchIdentities(job: SiloGridJob, allocator: Allocator, batch: thindb.Batch) 
 /// group identities. A counter needs only that a group's rows agree on its
 /// key, so the parts of a hashed key fold together in a multiply each
 /// instead of a digest; the grid digests just the rows the filter pass keeps.
-fn foldsSketchKeys(layout: GroupRowsLayout) bool {
-    return layout.hashed_key and layout.key_columns.len >= 2 and for (layout.key_columns) |part| {
-        if (part.nullable) break false;
-    } else true;
+/// A lone key folds when it's keyed by table id (`sketchIdKeys`): its id
+/// folds for less than its digest costs to gather.
+fn foldsSketchKeys(layout: GroupRowsLayout, id_key_columns: []const []const u8) bool {
+    if (!layout.hashed_key) return false;
+    for (layout.key_columns) |part| {
+        if (part.nullable) return false;
+    }
+    return switch (layout.key_columns.len) {
+        0 => false,
+        1 => isIdKey(layout.key_columns[0].name, id_key_columns),
+        else => true,
+    };
+}
+
+fn isIdKey(name: []const u8, id_key_columns: []const []const u8) bool {
+    for (id_key_columns) |id_key| {
+        if (types_mod.columnNameEql(name, id_key)) return true;
+    }
+    return false;
 }
 
 /// The folded sketch keys of rows `[lo, lo + out.len)` of `keys`, at most
@@ -10202,13 +10223,42 @@ fn foldsSketchKeys(layout: GroupRowsLayout) bool {
 fn foldSketchKeys(job: SiloGridJob, keys: *const BatchKeys, lo: usize, out: []u128) void {
     const lanes = job.sketch_scratch.lanes.items;
     for (job.shared.group_rows_layout.key_columns, 0..) |part, i| {
-        const lane = keyLane(keys.views[i], keys.digests[i], part.typ, lo, lanes[i * IDENTITY_LANE_ROWS ..][0..out.len]);
+        const lane_out = lanes[i * IDENTITY_LANE_ROWS ..][0..out.len];
+        const lane = if (job.shared.sketch_id_keys[i]) idLane(keys.views[i], lo, lane_out) else keyLane(keys.views[i], keys.digests[i], part.typ, lo, lane_out);
         if (i == 0) {
             for (out, lane) |*key, bits| key.* = foldSketchPart(0, bits);
         } else {
             for (out, lane) |*key, bits| key.* = foldSketchPart(@truncate(key.*), bits);
         }
     }
+}
+
+/// The key columns of `layout` a folded count sketch keys by table id: those
+/// of `id_key_columns`, whose values every batch carries as their ids'
+/// four bytes. Two rows share a value exactly when they share an id, so the
+/// id folds in place of the value's digest, and a tally's scan needn't
+/// gather sixteen digest bytes a row (`Scan.setIdKeyColumn`).
+fn sketchIdKeys(layout: GroupRowsLayout, id_key_columns: []const []const u8) [MAX_GENERIC_GROUP_KEYS]bool {
+    var keyed: [MAX_GENERIC_GROUP_KEYS]bool = @splat(false);
+    if (!foldsSketchKeys(layout, id_key_columns)) return keyed;
+    for (layout.key_columns, 0..) |part, i| keyed[i] = isIdKey(part.name, id_key_columns);
+    return keyed;
+}
+
+/// Rows `[lo, lo + lane.len)` of an id-keyed column's values, each its
+/// table id's four bytes, as their ids.
+fn idLane(view: ColumnView, lo: usize, lane: []u128) []const u128 {
+    const sv = switch (view.data) {
+        .string, .varchar => |sv| sv,
+        else => {
+            @memset(lane, 0);
+            return lane;
+        },
+    };
+    const base = sv.offsets[lo];
+    std.debug.assert(sv.offsets[lo + lane.len] - base == lane.len * 4);
+    for (lane, 0..) |*p, j| p.* = std.mem.readInt(u32, sv.bytes[base + j * 4 ..][0..4], .native);
+    return lane;
 }
 
 inline fn foldSketchPart(prior: u64, bits: u128) u64 {
@@ -10223,7 +10273,7 @@ fn tallyRows(job: SiloGridJob, pass: CountSketchPass, batch: thindb.Batch, weigh
     const row_weights: ?[]const u32 = if (weights) |w| w.counts[0..n] else null;
     const slots = try recordedSlots(job, pass, batch, weights);
     const layout = job.shared.group_rows_layout;
-    if (!foldsSketchKeys(layout)) return tallyIdentities(job, pass, try batchIdentities(job, job.scan.allocator, batch), row_weights, slots);
+    if (!job.shared.folds_sketch_keys) return tallyIdentities(job, pass, try batchIdentities(job, job.scan.allocator, batch), row_weights, slots);
     const keys = try BatchKeys.init(layout, batch);
     try job.sketch_scratch.lanes.resize(job.scan.allocator, keys.len * IDENTITY_LANE_ROWS);
     var chunk: [IDENTITY_LANE_ROWS]u128 = undefined;
@@ -10303,7 +10353,7 @@ fn keptRows(job: SiloGridJob, allocator: Allocator, pass: CountSketchPass, batch
     const mask = scratch.mask.items;
     var kept: usize = 0;
     const layout = job.shared.group_rows_layout;
-    if (!foldsSketchKeys(layout)) {
+    if (!job.shared.folds_sketch_keys) {
         const ids = try batchIdentities(job, allocator, batch);
         for (mask, ids) |*m, id| {
             m.* = filterKeeps(pass, id);
@@ -11083,6 +11133,12 @@ pub const RunConfig = struct {
     // (`Batch.hashed`). A scan decline (or a sidecar-less batch) falls back
     // to digesting bytes.
     hash_key_columns: []const []const u8 = &.{},
+    // String group-key columns every worker scan of every pass emits by table
+    // id (`Scan.setIdKeyColumn`): keys compare and hash as their ids' four
+    // bytes, and the result reads the values back by rowref. The caller has
+    // checked that the snapshot's segments store the ids
+    // (`table_id_distinct.readable`).
+    id_key_columns: []const []const u8 = &.{},
     /// Keeps only these bits of each hashed key's digest where a row takes
     /// its staged key, so keys collide as often as a digest this narrow
     /// collides: a test of exact group keys under real collisions.
@@ -11650,6 +11706,8 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
         .local_parts = parts,
         .shared_scan_buffers = shared_scan_buffers_ptr,
         .defer_fold = defer_fold,
+        .folds_sketch_keys = foldsSketchKeys(staged_layout, cfg.id_key_columns),
+        .sketch_id_keys = sketchIdKeys(staged_layout, cfg.id_key_columns),
     };
     defer shared.scan_tiles.deinit(allocator);
     raw_queues_moved_to_shared = true;
@@ -11734,6 +11792,11 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             for (cfg.hash_key_columns) |hc| _ = scans[i].setHashKeyColumn(hc);
         }
         for (cfg.byte_length_columns) |lc| _ = scans[i].setByteLengthColumn(lc);
+        // A folded tally keys id columns by their ids alone (`sketchIdKeys`).
+        const id_digests = !(tallies and foldsSketchKeys(cfg.group_rows_layout, cfg.id_key_columns));
+        for (cfg.id_key_columns) |name| {
+            if (!try scans[i].setIdKeyColumn(name, id_digests)) return error.UnsupportedQueryShape;
+        }
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
         if (cfg.count_sketch) |pass| switch (pass) {
             .filter => |sketch| if (sketch.row_slots) |rs| scans[i].setRowSieve(.{

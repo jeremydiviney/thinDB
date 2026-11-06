@@ -69,6 +69,36 @@ pub const Key = struct {
     predicate: u128 = 0,
 };
 
+/// An `.id_keys` entry's layout over `bytes`, `n` digests then `n` ids:
+/// the ids start on a multiple of 16 bytes, so they stay aligned.
+pub const IdKeys = struct {
+    digests: []const u128,
+    ids: []const u32,
+
+    pub fn bytesFor(n: usize) usize {
+        return n * (@sizeOf(u128) + @sizeOf(u32));
+    }
+
+    pub fn of(bytes: []align(16) const u8) IdKeys {
+        const n = bytes.len / (@sizeOf(u128) + @sizeOf(u32));
+        const split = n * @sizeOf(u128);
+        return .{
+            .digests = std.mem.bytesAsSlice(u128, bytes[0..split]),
+            .ids = @alignCast(std.mem.bytesAsSlice(u32, bytes[split..][0 .. n * @sizeOf(u32)])),
+        };
+    }
+
+    /// `of`, writable, for the one filling a new entry.
+    pub fn slotsOf(bytes: []align(16) u8) struct { digests: []u128, ids: []u32 } {
+        const n = bytes.len / (@sizeOf(u128) + @sizeOf(u32));
+        const split = n * @sizeOf(u128);
+        return .{
+            .digests = std.mem.bytesAsSlice(u128, bytes[0..split]),
+            .ids = @alignCast(std.mem.bytesAsSlice(u32, bytes[split..][0 .. n * @sizeOf(u32)])),
+        };
+    }
+};
+
 /// What an entry holds: a column block; a condition-cache entry (§6.4)
 /// for one row group and one predicate, either the record of the stored rows
 /// it matched (`exec/condition_cache.zig`) or only how many it matched; the
@@ -79,8 +109,10 @@ pub const Key = struct {
 /// segment-dictionary column block rebuilt without its codes or without its
 /// values' bytes (`segment_strings.Form`), which a whole `.column` entry
 /// serves in its place; such a block's values by segment id alone
-/// (`segment_strings.EntryCounts`), which either of those serves too; or a
-/// segment string table's table ids (§4.6), keyed by row group 0.
+/// (`segment_strings.EntryCounts`), which either of those serves too; a
+/// segment string table's table ids (§4.6), keyed by row group 0; or the
+/// table id of each entry of a column block's dictionary with the digest of
+/// its four bytes, which holds only for the process's digest key too.
 pub const Content = enum(u8) {
     column,
     matched_rows,
@@ -92,6 +124,7 @@ pub const Content = enum(u8) {
     dict_no_bytes,
     dict_counts,
     table_ids,
+    id_keys,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).
@@ -415,6 +448,12 @@ pub const Cache = struct {
         /// The digests a `.dict_digests` entry holds.
         pub fn digests(self: *const Entry) []const u128 {
             return std.mem.bytesAsSlice(u128, self.bytes);
+        }
+
+        /// What an `.id_keys` entry holds: each dictionary entry's digest,
+        /// then each one's table id.
+        pub fn idKeys(self: *const Entry) IdKeys {
+            return IdKeys.of(self.bytes);
         }
     };
 
