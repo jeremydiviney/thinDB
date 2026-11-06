@@ -167,10 +167,6 @@ test "a part table a heavy part grew shrinks back before a small part's fold" {
     try std.testing.expect(table == .wide);
 }
 
-/// Selective-query right-sizing: one grid worker per this many surviving
-/// (post-zone-map) row groups, so a filter that touches a handful of row
-/// groups doesn't pay full-DOP worker setup (scans, staging, bucket scratch).
-const RGS_PER_GRID_WORKER: usize = 1;
 const PREFETCH_DIST_BUCKET: usize = 32;
 /// Rows ahead the staging fetches an exact key's coded bytes (`ExactKey.prefetch`).
 const KEY_PREFETCH_ROWS: usize = 8;
@@ -11563,8 +11559,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     // Right-size the worker fleet to the work that survives zone-map pruning:
     // fuse the filter into the stats scan (the same hint set every worker scan
     // gets) and count the surviving row groups. A selective filter then spins
-    // ceil(surviving/RGS_PER_GRID_WORKER) workers instead of the full DOP; an
-    // unfusable or absent filter keeps full DOP. The same survival mask cuts
+    // a worker per surviving row group instead of the full DOP, so a handful
+    // of row groups doesn't pay full-DOP worker setup (scans, staging, bucket
+    // scratch); an unfusable or absent filter keeps full DOP. The same survival mask cuts
     // the scan tiles, so every sized worker finds surviving work to claim.
     const memtable_units = (@as(usize, @intCast(snap.memtable_snap.row_count)) + 65535) / 65536;
     var work_rgs: usize = total_rgs + memtable_units;
@@ -11579,8 +11576,7 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
     } else if (hinted) {
         if (stats_scan.survivingWorkUnits()) |surviving| work_rgs = surviving;
     }
-    const sized_workers = (work_rgs + RGS_PER_GRID_WORKER - 1) / RGS_PER_GRID_WORKER;
-    var grant = core_scheduler.reserveWorkers(@min(dop, @min(cpus.len, @max(sized_workers, 1))));
+    var grant = core_scheduler.reserveWorkers(@min(dop, @min(cpus.len, @max(work_rgs, 1))));
     defer grant.release();
     const n_workers = grant.count;
 
