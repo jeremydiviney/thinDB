@@ -264,9 +264,12 @@ pub const LateScan = struct {
     /// column, on up to `dop` threads: a cold fetch of a wide row otherwise
     /// reads and decompresses every column's block one after another on
     /// one thread. The gather then finds them cached. A column a scan cached
-    /// without its codes is left to the gather, which may take less of it.
+    /// without its codes is left to the gather, which may take less of it;
+    /// one read values apart has just its rows' values read
+    /// (`loadValuesApart`).
     fn prefill(self: *LateScan, locs: []const i64) !void {
-        const Group = struct { seg_idx: usize, rg_idx: usize, entry: *storage.cache.SegmentHandles.Entry };
+        // A row group's survivors are `locs[first..][0..rows]`.
+        const Group = struct { seg_idx: usize, rg_idx: usize, entry: *storage.cache.SegmentHandles.Entry, first: usize, rows: usize };
         var groups: std.ArrayListUnmanaged(Group) = .empty;
         defer {
             for (groups.items, 0..) |g, i| {
@@ -274,16 +277,19 @@ pub const LateScan = struct {
             }
             groups.deinit(self.allocator);
         }
-        for (locs) |packed_loc| switch (rowloc.unpack(packed_loc)) {
+        for (locs, 0..) |packed_loc, i| switch (rowloc.unpack(packed_loc)) {
             .memtable => {},
             .segment => |s| {
                 const last = if (groups.items.len > 0) groups.items[groups.items.len - 1] else null;
-                if (last) |g| if (g.seg_idx == s.seg_idx and g.rg_idx == s.rg_idx) continue;
+                if (last) |g| if (g.seg_idx == s.seg_idx and g.rg_idx == s.rg_idx) {
+                    groups.items[groups.items.len - 1].rows += 1;
+                    continue;
+                };
                 const entry = if (last != null and last.?.seg_idx == s.seg_idx)
                     last.?.entry
                 else
                     try self.table.acquireSegment(self.inner_scan.segs[s.seg_idx].segment_id);
-                groups.append(self.allocator, .{ .seg_idx = s.seg_idx, .rg_idx = s.rg_idx, .entry = entry }) catch |err| {
+                groups.append(self.allocator, .{ .seg_idx = s.seg_idx, .rg_idx = s.rg_idx, .entry = entry, .first = i, .rows = 1 }) catch |err| {
                     if (last == null or last.?.entry != entry) self.table.releaseSegment(entry);
                     return err;
                 };
@@ -298,6 +304,7 @@ pub const LateScan = struct {
         const Prefill = struct {
             late: *LateScan,
             groups: []const Group,
+            locs: []const i64,
             allocator: Allocator,
             failed: std.atomic.Value(bool) = .init(false),
             err: ?anyerror = null,
@@ -306,20 +313,20 @@ pub const LateScan = struct {
                 if (ctx.failed.load(.monotonic)) return;
                 const g = ctx.groups[j / ctx.late.out_phys.len];
                 const phys = ctx.late.out_phys[j % ctx.late.out_phys.len];
-                ctx.fill(&g.entry.seg, g.rg_idx, phys) catch |err| {
+                ctx.fill(&g.entry.seg, g.rg_idx, phys, ctx.locs[g.first..][0..g.rows]) catch |err| {
                     if (ctx.failed.swap(true, .acq_rel)) return;
                     ctx.err = err;
                 };
             }
 
-            fn fill(ctx: *@This(), seg: *storage.ReadSegment, rg_idx: usize, phys: usize) !void {
+            fn fill(ctx: *@This(), seg: *storage.ReadSegment, rg_idx: usize, phys: usize, locs_of_group: []const i64) !void {
                 const c = ctx.late.table.cacheRef();
                 if (seg.cachedStringBlock(rg_idx, phys, c, .no_codes)) |cached| {
                     var values = cached;
                     values.release(ctx.allocator, c);
                     return;
                 }
-                if (ctx.late.readsValuesApart(seg, rg_idx, phys)) return;
+                if (ctx.late.readsValuesApart(seg, rg_idx, phys)) return ctx.late.loadValuesApart(ctx.allocator, seg, rg_idx, phys, locs_of_group);
                 var bb = try seg.borrowColumnBlock(ctx.allocator, rg_idx, phys, c);
                 bb.release(ctx.allocator, c);
             }
@@ -327,6 +334,7 @@ pub const LateScan = struct {
         var ctx: Prefill = .{
             .late = self,
             .groups = groups.items,
+            .locs = locs,
             .allocator = try exec.memory.workerAllocator(exec.memory.accountantOf(self.allocator), std.heap.c_allocator),
         };
         parallel.forJobs(grant.count, jobs, &ctx, Prefill.job);
@@ -473,6 +481,22 @@ pub const LateScan = struct {
             else => return false,
         }
         return true;
+    }
+
+    /// Reads into the cache what `appendValuesApart` reads for the
+    /// survivors `locs` of row group `rg_idx`: their shared values' pages
+    /// and the row group's own values.
+    fn loadValuesApart(self: *LateScan, allocator: Allocator, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, locs: []const i64) !void {
+        const c = self.table.cacheRef();
+        var codes = seg.cachedStringBlock(rg_idx, phys, c, .no_bytes) orelse return;
+        defer codes.release(allocator, c);
+        const db = storage.segment_reader.dictBlockOf(codes.bytes, seg.info.row_groups[rg_idx].row_count);
+        if (!db.hasSegmentIds()) return;
+        var values = seg.entryValues(allocator, rg_idx, phys, c) orelse return;
+        defer values.release();
+        for (locs) |loc| try values.want(db.segmentId(db.rowCode(@intCast(rowloc.unpack(loc).segment.offset))));
+        try values.loadWanted();
+        for (locs) |loc| _ = try values.value(db.segmentId(db.rowCode(@intCast(rowloc.unpack(loc).segment.offset))));
     }
 
     fn appendMemtableRow(self: *LateScan, row: usize) !void {

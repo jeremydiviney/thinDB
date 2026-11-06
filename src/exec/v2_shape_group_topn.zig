@@ -1535,9 +1535,12 @@ const EMIT_ROWS_PER_WORKER: usize = 65536;
 const MAX_EMIT_WORKERS: usize = 64;
 
 fn emitWorkerCount(op: *GroupTopNPipeline, rows: usize) usize {
-    const dop: usize = if (op.request.dop == 0) DEFAULT_DOP else op.request.dop;
     const by_rows: usize = rows / EMIT_ROWS_PER_WORKER;
-    return @max(@as(usize, 1), @min(@min(dop, by_rows), MAX_EMIT_WORKERS));
+    return @max(@as(usize, 1), @min(@min(requestDop(op), by_rows), MAX_EMIT_WORKERS));
+}
+
+fn requestDop(op: *const GroupTopNPipeline) usize {
+    return if (op.request.dop == 0) DEFAULT_DOP else op.request.dop;
 }
 
 fn emitPackedRange(allocator: Allocator, op: *GroupTopNPipeline, rows: []const SiloCore.TopRow, cols: []ColumnStore) !void {
@@ -1800,6 +1803,9 @@ fn emitResultStageHashed(op: *GroupTopNPipeline, snapshot: Scan.Snapshot, rows: 
     if (workers <= 1) {
         var part = try MatPartition.create(allocator, op.table, snapshot, op.request.udf_registry, names, derived, locs);
         defer part.deinit();
+        // The lone partition runs on this thread, so its fetch may read the
+        // rows' row groups side by side (`LateScan.prefill`).
+        part.late.dop = requestDop(op);
         try part.materialize();
         const mat_ms = exec.prof.ticksToMs(exec.prof.nowTicks() - t_mat);
         const t_emit = exec.prof.nowTicks();
