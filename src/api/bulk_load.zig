@@ -448,6 +448,13 @@ const Segment = struct {
         defer self.sketch_mutex.unlock();
         for (self.sketches[first_column * hll.m ..][0..sketches.len], sketches) |*a, b| a.* = @max(a.*, b);
     }
+
+    /// Column `ci`'s distinct values by its sketch, padded past the sketch's
+    /// few percent of error; whole once every batch of the column decodes.
+    fn distinctEstimate(self: *const Segment, ci: usize) u32 {
+        const estimate = hll.Hll.fromBytes(self.sketches[ci * hll.m ..][0..hll.m]).estimate();
+        return std.math.cast(u32, estimate + estimate / 16) orelse std.math.maxInt(u32);
+    }
 };
 
 /// A row of the merged output: batch `batch`'s row `row`.
@@ -787,6 +794,10 @@ const Load = struct {
     changed: Io.Condition = .init,
     next_unit: usize = 0,
     decoding: usize = 0,
+    /// Workers waiting for a task, and the threads of theirs a table's id
+    /// resolve has borrowed.
+    idle: usize = 0,
+    lent: usize = 0,
     /// The lowest segment still holding decoded batches.
     low: usize = 0,
     finished: usize = 0,
@@ -833,6 +844,8 @@ const Load = struct {
             if (task) |tk| {
                 self.perform(&w, tk) catch |e| return self.fail(e);
             } else {
+                self.idle += 1;
+                defer self.idle -= 1;
                 self.changed.waitUncancelable(io, &self.mutex);
             }
         }
@@ -1035,6 +1048,7 @@ const Load = struct {
             const r = write.commit_next[ci];
             const g = &write.groups[r];
             if (!g.claimed() or !g.ready[ci]) return;
+            if (r == 0) try self.unlocked(storage.MergedSegmentWriter.reserveColumnStrings, .{ &write.writer, ci, self.segments[write.segment].distinctEstimate(ci) });
             try self.unlocked(commitHeld, .{ write, w, ci, r, g });
             write.commit_next[ci] = r + 1;
             try self.blockDone(write, r, ci);
@@ -1117,7 +1131,14 @@ const Load = struct {
 
     fn tableBegin(self: *Load, s: usize, ci: usize) !void {
         const write = self.segments[s].write.?;
-        const build = try self.unlocked(storage.MergedSegmentWriter.beginStringTable, .{ &write.writer, ci });
+        // A table's id resolve is its one step that doesn't split into tasks,
+        // so it runs on the cores of the workers left without one, as at the
+        // load's end, where it would otherwise run alone.
+        const borrowed = self.idle -| self.lent;
+        self.lent += borrowed;
+        defer self.lent -= borrowed;
+        const threads = @max(self.t.compact_threads, 1 + borrowed);
+        const build = try self.unlocked(storage.MergedSegmentWriter.beginStringTableOn, .{ &write.writer, ci, threads });
         const step = &write.tables[ci];
         if (build) |b| {
             step.build = b;

@@ -634,6 +634,9 @@ pub const ColumnList = struct {
             try file.writePositionalAll(io, page, offset);
             offset += page.len;
         }
+        // The list is fsynced only at the next persist, the end of a bulk
+        // load, which would otherwise wait on the whole load's pages.
+        @import("storage.zig").startWriteback(file, self.list_len, offset - self.list_len);
         offset = self.list_len;
         for (cuts.items, out) |c, page| {
             self.pages.appendAssumeCapacity(.{ .first_id = self.sealed + c.lo, .count = c.hi - c.lo, .offset = offset, .stored_len = @intCast(page.len - page_header_size) });
@@ -865,7 +868,9 @@ fn encodePage(allocator: Allocator, packing: Packing, first_id: u32, count: u32,
         .table => |t| switch (t.codec) {
             .none => {},
             .zstd => {
-                compressed = try t.compressor.compress(allocator, raw, compression.block_level);
+                // No query reads a list, so its level trades only the load's
+                // CPU for bytes on disk, not the cold reads blocks pay for.
+                compressed = try t.compressor.compress(allocator, raw, compression.default_level);
                 codec = .zstd;
             },
             .lz4 => {
