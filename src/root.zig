@@ -135,6 +135,7 @@ test {
     _ = @import("util/xxh3.zig");
     _ = @import("util/stats.zig");
     _ = @import("util/like.zig");
+    _ = @import("util/ngram.zig");
     _ = @import("util/affinity.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/core_scheduler.zig");

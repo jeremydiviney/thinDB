@@ -128,6 +128,8 @@ pub const Content = enum(u8) {
     /// A string block's row-group-own values alone, its index and bytes
     /// parts (`ReadSegment.EntryValues`).
     local_strings,
+    /// A segment string table's n-gram index (§4.7), keyed by row group 0.
+    ngram_index,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).

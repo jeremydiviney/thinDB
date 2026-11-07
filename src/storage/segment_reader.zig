@@ -39,6 +39,7 @@ const compression_mod = @import("compression.zig");
 const int_streams = @import("int_streams.zig");
 const fsst = @import("fsst.zig");
 const segment_strings = @import("segment_strings.zig");
+const ngram_index = @import("ngram_index.zig");
 const storage_cache = @import("cache.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const parallel = @import("../util/parallel.zig");
@@ -450,6 +451,57 @@ pub const ReadSegment = struct {
         for (chunks.items) |c| {
             if (!c.done) try decompressBlockInto(scratch, c.frame, c.out);
         }
+        return payload;
+    }
+
+    /// Column `column_idx`'s n-gram index (DESIGN.md §4.7) through the
+    /// cache, held until `NgramIndex.release`; null when the segment keeps
+    /// none for the column.
+    pub fn cachedNgramIndex(self: ReadSegment, column_idx: usize, c: storage_cache.TableCache) !?NgramIndex {
+        const table = self.info.stringTable(column_idx) orelse return null;
+        const range = table.ngram_index;
+        if (range.length == 0) return null;
+        const key: storage_cache.Key = .{
+            .table_uid = c.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = 0,
+            .column_idx = @intCast(column_idx),
+            .content = .ngram_index,
+        };
+        const entry = switch (try c.cache.claimAfterFill(self.io, key)) {
+            .hit => |entry| entry,
+            .fill => |fill| fill: {
+                defer c.cache.endFill(self.io, fill);
+                const payload = try self.readBlock(c.cache.blockAllocator(), self.allocator, range);
+                errdefer c.cache.blockAllocator().free(payload);
+                break :fill try c.cache.insertPinned(key, payload, .raw);
+            },
+        };
+        errdefer c.cache.release(entry);
+        return .{ .index = try ngram_index.Index.of(entry.bytes), .entry = entry, .cache = c.cache };
+    }
+
+    /// A segment string table's n-gram index, pinned in the cache.
+    pub const NgramIndex = struct {
+        index: ngram_index.Index,
+        entry: *storage_cache.Cache.Entry,
+        cache: *storage_cache.Cache,
+
+        pub fn release(self: NgramIndex) void {
+            self.cache.release(self.entry);
+        }
+    };
+
+    /// The decompressed payload of the one column block at `range`, from
+    /// `out_allocator`; `scratch` holds the stored block.
+    fn readBlock(self: ReadSegment, out_allocator: Allocator, scratch: Allocator, range: format.FileRange) ![]align(16) u8 {
+        const frame = try scratch.alloc(u8, range.length);
+        defer scratch.free(frame);
+        if (try self.file.readPositionalAll(self.io, frame, range.offset) != frame.len) return format.Error.UnexpectedEof;
+        try checkFrame(frame);
+        const payload = try out_allocator.alignedAlloc(u8, .@"16", format.readU32(frame[4..8]));
+        errdefer out_allocator.free(payload);
+        try decompressBlockInto(scratch, frame, payload);
         return payload;
     }
 
@@ -1514,7 +1566,7 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
             return format.Error.CorruptFooter;
         }
         const parts_len = std.enums.values(format.StringBlockPart).len * 4;
-        if (bytes.len < off + @as(usize, page_count) * 16 + row_groups.len * parts_len + 12) return format.Error.CorruptFooter;
+        if (bytes.len < off + @as(usize, page_count) * 16 + row_groups.len * parts_len + 24) return format.Error.CorruptFooter;
         const pages = try allocator.alloc(format.SharedPage, page_count);
         errdefer allocator.free(pages);
         for (pages) |*p| {
@@ -1536,8 +1588,18 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
             if (b.isSplit() and b.total() != rg.col_lengths[column_idx]) return format.Error.CorruptFooter;
         }
         const table_ids: format.TableIdsBlock = .{ .offset = format.readU64(bytes[off..][0..8]), .length = format.readU32(bytes[off + 8 ..][0..4]) };
-        off += 12;
-        t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages, .blocks = blocks, .table_ids = table_ids };
+        const ngram_range: format.FileRange = .{ .offset = format.readU64(bytes[off + 12 ..][0..8]), .length = format.readU32(bytes[off + 20 ..][0..4]) };
+        off += 24;
+        t.* = .{
+            .column_idx = column_idx,
+            .shared_count = shared_count,
+            .value_count = value_count,
+            .value_bytes = value_bytes,
+            .pages = pages,
+            .blocks = blocks,
+            .table_ids = table_ids,
+            .ngram_index = ngram_range,
+        };
         inited += 1;
     }
     if (off != bytes.len) return format.Error.CorruptFooter;
