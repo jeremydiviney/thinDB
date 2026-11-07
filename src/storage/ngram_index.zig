@@ -52,18 +52,18 @@ pub fn qualifies(cs: *const segment_strings.ColumnStrings) bool {
     return dictionary_bytes >= min_row_group_bytes * blocks.len;
 }
 
-/// One column's index under construction: each block's grams gather apart,
-/// in parallel, then `assemble` lays out the payload.
+/// The index of column `strings` under construction: each block's grams
+/// gather apart, in parallel, then `assemble` lays out the payload. Every
+/// call takes the same `strings`.
 pub const Build = struct {
     allocator: Allocator,
-    strings: *const segment_strings.ColumnStrings,
     /// Each block's distinct grams, by `strings.blocks` index.
     grams: []std.ArrayList(Gram),
 
     pub fn init(allocator: Allocator, strings: *const segment_strings.ColumnStrings) !Build {
         const grams = try allocator.alloc(std.ArrayList(Gram), strings.blocks.items.len);
         @memset(grams, .empty);
-        return .{ .allocator = allocator, .strings = strings, .grams = grams };
+        return .{ .allocator = allocator, .grams = grams };
     }
 
     pub fn deinit(self: *Build) void {
@@ -73,12 +73,12 @@ pub const Build = struct {
     }
 
     /// Gathers blocks `lo..hi`'s grams, apart from other ranges.
-    pub fn gather(self: *Build, lo: usize, hi: usize) !void {
+    pub fn gather(self: *Build, strings: *const segment_strings.ColumnStrings, lo: usize, hi: usize) !void {
         var seen = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, ngram.gram_space);
         defer seen.deinit(self.allocator);
-        for (self.strings.blocks.items[lo..hi], self.grams[lo..hi]) |b, *out| {
+        for (strings.blocks.items[lo..hi], self.grams[lo..hi]) |b, *out| {
             for (b.values) |v| {
-                const bytes = self.strings.value(v);
+                const bytes = strings.value(v);
                 if (bytes.len < 3) continue;
                 for (0..bytes.len - 2) |i| {
                     const g = ngram.gramAt(bytes, i);
@@ -93,9 +93,9 @@ pub const Build = struct {
 
     /// The payload, once every block has gathered, onto `out`, and its two
     /// integer arrays; null when it would hold no gram or pass `max_pairs`.
-    pub fn assemble(self: *Build, out: *std.ArrayList(u8)) !?[2]int_streams.Stream {
+    pub fn assemble(self: *Build, strings: *const segment_strings.ColumnStrings, out: *std.ArrayList(u8)) !?[2]int_streams.Stream {
         const allocator = self.allocator;
-        const blocks = self.strings.blocks.items;
+        const blocks = strings.blocks.items;
         const row_group_count = blocks[blocks.len - 1].rg_idx + 1;
         var pairs: usize = 0;
         for (self.grams) |g| pairs += g.items.len;
@@ -336,11 +336,11 @@ test "ngram index: postings as every row group, gaps and bitmaps read back" {
 
     var build = try Build.init(allocator, &cs);
     defer build.deinit();
-    try build.gather(0, 7);
-    try build.gather(7, row_group_count);
+    try build.gather(&cs, 0, 7);
+    try build.gather(&cs, 7, row_group_count);
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
-    _ = (try build.assemble(&payload)).?;
+    _ = (try build.assemble(&cs, &payload)).?;
 
     const index = try Index.of(payload.items);
     try std.testing.expectEqual(@as(u32, row_group_count), index.row_group_count);

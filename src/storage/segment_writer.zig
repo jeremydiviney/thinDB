@@ -611,11 +611,24 @@ fn encodeNgramIndex(
     if (!ngram_index.qualifies(cs)) return false;
     var build = try ngram_index.Build.init(allocator, cs);
     defer build.deinit();
-    var job: NgramGatherJob = .{ .build = &build, .ranges = @min(@max(1, threads) * 4, cs.blocks.items.len) };
+    var job: NgramGatherJob = .{ .build = &build, .strings = cs, .ranges = @min(@max(1, threads) * 4, cs.blocks.items.len) };
     try encodeParallel(allocator, threads, job.ranges, &job);
+    return appendNgramIndex(allocator, compressor, cs, &build, table_compression, out);
+}
+
+/// Appends the n-gram index `build` gathered of column `cs` onto `out`;
+/// false, adding nothing, when it holds nothing.
+fn appendNgramIndex(
+    allocator: Allocator,
+    compressor: *compression_mod.Compressor,
+    cs: *const segment_strings.ColumnStrings,
+    build: *ngram_index.Build,
+    table_compression: types.TableCompression,
+    out: *std.ArrayList(u8),
+) !bool {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(allocator);
-    const streams = (try build.assemble(&payload)) orelse return false;
+    const streams = (try build.assemble(cs, &payload)) orelse return false;
     try appendBlock(allocator, compressor, out, payload.items, &streams, @backingInt(format.Encoding.raw), false, table_compression);
     return true;
 }
@@ -623,11 +636,12 @@ fn encodeNgramIndex(
 /// Gathers an n-gram index's grams, one range of its blocks per call.
 const NgramGatherJob = struct {
     build: *ngram_index.Build,
+    strings: *const segment_strings.ColumnStrings,
     ranges: usize,
 
     fn encode(self: *NgramGatherJob, _: *compression_mod.Compressor, i: usize) !void {
         const n = self.build.grams.len;
-        try self.build.gather(n * i / self.ranges, n * (i + 1) / self.ranges);
+        try self.build.gather(self.strings, n * i / self.ranges, n * (i + 1) / self.ranges);
     }
 };
 
@@ -642,9 +656,13 @@ pub const StringTableBuild = struct {
     page_count: usize,
     /// The table id of each segment id; null when the table carries none.
     table_ids: ?[]u32,
-    /// Whether the last piece is the table's n-gram index, which stays
-    /// empty when the index comes to hold nothing.
-    ngram: bool,
+    /// The table's n-gram index under construction, when it qualifies for
+    /// one: each row-group block's piece gathers that block's grams, and
+    /// whichever of those pieces and the last finishes last lays the index
+    /// out as the last piece, which stays empty when it holds nothing.
+    ngram: ?ngram_index.Build,
+    /// Pieces yet to finish their part of the n-gram index.
+    ngram_pending: std.atomic.Value(usize) = .init(0),
     /// Each piece's encoded bytes, pages first.
     pieces: []std.ArrayList(u8),
     /// Each piece's part lengths; a page's are its index and bytes.
@@ -655,8 +673,16 @@ pub const StringTableBuild = struct {
         allocator.free(self.pieces);
         allocator.free(self.parts);
         if (self.table_ids) |ids| allocator.free(ids);
+        if (self.ngram) |*g| g.deinit();
         self.strings.deinit();
         self.* = undefined;
+    }
+
+    /// Counts one piece's part of the n-gram index done, laying the index
+    /// out once every part is.
+    fn ngramPartDone(self: *StringTableBuild, allocator: Allocator, compressor: *compression_mod.Compressor, table_compression: types.TableCompression) !void {
+        if (self.ngram_pending.fetchSub(1, .acq_rel) != 1) return;
+        _ = try appendNgramIndex(allocator, compressor, &self.strings, &self.ngram.?, table_compression, &self.pieces[self.pieces.len - 1]);
     }
 
     fn blockCount(self: *const StringTableBuild) usize {
@@ -959,21 +985,31 @@ pub const MergedSegmentWriter = struct {
         const table_ids = if (self.table_ids) |target| try resolveTableIds(self.allocator, target, &cs, ci) else null;
         errdefer if (table_ids) |ids| self.allocator.free(ids);
         const page_count = segment_strings.pageCount(cs.sharedCount());
-        const ngram = ngram_index.qualifies(&cs);
-        const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len + @intFromBool(table_ids != null) + @intFromBool(ngram));
+        var ngram = if (ngram_index.qualifies(&cs)) try ngram_index.Build.init(self.allocator, &cs) else null;
+        errdefer if (ngram) |*g| g.deinit();
+        const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len + @intFromBool(table_ids != null) + @intFromBool(ngram != null));
         errdefer self.allocator.free(pieces);
         @memset(pieces, .empty);
         const parts = try self.allocator.alloc(format.StringBlockParts, pieces.len);
         @memset(parts, .{});
-        return .{ .strings = cs, .column_idx = @intCast(ci), .page_count = page_count, .table_ids = table_ids, .ngram = ngram, .pieces = pieces, .parts = parts };
+        return .{
+            .strings = cs,
+            .column_idx = @intCast(ci),
+            .page_count = page_count,
+            .table_ids = table_ids,
+            .ngram = ngram,
+            .ngram_pending = .init(if (ngram != null) cs.blocks.items.len + 1 else 0),
+            .pieces = pieces,
+            .parts = parts,
+        };
     }
 
     /// Encodes piece `i` of `build` into its own buffer, apart from the
     /// writer's other work and the build's other pieces.
     pub fn encodeStringTablePiece(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, build: *StringTableBuild, i: usize) !void {
         const cs = &build.strings;
-        if (build.ngram and i == build.pieces.len - 1) {
-            _ = try encodeNgramIndex(self.allocator, compressor, cs, 1, self.schema.compression, &build.pieces[i]);
+        if (build.ngram != null and i == build.pieces.len - 1) {
+            try build.ngramPartDone(self.allocator, compressor, self.schema.compression);
             return;
         }
         if (i == build.page_count + build.blockCount()) {
@@ -981,7 +1017,12 @@ pub const MergedSegmentWriter = struct {
             return;
         }
         if (i >= build.page_count) {
-            build.parts[i] = try encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[i - build.page_count], self.schema.compression, &build.pieces[i]);
+            const b = i - build.page_count;
+            build.parts[i] = try encodeStringBlock(self.allocator, compressor, cs, cs.blocks.items[b], self.schema.compression, &build.pieces[i]);
+            if (build.ngram) |*g| {
+                try g.gather(cs, b, b + 1);
+                try build.ngramPartDone(self.allocator, compressor, self.schema.compression);
+            }
             return;
         }
         var index: std.ArrayList(u8) = .empty;
@@ -1025,7 +1066,7 @@ pub const MergedSegmentWriter = struct {
             try self.out.append(self.allocator, piece);
         }
         var ngram_range: format.FileRange = .{ .offset = 0, .length = 0 };
-        if (build.ngram) {
+        if (build.ngram != null) {
             const piece = build.pieces[build.pieces.len - 1].items;
             ngram_range = .{ .offset = self.out.offset(), .length = @intCast(piece.len) };
             try self.out.append(self.allocator, piece);

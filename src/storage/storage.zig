@@ -1566,6 +1566,82 @@ test "MergedSegmentWriter: the step API writes the bytes writeRowGroup writes" {
     try std.testing.expectEqualSlices(u8, rows_bytes, steps_bytes);
 }
 
+test "MergedSegmentWriter: pieces in any order lay out the n-gram index writeRowGroup does" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 32 values of 2,500 bytes give each row group 80 KB of dictionary, so
+    // the column takes an index.
+    const rows = 32;
+    const value_len = 2500;
+    const schema = TableSchema{
+        .columns = &.{ .{ .name = "id", .type = .int }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"id"},
+        .unique = false,
+    };
+    const text = try allocator.alloc(u8, 3 * rows * value_len);
+    defer allocator.free(text);
+    var prng = std.Random.DefaultPrng.init(7);
+    for (text) |*c| c.* = 'a' + prng.random().uintLessThan(u8, 26);
+    var offsets: [rows + 1]u32 = undefined;
+    for (&offsets, 0..) |*o, i| o.* = @intCast(i * value_len);
+
+    var compressor = try compression.Compressor.init();
+    defer compressor.deinit();
+    const file_names = [_][]const u8{ "rows.dat", "steps.dat" };
+    for (file_names, [_]bool{ false, true }) |file_name, steps| {
+        var w = try MergedSegmentWriter.begin(allocator, io, tmp.dir, file_name, schema, 2, 0, rows, &.{}, 2);
+        var finished = false;
+        defer if (!finished) w.deinit();
+        for (0..3) |g| {
+            var ids: [rows]i32 = undefined;
+            for (&ids, 0..) |*v, i| v.* = @intCast(g * rows + i);
+            const views = [_]ColumnView{
+                .{ .data = .{ .int = &ids } },
+                .{ .data = .{ .string = .{ .offsets = &offsets, .bytes = text[g * rows * value_len ..][0 .. rows * value_len] } } },
+            };
+            if (!steps) {
+                try w.writeRowGroup(&views);
+                continue;
+            }
+            var blocks: [views.len]segment_writer.ColumnBlock = @splat(.{});
+            defer for (&blocks) |*b| b.deinit(allocator);
+            for (views, &blocks, 0..) |view, *block, ci| {
+                try w.encodeColumn(&compressor, ci, view, block);
+                try w.commitColumn(&compressor, ci, @intCast(g), view, block);
+            }
+            try w.appendRowGroup(&blocks, ids.len);
+        }
+        if (steps) {
+            var build = (try w.beginStringTable(1)).?;
+            var i = build.pieces.len;
+            while (i > 0) {
+                i -= 1;
+                w.encodeStringTablePiece(&compressor, &build, i) catch |e| {
+                    build.deinit(allocator);
+                    return e;
+                };
+            }
+            try w.appendStringTable(&build);
+        }
+        var info = try w.finish(false);
+        finished = true;
+        info.deinit(allocator);
+    }
+
+    const rows_bytes = try tmp.dir.readFileAlloc(io, "rows.dat", allocator, .unlimited);
+    defer allocator.free(rows_bytes);
+    const steps_bytes = try tmp.dir.readFileAlloc(io, "steps.dat", allocator, .unlimited);
+    defer allocator.free(steps_bytes);
+    try std.testing.expectEqualSlices(u8, rows_bytes, steps_bytes);
+
+    var seg = try readSegment(allocator, io, tmp.dir, "steps.dat", schema);
+    defer seg.deinit();
+    try std.testing.expect(seg.info.stringTable(1).?.ngram_index.length > 0);
+}
+
 test "MergedSegmentWriter: a segment written column by column reads back its rows" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
