@@ -5,7 +5,6 @@
 //! (call `.deinit(allocator)`).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -74,16 +73,11 @@ const SegmentFile = struct {
     }
 
     /// Counts `n` bytes written, starting the writeback of each
-    /// `writeback_step` that lands. A segment is fsynced at close, and the
-    /// kernel would otherwise keep its pages dirty until then, so the fsync
-    /// would write the whole file while the writer waits; started as the
-    /// file grows, the writeback leaves the fsync only the tail.
+    /// `writeback_step` that lands, since a segment is fsynced at close.
     fn wrote(self: *SegmentFile, n: usize) void {
         self.written += n;
-        if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8 or !@hasField(std.os.linux.SYS, "sync_file_range")) return;
         if (self.written - self.written_back < writeback_step) return;
-        const sync_file_range_write = 2;
-        _ = std.os.linux.syscall4(.sync_file_range, @intCast(self.file.handle), self.written_back, self.written - self.written_back, sync_file_range_write);
+        @import("storage.zig").startWriteback(self.file, self.written_back, self.written - self.written_back);
         self.written_back = self.written;
     }
 
@@ -469,7 +463,7 @@ fn writeStringTables(
         }
 
         var ids_block: format.TableIdsBlock = .{};
-        if (table_ids) |target| if (try resolveTableIds(allocator, target, cs, ci)) |ids| {
+        if (table_ids) |target| if (try resolveTableIds(allocator, target, target.threads, cs, ci)) |ids| {
             defer allocator.free(ids);
             page_block.clearRetainingCapacity();
             try encodeTableIds(allocator, &compressor, ids, table_compression, &page_block);
@@ -554,14 +548,14 @@ const SegmentValues = struct {
 
 /// The table id of each of `cs`'s segment ids, after `assignIds`; null
 /// when column `ci` takes none. Caller owns the result.
-fn resolveTableIds(allocator: Allocator, target: table_strings.Target, cs: *const segment_strings.ColumnStrings, ci: usize) !?[]u32 {
+fn resolveTableIds(allocator: Allocator, target: table_strings.Target, threads: usize, cs: *const segment_strings.ColumnStrings, ci: usize) !?[]u32 {
     const by_id = try allocator.alloc(u32, cs.valueCount());
     defer allocator.free(by_id);
     for (cs.ids, 0..) |id, v| by_id[id] = @intCast(v);
     const ids = try allocator.alloc(u32, by_id.len);
     errdefer allocator.free(ids);
     const values: SegmentValues = .{ .strings = cs, .by_id = by_id };
-    if (!try target.strings.resolve(target.io, target.table_dir, target.threads, ci, values, ids)) {
+    if (!try target.strings.resolve(target.io, target.table_dir, threads, ci, values, ids)) {
         allocator.free(ids);
         return null;
     }
@@ -839,6 +833,12 @@ pub const MergedSegmentWriter = struct {
         try commitBlock(self.allocator, compressor, self.schema, ci, cs, view, 0, view.rowCount(), rg_idx, 1, block);
     }
 
+    /// Sizes column `ci`'s string table for `values` distinct values, before
+    /// its first `commitColumn`.
+    pub fn reserveColumnStrings(self: *MergedSegmentWriter, ci: usize, values: u32) !void {
+        if (self.strings.columns[ci]) |*c| try c.reserve(values);
+    }
+
     /// Appends the next row group of `rows` rows from its column blocks,
     /// each encoded and committed.
     pub fn appendRowGroup(self: *MergedSegmentWriter, blocks: []const ColumnBlock, rows: usize) !void {
@@ -899,6 +899,12 @@ pub const MergedSegmentWriter = struct {
     /// committed, taking over the column's builder; null when the column has
     /// none. Its pieces then encode in parallel with `encodeStringTablePiece`.
     pub fn beginStringTable(self: *MergedSegmentWriter, ci: usize) !?StringTableBuild {
+        return self.beginStringTableOn(ci, if (self.table_ids) |target| target.threads else 1);
+    }
+
+    /// `beginStringTable`, resolving the table ids on `threads` threads in
+    /// place of the target's own.
+    pub fn beginStringTableOn(self: *MergedSegmentWriter, ci: usize, threads: usize) !?StringTableBuild {
         const slot = &self.strings.columns[ci];
         var cs = slot.* orelse return null;
         slot.* = null;
@@ -908,7 +914,7 @@ pub const MergedSegmentWriter = struct {
             return null;
         }
         try cs.assignIds();
-        const table_ids = if (self.table_ids) |target| try resolveTableIds(self.allocator, target, &cs, ci) else null;
+        const table_ids = if (self.table_ids) |target| try resolveTableIds(self.allocator, target, threads, &cs, ci) else null;
         errdefer if (table_ids) |ids| self.allocator.free(ids);
         const page_count = segment_strings.pageCount(cs.sharedCount());
         const pieces = try self.allocator.alloc(std.ArrayList(u8), page_count + cs.blocks.items.len + @intFromBool(table_ids != null));
@@ -1544,13 +1550,7 @@ fn tryEncodeDict(
     const order = try allocator.alloc(u32, k);
     defer allocator.free(order);
     for (order, 0..) |*o, idx| o.* = @intCast(idx);
-    const SortCtx = struct {
-        items: []const []const u8,
-        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
-            return std.mem.lessThan(u8, ctx.items[a], ctx.items[b]);
-        }
-    };
-    std.sort.pdq(u32, order, SortCtx{ .items = distinct.items }, SortCtx.lessThan);
+    try segment_strings.sortByBytes(allocator, order, segment_strings.SliceValues{ .items = distinct.items });
     const ins_to_sorted = try allocator.alloc(u32, k);
     defer allocator.free(ins_to_sorted);
     for (order, 0..) |ins_idx, p| ins_to_sorted[ins_idx] = @intCast(p);

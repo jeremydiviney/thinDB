@@ -61,6 +61,17 @@ pub fn writeFileSynced(
     if (sync_after_write) try file.sync(io);
 }
 
+/// Starts writing `file`'s bytes `offset..offset + len` back to the disk
+/// without waiting for them. The kernel would otherwise keep them dirty until
+/// the file's fsync, which would then write them all while its caller waits;
+/// started as the file grows, the writeback leaves the fsync only the tail.
+/// Linux only; elsewhere a no-op.
+pub fn startWriteback(file: Io.File, offset: u64, len: u64) void {
+    if (comptime @import("builtin").os.tag != .linux or @sizeOf(usize) != 8 or !@hasField(std.os.linux.SYS, "sync_file_range")) return;
+    const sync_file_range_write = 2;
+    _ = std.os.linux.syscall4(.sync_file_range, @intCast(file.handle), offset, len, sync_file_range_write);
+}
+
 /// POSIX file sync does not persist the directory entry selecting that file.
 /// Windows does not support fsync on a directory handle.
 pub fn syncDirectory(io: Io, dir: Io.Dir) !void {

@@ -94,12 +94,60 @@ pub fn pageCount(shared_count: u32) u32 {
     return @intCast((@as(u64, shared_count) + page_values - 1) / page_values);
 }
 
-const SortCtx = struct {
+/// Sorts `order`, indices of `values` (anything with `value(u32)` returning
+/// bytes), by their bytes as `std.mem.lessThan` orders them. It sorts on
+/// eight bytes at a time and only ties go on to the next eight, so a
+/// comparison reads a key rather than two values scattered in memory, past
+/// prefixes many values share (`http://www.`).
+pub fn sortByBytes(allocator: Allocator, order: []u32, values: anytype) !void {
+    const keyed = try allocator.alloc(KeyedValue, order.len);
+    defer allocator.free(keyed);
+    sortKeyedFrom(keyed, order, values, 0);
+}
+
+/// The values `[]const []const u8` holds, for `sortByBytes`.
+pub const SliceValues = struct {
     items: []const []const u8,
-    fn lessThan(ctx: SortCtx, a: u32, b: u32) bool {
-        return std.mem.lessThan(u8, ctx.items[a], ctx.items[b]);
+
+    pub fn value(self: SliceValues, i: u32) []const u8 {
+        return self.items[i];
     }
 };
+
+const KeyedValue = struct {
+    /// The value's eight bytes from the sort's depth, big-endian, zero-padded.
+    key: u64,
+    /// The value's bytes from the depth, 9 standing for more than eight: a
+    /// value that ends sorts before a longer one its zero padding ties.
+    rest: u8,
+    index: u32,
+
+    fn lessThan(_: void, a: KeyedValue, b: KeyedValue) bool {
+        if (a.key != b.key) return a.key < b.key;
+        return a.rest < b.rest;
+    }
+};
+
+fn sortKeyedFrom(keyed: []KeyedValue, order: []u32, values: anytype, depth: usize) void {
+    if (order.len < 2) return;
+    for (order, keyed) |i, *k| {
+        const bytes = values.value(i);
+        const tail = bytes[@min(depth, bytes.len)..];
+        var chunk: [8]u8 = @splat(0);
+        const n = @min(tail.len, chunk.len);
+        @memcpy(chunk[0..n], tail[0..n]);
+        k.* = .{ .key = std.mem.readInt(u64, &chunk, .big), .rest = @intCast(@min(tail.len, 9)), .index = i };
+    }
+    std.sort.pdq(KeyedValue, keyed, {}, KeyedValue.lessThan);
+    for (keyed, order) |k, *o| o.* = k.index;
+    var lo: usize = 0;
+    while (lo < keyed.len) {
+        var hi = lo + 1;
+        while (hi < keyed.len and keyed[hi].key == keyed[lo].key and keyed[hi].rest == keyed[lo].rest) hi += 1;
+        if (hi - lo > 1 and keyed[lo].rest > 8) sortKeyedFrom(keyed[lo..hi], order[lo..hi], values, depth + 8);
+        lo = hi;
+    }
+}
 
 /// A column's distinct values, their bytes packed into chunks: a segment holds
 /// every distinct value until its end, and a growing arena's newest block can
@@ -161,13 +209,6 @@ const ValueStore = struct {
         @memcpy(self.chunks.items[open][self.open_used..][0..bytes.len], bytes);
         self.refs.appendAssumeCapacity(.{ .chunk = open, .offset = @intCast(self.open_used), .len = @intCast(bytes.len) });
         self.open_used += bytes.len;
-    }
-};
-
-const StoreSortCtx = struct {
-    store: *const ValueStore,
-    fn lessThan(ctx: StoreSortCtx, a: u32, b: u32) bool {
-        return std.mem.lessThan(u8, ctx.store.value(a), ctx.store.value(b));
     }
 };
 
@@ -263,6 +304,17 @@ pub const ColumnStrings = struct {
         self.allocator.free(self.ids);
         self.allocator.free(self.shared);
         self.* = undefined;
+    }
+
+    /// Sizes the column for `values` distinct values ahead of its row groups,
+    /// so the index doesn't grow on the way, and each growth rehash every
+    /// value's bytes.
+    pub fn reserve(self: *ColumnStrings, values: u32) !void {
+        if (self.full) return;
+        const n = @min(values, self.cap);
+        try self.index.ensureTotalCapacityContext(self.allocator, n, .{ .values = &self.values });
+        try self.values.refs.ensureTotalCapacity(self.allocator, n);
+        try self.owners.ensureTotalCapacity(self.allocator, n);
     }
 
     pub fn value(self: *const ColumnStrings, v: u32) []const u8 {
@@ -390,7 +442,7 @@ pub const ColumnStrings = struct {
             shared[i] = @intCast(v);
             i += 1;
         };
-        std.sort.pdq(u32, shared, StoreSortCtx{ .store = &self.values }, StoreSortCtx.lessThan);
+        try sortByBytes(allocator, shared, &self.values);
 
         const ids = try allocator.alloc(u32, self.values.len());
         errdefer allocator.free(ids);
@@ -572,7 +624,7 @@ pub fn prepare(
     const order = try allocator.alloc(u32, k);
     errdefer allocator.free(order);
     for (order, 0..) |*o, i| o.* = @intCast(i);
-    std.sort.pdq(u32, order, SortCtx{ .items = distinct.items }, SortCtx.lessThan);
+    try sortByBytes(allocator, order, SliceValues{ .items = distinct.items });
 
     const ins_to_sorted = try allocator.alloc(u32, k);
     defer allocator.free(ins_to_sorted);
@@ -1076,4 +1128,27 @@ test "ColumnStrings stops at the cap and undoes the row group that passed it" {
     try cs.assignIds();
     // b reverts to row group 0 alone, so nothing is shared.
     try std.testing.expectEqual(@as(u32, 0), cs.sharedCount());
+}
+
+test "sortByBytes orders values as std.mem.lessThan does" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(11);
+    const random = prng.random();
+    // Few distinct bytes, zeros among them, and lengths around the 8-byte
+    // steps, so values tie for whole keys and end inside their padding.
+    const alphabet = [_]u8{ 0, 1, 'a', 'b', 0xff };
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const items = try arena.allocator().alloc([]const u8, 3000);
+    for (items) |*item| {
+        const len = random.uintLessThan(usize, 26);
+        const bytes = try arena.allocator().alloc(u8, len);
+        for (bytes) |*b| b.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        item.* = bytes;
+    }
+    const order = try allocator.alloc(u32, items.len);
+    defer allocator.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    try sortByBytes(allocator, order, SliceValues{ .items = items });
+    for (order[0 .. order.len - 1], order[1..]) |a, b| try std.testing.expect(!std.mem.lessThan(u8, items[b], items[a]));
 }
