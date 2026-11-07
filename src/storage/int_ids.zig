@@ -140,14 +140,27 @@ pub const Builder = struct {
         };
     }
 
+    /// Bits a value block spends on each of the values added: their span in
+    /// steps of their common factor, which the block divides out
+    /// (`int_streams`), so a microsecond timestamp of whole seconds spends
+    /// a second's bits.
+    fn valueBits(self: *const Builder) u64 {
+        var step: u64 = 0;
+        for (self.map.keys, self.map.vals) |k, v| if (v != 0) {
+            const off: u64 = @bitCast(k -% self.min);
+            if (off != 0 and step != 1) step = if (step == 0) off else std.math.gcd(step, off);
+        };
+        const steps = @as(u64, @bitCast(self.max -% self.min)) / @max(step, 1);
+        return if (steps == std.math.maxInt(u64)) 64 else bitsBelow(steps + 1);
+    }
+
     /// The column's plan when `target`'s list of column `ci` admits its
     /// values, else null. Spends the builder either way.
     pub fn finish(self: *Builder, target: table_strings.Target, ci: usize) !?Plan {
         defer self.deinit();
         if (self.rows == 0) return null;
         const id_count = if (target.strings.state(target.io, ci)) |s| s.id_count else return null;
-        const range: u64 = @intCast(@as(i128, self.max) - self.min);
-        const value_bits = if (range == std.math.maxInt(u64)) 64 else bitsBelow(range + 1);
+        const value_bits = self.valueBits();
         if (value_bits < bitsBelow(self.map.count) + min_gain_bits) return null;
         if (!worthPlanning(self.rows, self.map.count, id_count)) return null;
 
@@ -272,5 +285,24 @@ test "a column takes ids when its values outgrow them and repeat" {
     inline for (cases) |c| {
         const admit: Admit = .{ .rows = c.rows, .value_bits = c.value_bits };
         try std.testing.expectEqual(c.admits, admit.admits(c.new, c.ids));
+    }
+}
+
+test "a column's values cost their span in steps of their common factor" {
+    const allocator = std.testing.allocator;
+    const second: i64 = 1_000_000;
+    const cases = .{
+        .{ .values = [_]i64{ 0, 86_400 * second, 2 * 86_400 * second, 22 * 86_400 * second }, .bits = 5 },
+        .{ .values = [_]i64{ 1_700_000_000 * second, 1_700_000_001 * second, 1_700_000_007 * second, 1_700_002_047 * second }, .bits = 11 },
+        .{ .values = [_]i64{ -5, 0, 1, 1_000_000 }, .bits = 20 },
+        .{ .values = [_]i64{ std.math.minInt(i64), 0, 1, std.math.maxInt(i64) }, .bits = 64 },
+        .{ .values = [_]i64{ 9, 9, 9, 9 }, .bits = 0 },
+    };
+    inline for (cases) |c| {
+        var builder: Builder = .init(allocator);
+        defer builder.deinit();
+        var values = c.values;
+        try builder.add(.{ .data = .{ .bigint = &values } });
+        try std.testing.expectEqual(@as(u64, c.bits), builder.valueBits());
     }
 }

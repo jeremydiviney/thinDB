@@ -32,8 +32,8 @@ const queries = [_][]const u8{
     "SELECT u, COUNT(*) FROM {T} GROUP BY u ORDER BY u",
     "SELECT u, COUNT(*) AS c FROM {T} GROUP BY u ORDER BY c DESC, u LIMIT 5",
     "SELECT SUM(u), MIN(u), MAX(u), SUM(amt), MIN(ts), MAX(ts) FROM {T}",
-    "SELECT id, u, ts, amt FROM {T} WHERE u = 1039595000000065 ORDER BY id",
-    "SELECT COUNT(*) FROM {T} WHERE u > 1039595000000065 AND u < 1150000000000000",
+    "SELECT id, u, ts, amt FROM {T} WHERE u = 1039595000000080 ORDER BY id",
+    "SELECT COUNT(*) FROM {T} WHERE u > 1039595000000080 AND u < 1150000000000000",
     "SELECT ts, COUNT(DISTINCT u) FROM {T} GROUP BY ts ORDER BY ts",
     "SELECT id, u FROM {T} ORDER BY u DESC, id LIMIT 7",
     "SELECT id, u, ts, amt FROM {T} WHERE id IN (3, 77, 391, 650, 1000, 1150) ORDER BY id",
@@ -41,7 +41,7 @@ const queries = [_][]const u8{
     "SELECT COUNT(*) FROM {T} WHERE u IS NULL",
     "SELECT amt, ts, COUNT(*) FROM {T} GROUP BY amt, ts ORDER BY amt, ts LIMIT 20",
     "SELECT u, ts, MAX(amt) FROM {T} WHERE id % 3 = 0 GROUP BY u, ts ORDER BY u, ts LIMIT 15",
-    "SELECT u FROM {T} WHERE ts = '2024-01-05 00:00:00' ORDER BY id LIMIT 10",
+    "SELECT u FROM {T} WHERE ts = '2024-01-05 00:00:16' ORDER BY id LIMIT 10",
     "SELECT amt, COUNT(DISTINCT u), COUNT(DISTINCT ts) FROM {T} GROUP BY amt ORDER BY amt",
 };
 
@@ -122,7 +122,8 @@ const Rows = struct {
 
 /// Inserts `rows` into `table`: every 13th `u` NULL, the rest cycling over
 /// `u_values` wide values (or new on every row), `ts` over 23 days and
-/// `amt` over 11 amounts.
+/// `amt` over 11 amounts. No column's values share a common step, which
+/// would narrow their blocks past any ids.
 fn insertRows(allocator: std.mem.Allocator, db: *thindb.Database, table: []const u8, rows: Rows) !void {
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(allocator);
@@ -136,9 +137,12 @@ fn insertRows(allocator: std.mem.Allocator, db: *thindb.Database, table: []const
         } else if (rows.unique_u) {
             try sql.print(allocator, "{d}", .{-u_base + @as(i64, @intCast(id)) * 3_000_000_017});
         } else {
-            try sql.print(allocator, "{d}", .{u_base + @as(i64, @intCast(rows.u_offset + id % rows.u_values)) * u_step});
+            const k: i64 = @intCast(rows.u_offset + id % rows.u_values);
+            try sql.print(allocator, "{d}", .{u_base + k * u_step + @divExact(k * (k + 1), 2)});
         }
-        try sql.print(allocator, ", '2024-01-{d:0>2} 00:00:00', {d}.{d:0>2})", .{ 1 + id % 23, (id % 11) * 1_234_567, id % 11 });
+        const day = id % 23;
+        const amount = id % 11;
+        try sql.print(allocator, ", '2024-01-{d:0>2} 00:00:{d:0>2}', {d}.{d:0>2})", .{ 1 + day, day * day % 60, amount * 1_234_567, amount * amount * 7 % 100 });
     }
     try exec(allocator, db, sql.items);
 }
