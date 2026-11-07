@@ -74,20 +74,30 @@ pub const Build = struct {
 
     /// Gathers blocks `lo..hi`'s grams, apart from other ranges.
     pub fn gather(self: *Build, strings: *const segment_strings.ColumnStrings, lo: usize, hi: usize) !void {
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, ngram.gram_space);
-        defer seen.deinit(self.allocator);
+        // Setting every gram's bit unconditionally and reading the set bits
+        // back once per block beats testing each gram before keeping it:
+        // the test is a data-dependent branch per byte.
+        const seen = try self.allocator.alloc(u64, ngram.gram_space / 64);
+        defer self.allocator.free(seen);
+        @memset(seen, 0);
         for (strings.blocks.items[lo..hi], self.grams[lo..hi]) |b, *out| {
             for (b.values) |v| {
                 const bytes = strings.value(v);
                 if (bytes.len < 3) continue;
-                for (0..bytes.len - 2) |i| {
-                    const g = ngram.gramAt(bytes, i);
-                    if (seen.isSet(g)) continue;
-                    seen.set(g);
-                    try out.append(self.allocator, g);
+                var g: Gram = @as(Gram, ngram.fold(bytes[0])) << 8 | ngram.fold(bytes[1]);
+                for (bytes[2..]) |c| {
+                    g = (g << 8 | ngram.fold(c)) & @as(Gram, ngram.gram_space - 1);
+                    seen[g / 64] |= @as(u64, 1) << @intCast(g % 64);
                 }
             }
-            for (out.items) |g| seen.unset(g);
+            for (seen, 0..) |*word, w| {
+                var bits = word.*;
+                if (bits == 0) continue;
+                word.* = 0;
+                while (bits != 0) : (bits &= bits - 1) {
+                    try out.append(self.allocator, @intCast(w * 64 + @ctz(bits)));
+                }
+            }
         }
     }
 
