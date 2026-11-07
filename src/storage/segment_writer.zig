@@ -18,6 +18,7 @@ const fsst = @import("fsst.zig");
 const int_streams = @import("int_streams.zig");
 const segment_strings = @import("segment_strings.zig");
 const table_strings = @import("table_strings.zig");
+const int_ids = @import("int_ids.zig");
 const hll = @import("../util/hll.zig");
 const ColumnView = column.ColumnView;
 const StringView = column.StringView;
@@ -195,6 +196,9 @@ pub fn writeSegmentWithStrings(
     }
     var strings = try segment_strings.SegmentStrings.init(allocator, schema, string_options.value_cap);
     defer strings.deinit();
+    var id_columns: IdColumns = try .init(allocator, columns.len);
+    defer id_columns.deinit(allocator);
+    if (string_options.table_ids) |target| try id_columns.plan(allocator, target, columns, column_sketches, row_count);
 
     var row_offset: usize = 0;
     while (row_offset < row_count) {
@@ -208,6 +212,7 @@ pub fn writeSegmentWithStrings(
             row_offset,
             row_offset + rows_in_group,
             strings.columns,
+            id_columns.views,
             @intCast(row_groups.items.len),
             encode_threads,
         ));
@@ -222,7 +227,9 @@ pub fn writeSegmentWithStrings(
     try writeStringTables(allocator, &out, &strings, row_groups.items, schema.compression, encode_threads, string_options.table_ids, &tables);
     const string_tables = try tables.toOwnedSlice(allocator);
     errdefer format.freeStringTables(allocator, string_tables);
-    try writeFooter(allocator, &out, row_groups.items, string_tables);
+    const int_id_columns = try id_columns.columnList(allocator);
+    errdefer if (int_id_columns.len > 0) allocator.free(int_id_columns);
+    try writeFooter(allocator, &out, row_groups.items, string_tables, int_id_columns);
     try out.drain();
     if (sync_on_close) try out.file.sync(io);
     const byte_size = out.offset();
@@ -235,8 +242,64 @@ pub fn writeSegmentWithStrings(
         .row_groups = try row_groups.toOwnedSlice(allocator),
         .column_sketches = column_sketches,
         .string_tables = string_tables,
+        .int_id_columns = int_id_columns,
     };
 }
+
+/// A segment's fixed-width columns that take table ids (§4.7), with the id
+/// of each of their rows, for `writeSegmentWithStrings`.
+const IdColumns = struct {
+    /// Per column, its ids as an `int` view over every row, or null.
+    views: []?ColumnView,
+
+    fn init(allocator: Allocator, columns: usize) !IdColumns {
+        const views = try allocator.alloc(?ColumnView, columns);
+        @memset(views, null);
+        return .{ .views = views };
+    }
+
+    fn deinit(self: *IdColumns, allocator: Allocator) void {
+        for (self.views) |v| if (v) |view| allocator.free(view.data.int);
+        allocator.free(self.views);
+    }
+
+    /// Plans each fixed-width column of `target`'s table, its rows
+    /// `columns`, whose sketch in `sketches` leaves it a chance.
+    fn plan(self: *IdColumns, allocator: Allocator, target: table_strings.Target, columns: []const ColumnView, sketches: []const u8, rows: usize) !void {
+        for (columns, 0..) |view, ci| {
+            if (target.strings.fixedListWidth(ci) == null) continue;
+            const state = target.strings.state(target.io, ci) orelse continue;
+            if (state.closed) continue;
+            const distinct = hll.Hll.fromBytes(sketches[ci * hll.m ..][0..hll.m]).estimate();
+            if (!int_ids.worthPlanning(rows, distinct - distinct / 16, state.id_count)) continue;
+            var builder: int_ids.Builder = .init(allocator);
+            builder.add(view) catch |e| {
+                builder.deinit();
+                return e;
+            };
+            var p = try builder.finish(target, ci) orelse continue;
+            defer p.deinit(allocator);
+            const ids = try allocator.alloc(i32, rows);
+            errdefer allocator.free(ids);
+            try p.idsOf(view, 0, rows, ids);
+            self.views[ci] = .{ .data = .{ .int = ids }, .nulls = view.nulls };
+        }
+    }
+
+    /// The columns that took ids, ascending. Caller owns the result.
+    fn columnList(self: *const IdColumns, allocator: Allocator) ![]const u32 {
+        var count: usize = 0;
+        for (self.views) |v| count += @intFromBool(v != null);
+        if (count == 0) return &.{};
+        const list = try allocator.alloc(u32, count);
+        var i: usize = 0;
+        for (self.views, 0..) |v, ci| if (v != null) {
+            list[i] = @intCast(ci);
+            i += 1;
+        };
+        return list;
+    }
+};
 
 fn freeStringTable(allocator: Allocator, t: format.StringTable) void {
     allocator.free(t.pages);
@@ -261,6 +324,7 @@ fn encodeRowGroup(
     row_start: usize,
     row_end: usize,
     strings: []?segment_strings.ColumnStrings,
+    ids: []const ?ColumnView,
     rg_idx: u32,
     encode_threads: usize,
 ) !RowGroupMeta {
@@ -279,6 +343,7 @@ fn encodeRowGroup(
         .row_end = row_end,
         .blocks = blocks,
         .strings = strings,
+        .ids = ids,
         .rg_idx = rg_idx,
     };
     try job.run(encode_threads);
@@ -291,6 +356,8 @@ pub const ColumnBlock = struct {
     bytes: std.ArrayList(u8) = .empty,
     stats: format.Stats = undefined,
     strings: ?segment_strings.Prepared = null,
+    /// Whether the block stores table ids in place of values (§4.7).
+    table_ids: bool = false,
 
     pub fn deinit(self: *ColumnBlock, allocator: Allocator) void {
         self.bytes.deinit(allocator);
@@ -300,8 +367,9 @@ pub const ColumnBlock = struct {
 };
 
 /// Encodes rows `row_start..row_end` of column `ci` into `out`: its block,
-/// or, when `to_table` and the rows hold a string, the rows readied for the
-/// column's string table, which `commitBlock` hands them to.
+/// of the table ids `ids` holds of its values when given, or, when
+/// `to_table` and the rows hold a string, the rows readied for the column's
+/// string table, which `commitBlock` hands them to.
 fn encodeBlock(
     allocator: Allocator,
     compressor: *compression_mod.Compressor,
@@ -309,6 +377,7 @@ fn encodeBlock(
     ci: usize,
     to_table: bool,
     view: ColumnView,
+    ids: ?ColumnView,
     row_start: usize,
     row_end: usize,
     fsst_threads: usize,
@@ -316,6 +385,10 @@ fn encodeBlock(
 ) !void {
     const nullable = schema.columns[ci].nullable;
     out.stats = computeStats(view, row_start, row_end);
+    if (ids) |id_view| {
+        out.table_ids = true;
+        return writeColumnBlock(allocator, compressor, &out.bytes, id_view, nullable, schema.compression, row_start, row_end, 1, true);
+    }
     if (to_table) {
         var bitmap: std.ArrayList(u8) = .empty;
         defer bitmap.deinit(allocator);
@@ -323,7 +396,7 @@ fn encodeBlock(
         out.strings = try segment_strings.prepare(allocator, view, row_start, row_end, bitmap.items, !nullable);
         if (out.strings != null) return;
     }
-    try writeColumnBlock(allocator, compressor, &out.bytes, view, nullable, schema.compression, row_start, row_end, fsst_threads);
+    try writeColumnBlock(allocator, compressor, &out.bytes, view, nullable, schema.compression, row_start, row_end, fsst_threads, false);
 }
 
 /// Hands `block`'s readied rows to column `ci`'s string table `cs` as row
@@ -350,7 +423,7 @@ fn commitBlock(
     };
     if (taken) return;
     p.deinit(allocator);
-    try writeColumnBlock(allocator, compressor, &block.bytes, view, schema.columns[ci].nullable, schema.compression, row_start, row_end, fsst_threads);
+    try writeColumnBlock(allocator, compressor, &block.bytes, view, schema.columns[ci].nullable, schema.compression, row_start, row_end, fsst_threads, false);
 }
 
 /// Appends one row group of `rows` rows to `out`: its header, then each
@@ -499,9 +572,9 @@ fn encodeSharedPage(
 ) !struct { index: u32, bytes: u32 } {
     const offsets = try cs.pagePayload(allocator, p, index, bytes);
     const start = out.items.len;
-    try appendBlock(allocator, compressor, out, index.items, &.{offsets}, @backingInt(format.Encoding.raw), false, table_compression);
+    try appendBlock(allocator, compressor, out, index.items, &.{offsets}, @backingInt(format.Encoding.raw), .{}, table_compression);
     const index_length: u32 = @intCast(out.items.len - start);
-    try appendBlock(allocator, compressor, out, bytes.items, &.{}, @backingInt(format.Encoding.raw), false, table_compression);
+    try appendBlock(allocator, compressor, out, bytes.items, &.{}, @backingInt(format.Encoding.raw), .{}, table_compression);
     return .{ .index = index_length, .bytes = @intCast(out.items.len - start - index_length) };
 }
 
@@ -524,7 +597,7 @@ fn encodeStringBlock(
         if (payload.bytes.items.len == 0) continue;
         const start = out.items.len;
         const has_nulls = part == .index and b.bitmap.len > 0;
-        try appendBlock(allocator, compressor, out, payload.bytes.items, payload.streams.items, format.segment_dict_encoding, has_nulls, table_compression);
+        try appendBlock(allocator, compressor, out, payload.bytes.items, payload.streams.items, format.segment_dict_encoding, .{ .has_nulls = has_nulls }, table_compression);
         parts.lengths.set(part, @intCast(out.items.len - start));
     }
     return parts;
@@ -546,16 +619,21 @@ const SegmentValues = struct {
     }
 };
 
+/// Mean bytes a value past which a segment's strings take no table ids: a
+/// list of such values costs as much as the blocks it would spare.
+const table_id_mean_len_cap: u64 = 1024;
+
 /// The table id of each of `cs`'s segment ids, after `assignIds`; null
 /// when column `ci` takes none. Caller owns the result.
 fn resolveTableIds(allocator: Allocator, target: table_strings.Target, threads: usize, cs: *const segment_strings.ColumnStrings, ci: usize) !?[]u32 {
+    if (cs.valueCount() > 0 and cs.valueBytes() / cs.valueCount() > table_id_mean_len_cap) return null;
     const by_id = try allocator.alloc(u32, cs.valueCount());
     defer allocator.free(by_id);
     for (cs.ids, 0..) |id, v| by_id[id] = @intCast(v);
     const ids = try allocator.alloc(u32, by_id.len);
     errdefer allocator.free(ids);
     const values: SegmentValues = .{ .strings = cs, .by_id = by_id };
-    if (!try target.strings.resolve(target.io, target.table_dir, threads, ci, values, ids)) {
+    if (!try target.strings.resolve(target.io, target.table_dir, threads, ci, values, ids, table_strings.admit_all)) {
         allocator.free(ids);
         return null;
     }
@@ -577,7 +655,7 @@ fn encodeTableIds(
     while (true) {
         const chunk = ids[lo..@min(lo + format.table_ids_chunk, ids.len)];
         for (chunk, 0..) |id, i| format.writeU32(payload[i * 4 ..][0..4], id);
-        try appendBlock(allocator, compressor, out, payload[0 .. chunk.len * 4], &.{.{ .offset = 0, .count = @intCast(chunk.len), .width = 4 }}, @backingInt(format.Encoding.raw), false, table_compression);
+        try appendBlock(allocator, compressor, out, payload[0 .. chunk.len * 4], &.{.{ .offset = 0, .count = @intCast(chunk.len), .width = 4 }}, @backingInt(format.Encoding.raw), .{}, table_compression);
         lo += chunk.len;
         if (lo >= ids.len) break;
     }
@@ -632,10 +710,11 @@ fn writeFooter(
     out: *SegmentFile,
     row_groups: []const RowGroupMeta,
     string_tables: []const format.StringTable,
+    int_id_columns: []const u32,
 ) !void {
     var footer: std.ArrayList(u8) = .empty;
     defer footer.deinit(allocator);
-    try appendFooter(allocator, &footer, row_groups, string_tables);
+    try appendFooter(allocator, &footer, row_groups, string_tables, int_id_columns);
     try out.append(allocator, footer.items);
 }
 
@@ -644,6 +723,7 @@ fn appendFooter(
     buf: *std.ArrayList(u8),
     row_groups: []const RowGroupMeta,
     string_tables: []const format.StringTable,
+    int_id_columns: []const u32,
 ) !void {
     const footer_start = buf.items.len;
     try appendU32(allocator, buf, @intCast(row_groups.len));
@@ -676,6 +756,8 @@ fn appendFooter(
         try appendU64(allocator, buf, t.table_ids.offset);
         try appendU32(allocator, buf, t.table_ids.length);
     }
+    try appendU32(allocator, buf, @intCast(int_id_columns.len));
+    for (int_id_columns) |c| try appendU32(allocator, buf, c);
     const footer_size: u32 = @intCast(buf.items.len - footer_start + format.footer_trailer_size);
     try appendU32(allocator, buf, footer_size);
     try buf.appendSlice(allocator, &format.segment_magic);
@@ -726,6 +808,19 @@ pub const MergedSegmentWriter = struct {
     /// String tables `appendStringTable` placed.
     string_tables: std.ArrayList(format.StringTable),
     table_ids: ?table_strings.Target = null,
+    /// Per column, how its blocks take table ids (§4.7), and how many of
+    /// its blocks so far store them.
+    id_modes: []IdMode,
+    id_blocks: []u32,
+
+    pub const IdMode = union(enum) {
+        values,
+        /// By a plan of the whole segment's values.
+        plan: int_ids.Plan,
+        /// Each row group resolving its own values, of a merge of segments
+        /// every block of the column of which stores ids.
+        merge,
+    };
 
     pub fn begin(
         allocator: Allocator,
@@ -748,6 +843,12 @@ pub const MergedSegmentWriter = struct {
         errdefer allocator.free(name);
         var strings = try segment_strings.SegmentStrings.init(allocator, schema, segment_strings.segment_value_cap);
         errdefer strings.deinit();
+        const id_modes = try allocator.alloc(IdMode, schema.columns.len);
+        errdefer allocator.free(id_modes);
+        @memset(id_modes, .values);
+        const id_blocks = try allocator.alloc(u32, schema.columns.len);
+        errdefer allocator.free(id_blocks);
+        @memset(id_blocks, 0);
         var out = try SegmentFile.create(io, dir, name);
         errdefer {
             out.close(allocator);
@@ -771,6 +872,8 @@ pub const MergedSegmentWriter = struct {
             .row_count = 0,
             .strings = strings,
             .string_tables = .empty,
+            .id_modes = id_modes,
+            .id_blocks = id_blocks,
         };
     }
 
@@ -793,6 +896,15 @@ pub const MergedSegmentWriter = struct {
         }
         if (rows > self.row_group_size) return format.Error.InvalidRowGroupSize;
 
+        const ids = try self.allocator.alloc(?ColumnView, columns.len);
+        @memset(ids, null);
+        defer {
+            for (ids) |v| if (v) |view| self.allocator.free(view.data.int);
+            self.allocator.free(ids);
+        }
+        for (ids, columns, 0..) |*slot, view, ci| {
+            if (try self.rowIds(ci, view)) |x| slot.* = .{ .data = .{ .int = x }, .nulls = view.nulls };
+        }
         const rg = try encodeRowGroup(
             self.allocator,
             &self.out,
@@ -801,9 +913,11 @@ pub const MergedSegmentWriter = struct {
             0,
             rows,
             self.strings.columns,
+            ids,
             @intCast(self.row_groups.items.len),
             self.encode_threads,
         );
+        for (ids, self.id_blocks) |v, *n| n.* += @intFromBool(v != null);
         self.row_groups.append(self.allocator, rg) catch |e| {
             freeRowGroupMeta(self.allocator, rg);
             return e;
@@ -817,11 +931,59 @@ pub const MergedSegmentWriter = struct {
         self.table_ids = target;
     }
 
+    /// Has fixed-width column `ci`'s blocks store the ids `plan` gives its
+    /// values (§4.7), taking the plan over.
+    pub fn useIdPlan(self: *MergedSegmentWriter, ci: usize, plan: int_ids.Plan) void {
+        self.dropIdPlan(ci);
+        self.id_modes[ci] = .{ .plan = plan };
+    }
+
+    /// Has fixed-width column `ci`'s blocks store ids, each row group's
+    /// from the table's list, after `useTableIds`: for a merge of segments
+    /// whose every block of the column stores them.
+    pub fn mergeIds(self: *MergedSegmentWriter, ci: usize) void {
+        self.dropIdPlan(ci);
+        self.id_modes[ci] = .merge;
+    }
+
+    fn dropIdPlan(self: *MergedSegmentWriter, ci: usize) void {
+        switch (self.id_modes[ci]) {
+            .plan => |*p| p.deinit(self.allocator),
+            .values, .merge => {},
+        }
+        self.id_modes[ci] = .values;
+    }
+
+    /// The table id of each of `view`'s rows of column `ci` when the
+    /// column takes ids (caller owns them), else null.
+    fn rowIds(self: *const MergedSegmentWriter, ci: usize, view: ColumnView) !?[]i32 {
+        switch (self.id_modes[ci]) {
+            .values => return null,
+            .plan => |*p| {
+                const ids = try self.allocator.alloc(i32, view.rowCount());
+                errdefer self.allocator.free(ids);
+                try p.idsOf(view, 0, ids.len, ids);
+                return ids;
+            },
+            .merge => {
+                const target = self.table_ids orelse return null;
+                const ids = try self.allocator.alloc(i32, view.rowCount());
+                errdefer self.allocator.free(ids);
+                if (try int_ids.resolveRows(self.allocator, target, ci, view, ids)) return ids;
+                self.allocator.free(ids);
+                return null;
+            },
+        }
+    }
+
     /// Encodes column `ci` of a row group into `out`, apart from the writer's
     /// other work. A column with a string table comes back readied for
     /// `commitColumn`, and `view` must outlive that commit.
     pub fn encodeColumn(self: *const MergedSegmentWriter, compressor: *compression_mod.Compressor, ci: usize, view: ColumnView, out: *ColumnBlock) !void {
-        try encodeBlock(self.allocator, compressor, self.schema, ci, self.strings.columns[ci] != null, view, 0, view.rowCount(), 1, out);
+        const ids = try self.rowIds(ci, view);
+        defer if (ids) |x| self.allocator.free(x);
+        const id_view: ?ColumnView = if (ids) |x| .{ .data = .{ .int = x }, .nulls = view.nulls } else null;
+        try encodeBlock(self.allocator, compressor, self.schema, ci, self.strings.columns[ci] != null, view, id_view, 0, view.rowCount(), 1, out);
     }
 
     /// Hands column `ci`'s readied rows to its string table as row group
@@ -847,6 +1009,7 @@ pub const MergedSegmentWriter = struct {
         try self.row_groups.ensureUnusedCapacity(self.allocator, 1);
         self.row_groups.appendAssumeCapacity(try appendRowGroupBlocks(self.allocator, &self.out, blocks, rows));
         self.row_count += @intCast(rows);
+        for (blocks, self.id_blocks) |b, *n| n.* += @intFromBool(b.table_ids);
     }
 
     /// Starts every row group of a segment of `rows` rows at once, writing
@@ -893,6 +1056,7 @@ pub const MergedSegmentWriter = struct {
         @constCast(meta.col_lengths)[ci] = @intCast(block.bytes.items.len);
         meta.length += @intCast(block.bytes.items.len);
         try self.out.append(self.allocator, block.bytes.items);
+        self.id_blocks[ci] += @intFromBool(block.table_ids);
     }
 
     /// Starts column `ci`'s string table, once its row groups have all
@@ -997,7 +1161,9 @@ pub const MergedSegmentWriter = struct {
         try writeStringTables(self.allocator, &self.out, &self.strings, self.row_groups.items, self.schema.compression, self.encode_threads, self.table_ids, &self.string_tables);
         const string_tables = try self.string_tables.toOwnedSlice(self.allocator);
         errdefer format.freeStringTables(self.allocator, string_tables);
-        try writeFooter(self.allocator, &self.out, self.row_groups.items, string_tables);
+        const int_id_columns = try self.idColumnList();
+        errdefer if (int_id_columns.len > 0) self.allocator.free(int_id_columns);
+        try writeFooter(self.allocator, &self.out, self.row_groups.items, string_tables, int_id_columns);
         try self.out.drain();
         var row_count: [8]u8 = undefined;
         format.writeU64(&row_count, self.row_count);
@@ -1012,13 +1178,37 @@ pub const MergedSegmentWriter = struct {
             .row_groups = try self.row_groups.toOwnedSlice(self.allocator),
             .column_sketches = self.column_sketches,
             .string_tables = string_tables,
+            .int_id_columns = int_id_columns,
         };
 
         self.out.close(self.allocator);
         self.allocator.free(self.file_name);
         self.strings.deinit();
+        self.freeIdModes();
         self.* = undefined;
         return info;
+    }
+
+    /// The columns every block of which stores ids, ascending. Caller owns
+    /// the result.
+    fn idColumnList(self: *const MergedSegmentWriter) ![]const u32 {
+        const rgs = self.row_groups.items.len;
+        var count: usize = 0;
+        for (self.id_blocks) |n| count += @intFromBool(rgs > 0 and n == rgs);
+        if (count == 0) return &.{};
+        const list = try self.allocator.alloc(u32, count);
+        var i: usize = 0;
+        for (self.id_blocks, 0..) |n, ci| if (rgs > 0 and n == rgs) {
+            list[i] = @intCast(ci);
+            i += 1;
+        };
+        return list;
+    }
+
+    fn freeIdModes(self: *MergedSegmentWriter) void {
+        for (0..self.id_modes.len) |ci| self.dropIdPlan(ci);
+        self.allocator.free(self.id_modes);
+        self.allocator.free(self.id_blocks);
     }
 
     /// Release everything the writer owns and delete the partial file. Frees
@@ -1030,6 +1220,7 @@ pub const MergedSegmentWriter = struct {
         self.strings.deinit();
         for (self.string_tables.items) |t| freeStringTable(self.allocator, t);
         self.string_tables.deinit(self.allocator);
+        self.freeIdModes();
         if (self.column_sketches.len > 0) self.allocator.free(@constCast(self.column_sketches));
         const io = self.out.io;
         self.out.close(self.allocator);
@@ -1052,6 +1243,8 @@ const BlockEncodeJob = struct {
     row_end: usize,
     blocks: []ColumnBlock,
     strings: []?segment_strings.ColumnStrings,
+    /// Per column, the table ids of its rows, or null.
+    ids: []const ?ColumnView,
     rg_idx: u32,
     fsst_threads: usize = 1,
 
@@ -1069,7 +1262,7 @@ const BlockEncodeJob = struct {
         const view = self.columns[ci];
         const cs: ?*segment_strings.ColumnStrings = if (self.strings[ci]) |*c| c else null;
         const to_table = if (cs) |c| !c.full else false;
-        try encodeBlock(self.allocator, compressor, self.schema, ci, to_table, view, self.row_start, self.row_end, self.fsst_threads, &self.blocks[ci]);
+        try encodeBlock(self.allocator, compressor, self.schema, ci, to_table, view, self.ids[ci], self.row_start, self.row_end, self.fsst_threads, &self.blocks[ci]);
         if (cs) |c| try commitBlock(self.allocator, compressor, self.schema, ci, c, view, self.row_start, self.row_end, self.rg_idx, self.fsst_threads, &self.blocks[ci]);
     }
 };
@@ -1150,6 +1343,8 @@ fn writeColumnBlock(
     /// Sub-worker lanes for the FSST row encode (the one per-block encoder
     /// expensive enough to parallelize WITHIN a column). 1 = serial.
     fsst_threads: usize,
+    /// Whether `view` holds the table ids of a fixed-width column's values.
+    table_ids: bool,
 ) !void {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
@@ -1184,7 +1379,7 @@ fn writeColumnBlock(
         break :blk .raw;
     };
 
-    try appendBlock(allocator, compressor, buf, scratch.items, streams.items, @backingInt(encoding), has_nulls, table_compression);
+    try appendBlock(allocator, compressor, buf, scratch.items, streams.items, @backingInt(encoding), .{ .has_nulls = has_nulls, .table_ids = table_ids }, table_compression);
 }
 
 fn addStream(allocator: Allocator, streams: *Streams, offset: usize, count: usize, width: u8, signed: bool) !void {
@@ -1205,7 +1400,7 @@ fn appendBlock(
     payload: []const u8,
     streams: []const int_streams.Stream,
     encoding_byte: u8,
-    has_nulls: bool,
+    block_flags: format.ColumnBlockFlags,
     table_compression: types.TableCompression,
 ) !void {
     const raw_size: u32 = @intCast(payload.len);
@@ -1232,7 +1427,8 @@ fn appendBlock(
     }
     const stored = if (kind != .none) compressed.? else source;
 
-    const flags = format.ColumnBlockFlags{ .has_nulls = has_nulls, .int_streams = rewrite };
+    var flags = block_flags;
+    flags.int_streams = rewrite;
 
     // Header: kind (u8) + flags (u8) + encoding (u8) + 1 reserved + uncompressed_size (u32) + compressed_size (u32)
     try buf.ensureUnusedCapacity(allocator, format.column_block_header_size + directory.items.len + stored.len);

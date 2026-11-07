@@ -421,8 +421,9 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
     shadow_open = false;
     // Cached segment handles hold their files open, and Windows refuses to
     // rename a directory while a file inside it is open. Their parsed footers
-    // embed the old schema anyway.
+    // embed the old schema anyway. The lists' readers hold theirs open too.
     t.seg_handles.clear(t.allocator);
+    t.strings.closeReaders(t.io);
     // Nothing on disk has moved yet, so a refusal to set the original aside
     // reopens it unchanged.
     storage.retryTransientWindowsRefusal(t.io, Io.Dir.rename, .{ s.schema_dir, t.name, s.schema_dir, aside_name, t.io }) catch |err| {
@@ -442,9 +443,11 @@ pub fn execAlter(s: *NsSchema, t: *Table, ops: []const AlterOp) !void {
 
     // 6. Re-open Table state under the new schema.
     try reInitTableState(s, t, new_fp, had_wal);
+    if (t.strings.reader) |r| t.cache.purgeTable(r.uid);
     t.strings.deinit();
     t.strings = new_strings;
     owns_new_strings = false;
+    t.strings.attach(t.io, &t.table_dir, t.cache);
     // Committed: an original the delete leaves behind is only garbage, which
     // the next open of the schema or alter of the table removes.
     storage.retryTransientWindowsRefusal(t.io, Io.Dir.deleteTree, .{ s.schema_dir, t.io, aside_name }) catch {};
@@ -470,6 +473,7 @@ fn rewriteSegment(
 
     var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
     defer seg.deinit();
+    seg.lists = &t.strings;
 
     var new_stores = try t.allocator.alloc(ColumnStore, new_schema.columns.len);
     var inited: usize = 0;

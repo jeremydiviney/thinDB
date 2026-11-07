@@ -504,6 +504,11 @@ const Write = struct {
     table_columns: []usize,
     /// Per column, its string table's step.
     tables: []TableStep,
+    /// Per column, whether its blocks' table ids (DESIGN.md §4.7) are still
+    /// to plan, which its gathers wait on.
+    id_steps: []IdStep,
+
+    const IdStep = enum { pending, planning, done };
 
     fn create(t: *Table, segment: usize, seg: *Segment) !*Write {
         const allocator = t.allocator;
@@ -540,6 +545,9 @@ const Write = struct {
         const gathered = try allocator.alloc(usize, columns);
         errdefer allocator.free(gathered);
         @memset(gathered, 0);
+        const id_steps = try allocator.alloc(Write.IdStep, columns);
+        errdefer allocator.free(id_steps);
+        for (id_steps, 0..) |*step, ci| step.* = if (t.strings.fixedListWidth(ci) == null) .done else .pending;
         @memset(decode_next, 0);
         @memset(decoded, 0);
         for (t.order_key_indices) |ci| {
@@ -587,6 +595,7 @@ const Write = struct {
             .decoded = decoded,
             .gather_next = gather_next,
             .gathered = gathered,
+            .id_steps = id_steps,
         };
         return self;
     }
@@ -606,6 +615,7 @@ const Write = struct {
         allocator.free(self.decoded);
         allocator.free(self.gather_next);
         allocator.free(self.gathered);
+        allocator.free(self.id_steps);
         allocator.destroy(self);
     }
 
@@ -680,6 +690,7 @@ const Task = union(enum) {
     column: struct { segment: usize, rg: usize, column: usize },
     table_begin: struct { segment: usize, column: usize },
     table_pieces: struct { segment: usize, column: usize, first: usize, end: usize },
+    id_plan: struct { segment: usize, column: usize },
 };
 
 /// A worker's file handle and buffers, kept across its tasks.
@@ -887,7 +898,16 @@ const Load = struct {
             const units = seg.batches.len;
             while (true) {
                 for (w.first_open..w.opened) |ci| {
-                    if (w.decoded[ci] < units or w.gather_next[ci] >= w.picked) continue;
+                    if (w.decoded[ci] < units) continue;
+                    switch (w.id_steps[ci]) {
+                        .pending => {
+                            w.id_steps[ci] = .planning;
+                            return .{ .id_plan = .{ .segment = s, .column = ci } };
+                        },
+                        .planning => continue,
+                        .done => {},
+                    }
+                    if (w.gather_next[ci] >= w.picked) continue;
                     const rg = w.gather_next[ci];
                     w.gather_next[ci] += 1;
                     if (!w.groups[rg].claimed()) try w.groups[rg].init(self.t.allocator, columns);
@@ -922,7 +942,36 @@ const Load = struct {
             .column => |c| try self.column(w, c.segment, c.rg, c.column),
             .table_begin => |c| try self.tableBegin(c.segment, c.column),
             .table_pieces => |c| try self.tablePieces(w, c.segment, c.column, c.first, c.end),
+            .id_plan => |c| try self.idPlan(c.segment, c.column),
         }
+    }
+
+    /// Plans fixed-width column `ci`'s table ids over segment `s`'s rows,
+    /// all decoded, ahead of its gathers.
+    fn idPlan(self: *Load, s: usize, ci: usize) !void {
+        const seg = &self.segments[s];
+        const write = seg.write.?;
+        defer {
+            write.id_steps[ci] = .done;
+            self.changed.broadcast(self.t.io);
+        }
+        if (try self.unlocked(planIds, .{ self.t, seg, ci })) |plan| write.writer.useIdPlan(ci, plan);
+    }
+
+    fn planIds(t: *Table, seg: *const Segment, ci: usize) !?storage.int_ids.Plan {
+        const target = t.tableIdsTarget();
+        const state = target.strings.state(target.io, ci) orelse return null;
+        if (state.closed) return null;
+        var rows: u64 = 0;
+        for (seg.batches) |b| rows += b.?.order.len;
+        const distinct = hll.Hll.fromBytes(seg.sketches[ci * hll.m ..][0..hll.m]).estimate();
+        if (!storage.int_ids.worthPlanning(rows, distinct - distinct / 16, state.id_count)) return null;
+        var builder: storage.int_ids.Builder = .init(t.allocator);
+        for (seg.batches) |b| builder.add(b.?.views[ci]) catch |e| {
+            builder.deinit();
+            return e;
+        };
+        return builder.finish(target, ci);
     }
 
     fn decode(self: *Load, w: *Worker, u: usize) !void {

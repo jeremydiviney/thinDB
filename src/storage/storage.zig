@@ -21,6 +21,7 @@ pub const snappy = @import("snappy.zig");
 pub const fsst = @import("fsst.zig");
 pub const segment_strings = @import("segment_strings.zig");
 pub const table_strings = @import("table_strings.zig");
+pub const int_ids = @import("int_ids.zig");
 pub const cache = @import("cache.zig");
 
 pub const ColumnView = column.ColumnView;
@@ -1850,5 +1851,6 @@ test {
     _ = compression;
     _ = segment_strings;
     _ = table_strings;
+    _ = int_ids;
     _ = cache;
 }

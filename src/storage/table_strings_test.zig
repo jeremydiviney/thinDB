@@ -10,7 +10,7 @@ const io = std.testing.io;
 
 const schema = types.TableSchema{
     .columns = &.{
-        .{ .name = "id", .type = .bigint },
+        .{ .name = "id", .type = .int },
         .{ .name = "url", .type = .string },
     },
     .order_key = &.{"id"},
@@ -31,7 +31,7 @@ const Values = struct {
 };
 
 fn resolve(ts: *TableStrings, dir: std.Io.Dir, items: []const []const u8, ids: []u32) !bool {
-    return ts.resolve(io, dir, 4, url_column, Values{ .items = items }, ids);
+    return ts.resolve(io, dir, 4, url_column, Values{ .items = items }, ids, table_strings.admit_all);
 }
 
 /// Distinct values `"value-<i>-..."`, padded so `count` of them pass a page.
@@ -175,4 +175,84 @@ test "table strings cut a torn page and close a column missing published ids" {
     try reopen(allocator, &ts, states);
     try std.testing.expect(!try resolve(&ts, tmp.dir, values[5..6], &one));
     try std.testing.expect(ts.state(io, url_column).?.closed);
+}
+
+const fixed_schema = types.TableSchema{
+    .columns = &.{
+        .{ .name = "id", .type = .int },
+        .{ .name = "user", .type = .bigint },
+    },
+    .order_key = &.{"id"},
+    .unique = false,
+};
+const user_column = 1;
+
+const FixedValues = struct {
+    items: []const i64,
+
+    pub fn len(self: FixedValues) usize {
+        return self.items.len;
+    }
+
+    pub fn get(self: FixedValues, i: usize) []const u8 {
+        return std.mem.sliceAsBytes(self.items[i..][0..1]);
+    }
+};
+
+const AdmitNone = struct {
+    pub fn admits(_: AdmitNone, _: usize, _: u32) bool {
+        return false;
+    }
+};
+
+fn userValue(i: usize) i64 {
+    return @as(i64, @intCast(i)) * 7_919 - 1_000_000_000_007;
+}
+
+test "table strings keep fixed-width values in pages a reader pins" {
+    const memory = @import("../memory.zig");
+    const storage_cache = @import("cache.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ts = try TableStrings.init(allocator, fixed_schema, &.{});
+    defer ts.deinit();
+    try std.testing.expectEqual(@as(?u8, 8), ts.fixedListWidth(user_column));
+
+    // About five pages of values.
+    const n = 40_000;
+    const values = try allocator.alloc(i64, n);
+    defer allocator.free(values);
+    for (values, 0..) |*v, i| v.* = userValue(i);
+    const ids = try allocator.alloc(u32, n);
+    defer allocator.free(ids);
+    try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = values }, ids, table_strings.admit_all));
+    for (ids, 0..) |id, i| try std.testing.expectEqual(@as(u32, @intCast(i)), id);
+
+    // A rejected batch takes no ids and leaves the column open.
+    var extra = [_]i64{ userValue(n), userValue(0) };
+    var two: [2]u32 = undefined;
+    try std.testing.expect(!try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = &extra }, &two, AdmitNone{}));
+    try std.testing.expect(!ts.state(io, user_column).?.closed);
+
+    const states = try ts.persist(allocator, io, tmp.dir, true);
+    defer allocator.free(states);
+    try std.testing.expectEqualSlices(State, &.{.{ .column_idx = user_column, .id_count = n, .closed = false }}, states);
+    ts.deinit();
+    ts = try TableStrings.init(allocator, fixed_schema, states);
+
+    var pool = memory.MemoryPool.init(1 << 24);
+    var cache = storage_cache.Cache.init(allocator, &pool, 0);
+    pool.shareCache(&cache, pool.budget);
+    defer cache.deinit();
+    ts.attach(io, &tmp.dir, &cache);
+
+    const probe = [_]u32{ 39_999, 0, 17, 8_191, 8_192, 20_001, 17 };
+    var got: [probe.len]i64 = undefined;
+    try ts.fixedValues(io, user_column, &probe, std.mem.sliceAsBytes(&got));
+    for (probe, got) |id, v| try std.testing.expectEqual(userValue(id), v);
+
+    // The reopened writer finds the old values and continues the ids.
+    try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = &extra }, &two, table_strings.admit_all));
+    try std.testing.expectEqualSlices(u32, &.{ n, 0 }, &two);
 }
