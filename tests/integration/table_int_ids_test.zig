@@ -58,6 +58,9 @@ const queries = [_][]const u8{
     "SELECT id % 5, COUNT(DISTINCT u), COUNT(DISTINCT ts) FROM {T} GROUP BY id % 5",
     "SELECT COUNT(DISTINCT u), COUNT(DISTINCT ts), COUNT(DISTINCT amt) FROM {T}",
     "SELECT COUNT(DISTINCT u) FROM {T} WHERE id > 100",
+    // A few rows' values, fetched by location after the rows are picked.
+    "SELECT id, u, ts, amt, k FROM {T} WHERE k = 1 ORDER BY id DESC LIMIT 6",
+    "SELECT u, k, COUNT(*) AS c FROM {T} WHERE u > 1000000000000001 GROUP BY u, k ORDER BY c DESC, u, k LIMIT 4",
 };
 
 /// Every row of `sql` over table `table`, its cells joined by `|` and its
@@ -299,4 +302,60 @@ test "table int ids: a merge of id-coded segments keeps the ids, and new values 
     try expectIdSegments(allocator, t, u_column, &.{ true, true });
     try std.testing.expect(t.strings.state(t.io, u_column).?.id_count > before);
     try expectMatchesOracle(allocator, db);
+}
+
+/// Queries over `s` reading `u`'s values for whole blocks, whose ids lie on
+/// every page of its list, and for a few rows fetched by location.
+const scattered_queries = [_][]const u8{
+    "SELECT SUM(u - 1000000000000000), MIN(u), MAX(u) FROM {T}",
+    "SELECT id, u FROM {T} WHERE u = 1039595000000080 ORDER BY id",
+    "SELECT * FROM {T} WHERE name = 'n3' ORDER BY u DESC LIMIT 4",
+    "SELECT * FROM {T} WHERE name = 'n3' ORDER BY id DESC LIMIT 4",
+    "SELECT u, name, COUNT(*) FROM {T} GROUP BY u, name",
+    "SELECT u, name, COUNT(*) AS c FROM {T} WHERE id % 7 = 2 GROUP BY u, name HAVING COUNT(*) > 1",
+};
+
+test "table int ids: values come off a list of many pages for whole blocks and a few rows alike" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    // A nullable string key keeps a group key with `u` hashed.
+    try exec(allocator, db, "CREATE TABLE s (id BIGINT NOT NULL, u BIGINT NOT NULL, name VARCHAR(8), PRIMARY KEY (id))");
+    try exec(allocator, db, "CREATE TABLE q (id BIGINT NOT NULL, u BIGINT NOT NULL, name VARCHAR(8), PRIMARY KEY (id))");
+    const s = try db.openTable("s", .{});
+
+    // 17,000 values fill three of the list's pages. The first 17,000 rows
+    // take them in row order; the rest name them scattered, so each of
+    // their blocks reads every page.
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    for (0..40) |chunk| for ([_][]const u8{ "s", "q" }) |table| {
+        sql.clearRetainingCapacity();
+        try sql.print(allocator, "INSERT INTO {s} (id, u, name) VALUES ", .{table});
+        for (0..1000) |j| {
+            const id = chunk * 1000 + j;
+            const k: i64 = @intCast(if (id < 17_000) id else id * 7919 % 17_000);
+            if (j != 0) try sql.appendSlice(allocator, ", ");
+            try sql.print(allocator, "({d}, {d}, 'n{d}')", .{ id, u_base + k * u_step + @divExact(k * (k + 1), 2), id % 5 });
+        }
+        try exec(allocator, db, sql.items);
+    };
+    try s.flush();
+    try expectIdSegments(allocator, s, 1, &.{true});
+    try std.testing.expect(s.strings.state(s.io, 1).?.id_count > 16_384);
+
+    for (scattered_queries) |text| {
+        // Cold: neither the values' blocks nor the list's pages cached.
+        const tc = s.cacheRef();
+        tc.cache.purgeTable(tc.table_uid);
+        tc.cache.purgeTable(s.strings.reader.?.uid);
+        const got = try rowsText(allocator, db, text, "s");
+        defer allocator.free(got);
+        const want = try rowsText(allocator, db, text, "q");
+        defer allocator.free(want);
+        errdefer std.debug.print("query: {s}\n", .{text});
+        try std.testing.expectEqualStrings(want, got);
+    }
 }

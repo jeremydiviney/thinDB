@@ -198,20 +198,25 @@ pub const TableStrings = struct {
             self.allocator.free(pinned);
         }
         @memset(pinned, null);
-        const w: usize = list.width;
+        const page_of = try self.allocator.alloc(u32, ids.len);
+        defer self.allocator.free(page_of);
+        var needed = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, count);
+        defer needed.deinit(self.allocator);
         var at: usize = 0;
         var page = list.readPage(0);
-        for (ids, 0..) |id, i| {
+        for (ids, page_of) |id, *p| {
             if (id < page.first_id or id - page.first_id >= page.count) {
                 at = list.readPageOf(id, count);
                 page = list.readPage(at);
             }
-            const entry = pinned[at] orelse pin: {
-                const e = try list.pinPage(io, r, at, page);
-                pinned[at] = e;
-                break :pin e;
-            };
-            @memcpy(out[i * w ..][0..w], entry.bytes[(id - page.first_id) * w ..][0..w]);
+            p.* = @intCast(at);
+            needed.set(at);
+        }
+        try list.pinPages(io, r, &needed, page_of[0], pinned);
+        const w: usize = list.width;
+        for (ids, page_of, 0..) |id, p, i| {
+            const first = list.readPage(p).first_id;
+            @memcpy(out[i * w ..][0..w], pinned[p].?.bytes[(id - first) * w ..][0..w]);
         }
     }
 
@@ -528,35 +533,112 @@ pub const ColumnList = struct {
         return count;
     }
 
-    /// Page `p`, `page`, decoded, pinned in the block cache; read in on a
-    /// miss.
-    fn pinPage(self: *ColumnList, io: Io, r: Reader, p: usize, page: Page) !*storage_cache.Cache.Entry {
-        const key: storage_cache.Key = .{
+    /// Stored bytes one read of `pinPages` takes at most.
+    const pages_read_bytes: usize = 2 << 20;
+
+    fn pageKey(self: *const ColumnList, r: Reader, p: usize) storage_cache.Key {
+        return .{
             .table_uid = r.uid,
             .segment_id = list_segment_id,
             .row_group_idx = @intCast(p),
             .column_idx = self.column_idx,
             .content = .list_page,
         };
-        const fill = switch (try r.cache.claimAfterFill(io, key)) {
+    }
+
+    /// Pins each page `needed` marks, of the first `pinned.len` read in,
+    /// into `pinned`, decoded, reading the misses in a run of adjacent
+    /// pages a read: a block's ids lie on every page of a wide list, and a
+    /// read a page waits out a disk round trip each. The walk starts at page
+    /// `start`, so readers of one list at once read apart; a page another is
+    /// reading in is waited for last.
+    fn pinPages(self: *ColumnList, io: Io, r: Reader, needed: *const std.DynamicBitSetUnmanaged, start: usize, pinned: []?*storage_cache.Cache.Entry) !void {
+        var busy: std.ArrayList(u32) = .empty;
+        defer busy.deinit(self.allocator);
+        var run: std.ArrayList(*storage_cache.Cache.Fill) = .empty;
+        defer run.deinit(self.allocator);
+        errdefer for (run.items) |f| r.cache.endFill(io, f);
+        var run_first: usize = 0;
+        for (0..pinned.len) |k| {
+            const p = (start + k) % pinned.len;
+            if (!needed.isSet(p)) continue;
+            switch (try r.cache.claim(self.pageKey(r, p))) {
+                .hit => |e| pinned[p] = e,
+                .busy => try busy.append(self.allocator, @intCast(p)),
+                .fill => |f| {
+                    if (run.items.len > 0 and !self.extendsRun(run_first, run.items.len, p)) {
+                        try self.readRun(io, r, run_first, &run, pinned);
+                    }
+                    if (run.items.len == 0) run_first = p;
+                    run.append(self.allocator, f) catch |err| {
+                        r.cache.endFill(io, f);
+                        return err;
+                    };
+                },
+            }
+        }
+        if (run.items.len > 0) try self.readRun(io, r, run_first, &run, pinned);
+        for (busy.items) |p| pinned[p] = try self.pinPage(io, r, p);
+    }
+
+    /// Whether page `p` follows the run of `len` pages from `first` on in
+    /// `.list` with the run still in one read.
+    fn extendsRun(self: *const ColumnList, first: usize, len: usize, p: usize) bool {
+        if (p != first + len) return false;
+        const last = self.readPage(p - 1);
+        const next = self.readPage(p);
+        if (next.offset != last.offset + page_header_size + last.stored_len) return false;
+        return next.offset + page_header_size + next.stored_len - self.readPage(first).offset <= pages_read_bytes;
+    }
+
+    /// Reads in the run of pages from `first` on whose fills `run` holds,
+    /// in one read, pins each into `pinned` and ends the fills.
+    fn readRun(self: *ColumnList, io: Io, r: Reader, first: usize, run: *std.ArrayList(*storage_cache.Cache.Fill), pinned: []?*storage_cache.Cache.Entry) !void {
+        defer {
+            for (run.items) |f| r.cache.endFill(io, f);
+            run.clearRetainingCapacity();
+        }
+        const from = self.readPage(first).offset;
+        const last = self.readPage(first + run.items.len - 1);
+        const stored = try self.allocator.alloc(u8, @intCast(last.offset + page_header_size + last.stored_len - from));
+        defer self.allocator.free(stored);
+        if (try (try self.listFile(io, r)).readPositionalAll(io, stored, from) != stored.len) return format.Error.UnexpectedEof;
+        for (first..first + run.items.len) |p| {
+            const page = self.readPage(p);
+            const at: usize = @intCast(page.offset - from);
+            pinned[p] = try self.insertPage(r, p, stored[at..][0 .. page_header_size + page.stored_len]);
+        }
+    }
+
+    /// Page `p`, decoded, pinned in the block cache; read in on a miss.
+    fn pinPage(self: *ColumnList, io: Io, r: Reader, p: usize) !*storage_cache.Cache.Entry {
+        const fill = switch (try r.cache.claimAfterFill(io, self.pageKey(r, p))) {
             .hit => |entry| return entry,
             .fill => |fill| fill,
         };
         defer r.cache.endFill(io, fill);
-        const file = file: {
-            self.read_mutex.lockUncancelable(io);
-            defer self.read_mutex.unlock(io);
-            if (self.read_file == null) {
-                var dir = try r.table_dir.openDir(io, dir_name, .{});
-                defer dir.close(io);
-                var list_buf: [16]u8 = undefined;
-                self.read_file = try dir.openFile(io, try listName(&list_buf, self.column_idx), .{});
-            }
-            break :file self.read_file.?;
-        };
+        const page = self.readPage(p);
         const stored = try self.allocator.alloc(u8, page_header_size + @as(usize, page.stored_len));
         defer self.allocator.free(stored);
-        if (try file.readPositionalAll(io, stored, page.offset) != stored.len) return format.Error.UnexpectedEof;
+        if (try (try self.listFile(io, r)).readPositionalAll(io, stored, page.offset) != stored.len) return format.Error.UnexpectedEof;
+        return self.insertPage(r, p, stored);
+    }
+
+    fn listFile(self: *ColumnList, io: Io, r: Reader) !Io.File {
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_file == null) {
+            var dir = try r.table_dir.openDir(io, dir_name, .{});
+            defer dir.close(io);
+            var list_buf: [16]u8 = undefined;
+            self.read_file = try dir.openFile(io, try listName(&list_buf, self.column_idx), .{});
+        }
+        return self.read_file.?;
+    }
+
+    /// Page `p`, stored as `stored`, decoded into the block cache, pinned.
+    fn insertPage(self: *ColumnList, r: Reader, p: usize, stored: []const u8) !*storage_cache.Cache.Entry {
+        const page = self.readPage(p);
         var raw: std.ArrayList(u8) = .empty;
         defer raw.deinit(self.allocator);
         const decoded = try decodePage(self.allocator, stored, page.first_id, &raw) orelse return format.Error.CorruptColumnBlockHeader;
@@ -565,7 +647,7 @@ pub const ColumnList = struct {
         const bytes = try block_alloc.alignedAlloc(u8, .@"16", raw.items.len);
         errdefer block_alloc.free(bytes);
         @memcpy(bytes, raw.items);
-        return r.cache.insertPinned(key, bytes, .raw);
+        return r.cache.insertPinned(self.pageKey(r, p), bytes, .raw);
     }
 
     /// Drops everything held in memory, keeping the column's identity and

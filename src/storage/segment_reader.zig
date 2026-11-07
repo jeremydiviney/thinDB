@@ -1159,6 +1159,89 @@ pub const ReadSegment = struct {
         return .{ .bytes = raw, .encoding = blockEncoding(block, 0), .owned = raw };
     }
 
+    /// Column `column_idx`'s block of row group `row_group_idx` as the table
+    /// ids it stores (§4.7), pinned as `borrowColumnBlock` pins it: 8-byte
+    /// ids, raw or in runs. The segment lists the column
+    /// (`SegmentInfo.intIdColumn`).
+    pub fn borrowIdBlock(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache) !BorrowedBlock {
+        const key = storage_cache.Key{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+            .content = .int_ids,
+        };
+        const entry = try self.acquireBlock(allocator, tc, key, column_idx);
+        return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
+    }
+
+    /// Whether a reader of some rows of column `column_idx`'s row group
+    /// `row_group_idx` reads their values by `idRows`: the column stores
+    /// table ids here, and no reader holds or reads in the values' block.
+    /// That block's ids lie on every page of a wide list; a few rows' lie
+    /// on a few.
+    pub fn readsIdRows(self: ReadSegment, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache) bool {
+        if (self.lists == null or !self.info.intIdColumn(column_idx)) return false;
+        return !tc.cache.holdsOrFills(.{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+        });
+    }
+
+    /// The values of `rows` of column `column_idx`'s row group
+    /// `row_group_idx`, which `readsIdRows`, as a raw block payload of
+    /// `rows.len` rows in `allocator`: their validity bitmap when `nullable`,
+    /// then each value in its list's width. Reads the ids' block and the
+    /// list pages the rows' ids lie on.
+    pub fn idRows(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache, nullable: bool, rows: []const u32) ![]align(16) u8 {
+        const corrupt = format.Error.CorruptColumnBlockHeader;
+        const lists = self.lists orelse return corrupt;
+        const width: usize = lists.fixedListWidth(column_idx) orelse return corrupt;
+        var block = try self.borrowIdBlock(allocator, row_group_idx, column_idx, tc);
+        defer block.release(allocator, tc);
+        const rc = self.info.row_groups[row_group_idx].row_count;
+        const flags = format.ColumnBlockFlags{ .has_nulls = nullable };
+        var expanded: ?OwnedColumn = null;
+        defer if (expanded) |*col| col.deinit(allocator);
+        const view = viewRawColumn(.bigint, block.bytes, rc, flags, block.encoding) orelse view: {
+            expanded = try decodeColumnPayload(allocator, .bigint, block.bytes, rc, flags, block.encoding);
+            break :view expanded.?.view();
+        };
+        const block_ids = switch (view.data) {
+            .bigint => |s| s,
+            else => return corrupt,
+        };
+        const bm_len: usize = if (nullable) column.bitmapBytes(rows.len) else 0;
+        const out = try allocator.alignedAlloc(u8, .@"16", bm_len + rows.len * width);
+        errdefer allocator.free(out);
+        @memset(out, 0);
+        const ids = try allocator.alloc(u32, rows.len);
+        defer allocator.free(ids);
+        const valid = try allocator.alloc(u32, rows.len);
+        defer allocator.free(valid);
+        var n: usize = 0;
+        for (rows, 0..) |row, i| {
+            if (row >= rc) return corrupt;
+            if (!view.isValid(row)) continue;
+            if (nullable) column.setValidBit(out[0..bm_len], i, true);
+            ids[n] = try tableIdOf(block_ids[row]);
+            valid[n] = @intCast(i);
+            n += 1;
+        }
+        const values = out[bm_len..];
+        if (n == rows.len) {
+            try lists.fixedValues(self.io, column_idx, ids, values);
+            return out;
+        }
+        const named = try allocator.alloc(u8, n * width);
+        defer allocator.free(named);
+        try lists.fixedValues(self.io, column_idx, ids[0..n], named);
+        for (valid[0..n], 0..) |i, k| @memcpy(values[i * width ..][0..width], named[k * width ..][0..width]);
+        return out;
+    }
+
     /// The payload of column `column_idx`'s block `block`, coded in table
     /// ids, over the values they name (or, with `ids`, over the ids
     /// themselves), in `allocator`, with the encoding it reads as.

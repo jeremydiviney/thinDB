@@ -327,6 +327,7 @@ pub const LateScan = struct {
                     return;
                 }
                 if (ctx.late.readsValuesApart(seg, rg_idx, phys)) return ctx.late.loadValuesApart(ctx.allocator, seg, rg_idx, phys, locs_of_group);
+                if (seg.readsIdRows(rg_idx, phys, c)) return ctx.late.loadIdRows(ctx.allocator, seg, rg_idx, phys, locs_of_group);
                 var bb = try seg.borrowColumnBlock(ctx.allocator, rg_idx, phys, c);
                 bb.release(ctx.allocator, c);
             }
@@ -408,6 +409,10 @@ pub const LateScan = struct {
                 continue;
             }
             if (try self.appendValuesApart(seg, rg_idx, phys, rc, offsets, out)) continue;
+            if (seg.readsIdRows(rg_idx, phys, self.table.cacheRef())) {
+                try self.appendIdRows(seg, rg_idx, phys, offsets, out);
+                continue;
+            }
 
             var bb = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.table.cacheRef());
             defer bb.release(self.allocator, self.table.cacheRef());
@@ -481,6 +486,32 @@ pub const LateScan = struct {
             else => return false,
         }
         return true;
+    }
+
+    /// The values of `rows` (ascending) of row group `rg_idx` of column
+    /// `phys`, which `ReadSegment.readsIdRows`: their ids, then only the
+    /// list pages those lie on.
+    fn appendIdRows(self: *LateScan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rows: []const u32, out: *ColumnStore) !void {
+        const col = self.table.schema.columns[phys];
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+        const payload = try seg.idRows(self.allocator, rg_idx, phys, self.table.cacheRef(), col.nullable, rows);
+        defer self.allocator.free(payload);
+        const n: u32 = @intCast(rows.len);
+        if (storage.segment_reader.viewRawColumn(col.type, payload, n, flags, .raw)) |view| return engine.transform.appendAllColumn(self.allocator, view, out);
+        // A bitmap ahead of the values leaves them unaligned to view.
+        var decoded = try storage.segment_reader.decodeColumnPayload(self.allocator, col.type, payload, n, flags, .raw);
+        defer decoded.deinit(self.allocator);
+        try engine.transform.appendAllColumn(self.allocator, decoded.view(), out);
+    }
+
+    /// Reads into the cache what `appendIdRows` reads for the survivors
+    /// `locs` of row group `rg_idx`.
+    fn loadIdRows(self: *LateScan, allocator: Allocator, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, locs: []const i64) !void {
+        const rows = try allocator.alloc(u32, locs.len);
+        defer allocator.free(rows);
+        for (locs, rows) |loc, *row| row.* = @intCast(rowloc.unpack(loc).segment.offset);
+        const payload = try seg.idRows(allocator, rg_idx, phys, self.table.cacheRef(), self.table.schema.columns[phys].nullable, rows);
+        allocator.free(payload);
     }
 
     /// Reads into the cache what `appendValuesApart` reads for the

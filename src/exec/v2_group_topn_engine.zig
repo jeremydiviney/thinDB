@@ -751,7 +751,13 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
             }
             return false;
         };
-        var block = seg.borrowColumnBlock(table.allocator, rg, phys, table.cacheRef()) catch return false;
+        // Ids run where their values do, and a block's values span a wide
+        // list's every page.
+        const borrowed = if (seg.info.intIdColumn(phys))
+            seg.borrowIdBlock(table.allocator, rg, phys, table.cacheRef())
+        else
+            seg.borrowColumnBlock(table.allocator, rg, phys, table.cacheRef());
+        var block = borrowed catch return false;
         defer block.release(table.allocator, table.cacheRef());
         if (block.encoding != .rle) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = table.schema.columns[phys].nullable };
