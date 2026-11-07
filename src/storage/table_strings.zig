@@ -685,7 +685,7 @@ pub const ColumnList = struct {
             else => return err,
         };
         defer if (current) |c| self.allocator.free(c);
-        if (current) |c| if (std.mem.eql(u8, c, records)) return;
+        if (std.mem.eql(u8, current orelse &.{}, records)) return;
         var tmp_buf: [24]u8 = undefined;
         try @import("storage.zig").writeFileAtomic(io, dir, try dirTmpName(&tmp_buf, self.column_idx), name, records, true);
     }
