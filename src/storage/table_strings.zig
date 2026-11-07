@@ -86,6 +86,7 @@ const parallel_min_values: usize = 1 << 14;
 const none: u32 = std.math.maxInt(u32);
 
 const JobError = Io.File.ReadPositionalError || Allocator.Error;
+const PageReadError = JobError || format.Error;
 
 /// Whether column type `t` of `schema` takes table ids: the columns that
 /// take segment string tables.
@@ -605,6 +606,11 @@ pub const ColumnList = struct {
 
     /// Stored bytes one read of `pinPages` takes at most.
     const pages_read_bytes: usize = 2 << 20;
+    /// Reads of `pinPages` in flight at once: each waits on the disk, not
+    /// on a core.
+    const list_read_threads: usize = 8;
+
+    const PageRun = struct { first: u32, len: u32 };
 
     fn pageKey(self: *const ColumnList, r: Reader, p: usize) storage_cache.Key {
         return .{
@@ -618,36 +624,46 @@ pub const ColumnList = struct {
 
     /// Pins each page `needed` marks, of the first `pinned.len` read in,
     /// into `pinned`, decoded, reading the misses in a run of adjacent
-    /// pages a read: a block's ids lie on every page of a wide list, and a
-    /// read a page waits out a disk round trip each. The walk starts at page
+    /// pages a read, the runs side by side: a block's ids lie on every page
+    /// of a wide list, a literal's candidates on one page per write, and a
+    /// read waits out a disk round trip each. The walk starts at page
     /// `start`, so readers of one list at once read apart; a page another is
-    /// reading in is waited for last.
+    /// reading in is waited for last, once this reader's own fills end.
     fn pinPages(self: *ColumnList, io: Io, r: Reader, needed: *const std.DynamicBitSetUnmanaged, start: usize, pinned: []?*storage_cache.Cache.Entry) !void {
         var busy: std.ArrayList(u32) = .empty;
         defer busy.deinit(self.allocator);
-        var run: std.ArrayList(*storage_cache.Cache.Fill) = .empty;
-        defer run.deinit(self.allocator);
-        errdefer for (run.items) |f| r.cache.endFill(io, f);
-        var run_first: usize = 0;
-        for (0..pinned.len) |k| {
-            const p = (start + k) % pinned.len;
-            if (!needed.isSet(p)) continue;
-            switch (try r.cache.claim(self.pageKey(r, p))) {
-                .hit => |e| pinned[p] = e,
-                .busy => try busy.append(self.allocator, @intCast(p)),
-                .fill => |f| {
-                    if (run.items.len > 0 and !self.extendsRun(run_first, run.items.len, p)) {
-                        try self.readRun(io, r, run_first, &run, pinned);
-                    }
-                    if (run.items.len == 0) run_first = p;
-                    run.append(self.allocator, f) catch |err| {
-                        r.cache.endFill(io, f);
-                        return err;
-                    };
-                },
+        {
+            var fills: std.ArrayList(*storage_cache.Cache.Fill) = .empty;
+            defer fills.deinit(self.allocator);
+            defer for (fills.items) |f| r.cache.endFill(io, f);
+            var runs: std.ArrayList(PageRun) = .empty;
+            defer runs.deinit(self.allocator);
+            for (0..pinned.len) |k| {
+                const p = (start + k) % pinned.len;
+                if (!needed.isSet(p)) continue;
+                switch (try r.cache.claim(self.pageKey(r, p))) {
+                    .hit => |e| pinned[p] = e,
+                    .busy => try busy.append(self.allocator, @intCast(p)),
+                    .fill => |f| {
+                        fills.append(self.allocator, f) catch |err| {
+                            r.cache.endFill(io, f);
+                            return err;
+                        };
+                        const last = if (runs.items.len > 0) &runs.items[runs.items.len - 1] else null;
+                        if (last != null and self.extendsRun(last.?.first, last.?.len, p)) {
+                            last.?.len += 1;
+                        } else {
+                            try runs.append(self.allocator, .{ .first = @intCast(p), .len = 1 });
+                        }
+                    },
+                }
+            }
+            if (runs.items.len > 0) {
+                var job: PageRunJob = .{ .column = self, .io = io, .r = r, .file = try self.listFile(io, r), .runs = runs.items, .pinned = pinned };
+                parallel.forJobs(list_read_threads, runs.items.len, &job, PageRunJob.run);
+                if (job.failure.err) |e| return e;
             }
         }
-        if (run.items.len > 0) try self.readRun(io, r, run_first, &run, pinned);
         for (busy.items) |p| pinned[p] = try self.pinPage(io, r, p);
     }
 
@@ -661,19 +677,15 @@ pub const ColumnList = struct {
         return next.offset + page_header_size + next.stored_len - self.readPage(first).offset <= pages_read_bytes;
     }
 
-    /// Reads in the run of pages from `first` on whose fills `run` holds,
-    /// in one read, pins each into `pinned` and ends the fills.
-    fn readRun(self: *ColumnList, io: Io, r: Reader, first: usize, run: *std.ArrayList(*storage_cache.Cache.Fill), pinned: []?*storage_cache.Cache.Entry) !void {
-        defer {
-            for (run.items) |f| r.cache.endFill(io, f);
-            run.clearRetainingCapacity();
-        }
-        const from = self.readPage(first).offset;
-        const last = self.readPage(first + run.items.len - 1);
+    /// Reads in `run`'s pages, whose fills the caller holds, in one read
+    /// and pins each into `pinned`.
+    fn readRun(self: *ColumnList, io: Io, r: Reader, file: Io.File, run: PageRun, pinned: []?*storage_cache.Cache.Entry) PageReadError!void {
+        const from = self.readPage(run.first).offset;
+        const last = self.readPage(run.first + run.len - 1);
         const stored = try self.allocator.alloc(u8, @intCast(last.offset + page_header_size + last.stored_len - from));
         defer self.allocator.free(stored);
-        if (try (try self.listFile(io, r)).readPositionalAll(io, stored, from) != stored.len) return format.Error.UnexpectedEof;
-        for (first..first + run.items.len) |p| {
+        if (try file.readPositionalAll(io, stored, from) != stored.len) return format.Error.UnexpectedEof;
+        for (run.first..run.first + run.len) |p| {
             const page = self.readPage(p);
             const at: usize = @intCast(page.offset - from);
             pinned[p] = try self.insertPage(r, p, stored[at..][0 .. page_header_size + page.stored_len]);
@@ -1572,6 +1584,22 @@ fn VerifyJob(comptime Values: type) type {
         }
     };
 }
+
+/// Reads in runs of a list's pages, a run a job (`ColumnList.pinPages`).
+const PageRunJob = struct {
+    column: *ColumnList,
+    io: Io,
+    r: Reader,
+    file: Io.File,
+    runs: []const ColumnList.PageRun,
+    pinned: []?*storage_cache.Cache.Entry,
+    failure: Failure(PageReadError) = .{},
+
+    fn run(self: *PageRunJob, _: usize, j: usize) void {
+        if (self.failure.stopped()) return;
+        self.column.readRun(self.io, self.r, self.file, self.runs[j], self.pinned) catch |e| self.failure.fail(e);
+    }
+};
 
 const SealJob = struct {
     allocator: Allocator,
