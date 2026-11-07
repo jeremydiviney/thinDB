@@ -1100,6 +1100,15 @@ fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant,
     if (request.where_filter) |where| {
         if (!try scan.tryFuseFilter(where)) return null;
     }
+    // A key column every segment stores table ids of is read as them: the
+    // first block of its values reads about every page of its list, its
+    // picked ids a page each.
+    var by_id: [MAX_GROUP_KEYS]?usize = @splat(null);
+    for (cols[0..col_count], by_id[0..col_count]) |name, *id_column| {
+        const ci = types.findColumn(table.schema.columns, name) orelse continue;
+        const id_count = (try table_id_distinct.intIdsReadable(table, snapshot, ci)) orelse continue;
+        if (try scan.setIntIdColumn(name, id_count)) id_column.* = ci;
+    }
 
     var tuples: std.StringHashMapUnmanaged(void) = .empty;
     var values: [MAX_GROUP_KEYS]std.StringHashMapUnmanaged(types.Value) = @splat(.empty);
@@ -1168,10 +1177,35 @@ fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant,
         var it = values[k].valueIterator();
         var i: usize = 0;
         while (it.next()) |v| : (i += 1) set_values[i] = v.*;
+        if (by_id[k]) |ci| {
+            if (!try nameIds(allocator, table, ci, set_values)) return null;
+        }
         try sets.append(allocator, .{ .col = name, .values = set_values, .negate = false, .rows = true });
     }
     if (sets.items.len == 0) return null;
     return sets.items;
+}
+
+/// Turns `cells`, table ids of fixed-width column `ci` a scan read in
+/// place of its values, into the values they name; false for a cell no id
+/// could be.
+fn nameIds(allocator: Allocator, table: *api.Table, ci: usize, cells: []types.Value) !bool {
+    const ids = try allocator.alloc(u32, cells.len);
+    defer allocator.free(ids);
+    for (cells, ids) |cell, *id| id.* = std.math.cast(u32, predicate.valueToRangeI128(cell) orelse return false) orelse return false;
+    const named = try allocator.alloc(i64, cells.len);
+    defer allocator.free(named);
+    try table.strings.fixedValues(table.io, ci, ids, std.mem.sliceAsBytes(named));
+    for (cells, named) |*cell, little| {
+        const v = std.mem.littleToNative(i64, little);
+        cell.* = switch (cell.*) {
+            .bigint => .{ .bigint = v },
+            .datetime => .{ .datetime = v },
+            .decimal64 => .{ .decimal64 = v },
+            else => return false,
+        };
+    }
+    return true;
 }
 
 /// The bytes that identify a key value, length-prefixed for text so a tuple of

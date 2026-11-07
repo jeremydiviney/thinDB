@@ -36,6 +36,12 @@
 //! record each, for readers to find them without reading every header:
 //!
 //!   record: [first_id: u32][count: u32][offset: u64][stored_len: u32][pad: 4]
+//!           [min: i64][max: i64]
+//!
+//! A write takes its new ids in value order, so a page's values span a
+//! slice of the column's range and a reader after a value's id
+//! (`fixedIdsOf`) reads only the pages whose span holds it: about one a
+//! write that brought new values.
 //!
 //! And a closed fixed-width column keeps its list: the segments that stored
 //! its ids still read through it.
@@ -220,6 +226,45 @@ pub const TableStrings = struct {
         }
     }
 
+    /// The table id of each of `values` of fixed-width column `ci` into
+    /// `out`, null for a value its list lacks, which no segment that stores
+    /// the column's ids holds. Reads the pages whose span holds a value.
+    pub fn fixedIdsOf(self: *TableStrings, io: Io, ci: usize, values: []const i64, out: []?u32) !void {
+        @memset(out, null);
+        const r = self.reader orelse return format.Error.CorruptColumnBlockHeader;
+        const c = if (ci < self.columns.len) (if (self.columns[ci]) |*col| col else null) else null;
+        const list = c orelse return format.Error.CorruptColumnBlockHeader;
+        if (list.width != 8) return format.Error.CorruptColumnBlockHeader;
+        const id_count = unpackState(list.column_idx, list.reader_state.load(.acquire)).id_count;
+        if (values.len == 0 or id_count == 0) return;
+        const count = try list.coverReads(io, r.table_dir.*, id_count);
+        var needed = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, count);
+        defer needed.deinit(self.allocator);
+        for (0..count) |p| {
+            const page = list.readPage(p);
+            for (values) |v| if (page.spans(v)) {
+                needed.set(p);
+                break;
+            };
+        }
+        if (needed.count() == 0) return;
+        const pinned = try self.allocator.alloc(?*storage_cache.Cache.Entry, count);
+        defer {
+            for (pinned) |p| if (p) |e| r.cache.release(e);
+            self.allocator.free(pinned);
+        }
+        @memset(pinned, null);
+        try list.pinPages(io, r, &needed, 0, pinned);
+        var it = needed.iterator(.{});
+        while (it.next()) |p| {
+            const page = list.readPage(p);
+            const stored = std.mem.bytesAsSlice(i64, pinned[p].?.bytes[0 .. @as(usize, page.count) * 8]);
+            for (values, out) |v, *id| if (id.* == null and page.spans(v)) {
+                if (std.mem.indexOfScalar(i64, stored, std.mem.nativeToLittle(i64, v))) |k| id.* = page.first_id + @as(u32, @intCast(k));
+            };
+        }
+    }
+
     /// Column `ci`'s state as the next publish would record it; null when
     /// the column takes no ids.
     pub fn state(self: *TableStrings, io: Io, ci: usize) ?State {
@@ -383,8 +428,11 @@ const Page = struct {
     count: u32,
     offset: u64,
     stored_len: u32,
+    /// The smallest and largest value of a fixed-width page.
+    min: i64 = std.math.minInt(i64),
+    max: i64 = std.math.maxInt(i64),
 
-    const record_size: usize = 24;
+    const record_size: usize = 40;
 
     fn record(self: Page) [record_size]u8 {
         var r: [record_size]u8 = @splat(0);
@@ -392,6 +440,8 @@ const Page = struct {
         format.writeU32(r[4..8], self.count);
         format.writeU64(r[8..16], self.offset);
         format.writeU32(r[16..20], self.stored_len);
+        format.writeU64(r[24..32], @bitCast(self.min));
+        format.writeU64(r[32..40], @bitCast(self.max));
         return r;
     }
 
@@ -401,7 +451,27 @@ const Page = struct {
             .count = format.readU32(r[4..8]),
             .offset = format.readU64(r[8..16]),
             .stored_len = format.readU32(r[16..20]),
+            .min = @bitCast(format.readU64(r[24..32])),
+            .max = @bitCast(format.readU64(r[32..40])),
         };
+    }
+
+    fn spans(self: Page, v: i64) bool {
+        return v >= self.min and v <= self.max;
+    }
+
+    /// Sets `min` and `max` from `raw`, a fixed-width page's values.
+    fn spanValues(self: *Page, raw: []const u8) void {
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+        var k: usize = 0;
+        while (k + 8 <= raw.len) : (k += 8) {
+            const v = std.mem.readInt(i64, raw[k..][0..8], .little);
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        self.min = lo;
+        self.max = hi;
     }
 };
 
@@ -1018,7 +1088,9 @@ pub const ColumnList = struct {
         offset = self.list_len;
         const first_new = self.pages.items.len;
         for (cuts.items, out) |c, page| {
-            self.pages.appendAssumeCapacity(.{ .first_id = self.sealed + c.lo, .count = c.hi - c.lo, .offset = offset, .stored_len = @intCast(page.len - page_header_size) });
+            const sealed_page = self.pages.addOneAssumeCapacity();
+            sealed_page.* = .{ .first_id = self.sealed + c.lo, .count = c.hi - c.lo, .offset = offset, .stored_len = @intCast(page.len - page_header_size) };
+            if (self.width > 0) sealed_page.spanValues(self.tail_bytes.items[self.tailStart(c.lo)..self.tailStart(c.hi)]);
             offset += page.len;
         }
         if (self.width > 0) {
@@ -1451,11 +1523,13 @@ fn ProbeJob(comptime Values: type) type {
     };
 }
 
+/// Indexes each page's values, and spans each fixed-width page's (`scanPages`
+/// reads only headers).
 const RebuildJob = struct {
     allocator: Allocator,
     io: Io,
     file: Io.File,
-    pages: []const Page,
+    pages: []Page,
     index: *Index,
     scratch: [parallel.MAX_THREADS]Scratch = @splat(.{}),
     failure: Failure(JobError) = .{},
@@ -1465,6 +1539,7 @@ const RebuildJob = struct {
         const page = self.pages[j];
         const view = self.scratch[t].read(self.allocator, self.io, self.file, page) catch |e| return self.failure.fail(e);
         const v = view orelse return self.failure.damage(j);
+        if (v.width > 0) self.pages[j].spanValues(v.raw);
         for (0..v.count) |k| self.index.insertShared(std.hash.Wyhash.hash(0, v.value(k)), page.first_id + @as(u32, @intCast(k)));
         _ = @atomicRmw(usize, &self.index.count, .Add, @as(usize, v.count), .monotonic);
     }

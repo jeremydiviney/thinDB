@@ -256,3 +256,56 @@ test "table strings keep fixed-width values in pages a reader pins" {
     try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = &extra }, &two, table_strings.admit_all));
     try std.testing.expectEqualSlices(u32, &.{ n, 0 }, &two);
 }
+
+test "table strings find a fixed-width value's id through the pages whose span holds it" {
+    const memory = @import("../memory.zig");
+    const storage_cache = @import("cache.zig");
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ts = try TableStrings.init(allocator, fixed_schema, &.{});
+    defer ts.deinit();
+
+    // Two writes of sorted values over one range, each a few pages.
+    const n = 20_000;
+    const values = try allocator.alloc(i64, 2 * n);
+    defer allocator.free(values);
+    for (values[0..n], 0..) |*v, i| v.* = userValue(2 * i);
+    for (values[n..], 0..) |*v, i| v.* = userValue(2 * i + 1);
+    const ids = try allocator.alloc(u32, 2 * n);
+    defer allocator.free(ids);
+    try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = values[0..n] }, ids[0..n], table_strings.admit_all));
+    var states = try ts.persist(allocator, io, tmp.dir, true);
+    allocator.free(states);
+    try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = values[n..] }, ids[n..], table_strings.admit_all));
+    states = try ts.persist(allocator, io, tmp.dir, true);
+    defer allocator.free(states);
+
+    var pool = memory.MemoryPool.init(1 << 24);
+    var cache = storage_cache.Cache.init(allocator, &pool, 0);
+    pool.shareCache(&cache, pool.budget);
+    defer cache.deinit();
+    const probe = [_]i64{ userValue(0), userValue(2 * n - 1), userValue(12_345), userValue(30_000), userValue(2 * n), userValue(0) - 1, std.math.minInt(i64) };
+    const want = [_]?u32{ 0, 2 * n - 1, n + 6_172, 15_000, null, null, null };
+    // Spans as written, then as a reopened writer rebuilt them from pages
+    // into a `.dir` cut short.
+    for (0..2) |round| {
+        ts.deinit();
+        ts = try TableStrings.init(allocator, fixed_schema, states);
+        ts.attach(io, &tmp.dir, &cache);
+        var got: [probe.len]?u32 = undefined;
+        try ts.fixedIdsOf(io, user_column, &probe, &got);
+        try std.testing.expectEqualSlices(?u32, &want, &got);
+        cache.purgeTable(ts.reader.?.uid);
+        if (round == 0) {
+            var strings_dir = try tmp.dir.openDir(io, table_strings.dir_name, .{});
+            defer strings_dir.close(io);
+            const dir_file = try strings_dir.openFile(io, std.fmt.comptimePrint("{d}.dir", .{user_column}), .{ .mode = .read_write });
+            defer dir_file.close(io);
+            try dir_file.setLength(io, 0);
+        }
+        var one: [1]u32 = undefined;
+        try std.testing.expect(try ts.resolve(io, tmp.dir, 4, user_column, FixedValues{ .items = values[5..6] }, &one, table_strings.admit_all));
+        try std.testing.expectEqual(@as(u32, 5), one[0]);
+    }
+}

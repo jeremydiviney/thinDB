@@ -61,6 +61,19 @@ const queries = [_][]const u8{
     // A few rows' values, fetched by location after the rows are picked.
     "SELECT id, u, ts, amt, k FROM {T} WHERE k = 1 ORDER BY id DESC LIMIT 6",
     "SELECT u, k, COUNT(*) AS c FROM {T} WHERE u > 1000000000000001 GROUP BY u, k ORDER BY c DESC, u, k LIMIT 4",
+    // Equality and IN over ids, by the literal's id: values the list holds
+    // and values it lacks, NULLs left out either way.
+    "SELECT id, u FROM {T} WHERE u = 1000000000000000 ORDER BY id",
+    "SELECT id, u FROM {T} WHERE u = 5 ORDER BY id",
+    "SELECT id, u, ts FROM {T} WHERE u <> 1039595000000080 ORDER BY id LIMIT 30",
+    "SELECT id FROM {T} WHERE u <> 1039595000000081 AND id < 60 ORDER BY id",
+    "SELECT id, u FROM {T} WHERE u IN (1039595000000080, 5, 1000000000000000) ORDER BY id",
+    "SELECT id, u FROM {T} WHERE u NOT IN (1039595000000080, 1000000000000000) AND id > 1100 ORDER BY id",
+    "SELECT id FROM {T} WHERE u = 1039595000000080 OR u = 1000000000000000 ORDER BY id",
+    "SELECT id, ts FROM {T} WHERE u = 1000000000000000 AND k = 2 ORDER BY id",
+    "SELECT COUNT(*), SUM(id) FROM {T} WHERE u = 1039595000000080",
+    "SELECT id, ts FROM {T} WHERE ts <> '2024-01-05 00:00:16' AND id < 40 ORDER BY id",
+    "SELECT id, amt FROM {T} WHERE amt = 1234567.07 ORDER BY id LIMIT 10",
 };
 
 /// Every row of `sql` over table `table`, its cells joined by `|` and its
@@ -114,16 +127,27 @@ fn sortLines(allocator: std.mem.Allocator, text: *std.ArrayList(u8)) !void {
     text.* = sorted;
 }
 
-/// Every query over `t` matches it over the memtable-only `r`.
+/// Drops `t`'s cached blocks and list pages, so the next query reads its
+/// row groups as a cold one does: ids where they store ids.
+fn purgeT(db: *thindb.Database) !void {
+    const t = try db.openTable("t", .{});
+    const tc = t.cacheRef();
+    tc.cache.purgeTable(tc.table_uid);
+    if (t.strings.reader) |r| tc.cache.purgeTable(r.uid);
+}
+
+/// Every query over `t` matches it over the memtable-only `r`, cold and
+/// then over what the cold run cached.
 fn expectMatchesOracle(allocator: std.mem.Allocator, db: *thindb.Database) !void {
-    for (queries) |sql| {
+    for (queries) |sql| for (0..2) |round| {
+        if (round == 0) try purgeT(db);
         const got = try rowsText(allocator, db, sql, "t");
         defer allocator.free(got);
         const want = try rowsText(allocator, db, sql, "r");
         defer allocator.free(want);
-        errdefer std.debug.print("query: {s}\n", .{sql});
+        errdefer std.debug.print("query (round {d}): {s}\n", .{ round, sql });
         try std.testing.expectEqualStrings(want, got);
-    }
+    };
 }
 
 /// Every query's rows over `t`, for a later `expectSameAs`.
@@ -139,12 +163,13 @@ fn capture(allocator: std.mem.Allocator, db: *thindb.Database) ![queries.len][]u
 }
 
 fn expectSameAs(allocator: std.mem.Allocator, db: *thindb.Database, captured: [queries.len][]u8) !void {
-    for (queries, captured) |sql, want| {
+    for (queries, captured) |sql, want| for (0..2) |round| {
+        if (round == 0) try purgeT(db);
         const got = try rowsText(allocator, db, sql, "t");
         defer allocator.free(got);
-        errdefer std.debug.print("query: {s}\n", .{sql});
+        errdefer std.debug.print("query (round {d}): {s}\n", .{ round, sql });
         try std.testing.expectEqualStrings(want, got);
-    }
+    };
 }
 
 fn freeCaptured(allocator: std.mem.Allocator, captured: [queries.len][]u8) void {
@@ -313,6 +338,10 @@ const scattered_queries = [_][]const u8{
     "SELECT * FROM {T} WHERE name = 'n3' ORDER BY id DESC LIMIT 4",
     "SELECT u, name, COUNT(*) FROM {T} GROUP BY u, name",
     "SELECT u, name, COUNT(*) AS c FROM {T} WHERE id % 7 = 2 GROUP BY u, name HAVING COUNT(*) > 1",
+    // One NOT NULL column filtered by and gathered: the literal per match.
+    "SELECT u FROM {T} WHERE u = 1039595000000080",
+    "SELECT u FROM {T} WHERE u = 1039595000000081",
+    "SELECT u FROM {T} WHERE u IN (1039595000000080, 1000000000000000, 7)",
 };
 
 test "table int ids: values come off a list of many pages for whole blocks and a few rows alike" {
@@ -358,4 +387,81 @@ test "table int ids: values come off a list of many pages for whole blocks and a
         errdefer std.debug.print("query: {s}\n", .{text});
         try std.testing.expectEqualStrings(want, got);
     }
+
+    // An unordered LIMIT picks any groups, by id here: each counts every row
+    // of its key.
+    const tc = s.cacheRef();
+    tc.cache.purgeTable(tc.table_uid);
+    tc.cache.purgeTable(s.strings.reader.?.uid);
+    const picked = try rowsText(allocator, db, "SELECT u, name, COUNT(*) FROM {T} GROUP BY u, name LIMIT 3", "s");
+    defer allocator.free(picked);
+    var lines = std.mem.splitScalar(u8, picked, '\n');
+    var groups: usize = 0;
+    while (lines.next()) |line| if (line.len > 0) {
+        var cells = std.mem.splitScalar(u8, line, '|');
+        const u = cells.next().?;
+        const name = cells.next().?;
+        const count = cells.next().?;
+        const check = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM {{T}} WHERE u = {s} AND name = '{s}'", .{ u, name });
+        defer allocator.free(check);
+        const want = try rowsText(allocator, db, check, "q");
+        defer allocator.free(want);
+        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, want, "\n"), count);
+        groups += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), groups);
+}
+
+/// Filters on `u` over ids in long runs, which its blocks store as runs.
+const run_queries = [_][]const u8{
+    "SELECT id, u FROM {T} WHERE u = 1039595000000080 ORDER BY id",
+    "SELECT COUNT(*) FROM {T} WHERE u <> 1039595000000080",
+    "SELECT id FROM {T} WHERE u <> 1039595000000080 AND id < 300 ORDER BY id",
+    "SELECT id, u FROM {T} WHERE u IN (1000000000000000, 1039595000000080, 3) ORDER BY id",
+    "SELECT COUNT(*), SUM(id) FROM {T} WHERE u NOT IN (1000000000000000, 1039595000000080)",
+    "SELECT id FROM {T} WHERE u = 1039595000000081 ORDER BY id",
+};
+
+test "table int ids: equality and IN read ids stored in runs by the literal's id" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db = try thindb.Database.open(allocator, io, tmp.dir, config);
+    defer db.close();
+    try exec(allocator, db, "CREATE TABLE p (id BIGINT NOT NULL, u BIGINT, PRIMARY KEY (id))");
+    try exec(allocator, db, "CREATE TABLE o (id BIGINT NOT NULL, u BIGINT, PRIMARY KEY (id))");
+    const p = try db.openTable("p", .{});
+
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(allocator);
+    for ([_][]const u8{ "p", "o" }) |table| {
+        sql.clearRetainingCapacity();
+        try sql.print(allocator, "INSERT INTO {s} (id, u) VALUES ", .{table});
+        for (0..4000) |id| {
+            if (id != 0) try sql.appendSlice(allocator, ", ");
+            const k: i64 = @intCast(id / 40);
+            if (id % 97 == 5) {
+                try sql.print(allocator, "({d}, NULL)", .{id});
+            } else {
+                try sql.print(allocator, "({d}, {d})", .{ id, u_base + k * u_step + @divExact(k * (k + 1), 2) });
+            }
+        }
+        try exec(allocator, db, sql.items);
+    }
+    try p.flush();
+    try expectIdSegments(allocator, p, 1, &.{true});
+
+    for (run_queries) |text| for (0..2) |round| {
+        if (round == 0) {
+            const tc = p.cacheRef();
+            tc.cache.purgeTable(tc.table_uid);
+            tc.cache.purgeTable(p.strings.reader.?.uid);
+        }
+        const got = try rowsText(allocator, db, text, "p");
+        defer allocator.free(got);
+        const want = try rowsText(allocator, db, text, "o");
+        defer allocator.free(want);
+        errdefer std.debug.print("query: {s}\n", .{text});
+        try std.testing.expectEqualStrings(want, got);
+    };
 }
