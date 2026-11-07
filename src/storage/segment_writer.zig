@@ -198,7 +198,7 @@ pub fn writeSegmentWithStrings(
     defer strings.deinit();
     var id_columns: IdColumns = try .init(allocator, columns.len);
     defer id_columns.deinit(allocator);
-    if (string_options.table_ids) |target| try id_columns.plan(allocator, target, columns, column_sketches, row_count);
+    if (string_options.table_ids) |target| try id_columns.plan(allocator, target, columns, column_sketches, row_count, row_group_size);
 
     var row_offset: usize = 0;
     while (row_offset < row_count) {
@@ -264,8 +264,9 @@ const IdColumns = struct {
     }
 
     /// Plans each fixed-width column of `target`'s table, its rows
-    /// `columns`, whose sketch in `sketches` leaves it a chance.
-    fn plan(self: *IdColumns, allocator: Allocator, target: table_strings.Target, columns: []const ColumnView, sketches: []const u8, rows: usize) !void {
+    /// `columns` in row groups of `group_rows`, whose sketch in
+    /// `sketches` leaves it a chance.
+    fn plan(self: *IdColumns, allocator: Allocator, target: table_strings.Target, columns: []const ColumnView, sketches: []const u8, rows: usize, group_rows: usize) !void {
         for (columns, 0..) |view, ci| {
             if (target.strings.fixedListWidth(ci) == null) continue;
             const state = target.strings.state(target.io, ci) orelse continue;
@@ -273,7 +274,7 @@ const IdColumns = struct {
             const distinct = hll.Hll.fromBytes(sketches[ci * hll.m ..][0..hll.m]).estimate();
             if (!int_ids.worthPlanning(rows, distinct - distinct / 16, state.id_count)) continue;
             var builder: int_ids.Builder = .init(allocator);
-            builder.add(view) catch |e| {
+            builder.addRowGroups(view, group_rows) catch |e| {
                 builder.deinit();
                 return e;
             };

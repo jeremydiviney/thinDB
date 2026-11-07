@@ -2,15 +2,19 @@
 //! column stores the table id of each row's value in place of the value,
 //! and each row's id when it does.
 //!
-//! A segment's column takes ids when its values are wide past the ids by
-//! `min_gain_bits` and each value it adds to the table's list serves enough
-//! of its rows: `wide_reuse` rows when the values are wide past the ids by
-//! `wide_gain_bits`, else `narrow_reuse`. Its ids are then as small as the
-//! list allows, and repeat as often as its values, so its blocks shrink by
-//! about the bits saved per row while the list costs each new value once.
-//! A column of values new to every row (an event id) takes none. The rule
-//! looks at one segment at a time, so a column may take ids in some
-//! segments and not others; readers see values either way.
+//! A segment's column takes ids when its value blocks spend `min_gain_bits`
+//! more on a row than its ids would, and each value it adds to the table's
+//! list serves `reuse` of its rows. A value block spends a row group's span
+//! of values (`GroupSpan`), so a column that clusters within its row groups
+//! (a timestamp in insert order) or holds one value through most of them
+//! takes none, and neither does a column of values new to every row (an
+//! event id). Its ids are as small as the list allows and repeat as often as
+//! its values, so its blocks shrink by about the bits saved per row while
+//! the list costs each new value once. Below `min_gain_bits` the codec
+//! closes most of the gap on its own: ClickBench's `ClientEventTime` spans
+//! ~31 bits a row group beside ids of ~20, and its blocks came out no
+//! smaller in ids. The rule looks at one segment at a time, so a column may
+//! take ids in some segments and not others; readers see values either way.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -20,10 +24,8 @@ const format = @import("format.zig");
 const table_strings = @import("table_strings.zig");
 const ColumnView = column.ColumnView;
 
-const min_gain_bits = 8;
-const wide_gain_bits = 16;
-const wide_reuse = 2;
-const narrow_reuse = 8;
+const min_gain_bits = 16;
+const reuse = 2;
 
 /// Bits that hold every value below `n`.
 fn bitsBelow(n: u64) u64 {
@@ -31,16 +33,14 @@ fn bitsBelow(n: u64) u64 {
 }
 
 /// The admission `TableStrings.resolve` asks of a segment's column: of
-/// `rows` non-NULL rows whose values span `value_bits` bits.
+/// `rows` non-NULL rows whose value blocks spend `value_bits` bits a row.
 const Admit = struct {
     rows: u64,
     value_bits: u64,
 
     pub fn admits(self: Admit, new_count: usize, id_count: u32) bool {
         const id_bits = bitsBelow(@as(u64, id_count) + new_count);
-        if (self.value_bits < id_bits + min_gain_bits) return false;
-        const reuse: u64 = if (self.value_bits - id_bits >= wide_gain_bits) wide_reuse else narrow_reuse;
-        return self.rows >= reuse * new_count;
+        return self.value_bits >= id_bits + min_gain_bits and self.rows >= reuse * new_count;
     }
 };
 
@@ -49,8 +49,37 @@ const Admit = struct {
 /// values number at least `distinct - id_count`.
 pub fn worthPlanning(rows: u64, distinct: u64, id_count: u32) bool {
     const fewest_new = distinct -| id_count;
-    return rows > 0 and rows >= wide_reuse * fewest_new;
+    return rows > 0 and rows >= reuse * fewest_new;
 }
+
+/// A row group's non-NULL values as its value block spans them: their
+/// offsets from the smallest, in steps of their common factor, which the
+/// block divides out (`int_streams`), so a microsecond timestamp of whole
+/// seconds spends a second's bits.
+pub const GroupSpan = struct {
+    rows: u64 = 0,
+    first: i64 = 0,
+    min: i64 = std.math.maxInt(i64),
+    max: i64 = std.math.minInt(i64),
+    step: u64 = 0,
+
+    pub fn add(self: *GroupSpan, v: i64) void {
+        if (self.rows == 0) self.first = v;
+        self.rows += 1;
+        self.min = @min(self.min, v);
+        self.max = @max(self.max, v);
+        // Any two values differ by a sum of their offsets from the first.
+        const d: u64 = if (v >= self.first) @bitCast(v -% self.first) else @bitCast(self.first -% v);
+        if (d == 0 or self.step == 1) return;
+        if (self.step == 0) self.step = d else if (d % self.step != 0) self.step = std.math.gcd(self.step, d);
+    }
+
+    fn bits(self: GroupSpan) u64 {
+        if (self.rows == 0) return 0;
+        const steps = @as(u64, @bitCast(self.max -% self.min)) / @max(self.step, 1);
+        return if (steps == std.math.maxInt(u64)) 64 else bitsBelow(steps + 1);
+    }
+};
 
 /// An open-addressed map of a column's values, to `slot_present` while a
 /// plan gathers them and to each one's table id plus one after.
@@ -117,8 +146,10 @@ pub const Builder = struct {
     allocator: Allocator,
     map: ValueMap = .{},
     rows: u64 = 0,
-    min: i64 = std.math.maxInt(i64),
-    max: i64 = std.math.minInt(i64),
+    // The bits the value blocks spend, summed over the rows of the row
+    // groups `addGroup` counted.
+    span_bits: u64 = 0,
+    span_rows: u64 = 0,
 
     pub fn init(allocator: Allocator) Builder {
         return .{ .allocator = allocator };
@@ -129,29 +160,39 @@ pub const Builder = struct {
         self.* = undefined;
     }
 
-    /// Adds `view`'s non-NULL values, of a fixed-width column.
+    /// Adds `view`'s non-NULL values, of a fixed-width column. Their row
+    /// groups are counted apart (`addGroup`).
     pub fn add(self: *Builder, view: ColumnView) !void {
         const values = valuesOf(view) orelse return format.Error.SchemaMismatch;
         for (values, 0..) |v, r| if (view.isValid(r)) {
             try self.map.put(self.allocator, v);
             self.rows += 1;
-            self.min = @min(self.min, v);
-            self.max = @max(self.max, v);
         };
     }
 
-    /// Bits a value block spends on each of the values added: their span in
-    /// steps of their common factor, which the block divides out
-    /// (`int_streams`), so a microsecond timestamp of whole seconds spends
-    /// a second's bits.
+    /// `add`s `view`'s rows, the segment's in order, and counts each
+    /// `group_rows` of them as a row group.
+    pub fn addRowGroups(self: *Builder, view: ColumnView, group_rows: usize) !void {
+        try self.add(view);
+        const values = valuesOf(view).?;
+        var start: usize = 0;
+        while (start < values.len) : (start += group_rows) {
+            var span: GroupSpan = .{};
+            for (values[start..@min(values.len, start + group_rows)], start..) |v, r| {
+                if (view.isValid(r)) span.add(v);
+            }
+            self.addGroup(span);
+        }
+    }
+
+    pub fn addGroup(self: *Builder, span: GroupSpan) void {
+        self.span_bits += span.bits() * span.rows;
+        self.span_rows += span.rows;
+    }
+
+    /// Bits a value block spends on each row counted, on average.
     fn valueBits(self: *const Builder) u64 {
-        var step: u64 = 0;
-        for (self.map.keys, self.map.vals) |k, v| if (v != 0) {
-            const off: u64 = @bitCast(k -% self.min);
-            if (off != 0 and step != 1) step = if (step == 0) off else std.math.gcd(step, off);
-        };
-        const steps = @as(u64, @bitCast(self.max -% self.min)) / @max(step, 1);
-        return if (steps == std.math.maxInt(u64)) 64 else bitsBelow(steps + 1);
+        return if (self.span_rows == 0) 0 else self.span_bits / self.span_rows;
     }
 
     /// The column's plan when `target`'s list of column `ci` admits its
@@ -260,7 +301,7 @@ fn orderI64(a: i64, b: i64) std.math.Order {
     return std.math.order(a, b);
 }
 
-fn valuesOf(view: ColumnView) ?[]const i64 {
+pub fn valuesOf(view: ColumnView) ?[]const i64 {
     return switch (view.data) {
         .bigint, .datetime, .decimal64 => |s| s,
         else => null,
@@ -271,12 +312,12 @@ test "a column takes ids when its values outgrow them and repeat" {
     const cases = .{
         // A user id: 64-bit values, six rows a new value.
         .{ .rows = 8_000_000, .value_bits = 60, .new = 1_280_000, .ids = 0, .admits = true },
+        // The same, repeated too little.
+        .{ .rows = 2_000_000, .value_bits = 60, .new = 1_280_000, .ids = 0, .admits = false },
         // An event id: new on every row.
         .{ .rows = 8_000_000, .value_bits = 62, .new = 8_000_000, .ids = 0, .admits = false },
-        // A timestamp a few bits past its ids, repeated often.
-        .{ .rows = 8_000_000, .value_bits = 30, .new = 250_000, .ids = 0, .admits = true },
-        // The same, repeated too little for the narrow gain.
-        .{ .rows = 1_000_000, .value_bits = 30, .new = 250_000, .ids = 0, .admits = false },
+        // A timestamp a dozen bits past its ids, which the codec makes up.
+        .{ .rows = 8_000_000, .value_bits = 30, .new = 250_000, .ids = 0, .admits = false },
         // A narrow code no id beats.
         .{ .rows = 8_000_000, .value_bits = 8, .new = 10, .ids = 0, .admits = false },
         // Values the list already holds.
@@ -288,21 +329,23 @@ test "a column takes ids when its values outgrow them and repeat" {
     }
 }
 
-test "a column's values cost their span in steps of their common factor" {
+test "a column's values cost their row groups' spans in steps of their common factor" {
     const allocator = std.testing.allocator;
     const second: i64 = 1_000_000;
     const cases = .{
-        .{ .values = [_]i64{ 0, 86_400 * second, 2 * 86_400 * second, 22 * 86_400 * second }, .bits = 5 },
-        .{ .values = [_]i64{ 1_700_000_000 * second, 1_700_000_001 * second, 1_700_000_007 * second, 1_700_002_047 * second }, .bits = 11 },
-        .{ .values = [_]i64{ -5, 0, 1, 1_000_000 }, .bits = 20 },
-        .{ .values = [_]i64{ std.math.minInt(i64), 0, 1, std.math.maxInt(i64) }, .bits = 64 },
-        .{ .values = [_]i64{ 9, 9, 9, 9 }, .bits = 0 },
+        .{ .values = [_]i64{ 0, 86_400 * second, 2 * 86_400 * second, 22 * 86_400 * second }, .group_rows = 4, .bits = 5 },
+        .{ .values = [_]i64{ 1_700_000_007 * second, 1_700_000_001 * second, 1_700_000_000 * second, 1_700_002_047 * second }, .group_rows = 4, .bits = 11 },
+        .{ .values = [_]i64{ -5, 0, 1, 1_000_000 }, .group_rows = 4, .bits = 20 },
+        .{ .values = [_]i64{ std.math.minInt(i64), 0, 1, std.math.maxInt(i64) }, .group_rows = 4, .bits = 64 },
+        .{ .values = [_]i64{ 9, 9, 9, 9 }, .group_rows = 4, .bits = 0 },
+        // Two row groups, each a narrow span of a wide range: (8 + 2) / 2.
+        .{ .values = [_]i64{ 1 << 40, (1 << 40) + 200, (1 << 40) + 7, 7, 4, 5 }, .group_rows = 3, .bits = 5 },
     };
     inline for (cases) |c| {
         var builder: Builder = .init(allocator);
         defer builder.deinit();
         var values = c.values;
-        try builder.add(.{ .data = .{ .bigint = &values } });
+        try builder.addRowGroups(.{ .data = .{ .bigint = &values } }, c.group_rows);
         try std.testing.expectEqual(@as(u64, c.bits), builder.valueBits());
     }
 }

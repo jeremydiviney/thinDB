@@ -901,6 +901,8 @@ const Load = struct {
                     if (w.decoded[ci] < units) continue;
                     switch (w.id_steps[ci]) {
                         .pending => {
+                            // The plan weighs the output's row groups.
+                            if (w.picked < w.groups.len) continue;
                             w.id_steps[ci] = .planning;
                             return .{ .id_plan = .{ .segment = s, .column = ci } };
                         },
@@ -955,10 +957,10 @@ const Load = struct {
             write.id_steps[ci] = .done;
             self.changed.broadcast(self.t.io);
         }
-        if (try self.unlocked(planIds, .{ self.t, seg, ci })) |plan| write.writer.useIdPlan(ci, plan);
+        if (try self.unlocked(planIds, .{ self.t, seg, write, ci })) |plan| write.writer.useIdPlan(ci, plan);
     }
 
-    fn planIds(t: *Table, seg: *const Segment, ci: usize) !?storage.int_ids.Plan {
+    fn planIds(t: *Table, seg: *const Segment, write: *const Write, ci: usize) !?storage.int_ids.Plan {
         const target = t.tableIdsTarget();
         const state = target.strings.state(target.io, ci) orelse return null;
         if (state.closed) return null;
@@ -971,6 +973,14 @@ const Load = struct {
             builder.deinit();
             return e;
         };
+        for (0..write.groups.len) |rg| {
+            var span: storage.int_ids.GroupSpan = .{};
+            for (write.picksOf(rg)) |p| {
+                const view = seg.batches[p.batch].?.views[ci];
+                if (view.isValid(p.row)) span.add(storage.int_ids.valuesOf(view).?[p.row]);
+            }
+            builder.addGroup(span);
+        }
         return builder.finish(target, ci);
     }
 

@@ -4,7 +4,8 @@
 //! `parquet/types_expected.txt` is DuckDB's own text of every value, so each
 //! load is checked cell by cell. `parquet/multi.parquet` holds 9000 rows in
 //! five row groups, for segment cuts, lanes, failure cleanup and the SQL
-//! path, `INSERT ... SELECT * FROM read_parquet(...)`.
+//! path, `INSERT ... SELECT * FROM read_parquet(...)`. `parquet/ids.parquet`
+//! holds a column of repeated wide values, for table ids (DESIGN.md §4.7).
 
 const std = @import("std");
 const thindb = @import("thindb");
@@ -194,6 +195,36 @@ test "bulk load cuts whole row groups into sorted segments and appends them" {
     try std.testing.expectEqual(@as(u64, 0), empty.rows);
     try std.testing.expectEqual(@as(usize, 0), empty.segments);
     try std.testing.expectEqual(@as(usize, 8), t.manifest.segments.items.len);
+}
+
+test "bulk load stores a column's repeated wide values as table ids, weighed over its output row groups" {
+    const allocator = std.testing.allocator;
+    var fx = try Fixture.init(allocator);
+    defer fx.deinit();
+    // `parquet/ids.parquet`: 9000 rows, `u` 37 wide values cycling with id
+    // (every 13th NULL), `ts` a new second on every row.
+    try exec(allocator, fx.db, "CREATE TABLE b (id BIGINT NOT NULL, grp VARCHAR NOT NULL, u BIGINT, ts DATETIME NOT NULL) ORDER BY (grp, id)");
+    try fx.put("ids.parquet", @embedFile("parquet/ids.parquet"));
+    const stats = try fx.load("b", "ids.parquet", .{ .segment_rows = 4096, .threads = 4 });
+    try std.testing.expectEqual(@as(usize, 3), stats.segments);
+
+    const t = try fx.db.openTable("b", .{});
+    for (t.manifest.segments.items) |entry| {
+        var name_buf: [32]u8 = undefined;
+        const name = try thindb.Table.segmentFileName(&name_buf, entry.segment_id);
+        var seg = try thindb.storage.readSegment(allocator, t.io, t.segments_dir, name, t.schema);
+        defer seg.deinit();
+        try std.testing.expect(seg.info.intIdColumn(2));
+        try std.testing.expect(!seg.info.intIdColumn(3));
+    }
+
+    try helpers.expectText(allocator, fx.db, "SELECT COUNT(DISTINCT u) FROM b", "37");
+    try helpers.expectText(allocator, fx.db, "SELECT COUNT(DISTINCT u) FROM b WHERE grp = 'g4'", "37");
+    try helpers.expectText(allocator, fx.db, "SELECT COUNT(u) FROM b", "8307");
+    try helpers.expectText(allocator, fx.db, "SELECT SUM(u - 1000000000000000) FROM b", "1183336170003835134");
+    try helpers.expectText(allocator, fx.db, "SELECT COUNT(*) FROM b WHERE u = 1007919000000014", "225");
+    try helpers.expectText(allocator, fx.db, "SELECT MAX(id) FROM b WHERE u = 1007919000000014", "8992");
+    try helpers.expectTexts(allocator, fx.db, "SELECT u FROM b WHERE u IS NOT NULL GROUP BY u ORDER BY COUNT(*) DESC, u LIMIT 3", &.{ "1055433000000119", "1000000000000000", "1007919000000014" });
 }
 
 test "INSERT ... SELECT * from a Parquet file bulk-loads, pairing columns by position" {
