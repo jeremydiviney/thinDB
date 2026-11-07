@@ -97,6 +97,7 @@ fn openScanSource(
     derived: []const compute.Derived,
     hash_cols: []const []const u8,
     id_cols: []const bool,
+    int_id_cols: []const IntIdColumn,
     aggs: []const AggSpec,
     snap: ?Scan.Snapshot,
     registry: ?*const udf_mod.UdfRegistry,
@@ -106,6 +107,9 @@ fn openScanSource(
     if (where_filter) |w| {
         // Never produce a result from an unapplied filter.
         if (!try scan.tryFuseFilter(w)) return error.UnsupportedQueryShape;
+    }
+    for (int_id_cols) |c| {
+        if (!try scan.setIntIdColumn(c.name, c.id_count)) return error.UnsupportedQueryShape;
     }
     // A decline (nullable column) or a sidecar-less batch falls back to
     // digesting the materialized bytes in the fold — same digest either way.
@@ -205,9 +209,9 @@ const AggPlan = struct {
     input_scale: u8 = 0,
     // Distinct-key derivation; meaningful only for .count_distinct.
     dkind: DistinctKind = .int,
-    // A string COUNT(DISTINCT) the scan feeds by table id (DESIGN.md §4.6):
+    // A COUNT(DISTINCT) the scan feeds by table id (DESIGN.md §4.6, §4.7):
     // every lane marks its rows' ids in one shared bitmap, `id_map`, instead
-    // of a digest set.
+    // of a set.
     by_table_id: bool = false,
     id_map: []u64 = &.{},
     output_type: Type,
@@ -615,6 +619,7 @@ fn foldExtremeFloatGlobal(comptime is_min: bool, view: ColumnView, n: usize, ns:
 // field's shared set, on the serial path into the lane's own set through a
 // `DistinctFeed`, which overlaps the set probes' cache misses.
 fn foldDistinctGlobal(lane: *Lane, p: AggPlan, i: usize, view: ColumnView, digests: ?[]const u128, dict: ?exec.BlockDictColumn, n: usize) !void {
+    if (p.by_table_id and p.dkind != .string) return markIntIds(p.id_map, view, n, &lane.ns[i]);
     if (p.by_table_id) {
         const d = dict orelse return error.UnsupportedQueryShape;
         lane.ns[i] += n;
@@ -636,6 +641,40 @@ fn markTableIds(map: []u64, dict: exec.BlockDictColumn, ids: []const u32, n: usi
         return;
     }
     for (dict.codes[0..n]) |c| try setIdBit(map, ids[c]);
+}
+
+// Marks the table id each non-NULL row of an int-id column holds (§4.7).
+// Its rows hold their values' runs, so a row repeating the one before marks
+// nothing new.
+fn markIntIds(map: []u64, view: ColumnView, n: usize, ns: *u64) !void {
+    const ids = switch (view.data) {
+        .bigint, .datetime, .decimal64 => |d| d,
+        else => return error.UnsupportedQueryShape,
+    };
+    var prev: i64 = -1;
+    var valid: u64 = 0;
+    for (ids[0..n], 0..) |id, r| {
+        if (!view.isValid(r)) continue;
+        valid += 1;
+        if (id == prev) continue;
+        prev = id;
+        try setIdBit(map, std.math.cast(u32, id) orelse return storage.format.Error.CorruptColumnBlockHeader);
+    }
+    ns.* += valid;
+}
+
+fn markIntIdRuns(map: []u64, runs: storage.segment_reader.RleBlock, row_count: u32, ns: *u64) !void {
+    if (runs.value_width != 8) return error.CorruptColumnBlockHeader;
+    var count: u64 = 0;
+    for (0..runs.n_runs) |r| {
+        const length = runs.runLength(r);
+        if (length == 0 or length > row_count -| count) return error.CorruptColumnBlockHeader;
+        count += length;
+        const id = std.mem.readInt(i64, runs.values[r * 8 ..][0..8], .little);
+        try setIdBit(map, std.math.cast(u32, id) orelse return storage.format.Error.CorruptColumnBlockHeader);
+    }
+    if (count != row_count) return error.CorruptColumnBlockHeader;
+    ns.* += count;
 }
 
 // Most rows repeat a value some row already marked, so a plain load finds
@@ -953,7 +992,9 @@ const EncodedFold = struct {
             const block = batch.blocks[idx];
             if (block.encoding == .rle) {
                 const runs = storage.segment_reader.rleViewOf(block.bytes, batch.row_count, .{}).block;
-                if (p.op == .count_distinct) {
+                if (p.op == .count_distinct and p.by_table_id) {
+                    try markIntIdRuns(p.id_map, runs, batch.row_count, &self.lane.ns[i]);
+                } else if (p.op == .count_distinct) {
                     try foldDistinctRunsGlobal(self.lane, i, col.type, runs, batch.row_count);
                 } else try fold_run_aggregate(self.lane, p, i, col.type, runs, batch.row_count);
                 continue;
@@ -1290,7 +1331,7 @@ pub fn tryBuild(allocator: Allocator, table: *api.Table, request: Request) !?Que
         defer if (probe) |*p| p.deinit();
         var probe_schema: ?[]const Column = null;
         if (request.derived.len > 0) {
-            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, &.{}, &.{}, null, request.udf_registry);
+            probe = try openScanSource(allocator, table, needed.items, null, request.derived, &.{}, &.{}, &.{}, &.{}, null, request.udf_registry);
             probe_schema = probe.?.schema();
         }
         for (request.aggs, plans) |agg, *p| {
@@ -1419,6 +1460,8 @@ fn addNeeded(allocator: Allocator, needed: *std.ArrayListUnmanaged([]const u8), 
     return idx;
 }
 
+const IntIdColumn = struct { name: []const u8, id_count: u32 };
+
 const GlobalAggregate = struct {
     allocator: Allocator,
     table: *api.Table,
@@ -1434,6 +1477,8 @@ const GlobalAggregate = struct {
     // Which of `hash_cols` the scans read by table id instead, decided once
     // the snapshot is taken (`markTableIdPlans`).
     id_cols: []bool = &.{},
+    // The fixed-width columns the scans read by table id (`markTableIdPlans`).
+    int_id_cols: std.ArrayListUnmanaged(IntIdColumn) = .empty,
     output_schema: []Column,
     output_cols: []ColumnStore,
     views: []ColumnView,
@@ -1495,6 +1540,7 @@ const GlobalAggregate = struct {
         self.allocator.free(@constCast(self.needed));
         if (self.hash_cols.len > 0) self.allocator.free(@constCast(self.hash_cols));
         self.allocator.free(self.id_cols);
+        self.int_id_cols.deinit(self.allocator);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -1577,7 +1623,7 @@ const GlobalAggregate = struct {
     }
 
     fn openScan(self: *GlobalAggregate, allocator: Allocator, snap: ?Scan.Snapshot) !ScanSource {
-        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, self.id_cols, self.aggs, snap, self.udf_registry);
+        return openScanSource(allocator, self.table, self.needed, self.where_filter, self.derived, self.hash_cols, self.id_cols, self.int_id_cols.items, self.aggs, snap, self.udf_registry);
     }
 
     /// Marks each string COUNT(DISTINCT) whose column the scans of `snap`
@@ -1599,6 +1645,31 @@ const GlobalAggregate = struct {
                 p.by_table_id = true;
             }
         }
+        for (self.plans) |*p| {
+            if (p.op != .count_distinct or p.is_udf or p.dkind != .int) continue;
+            const name = p.input_name orelse continue;
+            if (!self.readsOnlyDistinct(name)) continue;
+            const column_idx = types.findColumn(table.schema.columns, name) orelse continue;
+            const id_count = (try table_id_distinct.intIdsReadable(table, snap, column_idx)) orelse continue;
+            p.id_map = try self.allocator.alloc(u64, (@as(usize, id_count) + 63) / 64);
+            @memset(p.id_map, 0);
+            p.by_table_id = true;
+            for (self.int_id_cols.items) |c| {
+                if (types.columnNameEql(c.name, name)) break;
+            } else try self.int_id_cols.append(self.allocator, .{ .name = name, .id_count = id_count });
+        }
+    }
+
+    /// Whether only COUNT(DISTINCT)s read column `name`: the scans may then
+    /// read it by table id (§4.7).
+    fn readsOnlyDistinct(self: *const GlobalAggregate, name: []const u8) bool {
+        if (self.where_filter) |w| if (exec.predicate.touchesColumn(w, name)) return false;
+        for (self.plans) |p| {
+            for (p.udf_arg_names) |arg| if (types.columnNameEql(arg, name)) return false;
+            if (p.op == .count_distinct and !p.is_udf) continue;
+            if (types.columnNameEql(p.input_name orelse continue, name)) return false;
+        }
+        return true;
     }
 
     fn reduceSerial(self: *GlobalAggregate) !Lane {

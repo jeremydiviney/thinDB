@@ -72,6 +72,7 @@ const store = @import("../engine/store.zig");
 const ColumnStore = store.ColumnStore;
 
 const exec = @import("exec.zig");
+const table_id_distinct = @import("table_id_distinct.zig");
 const aggregate = @import("aggregate.zig");
 const compute = @import("compute.zig");
 const udf_mod = @import("../udf.zig");
@@ -179,6 +180,10 @@ const AggPlan = struct {
     distinct_kind: DistinctKind = .int,
     value_bits: u8 = 0,
     tier: DistinctSet.Tier = .u64,
+    // An integer count_distinct whose scans read its column's table ids
+    // (DESIGN.md §4.7, `LowCardGroup.readIntIds`): how many the list held.
+    // 0 while they read values.
+    int_id_count: u32 = 0,
 };
 
 fn keyTypeBits(t: Type) ?u8 {
@@ -684,6 +689,7 @@ fn openScanSource(
     }
     for (aggs, 0..) |a, i| {
         if (a.op == .count_distinct and a.distinct_kind == .coded) _ = scan.setDictCodeColumn(a.input_name.?, distinct_dicts[i].?);
+        if (a.int_id_count > 0 and !try scan.setIntIdColumn(a.input_name.?, a.int_id_count)) return error.UnsupportedQueryShape;
     }
     if (derived.len == 0) return .{ .scan = scan, .drive = drive };
     for (needed) |name| {
@@ -1789,6 +1795,28 @@ const LowCardGroup = struct {
         try self.emitSorted(&merged);
     }
 
+    /// Has each integer COUNT(DISTINCT) whose column nothing else reads
+    /// count its column's table ids (DESIGN.md §4.7) where every segment of
+    /// `snap` stores them: its composites then spend only the ids' bits on
+    /// the value, and often fit the narrow tier.
+    fn readIntIds(self: *LowCardGroup, snap: Scan.Snapshot) !void {
+        if (self.derived.len != 0) return;
+        outer: for (self.aggs) |*a| {
+            if (a.op != .count_distinct or a.distinct_kind != .int) continue;
+            const name = a.input_name.?;
+            if (!try readOnlyBy(self.allocator, self.derived, self.aggs, a, name)) continue;
+            if (self.where_filter) |w| if (exec.predicate.touchesColumn(w, name)) continue;
+            for (self.parts[0..self.part_count]) |part| {
+                if (types.columnNameEql(part.name, name)) continue :outer;
+            }
+            const column_idx = types.findColumn(self.table.schema.columns, name) orelse continue;
+            const id_count = (try table_id_distinct.intIdsReadable(self.table, snap, column_idx)) orelse continue;
+            a.int_id_count = id_count;
+            a.value_bits = if (id_count <= 1) 1 else @intCast(32 - @clz(id_count - 1));
+            a.tier = tierFor(@as(u16, self.key_bits) + a.value_bits);
+        }
+    }
+
     fn reduceParallel(self: *LowCardGroup) !Merged {
         const table = self.table;
         const allocator = self.allocator;
@@ -1799,6 +1827,7 @@ const LowCardGroup = struct {
         var pin_held = true;
         defer if (pin_held) snap.release(table);
         defer allocator.free(snap.segments);
+        try self.readIntIds(snap);
 
         const seg_start = try allocator.alloc(usize, snap.segment_count + 1);
         defer allocator.free(seg_start);

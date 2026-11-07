@@ -31,6 +31,7 @@ const SingleBatchSource = @import("single_batch.zig").SingleBatchSource;
 const parallel = @import("../util/parallel.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const rowloc = @import("rowloc.zig");
+const table_id_distinct = @import("table_id_distinct.zig");
 
 const Batch = exec.Batch;
 const Query = exec.Query;
@@ -222,6 +223,8 @@ const ExecutionContext = struct {
     raw_batch_chunks: usize = DEFAULT_RAW_BATCH_CHUNKS,
     shared_stage_builders: bool = true,
     offered_prunes: Scan.OfferedPrunes = .{},
+    // The columns the run reads by table id (`intIdColumns`).
+    int_id_columns: []const SiloCore.IntIdColumn = &.{},
     // Borrowed from the pipeline.
     order_keys: []const OrderKey = &.{},
     prefix_keys: []const OrderKey = &.{},
@@ -666,6 +669,8 @@ const GroupTopNPipeline = struct {
         ctx.offered_prunes = .{ .ranges = self.offered_ranges.items, .sets = offered_sets };
         ctx.order_keys = self.order_keys;
         ctx.prefix_keys = self.prefix_keys;
+        var id_columns_buf: [MAX_GROUP_KEYS + MAX_AGGS]SiloCore.IntIdColumn = undefined;
+        ctx.int_id_columns = try intIdColumns(self, snapshot, ctx.offered_prunes, &id_columns_buf);
         var rows = try runGroupTopNStage(&ctx);
         defer rows.deinit();
         const emit_t0 = exec.prof.nowTicks();
@@ -674,6 +679,8 @@ const GroupTopNPipeline = struct {
         var final_rows = try prepareFinalRows(self, grouped);
         defer final_rows.deinit();
         try exec.memory.checkCancelled(self.allocator);
+        // A hashed key's values come back by rowref, read as values.
+        if (!self.plan.hashed) try keyValuesOfIntIds(self, ctx.int_id_columns, final_rows.items);
         try emitResultStage(self, snapshot, final_rows.items);
         ctx.times.emit_ticks = exec.prof.nowTicks() - emit_t0;
         traceProfile(ctx);
@@ -825,6 +832,7 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
             else
                 null,
             .having_bound = having_bound,
+            .int_id_columns = ctx.int_id_columns,
         },
         .params = params,
         .scan_columns = scan_columns,
@@ -841,6 +849,109 @@ fn runGroupTopNStage(ctx: *ExecutionContext) !TopRows {
     const rows = result.rows;
     result.rows = &.{};
     return .{ .allocator = result.allocator, .items = rows };
+}
+
+/// The group keys and COUNT(DISTINCT) inputs the run reads by table id
+/// (DESIGN.md §4.7), listed in `buf`: table columns every segment of
+/// `snapshot` stores in ids, which the run only tells apart
+/// (`readsOnlyIdentity`).
+fn intIdColumns(op: *const GroupTopNPipeline, snapshot: Scan.Snapshot, prunes: Scan.OfferedPrunes, buf: []SiloCore.IntIdColumn) ![]const SiloCore.IntIdColumn {
+    const plan = &op.plan;
+    if (op.request.computed_where != null or snapshot.memtable_row_count != 0) return &.{};
+    var n: usize = 0;
+    for (0..plan.layout.part_count + plan.aggregate_count) |c| {
+        const name = if (c < plan.layout.part_count) plan.layout.parts[c].name else name: {
+            const agg = plan.aggregates[c - plan.layout.part_count];
+            if (agg.func != .count_distinct or agg.distinct_str) continue;
+            break :name plan.aggregate_inputs[agg.input_column_index orelse continue].source_name;
+        };
+        if (n == buf.len) break;
+        for (buf[0..n]) |listed| {
+            if (types.columnNameEql(listed.name, name)) break;
+        } else {
+            if (!try readsOnlyIdentity(op, prunes, name)) continue;
+            const column_idx = types.findColumn(op.table.schema.columns, name) orelse continue;
+            const id_count = (try table_id_distinct.intIdsReadable(op.table, snapshot, column_idx)) orelse continue;
+            buf[n] = .{ .name = name, .id_count = id_count };
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// Whether the run reads column `name` only to tell its values apart, as a
+/// group key or a COUNT(DISTINCT) input: no filter, expression, ordering,
+/// bound, hint or other aggregate reads it.
+fn readsOnlyIdentity(op: *const GroupTopNPipeline, prunes: Scan.OfferedPrunes, name: []const u8) !bool {
+    const request = op.request;
+    const plan = &op.plan;
+    if (findDerived(plan.derived, name) != null) return false;
+    for (plan.derived) |d| {
+        var refs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer refs.deinit(op.allocator);
+        try compute.collectColumnRefs(op.allocator, &refs, d.expr);
+        for (refs.items) |ref| if (types.columnNameEql(ref, name)) return false;
+    }
+    const filters = [_]?PredicateExpr{ request.where_filter, request.residual_filter, request.having_filter, request.bound_having };
+    for (filters) |filter| {
+        if (filter) |f| if (predicate.touchesColumn(f, name)) return false;
+    }
+    for (plan.aggregates[0..plan.aggregate_count]) |agg| {
+        for (agg.udf_arg_input_indices[0..agg.udf_arg_count]) |idx| {
+            if (types.columnNameEql(plan.aggregate_inputs[idx].source_name, name)) return false;
+        }
+        if (agg.func == .count_distinct) continue;
+        const idx = agg.input_column_index orelse continue;
+        if (types.columnNameEql(plan.aggregate_inputs[idx].source_name, name)) return false;
+    }
+    for ([_][]const OrderKey{ op.order_keys, op.prefix_keys }) |keys| {
+        for (keys) |key| switch (key.target) {
+            .part => |part| if (types.columnNameEql(part.name, name)) return false,
+            .aggregate => {},
+        };
+    }
+    for (request.order_specs) |spec| if (types.columnNameEql(spec.col, name)) return false;
+    if (request.prefix_rank) |rank| for (rank.specs) |spec| {
+        if (types.columnNameEql(spec.col, name)) return false;
+    };
+    if (request.key_bound) |kb| if (types.columnNameEql(kb.col, name)) return false;
+    for (prunes.ranges) |range| if (types.columnNameEql(range.col, name)) return false;
+    for (prunes.sets) |set| if (types.columnNameEql(set.col, name)) return false;
+    return true;
+}
+
+/// Turns each packed key part the run read by table id (`int_id_columns`)
+/// back into the value its id names, in place, ahead of the emit.
+fn keyValuesOfIntIds(op: *const GroupTopNPipeline, id_columns: []const SiloCore.IntIdColumn, rows: []SiloCore.TopRow) !void {
+    if (id_columns.len == 0 or rows.len == 0) return;
+    const table = op.table;
+    const ids = try op.allocator.alloc(u32, rows.len);
+    defer op.allocator.free(ids);
+    const values = try op.allocator.alloc(u8, rows.len * @sizeOf(u64));
+    defer op.allocator.free(values);
+    for (op.plan.layout.parts[0..op.plan.layout.part_count]) |part| {
+        for (id_columns) |c| {
+            if (types.columnNameEql(c.name, part.name)) break;
+        } else continue;
+        if (keyPartPayloadBits(part) != 64) return error.UnsupportedQueryShape;
+        const column_idx = types.findColumn(table.schema.columns, part.name) orelse return error.ColumnNotFound;
+        const shift: u7 = @intCast(part.offset_bits);
+        const mask: u128 = std.math.maxInt(u64);
+        var n: usize = 0;
+        for (rows) |row| {
+            if (part.nullable and keyPartIsNull(part, row.key)) continue;
+            ids[n] = std.math.cast(u32, (row.key >> shift) & mask) orelse return storage.format.Error.CorruptColumnBlockHeader;
+            n += 1;
+        }
+        try table.strings.fixedValues(table.io, column_idx, ids[0..n], values[0 .. n * @sizeOf(u64)]);
+        var k: usize = 0;
+        for (rows) |*row| {
+            if (part.nullable and keyPartIsNull(part, row.key)) continue;
+            const value = std.mem.readInt(u64, values[k * @sizeOf(u64) ..][0..@sizeOf(u64)], .little);
+            row.key = (row.key & ~(mask << shift)) | (@as(u128, value) << shift);
+            k += 1;
+        }
+    }
 }
 
 fn canUseCoreCountDescTopN(ctx: *const ExecutionContext) bool {
@@ -989,6 +1100,15 @@ fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant,
     if (request.where_filter) |where| {
         if (!try scan.tryFuseFilter(where)) return null;
     }
+    // A key column every segment stores table ids of is read as them: the
+    // first block of its values reads about every page of its list, its
+    // picked ids a page each.
+    var by_id: [MAX_GROUP_KEYS]?usize = @splat(null);
+    for (cols[0..col_count], by_id[0..col_count]) |name, *id_column| {
+        const ci = types.findColumn(table.schema.columns, name) orelse continue;
+        const id_count = (try table_id_distinct.intIdsReadable(table, snapshot, ci)) orelse continue;
+        if (try scan.setIntIdColumn(name, id_count)) id_column.* = ci;
+    }
 
     var tuples: std.StringHashMapUnmanaged(void) = .empty;
     var values: [MAX_GROUP_KEYS]std.StringHashMapUnmanaged(types.Value) = @splat(.empty);
@@ -1057,10 +1177,35 @@ fn pickKeySets(allocator: Allocator, accountant: ?*exec.memory.MemoryAccountant,
         var it = values[k].valueIterator();
         var i: usize = 0;
         while (it.next()) |v| : (i += 1) set_values[i] = v.*;
+        if (by_id[k]) |ci| {
+            if (!try nameIds(allocator, table, ci, set_values)) return null;
+        }
         try sets.append(allocator, .{ .col = name, .values = set_values, .negate = false, .rows = true });
     }
     if (sets.items.len == 0) return null;
     return sets.items;
+}
+
+/// Turns `cells`, table ids of fixed-width column `ci` a scan read in
+/// place of its values, into the values they name; false for a cell no id
+/// could be.
+fn nameIds(allocator: Allocator, table: *api.Table, ci: usize, cells: []types.Value) !bool {
+    const ids = try allocator.alloc(u32, cells.len);
+    defer allocator.free(ids);
+    for (cells, ids) |cell, *id| id.* = std.math.cast(u32, predicate.valueToRangeI128(cell) orelse return false) orelse return false;
+    const named = try allocator.alloc(i64, cells.len);
+    defer allocator.free(named);
+    try table.strings.fixedValues(table.io, ci, ids, std.mem.sliceAsBytes(named));
+    for (cells, named) |*cell, little| {
+        const v = std.mem.littleToNative(i64, little);
+        cell.* = switch (cell.*) {
+            .bigint => .{ .bigint = v },
+            .datetime => .{ .datetime = v },
+            .decimal64 => .{ .decimal64 = v },
+            else => return false,
+        };
+    }
+    return true;
 }
 
 /// The bytes that identify a key value, length-prefixed for text so a tuple of

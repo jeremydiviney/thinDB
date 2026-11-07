@@ -327,6 +327,7 @@ const MergeCursor = struct {
         const file_name = try Table.segmentFileName(&name_buf, id);
         var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
         errdefer seg.deinit();
+        seg.lists = &t.strings;
 
         const tombs = try t.readTombstones(t.allocator, id);
         errdefer if (tombs) |x| t.allocator.free(x);
@@ -586,6 +587,14 @@ fn streamMerge(
     var writer_finished = false;
     errdefer if (!writer_finished) writer.deinit();
     writer.useTableIds(t.tableIdsTarget());
+    // A column every input stores in table ids stays in them: its values
+    // are in the list already.
+    for (0..ncols) |ci| {
+        if (t.strings.fixedListWidth(ci) == null) continue;
+        for (cursors[0..opened]) |*c| {
+            if (!c.seg.info.intIdColumn(ci)) break;
+        } else writer.mergeIds(ci);
+    }
 
     // Output row-group accumulator: one ColumnStore per column, reused across
     // row-groups (cleared, capacity retained). Flushed to `writer` each time it
@@ -1041,6 +1050,7 @@ fn collectKeysForOffsets(
     const file_name = try Table.segmentFileName(&name_buf, seg_id);
     var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
     defer seg.deinit();
+    seg.lists = &t.strings;
 
     var rg_arena = std.heap.ArenaAllocator.init(t.allocator);
     defer rg_arena.deinit();
@@ -1081,6 +1091,7 @@ fn tombstoneKeysInSegment(
     const file_name = try Table.segmentFileName(&name_buf, seg_id);
     var seg = try storage.readSegment(t.allocator, t.io, t.segments_dir, file_name, t.schema);
     defer seg.deinit();
+    seg.lists = &t.strings;
 
     var rg_arena = std.heap.ArenaAllocator.init(t.allocator);
     defer rg_arena.deinit();
@@ -1202,6 +1213,7 @@ test "commitMerge re-applies deletes that land during the aside merge" {
     const file_name = try Table.segmentFileName(&name_buf, new_id);
     var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
     defer seg.deinit();
+    seg.lists = &t.strings;
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
     for (seg.info.row_groups, 0..) |_, rg_idx| {
@@ -1337,6 +1349,7 @@ test "a background merge abandons its commit when readers outlast the deadline" 
     const file_name = try Table.segmentFileName(&name_buf, t.manifest.segments.items[0].segment_id);
     var seg = try storage.readSegment(allocator, io, t.segments_dir, file_name, schema);
     defer seg.deinit();
+    seg.lists = &t.strings;
     var ids: std.ArrayList(i64) = .empty;
     defer ids.deinit(allocator);
     for (seg.info.row_groups, 0..) |_, rg_idx| {

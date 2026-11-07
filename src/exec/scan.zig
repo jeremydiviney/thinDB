@@ -737,6 +737,14 @@ pub const Scan = struct {
     schema_stats: []const exec.ColStat = &.{},
     /// `exec.snapshotId` of the segment set and memtable this scan reads.
     snapshot_id: u64 = 0,
+    /// Per table column, whether this scan reads its blocks' table ids
+    /// (DESIGN.md §4.7) in place of the values they name, and how many ids
+    /// its list held (`setIntIdColumn`); empty until one does.
+    int_id_cols: []bool = &.{},
+    int_id_counts: []u32 = &.{},
+    /// Literals compared with columns that row groups store table ids of,
+    /// to each one's id (`literalIds`).
+    id_literals: std.AutoHashMapUnmanaged(IdLiteral, ?u32) = .empty,
     /// What this scan reads once prune hints skip segments or row groups
     /// (issue #478). Allocated by the first hint; rebuilt by `stats()` while
     /// `pruned_stale`.
@@ -1791,6 +1799,86 @@ pub const Scan = struct {
         return true;
     }
 
+    /// Reads fixed-width column `name` as its rows' table ids (DESIGN.md
+    /// §4.7), each widened to the column's eight bytes. Two rows hold one
+    /// value exactly when they hold one id, so a consumer that only tells
+    /// values apart (a group key, a COUNT(DISTINCT)) reads no page of the
+    /// list. The caller has checked that every segment of the scan stores
+    /// the column's ids, `id_count` of them (`table_id_distinct.intIdsReadable`),
+    /// and that nothing above the scan compares the column's values; a row
+    /// group that stores values fails the scan. The column's stats become
+    /// the ids', and the table's order stops short of it. False, marking
+    /// nothing, when the scan reads memtable rows, doesn't project the
+    /// column, or compares its values itself: a filter, hint or key bound.
+    pub fn setIntIdColumn(self: *Scan, name: []const u8, id_count: u32) !bool {
+        if (self.memtable_row_count != 0 or id_count == 0) return false;
+        const j = types.findColumn(self.out_schema, name) orelse return false;
+        const phys = self.out_phys[j];
+        if (storage.table_strings.fixedWidth(self.out_schema[j].type) == null) return false;
+        if (self.comparesValues(phys, name)) return false;
+        if (self.int_id_cols.len == 0) {
+            const n = self.table.schema.columns.len;
+            const cols = try self.allocator.alloc(bool, n);
+            errdefer self.allocator.free(cols);
+            const counts = try self.allocator.alloc(u32, n);
+            @memset(cols, false);
+            @memset(counts, 0);
+            self.int_id_cols = cols;
+            self.int_id_counts = counts;
+        }
+        self.int_id_cols[phys] = true;
+        self.int_id_counts[phys] = id_count;
+        self.applyIntIdStats(self.cached_stats);
+        if (self.pruned != null) self.pruned_stale = true;
+        return true;
+    }
+
+    /// Whether the scan itself compares column `phys`'s values.
+    fn comparesValues(self: *const Scan, phys: usize, name: []const u8) bool {
+        if (self.fused_filter) |f| if (predicate.touchesColumn(f, name)) return true;
+        if (self.derived_filter != null) return true;
+        if (self.key_bound) |kb| if (kb.phys == phys) return true;
+        for (self.prunes.items) |h| if (h.col_idx == phys) return true;
+        for (self.in_prunes.items) |h| if (h.col_idx == phys) return true;
+        for (self.key_in_sets.items) |h| if (h.col_idx == phys) return true;
+        return false;
+    }
+
+    fn readsIntIds(self: *const Scan, phys: usize) bool {
+        return phys < self.int_id_cols.len and self.int_id_cols[phys];
+    }
+
+    /// Whether the scan, reading column `phys`'s values, reads row group
+    /// `rg_idx` of `seg` by the table ids it stores
+    /// (`ReadSegment.readsIdRows`).
+    fn readsIdRowsOf(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize) bool {
+        return !self.readsIntIds(phys) and seg.readsIdRows(rg_idx, phys, self.cacheRef());
+    }
+
+    /// `col_stats`, of the projected columns in order, with each column read
+    /// by table id holding the ids' range. Its values' origin no longer
+    /// describes them.
+    fn applyIntIdStats(self: *const Scan, col_stats: []exec.ColStat) void {
+        if (self.int_id_cols.len == 0) return;
+        for (col_stats, self.out_phys[0..col_stats.len]) |*st, phys| {
+            if (!self.readsIntIds(phys)) continue;
+            st.min = 0;
+            st.max = self.int_id_counts[phys] - 1;
+            st.origin = null;
+        }
+    }
+
+    /// The table's order key up to its first column read by table id.
+    fn orderKeyBeforeIntIds(self: *const Scan) []const []const u8 {
+        const keys = self.table.schema.order_key;
+        if (self.int_id_cols.len == 0) return keys;
+        for (keys, 0..) |k, i| {
+            const phys = types.findColumn(self.table.schema.columns, k) orelse return keys[0..i];
+            if (self.readsIntIds(phys)) return keys[0..i];
+        }
+        return keys;
+    }
+
     fn idKeyed(self: *const Scan, j: usize) bool {
         return self.n_id_keys > 0 and self.dict_bufs[j].id_keyed;
     }
@@ -2654,6 +2742,9 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
+        if (self.int_id_cols.len > 0) self.allocator.free(self.int_id_cols);
+        if (self.int_id_counts.len > 0) self.allocator.free(self.int_id_counts);
+        self.id_literals.deinit(self.allocator);
         if (self.pruned) |b| {
             self.allocator.free(b.stats);
             self.allocator.free(b.live);
@@ -3453,6 +3544,7 @@ pub const Scan = struct {
         }
         fillColumnStats(b.stats, self.table.schema.columns, self.segs, b.live, self.out_phys[0..b.stats.len], self.memtable_row_count);
         for (b.stats, self.cached_stats) |*s, whole| s.origin = whole.origin;
+        self.applyIntIdStats(b.stats);
         exec.capColStats(b.stats, rows);
         b.rows = rows;
     }
@@ -3473,6 +3565,7 @@ pub const Scan = struct {
     fn cacheRef(self: *Scan) storage.cache.TableCache {
         var c = self.table.cacheRef();
         c.misses = &self.misses;
+        c.int_ids = self.int_id_cols;
         return c;
     }
 
@@ -3516,7 +3609,7 @@ pub const Scan = struct {
         }
         self.hinted_to = rg_idx;
         self.misses.restart();
-        seg.hintMisses(window[0..n], missed, self.table.cacheRef());
+        seg.hintMisses(window[0..n], missed, self.cacheRef());
     }
 
     /// Once row group `rg_idx`'s filter kept rows, hints every output
@@ -3533,7 +3626,7 @@ pub const Scan = struct {
             m.* = .{ .column_idx = @intCast(phys), .read = if (measured and self.readsLengthsOnly(phys)) .no_bytes else .block };
         }
         const rgs = [1]u32{@intCast(rg_idx)};
-        seg.hintMisses(&rgs, misses[0..n], self.table.cacheRef());
+        seg.hintMisses(&rgs, misses[0..n], self.cacheRef());
     }
 
     pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
@@ -3626,13 +3719,14 @@ pub const Scan = struct {
         const snapshot_rows = seg_rows + self.memtable_row_count;
 
         const memtable_empty = self.memtable_row_count == 0;
-        const global = memtable_empty and self.scanIsGloballySorted(segs);
+        const keys = self.orderKeyBeforeIntIds();
+        const global = memtable_empty and (keys.len > 0 or self.table.schema.order_key.len == 0) and self.scanIsGloballySorted(segs);
         const pruned = self.prunedBounds();
 
         return .{
             .upper_rows = if (pruned) |b| b.rows else snapshot_rows,
             .sort_state = .{
-                .keys = self.table.schema.order_key,
+                .keys = keys,
                 .global = global,
             },
             .column_stats = if (pruned) |b| b.stats else self.cached_stats,
@@ -4882,6 +4976,7 @@ pub const Scan = struct {
         const pred_phys = types.findColumn(self.table.schema.columns, leaf.col) orelse return false;
         const col_type = self.table.schema.columns[pred_phys].type;
         if (!storage.format.bytesFollowComparison(col_type)) return false;
+        if (try self.idLeafMask(seg, rg_idx, rg_count, pred_phys, leaf, out)) return true;
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -4967,6 +5062,116 @@ pub const Scan = struct {
         try predicate.evaluateMaskWithPred(view, leaf, rg_count, out);
         if (exec.prof.enabled) exec.prof.add("scan.leaf.compare_raw", @intCast(@max(0, exec.prof.nowTicks() - _tc)));
         return true;
+    }
+
+    /// `col = v` or `col <> v` over the table ids a row group stores for
+    /// `col` (§4.7), against `v`'s id: its values' block would read every
+    /// list page. False when the row group reads values instead.
+    fn idLeafMask(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, phys: usize, leaf: Predicate, out: []bool) !bool {
+        if (leaf.op != .eq and leaf.op != .neq) return false;
+        if (!self.readsIdRowsOf(seg, rg_idx, phys)) return false;
+        const want = predicate.valueToRangeI128(leaf.val) orelse return false;
+        var id: [1]?u32 = .{null};
+        if (std.math.cast(i64, want)) |v| try self.literalIds(seg, phys, &.{v}, &id);
+        const one: [1]u32 = .{id[0] orelse 0};
+        const ids: []const u32 = if (id[0] != null) &one else &.{};
+        return self.idSetMask(seg, rg_idx, rg_count, phys, ids, leaf.op == .neq, out);
+    }
+
+    /// `col [NOT] IN (...)` over the table ids a row group stores for `col`,
+    /// as `idLeafMask`.
+    fn idInSetMask(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, phys: usize, set: predicate.InSet, out: []bool) !bool {
+        if (!self.readsIdRowsOf(seg, rg_idx, phys)) return false;
+        const values = try self.allocator.alloc(i64, set.values.len);
+        defer self.allocator.free(values);
+        var n: usize = 0;
+        for (set.values) |v| {
+            const want = predicate.valueToRangeI128(v) orelse return false;
+            values[n] = std.math.cast(i64, want) orelse continue;
+            n += 1;
+        }
+        const found = try self.allocator.alloc(?u32, n);
+        defer self.allocator.free(found);
+        try self.literalIds(seg, phys, values[0..n], found);
+        const ids = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(ids);
+        var len: usize = 0;
+        for (found) |f| if (f) |id| {
+            ids[len] = id;
+            len += 1;
+        };
+        std.sort.pdq(u32, ids[0..len], {}, std.sort.asc(u32));
+        return self.idSetMask(seg, rg_idx, rg_count, phys, ids[0..len], set.negate, out);
+    }
+
+    /// Whether each row of row group `rg_idx`'s ids of column `phys` is one
+    /// of `ids` (ascending), or with `negate` is not, into `out`; false on a
+    /// NULL row.
+    fn idSetMask(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, rg_count: u32, phys: usize, ids: []const u32, negate: bool, out: []bool) !bool {
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[phys].nullable };
+        var block = try seg.borrowIdBlock(self.allocator, rg_idx, phys, self.cacheRef());
+        defer block.release(self.allocator, self.cacheRef());
+        const bm_len: usize = if (flags.has_nulls) storage.column.bitmapBytes(rg_count) else 0;
+        var nulls: ?[]const u8 = if (flags.has_nulls) block.bytes[0..bm_len] else null;
+        switch (block.encoding) {
+            .rle => {
+                const rv = storage.segment_reader.rleViewOf(block.bytes, rg_count, flags);
+                if (rv.block.value_width != 8) return false;
+                nulls = rv.nulls;
+                var pos: usize = 0;
+                var run: usize = 0;
+                while (run < rv.block.n_runs and pos < rg_count) : (run += 1) {
+                    const len = @min(@as(usize, rv.block.runLength(run)), rg_count - pos);
+                    @memset(out[pos..][0..len], idIn(ids, std.mem.readInt(i64, rv.block.values[run * 8 ..][0..8], .little)) != negate);
+                    pos += len;
+                }
+                if (pos < rg_count) @memset(out[pos..rg_count], false);
+            },
+            .raw => {
+                const body = block.bytes[bm_len..];
+                if (body.len < @as(usize, rg_count) * 8) return false;
+                if (ids.len == 1) {
+                    const want: i64 = ids[0];
+                    for (out[0..rg_count], 0..) |*m, i| m.* = (std.mem.readInt(i64, body[i * 8 ..][0..8], .little) == want) != negate;
+                } else {
+                    for (out[0..rg_count], 0..) |*m, i| m.* = idIn(ids, std.mem.readInt(i64, body[i * 8 ..][0..8], .little)) != negate;
+                }
+            },
+            else => return false,
+        }
+        if (nulls) |bm| for (0..rg_count) |i| {
+            if (!storage.column.isValidBit(bm, i)) out[i] = false;
+        };
+        return true;
+    }
+
+    fn idIn(ids: []const u32, id: i64) bool {
+        const key = std.math.cast(u32, id) orelse return false;
+        return std.sort.binarySearch(u32, ids, key, orderU32) != null;
+    }
+
+    fn orderU32(key: u32, item: u32) std.math.Order {
+        return std.math.order(key, item);
+    }
+
+    const IdLiteral = struct { phys: u32, value: i64 };
+
+    /// The table id of each of `values`, literals compared with column
+    /// `phys`, into `out` (null where no row holds it), looked up once a
+    /// scan. The segment `readsIdRows`.
+    fn literalIds(self: *Scan, seg: *storage.ReadSegment, phys: usize, values: []const i64, out: []?u32) !void {
+        var missing: std.ArrayList(i64) = .empty;
+        defer missing.deinit(self.allocator);
+        for (values) |v| {
+            if (!self.id_literals.contains(.{ .phys = @intCast(phys), .value = v })) try missing.append(self.allocator, v);
+        }
+        if (missing.items.len > 0) {
+            const found = try self.allocator.alloc(?u32, missing.items.len);
+            defer self.allocator.free(found);
+            try seg.lists.?.fixedIdsOf(seg.io, phys, missing.items, found);
+            for (missing.items, found) |v, id| try self.id_literals.put(self.allocator, .{ .phys = @intCast(phys), .value = v }, id);
+        }
+        for (values, out) |v, *id| id.* = self.id_literals.get(.{ .phys = @intCast(phys), .value = v }).?;
     }
 
     /// Evaluate `col =|<> literal` against an FSST-encoded string block in the
@@ -5253,6 +5458,7 @@ pub const Scan = struct {
         const col_type = self.table.schema.columns[pred_phys].type;
         if (!storage.format.bytesFollowComparison(col_type)) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = self.table.schema.columns[pred_phys].nullable };
+        if (col_type == .bigint and try self.idInSetMask(seg, rg_idx, rg_count, pred_phys, set, out)) return true;
         var block = try seg.borrowColumnBlock(self.allocator, rg_idx, pred_phys, self.cacheRef());
         defer block.release(self.allocator, self.cacheRef());
 
@@ -5875,6 +6081,20 @@ pub const Scan = struct {
             else => return null, // ≤64-bit int family only (largeint/decimal128/float/string decline)
         }
         const want = predicate.valueToRangeI128(leaf.val) orelse return null;
+        if (self.readsIdRowsOf(seg, rg_idx, phys)) {
+            // Every survivor holds the literal itself.
+            if (leaf.op != .eq) return null;
+            const mask = (try self.ensureMask(rg_count))[0..rg_count];
+            if (!try self.idLeafMask(seg, rg_idx, rg_count, phys, leaf, mask)) return null;
+            const filtered = try self.ensureFilteredBuffers();
+            filtered[0].clear();
+            const matched = simd.countTrue(mask);
+            if (matched > 0) switch (filtered[0].data) {
+                inline .bigint, .datetime, .decimal64 => |*list| try list.appendNTimes(self.allocator, @intCast(want), matched),
+                else => return null,
+            };
+            return self.fusedGathered(matched);
+        }
 
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = false };
         const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
@@ -5908,6 +6128,12 @@ pub const Scan = struct {
             else => return null,
         };
         if (exec.prof.enabled) self.scan_kernel_ticks +%= @intCast(@max(0, exec.prof.nowTicks() - _tk));
+        return self.fusedGathered(matched);
+    }
+
+    /// `tryFusedLeafGather`'s batch of `matched` rows, gathered into the
+    /// first filtered buffer.
+    fn fusedGathered(self: *Scan, matched: usize) usize {
         self.filtered_coded = null;
         self.filtered_hashed = null;
         self.filtered_lengths = null;
@@ -6220,6 +6446,12 @@ pub const Scan = struct {
                 continue;
             }
 
+            if (rows.len * SPARSE_GATHER_DIVISOR < rg_count and self.readsIdRowsOf(seg, rg_idx, phys)) {
+                mat_kind = 8;
+                try self.appendIdRows(seg, rg_idx, phys, rows, &filtered_cols[j]);
+                continue;
+            }
+
             const _tb = if (exec.prof.enabled) exec.prof.nowTicks() else 0;
             var block = try seg.borrowColumnBlock(self.allocator, rg_idx, phys, self.cacheRef());
             defer block.release(self.allocator, self.cacheRef());
@@ -6269,6 +6501,21 @@ pub const Scan = struct {
         self.filtered_hashed = if (any_hashed) hash_slots else null;
         self.filtered_lengths = length_slots;
         self.filtered_dicts = if (any_dict) dict_slots else null;
+    }
+
+    /// The values of a few rows `rows` of a column a row group stores table
+    /// ids of, read off the list pages their ids lie on.
+    fn appendIdRows(self: *Scan, seg: *storage.ReadSegment, rg_idx: usize, phys: usize, rows: []const u32, out: *ColumnStore) !void {
+        const col = self.table.schema.columns[phys];
+        const flags = storage.format.ColumnBlockFlags{ .has_nulls = col.nullable };
+        const payload = try seg.idRows(self.allocator, rg_idx, phys, self.cacheRef(), col.nullable, rows);
+        defer self.allocator.free(payload);
+        const n: u32 = @intCast(rows.len);
+        if (storage.segment_reader.viewRawColumn(col.type, payload, n, flags, .raw)) |view| return engine.transform.appendAllColumn(self.allocator, view, out);
+        // A bitmap ahead of the values leaves them unaligned to view.
+        var decoded = try storage.segment_reader.decodeColumnPayload(self.allocator, col.type, payload, n, flags, .raw);
+        defer decoded.deinit(self.allocator);
+        try engine.transform.appendAllColumn(self.allocator, decoded.view(), out);
     }
 
     /// The set rows of `mask` as ascending indices, in a scratch reused across

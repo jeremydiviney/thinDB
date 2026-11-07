@@ -4281,6 +4281,10 @@ fn releaseRawQueueLane(queues: anytype, lane: usize) void {
     if (lane < queues.len) queues[lane].lease.store(false, .release);
 }
 
+/// A column a run reads by table id (`RunConfig.int_id_columns`) and the
+/// ids its list held.
+pub const IntIdColumn = struct { name: []const u8, id_count: u32 };
+
 pub const TopRow = struct {
     key: u128,
     count: u64 = 0,
@@ -11259,6 +11263,12 @@ pub const RunConfig = struct {
     // alone, for the CASE group keys that pick them: such a key compares a
     // picked value by its id's four bytes. Checked as `id_key_columns` are.
     id_value_columns: []const []const u8 = &.{},
+    // Fixed-width columns every worker scan of every pass reads as their
+    // table ids (`Scan.setIntIdColumn`, DESIGN.md §4.7): keys compare and
+    // distinct values count by id. The caller has checked that every
+    // segment stores the ids and that nothing else reads the columns, and
+    // turns the result's keys back into values.
+    int_id_columns: []const IntIdColumn = &.{},
     /// Keeps only these bits of each hashed key's digest where a row takes
     /// its staged key, so keys collide as often as a digest this narrow
     /// collides: a test of exact group keys under real collisions.
@@ -11922,6 +11932,9 @@ pub fn runSiloGrid(allocator: Allocator, table: *thindb.api.Table, cpus: []const
             if (!try scans[i].setIdKeyColumn(name, false)) return error.UnsupportedQueryShape;
         }
         if (cfg.key_bound) |kb| _ = try scans[i].setKeyBound(kb);
+        for (cfg.int_id_columns) |c| {
+            if (!try scans[i].setIntIdColumn(c.name, c.id_count)) return error.UnsupportedQueryShape;
+        }
         if (cfg.count_sketch) |pass| switch (pass) {
             .filter => |sketch| if (sketch.row_slots) |rs| scans[i].setRowSieve(.{
                 .seg_first = rs.seg_first,

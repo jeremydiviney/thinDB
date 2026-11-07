@@ -39,6 +39,7 @@ const compression_mod = @import("compression.zig");
 const int_streams = @import("int_streams.zig");
 const fsst = @import("fsst.zig");
 const segment_strings = @import("segment_strings.zig");
+const table_strings = @import("table_strings.zig");
 const storage_cache = @import("cache.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
 const parallel = @import("../util/parallel.zig");
@@ -60,6 +61,9 @@ pub const ReadSegment = struct {
     /// the awake-clock millisecond a reader last hinted its bytes
     /// (`claimPageHint`), 0 for never. Shared by every copy of the segment.
     page_hints: []std.atomic.Value(u32) = &.{},
+    /// The table's lists, whose values the blocks of `info.int_id_columns`
+    /// name by table id (§4.7); null for a reader of no such blocks.
+    lists: ?*table_strings.TableStrings = null,
 
     pub fn deinit(self: *ReadSegment) void {
         for (self.info.row_groups) |rg| {
@@ -69,6 +73,7 @@ pub const ReadSegment = struct {
         }
         self.allocator.free(self.info.row_groups);
         format.freeStringTables(self.allocator, self.info.string_tables);
+        if (self.info.int_id_columns.len > 0) self.allocator.free(self.info.int_id_columns);
         self.allocator.free(self.page_hints);
         self.file.close(self.io);
         self.* = undefined;
@@ -134,6 +139,7 @@ pub const ReadSegment = struct {
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
+                .content = blockContent(tc, column_idx),
             };
             const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             defer cc.release(entry);
@@ -142,6 +148,11 @@ pub const ReadSegment = struct {
 
         const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
+        if (isTableIdsBlock(block)) {
+            const values = try self.blockValues(allocator, allocator, block, column_idx, rg.row_count, false);
+            defer allocator.free(values.bytes);
+            return decodeColumnPayload(allocator, col_type, values.bytes, rg.row_count, flags, values.encoding);
+        }
         if (!isSegmentDictBlock(block)) return decodeBlock(allocator, block, 0, col_type, rg.row_count, flags);
         const payload = try self.rebuildSegmentDict(allocator, allocator, block, 0, row_group_idx, column_idx, null, .full);
         defer allocator.free(payload);
@@ -182,6 +193,14 @@ pub const ReadSegment = struct {
         const block = try self.readColumnBlock(allocator, key.row_group_idx, column_idx);
         defer allocator.free(block);
         const block_alloc = cc.blockAllocator();
+        if (isTableIdsBlock(block)) {
+            const values = try self.blockValues(block_alloc, allocator, block, column_idx, self.info.row_groups[key.row_group_idx].row_count, key.content == .int_ids);
+            errdefer block_alloc.free(values.bytes);
+            return cc.insertPinned(key, values.bytes, values.encoding);
+        }
+        // A reader asks for ids only of a column every block of which
+        // stores them (`SegmentInfo.int_id_columns`).
+        if (key.content == .int_ids) return format.Error.SchemaMismatch;
         const tc: storage_cache.TableCache = .{ .cache = cc, .table_uid = key.table_uid };
         const raw = if (isSegmentDictBlock(block))
             try self.rebuildSegmentDict(block_alloc, allocator, block, 0, key.row_group_idx, column_idx, tc, .full)
@@ -559,6 +578,7 @@ pub const ReadSegment = struct {
             .segment_id = self.info.segment_id,
             .row_group_idx = rg_idx,
             .column_idx = m.column_idx,
+            .content = blockContent(c, col),
         };
         if (c.cache.holdsOrFills(key)) return &.{};
         const block_offset = rg.col_offsets[col];
@@ -1121,17 +1141,117 @@ pub const ReadSegment = struct {
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
+                .content = blockContent(tc, column_idx),
             };
             const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
         }
         const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
+        if (isTableIdsBlock(block)) {
+            const values = try self.blockValues(allocator, allocator, block, column_idx, self.info.row_groups[row_group_idx].row_count, false);
+            return .{ .bytes = values.bytes, .encoding = values.encoding, .owned = values.bytes };
+        }
         const raw = if (isSegmentDictBlock(block))
             try self.rebuildSegmentDict(allocator, allocator, block, 0, row_group_idx, column_idx, null, .full)
         else
             try getDecompressedBytes(allocator, allocator, block, 0);
         return .{ .bytes = raw, .encoding = blockEncoding(block, 0), .owned = raw };
+    }
+
+    /// Column `column_idx`'s block of row group `row_group_idx` as the table
+    /// ids it stores (§4.7), pinned as `borrowColumnBlock` pins it: 8-byte
+    /// ids, raw or in runs. The segment lists the column
+    /// (`SegmentInfo.intIdColumn`).
+    pub fn borrowIdBlock(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache) !BorrowedBlock {
+        const key = storage_cache.Key{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+            .content = .int_ids,
+        };
+        const entry = try self.acquireBlock(allocator, tc, key, column_idx);
+        return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
+    }
+
+    /// Whether a reader of some rows of column `column_idx`'s row group
+    /// `row_group_idx` reads their values by `idRows`: the column stores
+    /// table ids here, and no reader holds or reads in the values' block.
+    /// That block's ids lie on every page of a wide list; a few rows' lie
+    /// on a few.
+    pub fn readsIdRows(self: ReadSegment, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache) bool {
+        if (self.lists == null or !self.info.intIdColumn(column_idx)) return false;
+        return !tc.cache.holdsOrFills(.{
+            .table_uid = tc.table_uid,
+            .segment_id = self.info.segment_id,
+            .row_group_idx = @intCast(row_group_idx),
+            .column_idx = @intCast(column_idx),
+        });
+    }
+
+    /// The values of `rows` of column `column_idx`'s row group
+    /// `row_group_idx`, which `readsIdRows`, as a raw block payload of
+    /// `rows.len` rows in `allocator`: their validity bitmap when `nullable`,
+    /// then each value in its list's width. Reads the ids' block and the
+    /// list pages the rows' ids lie on.
+    pub fn idRows(self: ReadSegment, allocator: Allocator, row_group_idx: usize, column_idx: usize, tc: storage_cache.TableCache, nullable: bool, rows: []const u32) ![]align(16) u8 {
+        const corrupt = format.Error.CorruptColumnBlockHeader;
+        const lists = self.lists orelse return corrupt;
+        const width: usize = lists.fixedListWidth(column_idx) orelse return corrupt;
+        var block = try self.borrowIdBlock(allocator, row_group_idx, column_idx, tc);
+        defer block.release(allocator, tc);
+        const rc = self.info.row_groups[row_group_idx].row_count;
+        const flags = format.ColumnBlockFlags{ .has_nulls = nullable };
+        var expanded: ?OwnedColumn = null;
+        defer if (expanded) |*col| col.deinit(allocator);
+        const view = viewRawColumn(.bigint, block.bytes, rc, flags, block.encoding) orelse view: {
+            expanded = try decodeColumnPayload(allocator, .bigint, block.bytes, rc, flags, block.encoding);
+            break :view expanded.?.view();
+        };
+        const block_ids = switch (view.data) {
+            .bigint => |s| s,
+            else => return corrupt,
+        };
+        const bm_len: usize = if (nullable) column.bitmapBytes(rows.len) else 0;
+        const out = try allocator.alignedAlloc(u8, .@"16", bm_len + rows.len * width);
+        errdefer allocator.free(out);
+        @memset(out, 0);
+        const ids = try allocator.alloc(u32, rows.len);
+        defer allocator.free(ids);
+        const valid = try allocator.alloc(u32, rows.len);
+        defer allocator.free(valid);
+        var n: usize = 0;
+        for (rows, 0..) |row, i| {
+            if (row >= rc) return corrupt;
+            if (!view.isValid(row)) continue;
+            if (nullable) column.setValidBit(out[0..bm_len], i, true);
+            ids[n] = try tableIdOf(block_ids[row]);
+            valid[n] = @intCast(i);
+            n += 1;
+        }
+        const values = out[bm_len..];
+        if (n == rows.len) {
+            try lists.fixedValues(self.io, column_idx, ids, values);
+            return out;
+        }
+        const named = try allocator.alloc(u8, n * width);
+        defer allocator.free(named);
+        try lists.fixedValues(self.io, column_idx, ids[0..n], named);
+        for (valid[0..n], 0..) |i, k| @memcpy(values[i * width ..][0..width], named[k * width ..][0..width]);
+        return out;
+    }
+
+    /// The payload of column `column_idx`'s block `block`, coded in table
+    /// ids, over the values they name (or, with `ids`, over the ids
+    /// themselves), in `allocator`, with the encoding it reads as.
+    /// `scratch` holds the ids meanwhile.
+    fn blockValues(self: ReadSegment, allocator: Allocator, scratch: Allocator, block: []const u8, column_idx: usize, row_count: u32, ids: bool) !IdBlockValues {
+        const lists: ?*table_strings.TableStrings = if (ids) null else self.lists orelse return format.Error.CorruptColumnBlockHeader;
+        const payload = try getDecompressedBytes(scratch, scratch, block, 0);
+        defer scratch.free(payload);
+        const has_nulls = format.ColumnBlockFlags.fromByte(block[1]).has_nulls;
+        return idBlockValues(allocator, scratch, self.io, lists, column_idx, payload, blockEncoding(block, 0), row_count, has_nulls);
     }
 
     /// The string bytes one row group's block of a string column decodes to,
@@ -1463,8 +1583,10 @@ pub fn readSegment(
         rg.col_lengths = col_lengths;
         inited_rg += 1;
     }
-    const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols, row_groups);
+    const string_tables = try readStringTables(allocator, footer[off .. footer.len - format.footer_trailer_size], ncols, row_groups, &off);
     errdefer format.freeStringTables(allocator, string_tables);
+    const int_id_columns = try readIntIdColumns(allocator, footer[off .. footer.len - format.footer_trailer_size], schema);
+    errdefer if (int_id_columns.len > 0) allocator.free(int_id_columns);
     var page_count: usize = 0;
     for (string_tables) |t| page_count += t.pages.len;
     const page_hints = try allocator.alloc(std.atomic.Value(u32), page_count);
@@ -1481,14 +1603,15 @@ pub fn readSegment(
             .byte_size = file_size,
             .row_groups = row_groups,
             .string_tables = string_tables,
+            .int_id_columns = int_id_columns,
         },
         .page_hints = page_hints,
     };
 }
 
-/// Parse the footer's string-table directory (`bytes` runs from its count
-/// to the footer trailer, exactly).
-fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_groups: []const RowGroupMeta) ![]const format.StringTable {
+/// Parse the footer's string-table directory, which `bytes` starts with,
+/// advancing `end` past it.
+fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_groups: []const RowGroupMeta, end: *usize) ![]const format.StringTable {
     if (bytes.len < 4) return format.Error.CorruptFooter;
     const count = format.readU32(bytes[0..4]);
     if (count > ncols) return format.Error.CorruptFooter;
@@ -1540,8 +1663,25 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
         t.* = .{ .column_idx = column_idx, .shared_count = shared_count, .value_count = value_count, .value_bytes = value_bytes, .pages = pages, .blocks = blocks, .table_ids = table_ids };
         inited += 1;
     }
-    if (off != bytes.len) return format.Error.CorruptFooter;
+    end.* += off;
     return tables;
+}
+
+/// Parse the footer's list of columns coded in table ids (`bytes` runs
+/// from its count to the footer trailer, exactly).
+fn readIntIdColumns(allocator: Allocator, bytes: []const u8, schema: TableSchema) ![]const u32 {
+    if (bytes.len < 4) return format.Error.CorruptFooter;
+    const count = format.readU32(bytes[0..4]);
+    if (count > schema.columns.len or bytes.len != 4 + @as(usize, count) * 4) return format.Error.CorruptFooter;
+    if (count == 0) return &.{};
+    const columns = try allocator.alloc(u32, count);
+    errdefer allocator.free(columns);
+    for (columns, 0..) |*c, i| {
+        c.* = format.readU32(bytes[4 + i * 4 ..][0..4]);
+        if (c.* >= schema.columns.len or table_strings.fixedWidth(schema.columns[c.*].type) == null) return format.Error.CorruptFooter;
+        if (i > 0 and c.* <= columns[i - 1]) return format.Error.CorruptFooter;
+    }
+    return columns;
 }
 
 // ---------------------------------------------------------------------------
@@ -1550,6 +1690,93 @@ fn readStringTables(allocator: Allocator, bytes: []const u8, ncols: usize, row_g
 
 fn isSegmentDictBlock(block: []const u8) bool {
     return block[format.column_block_encoding_offset] == format.segment_dict_encoding;
+}
+
+fn isTableIdsBlock(block: []const u8) bool {
+    return format.ColumnBlockFlags.fromByte(block[1]).table_ids;
+}
+
+fn blockContent(tc: storage_cache.TableCache, column_idx: usize) storage_cache.Content {
+    return if (tc.readsIds(column_idx)) .int_ids else .column;
+}
+
+const IdBlockValues = struct { bytes: []align(16) u8, encoding: format.Encoding };
+
+/// A fixed-width column's block payload `payload`, an `int` block of
+/// table ids (§4.7) of `encoding`, rebuilt over the values its ids name in
+/// `lists`, or over the ids themselves as 8-byte values without: a raw or
+/// FOR block as raw values, a run block as runs of them.
+fn idBlockValues(
+    allocator: Allocator,
+    scratch: Allocator,
+    io: Io,
+    lists: ?*table_strings.TableStrings,
+    column_idx: usize,
+    payload: []const u8,
+    encoding: format.Encoding,
+    row_count: u32,
+    has_nulls: bool,
+) !IdBlockValues {
+    const corrupt = format.Error.CorruptColumnBlockHeader;
+    const width: usize = if (lists) |l| l.fixedListWidth(column_idx) orelse return corrupt else @sizeOf(i64);
+    const bm_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
+    if (payload.len < bm_len) return corrupt;
+    const body = payload[bm_len..];
+    switch (encoding) {
+        .raw, .for_ => {
+            const ids = try scratch.alloc(u32, row_count);
+            defer scratch.free(ids);
+            if (encoding == .raw) {
+                if (body.len != ids.len * 4) return corrupt;
+                for (ids, 0..) |*id, i| id.* = try tableIdOf(std.mem.readInt(i32, body[i * 4 ..][0..4], .little));
+            } else {
+                if (body.len < 20) return corrupt;
+                const code_width = body[16];
+                if (code_width == 0 or code_width > 8 or body.len != 20 + ids.len * code_width) return corrupt;
+                const fb = forBlockOf(body, row_count);
+                for (ids, 0..) |*id, i| id.* = try tableIdOf(fb.base + readForCode(fb.codes, fb.width, i));
+            }
+            const out = try allocator.alignedAlloc(u8, .@"16", bm_len + ids.len * width);
+            errdefer allocator.free(out);
+            @memcpy(out[0..bm_len], payload[0..bm_len]);
+            try namedValues(io, lists, column_idx, ids, out[bm_len..]);
+            return .{ .bytes = out, .encoding = .raw };
+        },
+        .rle => {
+            if (body.len < 8 or body[4] != 4) return corrupt;
+            const runs = rleBlockOf(body);
+            if (body.len != 8 + @as(usize, runs.n_runs) * 8) return corrupt;
+            const ids = try scratch.alloc(u32, runs.n_runs);
+            defer scratch.free(ids);
+            for (ids, 0..) |*id, i| id.* = try tableIdOf(std.mem.readInt(i32, runs.values[i * 4 ..][0..4], .little));
+            const out = try allocator.alignedAlloc(u8, .@"16", bm_len + 8 + ids.len * (width + 4));
+            errdefer allocator.free(out);
+            @memcpy(out[0..bm_len], payload[0..bm_len]);
+            const head = out[bm_len..][0..8];
+            format.writeU32(head[0..4], runs.n_runs);
+            head[4..8].* = .{ @intCast(width), 0, 0, 0 };
+            const values = out[bm_len + 8 ..][0 .. ids.len * width];
+            try namedValues(io, lists, column_idx, ids, values);
+            @memcpy(out[bm_len + 8 + values.len ..], runs.lengths);
+            return .{ .bytes = out, .encoding = .rle };
+        },
+        .dict, .fsst => return corrupt,
+    }
+}
+
+/// The value each of `ids` names in `lists` into `out`, or without
+/// lists the ids themselves as little-endian i64s.
+fn namedValues(io: Io, lists: ?*table_strings.TableStrings, column_idx: usize, ids: []const u32, out: []u8) !void {
+    const l = lists orelse {
+        for (ids, 0..) |id, i| std.mem.writeInt(i64, out[i * 8 ..][0..8], id, .little);
+        return;
+    };
+    try l.fixedValues(io, column_idx, ids, out);
+}
+
+fn tableIdOf(v: i128) !u32 {
+    if (v < 0 or v > table_strings.id_cap) return format.Error.CorruptColumnBlockHeader;
+    return @intCast(v);
 }
 
 /// Checks that `frame` is exactly one column block: its header, then the

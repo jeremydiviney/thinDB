@@ -1,5 +1,6 @@
 //! `COUNT(DISTINCT <string column>)` by table ids (DESIGN.md §4.6),
-//! reading no value's bytes.
+//! reading no value's bytes, and whether scans can read a column by its
+//! table ids instead of its values (§4.6, §4.7).
 //!
 //! Each segment's string table stores the table id of every distinct value
 //! it holds, and one value has one table id in every segment, so the
@@ -97,6 +98,24 @@ pub fn readable(table: *api.Table, snapshot: exec.Scan.Snapshot, column_idx: usi
         const handle = try table.acquireSegment(entry.segment_id);
         defer table.releaseSegment(handle);
         if (!try qualifies(table, handle, snapshot, column_idx)) return null;
+    }
+    return state.id_count;
+}
+
+/// The id count of fixed-width column `column_idx`'s list (DESIGN.md
+/// §4.7) when a scan of the snapshot can read the column by table id
+/// (`Scan.setIntIdColumn`): the snapshot holds no memtable rows and every
+/// segment stores the column's ids. Null otherwise. A tombstoned row is no
+/// matter: the scan drops it either way.
+pub fn intIdsReadable(table: *api.Table, snapshot: exec.Scan.Snapshot, column_idx: usize) !?u32 {
+    if (snapshot.memtable_row_count != 0 or snapshot.segments.len == 0) return null;
+    if (table.strings.fixedListWidth(column_idx) == null) return null;
+    const state = table.strings.readerState(column_idx) orelse return null;
+    if (state.id_count == 0) return null;
+    for (snapshot.segments) |entry| {
+        const handle = try table.acquireSegment(entry.segment_id);
+        defer table.releaseSegment(handle);
+        if (!handle.seg.info.intIdColumn(column_idx)) return null;
     }
     return state.id_count;
 }

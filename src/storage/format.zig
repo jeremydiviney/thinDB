@@ -82,7 +82,13 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v16→v17: chunked table ids. A table-ids block is a run of column blocks
 /// of up to `table_ids_chunk` ids each, so a reader decodes them side by
 /// side.
-pub const segment_version: u16 = 17;
+///
+/// v17→v19: fixed-width table ids (DESIGN.md §4.7). A block whose flags set
+/// `table_ids` stores the table id of each row's value in place of the
+/// value, in the block's own encodings as an `int` column; its stats stay
+/// the values'. The footer ends with the columns every block of which is so
+/// coded. (v18 is the text n-gram index of a parallel branch.)
+pub const segment_version: u16 = 19;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -197,11 +203,14 @@ pub fn dictEntryStatWidth(row_count: u32) u8 {
 /// prefixed by a validity bitmap). Bit 1 = int_streams: the stored bytes are
 /// `[stored_size: u32]` and then the compressed `int_streams` form of the
 /// payload, which decompresses to `stored_size` bytes and restores to the
-/// header's `uncompressed_size`. Remaining bits reserved.
+/// header's `uncompressed_size`. Bit 2 = table_ids: the payload holds the
+/// table id (u32, as an `int` column) of each row's value of a fixed-width
+/// column (§4.7). Remaining bits reserved.
 pub const ColumnBlockFlags = packed struct(u8) {
     has_nulls: bool = false,
     int_streams: bool = false,
-    _reserved: u6 = 0,
+    table_ids: bool = false,
+    _reserved: u5 = 0,
 
     pub fn toByte(self: ColumnBlockFlags) u8 {
         return @bitCast(self);
@@ -442,6 +451,9 @@ pub const SegmentInfo = struct {
     /// Empty on non-unique tables.
     key_bloom: []const u8 = &.{},
     string_tables: []const StringTable = &.{},
+    /// The fixed-width columns every block of which stores table ids
+    /// (§4.7), ascending.
+    int_id_columns: []const u32 = &.{},
 
     pub fn deinit(self: SegmentInfo, allocator: std.mem.Allocator) void {
         for (self.row_groups) |rg| {
@@ -453,6 +465,12 @@ pub const SegmentInfo = struct {
         if (self.column_sketches.len > 0) allocator.free(self.column_sketches);
         if (self.key_bloom.len > 0) allocator.free(self.key_bloom);
         freeStringTables(allocator, self.string_tables);
+        if (self.int_id_columns.len > 0) allocator.free(self.int_id_columns);
+    }
+
+    pub fn intIdColumn(self: SegmentInfo, column_idx: usize) bool {
+        for (self.int_id_columns) |c| if (c == column_idx) return true;
+        return false;
     }
 
     pub fn stringTable(self: SegmentInfo, column_idx: usize) ?StringTable {

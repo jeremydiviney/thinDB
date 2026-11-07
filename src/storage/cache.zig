@@ -128,6 +128,14 @@ pub const Content = enum(u8) {
     /// A string block's row-group-own values alone, its index and bytes
     /// parts (`ReadSegment.EntryValues`).
     local_strings,
+    /// One page of a table's fixed-width list (§4.7), its values back to
+    /// back, keyed by page index in `row_group_idx` under the list's own
+    /// table uid.
+    list_page,
+    /// A fixed-width column block coded in table ids (§4.7) with its ids as
+    /// they are stored, widened to i64 where the block keeps them raw or in
+    /// runs; the `.column` entry holds its values.
+    int_ids,
 
     /// Whether the entry is a condition-cache record, kept within the
     /// records' share (`Cache.CONDITION_SHARE`).
@@ -163,6 +171,13 @@ pub const TableCache = struct {
     /// Where a reader notes the blocks it reads in on a miss, for a scan's
     /// read-ahead; null: nowhere.
     misses: ?*MissLog = null,
+    /// Per column, whether its blocks coded in table ids (§4.7) read as the
+    /// ids themselves (`Content.int_ids`) rather than the values they name.
+    int_ids: []const bool = &.{},
+
+    pub fn readsIds(self: TableCache, column_idx: usize) bool {
+        return column_idx < self.int_ids.len and self.int_ids[column_idx];
+    }
 };
 
 /// The blocks a reader missed in the cache and read in, by column and the
@@ -1610,6 +1625,8 @@ pub const SegmentHandles = struct {
     /// The opens in flight, by segment id (`acquire`).
     opening: std.AutoHashMapUnmanaged(u64, *Opening) = .empty,
     lock: std.atomic.Mutex = .unlocked,
+    /// The table's lists, for the segments it opens (`ReadSegment.lists`).
+    lists: ?*@import("table_strings.zig").TableStrings = null,
 
     /// A segment one reader is opening: readers of the same segment wait
     /// for it, readers of others open theirs alongside.
@@ -1670,6 +1687,7 @@ pub const SegmentHandles = struct {
         errdefer allocator.destroy(entry);
         entry.* = .{ .segment_id = segment_id, .seg = try segment_reader.readSegment(allocator, io, dir, file_name, schema), .pins = 1 };
         errdefer entry.seg.deinit();
+        entry.seg.lists = self.lists;
         self.lockSpin();
         defer self.lock.unlock();
         try self.map.put(allocator, segment_id, entry);

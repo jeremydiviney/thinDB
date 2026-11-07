@@ -23,6 +23,28 @@
 //! tag, id} slots, then checks the candidate's bytes: in the tail directly,
 //! or in its sealed page, reading each page a batch of candidates touches
 //! once. The index holds no bytes, so it grows by reading the pages again.
+//!
+//! Fixed-width columns (`fixedWidth`) keep lists too (§4.7), each value its
+//! little-endian bytes, and a segment that takes their ids stores the ids in
+//! place of the values, so readers do read these lists: they turn a block's
+//! ids back into values a page at a time, the pages cached in the block
+//! cache. Such a list differs in four ways. Its page payload is the values
+//! back to back, no offsets, rewritten (`int_streams`) before compression,
+//! which the header's flags record. Its pages are small, `fixed_page_bytes`,
+//! for a reader after a few values. Each publish seals its whole tail, so
+//! the `tails` file never holds it, and `<ci>.dir` lists its sealed pages, a
+//! record each, for readers to find them without reading every header:
+//!
+//!   record: [first_id: u32][count: u32][offset: u64][stored_len: u32][pad: 4]
+//!           [min: i64][max: i64]
+//!
+//! A write takes its new ids in value order, so a page's values span a
+//! slice of the column's range and a reader after a value's id
+//! (`fixedIdsOf`) reads only the pages whose span holds it: about one a
+//! write that brought new values.
+//!
+//! And a closed fixed-width column keeps its list: the segments that stored
+//! its ids still read through it.
 
 const std = @import("std");
 const Io = std.Io;
@@ -31,8 +53,10 @@ const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const format = @import("format.zig");
 const compression = @import("compression.zig");
+const int_streams = @import("int_streams.zig");
 const manifest = @import("manifest.zig");
 const segment_strings = @import("segment_strings.zig");
+const storage_cache = @import("cache.zig");
 const parallel = @import("../util/parallel.zig");
 
 pub const dir_name = "strings";
@@ -42,6 +66,11 @@ pub const dir_name = "strings";
 pub const id_cap: u32 = (1 << 26) - 1;
 /// Payload bytes past which the tail seals into a page.
 pub const page_bytes: usize = 1 << 20;
+/// `page_bytes` of a fixed-width column.
+pub const fixed_page_bytes: usize = 64 << 10;
+/// The block-cache segment id a list page is cached under, past every
+/// segment's.
+pub const list_segment_id: u64 = std.math.maxInt(u64);
 
 pub const State = manifest.StringIdState;
 
@@ -57,11 +86,21 @@ const parallel_min_values: usize = 1 << 14;
 const none: u32 = std.math.maxInt(u32);
 
 const JobError = Io.File.ReadPositionalError || Allocator.Error;
+const PageReadError = JobError || format.Error;
 
 /// Whether column type `t` of `schema` takes table ids: the columns that
 /// take segment string tables.
 pub fn eligible(schema: types.TableSchema, t: types.Type) bool {
     return segment_strings.eligible(t) and schema.compression != .lz4_fsst;
+}
+
+/// The bytes per value of a fixed-width column type that takes table ids:
+/// the 8-byte integers, whose values a 26-bit id can stand in for.
+pub fn fixedWidth(t: types.Type) ?u8 {
+    return switch (t) {
+        .bigint, .datetime, .decimal64 => 8,
+        else => null,
+    };
 }
 
 /// Where a segment writer takes its table ids from.
@@ -70,6 +109,27 @@ pub const Target = struct {
     io: Io,
     table_dir: Io.Dir,
     threads: usize,
+};
+
+/// What `TableStrings.resolve` asks before a write takes ids: `admits` with
+/// how many new ids the write's values would take and the ids the column
+/// holds.
+pub const admit_all: AdmitAll = .{};
+
+pub const AdmitAll = struct {
+    pub fn admits(_: AdmitAll, _: usize, _: u32) bool {
+        return true;
+    }
+};
+
+/// Where a table's readers find its fixed-width lists (`TableStrings.attach`).
+pub const Reader = struct {
+    io: Io,
+    /// The table's directory handle, which a DDL swap reopens in place.
+    table_dir: *const Io.Dir,
+    cache: *storage_cache.Cache,
+    /// The cache namespace of these lists' pages.
+    uid: u64,
 };
 
 /// A table's string-id lists, one per eligible column. Loaded from disk on
@@ -83,20 +143,127 @@ pub const TableStrings = struct {
     loaded: std.atomic.Value(bool) = .init(false),
     load_mutex: Io.Mutex = .init,
     persist_mutex: Io.Mutex = .init,
+    reader: ?Reader = null,
 
     /// `states` is what the table's manifest recorded.
     pub fn init(allocator: Allocator, schema: types.TableSchema, states: []const State) !TableStrings {
         const columns = try allocator.alloc(?ColumnList, schema.columns.len);
         for (columns, schema.columns, 0..) |*slot, col, ci| {
-            slot.* = if (eligible(schema, col.type)) ColumnList.init(allocator, @intCast(ci), schema.compression, stateOf(states, ci)) else null;
+            const width: ?u8 = if (eligible(schema, col.type)) 0 else fixedWidth(col.type);
+            slot.* = if (width) |w| ColumnList.init(allocator, @intCast(ci), schema.compression, w, stateOf(states, ci)) else null;
         }
         return .{ .allocator = allocator, .columns = columns };
     }
 
     pub fn deinit(self: *TableStrings) void {
+        if (self.reader) |r| self.closeReaders(r.io);
         for (self.columns) |*slot| if (slot.*) |*c| c.deinit();
         self.allocator.free(self.columns);
         self.* = undefined;
+    }
+
+    /// Lets queries read the fixed-width lists, under `table_dir` and through
+    /// `cache`.
+    pub fn attach(self: *TableStrings, io: Io, table_dir: *const Io.Dir, cache: *storage_cache.Cache) void {
+        self.reader = .{ .io = io, .table_dir = table_dir, .cache = cache, .uid = storage_cache.newTableUid() };
+    }
+
+    /// Closes the files readers hold open, ahead of a DDL swap moving the
+    /// table's directory; the next read opens them again.
+    pub fn closeReaders(self: *TableStrings, io: Io) void {
+        for (self.columns) |*slot| if (slot.*) |*c| {
+            c.read_mutex.lockUncancelable(io);
+            defer c.read_mutex.unlock(io);
+            if (c.read_file) |f| f.close(io);
+            c.read_file = null;
+        };
+    }
+
+    /// Bytes per value of column `ci`'s list when it is fixed-width; null
+    /// for a string list or a column without one.
+    pub fn fixedListWidth(self: *const TableStrings, ci: usize) ?u8 {
+        if (ci >= self.columns.len) return null;
+        const c = if (self.columns[ci]) |*col| col else return null;
+        return if (c.width == 0) null else c.width;
+    }
+
+    /// Writes the value of each of `ids` of fixed-width column `ci` into
+    /// `out`, `width` little-endian bytes each, reading the pages they lie
+    /// in through the block cache.
+    pub fn fixedValues(self: *TableStrings, io: Io, ci: usize, ids: []const u32, out: []u8) !void {
+        const r = self.reader orelse return format.Error.CorruptColumnBlockHeader;
+        const c = if (ci < self.columns.len) (if (self.columns[ci]) |*col| col else null) else null;
+        const list = c orelse return format.Error.CorruptColumnBlockHeader;
+        if (list.width == 0) return format.Error.CorruptColumnBlockHeader;
+        if (ids.len == 0) return;
+        var top: u32 = 0;
+        for (ids) |id| top = @max(top, id);
+        const count = try list.coverReads(io, r.table_dir.*, top + 1);
+        const pinned = try self.allocator.alloc(?*storage_cache.Cache.Entry, count);
+        defer {
+            for (pinned) |p| if (p) |e| r.cache.release(e);
+            self.allocator.free(pinned);
+        }
+        @memset(pinned, null);
+        const page_of = try self.allocator.alloc(u32, ids.len);
+        defer self.allocator.free(page_of);
+        var needed = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, count);
+        defer needed.deinit(self.allocator);
+        var at: usize = 0;
+        var page = list.readPage(0);
+        for (ids, page_of) |id, *p| {
+            if (id < page.first_id or id - page.first_id >= page.count) {
+                at = list.readPageOf(id, count);
+                page = list.readPage(at);
+            }
+            p.* = @intCast(at);
+            needed.set(at);
+        }
+        try list.pinPages(io, r, &needed, page_of[0], pinned);
+        const w: usize = list.width;
+        for (ids, page_of, 0..) |id, p, i| {
+            const first = list.readPage(p).first_id;
+            @memcpy(out[i * w ..][0..w], pinned[p].?.bytes[(id - first) * w ..][0..w]);
+        }
+    }
+
+    /// The table id of each of `values` of fixed-width column `ci` into
+    /// `out`, null for a value its list lacks, which no segment that stores
+    /// the column's ids holds. Reads the pages whose span holds a value.
+    pub fn fixedIdsOf(self: *TableStrings, io: Io, ci: usize, values: []const i64, out: []?u32) !void {
+        @memset(out, null);
+        const r = self.reader orelse return format.Error.CorruptColumnBlockHeader;
+        const c = if (ci < self.columns.len) (if (self.columns[ci]) |*col| col else null) else null;
+        const list = c orelse return format.Error.CorruptColumnBlockHeader;
+        if (list.width != 8) return format.Error.CorruptColumnBlockHeader;
+        const id_count = unpackState(list.column_idx, list.reader_state.load(.acquire)).id_count;
+        if (values.len == 0 or id_count == 0) return;
+        const count = try list.coverReads(io, r.table_dir.*, id_count);
+        var needed = try std.DynamicBitSetUnmanaged.initEmpty(self.allocator, count);
+        defer needed.deinit(self.allocator);
+        for (0..count) |p| {
+            const page = list.readPage(p);
+            for (values) |v| if (page.spans(v)) {
+                needed.set(p);
+                break;
+            };
+        }
+        if (needed.count() == 0) return;
+        const pinned = try self.allocator.alloc(?*storage_cache.Cache.Entry, count);
+        defer {
+            for (pinned) |p| if (p) |e| r.cache.release(e);
+            self.allocator.free(pinned);
+        }
+        @memset(pinned, null);
+        try list.pinPages(io, r, &needed, 0, pinned);
+        var it = needed.iterator(.{});
+        while (it.next()) |p| {
+            const page = list.readPage(p);
+            const stored = std.mem.bytesAsSlice(i64, pinned[p].?.bytes[0 .. @as(usize, page.count) * 8]);
+            for (values, out) |v, *id| if (id.* == null and page.spans(v)) {
+                if (std.mem.indexOfScalar(i64, stored, std.mem.nativeToLittle(i64, v))) |k| id.* = page.first_id + @as(u32, @intCast(k));
+            };
+        }
     }
 
     /// Column `ci`'s state as the next publish would record it; null when
@@ -122,8 +289,8 @@ pub const TableStrings = struct {
     /// new ids for values the list lacks. `values` has `len()` and
     /// `get(i)`, and holds distinct values. False, with `ids` unset, when
     /// the column takes no ids: it is closed, or the new values would pass
-    /// `cap`, which closes it.
-    pub fn resolve(self: *TableStrings, io: Io, table_dir: Io.Dir, threads: usize, ci: usize, values: anytype, ids: []u32) !bool {
+    /// `cap`, which closes it, or `admit` turns them away (`admit_all`).
+    pub fn resolve(self: *TableStrings, io: Io, table_dir: Io.Dir, threads: usize, ci: usize, values: anytype, ids: []u32, admit: anytype) !bool {
         const c = if (self.columns[ci]) |*col| col else return false;
         try self.ensureLoaded(io, table_dir, threads);
         c.mutex.lockUncancelable(io);
@@ -131,7 +298,7 @@ pub const TableStrings = struct {
         if (c.closed) return false;
         var dir = try table_dir.createDirPathOpen(io, dir_name, .{});
         defer dir.close(io);
-        return c.resolve(io, dir, @max(1, threads), self.cap, values, ids);
+        return c.resolve(io, dir, @max(1, threads), self.cap, values, ids, admit);
     }
 
     /// Makes every id given so far durable, ahead of the manifest about to
@@ -248,13 +415,71 @@ fn listName(buf: []u8, column_idx: u32) ![]u8 {
     return std.fmt.bufPrint(buf, "{d}.list", .{column_idx});
 }
 
+fn dirFileName(buf: []u8, column_idx: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "{d}.dir", .{column_idx});
+}
+
+fn dirTmpName(buf: []u8, column_idx: u32) ![]u8 {
+    return std.fmt.bufPrint(buf, "{d}.dir.tmp", .{column_idx});
+}
+
 /// A sealed page of `.list`.
 const Page = struct {
     first_id: u32,
     count: u32,
     offset: u64,
     stored_len: u32,
+    /// The smallest and largest value of a fixed-width page.
+    min: i64 = std.math.minInt(i64),
+    max: i64 = std.math.maxInt(i64),
+
+    const record_size: usize = 40;
+
+    fn record(self: Page) [record_size]u8 {
+        var r: [record_size]u8 = @splat(0);
+        format.writeU32(r[0..4], self.first_id);
+        format.writeU32(r[4..8], self.count);
+        format.writeU64(r[8..16], self.offset);
+        format.writeU32(r[16..20], self.stored_len);
+        format.writeU64(r[24..32], @bitCast(self.min));
+        format.writeU64(r[32..40], @bitCast(self.max));
+        return r;
+    }
+
+    fn ofRecord(r: *const [record_size]u8) Page {
+        return .{
+            .first_id = format.readU32(r[0..4]),
+            .count = format.readU32(r[4..8]),
+            .offset = format.readU64(r[8..16]),
+            .stored_len = format.readU32(r[16..20]),
+            .min = @bitCast(format.readU64(r[24..32])),
+            .max = @bitCast(format.readU64(r[32..40])),
+        };
+    }
+
+    fn spans(self: Page, v: i64) bool {
+        return v >= self.min and v <= self.max;
+    }
+
+    /// Sets `min` and `max` from `raw`, a fixed-width page's values.
+    fn spanValues(self: *Page, raw: []const u8) void {
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+        var k: usize = 0;
+        while (k + 8 <= raw.len) : (k += 8) {
+            const v = std.mem.readInt(i64, raw[k..][0..8], .little);
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        self.min = lo;
+        self.max = hi;
+    }
 };
+
+/// Pages per chunk of a reader's page directory. Chunks never move, so a
+/// reader looks pages up while another reads more of `.dir` in.
+const read_chunk_pages: usize = 4096;
+const ReadChunk = [read_chunk_pages]Page;
 
 /// One column's list: its sealed pages on disk, its tail in memory, and
 /// the index over both.
@@ -263,6 +488,19 @@ pub const ColumnList = struct {
     mutex: Io.Mutex = .init,
     column_idx: u32,
     codec: format.Compression,
+    /// Bytes per value of a fixed-width list; 0 for a string list.
+    width: u8,
+    /// `.dir` bytes the sealed pages' records take, of a fixed-width list.
+    dir_len: u64 = 0,
+    dir_synced: bool = true,
+    /// Readers' view of a fixed-width list, apart from the writers': the
+    /// pages `.dir` listed when last read (`coverReads`), `read_count` of
+    /// them covering ids `0 .. read_ids`, and `.list` open for reading.
+    read_mutex: Io.Mutex = .init,
+    read_chunks: []?*ReadChunk = &.{},
+    read_count: std.atomic.Value(usize) = .init(0),
+    read_ids: std.atomic.Value(u32) = .init(0),
+    read_file: ?Io.File = null,
     /// Ids the table's last published manifest counted; the files hold at
     /// least these.
     committed: u32,
@@ -289,18 +527,209 @@ pub const ColumnList = struct {
     /// whenever it changes.
     reader_state: std.atomic.Value(u64),
 
-    fn init(allocator: Allocator, column_idx: u32, table_compression: types.TableCompression, s: State) ColumnList {
+    fn init(allocator: Allocator, column_idx: u32, table_compression: types.TableCompression, width: u8, s: State) ColumnList {
         const codec: format.Compression = switch (table_compression) {
             .none => .none,
             .zstd => .zstd,
             .lz4, .lz4_fsst => .lz4,
         };
-        return .{ .allocator = allocator, .column_idx = column_idx, .codec = codec, .committed = s.id_count, .closed = s.closed, .reader_state = .init(packState(s)) };
+        return .{ .allocator = allocator, .column_idx = column_idx, .codec = codec, .width = width, .committed = s.id_count, .closed = s.closed, .reader_state = .init(packState(s)) };
     }
 
     fn deinit(self: *ColumnList) void {
         self.reset();
+        for (self.read_chunks) |chunk| if (chunk) |ch| self.allocator.destroy(ch);
+        self.allocator.free(self.read_chunks);
         self.* = undefined;
+    }
+
+    fn pageBytes(self: *const ColumnList) usize {
+        return if (self.width == 0) page_bytes else fixed_page_bytes;
+    }
+
+    // ---- Reads (fixed-width lists) ----
+
+    fn readPage(self: *const ColumnList, i: usize) Page {
+        return self.read_chunks[i / read_chunk_pages].?[i % read_chunk_pages];
+    }
+
+    /// The page of the first `count` read in that holds `id`.
+    fn readPageOf(self: *const ColumnList, id: u32, count: usize) usize {
+        var lo: usize = 0;
+        var hi: usize = count;
+        while (hi - lo > 1) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.readPage(mid).first_id <= id) lo = mid else hi = mid;
+        }
+        return lo;
+    }
+
+    /// Reads `.dir` on until its pages cover ids `0 .. ids` and returns how
+    /// many pages are read in. Takes only the pages the last published
+    /// manifest counts: a page past them can still be cut and written anew.
+    fn coverReads(self: *ColumnList, io: Io, table_dir: Io.Dir, ids: u32) !usize {
+        if (self.read_ids.load(.acquire) >= ids) return self.read_count.load(.acquire);
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_ids.load(.acquire) >= ids) return self.read_count.load(.acquire);
+        const limit = unpackState(self.column_idx, self.reader_state.load(.acquire)).id_count;
+        var dir = try table_dir.openDir(io, dir_name, .{});
+        defer dir.close(io);
+        var name_buf: [24]u8 = undefined;
+        const bytes = try dir.readFileAlloc(io, try dirFileName(&name_buf, self.column_idx), self.allocator, .unlimited);
+        defer self.allocator.free(bytes);
+        if (self.read_chunks.len == 0) {
+            const chunks = try self.allocator.alloc(?*ReadChunk, id_cap / read_chunk_pages + 1);
+            @memset(chunks, null);
+            self.read_chunks = chunks;
+        }
+        var count = self.read_count.load(.monotonic);
+        var covered = self.read_ids.load(.monotonic);
+        while ((count + 1) * Page.record_size <= bytes.len and count / read_chunk_pages < self.read_chunks.len) {
+            const page = Page.ofRecord(bytes[count * Page.record_size ..][0..Page.record_size]);
+            if (page.first_id != covered or page.count == 0 or @as(u64, covered) + page.count > limit) break;
+            const slot = &self.read_chunks[count / read_chunk_pages];
+            if (slot.* == null) slot.* = try self.allocator.create(ReadChunk);
+            slot.*.?[count % read_chunk_pages] = page;
+            count += 1;
+            covered += page.count;
+            self.read_count.store(count, .release);
+            self.read_ids.store(covered, .release);
+        }
+        if (covered < ids) return format.Error.CorruptColumnBlockHeader;
+        if (self.read_file == null) {
+            var list_buf: [16]u8 = undefined;
+            self.read_file = try dir.openFile(io, try listName(&list_buf, self.column_idx), .{});
+        }
+        return count;
+    }
+
+    /// Stored bytes one read of `pinPages` takes at most.
+    const pages_read_bytes: usize = 2 << 20;
+    /// Reads of `pinPages` in flight at once: each waits on the disk, not
+    /// on a core.
+    const list_read_threads: usize = 8;
+
+    const PageRun = struct { first: u32, len: u32 };
+
+    fn pageKey(self: *const ColumnList, r: Reader, p: usize) storage_cache.Key {
+        return .{
+            .table_uid = r.uid,
+            .segment_id = list_segment_id,
+            .row_group_idx = @intCast(p),
+            .column_idx = self.column_idx,
+            .content = .list_page,
+        };
+    }
+
+    /// Pins each page `needed` marks, of the first `pinned.len` read in,
+    /// into `pinned`, decoded, reading the misses in a run of adjacent
+    /// pages a read, the runs side by side: a block's ids lie on every page
+    /// of a wide list, a literal's candidates on one page per write, and a
+    /// read waits out a disk round trip each. The walk starts at page
+    /// `start`, so readers of one list at once read apart; a page another is
+    /// reading in is waited for last, once this reader's own fills end.
+    fn pinPages(self: *ColumnList, io: Io, r: Reader, needed: *const std.DynamicBitSetUnmanaged, start: usize, pinned: []?*storage_cache.Cache.Entry) !void {
+        var busy: std.ArrayList(u32) = .empty;
+        defer busy.deinit(self.allocator);
+        {
+            var fills: std.ArrayList(*storage_cache.Cache.Fill) = .empty;
+            defer fills.deinit(self.allocator);
+            defer for (fills.items) |f| r.cache.endFill(io, f);
+            var runs: std.ArrayList(PageRun) = .empty;
+            defer runs.deinit(self.allocator);
+            for (0..pinned.len) |k| {
+                const p = (start + k) % pinned.len;
+                if (!needed.isSet(p)) continue;
+                switch (try r.cache.claim(self.pageKey(r, p))) {
+                    .hit => |e| pinned[p] = e,
+                    .busy => try busy.append(self.allocator, @intCast(p)),
+                    .fill => |f| {
+                        fills.append(self.allocator, f) catch |err| {
+                            r.cache.endFill(io, f);
+                            return err;
+                        };
+                        const last = if (runs.items.len > 0) &runs.items[runs.items.len - 1] else null;
+                        if (last != null and self.extendsRun(last.?.first, last.?.len, p)) {
+                            last.?.len += 1;
+                        } else {
+                            try runs.append(self.allocator, .{ .first = @intCast(p), .len = 1 });
+                        }
+                    },
+                }
+            }
+            if (runs.items.len > 0) {
+                var job: PageRunJob = .{ .column = self, .io = io, .r = r, .file = try self.listFile(io, r), .runs = runs.items, .pinned = pinned };
+                parallel.forJobs(list_read_threads, runs.items.len, &job, PageRunJob.run);
+                if (job.failure.err) |e| return e;
+            }
+        }
+        for (busy.items) |p| pinned[p] = try self.pinPage(io, r, p);
+    }
+
+    /// Whether page `p` follows the run of `len` pages from `first` on in
+    /// `.list` with the run still in one read.
+    fn extendsRun(self: *const ColumnList, first: usize, len: usize, p: usize) bool {
+        if (p != first + len) return false;
+        const last = self.readPage(p - 1);
+        const next = self.readPage(p);
+        if (next.offset != last.offset + page_header_size + last.stored_len) return false;
+        return next.offset + page_header_size + next.stored_len - self.readPage(first).offset <= pages_read_bytes;
+    }
+
+    /// Reads in `run`'s pages, whose fills the caller holds, in one read
+    /// and pins each into `pinned`.
+    fn readRun(self: *ColumnList, io: Io, r: Reader, file: Io.File, run: PageRun, pinned: []?*storage_cache.Cache.Entry) PageReadError!void {
+        const from = self.readPage(run.first).offset;
+        const last = self.readPage(run.first + run.len - 1);
+        const stored = try self.allocator.alloc(u8, @intCast(last.offset + page_header_size + last.stored_len - from));
+        defer self.allocator.free(stored);
+        if (try file.readPositionalAll(io, stored, from) != stored.len) return format.Error.UnexpectedEof;
+        for (run.first..run.first + run.len) |p| {
+            const page = self.readPage(p);
+            const at: usize = @intCast(page.offset - from);
+            pinned[p] = try self.insertPage(r, p, stored[at..][0 .. page_header_size + page.stored_len]);
+        }
+    }
+
+    /// Page `p`, decoded, pinned in the block cache; read in on a miss.
+    fn pinPage(self: *ColumnList, io: Io, r: Reader, p: usize) !*storage_cache.Cache.Entry {
+        const fill = switch (try r.cache.claimAfterFill(io, self.pageKey(r, p))) {
+            .hit => |entry| return entry,
+            .fill => |fill| fill,
+        };
+        defer r.cache.endFill(io, fill);
+        const page = self.readPage(p);
+        const stored = try self.allocator.alloc(u8, page_header_size + @as(usize, page.stored_len));
+        defer self.allocator.free(stored);
+        if (try (try self.listFile(io, r)).readPositionalAll(io, stored, page.offset) != stored.len) return format.Error.UnexpectedEof;
+        return self.insertPage(r, p, stored);
+    }
+
+    fn listFile(self: *ColumnList, io: Io, r: Reader) !Io.File {
+        self.read_mutex.lockUncancelable(io);
+        defer self.read_mutex.unlock(io);
+        if (self.read_file == null) {
+            var dir = try r.table_dir.openDir(io, dir_name, .{});
+            defer dir.close(io);
+            var list_buf: [16]u8 = undefined;
+            self.read_file = try dir.openFile(io, try listName(&list_buf, self.column_idx), .{});
+        }
+        return self.read_file.?;
+    }
+
+    /// Page `p`, stored as `stored`, decoded into the block cache, pinned.
+    fn insertPage(self: *ColumnList, r: Reader, p: usize, stored: []const u8) !*storage_cache.Cache.Entry {
+        const page = self.readPage(p);
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(self.allocator);
+        const decoded = try decodePage(self.allocator, stored, page.first_id, &raw) orelse return format.Error.CorruptColumnBlockHeader;
+        if (decoded.view.count != page.count or decoded.view.width != self.width) return format.Error.CorruptColumnBlockHeader;
+        const block_alloc = r.cache.blockAllocator();
+        const bytes = try block_alloc.alignedAlloc(u8, .@"16", raw.items.len);
+        errdefer block_alloc.free(bytes);
+        @memcpy(bytes, raw.items);
+        return r.cache.insertPinned(self.pageKey(r, p), bytes, .raw);
     }
 
     /// Drops everything held in memory, keeping the column's identity and
@@ -319,9 +748,11 @@ pub const ColumnList = struct {
     }
 
     /// Stops the column taking ids, for good once the next manifest is
-    /// published.
+    /// published. A fixed-width list keeps what it holds, its tail included:
+    /// segments that stored its ids, some maybe not yet published, read
+    /// through it.
     fn close(self: *ColumnList) void {
-        self.reset();
+        if (self.width == 0) self.reset();
         self.closed = true;
         self.reader_state.store(packState(self.currentState()), .release);
     }
@@ -332,8 +763,8 @@ pub const ColumnList = struct {
     }
 
     fn currentState(self: *const ColumnList) State {
-        if (self.closed) return .{ .column_idx = self.column_idx, .id_count = 0, .closed = true };
-        return .{ .column_idx = self.column_idx, .id_count = self.committed, .closed = false };
+        if (self.closed and self.width == 0) return .{ .column_idx = self.column_idx, .id_count = 0, .closed = true };
+        return .{ .column_idx = self.column_idx, .id_count = self.committed, .closed = self.closed };
     }
 
     fn idCount(self: *const ColumnList) u32 {
@@ -350,7 +781,8 @@ pub const ColumnList = struct {
     }
 
     fn tailPayloadLen(self: *const ColumnList, lo: usize, hi: usize) usize {
-        return (hi - lo + 1) * 4 + (self.tailStart(hi) - self.tailStart(lo));
+        const bytes = self.tailStart(hi) - self.tailStart(lo);
+        return if (self.width > 0) bytes else (hi - lo + 1) * 4 + bytes;
     }
 
     // ---- Load ----
@@ -372,8 +804,12 @@ pub const ColumnList = struct {
                 self.list_len = cut.offset;
                 try file.setLength(io, self.list_len);
             }
+            if (self.width > 0) try self.matchDir(io, dir);
         } else |err| switch (err) {
-            error.FileNotFound => try self.allocateIndex(tailCount(tail_page)),
+            error.FileNotFound => {
+                try self.allocateIndex(tailCount(tail_page));
+                if (self.width > 0) try self.matchDir(io, dir);
+            },
             else => return err,
         }
 
@@ -397,6 +833,25 @@ pub const ColumnList = struct {
             self.tail_version = 1;
         }
         if (self.idCount() < self.committed) self.closeDamaged();
+    }
+
+    /// Makes `.dir` list exactly the sealed pages, replacing it when it
+    /// lists others: a crash can leave it short of `.list` or past it.
+    fn matchDir(self: *ColumnList, io: Io, dir: Io.Dir) !void {
+        const records = try self.allocator.alloc(u8, self.pages.items.len * Page.record_size);
+        defer self.allocator.free(records);
+        for (self.pages.items, 0..) |p, k| records[k * Page.record_size ..][0..Page.record_size].* = p.record();
+        self.dir_len = records.len;
+        var name_buf: [24]u8 = undefined;
+        const name = try dirFileName(&name_buf, self.column_idx);
+        const current = dir.readFileAlloc(io, name, self.allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (current) |c| self.allocator.free(c);
+        if (std.mem.eql(u8, current orelse &.{}, records)) return;
+        var tmp_buf: [24]u8 = undefined;
+        try @import("storage.zig").writeFileAtomic(io, dir, try dirTmpName(&tmp_buf, self.column_idx), name, records, true);
     }
 
     fn tailCount(tail_page: ?[]const u8) u32 {
@@ -474,7 +929,7 @@ pub const ColumnList = struct {
         }
     };
 
-    fn resolve(self: *ColumnList, io: Io, dir: Io.Dir, threads: usize, cap: u32, values: anytype, ids: []u32) !bool {
+    fn resolve(self: *ColumnList, io: Io, dir: Io.Dir, threads: usize, cap: u32, values: anytype, ids: []u32, admit: anytype) !bool {
         const allocator = self.allocator;
         const n = values.len();
         @memset(ids, none);
@@ -523,6 +978,10 @@ pub const ColumnList = struct {
 
         var new_count: usize = 0;
         for (ids) |id| new_count += @intFromBool(id == none);
+        if (!admit.admits(new_count, self.idCount())) {
+            @memset(ids, none);
+            return false;
+        }
         if (new_count == 0) return true;
         if (@as(u64, self.idCount()) + new_count > cap) {
             self.close();
@@ -540,7 +999,7 @@ pub const ColumnList = struct {
 
         // Pages seal as the tail grows, a batch at a time, so the tail never
         // holds all of a large write's new values.
-        const seal_at = 2 * threads * page_bytes;
+        const seal_at = 2 * threads * self.pageBytes();
         defer self.tail_version +%= 1;
         for (ids, 0..) |*id, i| if (id.* == none) {
             const bytes = values.get(i);
@@ -551,9 +1010,9 @@ pub const ColumnList = struct {
             self.tail_ends.appendAssumeCapacity(@intCast(self.tail_bytes.items.len));
             self.index.insert(hashes[i], new_id);
             id.* = new_id;
-            if (self.tail_bytes.items.len >= seal_at) try self.sealFullPages(io, dir, threads);
+            if (self.tail_bytes.items.len >= seal_at) try self.sealPages(io, dir, threads, false);
         };
-        try self.sealFullPages(io, dir, threads);
+        try self.sealPages(io, dir, threads, false);
         return true;
     }
 
@@ -597,10 +1056,11 @@ pub const ColumnList = struct {
 
     const Cut = struct { lo: u32, hi: u32 };
 
-    /// Seals the tail's front into full pages, compressed in parallel and
-    /// appended to `.list`. On failure the column is as it was: the pages
-    /// count only once all are written.
-    fn sealFullPages(self: *ColumnList, io: Io, dir: Io.Dir, threads: usize) !void {
+    /// Seals the tail's front into full pages, or with `all` the whole tail,
+    /// compressed in parallel and appended to `.list`, and lists them in
+    /// `.dir` when fixed-width. On failure the column is as it was: the
+    /// pages count only once all are written.
+    fn sealPages(self: *ColumnList, io: Io, dir: Io.Dir, threads: usize, all: bool) !void {
         const allocator = self.allocator;
         var cuts: std.ArrayList(Cut) = .empty;
         defer cuts.deinit(allocator);
@@ -608,7 +1068,7 @@ pub const ColumnList = struct {
         var hi: usize = 0;
         while (hi < self.tail_ends.items.len) {
             hi += 1;
-            if (self.tailPayloadLen(lo, hi) < page_bytes) continue;
+            if (self.tailPayloadLen(lo, hi) < self.pageBytes() and !(all and hi == self.tail_ends.items.len)) continue;
             try cuts.append(allocator, .{ .lo = @intCast(lo), .hi = @intCast(hi) });
             lo = hi;
         }
@@ -638,9 +1098,29 @@ pub const ColumnList = struct {
         // load, which would otherwise wait on the whole load's pages.
         @import("storage.zig").startWriteback(file, self.list_len, offset - self.list_len);
         offset = self.list_len;
+        const first_new = self.pages.items.len;
         for (cuts.items, out) |c, page| {
-            self.pages.appendAssumeCapacity(.{ .first_id = self.sealed + c.lo, .count = c.hi - c.lo, .offset = offset, .stored_len = @intCast(page.len - page_header_size) });
+            const sealed_page = self.pages.addOneAssumeCapacity();
+            sealed_page.* = .{ .first_id = self.sealed + c.lo, .count = c.hi - c.lo, .offset = offset, .stored_len = @intCast(page.len - page_header_size) };
+            if (self.width > 0) sealed_page.spanValues(self.tail_bytes.items[self.tailStart(c.lo)..self.tailStart(c.hi)]);
             offset += page.len;
+        }
+        if (self.width > 0) {
+            const records = try allocator.alloc(u8, cuts.items.len * Page.record_size);
+            defer allocator.free(records);
+            for (self.pages.items[first_new..], 0..) |p, k| records[k * Page.record_size ..][0..Page.record_size].* = p.record();
+            var dir_buf: [24]u8 = undefined;
+            const dir_file = dir.createFile(io, try dirFileName(&dir_buf, self.column_idx), .{ .truncate = false }) catch |e| {
+                self.pages.shrinkRetainingCapacity(first_new);
+                return e;
+            };
+            defer dir_file.close(io);
+            dir_file.writePositionalAll(io, records, self.dir_len) catch |e| {
+                self.pages.shrinkRetainingCapacity(first_new);
+                return e;
+            };
+            self.dir_len += records.len;
+            self.dir_synced = false;
         }
         self.list_len = offset;
         self.list_synced = false;
@@ -660,6 +1140,10 @@ pub const ColumnList = struct {
     fn tailPayload(self: *const ColumnList, allocator: Allocator, lo: usize, hi: usize) ![]u8 {
         const raw = try allocator.alloc(u8, self.tailPayloadLen(lo, hi));
         const base = self.tailStart(lo);
+        if (self.width > 0) {
+            @memcpy(raw, self.tail_bytes.items[base..self.tailStart(hi)]);
+            return raw;
+        }
         format.writeU32(raw[0..4], 0);
         for (self.tail_ends.items[lo..hi], 1..) |end, k| format.writeU32(raw[k * 4 ..][0..4], end - base);
         @memcpy(raw[(hi - lo + 1) * 4 ..], self.tail_bytes.items[base..self.tailStart(hi)]);
@@ -671,11 +1155,12 @@ pub const ColumnList = struct {
     /// Syncs the sealed pages when `durable` and encodes the tail's page,
     /// for `TableStrings.persist`, and returns the column's state.
     fn persist(self: *ColumnList, io: Io, dir: Io.Dir, durable: bool) !State {
-        if (self.closed) {
+        if (self.closed and self.width == 0) {
             var name_buf: [16]u8 = undefined;
             dir.deleteFile(io, try listName(&name_buf, self.column_idx)) catch {};
             return self.currentState();
         }
+        if (self.width > 0) try self.sealPages(io, dir, 1, true);
         if (durable and !self.list_synced) {
             var name_buf: [16]u8 = undefined;
             const file = try dir.openFile(io, try listName(&name_buf, self.column_idx), .{ .mode = .read_write });
@@ -683,11 +1168,20 @@ pub const ColumnList = struct {
             try file.sync(io);
             self.list_synced = true;
         }
-        if (self.page_version != self.tail_version) {
+        if (durable and !self.dir_synced) {
+            var name_buf: [24]u8 = undefined;
+            const file = try dir.openFile(io, try dirFileName(&name_buf, self.column_idx), .{ .mode = .read_write });
+            defer file.close(io);
+            try file.sync(io);
+            self.dir_synced = true;
+        }
+        if (self.width > 0) {
+            self.page_version = self.tail_version;
+        } else if (self.page_version != self.tail_version) {
             const page: []u8 = if (self.tail_ends.items.len == 0) &.{} else page: {
                 const raw = try self.tailPayload(self.allocator, 0, self.tail_ends.items.len);
                 defer self.allocator.free(raw);
-                break :page try encodePage(self.allocator, .fast, self.sealed, @intCast(self.tail_ends.items.len), raw);
+                break :page try encodePage(self.allocator, .fast, self.sealed, @intCast(self.tail_ends.items.len), raw, 0);
             };
             self.allocator.free(self.tail_page);
             self.tail_page = page;
@@ -791,12 +1285,20 @@ const Index = struct {
 // Pages
 // ---------------------------------------------------------------------------
 
+/// A page header's byte 21 is its values' width (0: a string page) and byte
+/// 22 its flags.
+const page_streams_flag: u8 = 1;
+
 const PageHeader = struct {
     first_id: u32,
     count: u32,
     raw_len: u32,
     stored_len: u32,
     codec: format.Compression,
+    width: u8,
+    /// The stored payload is its `int_streams` directory, then the codec
+    /// frame of the rewritten payload.
+    streams: bool,
 };
 
 fn parseHeader(h: *const [page_header_size]u8) ?PageHeader {
@@ -804,13 +1306,19 @@ fn parseHeader(h: *const [page_header_size]u8) ?PageHeader {
     if (h[20] > @backingInt(format.Compression.lz4)) return null;
     const count = format.readU32(h[8..12]);
     const raw_len = format.readU32(h[12..16]);
-    if (count == 0 or raw_len < (@as(u64, count) + 1) * 4) return null;
+    const width = h[21];
+    const streams = h[22] & page_streams_flag != 0;
+    if (count == 0) return null;
+    if (width == 0 and (streams or raw_len < (@as(u64, count) + 1) * 4)) return null;
+    if (width > 0 and raw_len != @as(u64, count) * width) return null;
     return .{
         .first_id = format.readU32(h[4..8]),
         .count = count,
         .raw_len = raw_len,
         .stored_len = format.readU32(h[16..20]),
         .codec = @fromBackingInt(@intCast(h[20])),
+        .width = width,
+        .streams = streams,
     };
 }
 
@@ -825,9 +1333,13 @@ fn checksum(header: []const u8, stored: []const u8) u64 {
 const PageView = struct {
     raw: []const u8,
     count: u32,
+    /// Bytes per value; 0 for a string page.
+    width: u8 = 0,
 
-    /// Null when the offsets don't lie within `raw` in order.
-    fn of(raw: []const u8, count: u32) ?PageView {
+    /// Null when the offsets don't lie within `raw` in order, or a
+    /// fixed-width page's values don't fill it.
+    fn of(raw: []const u8, count: u32, width: u8) ?PageView {
+        if (width > 0) return if (raw.len == @as(usize, count) * width) .{ .raw = raw, .count = count, .width = width } else null;
         const base = (@as(usize, count) + 1) * 4;
         if (raw.len < base or format.readU32(raw[0..4]) != 0) return null;
         var prev: u32 = 0;
@@ -845,6 +1357,7 @@ const PageView = struct {
     }
 
     fn value(self: PageView, k: usize) []const u8 {
+        if (self.width > 0) return self.raw[k * self.width ..][0..self.width];
         const base = (@as(usize, self.count) + 1) * 4;
         return self.raw[base + self.valueStart(k) .. base + self.valueStart(k + 1)];
     }
@@ -859,8 +1372,21 @@ const Packing = union(enum) {
 };
 
 /// Header and stored payload of the page of `count` values from `first_id`
-/// whose payload is `raw`. Caller owns the result.
-fn encodePage(allocator: Allocator, packing: Packing, first_id: u32, count: u32, raw: []const u8) compression.Error![]u8 {
+/// whose payload is `raw`, `width` bytes a value (0: strings). Caller owns
+/// the result.
+fn encodePage(allocator: Allocator, packing: Packing, first_id: u32, count: u32, raw: []const u8, width: u8) compression.Error![]u8 {
+    var directory: std.ArrayList(u8) = .empty;
+    defer directory.deinit(allocator);
+    var rewritten: std.ArrayList(u8) = .empty;
+    defer rewritten.deinit(allocator);
+    var source = raw;
+    if (width > 0) switch (packing) {
+        .table => |t| if (t.codec != .none) {
+            const stream: int_streams.Stream = .{ .offset = 0, .count = count, .width = width, .signed = true };
+            if (try int_streams.transform(allocator, t.compressor, raw, &.{stream}, &directory, &rewritten)) source = rewritten.items;
+        },
+        .fast => {},
+    };
     var codec: format.Compression = .none;
     var compressed: ?[]u8 = null;
     defer if (compressed) |c| allocator.free(c);
@@ -868,35 +1394,40 @@ fn encodePage(allocator: Allocator, packing: Packing, first_id: u32, count: u32,
         .table => |t| switch (t.codec) {
             .none => {},
             .zstd => {
-                // No query reads a list, so its level trades only the load's
-                // CPU for bytes on disk, not the cold reads blocks pay for.
-                compressed = try t.compressor.compress(allocator, raw, compression.default_level);
+                // A string list is never read by a query, so its level trades
+                // only the load's CPU for bytes on disk; a fixed-width list's
+                // reads are rarer than its blocks'.
+                compressed = try t.compressor.compress(allocator, source, compression.default_level);
                 codec = .zstd;
             },
             .lz4 => {
-                compressed = try t.compressor.compressLz4HC(allocator, raw);
+                compressed = try t.compressor.compressLz4HC(allocator, source);
                 codec = .lz4;
             },
         },
         .fast => {
-            compressed = try compression.lz4CompressFast(allocator, raw);
+            compressed = try compression.lz4CompressFast(allocator, source);
             codec = .lz4;
         },
     }
-    var stored = raw;
+    var body = source;
     if (compressed) |c| {
-        if (c.len < raw.len) stored = c else codec = .none;
+        if (c.len < source.len) body = c else codec = .none;
     }
-    const page = try allocator.alloc(u8, page_header_size + stored.len);
+    const stored_len = directory.items.len + body.len;
+    const page = try allocator.alloc(u8, page_header_size + stored_len);
     @memcpy(page[0..4], &page_magic);
     format.writeU32(page[4..8], first_id);
     format.writeU32(page[8..12], count);
     format.writeU32(page[12..16], @intCast(raw.len));
-    format.writeU32(page[16..20], @intCast(stored.len));
+    format.writeU32(page[16..20], @intCast(stored_len));
     page[20] = @backingInt(codec);
-    @memset(page[21..24], 0);
-    @memcpy(page[page_header_size..], stored);
-    format.writeU64(page[24..32], checksum(page[0..page_header_size], stored));
+    page[21] = width;
+    page[22] = if (directory.items.len > 0) page_streams_flag else 0;
+    page[23] = 0;
+    @memcpy(page[page_header_size..][0..directory.items.len], directory.items);
+    @memcpy(page[page_header_size + directory.items.len ..], body);
+    format.writeU64(page[24..32], checksum(page[0..page_header_size], page[page_header_size..]));
     return page;
 }
 
@@ -912,15 +1443,28 @@ fn decodePage(allocator: Allocator, bytes: []const u8, first_id: ?u32, raw: *std
     const stored = bytes[page_header_size..];
     if (format.readU64(bytes[24..32]) != checksum(bytes[0..page_header_size], stored)) return null;
     try raw.resize(allocator, h.raw_len);
+    var body = stored;
+    var into = raw.items;
+    var directory: ?int_streams.Directory = null;
+    if (h.streams) {
+        const d = int_streams.readDirectory(stored, h.raw_len) catch return null;
+        directory = d;
+        body = stored[d.bytes.len..];
+        into = raw.items[raw.items.len - d.stored_len ..];
+    }
     switch (h.codec) {
         .none => {
-            if (stored.len != raw.items.len) return null;
-            @memcpy(raw.items, stored);
+            if (body.len != into.len) return null;
+            @memcpy(into, body);
         },
-        .zstd => compression.decompressInto(stored, raw.items) catch return null,
-        .lz4 => compression.lz4DecompressInto(stored, raw.items) catch return null,
+        .zstd => compression.decompressInto(body, into) catch return null,
+        .lz4 => compression.lz4DecompressInto(body, into) catch return null,
     }
-    const view = PageView.of(raw.items, h.count) orelse return null;
+    if (directory) |d| int_streams.restore(allocator, d, raw.items) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const view = PageView.of(raw.items, h.count, h.width) orelse return null;
     return .{ .first_id = h.first_id, .view = view };
 }
 
@@ -991,11 +1535,13 @@ fn ProbeJob(comptime Values: type) type {
     };
 }
 
+/// Indexes each page's values, and spans each fixed-width page's (`scanPages`
+/// reads only headers).
 const RebuildJob = struct {
     allocator: Allocator,
     io: Io,
     file: Io.File,
-    pages: []const Page,
+    pages: []Page,
     index: *Index,
     scratch: [parallel.MAX_THREADS]Scratch = @splat(.{}),
     failure: Failure(JobError) = .{},
@@ -1005,6 +1551,7 @@ const RebuildJob = struct {
         const page = self.pages[j];
         const view = self.scratch[t].read(self.allocator, self.io, self.file, page) catch |e| return self.failure.fail(e);
         const v = view orelse return self.failure.damage(j);
+        if (v.width > 0) self.pages[j].spanValues(v.raw);
         for (0..v.count) |k| self.index.insertShared(std.hash.Wyhash.hash(0, v.value(k)), page.first_id + @as(u32, @intCast(k)));
         _ = @atomicRmw(usize, &self.index.count, .Add, @as(usize, v.count), .monotonic);
     }
@@ -1038,6 +1585,22 @@ fn VerifyJob(comptime Values: type) type {
     };
 }
 
+/// Reads in runs of a list's pages, a run a job (`ColumnList.pinPages`).
+const PageRunJob = struct {
+    column: *ColumnList,
+    io: Io,
+    r: Reader,
+    file: Io.File,
+    runs: []const ColumnList.PageRun,
+    pinned: []?*storage_cache.Cache.Entry,
+    failure: Failure(PageReadError) = .{},
+
+    fn run(self: *PageRunJob, _: usize, j: usize) void {
+        if (self.failure.stopped()) return;
+        self.column.readRun(self.io, self.r, self.file, self.runs[j], self.pinned) catch |e| self.failure.fail(e);
+    }
+};
+
 const SealJob = struct {
     allocator: Allocator,
     column: *const ColumnList,
@@ -1053,7 +1616,7 @@ const SealJob = struct {
         const raw = self.column.tailPayload(self.allocator, cut.lo, cut.hi) catch |e| return self.failure.fail(e);
         defer self.allocator.free(raw);
         const packing: Packing = .{ .table = .{ .compressor = &self.compressors[t].?, .codec = self.column.codec } };
-        self.out[j] = encodePage(self.allocator, packing, self.column.sealed + cut.lo, cut.hi - cut.lo, raw) catch |e| return self.failure.fail(e);
+        self.out[j] = encodePage(self.allocator, packing, self.column.sealed + cut.lo, cut.hi - cut.lo, raw, self.column.width) catch |e| return self.failure.fail(e);
     }
 };
 

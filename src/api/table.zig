@@ -312,6 +312,8 @@ pub const Table = struct {
             .wal = null,
             .next_segment_id = .init(manifest.nextSegmentId()),
         };
+        self.strings.attach(io, &self.table_dir, cache_ptr);
+        self.seg_handles.lists = &self.strings;
 
         // Reclaim orphaned segment files: a crash mid-compaction, or a #137
         // pending delete that never drained before shutdown, leaves .dat/
@@ -357,6 +359,7 @@ pub const Table = struct {
         if (self.upsert_idx_arena) |*a| a.deinit();
         self.seg_handles.deinit(allocator);
         self.cache.purgeTable(self.cache_uid);
+        if (self.strings.reader) |r| self.cache.purgeTable(r.uid);
         // Drop the Table's reference. If scans pinned a snapshot, the
         // memtable stays alive until the last reader releases it.
         self.memtable.release();

@@ -502,6 +502,10 @@ pub const Shape = struct {
     // too small to place.
     count_sketch: bool = false,
     count_rank: ?CountRank = null,
+    // Key and COUNT(DISTINCT) columns the scans read by table id
+    // (`SiloCore.RunConfig.int_id_columns`); the rows come back keyed by
+    // the ids.
+    int_id_columns: []const SiloCore.IntIdColumn = &.{},
     // The fewest rows a group needs to pass a HAVING the core's top-N
     // filters after it runs, so the sketch may drop every smaller group.
     count_floor: u64 = 0,
@@ -747,7 +751,13 @@ fn keyColumnsRunStructured(table: *api.Table, segs: []const storage.ManifestEntr
             }
             return false;
         };
-        var block = seg.borrowColumnBlock(table.allocator, rg, phys, table.cacheRef()) catch return false;
+        // Ids run where their values do, and a block's values span a wide
+        // list's every page.
+        const borrowed = if (seg.info.intIdColumn(phys))
+            seg.borrowIdBlock(table.allocator, rg, phys, table.cacheRef())
+        else
+            seg.borrowColumnBlock(table.allocator, rg, phys, table.cacheRef());
+        var block = borrowed catch return false;
         defer block.release(table.allocator, table.cacheRef());
         if (block.encoding != .rle) return false;
         const flags = storage.format.ColumnBlockFlags{ .has_nulls = table.schema.columns[phys].nullable };
@@ -1129,6 +1139,7 @@ fn runHarness(
         .hash_key_columns = if (hashed) hash_key_cols_buf[0..n_hash_keys] else &.{},
         .id_key_columns = id_key_columns,
         .id_value_columns = id_value_columns,
+        .int_id_columns = shape.int_id_columns,
         .byte_length_columns = length_cols_buf[0..n_length_cols],
         .key_digest_mask = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - params.key_digest_bits),
     };

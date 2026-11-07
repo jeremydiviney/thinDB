@@ -294,6 +294,7 @@ fn closeTableHandles(t: *Table) void {
     t.dirs_open = false;
     // Scans reopen them from the directory's new name.
     t.seg_handles.clear(t.allocator);
+    t.strings.closeReaders(t.io);
 }
 
 pub const Schema = struct {
