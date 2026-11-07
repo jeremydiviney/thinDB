@@ -43,10 +43,26 @@ const queries = [_][]const u8{
     "SELECT u, ts, MAX(amt) FROM {T} WHERE id % 3 = 0 GROUP BY u, ts ORDER BY u, ts LIMIT 15",
     "SELECT u FROM {T} WHERE ts = '2024-01-05 00:00:16' ORDER BY id LIMIT 10",
     "SELECT amt, COUNT(DISTINCT u), COUNT(DISTINCT ts) FROM {T} GROUP BY amt ORDER BY amt",
+    // Unordered, so their rows compare sorted: the keys and COUNT(DISTINCT)
+    // inputs nothing else reads, which the scans may read by id.
+    "SELECT u, COUNT(*) FROM {T} GROUP BY u",
+    "SELECT amt, COUNT(*) FROM {T} GROUP BY amt",
+    "SELECT ts, amt, COUNT(*) FROM {T} GROUP BY ts, amt",
+    "SELECT u, ts, COUNT(*), SUM(id) FROM {T} WHERE id > 100 GROUP BY u, ts",
+    "SELECT u, k, COUNT(*) FROM {T} GROUP BY u, k",
+    "SELECT k, u, MIN(id) FROM {T} WHERE id > 50 GROUP BY k, u",
+    "SELECT k, COUNT(DISTINCT u) FROM {T} GROUP BY k",
+    "SELECT u, COUNT(*) FROM {T} GROUP BY u HAVING COUNT(*) > 20",
+    "SELECT u, MAX(amt) FROM {T} GROUP BY u",
+    "SELECT amt, COUNT(DISTINCT u) FROM {T} GROUP BY amt",
+    "SELECT id % 5, COUNT(DISTINCT u), COUNT(DISTINCT ts) FROM {T} GROUP BY id % 5",
+    "SELECT COUNT(DISTINCT u), COUNT(DISTINCT ts), COUNT(DISTINCT amt) FROM {T}",
+    "SELECT COUNT(DISTINCT u) FROM {T} WHERE id > 100",
 };
 
 /// Every row of `sql` over table `table`, its cells joined by `|` and its
-/// rows by newlines. Caller owns the result.
+/// rows by newlines, sorted when `sql` leaves their order open. Caller owns
+/// the result.
 fn rowsText(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8, table: []const u8) ![]u8 {
     const text = try std.mem.replaceOwned(u8, allocator, sql, "{T}", table);
     defer allocator.free(text);
@@ -71,7 +87,28 @@ fn rowsText(allocator: std.mem.Allocator, db: *thindb.Database, sql: []const u8,
             try out.append(allocator, '\n');
         }
     }
+    if (std.mem.indexOf(u8, sql, "ORDER BY") == null) try sortLines(allocator, &out);
     return out.toOwnedSlice(allocator);
+}
+
+fn sortLines(allocator: std.mem.Allocator, text: *std.ArrayList(u8)) !void {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, text.items, '\n');
+    while (it.next()) |line| if (line.len > 0) try lines.append(allocator, line);
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    var sorted: std.ArrayList(u8) = .empty;
+    errdefer sorted.deinit(allocator);
+    for (lines.items) |line| {
+        try sorted.appendSlice(allocator, line);
+        try sorted.append(allocator, '\n');
+    }
+    text.deinit(allocator);
+    text.* = sorted;
 }
 
 /// Every query over `t` matches it over the memtable-only `r`.
@@ -121,13 +158,13 @@ const Rows = struct {
 };
 
 /// Inserts `rows` into `table`: every 13th `u` NULL, the rest cycling over
-/// `u_values` wide values (or new on every row), `ts` over 23 days and
-/// `amt` over 11 amounts. No column's values share a common step, which
+/// `u_values` wide values (or new on every row), `ts` over 23 days,
+/// `amt` over 11 amounts and `k` over 4. No column's values share a common step, which
 /// would narrow their blocks past any ids.
 fn insertRows(allocator: std.mem.Allocator, db: *thindb.Database, table: []const u8, rows: Rows) !void {
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(allocator);
-    try sql.print(allocator, "INSERT INTO {s} (id, u, ts, amt) VALUES ", .{table});
+    try sql.print(allocator, "INSERT INTO {s} (id, u, ts, amt, k) VALUES ", .{table});
     for (0..rows.count) |i| {
         const id = rows.first_id + i;
         if (i != 0) try sql.appendSlice(allocator, ", ");
@@ -142,7 +179,7 @@ fn insertRows(allocator: std.mem.Allocator, db: *thindb.Database, table: []const
         }
         const day = id % 23;
         const amount = id % 11;
-        try sql.print(allocator, ", '2024-01-{d:0>2} 00:00:{d:0>2}', {d}.{d:0>2})", .{ 1 + day, day * day % 60, amount * 1_234_567, amount * amount * 7 % 100 });
+        try sql.print(allocator, ", '2024-01-{d:0>2} 00:00:{d:0>2}', {d}.{d:0>2}, {d})", .{ 1 + day, day * day % 60, amount * 1_234_567, amount * amount * 7 % 100, id % 4 });
     }
     try exec(allocator, db, sql.items);
 }
@@ -172,8 +209,8 @@ fn expectIdSegments(allocator: std.mem.Allocator, t: *thindb.Table, ci: usize, e
     try std.testing.expectEqualSlices(bool, expected, got);
 }
 
-const create_t = "CREATE TABLE t (id BIGINT NOT NULL, u BIGINT, ts DATETIME NOT NULL, amt DECIMAL(18,2) NOT NULL, PRIMARY KEY (id))";
-const create_r = "CREATE TABLE r (id BIGINT NOT NULL, u BIGINT, ts DATETIME NOT NULL, amt DECIMAL(18,2) NOT NULL, PRIMARY KEY (id))";
+const create_t = "CREATE TABLE t (id BIGINT NOT NULL, u BIGINT, ts DATETIME NOT NULL, amt DECIMAL(18,2) NOT NULL, k INT NOT NULL, PRIMARY KEY (id))";
+const create_r = "CREATE TABLE r (id BIGINT NOT NULL, u BIGINT, ts DATETIME NOT NULL, amt DECIMAL(18,2) NOT NULL, k INT NOT NULL, PRIMARY KEY (id))";
 
 test "table int ids: queries over id-coded segments match the values" {
     const allocator = std.testing.allocator;

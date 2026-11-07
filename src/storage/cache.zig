@@ -171,6 +171,13 @@ pub const TableCache = struct {
     /// Where a reader notes the blocks it reads in on a miss, for a scan's
     /// read-ahead; null: nowhere.
     misses: ?*MissLog = null,
+    /// Per column, whether its blocks coded in table ids (§4.7) read as the
+    /// ids themselves (`Content.int_ids`) rather than the values they name.
+    int_ids: []const bool = &.{},
+
+    pub fn readsIds(self: TableCache, column_idx: usize) bool {
+        return column_idx < self.int_ids.len and self.int_ids[column_idx];
+    }
 };
 
 /// The blocks a reader missed in the cache and read in, by column and the

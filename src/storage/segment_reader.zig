@@ -139,6 +139,7 @@ pub const ReadSegment = struct {
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
+                .content = blockContent(tc, column_idx),
             };
             const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             defer cc.release(entry);
@@ -148,7 +149,7 @@ pub const ReadSegment = struct {
         const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
         if (isTableIdsBlock(block)) {
-            const values = try self.blockValues(allocator, allocator, block, column_idx, rg.row_count);
+            const values = try self.blockValues(allocator, allocator, block, column_idx, rg.row_count, false);
             defer allocator.free(values.bytes);
             return decodeColumnPayload(allocator, col_type, values.bytes, rg.row_count, flags, values.encoding);
         }
@@ -193,10 +194,13 @@ pub const ReadSegment = struct {
         defer allocator.free(block);
         const block_alloc = cc.blockAllocator();
         if (isTableIdsBlock(block)) {
-            const values = try self.blockValues(block_alloc, allocator, block, column_idx, self.info.row_groups[key.row_group_idx].row_count);
+            const values = try self.blockValues(block_alloc, allocator, block, column_idx, self.info.row_groups[key.row_group_idx].row_count, key.content == .int_ids);
             errdefer block_alloc.free(values.bytes);
             return cc.insertPinned(key, values.bytes, values.encoding);
         }
+        // A reader asks for ids only of a column every block of which
+        // stores them (`SegmentInfo.int_id_columns`).
+        if (key.content == .int_ids) return format.Error.SchemaMismatch;
         const tc: storage_cache.TableCache = .{ .cache = cc, .table_uid = key.table_uid };
         const raw = if (isSegmentDictBlock(block))
             try self.rebuildSegmentDict(block_alloc, allocator, block, 0, key.row_group_idx, column_idx, tc, .full)
@@ -574,6 +578,7 @@ pub const ReadSegment = struct {
             .segment_id = self.info.segment_id,
             .row_group_idx = rg_idx,
             .column_idx = m.column_idx,
+            .content = blockContent(c, col),
         };
         if (c.cache.holdsOrFills(key)) return &.{};
         const block_offset = rg.col_offsets[col];
@@ -1136,6 +1141,7 @@ pub const ReadSegment = struct {
                 .segment_id = self.info.segment_id,
                 .row_group_idx = @intCast(row_group_idx),
                 .column_idx = @intCast(column_idx),
+                .content = blockContent(tc, column_idx),
             };
             const entry = try self.acquireBlock(allocator, tc, key, column_idx);
             return .{ .bytes = entry.bytes, .encoding = entry.encoding, .entry = entry };
@@ -1143,7 +1149,7 @@ pub const ReadSegment = struct {
         const block = try self.readColumnBlock(allocator, row_group_idx, column_idx);
         defer allocator.free(block);
         if (isTableIdsBlock(block)) {
-            const values = try self.blockValues(allocator, allocator, block, column_idx, self.info.row_groups[row_group_idx].row_count);
+            const values = try self.blockValues(allocator, allocator, block, column_idx, self.info.row_groups[row_group_idx].row_count, false);
             return .{ .bytes = values.bytes, .encoding = values.encoding, .owned = values.bytes };
         }
         const raw = if (isSegmentDictBlock(block))
@@ -1154,14 +1160,15 @@ pub const ReadSegment = struct {
     }
 
     /// The payload of column `column_idx`'s block `block`, coded in table
-    /// ids, over the values they name, in `allocator`, with the encoding
-    /// it reads as. `scratch` holds the ids meanwhile.
-    fn blockValues(self: ReadSegment, allocator: Allocator, scratch: Allocator, block: []const u8, column_idx: usize, row_count: u32) !IdBlockValues {
-        const lists = self.lists orelse return format.Error.CorruptColumnBlockHeader;
-        const ids = try getDecompressedBytes(scratch, scratch, block, 0);
-        defer scratch.free(ids);
+    /// ids, over the values they name (or, with `ids`, over the ids
+    /// themselves), in `allocator`, with the encoding it reads as.
+    /// `scratch` holds the ids meanwhile.
+    fn blockValues(self: ReadSegment, allocator: Allocator, scratch: Allocator, block: []const u8, column_idx: usize, row_count: u32, ids: bool) !IdBlockValues {
+        const lists: ?*table_strings.TableStrings = if (ids) null else self.lists orelse return format.Error.CorruptColumnBlockHeader;
+        const payload = try getDecompressedBytes(scratch, scratch, block, 0);
+        defer scratch.free(payload);
         const has_nulls = format.ColumnBlockFlags.fromByte(block[1]).has_nulls;
-        return idBlockValues(allocator, scratch, self.io, lists, column_idx, ids, blockEncoding(block, 0), row_count, has_nulls);
+        return idBlockValues(allocator, scratch, self.io, lists, column_idx, payload, blockEncoding(block, 0), row_count, has_nulls);
     }
 
     /// The string bytes one row group's block of a string column decodes to,
@@ -1606,16 +1613,21 @@ fn isTableIdsBlock(block: []const u8) bool {
     return format.ColumnBlockFlags.fromByte(block[1]).table_ids;
 }
 
+fn blockContent(tc: storage_cache.TableCache, column_idx: usize) storage_cache.Content {
+    return if (tc.readsIds(column_idx)) .int_ids else .column;
+}
+
 const IdBlockValues = struct { bytes: []align(16) u8, encoding: format.Encoding };
 
 /// A fixed-width column's block payload `payload`, an `int` block of
 /// table ids (§4.7) of `encoding`, rebuilt over the values its ids name in
-/// `lists`: a raw or FOR block as raw values, a run block as runs of them.
+/// `lists`, or over the ids themselves as 8-byte values without: a raw or
+/// FOR block as raw values, a run block as runs of them.
 fn idBlockValues(
     allocator: Allocator,
     scratch: Allocator,
     io: Io,
-    lists: *table_strings.TableStrings,
+    lists: ?*table_strings.TableStrings,
     column_idx: usize,
     payload: []const u8,
     encoding: format.Encoding,
@@ -1623,7 +1635,7 @@ fn idBlockValues(
     has_nulls: bool,
 ) !IdBlockValues {
     const corrupt = format.Error.CorruptColumnBlockHeader;
-    const width: usize = lists.fixedListWidth(column_idx) orelse return corrupt;
+    const width: usize = if (lists) |l| l.fixedListWidth(column_idx) orelse return corrupt else @sizeOf(i64);
     const bm_len: usize = if (has_nulls) column.bitmapBytes(row_count) else 0;
     if (payload.len < bm_len) return corrupt;
     const body = payload[bm_len..];
@@ -1644,7 +1656,7 @@ fn idBlockValues(
             const out = try allocator.alignedAlloc(u8, .@"16", bm_len + ids.len * width);
             errdefer allocator.free(out);
             @memcpy(out[0..bm_len], payload[0..bm_len]);
-            try lists.fixedValues(io, column_idx, ids, out[bm_len..]);
+            try namedValues(io, lists, column_idx, ids, out[bm_len..]);
             return .{ .bytes = out, .encoding = .raw };
         },
         .rle => {
@@ -1661,12 +1673,22 @@ fn idBlockValues(
             format.writeU32(head[0..4], runs.n_runs);
             head[4..8].* = .{ @intCast(width), 0, 0, 0 };
             const values = out[bm_len + 8 ..][0 .. ids.len * width];
-            try lists.fixedValues(io, column_idx, ids, values);
+            try namedValues(io, lists, column_idx, ids, values);
             @memcpy(out[bm_len + 8 + values.len ..], runs.lengths);
             return .{ .bytes = out, .encoding = .rle };
         },
         .dict, .fsst => return corrupt,
     }
+}
+
+/// The value each of `ids` names in `lists` into `out`, or without
+/// lists the ids themselves as little-endian i64s.
+fn namedValues(io: Io, lists: ?*table_strings.TableStrings, column_idx: usize, ids: []const u32, out: []u8) !void {
+    const l = lists orelse {
+        for (ids, 0..) |id, i| std.mem.writeInt(i64, out[i * 8 ..][0..8], id, .little);
+        return;
+    };
+    try l.fixedValues(io, column_idx, ids, out);
 }
 
 fn tableIdOf(v: i128) !u32 {

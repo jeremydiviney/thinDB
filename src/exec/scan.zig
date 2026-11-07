@@ -737,6 +737,11 @@ pub const Scan = struct {
     schema_stats: []const exec.ColStat = &.{},
     /// `exec.snapshotId` of the segment set and memtable this scan reads.
     snapshot_id: u64 = 0,
+    /// Per table column, whether this scan reads its blocks' table ids
+    /// (DESIGN.md §4.7) in place of the values they name, and how many ids
+    /// its list held (`setIntIdColumn`); empty until one does.
+    int_id_cols: []bool = &.{},
+    int_id_counts: []u32 = &.{},
     /// What this scan reads once prune hints skip segments or row groups
     /// (issue #478). Allocated by the first hint; rebuilt by `stats()` while
     /// `pruned_stale`.
@@ -1791,6 +1796,79 @@ pub const Scan = struct {
         return true;
     }
 
+    /// Reads fixed-width column `name` as its rows' table ids (DESIGN.md
+    /// §4.7), each widened to the column's eight bytes. Two rows hold one
+    /// value exactly when they hold one id, so a consumer that only tells
+    /// values apart (a group key, a COUNT(DISTINCT)) reads no page of the
+    /// list. The caller has checked that every segment of the scan stores
+    /// the column's ids, `id_count` of them (`table_id_distinct.intIdsReadable`),
+    /// and that nothing above the scan compares the column's values; a row
+    /// group that stores values fails the scan. The column's stats become
+    /// the ids', and the table's order stops short of it. False, marking
+    /// nothing, when the scan reads memtable rows, doesn't project the
+    /// column, or compares its values itself: a filter, hint or key bound.
+    pub fn setIntIdColumn(self: *Scan, name: []const u8, id_count: u32) !bool {
+        if (self.memtable_row_count != 0 or id_count == 0) return false;
+        const j = types.findColumn(self.out_schema, name) orelse return false;
+        const phys = self.out_phys[j];
+        if (storage.table_strings.fixedWidth(self.out_schema[j].type) == null) return false;
+        if (self.comparesValues(phys, name)) return false;
+        if (self.int_id_cols.len == 0) {
+            const n = self.table.schema.columns.len;
+            const cols = try self.allocator.alloc(bool, n);
+            errdefer self.allocator.free(cols);
+            const counts = try self.allocator.alloc(u32, n);
+            @memset(cols, false);
+            @memset(counts, 0);
+            self.int_id_cols = cols;
+            self.int_id_counts = counts;
+        }
+        self.int_id_cols[phys] = true;
+        self.int_id_counts[phys] = id_count;
+        self.applyIntIdStats(self.cached_stats);
+        if (self.pruned != null) self.pruned_stale = true;
+        return true;
+    }
+
+    /// Whether the scan itself compares column `phys`'s values.
+    fn comparesValues(self: *const Scan, phys: usize, name: []const u8) bool {
+        if (self.fused_filter) |f| if (predicate.touchesColumn(f, name)) return true;
+        if (self.derived_filter != null) return true;
+        if (self.key_bound) |kb| if (kb.phys == phys) return true;
+        for (self.prunes.items) |h| if (h.col_idx == phys) return true;
+        for (self.in_prunes.items) |h| if (h.col_idx == phys) return true;
+        for (self.key_in_sets.items) |h| if (h.col_idx == phys) return true;
+        return false;
+    }
+
+    fn readsIntIds(self: *const Scan, phys: usize) bool {
+        return phys < self.int_id_cols.len and self.int_id_cols[phys];
+    }
+
+    /// `col_stats`, of the projected columns in order, with each column read
+    /// by table id holding the ids' range. Its values' origin no longer
+    /// describes them.
+    fn applyIntIdStats(self: *const Scan, col_stats: []exec.ColStat) void {
+        if (self.int_id_cols.len == 0) return;
+        for (col_stats, self.out_phys[0..col_stats.len]) |*st, phys| {
+            if (!self.readsIntIds(phys)) continue;
+            st.min = 0;
+            st.max = self.int_id_counts[phys] - 1;
+            st.origin = null;
+        }
+    }
+
+    /// The table's order key up to its first column read by table id.
+    fn orderKeyBeforeIntIds(self: *const Scan) []const []const u8 {
+        const keys = self.table.schema.order_key;
+        if (self.int_id_cols.len == 0) return keys;
+        for (keys, 0..) |k, i| {
+            const phys = types.findColumn(self.table.schema.columns, k) orelse return keys[0..i];
+            if (self.readsIntIds(phys)) return keys[0..i];
+        }
+        return keys;
+    }
+
     fn idKeyed(self: *const Scan, j: usize) bool {
         return self.n_id_keys > 0 and self.dict_bufs[j].id_keyed;
     }
@@ -2654,6 +2732,8 @@ pub const Scan = struct {
         if (self.borrow_blocks.len > 0) self.allocator.free(self.borrow_blocks);
         if (self.memtable_loc_buf.len > 0) self.allocator.free(self.memtable_loc_buf);
         if (self.cached_stats.len > 0) self.allocator.free(self.cached_stats);
+        if (self.int_id_cols.len > 0) self.allocator.free(self.int_id_cols);
+        if (self.int_id_counts.len > 0) self.allocator.free(self.int_id_counts);
         if (self.pruned) |b| {
             self.allocator.free(b.stats);
             self.allocator.free(b.live);
@@ -3453,6 +3533,7 @@ pub const Scan = struct {
         }
         fillColumnStats(b.stats, self.table.schema.columns, self.segs, b.live, self.out_phys[0..b.stats.len], self.memtable_row_count);
         for (b.stats, self.cached_stats) |*s, whole| s.origin = whole.origin;
+        self.applyIntIdStats(b.stats);
         exec.capColStats(b.stats, rows);
         b.rows = rows;
     }
@@ -3473,6 +3554,7 @@ pub const Scan = struct {
     fn cacheRef(self: *Scan) storage.cache.TableCache {
         var c = self.table.cacheRef();
         c.misses = &self.misses;
+        c.int_ids = self.int_id_cols;
         return c;
     }
 
@@ -3516,7 +3598,7 @@ pub const Scan = struct {
         }
         self.hinted_to = rg_idx;
         self.misses.restart();
-        seg.hintMisses(window[0..n], missed, self.table.cacheRef());
+        seg.hintMisses(window[0..n], missed, self.cacheRef());
     }
 
     /// Once row group `rg_idx`'s filter kept rows, hints every output
@@ -3533,7 +3615,7 @@ pub const Scan = struct {
             m.* = .{ .column_idx = @intCast(phys), .read = if (measured and self.readsLengthsOnly(phys)) .no_bytes else .block };
         }
         const rgs = [1]u32{@intCast(rg_idx)};
-        seg.hintMisses(&rgs, misses[0..n], self.table.cacheRef());
+        seg.hintMisses(&rgs, misses[0..n], self.cacheRef());
     }
 
     pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
@@ -3626,13 +3708,14 @@ pub const Scan = struct {
         const snapshot_rows = seg_rows + self.memtable_row_count;
 
         const memtable_empty = self.memtable_row_count == 0;
-        const global = memtable_empty and self.scanIsGloballySorted(segs);
+        const keys = self.orderKeyBeforeIntIds();
+        const global = memtable_empty and (keys.len > 0 or self.table.schema.order_key.len == 0) and self.scanIsGloballySorted(segs);
         const pruned = self.prunedBounds();
 
         return .{
             .upper_rows = if (pruned) |b| b.rows else snapshot_rows,
             .sort_state = .{
-                .keys = self.table.schema.order_key,
+                .keys = keys,
                 .global = global,
             },
             .column_stats = if (pruned) |b| b.stats else self.cached_stats,
