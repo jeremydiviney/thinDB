@@ -82,7 +82,12 @@ pub const segment_magic: [4]u8 = .{ 't', 'D', 'B', 'S' };
 /// v16→v17: chunked table ids. A table-ids block is a run of column blocks
 /// of up to `table_ids_chunk` ids each, so a reader decodes them side by
 /// side.
-pub const segment_version: u16 = 17;
+///
+/// v17→v18: n-gram indexes (DESIGN.md §4.7, `ngram_index.zig`). A string
+/// table may carry one more block after its table ids, the row groups
+/// holding each trigram of its values, and the directory gives its offset
+/// and length after the table ids'.
+pub const segment_version: u16 = 18;
 
 /// Column-block compression algorithm. Stored as a u8 in each block's header.
 pub const Compression = enum(u8) {
@@ -408,6 +413,9 @@ pub const StringTable = struct {
     /// Each row group's block parts, by row-group index.
     blocks: []const StringBlockParts,
     table_ids: TableIdsBlock = .{},
+    /// The table's n-gram index (DESIGN.md §4.7), one column block; length
+    /// 0 when the segment keeps none for the column.
+    ngram_index: FileRange = .{ .offset = 0, .length = 0 },
 };
 
 /// Ids per column block of a table-ids block: a segment's ids span many

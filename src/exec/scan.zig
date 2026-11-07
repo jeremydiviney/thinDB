@@ -14,6 +14,8 @@ const storage = @import("../storage/storage.zig");
 const ColumnView = storage.ColumnView;
 const hll = @import("../util/hll.zig");
 const bloom_util = @import("../util/bloom.zig");
+const ngram = @import("../util/ngram.zig");
+const regex = @import("../util/regex.zig");
 const simd = @import("../util/simd.zig");
 const parallel = @import("../util/parallel.zig");
 const core_scheduler = @import("../util/core_scheduler.zig");
@@ -750,6 +752,12 @@ pub const Scan = struct {
     /// opened for skipped segments. Null when no leading-key predicates
     /// have been pushed.
     seg_skip: ?[]bool = null,
+
+    /// Per segment of `segs`, the row groups a LIKE or regex conjunct rules
+    /// out through the segment's n-gram index (DESIGN.md §4.7,
+    /// `addNgramPrune`), by row-group index; null for a segment it rules
+    /// out none of, and null throughout until it rules out some.
+    ngram_skip: ?[]?[]bool = null,
 
     /// Diagnostic counter: number of segments actually opened via
     /// `readSegment`. Skipped segments don't increment it. Tests use
@@ -2694,6 +2702,7 @@ pub const Scan = struct {
         for (self.filter_rewritten.items) |slice| self.allocator.free(slice);
         self.filter_rewritten.deinit(self.allocator);
         if (self.seg_skip) |s| self.allocator.free(s);
+        self.freeNgramSkip();
         if (self.filtered) |arr| {
             for (arr) |*c| c.deinit(self.allocator);
             self.allocator.free(arr);
@@ -2862,7 +2871,73 @@ pub const Scan = struct {
         }
         self.derived_filter = df;
         self.filter_memo = null;
+        for (computed.items) |c| try self.addRegexPrune(c, derived);
         return true;
+    }
+
+    /// `addNgramPrune` for `c`, a conjunct of a derived filter, when it
+    /// holds only where a regex is found in a column: it requires
+    /// `regexp_like(column, 'pattern'[, 'match type'])` of `derived` true.
+    fn addRegexPrune(self: *Scan, c: PredicateExpr, derived: []const Derived) !void {
+        const leaf = switch (c) {
+            .leaf => |l| l,
+            else => return,
+        };
+        const truth: bool = switch (leaf.val) {
+            .boolean => |b| b,
+            .tinyint => |v| v != 0,
+            .smallint => |v| v != 0,
+            .int => |v| v != 0,
+            .bigint => |v| v != 0,
+            else => return,
+        };
+        const requires_true = switch (leaf.op) {
+            .eq => truth,
+            .neq => !truth,
+            else => false,
+        };
+        if (!requires_true) return;
+        const d = for (derived) |d| {
+            if (types.columnNameEql(d.name, leaf.col)) break d;
+        } else return;
+        const call = switch (d.expr) {
+            .call => |call| call,
+            else => return,
+        };
+        if (!std.ascii.eqlIgnoreCase(call.fn_name, "regexp_like") or call.args.len < 2 or call.args.len > 3) return;
+        const col = switch (call.args[0]) {
+            .col_ref => |name| name,
+            else => return,
+        };
+        const pattern = stringLiteral(call.args[1]) orelse return;
+        var options: regex.Options = .{};
+        if (call.args.len == 3) {
+            const match_type = stringLiteral(call.args[2]) orelse return;
+            for (match_type) |m| switch (m) {
+                'c' => options.case_insensitive = false,
+                'i' => options.case_insensitive = true,
+                'n', 'm', 'u' => {},
+                else => return,
+            };
+        }
+        const col_idx = types.findColumn(self.table.schema.columns, col) orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const query = regex.ngramQuery(arena.allocator(), pattern, options) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.RegexInvalidPattern => return,
+        };
+        try self.addNgramPrune(col_idx, query);
+    }
+
+    fn stringLiteral(e: @import("expr.zig").Expr) ?[]const u8 {
+        return switch (e) {
+            .lit => |v| switch (v) {
+                .text => |text| text,
+                else => null,
+            },
+            else => null,
+        };
     }
 
     /// `arms` as one predicate, an AND when there are several, in memory
@@ -2955,8 +3030,117 @@ pub const Scan = struct {
             .@"and" => |children| for (children) |child| try self.extractPruneHints(child),
             .leaf => |p| self.addPrune(p) catch {},
             .in_set => |s| if (!s.negate) try self.addInPrune(s),
+            .like, .@"or" => try self.addLikePrune(expr),
             else => {},
         }
+    }
+
+    /// `addNgramPrune` for a LIKE conjunct, or an OR whose arms are each a
+    /// LIKE on one column.
+    fn addLikePrune(self: *Scan, expr: PredicateExpr) !void {
+        const arms: []const PredicateExpr = switch (expr) {
+            .@"or" => |arms| arms,
+            else => (&expr)[0..1],
+        };
+        if (arms.len == 0 or arms[0] != .like) return;
+        const col = arms[0].like.col;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const queries = try arena.allocator().alloc(ngram.Query, arms.len);
+        for (arms, queries) |arm, *q| {
+            if (arm != .like or !types.columnNameEql(arm.like.col, col)) return;
+            q.* = try ngram.ofLike(arena.allocator(), arm.like.pattern);
+        }
+        const col_idx = types.findColumn(self.table.schema.columns, col) orelse return;
+        try self.addNgramPrune(col_idx, try ngram.disjoin(arena.allocator(), queries));
+    }
+
+    /// Skips each row group of a segment whose n-gram index (DESIGN.md
+    /// §4.7) for column `col_idx` says no value of it holds what `query`
+    /// asks, and each segment it says that of throughout. A segment with no
+    /// index for the column, or whose index can't be read, keeps its row
+    /// groups: the index only ever spares reading them.
+    fn addNgramPrune(self: *Scan, col_idx: usize, query: ngram.Query) !void {
+        if (query == .all) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var any = false;
+        for (self.segs, 0..) |entry, i| {
+            if (self.seg_skip) |skip| if (skip[i]) continue;
+            _ = arena.reset(.retain_capacity);
+            const kept = (self.ngramKept(arena.allocator(), entry, col_idx, query) catch |e| switch (e) {
+                error.OutOfMemory => return e,
+                else => null,
+            }) orelse continue;
+            if (std.mem.indexOfScalar(bool, kept, false) == null) continue;
+            if (self.ngram_skip == null) {
+                const per_segment = try self.allocator.alloc(?[]bool, self.segs.len);
+                @memset(per_segment, null);
+                self.ngram_skip = per_segment;
+            }
+            const slot = &self.ngram_skip.?[i];
+            if (slot.* == null) {
+                const skip = try self.allocator.alloc(bool, kept.len);
+                @memset(skip, false);
+                slot.* = skip;
+            }
+            var every = true;
+            for (slot.*.?, kept) |*skip, k| {
+                skip.* = skip.* or !k;
+                every = every and skip.*;
+            }
+            if (every) {
+                if (self.seg_skip == null) {
+                    const skip = try self.allocator.alloc(bool, self.segment_count);
+                    @memset(skip, false);
+                    self.seg_skip = skip;
+                }
+                self.seg_skip.?[i] = true;
+            }
+            any = true;
+        }
+        if (any) try self.markPruned();
+    }
+
+    /// Per row group of `entry`, whether its n-gram index for column
+    /// `col_idx` keeps it for `query`, from `scratch`; null when the
+    /// segment keeps no index for the column.
+    fn ngramKept(self: *const Scan, scratch: std.mem.Allocator, entry: storage.ManifestEntry, col_idx: usize, query: ngram.Query) !?[]bool {
+        const handle = try self.table.acquireSegment(entry.segment_id);
+        defer self.table.releaseSegment(handle);
+        const seg = &handle.seg;
+        const held = (try seg.cachedNgramIndex(col_idx, self.table.cacheRef())) orelse return null;
+        defer held.release();
+        const table = seg.info.stringTable(col_idx).?;
+        const counted = held.index.row_group_count;
+        if (counted > table.blocks.len) return null;
+        const kept = try scratch.alloc(bool, table.blocks.len);
+        @memset(kept[counted..], true);
+        try held.index.evaluate(scratch, query, kept[0..counted]);
+        for (kept, table.blocks) |*k, parts| {
+            if (!parts.isSplit()) k.* = true;
+        }
+        return kept;
+    }
+
+    fn freeNgramSkip(self: *Scan) void {
+        const per_segment = self.ngram_skip orelse return;
+        for (per_segment) |skip| if (skip) |rgs| self.allocator.free(rgs);
+        self.allocator.free(per_segment);
+        self.ngram_skip = null;
+    }
+
+    /// Whether the n-gram index ruled out row group `rg_idx` of the segment
+    /// at `seg_pos` of `segs`.
+    fn ngramRulesOut(self: *const Scan, seg_pos: usize, rg_idx: usize) bool {
+        const per_segment = self.ngram_skip orelse return false;
+        const skip = per_segment[seg_pos] orelse return false;
+        return rg_idx < skip.len and skip[rg_idx];
+    }
+
+    /// Whether some hint skips row groups (`rowGroupCanMatch`).
+    fn hasRowGroupHints(self: *const Scan) bool {
+        return self.prunes.items.len > 0 or self.in_prunes.items.len > 0 or self.ngram_skip != null;
     }
 
     fn addInPrune(self: *Scan, s: predicate.InSet) !void {
@@ -3253,7 +3437,20 @@ pub const Scan = struct {
                 for (own, skip) |*o, s| o.* = o.* or s;
             } else self.seg_skip = try self.allocator.dupe(bool, skip);
         }
-        if (src.prunes.items.len + src.in_prunes.items.len > 0 or src.seg_skip != null) try self.markPruned();
+        if (src.ngram_skip) |src_skip| {
+            if (self.ngram_skip == null) {
+                const per_segment = try self.allocator.alloc(?[]bool, self.segs.len);
+                @memset(per_segment, null);
+                self.ngram_skip = per_segment;
+            }
+            for (self.ngram_skip.?, src_skip) |*own, theirs| {
+                const rgs = theirs orelse continue;
+                if (own.*) |mine| {
+                    for (mine, rgs) |*o, t| o.* = o.* or t;
+                } else own.* = try self.allocator.dupe(bool, rgs);
+            }
+        }
+        if (src.hasRowGroupHints() or src.seg_skip != null) try self.markPruned();
     }
 
     /// `addPruneSet` for a row-level offer (`InSet.rows`): the rows outside
@@ -3443,11 +3640,11 @@ pub const Scan = struct {
     /// surviving segments' sketches, capped at the surviving rows; each
     /// column keeps its whole-snapshot origin.
     fn refreshPruned(self: *Scan, b: *PrunedBounds) void {
-        const hinted = self.prunes.items.len > 0 or self.in_prunes.items.len > 0;
+        const hinted = self.hasRowGroupHints();
         var rows: u64 = self.memtable_row_count;
         for (self.segs, b.live, 0..) |entry, *live, i| {
             const skipped = if (self.seg_skip) |s| s[i] else false;
-            const kept: u64 = if (skipped) 0 else if (hinted) self.survivingSegmentRows(entry) else entry.row_count;
+            const kept: u64 = if (skipped) 0 else if (hinted) self.survivingSegmentRows(i, entry) else entry.row_count;
             live.* = kept > 0;
             rows += kept;
         }
@@ -3458,13 +3655,13 @@ pub const Scan = struct {
     }
 
     /// Rows of `entry`'s row groups that `rowGroupCanMatch` keeps, or all of
-    /// its rows when its footer can't be read.
-    fn survivingSegmentRows(self: *const Scan, entry: storage.ManifestEntry) u64 {
+    /// its rows when its footer can't be read. `entry` is `segs[seg_pos]`.
+    fn survivingSegmentRows(self: *const Scan, seg_pos: usize, entry: storage.ManifestEntry) u64 {
         const handle = self.table.acquireSegment(entry.segment_id) catch return entry.row_count;
         defer self.table.releaseSegment(handle);
         var kept: u64 = 0;
-        for (handle.seg.info.row_groups) |rg| {
-            if (self.rowGroupCanMatch(rg)) kept += rg.row_count;
+        for (handle.seg.info.row_groups, 0..) |rg, ri| {
+            if (self.rowGroupCanMatch(seg_pos, ri, rg)) kept += rg.row_count;
         }
         return kept;
     }
@@ -3504,7 +3701,7 @@ pub const Scan = struct {
         var bytes: u64 = 0;
         var rg_idx = if (continues) self.hinted_to else at;
         while (rg_idx < end and n < window.len and bytes < READ_AHEAD_BYTES) : (rg_idx += 1) {
-            if (!self.rowGroupCanMatch(rgs[rg_idx])) continue;
+            if (!self.rowGroupCanMatch(self.cur_seg_idx, rg_idx, rgs[rg_idx])) continue;
             if (memo) |m| if (self.memoSaysUnmatched(m, seg, rg_idx)) continue;
             window[n] = @intCast(rg_idx);
             n += 1;
@@ -3536,7 +3733,10 @@ pub const Scan = struct {
         seg.hintMisses(&rgs, misses[0..n], self.table.cacheRef());
     }
 
-    pub fn rowGroupCanMatch(self: *const Scan, rg: storage.RowGroupMeta) bool {
+    /// Whether row group `rg_idx` (`rg`) of the segment at `seg_pos` of
+    /// `segs` may hold rows the hints keep.
+    pub fn rowGroupCanMatch(self: *const Scan, seg_pos: usize, rg_idx: usize, rg: storage.RowGroupMeta) bool {
+        if (self.ngramRulesOut(seg_pos, rg_idx)) return false;
         for (self.prunes.items) |hint| {
             const col_stats = rg.stats[hint.col_idx];
             if (!predicate.statsOverlapPredicateBlankAware(col_stats, hint.op, hint.val, hint.blanks_excluded)) return false;
@@ -3558,13 +3758,13 @@ pub const Scan = struct {
     /// scan has no prune hints (no basis to size below full DOP) or a footer
     /// can't be read — callers keep their full worker count.
     pub fn survivingWorkUnits(self: *const Scan) ?usize {
-        if (self.prunes.items.len == 0 and self.in_prunes.items.len == 0) return null;
+        if (!self.hasRowGroupHints()) return null;
         var surviving: usize = (@as(usize, @intCast(self.memtable_row_count)) + 65535) / 65536;
-        for (self.segs) |entry| {
+        for (self.segs, 0..) |entry, si| {
             const handle = self.table.acquireSegment(entry.segment_id) catch return null;
             defer self.table.releaseSegment(handle);
-            for (handle.seg.info.row_groups) |rg| {
-                if (self.rowGroupCanMatch(rg)) surviving += 1;
+            for (handle.seg.info.row_groups, 0..) |rg, ri| {
+                if (self.rowGroupCanMatch(si, ri, rg)) surviving += 1;
             }
         }
         return surviving;
@@ -3577,12 +3777,12 @@ pub const Scan = struct {
     /// realized row-group count disagrees with its manifest entry (a torn
     /// basis would misalign every downstream cut). Caller frees.
     pub fn survivingMask(self: *const Scan, allocator: std.mem.Allocator) ?[]bool {
-        if (self.prunes.items.len == 0 and self.in_prunes.items.len == 0) return null;
+        if (!self.hasRowGroupHints()) return null;
         var total: usize = 0;
         for (self.segs) |entry| total += entry.row_group_count;
         const mask = allocator.alloc(bool, total) catch return null;
         var i: usize = 0;
-        for (self.segs) |entry| {
+        for (self.segs, 0..) |entry, si| {
             const handle = self.table.acquireSegment(entry.segment_id) catch {
                 allocator.free(mask);
                 return null;
@@ -3592,8 +3792,8 @@ pub const Scan = struct {
                 allocator.free(mask);
                 return null;
             }
-            for (handle.seg.info.row_groups) |rg| {
-                mask[i] = self.rowGroupCanMatch(rg);
+            for (handle.seg.info.row_groups, 0..) |rg, ri| {
+                mask[i] = self.rowGroupCanMatch(si, ri, rg);
                 i += 1;
             }
         }
@@ -3687,7 +3887,7 @@ pub const Scan = struct {
             const handle = try self.table.acquireSegment(entry.segment_id);
             defer self.table.releaseSegment(handle);
             for (handle.seg.info.row_groups, 0..) |rg, ri| {
-                if (!self.rowGroupCanMatch(rg)) continue;
+                if (!self.rowGroupCanMatch(si, ri, rg)) continue;
                 try kept.append(self.allocator, .{ .seg = si, .rg = ri });
                 kept_rows += rg.row_count;
             }
@@ -4108,7 +4308,7 @@ pub const Scan = struct {
                 continue;
             }
             const rg = seg.info.row_groups[self.cur_rg_idx];
-            if (!self.rowGroupCanMatch(rg)) {
+            if (!self.rowGroupCanMatch(self.cur_seg_idx, self.cur_rg_idx, rg)) {
                 self.rgs_considered += 1;
                 self.cur_rg_idx += 1;
                 continue;
@@ -4229,7 +4429,7 @@ pub const Scan = struct {
 
             const rg = seg.info.row_groups[self.cur_rg_idx];
             self.rgs_considered += 1;
-            if (!self.rowGroupCanMatch(rg)) {
+            if (!self.rowGroupCanMatch(self.cur_seg_idx, self.cur_rg_idx, rg)) {
                 self.cur_rg_idx += 1;
                 continue;
             }
@@ -4555,7 +4755,7 @@ pub const Scan = struct {
 
             const rg = seg.info.row_groups[self.cur_rg_idx];
             self.rgs_considered += 1;
-            if (!self.rowGroupCanMatch(rg)) {
+            if (!self.rowGroupCanMatch(self.cur_seg_idx, self.cur_rg_idx, rg)) {
                 self.cur_rg_idx += 1;
                 continue;
             }
@@ -7076,11 +7276,11 @@ pub const Scan = struct {
         if (memo.cond_whole == null and memo.n_cond == 0) return false;
         var rows: u64 = self.memtable_row_count;
         if (rows >= limit) return false;
-        for (self.segs) |entry| {
+        for (self.segs, 0..) |entry, si| {
             const handle = self.table.acquireSegment(entry.segment_id) catch return false;
             defer self.table.releaseSegment(handle);
             for (handle.seg.info.row_groups, 0..) |rg, rg_idx| {
-                if (!self.rowGroupCanMatch(rg)) continue;
+                if (!self.rowGroupCanMatch(si, rg_idx, rg)) continue;
                 if (self.recordedMatches(memo, &handle.seg, rg_idx)) |matched| {
                     rows += matched;
                     if (rows >= limit) return false;

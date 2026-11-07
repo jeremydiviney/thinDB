@@ -21,6 +21,7 @@ pub const snappy = @import("snappy.zig");
 pub const fsst = @import("fsst.zig");
 pub const segment_strings = @import("segment_strings.zig");
 pub const table_strings = @import("table_strings.zig");
+pub const ngram_index = @import("ngram_index.zig");
 pub const cache = @import("cache.zig");
 
 pub const ColumnView = column.ColumnView;

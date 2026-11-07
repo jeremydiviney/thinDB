@@ -5261,6 +5261,109 @@ test "scan: a pruning set skips the row groups that hold none of its values" {
     try std.testing.expectEqual(@as(u64, 10), try drainKeys(allocator, &all, exec.queryAs(exec.Scan, all).?, &keys));
 }
 
+const TextRow = struct { k: i64, s: []const u8 };
+
+/// `k` 0..255 in eight 32-row row groups, `s` about 2.5 KB of digits and
+/// punctuation per row: enough dictionary per row group for an n-gram
+/// index, and no letters but "needle" in row 70 (row group 2) and "Pin" in
+/// row 170 (row group 5). `texts` owns the values.
+fn openTextTable(allocator: std.mem.Allocator, dir: std.Io.Dir, texts: *[256][2500]u8) !struct { db: *api.Database, t: *api.Table } {
+    const schema = types.TableSchema{
+        .columns = &.{ .{ .name = "k", .type = .bigint }, .{ .name = "s", .type = .string } },
+        .order_key = &.{"k"},
+        .unique = false,
+    };
+    const db = try api.Database.open(allocator, std.testing.io, dir, .{ .row_group_size = 32, .predicate_memo_bytes = 0 });
+    errdefer db.close();
+    const t = try db.table("t", schema, .{ .order_key = &.{"k"}, .row_group_size = 32 });
+    const alphabet = "0123456789-/.";
+    var rows: [256]TextRow = undefined;
+    for (&rows, texts, 0..) |*row, *text, i| {
+        for (text, 0..) |*c, j| c.* = alphabet[(i * 7919 + j * 31 + (j * j) % 13) % alphabet.len];
+        _ = try std.fmt.bufPrint(text, "{d}.", .{i});
+        if (i == 70) @memcpy(text[100..106], "needle");
+        if (i == 170) @memcpy(text[200..203], "Pin");
+        row.* = .{ .k = @intCast(i), .s = text };
+    }
+    try t.insert(&rows);
+    try t.flush();
+    return .{ .db = db, .t = t };
+}
+
+test "scan: the n-gram index skips the row groups a LIKE can't match in" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const texts = try allocator.create([256][2500]u8);
+    defer allocator.destroy(texts);
+    const opened = try openTextTable(allocator, tmp.dir, texts);
+    defer opened.db.close();
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+
+    const like = struct {
+        fn of(pattern: []const u8) PredicateExpr {
+            return .{ .like = .{ .col = "s", .pattern = pattern } };
+        }
+    }.of;
+    const cases = comptime .{
+        .{ like("%needle%"), 1, &[_]i64{70} },
+        // The index folds case; LIKE doesn't.
+        .{ like("%NEEDLE%"), 1, &[_]i64{} },
+        .{ like("%pin%"), 1, &[_]i64{} },
+        .{ like("%Pin%"), 1, &[_]i64{170} },
+        .{ like("%zzz%"), 0, &[_]i64{} },
+        .{ like("%ne%le%"), 8, &[_]i64{70} },
+        .{ PredicateExpr{ .@"or" = &.{ like("%needle%"), like("%Pin%") } }, 2, &[_]i64{ 70, 170 } },
+        .{ PredicateExpr{ .@"and" = &.{ like("%needle%"), like("%Pin%") } }, 0, &[_]i64{} },
+    };
+    inline for (cases) |c| {
+        try std.testing.expectEqual(@as(u64, c[1]), try memoScan(allocator, opened.t, c[0], &keys));
+        try std.testing.expectEqualSlices(i64, c[2], keys.items);
+    }
+    // A negated LIKE says nothing about which grams a row holds.
+    const needle = comptime like("%needle%");
+    try std.testing.expectEqual(@as(u64, 8), try memoScan(allocator, opened.t, .{ .not = &needle }, &keys));
+    try std.testing.expectEqual(@as(usize, 255), keys.items.len);
+}
+
+test "scan: the n-gram index skips the row groups a regex can't be found in" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const texts = try allocator.create([256][2500]u8);
+    defer allocator.destroy(texts);
+    const opened = try openTextTable(allocator, tmp.dir, texts);
+    defer opened.db.close();
+    var keys: std.ArrayList(i64) = .empty;
+    defer keys.deinit(allocator);
+
+    const cases = .{
+        .{ "ne+dle", "", 1, &[_]i64{70} },
+        .{ "pin", "i", 1, &[_]i64{170} },
+        .{ "pin", "", 1, &[_]i64{} },
+        .{ "(needle|Pin)", "", 2, &[_]i64{ 70, 170 } },
+        .{ "n.edle", "", 1, &[_]i64{70} },
+        .{ "n.e", "", 8, &[_]i64{70} },
+    };
+    inline for (cases) |c| {
+        const args = if (c[1].len == 0)
+            &[_]@import("expr.zig").Expr{ .{ .col_ref = "s" }, .{ .lit = .{ .text = c[0] } } }
+        else
+            &[_]@import("expr.zig").Expr{ .{ .col_ref = "s" }, .{ .lit = .{ .text = c[0] } }, .{ .lit = .{ .text = c[1] } } };
+        const derived = [_]@import("compute.zig").Derived{
+            .{ .name = "m", .expr = .{ .call = .{ .fn_name = "regexp_like", .args = args } } },
+        };
+        var q = try scan(allocator, opened.t);
+        defer q.deinit();
+        const scan_op = exec.queryAs(exec.Scan, q).?;
+        try std.testing.expect(try scan_op.tryFuseDerivedFilter(leafExpr("m", .neq, .{ .int = 0 }), &derived, null));
+        keys.clearRetainingCapacity();
+        try std.testing.expectEqual(@as(u64, c[2]), try drainKeys(allocator, &q, scan_op, &keys));
+        try std.testing.expectEqualSlices(i64, c[3], keys.items);
+    }
+}
+
 test "scan: a pruning set counts only the values the scan's own filter can match" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

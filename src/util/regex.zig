@@ -24,6 +24,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const ngram = @import("ngram.zig");
+
 pub const Error = error{RegexInvalidPattern} || Allocator.Error;
 
 /// Pattern-wide flags, as SQL match types set them.
@@ -3107,6 +3109,176 @@ fn expandTemplate(allocator: Allocator, out: *std.ArrayList(u8), template: []con
 }
 
 // ---------------------------------------------------------------------------
+// N-gram extraction
+// ---------------------------------------------------------------------------
+
+/// The grams (`util/ngram.zig`) every match of `pattern` holds, and so every
+/// text it is found in, the query's nodes from `allocator`. `.all` when no
+/// gram is certain.
+pub fn ngramQuery(allocator: Allocator, pattern: []const u8, options: Options) Error!ngram.Query {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var parser = Parser{ .pat = pattern, .arena = arena.allocator(), .options = options };
+    const root = try parser.parseAlt();
+    if (parser.pos != pattern.len) return Error.RegexInvalidPattern;
+    var gather: GramGather = .{ .allocator = allocator, .scratch = arena.allocator() };
+    return gather.queryOf(try gather.of(root));
+}
+
+/// What every match of a regex node holds, after Russ Cox's trigram
+/// indexing of regular expressions, kept to whole matches and the grams
+/// within them: a run of nodes with few matches each is matched as the
+/// strings it spells, so grams across its nodes count.
+const GramGather = struct {
+    allocator: Allocator,
+    scratch: Allocator,
+
+    const exact_limit = 16;
+    const class_limit = 4;
+
+    const Info = struct {
+        /// Every string the node matches, folded, when there are at most
+        /// `exact_limit`.
+        exact: ?[]const []const u8,
+        /// What a match holds, when `exact` isn't set.
+        match: ngram.Query = .all,
+    };
+
+    const nothing: Info = .{ .exact = null };
+
+    fn of(self: *GramGather, n: *const Node) Error!Info {
+        return switch (n.*) {
+            .empty, .bol, .eol, .word_boundary, .not_word_boundary => .{ .exact = &.{""} },
+            .class => |cc| self.ofClass(&cc),
+            .group => |g| self.of(g.node),
+            .concat => |parts| self.ofConcat(parts),
+            .alt => |arms| self.ofAlt(arms),
+            .repeat => |r| self.ofRepeat(r.node, r.min, r.max),
+        };
+    }
+
+    fn ofClass(self: *GramGather, cc: *const CharClass) Error!Info {
+        var folded: CharClass = .{};
+        var count: usize = 0;
+        for (0..256) |b| {
+            if (!cc.contains(@intCast(b))) continue;
+            const f = ngram.fold(@intCast(b));
+            if (folded.contains(f)) continue;
+            folded.add(f);
+            count += 1;
+            if (count > class_limit) return nothing;
+        }
+        const strings = try self.scratch.alloc([]const u8, count);
+        var i: usize = 0;
+        for (0..256) |b| {
+            if (!folded.contains(@intCast(b))) continue;
+            strings[i] = try self.scratch.dupe(u8, &.{@as(u8, @intCast(b))});
+            i += 1;
+        }
+        return .{ .exact = strings };
+    }
+
+    fn ofConcat(self: *GramGather, parts: []const *Node) Error!Info {
+        var arms: std.ArrayList(ngram.Query) = .empty;
+        defer arms.deinit(self.allocator);
+        var run: []const []const u8 = &.{""};
+        var whole = true;
+        for (parts) |p| {
+            const info = try self.of(p);
+            if (info.exact) |e| {
+                if (try self.cross(run, e)) |joined| {
+                    run = joined;
+                    continue;
+                }
+                try arms.append(self.allocator, try self.ofSet(run));
+                run = e;
+            } else {
+                try arms.append(self.allocator, try self.ofSet(run));
+                try arms.append(self.allocator, info.match);
+                run = &.{""};
+            }
+            whole = false;
+        }
+        if (whole) return .{ .exact = run };
+        try arms.append(self.allocator, try self.ofSet(run));
+        return .{ .exact = null, .match = try ngram.conjoin(self.allocator, arms.items) };
+    }
+
+    fn ofAlt(self: *GramGather, alternatives: []const *Node) Error!Info {
+        var exact: std.ArrayList([]const u8) = .empty;
+        var whole = true;
+        var arms: std.ArrayList(ngram.Query) = .empty;
+        defer arms.deinit(self.allocator);
+        for (alternatives) |alt| {
+            const info = try self.of(alt);
+            if (info.exact) |e| {
+                if (whole) {
+                    for (e) |s| try appendUnique(self.scratch, &exact, s);
+                    whole = exact.items.len <= exact_limit;
+                }
+            } else whole = false;
+            try arms.append(self.allocator, try self.queryOf(info));
+        }
+        if (whole) return .{ .exact = exact.items };
+        return .{ .exact = null, .match = try ngram.disjoin(self.allocator, arms.items) };
+    }
+
+    fn ofRepeat(self: *GramGather, node: *const Node, min: u32, max: ?u32) Error!Info {
+        const info = try self.of(node);
+        if (min == 0) {
+            const e = info.exact orelse return nothing;
+            if (max != 1) return nothing;
+            var optional: std.ArrayList([]const u8) = .empty;
+            try appendUnique(self.scratch, &optional, "");
+            for (e) |s| try appendUnique(self.scratch, &optional, s);
+            return if (optional.items.len <= exact_limit) .{ .exact = optional.items } else nothing;
+        }
+        if (info.exact) |e| if (max == min and min <= 3) {
+            if (try self.power(e, min)) |run| return .{ .exact = run };
+        };
+        return .{ .exact = null, .match = try self.queryOf(info) };
+    }
+
+    /// `n` of `e` in a row; null past `exact_limit`.
+    fn power(self: *GramGather, e: []const []const u8, n: u32) Error!?[]const []const u8 {
+        var run: []const []const u8 = &.{""};
+        for (0..n) |_| run = (try self.cross(run, e)) orelse return null;
+        return run;
+    }
+
+    /// Each of `a` followed by each of `b`; null when there'd be more than
+    /// `exact_limit`.
+    fn cross(self: *GramGather, a: []const []const u8, b: []const []const u8) Error!?[]const []const u8 {
+        if (a.len * b.len > exact_limit) return null;
+        var joined: std.ArrayList([]const u8) = .empty;
+        for (a) |x| for (b) |y| {
+            const s = try self.scratch.alloc(u8, x.len + y.len);
+            @memcpy(s[0..x.len], x);
+            @memcpy(s[x.len..], y);
+            try appendUnique(self.scratch, &joined, s);
+        };
+        return joined.items;
+    }
+
+    fn appendUnique(scratch: Allocator, list: *std.ArrayList([]const u8), s: []const u8) Error!void {
+        for (list.items) |have| if (std.mem.eql(u8, have, s)) return;
+        try list.append(scratch, s);
+    }
+
+    fn queryOf(self: *GramGather, info: Info) Error!ngram.Query {
+        return if (info.exact) |e| self.ofSet(e) else info.match;
+    }
+
+    /// The grams of one of `strings`, whichever a match is.
+    fn ofSet(self: *GramGather, strings: []const []const u8) Error!ngram.Query {
+        var arms: std.ArrayList(ngram.Query) = .empty;
+        defer arms.deinit(self.allocator);
+        for (strings) |s| try arms.append(self.allocator, try ngram.ofText(self.allocator, s));
+        return ngram.disjoin(self.allocator, arms.items);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4291,4 +4463,64 @@ test "regex throughput micro-bench" {
         const mrps = @as(f64, @floatFromInt(N)) / secs / 1e6;
         std.debug.print("[regex-bench] dop={d}: {d:.0}ms  {d:.0} MB/s  {d:.2} M urls/s  {d:.3} us/url\n", .{ dop, ms, mbps, mrps, us_per });
     }
+}
+
+/// Whether `text` holds what `q` asks.
+fn queryHolds(q: ngram.Query, text: []const u8) bool {
+    return switch (q) {
+        .all => true,
+        .gram => |g| for (0..text.len -| 2) |i| {
+            if (ngram.gramAt(text, i) == g) break true;
+        } else false,
+        .@"and" => |arms| for (arms) |arm| {
+            if (!queryHolds(arm, text)) break false;
+        } else true,
+        .@"or" => |arms| for (arms) |arm| {
+            if (queryHolds(arm, text)) break true;
+        } else false,
+    };
+}
+
+test "regex: n-gram queries hold of every text the regex is found in" {
+    const cases = .{
+        .{ "google", .{ "xgoogley", "www.google.com" }, .{ "goog", "gogle" } },
+        .{ "goo.*gle", .{ "goo-gle", "goooogle" }, .{"goo gl"} },
+        .{ "(www\\.)?google\\.com", .{ "http://www.google.com/", "google.com" }, .{"google.co"} },
+        .{ "^https?://ya", .{ "http://yandex.ru", "https://ya.ru" }, .{"ftp://ya"} },
+        .{ "x[ab]yz", .{ "xayz", "xbyz" }, .{"xcyz"} },
+        .{ "[a-z]+foo", .{"barfoo"}, .{"barfo"} },
+        .{ "(abc)+d", .{"abcabcd"}, .{"abd"} },
+        .{ "abc|def", .{ "abc", "xdefx" }, .{"abdxef"} },
+        .{ "(ab){3}", .{"ababab"}, .{"abba"} },
+        .{ "a(bc|de)f", .{ "abcf", "adef" }, .{"abdf"} },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (cases) |c| {
+        const q = try ngramQuery(arena.allocator(), c[0], .{});
+        try std.testing.expect(q != .all);
+        inline for (c[1]) |text| {
+            try expectMatch(c[0], text, true);
+            try std.testing.expect(queryHolds(q, text));
+        }
+        inline for (c[2]) |text| try std.testing.expect(!queryHolds(q, text));
+    }
+}
+
+test "regex: n-gram queries ask nothing when no gram is certain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    inline for (.{ ".*", "a|bcd", "ab", "(abc)?", "[a-z]{3}", "a.c", "(abc)*" }) |pattern| {
+        try std.testing.expectEqual(ngram.Query.all, try ngramQuery(arena.allocator(), pattern, .{}));
+    }
+    try std.testing.expectError(Error.RegexInvalidPattern, ngramQuery(arena.allocator(), "(abc", .{}));
+}
+
+test "regex: case-insensitive n-gram queries fold like the index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const q = try ngramQuery(arena.allocator(), "GoOgle", .{ .case_insensitive = true });
+    try std.testing.expect(queryHolds(q, "GOOGLE"));
+    try std.testing.expect(queryHolds(q, "google"));
+    try std.testing.expectEqual(@as(usize, 4), q.@"and".len);
 }
